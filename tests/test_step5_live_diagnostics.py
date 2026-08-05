@@ -1,3 +1,4 @@
+import csv
 import hashlib
 import json
 import sys
@@ -18,7 +19,11 @@ import run_step
 import s5_call_chain_engine_integrated as step5
 from step5_artifact_fact_store import Step5ArtifactFactStore
 from step5_diagnostics import Step5DiagnosticRecorder
-from step5_evidence_model import CollectorBatch, EvidenceFailure
+from step5_evidence_model import (
+    CollectorBatch,
+    EvidenceFailure,
+    EvidenceFailureOccurrence,
+)
 
 
 class Step5LiveDiagnosticsTest(unittest.TestCase):
@@ -133,6 +138,56 @@ class Step5LiveDiagnosticsTest(unittest.TestCase):
         self.assertEqual(event["scope"], "path")
         self.assertEqual(event["failure_count"], 2)
         self.assertEqual(len(event["samples"]), 2)
+
+    def test_unresolved_bytecode_caller_writes_instruction_level_evidence(self):
+        failure = EvidenceFailure(
+            stage="evidence-ingestion",
+            reason_code="BYTECODE_CALLER_UNRESOLVED",
+            blocking=True,
+            api_identity="com.vendor.Auth.exportFromERM(java.lang.String)",
+            scope="api",
+            occurrences=(EvidenceFailureOccurrence(
+                caller_symbol="com.acme.LoginService.login(java.lang.String)",
+                caller_qualified_key="com.acme.LoginService.login",
+                artifact="/tmp/app.jar",
+                artifact_entry="BOOT-INF/classes/com/acme/LoginService.class",
+                class_name="com.acme.LoginService",
+                line=42,
+                instruction_offset=17,
+                detail="caller could not be mapped",
+            ),),
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = Step5DiagnosticRecorder(tmp)
+            recorder.record_failure_records(
+                "evidence.merge",
+                (("business_bytecode", failure),),
+                reason_codes=("BYTECODE_CALLER_UNRESOLVED",),
+            )
+            event = json.loads(
+                recorder.path.read_text(encoding="utf-8").splitlines()[0]
+            )
+            evidence_path = Path(tmp) / event["evidence_file"]
+            with evidence_path.open(
+                "r", encoding="utf-8-sig", newline=""
+            ) as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual(
+            event["evidence_file"],
+            "evidence/call_chain/bytecode_unresolved.csv",
+        )
+        self.assertIn(
+            "com.acme.LoginService:login:17 -> "
+            "com.vendor.Auth.exportFromERM(java.lang.String)",
+            event["samples"][0]["instruction_evidence"],
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["caller_method"], "login")
+        self.assertEqual(rows[0]["instruction_offset"], "17")
+        self.assertEqual(rows[0]["unresolved_owner"], "com.vendor.Auth")
+        self.assertEqual(rows[0]["unresolved_method"], "exportFromERM")
 
     def test_tracer_callback_receives_each_completed_result(self):
         callback_events = []

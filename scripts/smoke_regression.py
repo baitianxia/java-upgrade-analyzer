@@ -4182,9 +4182,9 @@ BridgeFacade.callAdapter();
         "not_analyzed": 3,
         "not_found_in_static_analysis": 0,
         "user_conclusion_summary": {
-            "可能影响": 1,
-            "需要补充输入": 1,
-            "当前无法确认": 1,
+            "probable_impact": 1,
+            "input_required": 1,
+            "inconclusive": 1,
         },
         "quality_gate": {
             "confirmed_impact": 0,

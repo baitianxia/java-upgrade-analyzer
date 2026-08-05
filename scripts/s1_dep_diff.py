@@ -75,6 +75,7 @@ STEP1_MAX_TOTAL_DEPENDENCY_BYTES = 2 * 1024 * 1024 * 1024
 # repository connection/read timeouts, so Step1 must not impose a total
 # wall-clock deadline unless an explicit timeout option is added in the future.
 STEP1_BUILD_TOOL_TIMEOUT = None
+MAVEN_SKIP_TEST_COMPILATION_ARG = '-Dmaven.test.skip=true'
 GRADLE_LOCK_RETRY_DELAYS_SECONDS = (1, 3)
 
 
@@ -4103,15 +4104,12 @@ def _collect_maven_runtime_deps_for_workspace(
     profile_args = _maven_profile_args_for_module(
         work_dir, target_selector, active_maven_profiles
     )
-    reactor_prepare = (
-        ['-Dmaven.test.skip=true', 'package']
-        if _maven_reactor_has_modules(work_dir) else []
-    )
+    reactor_prepare = ['package'] if _maven_reactor_has_modules(work_dir) else []
     list_cmd = mvn_cmd(work_dir) + [
         '--batch-mode',
         *profile_args,
         *(["-pl", pl, "-am"] if pl else []),
-        '-DskipTests',
+        MAVEN_SKIP_TEST_COMPILATION_ARG,
         *reactor_prepare,
         'dependency:list',
         '-DincludeScope=runtime',
@@ -4459,7 +4457,7 @@ def collect_maven_deps_for_workspace(
         '--batch-mode',
         *profile_args,
         *(["-pl", pl, "-am"] if pl else []),
-        '-DskipTests',
+        MAVEN_SKIP_TEST_COMPILATION_ARG,
         'package',
     ]
     package_command = ' '.join(package_cmd)
@@ -5100,7 +5098,7 @@ def get_packaged_deps_by_switching_branch(
                     default_command=(
                         "gradlew --no-daemon --console=plain build -x test"
                         if str(build_tool).lower() == 'gradle'
-                        else "mvn --batch-mode -DskipTests package"
+                        else f"mvn --batch-mode {MAVEN_SKIP_TEST_COMPILATION_ARG} package"
                     ),
                     side=side,
                     branch=branch,
@@ -5224,7 +5222,7 @@ def get_runtime_deps_by_switching_branch(
                         "--configuration runtimeClasspath"
                         if str(build_tool).lower() == 'gradle'
                         else (
-                            "mvn --batch-mode -DskipTests dependency:list "
+                            f"mvn --batch-mode {MAVEN_SKIP_TEST_COMPILATION_ARG} dependency:list "
                             "-DincludeScope=runtime "
                             "-DoutputAbsoluteArtifactFilename=true"
                         )
@@ -5273,7 +5271,10 @@ def print_manual_instructions(base_branch, current_branch, primary_module=None, 
     """打印用户需要手动执行的命令，确保按最终打包依赖口径获取结果"""
     target_selector = _resolve_single_module_selector(primary_module, modules, work_dir)
     pl = _normalize_maven_pl_with_workdir(target_selector, work_dir)
-    package_cmd = f"mvn {'-pl ' + pl + ' -am ' if pl else ''}-DskipTests package"
+    package_cmd = (
+        f"mvn {'-pl ' + pl + ' -am ' if pl else ''}"
+        f"{MAVEN_SKIP_TEST_COMPILATION_ARG} package"
+    )
 
     sep = "=" * 60
     print(f"\n{sep}", file=sys.stderr)
@@ -5975,7 +5976,10 @@ def main():
                 command = ' '.join(gradle_cmd(args.work_dir) + [_gradle_task(target_model, 'build'), '-x', 'test'])
             else:
                 pl = _normalize_maven_pl_with_workdir(target_selector, args.work_dir)
-                command = f"mvn {'-pl ' + pl + ' -am ' if pl else ''}-DskipTests package"
+                command = (
+                    f"mvn {'-pl ' + pl + ' -am ' if pl else ''}"
+                    f"{MAVEN_SKIP_TEST_COMPILATION_ARG} package"
+                )
             print(f"  {command}", file=sys.stderr)
             print(f"  git checkout {args.current_branch}", file=sys.stderr)
             print(f"  {command}", file=sys.stderr)

@@ -294,6 +294,7 @@ S6_DETAIL_BUCKETS = {
         "csv": "s6_uncertain_apis.csv",
         "md": "s6_uncertain_apis.md",
         "summary_key": "uncertain_reason_summary",
+        "show_priority": True,
         "note": (
             "包含已有候选证据但链路未确认的项目，以及因静态分析能力边界"
             "无法取得候选调用证据的项目；两类证据状态在明细中分别标注。"
@@ -912,6 +913,36 @@ def _validate_call_summary_contract(path, summary, diagnostics):
         if value is not None and not isinstance(value, dict):
             issues.append(f"{object_field} is not an object")
             summary[object_field] = {}
+    user_conclusion_summary = summary.get("user_conclusion_summary") or {}
+    if isinstance(user_conclusion_summary, dict):
+        allowed_conclusion_keys = {
+            "confirmed_impact",
+            "confirmed_no_impact",
+            "probable_impact",
+            "inconclusive",
+            "input_required",
+        }
+        invalid_conclusion_keys = sorted(
+            str(key)
+            for key in user_conclusion_summary
+            if str(key) not in allowed_conclusion_keys
+        )
+        if invalid_conclusion_keys:
+            _record_content_diagnostic(
+                diagnostics,
+                artifact="call_chain_summary",
+                stage="json_contract",
+                path=path,
+                message=(
+                    "user_conclusion_summary contains non-contract keys: "
+                    + ", ".join(invalid_conclusion_keys)
+                ),
+            )
+            summary["user_conclusion_summary"] = {
+                key: user_conclusion_summary[key]
+                for key in allowed_conclusion_keys
+                if key in user_conclusion_summary
+            }
     meta = summary.get("meta", {})
     if meta is not None and not isinstance(meta, dict):
         issues.append("meta is not an object")
@@ -1885,7 +1916,64 @@ def _known_context_parts(findings):
     return parts
 
 
-def _detail_row(idx, item, conclusion=''):
+def _uncertain_item_sort_key(item):
+    return (
+        -int(item.get("priority_score") or 0),
+        _severity_rank(item.get("severity")),
+        -len(item.get("call_paths") or item.get("paths") or []),
+        str(item.get("api") or item.get("api_name") or ""),
+        str(item.get("api_signature") or ""),
+    )
+
+
+def _order_uncertain_items_by_dependency(items):
+    """Keep dependency coordinates contiguous while ordering review risk."""
+    grouped = defaultdict(list)
+    for item in items or []:
+        coord = str((item or {}).get("coord") or "").strip()
+        grouped[coord].append(item)
+
+    dependency_groups = []
+    for coord, group_items in grouped.items():
+        ordered_items = sorted(group_items, key=_uncertain_item_sort_key)
+        scores = [int((item or {}).get("priority_score") or 0) for item in ordered_items]
+        dependency_groups.append({
+            "coord": coord,
+            "items": ordered_items,
+            "dependency_uncertain_api_count": len(ordered_items),
+            "dependency_top_priority_score": max(scores, default=0),
+            "dependency_total_priority_score": sum(scores),
+        })
+
+    dependency_groups.sort(key=lambda group: (
+        -int(group["dependency_top_priority_score"]),
+        -int(group["dependency_total_priority_score"]),
+        -int(group["dependency_uncertain_api_count"]),
+        not bool(group["coord"]),
+        str(group["coord"]),
+    ))
+
+    ordered = []
+    for rank, group in enumerate(dependency_groups, 1):
+        for item in group["items"]:
+            enriched = dict(item or {})
+            enriched.update({
+                "dependency_priority_rank": rank,
+                "dependency_top_priority_score": group[
+                    "dependency_top_priority_score"
+                ],
+                "dependency_total_priority_score": group[
+                    "dependency_total_priority_score"
+                ],
+                "dependency_uncertain_api_count": group[
+                    "dependency_uncertain_api_count"
+                ],
+            })
+            ordered.append(enriched)
+    return ordered
+
+
+def _detail_row(idx, item, conclusion='', *, show_priority=False):
     display_conclusion = str(conclusion or '').strip()
     if not display_conclusion and str((item or {}).get('uncertainty_kind') or '').strip():
         display_conclusion = _uncertain_conclusion(item)
@@ -1902,8 +1990,14 @@ def _detail_row(idx, item, conclusion=''):
         or "未记录更多客观原因。"
     )
     boundary = _detail_review_focus(item, display_conclusion)
+    priority_cell = (
+        f"| {int(item.get('priority_score') or 0)} "
+        if show_priority
+        else ""
+    )
     return (
         f"| {idx} | `{_md_cell(item.get('coord'))}` | `{_md_cell(item.get('api'))}` | "
+        f"{priority_cell}"
         f"{_md_cell(_change_summary(item), 220)} | "
         f"{_md_cell(display_conclusion)} | "
         f"{_md_cell(reason)} | {_md_cell(boundary)} |"
@@ -1941,6 +2035,8 @@ def _detail_review_focus(item, conclusion=''):
 
 
 def build_bucket_detail_markdown(config, items, csv_name, *, alerts_available=False):
+    if config.get("show_priority"):
+        items = _order_uncertain_items_by_dependency(items)
     reason_summary = summarize_item_reasons(
         items, config.get("conclusion") or ""
     )
@@ -1975,6 +2071,14 @@ def build_bucket_detail_markdown(config, items, csv_name, *, alerts_available=Fa
         "- 下表记录变更事实、当前结论、形成结论的原因和适用边界。",
         "- Markdown 仅在数据量较大时展示样例；完整记录保存在同名 CSV。",
     ]
+    if config.get("show_priority"):
+        lines.append(
+            "- 两级排序：先按依赖组最高分、组内总分排列依赖坐标，"
+            "再在每个依赖内部按 API 复核优先分数降序排列。"
+        )
+        lines.append(
+            "- API 复核优先分数 = 严重级别权重 × 调用方权重 × 运行时必加载权重。"
+        )
     if alerts_available:
         lines.append("- 完整逐链路事实保存在 `evidence/call_chain/alerts.csv`。")
     lines.append("")
@@ -1984,7 +2088,36 @@ def build_bucket_detail_markdown(config, items, csv_name, *, alerts_available=Fa
             "## 事实分布",
             "",
         ]
-    if len(items) > 1 and coord_summary:
+    if len(items) > 1 and coord_summary and config.get("show_priority"):
+        dependency_rows = []
+        seen_dependency_ranks = set()
+        for item in items:
+            dependency_rank = int(item.get("dependency_priority_rank") or 0)
+            if dependency_rank in seen_dependency_ranks:
+                continue
+            seen_dependency_ranks.add(dependency_rank)
+            dependency_rows.append(item)
+        lines += [
+            "### 依赖复核顺序",
+            "",
+            "| 依赖排名 | 依赖坐标 | 组内最高分 | 组内总分 | uncertain API 数 |",
+            "|---:|---|---:|---:|---:|",
+        ]
+        for item in dependency_rows[:S6_DETAIL_MD_DEP_SUMMARY_LIMIT]:
+            lines.append(
+                f"| {int(item.get('dependency_priority_rank') or 0)} | "
+                f"`{_md_cell(item.get('coord'))}` | "
+                f"{int(item.get('dependency_top_priority_score') or 0)} | "
+                f"{int(item.get('dependency_total_priority_score') or 0)} | "
+                f"{int(item.get('dependency_uncertain_api_count') or 0)} |"
+            )
+        if len(dependency_rows) > S6_DETAIL_MD_DEP_SUMMARY_LIMIT:
+            lines.append(
+                f"| 其他 {len(dependency_rows) - S6_DETAIL_MD_DEP_SUMMARY_LIMIT} 个依赖 | "
+                "— | — | — | — |"
+            )
+        lines.append("")
+    elif len(items) > 1 and coord_summary:
         lines += [
             f"### 依赖坐标分布（前 {min(S6_DETAIL_MD_DEP_SUMMARY_LIMIT, len(coord_summary))} 个）",
             "",
@@ -2031,16 +2164,25 @@ def build_bucket_detail_markdown(config, items, csv_name, *, alerts_available=Fa
         lines.append("")
 
     if len(items) <= S6_DETAIL_MD_FULL_LIMIT:
+        priority_header = " 复核优先分数 |" if config.get("show_priority") else ""
+        priority_separator = "---:|" if config.get("show_priority") else ""
         lines += [
             "## API 明细（完整）",
             "",
-            "| # | 依赖坐标 | 变更 API | 变化 | 结论 | 原因 | 结论边界 |",
-            "|---:|---|---|---|---|---|---|",
+            f"| # | 依赖坐标 | 变更 API |{priority_header} 变化 | 结论 | 原因 | 结论边界 |",
+            f"|---:|---|---|{priority_separator}---|---|---|---|",
         ]
         for idx, item in enumerate(items, 1):
-            lines.append(_detail_row(idx, item, config.get('conclusion') or ''))
+            lines.append(_detail_row(
+                idx,
+                item,
+                config.get('conclusion') or '',
+                show_priority=bool(config.get("show_priority")),
+            ))
         lines.append("")
     else:
+        priority_header = " 复核优先分数 |" if config.get("show_priority") else ""
+        priority_separator = "---:|" if config.get("show_priority") else ""
         lines += [
             f"## 明细样例（排序前 {S6_DETAIL_MD_SAMPLE_LIMIT} 条）",
             "",
@@ -2049,11 +2191,16 @@ def build_bucket_detail_markdown(config, items, csv_name, *, alerts_available=Fa
                 f"同名 CSV 保存全部 {len(items)} 条。"
             ),
             "",
-            "| # | 依赖坐标 | 变更 API | 变化 | 结论 | 原因 | 结论边界 |",
-            "|---:|---|---|---|---|---|---|",
+            f"| # | 依赖坐标 | 变更 API |{priority_header} 变化 | 结论 | 原因 | 结论边界 |",
+            f"|---:|---|---|{priority_separator}---|---|---|---|",
         ]
         for idx, item in enumerate(items[:S6_DETAIL_MD_SAMPLE_LIMIT], 1):
-            lines.append(_detail_row(idx, item, config.get('conclusion') or ''))
+            lines.append(_detail_row(
+                idx,
+                item,
+                config.get('conclusion') or '',
+                show_priority=bool(config.get("show_priority")),
+            ))
         lines += [
             "",
             f"未在本 Markdown 展开的记录：{len(items) - S6_DETAIL_MD_SAMPLE_LIMIT} 条。",
@@ -2192,16 +2339,19 @@ def write_bucket_detail_artifacts(report_dir, findings, bucket_name):
             item for item in items
             if item.get("user_conclusion") not in {"可能影响", "需要补充输入"}
         ]
-    items = sorted(
-        items,
-        key=lambda item: (
-            _severity_rank(item.get("severity")),
-            -len(item.get("call_paths") or []),
-            str(item.get("coord") or ""),
-            str(item.get("api") or item.get("api_name") or ""),
-            str(item.get("api_signature") or ""),
-        ),
-    )
+    if bucket_name == "uncertain":
+        items = _order_uncertain_items_by_dependency(items)
+    else:
+        items = sorted(
+            items,
+            key=lambda item: (
+                _severity_rank(item.get("severity")),
+                -len(item.get("call_paths") or []),
+                str(item.get("coord") or ""),
+                str(item.get("api") or item.get("api_name") or ""),
+                str(item.get("api_signature") or ""),
+            ),
+        )
     artifacts = {}
     report_path = _deliverables_dir(report_dir)
     csv_path = report_path / config.get("csv", f"s6_{bucket_name}_apis.csv")
@@ -2232,11 +2382,21 @@ def write_bucket_detail_artifacts(report_dir, findings, bucket_name):
         "symbol_kind",
         "change_type",
         "severity",
+    ]
+    if bucket_name == "uncertain":
+        fieldnames.extend([
+            "dependency_priority_rank",
+            "dependency_top_priority_score",
+            "dependency_total_priority_score",
+            "dependency_uncertain_api_count",
+        ])
+    fieldnames.extend([
+        "priority_score",
         "uncertainty_kind",
         "reason_code",
         "reason",
         "user_reason",
-    ]
+    ])
     with open_csv_write(csv_path) as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -3368,6 +3528,7 @@ def collect_findings(d):
         'not_analyzed':        [],
         'not_found':           [],
         'uncertain_reason_summary': {},
+        'uncertain_dependency_summary': [],
         'uncertainty_kind_summary': {},
         'not_analyzed_reason_summary': {},
         'not_found_reason_summary': {},
@@ -3397,6 +3558,10 @@ def collect_findings(d):
     for key, path in (
         ('dependency_changes_csv', _dep_changes_path(d)),
         ('alerts_csv', _call_chain_dir(d) / 'alerts.csv'),
+        (
+            'bytecode_unresolved_csv',
+            _call_chain_dir(d) / 'bytecode_unresolved.csv',
+        ),
         ('changed_apis_csv', _api_changes_dir(d) / 'all_changed_apis.csv'),
         (
             'build_provenance_json',
@@ -3713,6 +3878,15 @@ def collect_findings(d):
                 'affected_artifact_entries': list(
                     raw_item.get('affected_artifact_entries') or []
                 ),
+                'evidence_file': str(
+                    raw_item.get('evidence_file')
+                    or next(iter(raw_item.get('evidence_files') or []), '')
+                ),
+                'evidence_files': list(
+                    raw_item.get('evidence_files')
+                    or ([raw_item.get('evidence_file')]
+                        if raw_item.get('evidence_file') else [])
+                ),
                 'collectors': list(raw_item.get('collectors') or []),
                 'candidate_evidence': list(
                     raw_item.get('candidate_evidence') or []
@@ -3734,7 +3908,12 @@ def collect_findings(d):
         findings['diagnostic_guidance'] = normalized_guidance
         if not findings.get('coverage'):
             findings['coverage'] = _step5_summary_coverage_fallback(call_summary)
-        findings['user_conclusion_summary'] = dict(call_summary.get('user_conclusion_summary') or {})
+        findings['user_conclusion_summary'] = dict(
+            call_summary.get('user_conclusion_summary') or {}
+        )
+        findings['uncertain_dependency_summary'] = list(
+            call_summary.get('uncertain_dependency_summary') or []
+        )
         not_found_count = call_summary.get(
             'not_found_in_static_analysis',
             call_summary.get('not_reachable', 0),
@@ -3836,6 +4015,8 @@ def collect_findings(d):
                 'path_details': item.get('path_details', []),
                 'compile_impact': item.get('compile_impact', ''),
                 'runtime_link_impact': item.get('runtime_link_impact', ''),
+                'priority_score': int(item.get('priority_score') or 0),
+                'priority_factors': dict(item.get('priority_factors') or {}),
                 'reason':       item.get('reason', ''),
                 'reason_code':  reason_code,
                 'origin_step':  item.get('origin_step', ''),
@@ -5355,6 +5536,8 @@ def build_api_result_rows(findings):
                     if fallback_conclusion == UNCERTAIN_CANDIDATE_CONCLUSION
                     else ''
                 ),
+                'priority_score': int(item.get('priority_score') or 0),
+                'priority_factors': dict(item.get('priority_factors') or {}),
                 'business_entries': business_entries,
                 'business_entry_count': len(all_business_entries),
                 'modules': modules,
@@ -6153,6 +6336,10 @@ def _diagnostic_evidence_text(item):
     collectors = list(item.get('collectors') or [])
     candidates = list(item.get('candidate_evidence') or [])
     source_components = list(item.get('source_components') or [])
+    evidence_files = list(
+        item.get('evidence_files')
+        or ([item.get('evidence_file')] if item.get('evidence_file') else [])
+    )
     if classes:
         pieces.append('类：' + '、'.join(classes[:5]))
     if artifacts:
@@ -6180,6 +6367,14 @@ def _diagnostic_evidence_text(item):
         pieces.append(
             '覆盖组件：'
             + '、'.join(_coverage_item_label(value) for value in source_components[:5])
+        )
+    if evidence_files:
+        pieces.append(
+            '指令级明细：'
+            + '、'.join(
+                _report_link(value, Path(str(value)).name)
+                for value in evidence_files[:3]
+            )
         )
     return '；'.join(pieces) or '当前只记录了 API 级原因，未附加制品或类证据。'
 
@@ -6989,6 +7184,16 @@ def build_human_api_analysis(findings):
     )
     completed = [row for row in rows if not _api_result_is_incomplete(row)]
     incomplete = [row for row in rows if _api_result_is_incomplete(row)]
+    completed = [
+        row
+        for _coord, dependency_rows in _completed_api_rows_by_dependency({
+            "completed": completed,
+        })
+        for row in dependency_rows
+    ]
+    # Keep the model order identical to the Markdown and CSV detail artifacts:
+    # dependency coordinates first, APIs within each dependency second.
+    rows = [*completed, *incomplete]
     total_count = sum(int(row.get("aggregate_count") or 1) for row in rows)
     completed_count = sum(
         int(row.get("aggregate_count") or 1) for row in completed
@@ -7199,6 +7404,8 @@ def _dependency_result_rank(row):
 def _dependency_display_sort_key(row):
     return (
         _dependency_result_rank(row),
+        -int((row or {}).get("top_uncertain_priority_score") or 0),
+        -int((row or {}).get("total_uncertain_priority_score") or 0),
         -int((row or {}).get("call_relationship_count") or 0),
         str((row or {}).get("coord") or ""),
     )
@@ -7342,6 +7549,15 @@ def build_human_dependency_analysis(findings, api_model=None):
             for row in api_rows
             if not _api_result_is_incomplete(row)
         )
+        uncertain_priority_scores = [
+            int(row.get("priority_score") or 0)
+            for row in api_rows
+            if str(row.get("conclusion") or "") in {
+                "可能影响",
+                UNCERTAIN_CANDIDATE_CONCLUSION,
+                UNCERTAIN_ANALYSIS_LIMITATION_CONCLUSION,
+            }
+        ]
         if incomplete:
             conclusion = (
                 "部分结果确认影响；分析未完成"
@@ -7427,6 +7643,12 @@ def build_human_dependency_analysis(findings, api_model=None):
             "confirmed_api_count": confirmed_api_count,
             "confirmed_relationship_count": confirmed_relationships,
             "call_relationship_count": call_relationships,
+            "top_uncertain_priority_score": max(
+                uncertain_priority_scores, default=0
+            ),
+            "total_uncertain_priority_score": sum(
+                uncertain_priority_scores
+            ),
             "unassigned_api_count": unassigned_api_count,
             "analysis_conclusion": conclusion,
             "conclusion_basis": _dependency_basis(api_rows),
@@ -7950,9 +8172,26 @@ def _main_completed_api_rows(rows):
     confirmed = [
         row for row in rows if row.get("conclusion") == "已确认影响"
     ]
-    other = [
-        row for row in rows if row.get("conclusion") != "已确认影响"
-    ]
+    uncertain_conclusions = {
+        "可能影响",
+        UNCERTAIN_CANDIDATE_CONCLUSION,
+        UNCERTAIN_ANALYSIS_LIMITATION_CONCLUSION,
+    }
+    uncertain_rows = _order_uncertain_items_by_dependency([
+        row
+        for row in rows
+        if str(row.get("conclusion") or "") in uncertain_conclusions
+    ])
+    non_uncertain_rows = sorted(
+        (
+            row
+            for row in rows
+            if row.get("conclusion") != "已确认影响"
+            and str(row.get("conclusion") or "") not in uncertain_conclusions
+        ),
+        key=_report_result_sort_key,
+    )
+    other = [*uncertain_rows, *non_uncertain_rows]
     selected = []
     remaining = S6_MAIN_RESULT_LIMIT
     seen_coords = set()
@@ -7983,7 +8222,28 @@ def _main_completed_api_rows(rows):
                 break
             selected.append(row)
             remaining -= 1
-    return sorted(selected, key=_report_result_sort_key)
+    selected_confirmed = sorted(
+        (
+            row for row in selected
+            if str(row.get("conclusion") or "") == "已确认影响"
+        ),
+        key=_report_result_sort_key,
+    )
+    selected_uncertain = _order_uncertain_items_by_dependency([
+        row
+        for row in selected
+        if str(row.get("conclusion") or "") in uncertain_conclusions
+    ])
+    selected_other = sorted(
+        (
+            row
+            for row in selected
+            if str(row.get("conclusion") or "") != "已确认影响"
+            and str(row.get("conclusion") or "") not in uncertain_conclusions
+        ),
+        key=_report_result_sort_key,
+    )
+    return [*selected_confirmed, *selected_uncertain, *selected_other]
 
 
 def _main_relationship_cell(row):
@@ -8043,10 +8303,15 @@ def _api_result_explanation(row, findings=None):
             "已有相关证据，但现有证据不能确认当前系统是否会触发该影响。"
         )
     if conclusion == UNCERTAIN_CANDIDATE_CONCLUSION:
-        return "存在候选调用关系，但尚未形成完整的系统触达证据。"
+        priority = int(row.get("priority_score") or 0)
+        prefix = f"复核优先分数 {priority}。" if priority else ""
+        return prefix + "存在候选调用关系，但尚未形成完整的系统触达证据。"
     if conclusion == UNCERTAIN_ANALYSIS_LIMITATION_CONCLUSION:
+        priority = int(row.get("priority_score") or 0)
+        prefix = f"复核优先分数 {priority}。" if priority else ""
         return (
-            "当前未发现候选调用证据；受静态分析能力边界限制，"
+            prefix
+            + "当前未发现候选调用证据；受静态分析能力边界限制，"
             "不能据此判定该 API 未被使用。"
         )
     boundary = _result_boundary_text(row)
@@ -8465,12 +8730,88 @@ def _completed_api_rows_by_dependency(api_model):
     grouped = defaultdict(list)
     for row in api_model.get("completed") or []:
         grouped[_canonical_identity_coord(row.get("coord"))].append(row)
-    return [
-        (
-            coord,
-            sorted(grouped[coord], key=_report_result_sort_key),
+
+    uncertain_conclusions = {
+        "可能影响",
+        UNCERTAIN_CANDIDATE_CONCLUSION,
+        UNCERTAIN_ANALYSIS_LIMITATION_CONCLUSION,
+    }
+
+    def row_sort_key(row):
+        conclusion = str(row.get("conclusion") or "")
+        result_rank = _api_result_rank(row)
+        is_uncertain = conclusion in uncertain_conclusions
+        return (
+            result_rank,
+            -int(row.get("priority_score") or 0) if is_uncertain else 0,
+            _severity_rank(row.get("severity")),
+            -_api_call_relationship_count(row),
+            str(row.get("api") or ""),
+            str(row.get("api_signature") or ""),
+            str(row.get("change_type") or ""),
         )
-        for coord in sorted(grouped)
+
+    dependency_groups = []
+    for coord, rows in grouped.items():
+        ordered_rows = sorted(rows, key=row_sort_key)
+        result_ranks = [_api_result_rank(row) for row in ordered_rows]
+        best_result_rank = min(result_ranks, default=99)
+        best_severity_rank = min(
+            (
+                _severity_rank(row.get("severity"))
+                for row in ordered_rows
+                if _api_result_rank(row) == best_result_rank
+            ),
+            default=99,
+        )
+        uncertain_scores = [
+            int(row.get("priority_score") or 0)
+            for row in ordered_rows
+            if str(row.get("conclusion") or "") in uncertain_conclusions
+        ]
+        dependency_groups.append({
+            "coord": coord,
+            "rows": ordered_rows,
+            "best_result_rank": best_result_rank,
+            "best_severity_rank": best_severity_rank,
+            "top_priority_score": max(uncertain_scores, default=0),
+            "total_priority_score": sum(uncertain_scores),
+            "uncertain_count": len(uncertain_scores),
+            "relationship_count": sum(
+                _api_call_relationship_count(row) for row in ordered_rows
+            ),
+        })
+
+    def dependency_group_sort_key(group):
+        result_rank = int(group["best_result_rank"])
+        stable_tail = (
+            not bool(group["coord"]),
+            str(group["coord"]),
+        )
+        if result_rank == 1 and int(group["uncertain_count"]):
+            return (
+                result_rank,
+                -int(group["top_priority_score"]),
+                -int(group["total_priority_score"]),
+                -int(group["uncertain_count"]),
+                int(group["best_severity_rank"]),
+                -int(group["relationship_count"]),
+                *stable_tail,
+            )
+        return (
+            result_rank,
+            int(group["best_severity_rank"]),
+            -int(group["relationship_count"]),
+            -len(group["rows"]),
+            -int(group["top_priority_score"]),
+            -int(group["total_priority_score"]),
+            *stable_tail,
+        )
+
+    dependency_groups.sort(key=dependency_group_sort_key)
+    return [
+        (group["coord"], group["rows"])
+        for group in dependency_groups
     ]
 
 
@@ -8542,10 +8883,9 @@ def write_full_dependency_analysis_artifact(
             ),
             "",
             (
-                "确认影响、未确认影响和确认不受 API 调用影响的依赖"
-                "按该顺序合并在同一张表中；同类结果按调用关系数量"
-                "从多到少排列。“API 分析”中的链接指向该依赖的"
-                "完整 API 结果。"
+                "依赖先按影响结论、严重级别、uncertain 最高优先分和"
+                "总优先分排序，再比较调用关系数量；“API 分析”中的"
+                "链接指向该依赖的完整 API 结果。"
             ),
             "",
             *_dependency_completed_table(
@@ -8648,9 +8988,9 @@ def write_full_api_analysis_artifact(
         lines.extend([
             (
                 f"以下 {api_model['completed_count']} 个已完成分析的 API "
-                "按依赖展示；每个依赖内按确认影响、未确认影响、"
-                "确认不受影响排列，同类结果按调用关系数量从多到少"
-                "排列。"
+                "按依赖影响程度展示；依赖之间先比较最强结论、严重级别"
+                "和 uncertain 优先分数，每个依赖内再按结论类型及 API "
+                "复核优先分数排列。"
             ),
             "",
         ])

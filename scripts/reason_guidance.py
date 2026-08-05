@@ -712,6 +712,9 @@ def build_diagnostic_guidance(
             failure.get("collector") or failure.get("stage")
             for failure in failures
         ])
+        evidence_files = _unique([
+            failure.get("evidence_file") for failure in failures
+        ])
         detail_summaries = _unique([
             _detail_summary(failure.get("detail")) for failure in failures
         ], limit=3)
@@ -772,6 +775,8 @@ def build_diagnostic_guidance(
             "affected_classes": classes,
             "affected_artifacts": artifacts,
             "affected_artifact_entries": artifact_entries,
+            "evidence_file": evidence_files[0] if evidence_files else "",
+            "evidence_files": evidence_files,
             "candidate_evidence": candidate_evidence,
             "sample_apis": _unique(
                 (_api_identity(item) for item in potentially_affected_items),
@@ -832,6 +837,8 @@ def build_catalog_guidance(
             "affected_classes": [],
             "affected_artifacts": [],
             "affected_artifact_entries": [],
+            "evidence_file": "",
+            "evidence_files": [],
             "candidate_evidence": [],
             "sample_apis": [],
             "failure_detail_summaries": [],

@@ -11,11 +11,14 @@ from __future__ import annotations
 import json
 import os
 import time
+import csv
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
+from itertools import islice
 from pathlib import Path
 
 from diagnostic_contract import canonical_reason_code, normalize_diagnostic_payload
+from csv_io import open_csv_write
 from pipeline_constants import STEP5_PROGRESS_FILE
 from progress_logging import emit_progress
 
@@ -24,16 +27,89 @@ STEP5_DIAGNOSTICS_SCHEMA = "java-upgrade-analyzer.step5-diagnostics.v1"
 STEP5_PROGRESS_SCHEMA = "java-upgrade-analyzer.step5-progress.v1"
 _SAMPLE_LIMIT = 5
 _PROGRESS_FLUSH_INTERVAL_SECONDS = 1.0
+BYTECODE_UNRESOLVED_EVIDENCE_FILE = "evidence/call_chain/bytecode_unresolved.csv"
+BYTECODE_UNRESOLVED_FIELDS = (
+    "collector",
+    "reason_code",
+    "caller_class",
+    "caller_method",
+    "caller_symbol",
+    "caller_qualified_key",
+    "instruction_offset",
+    "unresolved_owner",
+    "unresolved_method",
+    "unresolved_signature",
+    "unresolved_symbol",
+    "instruction_reference",
+    "artifact",
+    "artifact_entry",
+    "source_line",
+    "detail",
+)
+
+
+def _split_java_symbol(value):
+    symbol = str(value or "").strip()
+    if not symbol:
+        return "", "", ""
+    head, separator, signature_tail = symbol.partition("(")
+    signature = "(" + signature_tail if separator else ""
+    if "." not in head:
+        return "", head, signature
+    owner, member = head.rsplit(".", 1)
+    return owner, member, signature
+
+
+def _caller_method(occurrence):
+    caller_symbol = str(getattr(occurrence, "caller_symbol", "") or "").strip()
+    caller_class = str(getattr(occurrence, "class_name", "") or "").strip()
+    head = caller_symbol.split("(", 1)[0]
+    if caller_class and head.startswith(caller_class + "."):
+        return head[len(caller_class) + 1:]
+    return head.rsplit(".", 1)[-1] if head else ""
+
+
+def _instruction_reference(failure, occurrence):
+    target_owner, target_method, target_signature = _split_java_symbol(
+        getattr(failure, "api_identity", "")
+    )
+    caller_class = str(getattr(occurrence, "class_name", "") or "").strip()
+    if not caller_class:
+        caller_class, _member, _signature = _split_java_symbol(
+            getattr(occurrence, "caller_symbol", "")
+        )
+    offset = getattr(occurrence, "instruction_offset", -1)
+    offset_text = str(offset) if isinstance(offset, int) and offset >= 0 else "?"
+    caller_method = _caller_method(occurrence) or "?"
+    target = ".".join(
+        value for value in (target_owner, target_method) if value
+    ) or str(getattr(failure, "api_identity", "") or "?")
+    return (
+        f"{caller_class or '?'}:{caller_method}:{offset_text} -> "
+        f"{target}{target_signature}"
+    )
 
 
 def _failure_sample(failure):
-    return {
+    sample = {
         "stage": str(getattr(failure, "stage", "") or ""),
         "artifact": str(getattr(failure, "artifact", "") or ""),
         "class_name": str(getattr(failure, "class_name", "") or ""),
         "api_identity": str(getattr(failure, "api_identity", "") or ""),
         "detail": str(getattr(failure, "detail", "") or "")[:1000],
     }
+    occurrences = getattr(failure, "occurrences", ()) or ()
+    if occurrences:
+        sample_occurrences = (
+            occurrences[:_SAMPLE_LIMIT]
+            if hasattr(occurrences, "__getitem__")
+            else tuple(islice(occurrences, _SAMPLE_LIMIT))
+        )
+        sample["instruction_evidence"] = [
+            _instruction_reference(failure, occurrence)
+            for occurrence in sample_occurrences
+        ]
+    return sample
 
 
 class Step5DiagnosticRecorder:
@@ -57,6 +133,12 @@ class Step5DiagnosticRecorder:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if reset:
             self.path.write_text("", encoding="utf-8")
+            try:
+                (self.report_dir / BYTECODE_UNRESOLVED_EVIDENCE_FILE).unlink(
+                    missing_ok=True
+                )
+            except OSError:
+                pass
             try:
                 self.progress_path.unlink(missing_ok=True)
             except OSError:
@@ -162,6 +244,7 @@ class Step5DiagnosticRecorder:
         occurrence_count=0,
         collectors=(),
         samples=(),
+        evidence_file="",
         current=None,
         total=None,
     ):
@@ -184,6 +267,7 @@ class Step5DiagnosticRecorder:
                     if str(value or "").strip()
                 }),
                 "samples": list(samples or ())[:_SAMPLE_LIMIT],
+                "evidence_file": str(evidence_file or ""),
                 "current": current,
                 "total": total,
             },
@@ -211,20 +295,135 @@ class Step5DiagnosticRecorder:
         )
         return payload
 
-    def record_collector_failures(self, phase, collector_batches):
+    def _write_bytecode_unresolved_evidence(self, failures):
+        ordered_failures = sorted(
+            (
+                (collector, failure)
+                for collector, failure in failures
+                if getattr(failure, "occurrences", ())
+            ),
+            key=lambda item: (
+                str(item[0] or ""),
+                str(getattr(item[1], "api_identity", "") or ""),
+                str(getattr(item[1], "artifact", "") or ""),
+            ),
+        )
+        if not ordered_failures:
+            return ""
+        path = self.report_dir / BYTECODE_UNRESOLVED_EVIDENCE_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = path.with_name(
+            f".{path.name}.{os.getpid()}.tmp"
+        )
+        try:
+            with open_csv_write(temporary_path) as handle:
+                writer = csv.DictWriter(handle, fieldnames=BYTECODE_UNRESOLVED_FIELDS)
+                writer.writeheader()
+                # EvidenceFailure already de-duplicates and sorts its immutable
+                # occurrence tuple.  Stream rows directly so a 100k-instruction
+                # ledger does not create a second object graph during reporting.
+                for collector, failure in ordered_failures:
+                    target_owner, target_method, target_signature = (
+                        _split_java_symbol(
+                            getattr(failure, "api_identity", "")
+                        )
+                    )
+                    for occurrence in getattr(
+                        failure, "occurrences", ()
+                    ) or ():
+                        offset = getattr(
+                            occurrence, "instruction_offset", -1
+                        )
+                        writer.writerow({
+                            "collector": str(collector or ""),
+                            "reason_code": "BYTECODE_CALLER_UNRESOLVED",
+                            "caller_class": str(
+                                getattr(occurrence, "class_name", "") or ""
+                            ),
+                            "caller_method": _caller_method(occurrence),
+                            "caller_symbol": str(
+                                getattr(occurrence, "caller_symbol", "") or ""
+                            ),
+                            "caller_qualified_key": str(
+                                getattr(
+                                    occurrence, "caller_qualified_key", ""
+                                ) or ""
+                            ),
+                            "instruction_offset": (
+                                offset
+                                if isinstance(offset, int) and offset >= 0
+                                else ""
+                            ),
+                            "unresolved_owner": target_owner,
+                            "unresolved_method": target_method,
+                            "unresolved_signature": target_signature,
+                            "unresolved_symbol": str(
+                                getattr(failure, "api_identity", "") or ""
+                            ),
+                            "instruction_reference": _instruction_reference(
+                                failure, occurrence
+                            ),
+                            "artifact": str(
+                                getattr(occurrence, "artifact", "") or ""
+                            ),
+                            "artifact_entry": str(
+                                getattr(occurrence, "artifact_entry", "") or ""
+                            ),
+                            "source_line": getattr(
+                                occurrence, "line", 0
+                            ) or "",
+                            "detail": str(
+                                getattr(occurrence, "detail", "") or ""
+                            ),
+                        })
+            os.replace(temporary_path, path)
+        except (OSError, TypeError, ValueError):
+            return ""
+        finally:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return BYTECODE_UNRESOLVED_EVIDENCE_FILE
+
+    def record_failure_records(
+        self, phase, failure_records, *, reason_codes=None
+    ):
+        accepted_codes = {
+            canonical_reason_code(value)
+            for value in (reason_codes or ())
+            if str(value or "").strip()
+        }
         grouped = defaultdict(list)
-        for batch in collector_batches or ():
-            collector = str(getattr(batch, "collector", "") or "unknown")
-            for failure in getattr(batch, "failures", ()) or ():
-                key = (
-                    canonical_reason_code(getattr(failure, "reason_code", "")),
-                    bool(getattr(failure, "blocking", False)),
-                    str(getattr(failure, "scope", "") or "global"),
-                )
-                grouped[key].append((collector, failure))
+        normalized_records = []
+        for collector, failure in failure_records or ():
+            reason_code = canonical_reason_code(
+                getattr(failure, "reason_code", "")
+            )
+            if accepted_codes and reason_code not in accepted_codes:
+                continue
+            normalized_records.append((str(collector or "unknown"), failure))
+            key = (
+                reason_code,
+                bool(getattr(failure, "blocking", False)),
+                str(getattr(failure, "scope", "") or "global"),
+            )
+            grouped[key].append((str(collector or "unknown"), failure))
+
+        unresolved_evidence_file = self._write_bytecode_unresolved_evidence([
+            (collector, failure)
+            for collector, failure in normalized_records
+            if canonical_reason_code(getattr(failure, "reason_code", ""))
+            == "BYTECODE_CALLER_UNRESOLVED"
+        ])
 
         events = []
         for (reason_code, blocking, scope), failures in sorted(grouped.items()):
+            evidence_file = (
+                unresolved_evidence_file
+                if reason_code == "BYTECODE_CALLER_UNRESOLVED"
+                else ""
+            )
             occurrence_count = sum(
                 len(getattr(failure, "occurrences", ()) or ())
                 for _collector, failure in failures
@@ -238,12 +437,21 @@ class Step5DiagnosticRecorder:
                 failure_count=len(failures),
                 occurrence_count=occurrence_count,
                 collectors=[collector for collector, _failure in failures],
+                evidence_file=evidence_file,
                 samples=[
                     _failure_sample(failure)
                     for _collector, failure in failures[:_SAMPLE_LIMIT]
                 ],
             ))
         return events
+
+    def record_collector_failures(self, phase, collector_batches):
+        failure_records = []
+        for batch in collector_batches or ():
+            collector = str(getattr(batch, "collector", "") or "unknown")
+            for failure in getattr(batch, "failures", ()) or ():
+                failure_records.append((collector, failure))
+        return self.record_failure_records(phase, failure_records)
 
     def record_trace_result(self, result, current, total):
         self.record_trace_progress(current, total)
@@ -285,5 +493,6 @@ class Step5DiagnosticRecorder:
 __all__ = [
     "STEP5_DIAGNOSTICS_SCHEMA",
     "STEP5_PROGRESS_SCHEMA",
+    "BYTECODE_UNRESOLVED_EVIDENCE_FILE",
     "Step5DiagnosticRecorder",
 ]

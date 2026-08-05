@@ -8,10 +8,12 @@ import os
 import re
 import shlex
 import shutil
+import subprocess
 import sys
 import threading
 import time
 import traceback
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -78,6 +80,14 @@ CHECKPOINT_RULES_FILE = SKILL_DIR / "CHECKPOINT_RULES.md"
 EXIT_AWAITING_USER = 4
 EXIT_INTERRUPTED = 130
 MAIN_STATE_FILE_NAME = "main_state.json"
+LAST_STEP_SUMMARY_FILE_NAME = "last_step_summary.json"
+RESUME_CONTEXT_FILE_NAME = "resume_context.md"
+LAST_STEP_SUMMARY_SCHEMA = "java-upgrade-analyzer.last-step-summary.v1"
+BACKGROUND_RUNTIME_DIRNAME = "background"
+BACKGROUND_STATUS_FILE_NAME = "status.json"
+BACKGROUND_CHILD_ENV = "JUA_BACKGROUND_CHILD"
+BACKGROUND_RUN_ID_ENV = "JUA_BACKGROUND_RUN_ID"
+BACKGROUND_STATUS_PATH_ENV = "JUA_BACKGROUND_STATUS_PATH"
 TERMINAL_WORKFLOW_STATUSES = {"completed", "completed_with_limits"}
 USER_TASK_NAMES = {
     "step1": "分析对象与依赖范围",
@@ -86,6 +96,14 @@ USER_TASK_NAMES = {
     "step4": "依赖 API 变化",
     "step5": "系统触达证据",
     "step6": "分析报告",
+}
+STEP_COMPLETION_DESCRIPTIONS = {
+    "step1": "已固定分析对象、目标模块和最终制品依赖范围。",
+    "step2": "已整理升级前后版本、源码范围和依赖上下文。",
+    "step3": "已完成 JDK、Spring Boot 与依赖兼容性线索扫描。",
+    "step4": "已生成依赖级 API 变化清单和比较证据。",
+    "step5": "已生成系统触达结论、逐链路台账和诊断证据。",
+    "step6": "已生成最终报告、完整明细和结论边界。",
 }
 USER_ACTION_LABELS = {
     "continue": "接受当前结果并继续",
@@ -228,6 +246,14 @@ def runtime_observability_dir(report_dir):
     return runtime_dir(report_dir) / RUNTIME_OBSERVABILITY_DIRNAME
 
 
+def runtime_background_dir(report_dir):
+    return runtime_dir(report_dir) / BACKGROUND_RUNTIME_DIRNAME
+
+
+def background_status_path(report_dir):
+    return runtime_background_dir(report_dir) / BACKGROUND_STATUS_FILE_NAME
+
+
 def step1_dep_changes_path(report_dir):
     return evidence_dependencies_dir(report_dir) / "dep_changes.csv"
 
@@ -307,7 +333,7 @@ def artifact_path(report_dir, rel_path):
 
 
 def read_json(path):
-    with open_text(path) as f:
+    with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -318,10 +344,486 @@ def write_json(path, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+def _write_background_json(path, data):
+    """Atomically publish launcher state while parent and child may both update it."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(
+        f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        with open(temp_path, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+        os.replace(temp_path, path)
+    finally:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _read_background_json(path):
+    try:
+        payload = read_json(path)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _windows_pid_is_running(pid):
+    """Check a Windows process handle without sending a signal to that process."""
+    try:
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        open_process.restype = ctypes.c_void_p
+        wait_for_single_object = kernel32.WaitForSingleObject
+        wait_for_single_object.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        wait_for_single_object.restype = ctypes.c_uint32
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [ctypes.c_void_p]
+        close_handle.restype = ctypes.c_int
+        handle = open_process(0x00100000, False, int(pid))  # SYNCHRONIZE
+        if not handle:
+            return False
+        try:
+            return wait_for_single_object(handle, 0) == 0x00000102  # WAIT_TIMEOUT
+        finally:
+            close_handle(handle)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
+
+
+def _pid_is_running(pid, platform_name=None):
+    try:
+        normalized = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if normalized <= 0:
+        return False
+    if str(platform_name or os.name) == "nt":
+        return _windows_pid_is_running(normalized)
+    try:
+        os.kill(normalized, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _background_record_is_live(payload):
+    status = str((payload or {}).get("status") or "").strip()
+    if status not in {"starting", "running"}:
+        return False
+    tracked_pid = (payload or {}).get("pid") or (payload or {}).get("launcher_pid")
+    return _pid_is_running(tracked_pid)
+
+
+def _background_platform_kwargs(platform_name=None):
+    platform_name = str(platform_name or os.name)
+    if platform_name == "nt":
+        # Values from the Windows CreateProcess API.  Referencing numeric
+        # constants also keeps this helper importable and testable on POSIX.
+        return {"creationflags": 0x00000200 | 0x00000008}
+    return {"start_new_session": True}
+
+
+def _background_exit_status(exit_code):
+    if exit_code == 0:
+        return "completed"
+    if exit_code == EXIT_AWAITING_USER:
+        return "awaiting_user"
+    if exit_code == EXIT_INTERRUPTED:
+        return "interrupted"
+    return "failed"
+
+
+def _without_background_flag(argv):
+    return [value for value in list(argv or []) if value != "--background"]
+
+
+def start_background_run(args, argv):
+    """Launch this orchestrator detached with an explicit foreground PATH snapshot."""
+    report_dir = Path(args.report_dir).expanduser().resolve()
+    project_dir = Path(args.project_dir).expanduser().resolve()
+    background_dir = runtime_background_dir(report_dir)
+    background_dir.mkdir(parents=True, exist_ok=True)
+    status_path = background_status_path(report_dir)
+    existing = _read_background_json(status_path)
+    if _background_record_is_live(existing):
+        raise StepError(
+            "已有后台分析任务正在运行："
+            f"pid={existing.get('pid') or existing.get('launcher_pid')}；"
+            f"状态文件：{status_path}"
+        )
+
+    run_id = (
+        datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        + "-"
+        + uuid.uuid4().hex[:12]
+    )
+    log_path = background_dir / "run.log"
+    environment_path = background_dir / "environment.json"
+    path_from_environment = str(os.environ.get("PATH") or "")
+    path_value = path_from_environment or os.defpath
+    environment_payload = {
+        "schema": "java-upgrade-analyzer.background-environment.v1",
+        "run_id": run_id,
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "python_executable": str(Path(sys.executable).resolve()),
+        "path": path_value,
+        "path_source": "current_process" if path_from_environment else "os.defpath_fallback",
+    }
+    _write_background_json(environment_path, environment_payload)
+
+    status_payload = {
+        "schema": "java-upgrade-analyzer.background-run.v1",
+        "run_id": run_id,
+        "status": "starting",
+        "step": str(args.step or ""),
+        "project_dir": str(project_dir),
+        "report_dir": str(report_dir),
+        "launcher_pid": os.getpid(),
+        "pid": None,
+        "exit_code": None,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "finished_at": None,
+        "environment_path": str(environment_path),
+        "log_path": str(log_path),
+    }
+    _write_background_json(status_path, status_payload)
+
+    child_argv = _without_background_flag(argv)
+    command = [sys.executable, str(Path(__file__).resolve()), *child_argv]
+    child_env = os.environ.copy()
+    child_env.update(
+        {
+            "PATH": path_value,
+            BACKGROUND_CHILD_ENV: "1",
+            BACKGROUND_RUN_ID_ENV: run_id,
+            BACKGROUND_STATUS_PATH_ENV: str(status_path),
+        }
+    )
+    try:
+        with open(log_path, "wb", buffering=0) as log_handle:
+            log_handle.write(
+                (
+                    f"[background] run_id={run_id} step={args.step} "
+                    f"started_at={status_payload['started_at']}\n"
+                ).encode("utf-8")
+            )
+            process = subprocess.Popen(
+                command,
+                cwd=str(Path.cwd()),
+                stdin=subprocess.DEVNULL,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                env=child_env,
+                close_fds=True,
+                **_background_platform_kwargs(),
+            )
+    except (OSError, ValueError) as exc:
+        status_payload.update(
+            {
+                "status": "failed",
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "launch_error": str(exc),
+            }
+        )
+        _write_background_json(status_path, status_payload)
+        raise StepError(f"后台任务启动失败：{exc}；状态文件：{status_path}") from exc
+
+    latest = _read_background_json(status_path)
+    if latest.get("run_id") == run_id:
+        latest["pid"] = int(process.pid)
+        if latest.get("status") == "starting":
+            latest["status"] = "running"
+        _write_background_json(status_path, latest)
+        status_payload = latest
+    print(f"后台分析已启动（pid={process.pid}）。", file=sys.stderr)
+    print(f"状态：{status_path}", file=sys.stderr)
+    print(f"日志：{log_path}", file=sys.stderr)
+    return status_payload
+
+
+def finish_background_run(exit_code):
+    status_value = str(os.environ.get(BACKGROUND_STATUS_PATH_ENV) or "").strip()
+    run_id = str(os.environ.get(BACKGROUND_RUN_ID_ENV) or "").strip()
+    if not status_value or not run_id:
+        return
+    status_path = Path(status_value)
+    payload = _read_background_json(status_path)
+    if payload.get("run_id") != run_id:
+        return
+    payload.update(
+        {
+            "status": _background_exit_status(exit_code),
+            "exit_code": int(exit_code),
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    _write_background_json(status_path, payload)
+
+
+def wait_for_background_parent():
+    """Let the launcher publish the child PID before the child can finish."""
+    status_value = str(os.environ.get(BACKGROUND_STATUS_PATH_ENV) or "").strip()
+    run_id = str(os.environ.get(BACKGROUND_RUN_ID_ENV) or "").strip()
+    if not status_value or not run_id:
+        return
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        payload = _read_background_json(status_value)
+        if payload.get("run_id") != run_id or payload.get("pid"):
+            return
+        time.sleep(0.01)
+
+
 def _write_text_file(path, text):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text.rstrip() + "\n", encoding="utf-8")
+
+
+def _write_text_file_atomic(path, text):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(
+        f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        with temporary_path.open(
+            "w", encoding="utf-8", newline="\n"
+        ) as handle:
+            handle.write(text.rstrip() + "\n")
+        os.replace(temporary_path, path)
+    finally:
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _resume_single_line(value):
+    return " ".join(str(value or "").replace("`", "'").split())
+
+
+def _resume_display_path(path, report_dir):
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        candidate = Path(report_dir) / candidate
+    candidate = candidate.resolve()
+    try:
+        relative = candidate.relative_to(Path(report_dir).resolve())
+    except ValueError:
+        return str(candidate)
+    rendered = relative.as_posix()
+    return rendered + "/" if candidate.is_dir() else rendered
+
+
+def _resume_output_paths(step_id, report_dir, interaction=None):
+    candidates = list(step_output_paths_for_cleanup(step_id, report_dir))
+    for value in (interaction or {}).get("files_to_review") or []:
+        candidate = Path(str(value or ""))
+        if not candidate.is_absolute():
+            candidate = Path(report_dir) / candidate
+        candidates.append(candidate)
+    outputs = []
+    for candidate in candidates:
+        try:
+            if not Path(candidate).exists():
+                continue
+            rendered = _resume_display_path(candidate, report_dir)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if rendered not in outputs:
+            outputs.append(rendered)
+    return outputs[:24]
+
+
+def _resume_event_description(step_id, event, error=""):
+    task_name = USER_TASK_NAMES.get(step_id, step_id or "当前任务")
+    if event in {"step_completed", "step_completed_awaiting_user"}:
+        return STEP_COMPLETION_DESCRIPTIONS.get(
+            step_id, f"{task_name}已完成。"
+        )
+    if event == "awaiting_user_input":
+        return f"{task_name}尚未完成，当前缺少继续分析所需的用户输入。"
+    if event == "step_failed":
+        detail = _resume_single_line(error)
+        return f"{task_name}未完成。" + (f"原因：{detail}" if detail else "")
+    if event == "paused_by_user":
+        return f"{task_name}已安全暂停，已完成步骤的正式产物保持不变。"
+    return f"{task_name}状态已更新。"
+
+
+def _resume_next_action(state_view, event, interaction=None):
+    current_step = str(state_view.get("current_step") or "").strip()
+    if event in {"step_completed_awaiting_user", "awaiting_user_input"}:
+        question = _resume_single_line(
+            (interaction or {}).get("question")
+            or (interaction or {}).get("title")
+            or state_view.get("blocking_reason")
+        )
+        return (
+            "等待用户答复当前确认项。" + (f"问题：{question}" if question else "")
+        )
+    if event == "step_failed":
+        return "阻塞条件恢复后重新运行当前任务；不要重复已完成步骤。"
+    if event == "paused_by_user":
+        return "再次运行时从当前任务安全重试。"
+    if current_step == "done":
+        return "流程已结束；查看最终报告及其结论限制。"
+    return f"继续执行{USER_TASK_NAMES.get(current_step, current_step or '下一任务')}。"
+
+
+def write_resume_snapshot(
+    main_state,
+    step_id,
+    report_dir,
+    *,
+    event,
+    interaction=None,
+    completion_summary=None,
+    error="",
+):
+    """Publish a bounded cross-session index after every durable state change."""
+    report_dir = Path(report_dir).resolve()
+    state_view = dict((main_state or {}).get("state") or {})
+    needs_user_input = event in {
+        "step_completed_awaiting_user",
+        "awaiting_user_input",
+    }
+    completed = event in {
+        "step_completed",
+        "step_completed_awaiting_user",
+    }
+    current_step = str(state_view.get("current_step") or "").strip()
+    what_was_done = _resume_event_description(step_id, event, error=error)
+    next_action = _resume_next_action(
+        state_view, event, interaction=interaction
+    )
+    outputs = _resume_output_paths(
+        step_id, report_dir, interaction=interaction
+    )
+    question = _resume_single_line(
+        (interaction or {}).get("question")
+        or (interaction or {}).get("title")
+        or ""
+    )
+    payload = {
+        "schema": LAST_STEP_SUMMARY_SCHEMA,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "event": event,
+        "last_step": {
+            "step_id": step_id,
+            "step_name": USER_TASK_NAMES.get(step_id, step_id),
+            "completed": completed,
+            "summary": what_was_done,
+        },
+        "workflow_state": {
+            "status": str(state_view.get("status") or ""),
+            "current_step": current_step,
+            "current_step_name": USER_TASK_NAMES.get(
+                current_step, "分析已结束" if current_step == "done" else current_step
+            ),
+            "completed_step": str(state_view.get("completed_step") or ""),
+            "blocking_reason_codes": list(
+                state_view.get("blocking_reason_codes") or []
+            ),
+        },
+        "needs_user_input": needs_user_input,
+        "outputs": outputs,
+        "next_action": next_action,
+        "user_input": ({
+            "question": question,
+            "reason_code": str(
+                (interaction or {}).get("reason_code") or ""
+            ),
+            "interaction_file": ".runtime/state/interaction.json",
+        } if needs_user_input else None),
+        "completion_summary": dict(completion_summary or {}),
+        "state_files": {
+            "main_state": ".runtime/state/main_state.json",
+            "last_step_summary": ".runtime/state/last_step_summary.json",
+            "resume_context": ".runtime/state/resume_context.md",
+        },
+    }
+
+    direct_status = (
+        f"{what_was_done} {'需要用户输入。' if needs_user_input else next_action}"
+    )
+    markdown = [
+        "# 分析恢复上下文",
+        "",
+        f"> 生成时间：{payload['generated_at']}",
+        "",
+        "## 可直接转述的状态",
+        "",
+        direct_status,
+        "",
+        "## 当前状态",
+        "",
+        f"- 最近事件：`{event}`",
+        f"- 上一步：{USER_TASK_NAMES.get(step_id, step_id)}",
+        f"- 当前任务：{payload['workflow_state']['current_step_name']}",
+        f"- 是否需要用户输入：{'是' if needs_user_input else '否'}",
+        "",
+        "## 上一步做了什么",
+        "",
+        what_was_done,
+        "",
+        "## 产出位置",
+        "",
+    ]
+    if outputs:
+        markdown.extend(f"- `{value}`" for value in outputs)
+    else:
+        markdown.append("- 当前事件没有新增可列出的正式产物。")
+    markdown.extend([
+        "",
+        "## 下一步",
+        "",
+        next_action,
+        "",
+    ])
+    if needs_user_input:
+        markdown.extend([
+            "## 需要用户输入",
+            "",
+            question or "请读取 interaction.json 中的当前确认项。",
+            "",
+            "结构化交互详情：`.runtime/state/interaction.json`",
+            "",
+        ])
+    limitations = list((completion_summary or {}).get("limitations") or [])
+    if limitations:
+        markdown.extend([
+            "## 结论限制",
+            "",
+            *[f"- {_resume_single_line(value)}" for value in limitations],
+            "",
+        ])
+    markdown.extend([
+        "## 状态源",
+        "",
+        "- 快速进度：`.runtime/state/last_step_summary.json`",
+        "- 完整状态真相源：`.runtime/state/main_state.json`",
+        "",
+    ])
+    try:
+        _write_text_file_atomic(resume_context_path(report_dir), "\n".join(markdown))
+        _write_background_json(last_step_summary_path(report_dir), payload)
+    except (OSError, TypeError, ValueError):
+        # The canonical main_state was already persisted.  A convenience
+        # snapshot must never convert a successful analysis step into failure.
+        return {}
+    return payload
 
 
 def _resume_boundary_lines(current_step, completed_step):
@@ -753,6 +1255,14 @@ CHECKPOINT_RULES = load_checkpoint_rules()
 
 def main_state_path(report_dir):
     return runtime_state_dir(report_dir) / MAIN_STATE_FILE_NAME
+
+
+def last_step_summary_path(report_dir):
+    return runtime_state_dir(report_dir) / LAST_STEP_SUMMARY_FILE_NAME
+
+
+def resume_context_path(report_dir):
+    return runtime_state_dir(report_dir) / RESUME_CONTEXT_FILE_NAME
 
 
 def empty_step_state():
@@ -7330,11 +7840,11 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
         checklist_lines.extend(
             [
                 "调用链结论摘要：",
-                f"  - 已确认影响={user_conclusion_summary.get('已确认影响', call_summary.get('reachable', 0))}",
-                f"  - 可能影响={user_conclusion_summary.get('可能影响', 0)}",
-                f"  - 已确认不受影响={user_conclusion_summary.get('已确认不受影响', call_summary.get('not_impacted', 0))}",
-                f"  - 需人工复核={user_conclusion_summary.get('当前无法确认', 0)}",
-                f"  - 缺少依赖源码/构建产物={user_conclusion_summary.get('需要补充输入', 0)}",
+                f"  - 已确认影响={user_conclusion_summary.get('confirmed_impact', call_summary.get('reachable', 0))}",
+                f"  - 可能影响={user_conclusion_summary.get('probable_impact', 0)}",
+                f"  - 已确认不受影响={user_conclusion_summary.get('confirmed_no_impact', call_summary.get('not_impacted', 0))}",
+                f"  - 需人工复核={user_conclusion_summary.get('inconclusive', 0)}",
+                f"  - 缺少依赖源码/构建产物={user_conclusion_summary.get('input_required', 0)}",
                 f"  - 已提供依赖源码目录={len(dependency_source_dirs)} 个",
                 "覆盖缺口（可能与上面的结论重叠，不要相加）：",
                 f"  - 本次未完成分析={len(not_analyzed_apis)}",
@@ -8696,6 +9206,13 @@ def maybe_emit_step1_preflight_interaction(step_id, main_state, report_dir, pref
     )
     save_main_state(report_dir, main_state)
     save_interaction_file(report_dir, preflight_interaction)
+    write_resume_snapshot(
+        main_state,
+        step_id,
+        report_dir,
+        event="awaiting_user_input",
+        interaction=preflight_interaction,
+    )
     print_interaction_to_streams(preflight_interaction, report_dir)
     print(f"{USER_TASK_NAMES.get(step_id, '当前分析')}需要先补齐上面的信息。", file=sys.stderr)
     return EXIT_AWAITING_USER
@@ -8721,6 +9238,13 @@ def persist_step_interaction(main_state, step_id, report_dir, run_context, inter
     save_main_state(report_dir, main_state)
     write_coverage_report(runtime_coverage_dir(report_dir), project_scope=run_context.get("project_scope"))
     save_interaction_file(report_dir, interaction)
+    write_resume_snapshot(
+        main_state,
+        step_id,
+        report_dir,
+        event="step_completed_awaiting_user",
+        interaction=interaction,
+    )
     return interaction
 
 
@@ -8933,6 +9457,13 @@ def persist_completed_step(main_state, step_id, report_dir, run_context):
     save_main_state(report_dir, main_state)
     write_coverage_report(runtime_coverage_dir(report_dir), project_scope=run_context.get("project_scope"))
     clear_interaction_file(report_dir)
+    write_resume_snapshot(
+        main_state,
+        step_id,
+        report_dir,
+        event="step_completed",
+        completion_summary=completion_summary,
+    )
     return completion_summary
 
 
@@ -8989,6 +9520,13 @@ def persist_interaction_required_error(main_state, step_id, report_dir, interact
     )
     save_main_state(report_dir, main_state)
     save_interaction_file(report_dir, interaction)
+    write_resume_snapshot(
+        main_state,
+        step_id,
+        report_dir,
+        event="awaiting_user_input",
+        interaction=interaction,
+    )
     return interaction
 
 
@@ -9004,6 +9542,13 @@ def persist_step_error(main_state, step_id, report_dir, exc):
     )
     save_main_state(report_dir, main_state)
     clear_interaction_file(report_dir)
+    write_resume_snapshot(
+        main_state,
+        step_id,
+        report_dir,
+        event="step_failed",
+        error=str(exc),
+    )
 
 
 def persist_user_interrupt(main_state, step_id, report_dir):
@@ -9023,6 +9568,12 @@ def persist_user_interrupt(main_state, step_id, report_dir):
     )
     save_main_state(report_dir, main_state)
     clear_interaction_file(report_dir)
+    write_resume_snapshot(
+        main_state,
+        step_id,
+        report_dir,
+        event="paused_by_user",
+    )
 
 
 def refresh_step2_outputs(report_dir, project_dir, run_context):
@@ -9356,6 +9907,7 @@ def execute_step(step_id, args, manifest_steps, run_context, main_state=None):
 
 
 def main(argv=None, _skip_environment_contract=False):
+    argv_values = list(sys.argv[1:] if argv is None else argv)
     ap = argparse.ArgumentParser(description="统一执行 Java 升级分析的单个 Step")
     ap.add_argument("--step", choices=STEP_SEQUENCE + ["auto"])
     ap.add_argument("--project-dir", default=".")
@@ -9400,11 +9952,16 @@ def main(argv=None, _skip_environment_contract=False):
     ap.add_argument("--response-json", default="", help="结构化用户答复 JSON，例如 '{\"action\":\"continue\"}'")
     ap.add_argument("--response-file", default="", help="结构化用户答复 JSON 文件路径")
     ap.add_argument(
+        "--background",
+        action="store_true",
+        help="由调度器跨平台后台运行，并把 PATH 快照、状态和日志写入 .runtime/background/。",
+    )
+    ap.add_argument(
         "--describe-step1-contract",
         action="store_true",
         help="输出 Step1 的静态前置输入协议（JSON），供 Agent 在首次调用前读取。",
     )
-    args = ap.parse_args(argv)
+    args = ap.parse_args(argv_values)
     args.modules = _dedupe_strings(flatten_cli_values(args.modules)) if args.modules else None
     args.active_maven_profiles = _dedupe_strings(
         args.active_maven_profiles or []
@@ -9435,6 +9992,10 @@ def main(argv=None, _skip_environment_contract=False):
     if not project_dir.is_dir():
         print(f"❌ 项目目录不存在：{project_dir}", file=sys.stderr)
         return 1
+
+    if args.background:
+        start_background_run(args, argv_values)
+        return 0
 
     seed_payload = load_seed_json_arg(args.seed_json, project_dir)
     report_dir = Path(args.report_dir).resolve()
@@ -9667,16 +10228,18 @@ def _record_unexpected_cli_error(exc, argv=None):
 
 def cli_main(argv=None):
     """Keep implementation failures out of the user-facing terminal channel."""
+    exit_code = 1
+    wait_for_background_parent()
     try:
-        return main(argv)
+        exit_code = main(argv)
     except StepError as exc:
         reason = _humanize_interaction_text(str(exc)).strip()
         print(f"分析未能继续：{reason or '当前输入或状态不完整。'}", file=sys.stderr)
         print("已有正式产物保持不变；条件修正后重新运行即可。", file=sys.stderr)
-        return 1
+        exit_code = 1
     except KeyboardInterrupt:
         print("\n运行已停止。再次运行时会先检查已有证据完整性。", file=sys.stderr)
-        return EXIT_INTERRUPTED
+        exit_code = EXIT_INTERRUPTED
     except Exception as exc:
         diagnostic_path = _record_unexpected_cli_error(exc, argv=argv)
         print("系统未能完成当前操作，已停止以避免生成不完整结论。", file=sys.stderr)
@@ -9684,7 +10247,10 @@ def cli_main(argv=None):
             print(f"诊断已记录：{diagnostic_path}", file=sys.stderr)
         else:
             print("当前无法写入诊断文件；已有正式产物保持不变。", file=sys.stderr)
-        return 1
+        exit_code = 1
+    finally:
+        finish_background_run(exit_code)
+    return exit_code
 
 
 if __name__ == "__main__":

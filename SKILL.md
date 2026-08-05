@@ -16,14 +16,14 @@ description: "Java 升级兼容性分析。用户提到 JDK、Spring Boot、Spri
 允许做的事：
 
 1. 执行 `scripts/run_step.py`、门控脚本和只读检查命令
-2. 读取 `.upgrade-report/.runtime/state/main_state.json`、`.upgrade-report/.runtime/state/interaction.json` 与本阶段产物
+2. 新会话先读取 `.upgrade-report/.runtime/state/last_step_summary.json` 和 `.upgrade-report/.runtime/state/resume_context.md` 快速汇报进度，再以 `.upgrade-report/.runtime/state/main_state.json` 核实完整状态；待交互时继续读取 `.upgrade-report/.runtime/state/interaction.json`
 3. 将 `interaction.json` 转成用户可读的决策卡片：当前需要确认什么、为什么停下、推荐默认动作、可选动作、候选对象、完整候选文件、用户可直接回复什么；内部字段只用于恢复命令构造
 4. 把用户的真实答复整理成结构化 `intent_patch`，再通过 `--response-json` 或 `--response-file` 传回下一条恢复命令
 
 首次调用 `step1` 前，必须先读取静态前置协议，而不是先试跑：
 
 ```bash
-python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --describe-step1-contract
+python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --describe-step1-contract
 ```
 
 这份 JSON 协议用于让 Claude Code 在首轮就知道：
@@ -86,14 +86,18 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --describe-step1-contract
    - `completed` 表示流程已完成且没有记录结论限制；展示完成摘要和交付物路径后即可收尾，不生成 `interaction.json`。
    - `completed_with_limits` 表示流程已完成且交付物可读，但结论受分析范围或证据缺口限制；必须展示完整限制清单、适用范围和交付物路径后收尾，不生成强制确认。只有用户明确要求扩大范围、补充证据或重跑时，才按其选择恢复流程。
 9. **关键工具必须可用**：JApiCmp 与 tree-sitter 是 Java 升级分析的准确性前提。tree-sitter 必须按固定清单显式 bootstrap，运行时不联网安装；安装、版本或加载检查失败时记录 `blocked_by_system` 并停止，不生成用户确认项。不得使用 `allow_degraded=true` 绕过 JApiCmp 二进制对比或 tree-sitter Java AST 分析。
-10. **CSV 编码统一**：所有 CSV 产物统一使用 UTF-8 BOM；程序读取时同时兼容带 BOM 与历史无 BOM 的 UTF-8 文件，保证 Excel 直接打开中文不乱码。
+10. **CSV 编码统一**：所有 CSV 产物统一使用 UTF-8 BOM，程序按 UTF-8 BOM 口径读取，保证 Windows Excel 直接打开中文不乱码。
 11. **准确性双线验证**：真实项目验证必须并行生成分析器结果与独立 Oracle 结果，只共享同一最终制品、API 身份协议和运行输入，不得复用分析器的解析、筛选或结论实现。必须逐 API 闭集对账；缺失、重复、额外、冲突、错误结论或无法绑定本次最终制品的 Oracle 均不得标记为已验证。接入新项目只增加数据输入和独立证据，不得在生产代码中登记项目、坐标或类名特例。失效的辅助证据必须报告，但不能推翻同一 API 已存在的有效强证据。
+12. **JSON 编码与字段契约**：所有 JSON 产物统一读写为 UTF-8 无 BOM；字段名使用英文 `lower_snake_case`，中文说明只放在 value 中。不兼容带 BOM 或中文字段名的历史 JSON，旧产物必须重新生成。CSV 仍统一使用 UTF-8 BOM，保证 Windows Excel 直接打开中文不乱码。
 
 ## 执行模式
 
 把整个任务当成**状态机**，一次只推进一个 Step：
 
 ```text
+last_step_summary = read(.upgrade-report/.runtime/state/last_step_summary.json if exists)
+resume_context = read(.upgrade-report/.runtime/state/resume_context.md if exists)
+先用上述两个轻量文件汇报“做到哪、产出在哪、下一步是什么、是否需要用户输入”
 main_state = read(.upgrade-report/.runtime/state/main_state.json if exists)
 
 if main_state.state.status startswith "awaiting_":
@@ -108,7 +112,7 @@ if main_state.state.status startswith "awaiting_":
       - 完整候选或证据文件
       - 用户可直接回复的自然语言示例
     等待用户答复
-    run("python3 .../run_step.py --step auto --response-json '<intent_patch JSON>'")
+    run("python .../run_step.py --step auto --response-json '<intent_patch JSON>'")
     停止
 
 step = resolve_next_step(main_state)
@@ -117,7 +121,7 @@ if step 输入不足:
     向用户索取缺失输入
     停止
 
-run("python3 .../run_step.py --step <step>")
+run("python .../run_step.py --step <step>")
 
 if main_state.state.status startswith "awaiting_":
     回到上面的 CHECKPOINT 处理分支
@@ -172,10 +176,10 @@ Step5 必须使用 `tree-sitter` 做 Java AST 分析。分析器自身的正式�
 首次准备环境时，在 Skill 根目录使用任一受支持的 CPython 3.12–3.14 执行显式 bootstrap：
 
 ```bash
-python3 scripts/bootstrap_runtime.py
+python scripts/bootstrap_runtime.py
 ```
 
-离线环境使用 `python3 scripts/bootstrap_runtime.py --wheel-dir /abs/path/to/wheels`，该模式带 `--no-index`，只读取受控缓存。用户安装完成后恢复 checkpoint 时，应将自然语言“已安装，重跑 Step5”归一化为 `action=rerun_current_step` 与 `tree_sitter_installed=true`。
+离线环境使用 `python scripts/bootstrap_runtime.py --wheel-dir /abs/path/to/wheels`，该模式带 `--no-index`，只读取受控缓存。用户安装完成后恢复 checkpoint 时，应将自然语言“已安装，重跑 Step5”归一化为 `action=rerun_current_step` 与 `tree_sitter_installed=true`。
 
 首次进入任务时，先确认：
 
@@ -221,30 +225,41 @@ python3 scripts/bootstrap_runtime.py
 ```
 
 ```bash
-python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
+python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
   --seed-json /abs/path/to/seed.json
 ```
 
-如果 `.upgrade-report/.runtime/state/main_state.json` 已存在，优先读取主状态，再决定从哪个 Step 恢复。
+如果 `.upgrade-report/.runtime/state/last_step_summary.json` 已存在，先读它和同目录的 `resume_context.md` 形成进度摘要，再读取 `main_state.json` 核实状态真相并决定从哪个 Step 恢复；不要重新扫描多个大日志来拼接进度。
 
 若需要执行单步，优先使用：
 
 ```bash
-python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step <step1|step2|step3|step4|step5|step6> \
+python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step <step1|step2|step3|step4|step5|step6> \
   --project-dir . \
   --report-dir .upgrade-report
 ```
 
-说明：本文件中的命令默认使用 `python3`（适配 macOS/Linux）；若当前环境以 `python` 作为解释器入口，可等价替换。
+说明：本文件中的命令统一使用 `python`，避免 Windows 的 `python3` 被 Microsoft Store 别名拦截。若环境只提供 Windows Python Launcher，可把命令开头等价替换为 `py -3`；macOS/Linux 若只提供 `python3`，可等价替换为 `python3`。
+
+Step5 预计耗时较长时，使用调度器内建后台模式，不要手写 `nohup` 或 `.runtime/run_step5.sh`：
+
+```bash
+python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step step5 \
+  --project-dir . \
+  --report-dir .upgrade-report \
+  --background
+```
+
+`--background` 会把启动时的 PATH 快照写入 `.upgrade-report/.runtime/background/`，并通过子进程 `env` 显式继承；实际解释器使用当前进程的 `sys.executable`，不再依赖 `python3` 命令解析。启动命令返回 `0` 只表示后台进程创建成功，不表示 Step5 已完成。必须继续读取 `.upgrade-report/.runtime/background/status.json`：`running` 表示仍在执行，`completed` 表示成功，`awaiting_user` 表示已经进入 checkpoint，`failed` / `interrupted` 表示终止；具体日志路径由该状态文件的 `log_path` 给出。后台任务未结束时不得继续 Step6，也不得把启动成功汇报为分析完成。
 
 ### 最小参数用法（推荐）
 
 Step1 必须显式提供一种输入方式；若两种方式都没给全，`run_step.py` 会先返回前置输入契约交互，而不是直接执行实际分析：
 
 ```bash
-python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step step1 \
+python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step step1 \
   --project-dir . \
   --report-dir .upgrade-report \
   --base-branch <base_branch> \
@@ -254,7 +269,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step step1 \
 或直接提供两侧编译产物：
 
 ```bash
-python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step step1 \
+python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step step1 \
   --project-dir . \
   --report-dir .upgrade-report \
   --base-artifact-path /abs/path/to/base-app.jar \
@@ -274,7 +289,7 @@ Gradle 文件锁冲突属于原命令的瞬时执行故障，不是 artifact inv
 若用户已明确只分析某个模块，第一次执行 `step1` 时必须直接带模块参数，不得先跑 root 范围：
 
 ```bash
-python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step step1 \
+python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step step1 \
   --project-dir . \
   --report-dir .upgrade-report \
   --base-branch <base_branch> \
@@ -288,7 +303,7 @@ Step2 应优先消费 Step1 已确认并写入主状态的 `base_branch/current_
 如果希望按主状态续跑，可使用：
 
 ```bash
-python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
+python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report
 ```
@@ -356,13 +371,13 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 
 ```bash
 # 用户确认当前范围可信
-python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
+python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
   --response-json '{"intent_patch":{"action":"continue","set":{}}}'
 
 # 用户要求只分析某个模块
-python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
+python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
   --response-json '{"intent_patch":{"action":"rerun_current_step","set":{"primary_module":"module-a","modules":["module-a"]}}}'
@@ -389,13 +404,13 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 
 ```bash
 # 用户确认上下文正确
-python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
+python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
   --response-json '{"intent_patch":{"action":"continue","set":{}}}'
 
 # 用户补充分支后再恢复
-python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
+python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
   --response-json '{"intent_patch":{"action":"continue","set":{"base_branch":"origin/main","current_branch":"feature/upgrade"}}}'
@@ -439,13 +454,13 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 
 ```bash
 # 全量分析
-python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
+python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
   --response-json '{"intent_patch":{"action":"continue","set":{"scope_mode":"full"}}}'
 
 # 部分分析：系统把用户回复的依赖名称/完整坐标转换成内部恢复字段。
-python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
+python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
   --response-json '{"intent_patch":{"action":"continue","set":{"scope_mode":"partial","selected_targets":["com.example:legacy-lib"]}}}'
@@ -534,29 +549,29 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 
 ## 恢复与压缩
 
-默认由 `run_step.py` 自动保存主状态。若步骤执行后进入待交互状态，还会额外生成 `.upgrade-report/.runtime/state/interaction.json`，并以退出码 `4` 结束当前命令，供 Claude Code 读取并转成用户对话。若需要手动保存压缩摘要，执行：
+默认由 `run_step.py` 自动保存主状态。每个 Step 完成后都会原子更新 `.upgrade-report/.runtime/state/last_step_summary.json` 和 `.upgrade-report/.runtime/state/resume_context.md`；前者供程序快速判断进度，后者可直接向用户转述“上一步做了什么、产出在哪、下一步做什么、是否需要输入”。若步骤执行后进入待交互状态，还会额外生成 `.upgrade-report/.runtime/state/interaction.json`，并以退出码 `4` 结束当前命令。若需要手动保存额外的压缩归档，执行：
 
 长任务必须通过用户语言的定期心跳表明进程仍在运行，只有存在可靠已完成/总量时才显示预计剩余时间。用户按 `Ctrl-C` 时必须终止当前子进程、清理当前步骤的半成品并保留之前的正式产物与当前输入；退出码为 `130`，再次运行 `--step auto` 从当前任务安全重试。
 
 ```bash
 export PYTHONUTF8=1
-python3 "${CLAUDE_SKILL_DIR}/scripts/context_compress.py" save \
+python "${CLAUDE_SKILL_DIR}/scripts/context_compress.py" save \
   --report-dir .upgrade-report \
   --completed-step <步骤号> \
   --output .upgrade-report/context_summary.json
 ```
 
-新对话开始时，如存在状态摘要，先恢复：
+旧流程或人工归档场景中，如存在 `context_summary.json`，可额外加载：
 
 ```bash
 export PYTHONUTF8=1
-python3 "${CLAUDE_SKILL_DIR}/scripts/context_compress.py" load \
+python "${CLAUDE_SKILL_DIR}/scripts/context_compress.py" load \
   --input .upgrade-report/context_summary.json
 ```
 
 说明：
 
-1. `context_compress.py load` 主要用于“新对话先读状态摘要”的人工恢复场景。
+1. 新对话默认先读 `last_step_summary.json` 和 `resume_context.md`；`context_compress.py load` 只用于旧流程或人工归档恢复。
 2. 正式续跑仍以 `run_step.py --step auto` 为主；它会根据 `main_state.json` 自动决定从哪一步继续。
 3. 如果只是继续执行，不需要先手动运行 `context_compress.py load`。
 
@@ -572,15 +587,16 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/context_compress.py" load \
 
 Claude Code 在恢复或接收新的正式用户意图时必须：
 
-1. 先读取 `main_state.json`
-2. 若 `status` 为 `awaiting_*`，再读取 `interaction.json`
-3. 若存在 `pending_interaction`，先生成用户可读的决策卡片；卡片必须覆盖问题、停下原因、可选动作、缺失材料、候选对象、完整文件入口和可直接回复示例
-4. 将用户答复或新的正式业务意图整理为结构化 JSON；当前推荐统一整理为 `intent_patch`
-5. 收到结构化输入后，再执行：
+1. 先读取 `last_step_summary.json` 和 `resume_context.md`，向用户报告当前进度与下一动作
+2. 再读取 `main_state.json` 核实完整状态；轻量摘要与主状态冲突时以主状态为准
+3. 若 `status` 为 `awaiting_*`，再读取 `interaction.json`
+4. 若存在 `pending_interaction`，先生成用户可读的决策卡片；卡片必须覆盖问题、停下原因、可选动作、缺失材料、候选对象、完整文件入口和可直接回复示例
+5. 将用户答复或新的正式业务意图整理为结构化 JSON；当前推荐统一整理为 `intent_patch`
+6. 收到结构化输入后，再执行：
 
 ```bash
 # 推荐：直接传 `intent_patch` 结构化答复
-python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
+python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
   --response-json '{"intent_patch":{"action":"continue","set":{}}}'
@@ -588,7 +604,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 
 ```bash
 # 推荐：答复较长时，写入文件后恢复
-python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
+python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
   --response-file .upgrade-report/user_response.json
@@ -608,7 +624,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 - 若 `step1` 需要切换到模块级分析，优先使用：
 
 ```bash
-python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
+python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   --project-dir . \
   --report-dir .upgrade-report \
   --response-json '{"intent_patch":{"action":"rerun_current_step","set":{"primary_module":"module-a","modules":["module-a"]}}}'

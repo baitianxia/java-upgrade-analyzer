@@ -245,7 +245,7 @@ def step5_result_contract(report_dir):
     summary_path = call_chain_dir / "summary.json"
     if summary_path.is_file():
         payload["summary"] = _canonicalize_step5_result_value(
-            json.loads(summary_path.read_text(encoding="utf-8-sig")),
+            json.loads(summary_path.read_text(encoding="utf-8")),
             report_roots,
         )
     alerts_path = call_chain_dir / "alerts.csv"
@@ -258,7 +258,7 @@ def step5_result_contract(report_dir):
     query_index = report_root / ".runtime" / "indexes" / "s5_query_index.json"
     if query_index.is_file():
         payload["query_index"] = _canonicalize_step5_query_index(
-            json.loads(query_index.read_text(encoding="utf-8-sig")),
+            json.loads(query_index.read_text(encoding="utf-8")),
             report_roots,
         )
     if not payload:

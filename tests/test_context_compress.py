@@ -78,7 +78,10 @@ class ContextCompressTest(unittest.TestCase):
                         "not_analyzed_apis": [{"api": "c", "severity": "P2"}],
                         "not_found_apis": [{"api": "d", "severity": "P1"}],
                         "quality_gate": {"needs_input": 1},
-                        "user_conclusion_summary": {"已确认影响": 1},
+                        "user_conclusion_summary": {
+                            "confirmed_impact": 1,
+                            "inconclusive": 2,
+                        },
                         "origin_step": "step5",
                         "diagnostic_contract": {
                             "schema": "java-upgrade-analyzer.diagnostic.v1",
@@ -111,7 +114,10 @@ class ContextCompressTest(unittest.TestCase):
             self.assertEqual(summary["modules_affected"], 1)
             self.assertEqual(summary["severity_breakdown"], {"P0": 1, "P1": 2, "P2": 1})
             self.assertEqual(summary["quality_gate"], {"needs_input": 1})
-            self.assertEqual(summary["user_conclusion_summary"], {"已确认影响": 1})
+            self.assertEqual(
+                summary["user_conclusion_summary"],
+                {"confirmed_impact": 1, "inconclusive": 2},
+            )
             self.assertEqual(summary["origin_step"], "step5")
             self.assertEqual(
                 summary["diagnostic_contract"]["reason_code_style"],

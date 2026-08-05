@@ -115,7 +115,7 @@ class Step1ObservabilityTest(unittest.TestCase):
                 "maven_package",
                 side="base",
                 item="app-module",
-                command="mvn -pl app-module -am -DskipTests package",
+                command="mvn -pl app-module -am -Dmaven.test.skip=true package",
                 message="开始构建基准侧",
             )
 
@@ -227,6 +227,8 @@ class Step1ObservabilityTest(unittest.TestCase):
 
             self.assertTrue(calls[0][1]["stream_output"])
             self.assertIsNone(calls[0][1]["timeout"])
+            self.assertIn("-Dmaven.test.skip=true", calls[0][0])
+            self.assertNotIn("-DskipTests", calls[0][0])
             with observer.timing_path.open(encoding="utf-8-sig", newline="") as handle:
                 rows = list(csv.DictReader(handle))
             self.assertTrue(any(
@@ -244,6 +246,31 @@ class Step1ObservabilityTest(unittest.TestCase):
             self.assertTrue(any(
                 row["phase"] == "artifact_coordinate_resolution" for row in rows
             ))
+
+    def test_maven_runtime_inventory_skips_test_compilation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            captured = {}
+
+            def fake_run_cmd(command, **_kwargs):
+                captured["command"] = list(command)
+                return "", "", 0
+
+            with patch.object(s1_dep_diff, "run_cmd", side_effect=fake_run_cmd), \
+                 patch.object(s1_dep_diff, "mvn_cmd", return_value=["mvn"]), \
+                 patch.object(s1_dep_diff, "_resolve_single_module_selector", return_value=""), \
+                 patch.object(s1_dep_diff, "_normalize_maven_pl_with_workdir", return_value=""), \
+                 patch.object(s1_dep_diff, "_maven_profile_args_for_module", return_value=[]), \
+                 patch.object(s1_dep_diff, "_maven_reactor_has_modules", return_value=True), \
+                 patch.object(s1_dep_diff, "augment_runtime_deps_with_project_modules", return_value={}):
+                _deps, command_text = s1_dep_diff._collect_maven_runtime_deps_for_workspace(tmp)
+
+        self.assertEqual(
+            captured["command"].count("-Dmaven.test.skip=true"),
+            1,
+        )
+        self.assertNotIn("-DskipTests", captured["command"])
+        self.assertIn("package", captured["command"])
+        self.assertIn("-Dmaven.test.skip=true", command_text)
 
     def test_failed_phase_is_recorded_in_both_diagnostic_files(self):
         with tempfile.TemporaryDirectory() as tmp:

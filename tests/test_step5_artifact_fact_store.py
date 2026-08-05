@@ -294,6 +294,7 @@ class Step5ColdRunContractTest(unittest.TestCase):
                 api_identity="com.vendor.Legacy.call()",
                 occurrences=(occurrence,),
             ),
+            evidence_file="evidence/call_chain/bytecode_unresolved.csv",
         )
 
         self.assertEqual(
@@ -307,6 +308,10 @@ class Step5ColdRunContractTest(unittest.TestCase):
         self.assertEqual(len(payload["occurrences"]), 1)
         self.assertIsInstance(payload["occurrences"][0], tuple)
         self.assertEqual(payload["occurrences"][0][0], "com.acme.App.run()")
+        self.assertEqual(
+            payload["evidence_file"],
+            "evidence/call_chain/bytecode_unresolved.csv",
+        )
     def test_step5_timing_exposes_shared_artifact_fact_cost_and_reuse(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = _write_step5_timing_csv(tmp, {"step5_perf": {

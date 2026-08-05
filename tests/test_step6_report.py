@@ -226,6 +226,51 @@ class Step6ReportObjectivityTest(unittest.TestCase):
             f"[{path}]({path})",
         )
 
+    def test_json_loader_rejects_utf8_bom(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "summary.json"
+            path.write_bytes(
+                b"\xef\xbb\xbf" + '{"message":"中文"}'.encode("utf-8")
+            )
+            diagnostics = []
+            loaded = s6_report.load_json(
+                path,
+                diagnostics=diagnostics,
+                artifact="call_chain_summary",
+                required=True,
+            )
+
+        self.assertEqual(loaded, {})
+        self.assertEqual(diagnostics[0]["stage"], "json_load")
+
+    def test_call_summary_rejects_localized_conclusion_keys(self):
+        summary = {
+            "status": "skipped",
+            "skip_reason": "no_changed_apis",
+            "total_apis": 0,
+            "reachable_apis": [],
+            "not_impacted_apis": [],
+            "uncertain_apis": [],
+            "not_analyzed_apis": [],
+            "not_found_apis": [],
+            "user_conclusion_summary": {"当前无法确定": 1},
+        }
+        diagnostics = []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "summary.json"
+            path.write_text("{}", encoding="utf-8")
+            s6_report._validate_call_summary_contract(
+                path, summary, diagnostics
+            )
+
+        self.assertEqual(summary["user_conclusion_summary"], {})
+        self.assertTrue(any(
+            item.get("stage") == "json_contract"
+            and "non-contract keys" in str(item.get("message") or "")
+            for item in diagnostics
+        ))
+
     def test_scope_page_does_not_link_to_missing_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
@@ -870,6 +915,141 @@ class Step6ReportObjectivityTest(unittest.TestCase):
         self.assertIn("结论未确定（候选证据） 1", core)
         self.assertIn("当前未发现候选调用证据", detail)
         self.assertIn("现有记录包含候选证据", detail)
+
+    def test_uncertain_outputs_order_dependencies_then_apis_by_impact(self):
+        low = {
+            "coord": "com.acme:lib",
+            "api": "com.acme.Api.low",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+            "severity": "P0",
+            "uncertainty_kind": "analysis_limitation",
+            "priority_score": 4,
+        }
+        high = {
+            **low,
+            "api": "com.acme.Api.high",
+            "severity": "P1",
+            "uncertainty_kind": "candidate_evidence",
+            "priority_score": 18,
+        }
+        medium = {
+            **low,
+            "coord": "com.beta:lib",
+            "api": "com.beta.Api.medium",
+            "severity": "P1",
+            "uncertainty_kind": "candidate_evidence",
+            "priority_score": 12,
+        }
+        peer = {
+            **low,
+            "coord": "com.gamma:lib",
+            "api": "com.gamma.Api.high",
+            "severity": "P1",
+            "uncertainty_kind": "candidate_evidence",
+            "priority_score": 18,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            artifacts = s6_report.write_bucket_detail_artifacts(
+                tmp,
+                {"uncertain": [peer, medium, low, high]},
+                "uncertain",
+            )
+            csv_path = Path(tmp) / artifacts["uncertain_csv"]
+            with csv_path.open(
+                "r", encoding="utf-8-sig", newline=""
+            ) as handle:
+                rows = list(csv.DictReader(handle))
+            markdown = (
+                Path(tmp) / artifacts["uncertain_md"]
+            ).read_text(encoding="utf-8")
+
+        main_rows = s6_report._main_completed_api_rows([
+            {**low, "conclusion": s6_report.UNCERTAIN_ANALYSIS_LIMITATION_CONCLUSION},
+            {**high, "conclusion": s6_report.UNCERTAIN_CANDIDATE_CONCLUSION},
+            {**medium, "conclusion": s6_report.UNCERTAIN_CANDIDATE_CONCLUSION},
+            {**peer, "conclusion": s6_report.UNCERTAIN_CANDIDATE_CONCLUSION},
+        ])
+        self.assertEqual(
+            [row["api"] for row in rows],
+            [
+                "com.acme.Api.high",
+                "com.acme.Api.low",
+                "com.gamma.Api.high",
+                "com.beta.Api.medium",
+            ],
+        )
+        self.assertEqual(
+            [row["coord"] for row in rows],
+            [
+                "com.acme:lib",
+                "com.acme:lib",
+                "com.gamma:lib",
+                "com.beta:lib",
+            ],
+        )
+        self.assertEqual(
+            [row["priority_score"] for row in rows],
+            ["18", "4", "18", "12"],
+        )
+        self.assertEqual(
+            [row["dependency_priority_rank"] for row in rows],
+            ["1", "1", "2", "3"],
+        )
+        self.assertEqual(
+            [row["dependency_top_priority_score"] for row in rows],
+            ["18", "18", "18", "12"],
+        )
+        self.assertEqual(
+            [row["dependency_total_priority_score"] for row in rows],
+            ["22", "22", "18", "12"],
+        )
+        self.assertEqual(
+            [row["api"] for row in main_rows],
+            [
+                "com.acme.Api.high",
+                "com.acme.Api.low",
+                "com.gamma.Api.high",
+                "com.beta.Api.medium",
+            ],
+        )
+        self.assertIn("依赖复核顺序", markdown)
+        self.assertIn("复核优先分数", markdown)
+        self.assertLess(markdown.index("com.acme.Api.high"), markdown.index("com.acme.Api.low"))
+        self.assertLess(markdown.index("com.acme.Api.low"), markdown.index("com.gamma.Api.high"))
+        self.assertLess(markdown.index("com.gamma.Api.high"), markdown.index("com.beta.Api.medium"))
+
+    def test_full_api_detail_dependency_sections_use_impact_order(self):
+        def row(coord, api, score, severity="P1"):
+            return {
+                "coord": coord,
+                "api": api,
+                "api_signature": "()",
+                "change_type": "REMOVED",
+                "severity": severity,
+                "conclusion": s6_report.UNCERTAIN_CANDIDATE_CONCLUSION,
+                "priority_score": score,
+            }
+
+        groups = s6_report._completed_api_rows_by_dependency({
+            "completed": [
+                row("com.beta:lib", "com.beta.Api.medium", 12, "P0"),
+                row("com.acme:lib", "com.acme.Api.low", 4, "P0"),
+                row("com.gamma:lib", "com.gamma.Api.high", 18),
+                row("com.acme:lib", "com.acme.Api.high", 18),
+            ]
+        })
+
+        self.assertEqual(
+            [coord for coord, _rows in groups],
+            ["com.acme:lib", "com.gamma:lib", "com.beta:lib"],
+        )
+        self.assertEqual(
+            [item["api"] for item in groups[0][1]],
+            ["com.acme.Api.high", "com.acme.Api.low"],
+        )
 
     def test_core_conclusion_translates_partial_coverage_without_raw_status(self):
         text = "\n".join(
@@ -1813,11 +1993,11 @@ class Step6ReportObjectivityTest(unittest.TestCase):
         )
 
         expected_apis = [
+            "com.acme.Api.confirmedMany()",
+            "com.acme.Api.confirmedFew()",
             "com.acme.Api.uncertainMany()",
             "com.acme.Api.uncertainFew()",
             "com.acme.Api.noImpact()",
-            "com.acme.Api.confirmedFew()",
-            "com.acme.Api.confirmedMany()",
         ]
         self.assertEqual(
             expected_apis,
@@ -2946,6 +3126,9 @@ class Step6ReportObjectivityTest(unittest.TestCase):
                 "origin_step": "step5",
                 "observed_scope": "global",
                 "blocking": True,
+                "evidence_files": [
+                    "evidence/call_chain/bytecode_unresolved.csv"
+                ],
             }],
         }))
 
@@ -2954,6 +3137,81 @@ class Step6ReportObjectivityTest(unittest.TestCase):
             detail,
         )
         self.assertNotIn("未记录更具体的触发条件", detail)
+        self.assertIn(
+            "../evidence/call_chain/bytecode_unresolved.csv",
+            detail,
+        )
+
+    def test_collection_preserves_bytecode_instruction_evidence_pointer(self):
+        summary = {
+            "status": "done",
+            "origin_step": "step5",
+            "total_apis": 0,
+            "reachable": 0,
+            "not_impacted": 0,
+            "uncertain": 0,
+            "not_analyzed": 0,
+            "not_found_in_static_analysis": 0,
+            "reachable_apis": [],
+            "not_impacted_apis": [],
+            "uncertain_apis": [],
+            "not_analyzed_apis": [],
+            "not_found_apis": [],
+            "user_conclusion_summary": {
+                "inconclusive": 2,
+                "input_required": 1,
+            },
+            "diagnostic_guidance": [{
+                "reason_code": "BYTECODE_CALLER_UNRESOLVED",
+                "origin_step": "step5",
+                "observed_scope": "api",
+                "blocking": False,
+                "evidence_files": [
+                    "evidence/call_chain/bytecode_unresolved.csv"
+                ],
+            }],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_collection_fixture(
+                tmp,
+                summary=summary,
+                changed_rows=[],
+                alert_rows=[],
+            )
+            evidence = (
+                Path(tmp)
+                / "evidence"
+                / "call_chain"
+                / "bytecode_unresolved.csv"
+            )
+            evidence.write_text(
+                "caller_class,caller_method,instruction_offset,unresolved_owner,unresolved_method\n",
+                encoding="utf-8",
+            )
+
+            findings = s6_report.collect_findings(tmp)
+            detail = s6_report.render_diagnostic_detail_artifact(findings)
+
+        self.assertEqual(
+            findings["artifacts"]["bytecode_unresolved_csv"],
+            "evidence/call_chain/bytecode_unresolved.csv",
+        )
+        self.assertEqual(
+            findings["diagnostic_guidance"][0]["evidence_files"],
+            ["evidence/call_chain/bytecode_unresolved.csv"],
+        )
+        self.assertEqual(
+            findings["diagnostic_guidance"][0]["evidence_file"],
+            "evidence/call_chain/bytecode_unresolved.csv",
+        )
+        self.assertEqual(
+            findings["user_conclusion_summary"],
+            {"inconclusive": 2, "input_required": 1},
+        )
+        self.assertIn(
+            "../evidence/call_chain/bytecode_unresolved.csv",
+            detail,
+        )
 
     def test_aggregated_missing_identities_use_the_same_display_count_everywhere(self):
         findings = {

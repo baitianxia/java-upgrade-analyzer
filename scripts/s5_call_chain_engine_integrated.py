@@ -158,8 +158,8 @@ def record_trace_diagnostic_or_raise(
         raise Step5GlobalCoverageBlocked(reason_code, result)
 
 
-def _serialize_ingestion_failure(collector, failure):
-    return {
+def _serialize_ingestion_failure(collector, failure, *, evidence_file=""):
+    serialized = {
         'collector': collector,
         'reason_code': failure.reason_code,
         'blocking': failure.blocking,
@@ -174,6 +174,9 @@ def _serialize_ingestion_failure(collector, failure):
             for occurrence in failure.occurrences
         ],
     }
+    if evidence_file:
+        serialized['evidence_file'] = str(evidence_file)
+    return serialized
 
 
 def _evidence_dir(report_dir, name):
@@ -2293,6 +2296,17 @@ def _step5_integrated_main_impl(args):
     ingestion_result = ingest_collector_batches(
         graph, (bytecode_batch, *framework_batches, indirect_batch)
     )
+    unresolved_diagnostic_events = diagnostics.record_failure_records(
+        'evidence.merge',
+        ingestion_result.failures_by_collector,
+        reason_codes=('BYTECODE_CALLER_UNRESOLVED',),
+    )
+    bytecode_unresolved_evidence_file = next((
+        str(event.get('evidence_file') or '')
+        for event in unresolved_diagnostic_events
+        if event.get('reason_code') == 'BYTECODE_CALLER_UNRESOLVED'
+        and event.get('evidence_file')
+    ), '')
     graph_stats['step5_perf']['main']['framework_adapter_merge_elapsed_sec'] = round(
         time.perf_counter() - framework_merge_timer, 3
     )
@@ -2598,7 +2612,15 @@ def _step5_integrated_main_impl(args):
     )
 
     graph_stats['evidence_ingestion']['failures'] = [
-        _serialize_ingestion_failure(collector, failure)
+        _serialize_ingestion_failure(
+            collector,
+            failure,
+            evidence_file=(
+                bytecode_unresolved_evidence_file
+                if failure.reason_code == 'BYTECODE_CALLER_UNRESOLVED'
+                else ''
+            ),
+        )
         for collector, failure in ingestion_failure_records
     ]
     # Tracing and the persisted query index have consumed the typed ledger.

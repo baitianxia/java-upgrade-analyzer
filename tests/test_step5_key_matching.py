@@ -4,6 +4,7 @@ import hashlib
 import json
 import io
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -10653,6 +10654,7 @@ class StaticFieldUse { int use() { return Target.FIELD; } }
             ]
 
             summary_path, summary_json_path = formatter.generate_enhanced_summary(results, output_dir)
+            summary_json_bytes = Path(summary_json_path).read_bytes()
             summary = json.loads(Path(summary_json_path).read_text(encoding="utf-8"))
             by_api_text = next((output_dir / "by_api").glob("a_b_com_example_OrderService_run*.txt")).read_text(
                 encoding="utf-8"
@@ -10663,12 +10665,144 @@ class StaticFieldUse { int use() { return Target.FIELD; } }
         self.assertIsNone(summary_path)
         self.assertFalse(summary_txt_exists)
         self.assertFalse(enhanced_summary_exists)
-        self.assertEqual(summary["user_conclusion_summary"]["已确认影响"], 1)
-        self.assertEqual(summary["user_conclusion_summary"]["可能影响"], 1)
-        self.assertEqual(summary["user_conclusion_summary"]["需要补充输入"], 1)
+        self.assertEqual(summary["user_conclusion_summary"]["confirmed_impact"], 1)
+        self.assertEqual(summary["user_conclusion_summary"]["probable_impact"], 1)
+        self.assertEqual(summary["user_conclusion_summary"]["input_required"], 1)
+        self.assertTrue(all(
+            re.fullmatch(r"[a-z][a-z0-9_]*", key)
+            for key in summary["user_conclusion_summary"]
+        ))
+        self.assertFalse(summary_json_bytes.startswith(b"\xef\xbb\xbf"))
         self.assertEqual(summary["quality_gate"]["needs_input"], 1)
         self.assertLess(by_api_text.index("【结论】"), by_api_text.index("【变更信息】"))
         self.assertIn("【调用链路】", by_api_text)
+
+    def test_uncertain_apis_are_grouped_by_dependency_then_priority(self):
+        def result(coord, api_name, severity, path_details):
+            return tracer.TraceResult(
+                coord=coord,
+                api_name=api_name,
+                api_simple=api_name.rsplit(".", 1)[-1],
+                api_signature="()",
+                symbol_kind="method",
+                change_type="REMOVED",
+                severity=severity,
+                confirmed=False,
+                source="japicmp",
+                analysis_scope="method",
+                analysis_status="uncertain",
+                direct_callers=0,
+                is_reachable=False,
+                reachable_note="候选链路未确认",
+                business_reach_depth=0,
+                dependency_chain_coords=[],
+                call_paths=[],
+                evidence_paths=[],
+                path_details=path_details,
+                reason_code="DYNAMIC_DISPATCH_UNRESOLVED",
+                verification_commands=[],
+                hops=[],
+                confidence_score=0.4,
+                critical_nodes_hit=[],
+            )
+
+        runtime_callers = [
+            {
+                "consumer_class": f"com.acme.Caller{index}",
+                "consumer_method": "run",
+                "consumer_signature": "()",
+                "entry_kind": "spring_scheduled_entry",
+            }
+            for index in range(3)
+        ]
+        medium_callers = runtime_callers[:2]
+        high = result(
+            "a:dependency",
+            "com.vendor.Api.runtimeCandidate",
+            "P1",
+            runtime_callers,
+        )
+        low = result(
+            "a:dependency",
+            "com.vendor.Api.severeWithoutCaller",
+            "P0",
+            [],
+        )
+        medium = result(
+            "b:dependency",
+            "com.other.Api.runtimeCandidate",
+            "P1",
+            medium_callers,
+        )
+        peer = result(
+            "c:dependency",
+            "com.peer.Api.runtimeCandidate",
+            "P1",
+            runtime_callers,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            summary_path = formatter.write_summary_json(
+                [peer, medium, low, high], tmp
+            )
+            summary = json.loads(Path(summary_path).read_text(encoding="utf-8"))
+
+        uncertain = summary["uncertain_apis"]
+        self.assertEqual(
+            [item["api"] for item in uncertain],
+            [
+                "com.vendor.Api.runtimeCandidate",
+                "com.vendor.Api.severeWithoutCaller",
+                "com.peer.Api.runtimeCandidate",
+                "com.other.Api.runtimeCandidate",
+            ],
+        )
+        self.assertEqual(
+            [item["coord"] for item in uncertain],
+            [
+                "a:dependency",
+                "a:dependency",
+                "c:dependency",
+                "b:dependency",
+            ],
+        )
+        self.assertEqual(uncertain[0]["priority_score"], 18)
+        self.assertEqual(uncertain[0]["priority_factors"]["caller_count"], 3)
+        self.assertTrue(
+            uncertain[0]["priority_factors"]["runtime_required_load"]
+        )
+        self.assertEqual(uncertain[1]["priority_score"], 4)
+        self.assertEqual(uncertain[2]["priority_score"], 18)
+        self.assertEqual(uncertain[3]["priority_score"], 12)
+        self.assertEqual(
+            summary["uncertain_dependency_summary"],
+            [
+                {
+                    "dependency_priority_rank": 1,
+                    "coord": "a:dependency",
+                    "uncertain_api_count": 2,
+                    "top_priority_score": 18,
+                    "total_priority_score": 22,
+                    "runtime_required_api_count": 1,
+                },
+                {
+                    "dependency_priority_rank": 2,
+                    "coord": "c:dependency",
+                    "uncertain_api_count": 1,
+                    "top_priority_score": 18,
+                    "total_priority_score": 18,
+                    "runtime_required_api_count": 1,
+                },
+                {
+                    "dependency_priority_rank": 3,
+                    "coord": "b:dependency",
+                    "uncertain_api_count": 1,
+                    "top_priority_score": 12,
+                    "total_priority_score": 12,
+                    "runtime_required_api_count": 1,
+                },
+            ],
+        )
 
     def test_generate_enhanced_summary_persists_step5_perf_report_stats(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -13432,8 +13566,8 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
                 "not_analyzed": 0,
                 "not_found_in_static_analysis": 1,
                 "user_conclusion_summary": {
-                    "已确认影响": 1,
-                    "当前无法确认": 1,
+                    "confirmed_impact": 1,
+                    "inconclusive": 1,
                 },
                 "reachable_apis": [
                     {
@@ -13636,7 +13770,7 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
                 "uncertain": 0,
                 "not_analyzed": 0,
                 "not_found_in_static_analysis": 0,
-                "user_conclusion_summary": {"已确认影响": 1},
+                "user_conclusion_summary": {"confirmed_impact": 1},
                 "reachable_apis": [
                     {
                         "coord": "a:b",
@@ -14127,7 +14261,7 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
                 "uncertain": 0,
                 "not_analyzed": 0,
                 "not_found_in_static_analysis": 0,
-                "user_conclusion_summary": {"已确认影响": 1},
+                "user_conclusion_summary": {"confirmed_impact": 1},
                 "meta": {
                     "graph_stats": {
                         "truncated": False,
@@ -14304,7 +14438,7 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
                 "uncertain": 0,
                 "not_analyzed": 0,
                 "not_found_in_static_analysis": len(not_found_apis),
-                "user_conclusion_summary": {"当前无法确认": len(not_found_apis)},
+                "user_conclusion_summary": {"inconclusive": len(not_found_apis)},
                 "not_found_apis": not_found_apis,
             }
             (s5_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False), encoding="utf-8")
@@ -14487,9 +14621,9 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
                 "not_analyzed": len(not_analyzed_apis),
                 "not_found_in_static_analysis": 0,
                 "user_conclusion_summary": {
-                    "可能影响": 30,
-                    "需要补充输入": 30,
-                    "当前无法确认": 60,
+                    "probable_impact": 30,
+                    "input_required": 30,
+                    "inconclusive": 60,
                 },
                 "uncertain_apis": uncertain_apis,
                 "not_analyzed_apis": not_analyzed_apis,
@@ -14605,7 +14739,7 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
                 "uncertain": 0,
                 "not_analyzed": 0,
                 "not_found_in_static_analysis": len(not_found_apis),
-                "user_conclusion_summary": {"当前无法确认": len(not_found_apis)},
+                "user_conclusion_summary": {"inconclusive": len(not_found_apis)},
                 "not_found_apis": not_found_apis,
             }
             (s5_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False), encoding="utf-8")
@@ -14676,9 +14810,9 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
                 "not_analyzed": 3,
                 "not_found_in_static_analysis": 0,
                 "user_conclusion_summary": {
-                    "可能影响": 1,
-                    "需要补充输入": 1,
-                    "当前无法确认": 1,
+                    "probable_impact": 1,
+                    "input_required": 1,
+                    "inconclusive": 1,
                 },
                 "quality_gate": {
                     "confirmed_impact": 0,
@@ -14886,7 +15020,7 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
                         "uncertain": 0,
                         "not_analyzed": 0,
                         "not_found_in_static_analysis": 0,
-                        "user_conclusion_summary": {"已确认影响": 1},
+                        "user_conclusion_summary": {"confirmed_impact": 1},
                         "reachable_apis": [
                             {
                                 "coord": "a:b",
@@ -15036,7 +15170,7 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
                         "uncertain": 0,
                         "not_analyzed": 1,
                         "not_found_in_static_analysis": 0,
-                        "user_conclusion_summary": {"需要补充输入": 1},
+                        "user_conclusion_summary": {"input_required": 1},
                         "quality_gate": {"needs_input": 1, "inconclusive": 0, "probable_impact": 0, "confirmed_impact": 0},
                         "not_analyzed_apis": [
                             {

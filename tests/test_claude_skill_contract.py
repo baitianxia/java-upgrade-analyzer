@@ -103,6 +103,31 @@ class ClaudeSkillContractTest(unittest.TestCase):
         self.assertIn("完整限制清单", rules)
         self.assertIn("Step5 成功后的例行复核", rules)
 
+    def test_public_commands_avoid_windows_python3_alias_and_document_background_state(self):
+        skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
+
+        self.assertNotRegex(skill, r"(?m)^\s*python3\s+")
+        self.assertIn("--background", skill)
+        self.assertIn(".upgrade-report/.runtime/background/status.json", skill)
+        self.assertIn("启动命令返回 `0` 只表示后台进程创建成功", skill)
+
+    def test_cross_session_startup_reads_compact_resume_snapshot_first(self):
+        skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
+
+        last_summary = ".upgrade-report/.runtime/state/last_step_summary.json"
+        resume_context = ".upgrade-report/.runtime/state/resume_context.md"
+        main_state = ".upgrade-report/.runtime/state/main_state.json"
+        execution_mode = skill[skill.index("## 执行模式"):]
+
+        self.assertIn(last_summary, skill)
+        self.assertIn(resume_context, skill)
+        self.assertLess(
+            execution_mode.index("last_step_summary = read"),
+            execution_mode.index("main_state = read"),
+        )
+        self.assertIn("轻量摘要与主状态冲突时以主状态为准", skill)
+        self.assertIn(main_state, skill)
+
     def test_all_metamorphic_variants_complete_step4_to_step5_closed_world(self):
         with tempfile.TemporaryDirectory() as tmp:
             reports = run_skill_contract_metamorphic_matrix(

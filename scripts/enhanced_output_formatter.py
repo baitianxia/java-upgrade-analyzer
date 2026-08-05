@@ -181,6 +181,190 @@ def _uncertainty_kind(trace_like):
     return UNCERTAINTY_KIND_ANALYSIS_LIMITATION
 
 
+_UNCERTAIN_SEVERITY_WEIGHTS = {
+    'P0': 4,
+    'P1': 3,
+    'P2': 2,
+}
+_RUNTIME_REQUIRED_ENTRY_KINDS = {
+    'spring_web_endpoint',
+    'spring_message_listener',
+    'spring_scheduled_entry',
+    'spring_event_listener',
+    'spring_xml_scheduled_task',
+    'spring_runtime_active_entry',
+    'jpa_lifecycle_callback',
+    'dubbo_service_entry',
+    'runtime_dependency_entry',
+}
+
+
+def _non_negative_int(value):
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _uncertain_caller_count(trace_like):
+    """Count distinct physical/logical callers without inflating duplicate paths."""
+    callers = set()
+    path_details = _get_trace_attr(trace_like, 'path_details', []) or []
+    for detail in path_details:
+        if not isinstance(detail, dict):
+            continue
+        consumer = '|'.join(
+            str(detail.get(key) or '').strip()
+            for key in ('consumer_class', 'consumer_method', 'consumer_signature')
+        ).strip('|')
+        if consumer:
+            callers.add(consumer)
+            continue
+        evidence = list(detail.get('evidence') or [])
+        if evidence and isinstance(evidence[0], dict):
+            caller = str(evidence[0].get('caller_symbol') or '').strip()
+            if caller:
+                callers.add(caller)
+
+    for evidence_path in _get_trace_attr(trace_like, 'evidence_paths', []) or []:
+        if evidence_path and isinstance(evidence_path[0], dict):
+            caller = str(evidence_path[0].get('caller_symbol') or '').strip()
+            if caller:
+                callers.add(caller)
+
+    direct_callers = _non_negative_int(
+        _get_trace_attr(trace_like, 'direct_callers', 0)
+    )
+    if callers:
+        return max(direct_callers, len(callers))
+    call_paths = {
+        str(path or '').strip()
+        for path in (_get_trace_attr(trace_like, 'call_paths', []) or [])
+        if str(path or '').strip()
+    }
+    return max(direct_callers, len(call_paths))
+
+
+def _uncertain_runtime_required_load(trace_like):
+    if str(
+        _get_trace_attr(trace_like, 'runtime_link_impact', '') or ''
+    ).strip() == 'runtime_link_present':
+        return True
+    if canonical_reason_code(
+        _get_trace_attr(trace_like, 'reason_code', '') or 'UNKNOWN'
+    ) in {
+        'RUNTIME_DEPENDENCY_USES_REMOVED_API',
+        'RUNTIME_DEPENDENCY_ENTRY_REACHED',
+        'RUNTIME_FRAMEWORK_ENTRY_REACHED',
+    }:
+        return True
+    for detail in _get_trace_attr(trace_like, 'path_details', []) or []:
+        if not isinstance(detail, dict):
+            continue
+        if str(detail.get('entry_kind') or '').strip() in _RUNTIME_REQUIRED_ENTRY_KINDS:
+            return True
+    for node in _get_trace_attr(trace_like, 'critical_nodes_hit', []) or []:
+        if not isinstance(node, dict):
+            continue
+        if node.get('activation_verified') is True:
+            return True
+        if str(node.get('entry_scope') or '').strip() == 'runtime_dependency_entry':
+            return True
+        if str(node.get('entry_kind') or '').strip() in _RUNTIME_REQUIRED_ENTRY_KINDS:
+            return True
+    return False
+
+
+def uncertain_priority(trace_like):
+    """Return the reproducible review score for one uncertain API.
+
+    A caller factor of one is used when static analysis found no caller.  This
+    keeps high-severity analysis-limit cases reviewable instead of assigning
+    every caller-less item a score of zero.
+    """
+    if str(_get_trace_attr(trace_like, 'analysis_status', '') or '') != 'uncertain':
+        return {
+            'priority_score': 0,
+            'severity_weight': 0,
+            'caller_count': 0,
+            'caller_weight': 0,
+            'runtime_required_load': False,
+            'runtime_load_weight': 0,
+        }
+    severity = str(
+        _get_trace_attr(trace_like, 'severity', '') or ''
+    ).strip().upper()
+    severity_weight = _UNCERTAIN_SEVERITY_WEIGHTS.get(severity, 1)
+    caller_count = _uncertain_caller_count(trace_like)
+    caller_weight = max(1, caller_count)
+    runtime_required_load = _uncertain_runtime_required_load(trace_like)
+    runtime_load_weight = 2 if runtime_required_load else 1
+    return {
+        'priority_score': severity_weight * caller_weight * runtime_load_weight,
+        'severity_weight': severity_weight,
+        'caller_count': caller_count,
+        'caller_weight': caller_weight,
+        'runtime_required_load': runtime_required_load,
+        'runtime_load_weight': runtime_load_weight,
+    }
+
+
+def _uncertain_dependency_groups(results):
+    """Order dependency groups, then APIs inside each dependency.
+
+    The dependency coordinate is a first-class review dimension: APIs from
+    different dependencies must never be interleaved merely because their
+    individual scores differ.  A dependency is ranked by its highest API
+    score, then by the sum of its API scores, then by API count and coordinate.
+    """
+    grouped = defaultdict(list)
+    for result in results or ():
+        coord = str(_get_trace_attr(result, 'coord', '') or '').strip()
+        grouped[coord].append(result)
+
+    dependency_groups = []
+    for coord, group_results in grouped.items():
+        priorities_by_identity = {
+            id(result): uncertain_priority(result)
+            for result in group_results
+        }
+        ordered_results = sorted(
+            group_results,
+            key=lambda result: (
+                -int(priorities_by_identity[id(result)]['priority_score']),
+                -int(priorities_by_identity[id(result)]['severity_weight']),
+                str(_get_trace_attr(result, 'api_name', '') or ''),
+                str(_get_trace_attr(result, 'api_signature', '') or ''),
+            ),
+        )
+        priorities = [
+            priorities_by_identity[id(result)] for result in ordered_results
+        ]
+        scores = [int(priority['priority_score']) for priority in priorities]
+        dependency_groups.append({
+            'coord': coord,
+            'items': ordered_results,
+            'uncertain_api_count': len(ordered_results),
+            'top_priority_score': max(scores, default=0),
+            'total_priority_score': sum(scores),
+            'runtime_required_api_count': sum(
+                bool(priority['runtime_required_load'])
+                for priority in priorities
+            ),
+        })
+
+    dependency_groups.sort(key=lambda group: (
+        -int(group['top_priority_score']),
+        -int(group['total_priority_score']),
+        -int(group['uncertain_api_count']),
+        not bool(group['coord']),
+        str(group['coord']),
+    ))
+    for rank, group in enumerate(dependency_groups, 1):
+        group['dependency_priority_rank'] = rank
+    return dependency_groups
+
+
 def _human_analysis_status(value, uncertainty_kind=''):
     if (
         str(value or '') == 'uncertain'
@@ -242,6 +426,7 @@ def trace_result_to_api_entry(r):
 
     canonical_code = canonical_reason_code(r.reason_code)
     uncertainty_kind = _uncertainty_kind(r)
+    priority = uncertain_priority(r)
     return {
         'diagnostic_schema':   diagnostic_contract_metadata()['schema'],
         'origin_step':         'step5',
@@ -287,6 +472,17 @@ def trace_result_to_api_entry(r):
         'constant_impact_evidence': dict(
             getattr(r, 'constant_impact_evidence', {}) or {}
         ),
+        'priority_score':      priority['priority_score'],
+        'priority_factors': {
+            key: priority[key]
+            for key in (
+                'severity_weight',
+                'caller_count',
+                'caller_weight',
+                'runtime_required_load',
+                'runtime_load_weight',
+            )
+        },
         'user_conclusion':     user_view['user_conclusion'],
         'decision_bucket':     user_view['decision_bucket'],
         'user_reason':         user_view['user_reason'],
@@ -420,12 +616,18 @@ def write_per_dependency_summaries(all_results, report_dir):
             grouped[coord].append(result)
 
     def representative_rank(result):
+        analysis_status = str(
+            getattr(result, 'analysis_status', '') or ''
+        ).strip()
         severity = {'P0': 0, 'P1': 1, 'P2': 2}.get(
             str(getattr(result, 'severity', '') or '').strip(), 9
         )
         return (
-            _per_dependency_status_rank(
-                getattr(result, 'analysis_status', '')
+            _per_dependency_status_rank(analysis_status),
+            (
+                -int(uncertain_priority(result)['priority_score'])
+                if analysis_status == 'uncertain'
+                else 0
             ),
             severity,
             -int(getattr(result, 'business_reach_depth', 0) or 0),
@@ -441,7 +643,8 @@ def write_per_dependency_summaries(all_results, report_dir):
         status_counts = defaultdict(int)
         for result in results:
             status_counts[str(getattr(result, 'analysis_status', '') or '')] += 1
-        representative_result = min(results, key=representative_rank) if results else None
+        ordered_results = sorted(results, key=representative_rank)
+        representative_result = ordered_results[0] if ordered_results else None
         representative = (
             trace_result_to_api_entry(representative_result)
             if representative_result is not None
@@ -468,7 +671,8 @@ def write_per_dependency_summaries(all_results, report_dir):
             'selected_api': str(representative.get('api') or representative.get('api_name') or '').strip(),
             'selected_reason': str(representative.get('reason') or representative.get('reachable_note') or '').strip(),
             'sample_results': [
-                trace_result_to_api_entry(result) for result in results[:20]
+                trace_result_to_api_entry(result)
+                for result in ordered_results[:20]
             ],
         }
 
@@ -1347,7 +1551,28 @@ def write_summary_json(all_results, output_dir, graph_stats=None):
     """
     reachable       = [r for r in all_results if r.analysis_status == 'reachable']
     not_impacted    = [r for r in all_results if r.analysis_status == 'not_impacted']
-    uncertain       = [r for r in all_results if r.analysis_status == 'uncertain']
+    uncertain_dependency_groups = _uncertain_dependency_groups(
+        r for r in all_results if r.analysis_status == 'uncertain'
+    )
+    uncertain = [
+        result
+        for group in uncertain_dependency_groups
+        for result in group['items']
+    ]
+    uncertain_dependency_summary = [
+        {
+            key: group[key]
+            for key in (
+                'dependency_priority_rank',
+                'coord',
+                'uncertain_api_count',
+                'top_priority_score',
+                'total_priority_score',
+                'runtime_required_api_count',
+            )
+        }
+        for group in uncertain_dependency_groups
+    ]
     not_analyzed    = [r for r in all_results if r.analysis_status == 'not_analyzed']
     # 兼容新旧状态名
     not_found       = [r for r in all_results if r.analysis_status in ('not_reachable', 'not_found_in_static_analysis')]
@@ -1355,7 +1580,10 @@ def write_summary_json(all_results, output_dir, graph_stats=None):
     decision_bucket_summary = defaultdict(int)
     for r in all_results:
         user_view = summarize_user_facing_outcome(r)
-        user_conclusion_summary[user_view['user_conclusion']] += 1
+        # Keys are a machine contract and therefore remain English
+        # lower_snake_case.  Localized user text stays in each API entry's
+        # ``user_conclusion`` value.
+        user_conclusion_summary[user_view['decision_bucket']] += 1
         decision_bucket_summary[user_view['decision_bucket']] += 1
 
     def reason_summary(results):
@@ -1398,6 +1626,22 @@ def write_summary_json(all_results, output_dir, graph_stats=None):
             'not_analyzed': len(not_analyzed),
             'not_found_in_static_analysis': len(not_found),
             'tool':         's5_call_chain_engine_integrated.py (enhanced)',
+            'json_encoding': 'utf-8',
+            'json_bom': False,
+            'json_field_style': 'lower_snake_case',
+            'uncertain_ordering': {
+                'dependency_groups': [
+                    'top_priority_score_desc',
+                    'total_priority_score_desc',
+                    'uncertain_api_count_desc',
+                    'coord_asc',
+                ],
+                'apis_within_dependency': [
+                    'priority_score_desc',
+                    'severity_weight_desc',
+                    'api_identity_asc',
+                ],
+            },
             'graph_stats':  thaw_evidence_value(graph_stats or {}),
     }
     quality_gate = {
@@ -1433,6 +1677,7 @@ def write_summary_json(all_results, output_dir, graph_stats=None):
     artifacts = {'summary_json': 'summary.json'}
     for key, path_name in (
         ('alerts_csv', 'alerts.csv'),
+        ('bytecode_unresolved_csv', 'bytecode_unresolved.csv'),
         ('api_detail_dir', 'by_api'),
         ('module_summary_dir', 'by_module'),
     ):
@@ -1497,6 +1742,10 @@ def write_summary_json(all_results, output_dir, graph_stats=None):
         write_api_array('uncertain_apis', uncertain)
         write_api_array('not_analyzed_apis', not_analyzed)
         write_api_array('not_found_apis', not_found)
+        write_field(
+            'uncertain_dependency_summary',
+            uncertain_dependency_summary,
+        )
         write_field('uncertain_reason_summary', uncertain_reason_summary)
         write_field('uncertainty_kind_summary', uncertainty_kind_summary)
         write_field('not_analyzed_reason_summary', not_analyzed_reason_summary)
@@ -1583,6 +1832,10 @@ def register_step5_summary_artifacts(output_dir, report_dir=None):
     known = {
         'summary_json': (output_path / 'summary.json', 'summary.json'),
         'alerts_csv': (output_path / 'alerts.csv', 'alerts.csv'),
+        'bytecode_unresolved_csv': (
+            output_path / 'bytecode_unresolved.csv',
+            'bytecode_unresolved.csv',
+        ),
         'api_detail_dir': (output_path / 'by_api', 'by_api'),
         'module_summary_dir': (output_path / 'by_module', 'by_module'),
         'timing_csv': (

@@ -21,6 +21,15 @@ import run_step  # noqa: E402
 
 
 class RunStepMainStateTest(unittest.TestCase):
+    def test_json_reader_rejects_bom_prefixed_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            invalid_path = Path(tmp) / "invalid.json"
+            invalid_path.write_bytes(
+                b"\xef\xbb\xbf" + '{"message":"中文"}'.encode("utf-8")
+            )
+            with self.assertRaises(json.JSONDecodeError):
+                run_step.read_json(invalid_path)
+
     def test_internal_tool_failure_reason_is_recorded_as_system_block(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp) / ".upgrade-report"
@@ -1507,6 +1516,82 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertNotRegex(text, r"\b[Ss]tep\d+\b")
             self.assertNotIn("main_state", text)
             self.assertNotIn("退出码", text)
+
+    def test_completed_step_publishes_compact_resume_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / ".upgrade-report"
+            output = (
+                report_dir
+                / "evidence"
+                / "static_scan"
+                / "s3_jdk_removed_api.csv"
+            )
+            output.parent.mkdir(parents=True)
+            output.write_text("api\n", encoding="utf-8")
+            state = run_step.new_main_state(report_dir)
+
+            run_step.persist_completed_step(
+                state,
+                "step3",
+                report_dir,
+                {"project_scope": {}},
+            )
+
+            summary_path = run_step.last_step_summary_path(report_dir)
+            summary_bytes = summary_path.read_bytes()
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            resume_text = run_step.resume_context_path(report_dir).read_text(
+                encoding="utf-8"
+            )
+
+        self.assertFalse(summary_bytes.startswith(b"\xef\xbb\xbf"))
+        self.assertEqual(summary["event"], "step_completed")
+        self.assertEqual(summary["last_step"]["step_id"], "step3")
+        self.assertTrue(summary["last_step"]["completed"])
+        self.assertEqual(summary["workflow_state"]["current_step"], "step4")
+        self.assertFalse(summary["needs_user_input"])
+        self.assertIn(
+            "evidence/static_scan/s3_jdk_removed_api.csv",
+            summary["outputs"],
+        )
+        self.assertIn("## 可直接转述的状态", resume_text)
+        self.assertIn("兼容性线索", resume_text)
+        self.assertIn("继续执行依赖 API 变化", resume_text)
+
+    def test_completed_checkpoint_snapshot_names_required_user_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / ".upgrade-report"
+            state = run_step.new_main_state(report_dir)
+            interaction = {
+                "step_id": "step4",
+                "status": "awaiting_user_input",
+                "question": "请选择全量分析或指定依赖。",
+                "options": [{"id": "continue", "label": "全量分析"}],
+            }
+
+            run_step.persist_step_interaction(
+                state,
+                "step4",
+                report_dir,
+                {"project_scope": {}},
+                interaction,
+            )
+            summary = run_step.read_json(
+                run_step.last_step_summary_path(report_dir)
+            )
+            resume_text = run_step.resume_context_path(report_dir).read_text(
+                encoding="utf-8"
+            )
+
+        self.assertEqual(summary["event"], "step_completed_awaiting_user")
+        self.assertTrue(summary["last_step"]["completed"])
+        self.assertTrue(summary["needs_user_input"])
+        self.assertEqual(
+            summary["user_input"]["question"],
+            "请选择全量分析或指定依赖。",
+        )
+        self.assertIn("是否需要用户输入：是", resume_text)
+        self.assertIn("请选择全量分析或指定依赖", resume_text)
 
     def test_environment_block_message_names_only_failed_prerequisites_and_preserves_business_input(self):
         text = "\n".join(
@@ -3378,11 +3463,11 @@ class RunStepMainStateTest(unittest.TestCase):
                         "reachable": 1,
                         "not_impacted": 1,
                         "user_conclusion_summary": {
-                            "已确认影响": 1,
-                            "可能影响": 2,
-                            "已确认不受影响": 1,
-                            "当前无法确认": 3,
-                            "需要补充输入": 4,
+                            "confirmed_impact": 1,
+                            "probable_impact": 2,
+                            "confirmed_no_impact": 1,
+                            "inconclusive": 3,
+                            "input_required": 4,
                         },
                         "quality_gate": {"inconclusive": 3, "needs_input": 4},
                         "uncertain_apis": [

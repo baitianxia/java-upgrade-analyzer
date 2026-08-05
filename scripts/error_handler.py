@@ -73,7 +73,10 @@ GUIDANCE = {
     },
     'DATA_EMPTY': {
         'step1_scope_empty': {
-            'diagnosis': ['mvn -pl <module> -am -DskipTests package', 'mvn -pl <module> -am -DskipTests dependency:list -DincludeScope=runtime'],
+            'diagnosis': [
+                'mvn -pl <module> -am -Dmaven.test.skip=true package',
+                'mvn -pl <module> -am -Dmaven.test.skip=true dependency:list -DincludeScope=runtime',
+            ],
             'actions':   ['确认目标模块 package 成功（无报错）',
                           '确认当前模块最终产物或 runtime 依赖结果非空'],
         }
