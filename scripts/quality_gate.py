@@ -95,8 +95,39 @@ PLATFORM_CONTRACT_TESTS = [
         "test_user_scenario_workspace_follows_portable_report_root"
     ),
     (
+        "tests.test_quality_gate.QualityGateTest."
+        "test_every_profile_runs_shared_script_boundary_regressions"
+    ),
+    (
         "tests.test_real_project_regression.RealProjectRegressionTest."
         "test_default_report_root_uses_platform_temp_directory"
+    ),
+]
+
+SHARED_SCRIPT_BOUNDARY_TESTS = [
+    (
+        "tests.test_step1_packaged_deps.Step1PackagedDepsTest."
+        "test_merge_runtime_artifact_record_ignores_blank_identity"
+    ),
+    (
+        "tests.test_step1_packaged_deps.Step1PackagedDepsTest."
+        "test_merge_runtime_artifact_record_initializes_without_mutating_input"
+    ),
+    (
+        "tests.test_step1_packaged_deps.Step1PackagedDepsTest."
+        "test_merge_runtime_artifact_record_preserves_and_deduplicates_evidence"
+    ),
+    (
+        "tests.test_artifact_safety.ArtifactSafetyTest."
+        "test_inspect_archive_rejects_missing_and_non_file_paths_without_scanning"
+    ),
+    (
+        "tests.test_artifact_safety.ArtifactSafetyTest."
+        "test_inspect_archive_distinguishes_read_failure_from_invalid_format"
+    ),
+    (
+        "tests.test_artifact_safety.ArtifactSafetyTest."
+        "test_inspect_archive_forwards_explicit_limits"
     ),
 ]
 
@@ -182,6 +213,15 @@ def _platform_contract_task(python_exe):
         "platform_compatibility",
         PLATFORM_CONTRACT_TESTS,
         "Linux、macOS、Windows 的导入、路径、命令、权限及临时目录契约",
+    )
+
+
+def _shared_script_boundary_task(python_exe):
+    return _unittest_task(
+        python_exe,
+        "shared_script_boundaries",
+        SHARED_SCRIPT_BOUNDARY_TESTS,
+        "全局共享脚本的运行时依赖合并与归档读取边界回归",
     )
 
 
@@ -446,6 +486,7 @@ def build_plan(profile, python_exe=None, skip_real=True, real_case="guard", repo
         _environment_contract_task(require_maven=profile in {"step5", "release"}),
         _py_compile_task(python_exe),
         _platform_contract_task(python_exe),
+        _shared_script_boundary_task(python_exe),
         _oracle_independence_task(python_exe),
     ]
     audit_root = Path(report_root) if report_root else DEFAULT_AUDIT_ROOT

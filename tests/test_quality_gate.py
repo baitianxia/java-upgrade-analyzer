@@ -85,6 +85,28 @@ class QualityGateTest(unittest.TestCase):
                 self.assertIn("tests.test_platform_contract", task.command)
                 self.assertIn("tests.test_build_tool_selection", task.command)
 
+    def test_every_profile_runs_shared_script_boundary_regressions(self):
+        for profile in ("quick", "step5", "release"):
+            with self.subTest(profile=profile):
+                tasks = quality_gate.build_plan(profile, skip_real=True)
+                task = next(
+                    item for item in tasks
+                    if item.name == "shared_script_boundaries"
+                )
+
+                self.assertEqual(
+                    task.command[3:],
+                    quality_gate.SHARED_SCRIPT_BOUNDARY_TESTS,
+                )
+                self.assertTrue(any(
+                    "test_merge_runtime_artifact_record" in test_id
+                    for test_id in task.command
+                ))
+                self.assertTrue(any(
+                    "test_inspect_archive" in test_id
+                    for test_id in task.command
+                ))
+
     def test_release_profile_has_explicit_production_mutation_gate(self):
         tasks = quality_gate.build_plan("release", skip_real=True)
         task = next(item for item in tasks if item.name == "production_mutations")

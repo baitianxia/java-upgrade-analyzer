@@ -53,6 +53,78 @@ class ArtifactSafetyTest(unittest.TestCase):
         self.assertEqual(result.entry_count, 2)
         self.assertEqual(result.reason_codes, ())
 
+    def test_inspect_archive_rejects_missing_and_non_file_paths_without_scanning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            cases = (directory / "missing.jar", directory)
+            with patch.object(
+                artifact_safety,
+                "_inspect_archive_source",
+            ) as inspect_mock:
+                results = [artifact_safety.inspect_archive(path) for path in cases]
+
+        inspect_mock.assert_not_called()
+        for result in results:
+            with self.subTest(result=result):
+                self.assertFalse(result.safe)
+                self.assertEqual(result.reason_codes, ("ARCHIVE_READ_FAILED",))
+                self.assertEqual(result.entry_count, 0)
+                self.assertEqual(result.total_uncompressed_bytes, 0)
+
+    def test_inspect_archive_distinguishes_read_failure_from_invalid_format(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            unreadable = Path(tmp) / "unreadable.jar"
+            invalid = Path(tmp) / "invalid.jar"
+            unreadable.write_bytes(b"placeholder")
+            invalid.write_bytes(b"not-a-zip")
+
+            with patch.object(
+                zipfile,
+                "ZipFile",
+                side_effect=OSError("permission denied"),
+            ):
+                unreadable_result = artifact_safety.inspect_archive(unreadable)
+            invalid_result = artifact_safety.inspect_archive(invalid)
+
+        self.assertEqual(
+            unreadable_result.reason_codes,
+            ("ARCHIVE_READ_FAILED",),
+        )
+        self.assertEqual(
+            invalid_result.reason_codes,
+            ("ARCHIVE_FORMAT_INVALID",),
+        )
+
+    def test_inspect_archive_forwards_explicit_limits(self):
+        expected = artifact_safety.ArchiveSafetyResult(
+            safe=True,
+            reason_codes=(),
+            entry_count=0,
+            total_uncompressed_bytes=0,
+            nested_archives=0,
+            max_observed_depth=0,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "empty.jar"
+            artifact.write_bytes(b"placeholder")
+            with patch.object(
+                artifact_safety,
+                "_inspect_archive_source",
+                return_value=expected,
+            ) as inspect_mock:
+                result = artifact_safety.inspect_archive(
+                    str(artifact),
+                    max_entries=7,
+                    inspect_nested_archives=False,
+                )
+
+        self.assertIs(result, expected)
+        inspect_mock.assert_called_once_with(
+            artifact,
+            max_entries=7,
+            inspect_nested_archives=False,
+        )
+
     def test_default_internal_policy_allows_high_expansion_ratio(self):
         payload = _archive_bytes([("large.bin", b"0" * 1024 * 1024)])
 

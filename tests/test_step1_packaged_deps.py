@@ -1078,6 +1078,89 @@ class Step1PackagedDepsTest(unittest.TestCase):
             parsed["org.example:demo"]["runtime_version_conflict"]
         )
 
+    def test_merge_runtime_artifact_record_ignores_blank_identity(self):
+        deps = {"org.example:kept": {"version": "1.0"}}
+
+        for item in ({}, {"key": ""}, {"key": "   ", "version": "2.0"}):
+            with self.subTest(item=item):
+                s1_dep_diff._merge_runtime_artifact_record(deps, item)
+
+        self.assertEqual(deps, {"org.example:kept": {"version": "1.0"}})
+
+    def test_merge_runtime_artifact_record_initializes_without_mutating_input(self):
+        item = {
+            "key": "org.example:demo",
+            "version": "1.0",
+            "artifact_file_name": "demo-1.0.jar",
+            "artifact_file_path": "/repo/demo-1.0.jar",
+        }
+        original = dict(item)
+        deps = {}
+
+        s1_dep_diff._merge_runtime_artifact_record(deps, item)
+
+        self.assertEqual(item, original)
+        self.assertEqual(
+            deps["org.example:demo"]["observed_versions"],
+            ["1.0"],
+        )
+        self.assertFalse(
+            deps["org.example:demo"]["runtime_version_conflict"]
+        )
+        self.assertEqual(
+            deps["org.example:demo"]["artifact_file_names"],
+            ["demo-1.0.jar"],
+        )
+        self.assertEqual(
+            deps["org.example:demo"]["artifact_file_paths"],
+            ["/repo/demo-1.0.jar"],
+        )
+
+    def test_merge_runtime_artifact_record_preserves_and_deduplicates_evidence(self):
+        deps = {
+            "org.example:demo": {
+                "key": "org.example:demo",
+                "version": "1.0",
+                "observed_versions": ["1.0", " 1.0 ", ""],
+                "artifact_file_name": "demo-1.0.jar",
+                "artifact_file_path": "/repo/demo-1.0.jar",
+            }
+        }
+        incoming = {
+            "key": "org.example:demo",
+            "version": "2.0",
+            "observed_versions": ["2.0", "3.0", "  "],
+            "artifact_file_name": "demo-2.0.jar",
+            "artifact_file_names": ["demo-2.0.jar", "demo-3.0.jar"],
+            "artifact_file_path": "/repo/demo-2.0.jar",
+            "artifact_file_paths": ["/repo/demo-2.0.jar", "/repo/demo-3.0.jar"],
+        }
+        original = {
+            key: list(value) if isinstance(value, list) else value
+            for key, value in incoming.items()
+        }
+
+        s1_dep_diff._merge_runtime_artifact_record(deps, incoming)
+        s1_dep_diff._merge_runtime_artifact_record(deps, incoming)
+
+        merged = deps["org.example:demo"]
+        self.assertEqual(incoming, original)
+        self.assertEqual(merged["version"], "1.0")
+        self.assertEqual(merged["observed_versions"], ["1.0", "2.0", "3.0"])
+        self.assertTrue(merged["runtime_version_conflict"])
+        self.assertEqual(
+            merged["artifact_file_names"],
+            ["demo-1.0.jar", "demo-2.0.jar", "demo-3.0.jar"],
+        )
+        self.assertEqual(
+            merged["artifact_file_paths"],
+            [
+                "/repo/demo-1.0.jar",
+                "/repo/demo-2.0.jar",
+                "/repo/demo-3.0.jar",
+            ],
+        )
+
     def test_dependency_list_parser_ignores_absolute_artifact_filename(self):
         samples = (
             "[INFO] org.ow2.asm:asm-util:jar:7.1:runtime:"

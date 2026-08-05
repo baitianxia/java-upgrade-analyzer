@@ -3260,43 +3260,67 @@ def _merge_runtime_artifact_record(deps, item):
     key = str((item or {}).get('key') or '').strip()
     if not key:
         return
+
+    def normalized_values(*groups):
+        values = []
+        seen = set()
+        for group in groups:
+            candidates = group if isinstance(group, (list, tuple)) else [group]
+            for candidate in candidates:
+                value = str(candidate or '').strip()
+                if value and value not in seen:
+                    seen.add(value)
+                    values.append(value)
+        return values
+
     existing = deps.get(key)
     if existing is None:
-        version = str(item.get('version') or '').strip()
-        item['observed_versions'] = [version] if version else []
-        names = [
-            str(item.get('artifact_file_name') or '').strip()
-        ]
-        paths = [
-            str(item.get('artifact_file_path') or '').strip()
-        ]
-        item['artifact_file_names'] = [value for value in names if value]
-        item['artifact_file_paths'] = [value for value in paths if value]
-        deps[key] = item
+        record = dict(item)
+        record['key'] = key
+        observed_versions = normalized_values(
+            record.get('observed_versions'),
+            record.get('version'),
+        )
+        record['observed_versions'] = observed_versions
+        record['runtime_version_conflict'] = len(observed_versions) > 1
+        for singular, plural in (
+            ('artifact_file_name', 'artifact_file_names'),
+            ('artifact_file_path', 'artifact_file_paths'),
+        ):
+            values = normalized_values(
+                record.get(singular),
+                record.get(plural),
+            )
+            record[plural] = values
+            if values:
+                record[singular] = values[0]
+        deps[key] = record
         return
     # dependency:list/runtime inventory is only a coordinate-enrichment source.
     # Reactor modules can legitimately resolve different versions of the same
     # coordinate, so retain those versions as diagnostics without selecting one
     # or blocking final-artifact analysis.
-    observed_versions = list(existing.get('observed_versions') or [])
-    existing_version = str(existing.get('version') or '').strip()
-    incoming_version = str(item.get('version') or '').strip()
-    for version in (existing_version, incoming_version):
-        if version and version not in observed_versions:
-            observed_versions.append(version)
+    observed_versions = normalized_values(
+        existing.get('observed_versions'),
+        existing.get('version'),
+        item.get('observed_versions'),
+        item.get('version'),
+    )
     existing['observed_versions'] = observed_versions
     existing['runtime_version_conflict'] = len(observed_versions) > 1
     for singular, plural in (
         ('artifact_file_name', 'artifact_file_names'),
         ('artifact_file_path', 'artifact_file_paths'),
     ):
-        values = list(existing.get(plural) or [])
-        value = str(item.get(singular) or '').strip()
-        if value and value not in values:
-            values.append(value)
+        values = normalized_values(
+            existing.get(singular),
+            existing.get(plural),
+            item.get(singular),
+            item.get(plural),
+        )
         existing[plural] = values
-        if not existing.get(singular) and value:
-            existing[singular] = value
+        if values:
+            existing[singular] = values[0]
 
 
 def _runtime_artifact_versions(item):

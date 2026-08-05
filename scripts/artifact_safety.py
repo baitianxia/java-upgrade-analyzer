@@ -169,7 +169,15 @@ def _inspect_archive_source(
                         continue
                     if is_nested and inspect_nested_archives:
                         inspect(nested_payload, depth + 1, info.filename)
-        except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
+        except OSError:
+            reason = (
+                "ARCHIVE_READ_FAILED"
+                if depth == 0 and isinstance(payload, (str, Path))
+                else "ARCHIVE_FORMAT_INVALID"
+            )
+            reasons.add(reason)
+            details.add(f"{reason}:{location}")
+        except (RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
             reasons.add("ARCHIVE_FORMAT_INVALID")
             details.add(f"ARCHIVE_FORMAT_INVALID:{location}")
 
