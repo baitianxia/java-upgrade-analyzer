@@ -1221,12 +1221,27 @@ def build_environment_block_message(environment):
     )
     if python_only:
         lines.append(
-            f"下一步：授权准备产品运行依赖后，在 `{SKILL_DIR}` 使用 CPython 3.12–3.14 执行 "
+            f"下一步：授权准备产品运行依赖后，在 `{SKILL_DIR}` 使用 CPython 3.10 或更高版本执行 "
             "`scripts/bootstrap_runtime.py`；完成后重新运行分析。"
         )
     else:
         lines.append("下一步：补齐上面列出的外部运行前提后重新运行；业务输入和分析范围无需修改。")
     return lines
+
+
+def build_environment_warning_messages(environment):
+    lines = []
+    for warning in (environment or {}).get("warnings") or []:
+        if warning.get("reason") != "python_version_not_ci_verified":
+            continue
+        lines.append(
+            "⚠️ 当前 "
+            f"{warning.get('observed') or 'Python 版本'}满足最低运行要求，但尚未进入 CI 验证矩阵；"
+            "本次将继续执行固定依赖版本、模块导入和后续质量检查。"
+        )
+    return lines
+
+
 def read_csv_rows(path):
     import csv
 
@@ -10229,6 +10244,8 @@ def main(argv=None, _skip_environment_contract=False):
         for line in build_environment_block_message(environment):
             print(line, file=sys.stderr)
         return 1
+    for line in build_environment_warning_messages(environment):
+        print(line, file=sys.stderr)
 
     if not project_dir.is_dir():
         print(f"❌ 项目目录不存在：{project_dir}", file=sys.stderr)

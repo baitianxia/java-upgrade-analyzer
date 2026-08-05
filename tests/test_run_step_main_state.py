@@ -1691,7 +1691,7 @@ class RunStepMainStateTest(unittest.TestCase):
                             "component": "python",
                             "status": "passed",
                             "observed": "CPython 3.12.9",
-                            "expected": "CPython 3.12.x",
+                            "expected": "CPython 3.10 or newer",
                         },
                         {
                             "component": "tool:mvn",
@@ -1708,6 +1708,26 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertNotIn("Python 运行时：", text)
         self.assertIn("业务输入和分析范围无需修改", text)
         self.assertNotIn("action=", text)
+
+    def test_environment_warning_explains_unverified_python_without_blocking(self):
+        lines = run_step.build_environment_warning_messages(
+            {
+                "status": "passed",
+                "warnings": [
+                    {
+                        "component": "python",
+                        "status": "warning",
+                        "observed": "CPython 3.11.9",
+                        "expected": "CPython 3.10 or newer",
+                        "reason": "python_version_not_ci_verified",
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(len(lines), 1)
+        self.assertIn("满足最低运行要求", lines[0])
+        self.assertIn("尚未进入 CI 验证矩阵", lines[0])
 
     def test_final_completion_summary_marks_partial_scope_and_uncertainty_as_limited(self):
         with tempfile.TemporaryDirectory() as tmp:

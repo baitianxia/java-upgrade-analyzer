@@ -149,10 +149,14 @@ def _run_environment_contract_task(task):
         require_maven=task.command == ["with_maven"],
     )
     failures = [item for item in payload["checks"] if item["status"] != "passed"]
+    warnings = payload.get("warnings") or []
     status = payload["status"]
     purpose = task.purpose + (
         "；失败：" + ", ".join(item["component"] for item in failures)
         if failures else ""
+    ) + (
+        "；提示：" + ", ".join(item["reason"] for item in warnings)
+        if warnings else ""
     )
     result = GateResult(
         name=task.name,
@@ -172,6 +176,13 @@ def _run_environment_contract_task(task):
             "[quality-gate] environment contract failure: "
             f"{failure['component']} observed={failure['observed']} "
             f"expected={failure['expected']} reason={failure['reason']}",
+            flush=True,
+        )
+    for warning in warnings:
+        print(
+            "[quality-gate] environment contract warning: "
+            f"{warning['component']} observed={warning['observed']} "
+            f"expected={warning['expected']} reason={warning['reason']}",
             flush=True,
         )
     return result

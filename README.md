@@ -408,7 +408,7 @@ Step4 需要 JApiCmp 做 JAR API 对比。
 
 默认会按系统环境错误阻断，不会生成用户确认，也不会静默降级。
 
-运行环境支持 CPython 3.12.x、3.13.x 和 3.14.x，并在 Skill 根目录用当前受支持的解释器显式执行 `python3 scripts/bootstrap_runtime.py` 安装固定版本的 `tree-sitter` 与 `tree-sitter-java`。PR quick 门禁会在三个 Python 小版本上分别执行。离线环境可增加 `--wheel-dir /abs/path/to/wheels`，安装过程会禁止访问包索引。分析运行时不会联网安装；依赖缺失、版本不符或加载失败时会在分析前明确停止，安装完成前不会使用增强正则继续分析。
+最低运行要求为 CPython 3.10；当前 CI 已验证 3.12.x、3.13.x 和 3.14.x。使用其他满足最低要求的小版本时，预检会明确提示“尚未进入 CI 验证矩阵”，并在固定依赖版本及模块导入检查通过后继续，不会把“未经验证”误报成“不兼容”。在 Skill 根目录显式执行 `python3 scripts/bootstrap_runtime.py` 安装固定版本的 `tree-sitter` 与 `tree-sitter-java`。离线环境可增加 `--wheel-dir /abs/path/to/wheels`，安装过程会禁止访问包索引。分析运行时不会联网安装；Python 低于最低版本、依赖缺失、版本不符或加载失败时会在分析前明确停止，安装完成前不会使用增强正则继续分析。
 
 不安装 tree-sitter 的后果是：Java AST 主链路不可用，源码调用链、重载签名、lambda、构造器、方法引用、局部变量类型传播等识别能力会下降。
 

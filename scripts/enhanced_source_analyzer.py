@@ -1212,7 +1212,7 @@ class TreeSitterAnalyzer:
 
     需安装：
       使用当前执行解释器安装，避免装到错误环境：
-      <CPython 3.12–3.14> scripts/bootstrap_runtime.py
+      <CPython 3.10+> scripts/bootstrap_runtime.py
     """
 
     def __init__(self, file_path, source_root):

@@ -7,6 +7,12 @@ import platform
 import subprocess
 import sys
 
+from runtime_contract import (
+    is_python_runtime_compatible,
+    python_runtime_expectation,
+    python_runtime_warning,
+)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 REQUIREMENTS = ROOT / "requirements-runtime.txt"
@@ -30,12 +36,20 @@ def main(argv=None):
     )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
-    if (
-        platform.python_implementation() != "CPython"
-        or sys.version_info[:2] not in {(3, 12), (3, 13), (3, 14)}
-    ):
+    implementation = platform.python_implementation()
+    version = sys.version_info[:2]
+    if not is_python_runtime_compatible(implementation, version):
         parser.error(
-            f"unsupported Python {sys.version.split()[0]}; use CPython 3.12.x, 3.13.x, or 3.14.x"
+            f"unsupported Python {implementation} {sys.version.split()[0]}; "
+            f"use {python_runtime_expectation()}"
+        )
+    warning = python_runtime_warning(implementation, version)
+    if warning:
+        print(
+            f"warning: {warning['observed']} meets the minimum runtime requirement "
+            "but is not in the CI-verified Python matrix; continuing with pinned "
+            "dependency installation and import validation",
+            file=sys.stderr,
         )
     command = build_command(args.wheel_dir)
     if args.dry_run:

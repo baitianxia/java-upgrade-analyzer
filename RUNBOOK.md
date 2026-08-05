@@ -101,10 +101,10 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 
 ### tree-sitter 安装
 
-- 分析器正式支持 CPython 3.12.x/3.13.x/3.14.x 与 Linux/macOS/Windows。JDK、Maven、Gradle 版本以 base/current 工程为准，不设全局最低版本；优先使用各 revision 的 `mvnw` / `gradlew` 和对应侧 JDK。
+- 分析器最低要求为 CPython 3.10；PR quick 在 Ubuntu 上验证 3.12.x/3.13.x/3.14.x，平台矩阵使用 3.12 验证 Linux/macOS/Windows。其他满足最低要求的小版本会记录未进入 CI 矩阵的提示，并在固定依赖版本和 import 检查通过后继续。JDK、Maven、Gradle 版本以 base/current 工程为准，不设全局最低版本；优先使用各 revision 的 `mvnw` / `gradlew` 和对应侧 JDK。
 - Windows 下所有步骤共用统一的短路径运行时：Git 命令自动带 `core.longpaths=true`；Step1/Step2 的 detached worktree 使用短名称，失败后定向清理本次注册并切换备用根目录；Step3–Step5 的源码快照、JAR/class 解压、`javap`/`jdeps`/JaCoCo 和排序缓存使用短临时根；Step4/Step5 的坐标、版本和 API 派生文件名会做定长截断并附稳定哈希。系统不会修改用户全局 Git 配置，一般无需人工干预。`JUA_SHORT_TEMP_ROOT` 可选指定一个可写的短目录（例如 `C:\jua-tmp`）；旧的 `JUA_STEP1_WORKTREE_ROOT` 仍兼容，但不再建议使用。只有所有候选目录都不可写，或下游旧版构建插件本身不支持长路径时才会阻塞。
 - 安装版本以根目录 `requirements-runtime.txt` 为唯一清单；Step5 运行时不会联网安装或修改 Python 环境。
-- 在仓库根目录使用任一受支持的 CPython 3.12–3.14 执行显式 bootstrap：
+- 在仓库根目录使用 CPython 3.10 或更高版本执行显式 bootstrap：
 
 ```bash
 python3 scripts/bootstrap_runtime.py

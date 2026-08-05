@@ -1,5 +1,7 @@
 import sys
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -12,10 +14,48 @@ import runtime_contract  # noqa: E402
 
 
 class RuntimeContractTest(unittest.TestCase):
-    def test_supported_python_matrix_covers_current_maintained_contract(self):
+    def test_python_policy_separates_minimum_from_ci_verified_matrix(self):
+        self.assertEqual(runtime_contract.MINIMUM_PYTHON, (3, 10))
         self.assertEqual(
-            runtime_contract.SUPPORTED_PYTHON,
+            runtime_contract.CI_VERIFIED_PYTHON,
             {(3, 12), (3, 13), (3, 14)},
+        )
+
+    def test_python_policy_accepts_unverified_minor_above_minimum(self):
+        self.assertTrue(
+            runtime_contract.is_python_runtime_compatible("CPython", (3, 11))
+        )
+        warning = runtime_contract.python_runtime_warning(
+            "CPython",
+            (3, 11),
+            "3.11.9",
+        )
+        self.assertIsNotNone(warning)
+        self.assertEqual(warning["reason"], "python_version_not_ci_verified")
+
+    def test_python_policy_rejects_below_minimum_and_unverified_implementation(self):
+        self.assertFalse(
+            runtime_contract.is_python_runtime_compatible("CPython", (3, 9))
+        )
+        self.assertFalse(
+            runtime_contract.is_python_runtime_compatible("PyPy", (3, 14))
+        )
+
+    def test_contract_payload_reports_unverified_minor_as_nonblocking_warning(self):
+        with patch.object(runtime_contract, "_run", return_value=(True, "git version 2.45.0")), \
+                patch.object(runtime_contract.metadata, "version", side_effect=lambda name: runtime_contract.REQUIRED_PACKAGES[name]), \
+                patch.object(runtime_contract.importlib, "import_module", return_value=object()), \
+                patch.object(runtime_contract.platform, "python_implementation", return_value="CPython"), \
+                patch.object(runtime_contract.platform, "python_version", return_value="3.11.9"), \
+                patch.object(runtime_contract.platform, "system", return_value="Linux"), \
+                patch.object(runtime_contract.sys, "version_info", (3, 11, 9)):
+            payload = runtime_contract.contract_payload()
+
+        self.assertEqual(payload["status"], "passed")
+        self.assertEqual(len(payload["warnings"]), 1)
+        self.assertEqual(
+            payload["warnings"][0]["reason"],
+            "python_version_not_ci_verified",
         )
 
     def test_runtime_requirements_are_exactly_pinned(self):
@@ -34,6 +74,31 @@ class RuntimeContractTest(unittest.TestCase):
         self.assertIn("--no-index", command)
         self.assertIn("--find-links", command)
         self.assertIn("--requirement", command)
+
+    def test_bootstrap_accepts_unverified_minor_and_prints_warning(self):
+        stdout = StringIO()
+        stderr = StringIO()
+        with patch.object(bootstrap_runtime.platform, "python_implementation", return_value="CPython"), \
+                patch.object(bootstrap_runtime.platform, "python_version", return_value="3.11.9"), \
+                patch.object(bootstrap_runtime.sys, "version_info", (3, 11, 9)), \
+                patch.object(bootstrap_runtime.sys, "version", "3.11.9 (test)"), \
+                redirect_stdout(stdout), redirect_stderr(stderr):
+            returncode = bootstrap_runtime.main(["--dry-run"])
+
+        self.assertEqual(returncode, 0)
+        self.assertIn("pip install", stdout.getvalue())
+        self.assertIn("not in the CI-verified Python matrix", stderr.getvalue())
+
+    def test_bootstrap_rejects_python_below_minimum(self):
+        stderr = StringIO()
+        with patch.object(bootstrap_runtime.platform, "python_implementation", return_value="CPython"), \
+                patch.object(bootstrap_runtime.sys, "version_info", (3, 9, 19)), \
+                patch.object(bootstrap_runtime.sys, "version", "3.9.19 (test)"), \
+                redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
+            bootstrap_runtime.main(["--dry-run"])
+
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("CPython 3.10 or newer", stderr.getvalue())
 
     def test_jdk_major_supports_legacy_and_modern_version_formats(self):
         self.assertEqual(runtime_contract._jdk_major('java version "1.8.0_402"'), 8)

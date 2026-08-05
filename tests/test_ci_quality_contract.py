@@ -172,6 +172,33 @@ class CiQualityContractTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("javap", result.purpose)
 
+    def test_environment_preflight_records_unverified_python_without_failing(self):
+        task = quality_gate._environment_contract_task()
+        with patch.object(
+            quality_gate,
+            "contract_payload",
+            return_value={
+                "status": "passed",
+                "checks": [{
+                    "component": "python", "status": "passed",
+                    "observed": "CPython 3.11.9",
+                    "expected": "CPython 3.10 or newer",
+                    "reason": "",
+                }],
+                "warnings": [{
+                    "component": "python", "status": "warning",
+                    "observed": "CPython 3.11.9",
+                    "expected": "CPython 3.10 or newer",
+                    "reason": "python_version_not_ci_verified",
+                }],
+            },
+        ):
+            result = quality_gate._run_environment_contract_task(task)
+
+        self.assertEqual(result.status, "passed")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("python_version_not_ci_verified", result.purpose)
+
 
 if __name__ == "__main__":
     unittest.main()

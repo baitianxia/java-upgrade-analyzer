@@ -15,7 +15,9 @@ import sys
 from compat import find_executable, gradle_cmd, mvn_cmd
 
 
-SUPPORTED_PYTHON = {(3, 12), (3, 13), (3, 14)}
+MINIMUM_PYTHON = (3, 10)
+CI_VERIFIED_PYTHON = {(3, 12), (3, 13), (3, 14)}
+REQUIRED_PYTHON_IMPLEMENTATION = "CPython"
 SUPPORTED_PLATFORMS = {"Linux", "Darwin", "Windows"}
 REQUIREMENTS_FILE = Path(__file__).resolve().parents[1] / "requirements-runtime.txt"
 
@@ -53,6 +55,42 @@ def _check(component, ok, observed, expected, reason=""):
         expected=expected,
         reason="" if ok else reason,
     )
+
+
+def python_runtime_expectation():
+    verified = ", ".join(
+        f"{major}.{minor}.x" for major, minor in sorted(CI_VERIFIED_PYTHON)
+    )
+    return (
+        f"{REQUIRED_PYTHON_IMPLEMENTATION} {MINIMUM_PYTHON[0]}.{MINIMUM_PYTHON[1]} "
+        f"or newer (CI-verified: {verified})"
+    )
+
+
+def is_python_runtime_compatible(implementation=None, version=None):
+    implementation = implementation or platform.python_implementation()
+    version = tuple(version or sys.version_info[:2])[:2]
+    return (
+        implementation == REQUIRED_PYTHON_IMPLEMENTATION
+        and version >= MINIMUM_PYTHON
+    )
+
+
+def python_runtime_warning(implementation=None, version=None, version_text=None):
+    implementation = implementation or platform.python_implementation()
+    version = tuple(version or sys.version_info[:2])[:2]
+    if not is_python_runtime_compatible(implementation, version):
+        return None
+    if version in CI_VERIFIED_PYTHON:
+        return None
+    observed_version = version_text or platform.python_version()
+    return {
+        "component": "python",
+        "status": "warning",
+        "observed": f"{implementation} {observed_version}",
+        "expected": python_runtime_expectation(),
+        "reason": "python_version_not_ci_verified",
+    }
 
 
 def _run(command, timeout=15):
@@ -116,12 +154,22 @@ def validate_runtime_contract(
     checks = []
     python_version = sys.version_info[:2]
     python_implementation = platform.python_implementation()
+    python_ok = is_python_runtime_compatible(
+        python_implementation,
+        python_version,
+    )
+    if python_implementation != REQUIRED_PYTHON_IMPLEMENTATION:
+        python_reason = "unsupported_python_implementation; use CPython"
+    elif python_version < MINIMUM_PYTHON:
+        python_reason = "python_below_minimum; use CPython 3.10 or newer"
+    else:
+        python_reason = ""
     checks.append(_check(
         "python",
-        python_implementation == "CPython" and python_version in SUPPORTED_PYTHON,
+        python_ok,
         f"{python_implementation} {platform.python_version()}",
-        "CPython 3.12.x, 3.13.x, or 3.14.x",
-        "unsupported_python; run the bootstrap with CPython 3.12-3.14",
+        python_runtime_expectation(),
+        python_reason,
     ))
     system = platform.system()
     checks.append(_check(
@@ -189,4 +237,5 @@ def contract_payload(
     return {
         "status": "passed" if all(item.status == "passed" for item in checks) else "failed",
         "checks": [asdict(item) for item in checks],
+        "warnings": [warning] if (warning := python_runtime_warning()) else [],
     }

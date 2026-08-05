@@ -172,9 +172,9 @@ if gate failed or step blocked:
 2. 正式流程默认通过 `scripts/run_step.py` 调度；单独运行某个脚本不等价于完整主状态流程。
 3. 即使是正式流程里的恢复/重建动作，也不能把业务参数通过单步脚本 CLI 重新透传；恢复时仍应以 `main_state.json` 为唯一业务参数源。
 
-Step5 必须使用 `tree-sitter` 做 Java AST 分析。分析器自身的正式运行契约为 CPython 3.12.x/3.13.x/3.14.x 和 Linux/macOS/Windows，Python 依赖版本由 `requirements-runtime.txt` 固定。JDK、Maven、Gradle 属于用户工程构建环境，不设分析器级版本下限：base/current 各自在隔离 worktree 中优先使用该 revision 的 `mvnw` / `gradlew`，没有 Wrapper 时才回落 PATH；JDK 使用该侧 `base_jdk_home/current_jdk_home`，未提供时回落宿主机 `JAVA_HOME`。Wrapper 对应 distribution 必须已可用，分析期间不得联网替换成其他版本。Python 运行依赖缺少、版本不符或加载失败时必须在分析前失败并记录系统环境阻塞，不得伪装成需要用户确认的业务 checkpoint，也不允许继续用增强正则生成分析结论。
+Step5 必须使用 `tree-sitter` 做 Java AST 分析。分析器自身的最低运行要求为 CPython 3.10；PR quick 在 Ubuntu 上验证 CPython 3.12.x/3.13.x/3.14.x，平台矩阵使用 3.12 验证 Linux/macOS/Windows，Python 依赖版本由 `requirements-runtime.txt` 固定。满足最低要求但未进入 CI 验证矩阵的小版本必须记录明确提示，并在固定依赖版本和 import 检查通过后继续，不得误报为版本不兼容。JDK、Maven、Gradle 属于用户工程构建环境，不设分析器级版本下限：base/current 各自在隔离 worktree 中优先使用该 revision 的 `mvnw` / `gradlew`，没有 Wrapper 时才回落 PATH；JDK 使用该侧 `base_jdk_home/current_jdk_home`，未提供时回落宿主机 `JAVA_HOME`。Wrapper 对应 distribution 必须已可用，分析期间不得联网替换成其他版本。Python 低于最低版本、运行依赖缺少、版本不符或加载失败时必须在分析前失败并记录系统环境阻塞，不得伪装成需要用户确认的业务 checkpoint，也不允许继续用增强正则生成分析结论。
 
-首次准备环境时，在 Skill 根目录使用任一受支持的 CPython 3.12–3.14 执行显式 bootstrap：
+首次准备环境时，在 Skill 根目录使用 CPython 3.10 或更高版本执行显式 bootstrap：
 
 ```bash
 python scripts/bootstrap_runtime.py
