@@ -202,14 +202,17 @@ Class.forName("org.apache.commons.lang.StringUtils")
 `summary.json` 不能只输出 `not_analyzed_reason_summary` 的原因码计数。每个进入
 `uncertain` / `not_analyzed` 的主原因，以及 failure ledger 中未成为主原因的阻塞失败，
 都必须进入 `diagnostic_guidance[]`。该数组使用
-`java-upgrade-analyzer.reason-guidance.v2`，至少包含：
+`java-upgrade-analyzer.reason-guidance.v3`，至少包含：
 
 - 稳定 `reason_code`、可读标题和触发条件；
 - 该原因的语义影响，以及本轮实际观察到的 `api` / `path` / `global` 传播范围；旧结果缺少
   typed failure 时必须标为 `unknown`，不能猜测；
-- 受影响 API 数、状态分布和少量 API 样例；
+- 以该原因为主原因的 API 数、按 failure 作用域反推的潜在受影响 API 数、状态分布和少量 API 样例；`affected_api_count` 表示两者并集，不再把 failure 记录数冒充 API 数；
+- failure 记录数与聚合后的物理 occurrence 数；`blocking` 表示该诊断是否实际限制本轮目标 API 结论，API 级 failure 未关联到本轮目标时只保留为覆盖遥测；
 - 采集器、类、JAR、物理 entry、候选 class 哈希和错误摘要；
 - 是否阻断、建议决策、可忽略条件、修复动作和完成标准。
+
+Step6 继续兼容读取 v2：缺少新计数字段时，分别用旧 `affected_api_count` 和 `observed_failure_count` 补齐，不能把旧报告静默显示为 0。
 
 Step6 必须直接消费 `diagnostic_guidance[]` 的诊断事实，不得维护另一套相互冲突的解释。
 主报告只呈现可读标题、观察范围和对结论的客观限制；原因码与物理证据进入诊断明细，

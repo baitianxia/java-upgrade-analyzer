@@ -24,8 +24,13 @@ from diagnostic_contract import (
     diagnostic_contract_metadata,
     reason_code_aliases,
 )
+from signature_utils import (
+    canonical_api_identity,
+    normalize_signature_for_identity,
+    signatures_match_identity,
+)
 
-REASON_GUIDANCE_SCHEMA = "java-upgrade-analyzer.reason-guidance.v2"
+REASON_GUIDANCE_SCHEMA = "java-upgrade-analyzer.reason-guidance.v3"
 _SAMPLE_LIMIT = 5
 _EVIDENCE_LIMIT = 10
 _VALID_ORIGIN_STEPS = {
@@ -376,6 +381,98 @@ def _api_identity(item):
     return " | ".join(pieces)
 
 
+def _canonical_result_identity(item):
+    row = {
+        "coord": _get(item, "coord", ""),
+        "api_name": _get(item, "api_name", "") or _get(item, "api", ""),
+        "api_signature": _get(item, "api_signature", ""),
+        "symbol_kind": _get(item, "symbol_kind", ""),
+        "change_type": _get(item, "change_type", ""),
+    }
+    if not any(str(value or "").strip() for value in row.values()):
+        return ""
+    return canonical_api_identity(row)
+
+
+def _compact_identity(value):
+    return "".join(str(value or "").replace("$", ".").split())
+
+
+def _failure_matches_result(failure, item):
+    scope = str(failure.get("scope") or "global").strip()
+    if scope == "global":
+        return True
+    failure_identity = str(failure.get("api_identity") or "").strip()
+    if not failure_identity:
+        return False
+
+    compact_failure = _compact_identity(failure_identity)
+    explicit_identity = str(_get(item, "api_identity", "") or "").strip()
+    result_identities = {
+        _compact_identity(explicit_identity),
+        _compact_identity(_canonical_result_identity(item)),
+    }
+    result_identities.discard("")
+    if compact_failure in result_identities:
+        return True
+
+    canonical_identity = _canonical_result_identity(item)
+    canonical_parts = canonical_identity.split("|")
+    api_name = str(
+        _get(item, "api_name", "") or _get(item, "api", "") or ""
+    ).strip().replace("$", ".")
+    result_signature = (
+        canonical_parts[2]
+        if len(canonical_parts) > 2
+        else normalize_signature_for_identity(
+            str(_get(item, "api_signature", "") or "").replace("$", ".")
+        )
+    )
+    api_names = {
+        _compact_identity(api_name),
+        _compact_identity(canonical_parts[1] if len(canonical_parts) > 1 else ""),
+    }
+    api_names.discard("")
+    for compact_api_name in api_names:
+        if compact_failure == compact_api_name:
+            return True
+        if not compact_failure.startswith(compact_api_name + "("):
+            continue
+        failure_signature = compact_failure[len(compact_api_name):]
+        if result_signature and signatures_match_identity(
+            failure_signature,
+            result_signature,
+        ):
+            return True
+    return False
+
+
+def _result_failure_lookup_keys(item):
+    canonical_identity = _canonical_result_identity(item)
+    canonical_parts = canonical_identity.split("|")
+    explicit_identity = str(_get(item, "api_identity", "") or "").strip()
+    raw_api_name = str(
+        _get(item, "api_name", "") or _get(item, "api", "") or ""
+    ).strip()
+    api_names = {
+        _compact_identity(raw_api_name),
+        _compact_identity(canonical_parts[1] if len(canonical_parts) > 1 else ""),
+    }
+    api_names.discard("")
+    signature = _compact_identity(
+        canonical_parts[2] if len(canonical_parts) > 2 else ""
+    )
+    exact_identities = {
+        _compact_identity(explicit_identity),
+        _compact_identity(canonical_identity),
+        *api_names,
+    }
+    if signature:
+        exact_identities.update(api_name + signature for api_name in api_names)
+    exact_identities.discard("")
+    return exact_identities, api_names
+
+
 def _unique(values, limit=_EVIDENCE_LIMIT):
     result = []
     for value in values:
@@ -444,12 +541,18 @@ def _detail_summary(detail):
     return text[:500] + ("…" if len(text) > 500 else "")
 
 
-def _scope_explanation(scope, affected_api_count):
-    count_text = (
-        f"本轮 {affected_api_count} 个 API 以该原因为主原因；"
-        if affected_api_count
-        else "本轮没有 API 以该原因为主原因，但 failure ledger 已记录此诊断；"
-    )
+def _scope_explanation(
+    scope,
+    affected_api_count,
+    primary_reason_api_count,
+    blocking,
+):
+    if affected_api_count:
+        count_text = f"本轮 {affected_api_count} 个 API 位于该诊断的传播范围内；"
+    else:
+        count_text = "该 failure ledger 记录未关联到本轮任何目标 API；"
+    if primary_reason_api_count:
+        count_text += f"其中 {primary_reason_api_count} 个 API 以该原因为主原因；"
     if scope == "global":
         return f"{count_text}该失败被分析器记录为全局阻断。"
     if scope == "path":
@@ -458,7 +561,9 @@ def _scope_explanation(scope, affected_api_count):
         return f"{count_text}本轮同时观察到多种传播作用域，需按证据逐项核对。"
     if scope == "unknown":
         return f"{count_text}旧摘要未保留 typed failure 的实际传播作用域。"
-    return f"{count_text}失败按目标 API 隔离。"
+    if blocking:
+        return f"{count_text}失败按目标 API 隔离，并限制这些 API 的结论。"
+    return f"{count_text}失败按目标 API 隔离，不限制本轮其他 API 的结论。"
 
 
 def build_diagnostic_guidance(
@@ -468,9 +573,53 @@ def build_diagnostic_guidance(
     origin_step="step5",
 ):
     """Aggregate result reasons and typed failure evidence into user guidance."""
+    all_results = list(results or ())
+    indexed_results = [
+        (_canonical_result_identity(item) or f"__result_{index}", item)
+        for index, item in enumerate(all_results)
+    ]
+    result_keys_by_object_id = {
+        id(item): identity for identity, item in indexed_results
+    }
+    result_items_by_key = {}
+    result_keys_by_failure_identity = defaultdict(set)
+    result_keys_by_api_name = defaultdict(set)
+    for identity, item in indexed_results:
+        result_items_by_key.setdefault(identity, item)
+        exact_identities, api_names = _result_failure_lookup_keys(item)
+        for exact_identity in exact_identities:
+            result_keys_by_failure_identity[exact_identity].add(identity)
+        for api_name in api_names:
+            result_keys_by_api_name[api_name].add(identity)
+    all_result_keys = set(result_items_by_key)
+    failure_match_cache = {}
+
+    def matching_result_keys(failure):
+        scope = str(failure.get("scope") or "global").strip()
+        if scope == "global":
+            return all_result_keys
+        compact_failure = _compact_identity(failure.get("api_identity"))
+        if not compact_failure:
+            return set()
+        cache_key = (scope, compact_failure)
+        if cache_key in failure_match_cache:
+            return failure_match_cache[cache_key]
+        candidates = set(
+            result_keys_by_failure_identity.get(compact_failure, ())
+        )
+        if "(" in compact_failure and "|" not in compact_failure:
+            api_name = compact_failure.split("(", 1)[0]
+            candidates.update(result_keys_by_api_name.get(api_name, ()))
+        matched = {
+            identity
+            for identity in candidates
+            if _failure_matches_result(failure, result_items_by_key[identity])
+        }
+        failure_match_cache[cache_key] = matched
+        return matched
     grouped_results = defaultdict(list)
     status_counts = defaultdict(lambda: defaultdict(int))
-    for item in results or ():
+    for item in all_results:
         status = str(_get(item, "analysis_status", "") or "").strip()
         reason_code = canonical_reason_code(
             _get(item, "reason_code", "") or "UNKNOWN"
@@ -566,24 +715,66 @@ def build_diagnostic_guidance(
         detail_summaries = _unique([
             _detail_summary(failure.get("detail")) for failure in failures
         ], limit=3)
-        affected_api_count = len(result_items)
+        primary_reason_keys = {
+            result_keys_by_object_id.get(id(item), _canonical_result_identity(item))
+            for item in result_items
+        }
+        primary_reason_keys.discard("")
+        potentially_affected_keys = set(primary_reason_keys)
+        relevant_blocking_failure_count = 0
+        for failure in failures:
+            matched_keys = matching_result_keys(failure)
+            potentially_affected_keys.update(matched_keys)
+            if not failure.get("blocking"):
+                continue
+            scope_value = str(failure.get("scope") or "global").strip()
+            if scope_value != "api" or matched_keys or primary_reason_keys:
+                relevant_blocking_failure_count += 1
+        potentially_affected_items = [
+            item
+            for identity, item in indexed_results
+            if identity in potentially_affected_keys
+        ]
+        affected_api_count = len(potentially_affected_keys)
+        primary_reason_api_count = len(primary_reason_keys)
+        blocking = bool(relevant_blocking_failure_count)
+        failure_occurrence_count = sum(
+            len(failure.get("occurrences") or ())
+            for failure in failures
+        )
         scope = _observed_scope(scopes)
         guidance.append({
             **definition,
-            "blocking": any(bool(failure.get("blocking")) for failure in failures),
+            "blocking": blocking,
+            "blocking_semantics": "effective_for_current_result_set",
+            "raw_blocking_failure_count": sum(
+                bool(failure.get("blocking")) for failure in failures
+            ),
+            "relevant_blocking_failure_count": relevant_blocking_failure_count,
             "observed_scope": scope,
-            "scope_explanation": _scope_explanation(scope, affected_api_count),
+            "scope_explanation": _scope_explanation(
+                scope,
+                affected_api_count,
+                primary_reason_api_count,
+                blocking,
+            ),
             "affected_api_count": affected_api_count,
-            "affected_api_count_semantics": "primary_reason",
+            "affected_api_count_semantics": "primary_reason_or_failure_scope",
+            "primary_reason_api_count": primary_reason_api_count,
+            "potentially_affected_api_count": affected_api_count,
             "affected_status_counts": dict(sorted(status_counts[reason_code].items())),
             "observed_failure_count": len(failures),
+            "observed_failure_count_semantics": "failure_records",
+            "failure_record_count": len(failures),
+            "failure_occurrence_count": failure_occurrence_count,
+            "failure_occurrence_count_semantics": "physical_occurrence_rows",
             "collectors": collectors,
             "affected_classes": classes,
             "affected_artifacts": artifacts,
             "affected_artifact_entries": artifact_entries,
             "candidate_evidence": candidate_evidence,
             "sample_apis": _unique(
-                (_api_identity(item) for item in result_items),
+                (_api_identity(item) for item in potentially_affected_items),
                 limit=_SAMPLE_LIMIT,
             ),
             "failure_detail_summaries": detail_summaries,
@@ -629,8 +820,14 @@ def build_catalog_guidance(
             ),
             "affected_api_count": 0,
             "affected_api_count_semantics": "not_available_at_step_scope",
+            "primary_reason_api_count": 0,
+            "potentially_affected_api_count": 0,
             "affected_status_counts": {},
             "observed_failure_count": 1,
+            "observed_failure_count_semantics": "failure_records",
+            "failure_record_count": 1,
+            "failure_occurrence_count": 0,
+            "failure_occurrence_count_semantics": "not_available_at_step_scope",
             "collectors": [],
             "affected_classes": [],
             "affected_artifacts": [],

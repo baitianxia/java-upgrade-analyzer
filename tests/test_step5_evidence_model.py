@@ -101,6 +101,22 @@ class EvidenceModelTest(unittest.TestCase):
             "BYTECODE_CALLER_UNRESOLVED",
         )
 
+    def test_failure_scope_defaults_to_api_identity_boundary(self):
+        api_failure = EvidenceFailure(
+            stage="ingestion",
+            reason_code="BYTECODE_CALLER_UNRESOLVED",
+            blocking=True,
+            api_identity="com.vendor.Legacy.call()",
+        )
+        global_failure = EvidenceFailure(
+            stage="ingestion",
+            reason_code="BYTECODE_SCAN_FAILED",
+            blocking=True,
+        )
+
+        self.assertEqual("api", api_failure.scope)
+        self.assertEqual("global", global_failure.scope)
+
     def test_collector_batch_requires_identity_and_valid_sha(self):
         with self.assertRaisesRegex(ValueError, "collector identity"):
             CollectorBatch(collector="", version="1")

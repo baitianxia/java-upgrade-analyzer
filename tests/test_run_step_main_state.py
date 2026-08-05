@@ -1635,6 +1635,8 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertIn("用户选择了部分变化依赖", summary["limitations"])
         self.assertIn("1 项存在候选证据但结论未确定", summary["limitations"])
         self.assertIn("分析已完成，但存在结论限制", message)
+        for limitation in summary["limitations"]:
+            self.assertIn(limitation, message)
         self.assertIn("部分依赖（1/3）", message)
         self.assertEqual(summary["dependency_total_count"], 1)
         self.assertEqual(summary["dependency_completed_count"], 0)
@@ -1774,7 +1776,7 @@ class RunStepMainStateTest(unittest.TestCase):
             "API：变化 10，已完成分析 7，未完成分析 3，确认影响 2。",
             text,
         )
-        self.assertIn("主要限制：用户选择了部分变化依赖", text)
+        self.assertIn("结论限制：用户选择了部分变化依赖", text)
         self.assertIn("[deliverables/report.md](deliverables/report.md)", text)
         self.assertIn(
             "[deliverables/all-affected-dependencies.md]"

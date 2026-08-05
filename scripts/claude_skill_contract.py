@@ -17,6 +17,11 @@ import zipfile
 
 PUBLIC_SCRIPT_RE = re.compile(r"\$\{CLAUDE_SKILL_DIR\}/(scripts/[A-Za-z0-9_./-]+\.py)")
 REPORT_ARG_RE = re.compile(r"--report-dir\s+([^\s\\]+)")
+PHASE_HEADING_RE = re.compile(
+    r"^### Phase\s+\d+\s+\[(?P<mode>AUTO|CHECKPOINT)\].*$",
+    re.MULTILINE,
+)
+PHASE_STEP_RE = re.compile(r"^- 对应步骤：`(?P<step>step[1-6])`", re.MULTILINE)
 
 
 @dataclass(frozen=True)
@@ -64,6 +69,36 @@ def audit_public_contract(root: Path) -> tuple[str, ...]:
     ):
         if required not in text:
             errors.append(f"missing_public_contract:{required}")
+    manifest_path = root / "scripts" / "step_manifest.json"
+    if manifest_path.is_file():
+        try:
+            manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest_steps = {
+                str(item.get("id") or ""): item
+                for item in manifest_payload.get("steps") or ()
+                if isinstance(item, dict)
+            }
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            errors.append("invalid_step_manifest")
+            manifest_steps = {}
+        headings = list(PHASE_HEADING_RE.finditer(text))
+        for index, heading in enumerate(headings):
+            if heading.group("mode") != "CHECKPOINT":
+                continue
+            section_end = (
+                headings[index + 1].start()
+                if index + 1 < len(headings)
+                else len(text)
+            )
+            step_match = PHASE_STEP_RE.search(text, heading.end(), section_end)
+            if not step_match:
+                continue
+            step_id = step_match.group("step")
+            step_meta = manifest_steps.get(step_id) or {}
+            if not step_meta.get("interaction"):
+                errors.append(
+                    f"skill_checkpoint_missing_manifest_interaction:{step_id}"
+                )
     return tuple(errors)
 
 

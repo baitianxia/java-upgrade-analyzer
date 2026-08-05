@@ -332,6 +332,8 @@ class ReasonGuidanceTest(unittest.TestCase):
         self.assertTrue(spring["blocking"])
         self.assertEqual("path", spring["observed_scope"])
         self.assertEqual(1, spring["affected_api_count"])
+        self.assertEqual(1, spring["primary_reason_api_count"])
+        self.assertEqual(2, spring["failure_occurrence_count"])
         self.assertEqual(["demo.Config"], spring["affected_classes"])
         self.assertEqual(
             ["/runtime/a.jar", "/runtime/b.jar"],
@@ -345,6 +347,8 @@ class ReasonGuidanceTest(unittest.TestCase):
 
         mybatis = by_code["MYBATIS_RUNTIME_ARTIFACT_PARSE_FAILED"]
         self.assertEqual("global", mybatis["observed_scope"])
+        self.assertEqual(2, mybatis["potentially_affected_api_count"])
+        self.assertEqual(1, mybatis["primary_reason_api_count"])
         self.assertIn("全局阻断", mybatis["scope_explanation"])
         self.assertEqual(
             ["/runtime/mybatis-runtime.jar"],
@@ -353,6 +357,71 @@ class ReasonGuidanceTest(unittest.TestCase):
         self.assertIn(
             "BadZipFile", mybatis["failure_detail_summaries"][0]
         )
+
+    def test_unrelated_api_scoped_bytecode_failure_is_coverage_telemetry(self):
+        results = [self._result("NO_PATH_FOUND", "demo.Api.selected")]
+        graph_stats = {
+            "evidence_ingestion": {
+                "failures": [
+                    {
+                        "collector": "business_bytecode",
+                        "reason_code": "BYTECODE_CALLER_UNRESOLVED",
+                        "blocking": True,
+                        "api_identity": f"demo.Other{index}.call()",
+                        "scope": "api",
+                        "occurrences": [],
+                    }
+                    for index in range(2309)
+                ],
+            },
+        }
+
+        guidance = build_diagnostic_guidance(results, graph_stats)
+        bytecode = next(
+            item for item in guidance
+            if item["reason_code"] == "BYTECODE_CALLER_UNRESOLVED"
+        )
+        rendered = "\n".join(s6_report.render_diagnostic_guidance({
+            "diagnostic_guidance": [bytecode],
+        }))
+
+        self.assertEqual("api", bytecode["observed_scope"])
+        self.assertEqual(0, bytecode["affected_api_count"])
+        self.assertEqual(0, bytecode["primary_reason_api_count"])
+        self.assertEqual(2309, bytecode["failure_record_count"])
+        self.assertEqual(0, bytecode["failure_occurrence_count"])
+        self.assertEqual(2309, bytecode["raw_blocking_failure_count"])
+        self.assertEqual(0, bytecode["relevant_blocking_failure_count"])
+        self.assertFalse(bytecode["blocking"])
+        self.assertIn("未关联到本轮目标 API", rendered)
+        self.assertIn("仅作为覆盖遥测保留", rendered)
+
+    def test_api_scoped_bytecode_failure_counts_matching_target(self):
+        results = [self._result("NO_PATH_FOUND", "demo.Api.selected")]
+        graph_stats = {
+            "evidence_ingestion": {
+                "failures": [{
+                    "collector": "business_bytecode",
+                    "reason_code": "BYTECODE_CALLER_UNRESOLVED",
+                    "blocking": True,
+                    "api_identity": "demo.Api.selected()",
+                    "scope": "api",
+                    "occurrences": [],
+                }],
+            },
+        }
+
+        guidance = build_diagnostic_guidance(results, graph_stats)
+        bytecode = next(
+            item for item in guidance
+            if item["reason_code"] == "BYTECODE_CALLER_UNRESOLVED"
+        )
+
+        self.assertEqual(1, bytecode["affected_api_count"])
+        self.assertEqual(0, bytecode["primary_reason_api_count"])
+        self.assertEqual(1, bytecode["potentially_affected_api_count"])
+        self.assertEqual(1, bytecode["relevant_blocking_failure_count"])
+        self.assertTrue(bytecode["blocking"])
 
     def test_summary_keeps_structured_guidance_while_report_stays_human_first(self):
         results = [

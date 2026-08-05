@@ -392,7 +392,7 @@ def _landing_status_lines(state):
             ])
             limitations = list(completion_summary.get("limitations") or [])
             if limitations:
-                lines.append("主要限制：" + "；".join(limitations[:5]) + "。")
+                lines.append("结论限制：" + "；".join(limitations) + "。")
         return lines
     if status in INTERACTIVE_STATUS or status.startswith("awaiting_"):
         lines = ["当前状态：等待你确认", f"当前任务：{task_name}"]
@@ -664,7 +664,7 @@ def build_user_runtime_message(event, step_id, reason="", completion_summary=Non
             )
         limitations = list(summary.get("limitations") or [])
         if limitations:
-            lines.append("主要限制：" + "；".join(limitations[:3]) + "。")
+            lines.append("结论限制：" + "；".join(limitations) + "。")
         lines.extend([
             "最终报告：deliverables/report.md",
             (

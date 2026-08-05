@@ -1,3 +1,4 @@
+import json
 import sys
 import tempfile
 import unittest
@@ -30,6 +31,42 @@ class ClaudeSkillContractTest(unittest.TestCase):
         self.assertIn("stale_public_script:scripts/missing.py", errors)
         self.assertIn("public_report_path_must_be_upgrade_report", errors)
 
+    def test_static_audit_rejects_checkpoint_absent_from_manifest_state_machine(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scripts = root / "scripts"
+            scripts.mkdir()
+            (scripts / "run_step.py").write_text("", encoding="utf-8")
+            (scripts / "step_manifest.json").write_text(json.dumps({
+                "steps": [{
+                    "id": "step5",
+                    "auto_continue_on_success": True,
+                    "interaction": None,
+                }],
+            }), encoding="utf-8")
+            (root / "SKILL.md").write_text(
+                "\n".join((
+                    'python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" '
+                    '--report-dir .upgrade-report',
+                    ".upgrade-report/.runtime/state/main_state.json",
+                    ".upgrade-report/.runtime/state/interaction.json",
+                    "--describe-step1-contract",
+                    "--response-json",
+                    "### Phase 8 [AUTO] Call Chain Analysis",
+                    "- 对应步骤：`step5`",
+                    "### Phase 9 [CHECKPOINT] Confirm Impact Judgment",
+                    "- 对应步骤：`step5` 完成后进入",
+                )),
+                encoding="utf-8",
+            )
+
+            errors = audit_public_contract(root)
+
+        self.assertIn(
+            "skill_checkpoint_missing_manifest_interaction:step5",
+            errors,
+        )
+
     def test_clean_copy_starts_and_stops_at_checkpoint_idempotently(self):
         with tempfile.TemporaryDirectory() as tmp:
             report = run_skill_contract(ROOT, Path(tmp))
@@ -55,6 +92,16 @@ class ClaudeSkillContractTest(unittest.TestCase):
 
     def test_repository_public_contract_has_no_undeclared_or_stale_entrypoint(self):
         self.assertEqual(audit_public_contract(ROOT), ())
+
+    def test_terminal_status_and_checkpoint_docs_follow_manifest_contract(self):
+        skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
+        rules = (ROOT / "CHECKPOINT_RULES.md").read_text(encoding="utf-8")
+
+        self.assertNotIn("Confirm Impact Judgment", skill)
+        self.assertIn("### Phase 9 [AUTO] Final Report", skill)
+        self.assertIn("completed_with_limits", skill)
+        self.assertIn("完整限制清单", rules)
+        self.assertIn("Step5 成功后的例行复核", rules)
 
     def test_all_metamorphic_variants_complete_step4_to_step5_closed_world(self):
         with tempfile.TemporaryDirectory() as tmp:

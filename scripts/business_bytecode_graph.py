@@ -1267,14 +1267,17 @@ def _business_bytecode_batch(
         owner = pooled(str(item.get("caller_owner") or "").strip())
         name = pooled(str(item.get("caller_name") or "").strip())
         signature = pooled(item.get("caller_signature"))
+        callee_identity = pooled(item.get("callee_key"))
         if not owner or not name:
             typed_failures.append(EvidenceFailure(
                 stage="business-bytecode",
                 reason_code="BYTECODE_CALLER_UNRESOLVED",
                 blocking=True,
+                api_identity=callee_identity,
                 detail=f"字节码调用缺少可解析调用方：{owner}.{name}",
                 artifact=str(item.get("class_file") or ""),
                 class_name=owner,
+                scope="api" if callee_identity else "global",
             ))
             continue
         if batch_sha_invalid:
@@ -1291,7 +1294,7 @@ def _business_bytecode_batch(
         )
         edges.append(CollectedEdge(
             caller_symbol=pooled(f"{owner}.{name}{signature}"),
-            callee_symbol=pooled(item.get("callee_key")),
+            callee_symbol=callee_identity,
             edge_kind=pooled(item.get("evidence_type") or "bytecode_reference"),
             semantic=False,
             owner_scope=ModuleScope.BUSINESS_CLASSES,

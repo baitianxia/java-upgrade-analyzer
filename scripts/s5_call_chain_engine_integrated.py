@@ -1274,11 +1274,13 @@ def _build_business_bytecode_coverage(batch, ingestion_result, api_identities):
         normalized_signature = normalize_signature_for_identity(signature.replace('$', '.'))
         relevant = []
         for failure in blocking_failures:
+            if failure.scope == 'global':
+                relevant.append(failure)
+                continue
             failure_identity = str(failure.api_identity or '').strip()
             normalized_failure = failure_identity.replace('$', '.')
             if (
-                not failure_identity
-                or failure_identity == str(api_identity)
+                failure_identity == str(api_identity)
                 or normalized_failure == normalized_api_name
             ):
                 relevant.append(failure)

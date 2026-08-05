@@ -485,6 +485,7 @@ class EvidenceIngestionTest(unittest.TestCase):
         self.assertEqual(result.rejected_edges, 2)
         self.assertEqual(len(result.failures), 1)
         self.assertEqual(result.failures[0].api_identity, first.callee_symbol)
+        self.assertEqual(result.failures[0].scope, "api")
         self.assertEqual(
             [item.class_name for item in result.failures[0].occurrences],
             ["com.acme.Application", "com.acme.Other"],
@@ -1115,6 +1116,7 @@ class EvidenceIngestionTest(unittest.TestCase):
             reason_code="BYTECODE_CALLER_UNRESOLVED",
             blocking=True,
             api_identity="org.springframework.cache.CacheManager",
+            scope="api",
         )
         batch = CollectorBatch(
             collector="business_bytecode",
@@ -1156,6 +1158,7 @@ class EvidenceIngestionTest(unittest.TestCase):
             reason_code="BYTECODE_CALLER_UNRESOLVED",
             blocking=True,
             api_identity=f"{api_name}()",
+            scope="api",
         )
         batch = CollectorBatch(
             collector="business_bytecode",
@@ -1190,6 +1193,7 @@ class EvidenceIngestionTest(unittest.TestCase):
             reason_code="BYTECODE_CALLER_UNRESOLVED",
             blocking=True,
             api_identity=f"{api_name}(Integer)",
+            scope="api",
         )
         batch = CollectorBatch(
             collector="business_bytecode",
@@ -1227,6 +1231,7 @@ class EvidenceIngestionTest(unittest.TestCase):
             api_identity=(
                 "com.vendor.Outer.Builder.call(com.vendor.Outer.Arg)"
             ),
+            scope="api",
         )
         batch = CollectorBatch(
             collector="business_bytecode",
@@ -1258,6 +1263,7 @@ class EvidenceIngestionTest(unittest.TestCase):
             reason_code="BYTECODE_CALLER_UNRESOLVED",
             blocking=True,
             api_identity="com.vendor.Target.call(x.Other.Arg)",
+            scope="api",
         )
         batch = CollectorBatch(
             collector="business_bytecode",

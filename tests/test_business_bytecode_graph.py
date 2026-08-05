@@ -233,6 +233,8 @@ class BusinessBytecodeGraphTest(unittest.TestCase):
         self.assertEqual(batch.edges, ())
         self.assertEqual(batch.failures[0].reason_code, "BYTECODE_CALLER_UNRESOLVED")
         self.assertTrue(batch.failures[0].blocking)
+        self.assertEqual(batch.failures[0].api_identity, "com.vendor.Legacy.call()")
+        self.assertEqual(batch.failures[0].scope, "api")
 
     def test_collect_business_bytecode_batch_does_not_treat_constant_pool_class_refs_as_call_edges(self):
         import business_bytecode_graph as module

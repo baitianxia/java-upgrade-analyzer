@@ -3168,6 +3168,56 @@ class Step6ReportObjectivityTest(unittest.TestCase):
         self.assertIn("未完成、未确认和未命中结果", text)
         self.assertNotIn("不改变已由完整调用链", text)
 
+    def test_unrelated_api_diagnostic_does_not_limit_global_conclusions(self):
+        text = s6_report._diagnostic_objective_impact(
+            {
+                "reason_code": "BYTECODE_CALLER_UNRESOLVED",
+                "blocking": False,
+                "observed_scope": "api",
+                "affected_api_count": 0,
+                "potentially_affected_api_count": 0,
+                "raw_blocking_failure_count": 2309,
+                "relevant_blocking_failure_count": 0,
+            }
+        )
+
+        self.assertIn("不限制本轮 API 结论", text)
+        self.assertIn("覆盖遥测", text)
+        self.assertNotIn("全局", text)
+
+    def test_v2_diagnostic_counts_remain_compatible_with_v3_fields(self):
+        summary = {
+            "status": "done",
+            "total_apis": 0,
+            "reachable_apis": [],
+            "not_impacted_apis": [],
+            "uncertain_apis": [],
+            "not_analyzed_apis": [],
+            "not_found_apis": [],
+            "diagnostic_guidance": [{
+                "reason_code": "BYTECODE_CALLER_UNRESOLVED",
+                "origin_step": "step5",
+                "observed_scope": "api",
+                "affected_api_count": 3,
+                "observed_failure_count": 2,
+                "blocking": True,
+            }],
+        }
+        diagnostics = []
+
+        s6_report._validate_call_summary_contract(
+            Path(__file__),
+            summary,
+            diagnostics,
+        )
+
+        guidance = summary["diagnostic_guidance"][0]
+        self.assertEqual([], diagnostics)
+        self.assertEqual(3, guidance["primary_reason_api_count"])
+        self.assertEqual(3, guidance["potentially_affected_api_count"])
+        self.assertEqual(2, guidance["failure_record_count"])
+        self.assertEqual(0, guidance["failure_occurrence_count"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -6411,6 +6411,13 @@ public class com.example.TargetBridge {
     def test_evidence_failure_index_preserves_order_and_indexes_appends(self):
         failures = [
             EvidenceFailure("stage", "GLOBAL", True, api_identity=""),
+            EvidenceFailure(
+                "stage",
+                "GLOBAL_NAMED",
+                True,
+                api_identity="diagnostic-subject",
+                scope="global",
+            ),
             EvidenceFailure("stage", "API_A_1", True, api_identity="api-a"),
             EvidenceFailure("stage", "API_B", True, api_identity="api-b"),
         ]
@@ -6422,13 +6429,16 @@ public class com.example.TargetBridge {
         ))
         second = tracer._evidence_failures_for_api(graph, "", "api-a")
 
-        self.assertEqual([item.reason_code for item in first], ["GLOBAL", "API_A_1"])
         self.assertEqual(
-            [item.reason_code for item in second],
-            ["GLOBAL", "API_A_1", "API_A_2"],
+            [item.reason_code for item in first],
+            ["GLOBAL", "GLOBAL_NAMED", "API_A_1"],
         )
         self.assertEqual(
-            graph._step5_evidence_failures_by_identity_index["indexed_count"], 4
+            [item.reason_code for item in second],
+            ["GLOBAL", "GLOBAL_NAMED", "API_A_1", "API_A_2"],
+        )
+        self.assertEqual(
+            graph._step5_evidence_failures_by_identity_index["indexed_count"], 5
         )
 
     def test_path_scoped_framework_failure_only_reaches_related_api(self):

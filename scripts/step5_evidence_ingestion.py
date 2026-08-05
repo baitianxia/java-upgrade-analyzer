@@ -2112,6 +2112,7 @@ class EvidenceRegistry:
                         "详见 occurrences"
                     ),
                     occurrences=occurrences,
+                    scope="api",
                 )
                 failures_by_collector.append((collector, failure))
                 unresolved_failure_positions[failure_key] = len(failures_by_collector) - 1
@@ -2119,7 +2120,11 @@ class EvidenceRegistry:
             existing_collector, existing = failures_by_collector[position]
             failures_by_collector[position] = (
                 existing_collector,
-                replace(existing, occurrences=(*existing.occurrences, *occurrences)),
+                replace(
+                    existing,
+                    occurrences=(*existing.occurrences, *occurrences),
+                    scope="api",
+                ),
             )
         failures = [failure for _collector, failure in failures_by_collector]
 

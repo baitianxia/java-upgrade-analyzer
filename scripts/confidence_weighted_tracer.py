@@ -1575,7 +1575,10 @@ def _evidence_failure_index(graph):
             'indexed_count': 0,
         }
     for position in range(start, len(failures)):
-        positions_by_identity[failures[position].api_identity].append(position)
+        failure = failures[position]
+        positions_by_identity[failure.api_identity].append(position)
+        if getattr(failure, 'scope', 'global') == 'global' and failure.api_identity:
+            positions_by_identity[''].append(position)
     cached['indexed_count'] = len(failures)
     if graph is not None:
         graph._step5_evidence_failures_by_identity_index = cached

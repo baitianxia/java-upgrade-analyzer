@@ -210,6 +210,8 @@ python3 scripts/quality_gate.py --profile quick --skip-real
 
 `ready` 表示上一 Step 已完成、下一 Step 尚待执行。只有 `current_step=done` 且 `completed_step=step6` 时，`status` 才能是 `completed` 或 `completed_with_limits`；不能仅凭某个中间 Step 成功就判断整个分析完成。
 
+两个完成状态都可以直接交付并收尾，不属于 checkpoint：`completed` 展示完成摘要和交付物路径；`completed_with_limits` 还必须展示完整限制清单与结论适用范围。只有用户明确要求扩大范围、补充证据或重跑时才恢复流程，不得为例行复核生成 `interaction.json`。
+
 新对话恢复时：
 
 1. 先读取 `main_state.json`

@@ -314,14 +314,18 @@ class EvidenceFailure:
     class_name: str = ""
     detail: str = ""
     occurrences: Tuple[EvidenceFailureOccurrence, ...] = field(default_factory=tuple)
-    scope: str = "global"
+    scope: str = ""
 
     def __post_init__(self):
         occurrences = tuple(self.occurrences or ())
         if any(not isinstance(item, EvidenceFailureOccurrence) for item in occurrences):
             raise ValueError("failure occurrences must be EvidenceFailureOccurrence values")
-        if self.scope not in {"api", "global", "path"}:
-            raise ValueError(f"unsupported evidence failure scope: {self.scope}")
+        scope = str(self.scope or "").strip() or (
+            "api" if str(self.api_identity or "").strip() else "global"
+        )
+        if scope not in {"api", "global", "path"}:
+            raise ValueError(f"unsupported evidence failure scope: {scope}")
+        object.__setattr__(self, "scope", scope)
         object.__setattr__(self, "occurrences", tuple(sorted(set(occurrences))))
 
 

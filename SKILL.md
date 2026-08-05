@@ -83,6 +83,8 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --describe-step1-contract
 7. **removed 统一语义**：`change_type=removed` 的分析对象不是“空的新 jar”，而是 `old jar symbol_set`。
 8. **主状态唯一真相源**：`step5_selected_coords` 等业务选择必须先写入 `main_state.json`，正式流程不得通过单步脚本 CLI 透传业务参数。
    - `state.status=ready` 表示上一 Step 已完成、`current_step` 指向下一待执行 Step；只有 `current_step=done`、`completed_step=step6` 且 `status` 为 `completed` / `completed_with_limits` 时，才能向用户表述为整个分析已完成。
+   - `completed` 表示流程已完成且没有记录结论限制；展示完成摘要和交付物路径后即可收尾，不生成 `interaction.json`。
+   - `completed_with_limits` 表示流程已完成且交付物可读，但结论受分析范围或证据缺口限制；必须展示完整限制清单、适用范围和交付物路径后收尾，不生成强制确认。只有用户明确要求扩大范围、补充证据或重跑时，才按其选择恢复流程。
 9. **关键工具必须可用**：JApiCmp 与 tree-sitter 是 Java 升级分析的准确性前提。tree-sitter 必须按固定清单显式 bootstrap，运行时不联网安装；安装、版本或加载检查失败时记录 `blocked_by_system` 并停止，不生成用户确认项。不得使用 `allow_degraded=true` 绕过 JApiCmp 二进制对比或 tree-sitter Java AST 分析。
 10. **CSV 编码统一**：所有 CSV 产物统一使用 UTF-8 BOM；程序读取时同时兼容带 BOM 与历史无 BOM 的 UTF-8 文件，保证 Excel 直接打开中文不乱码。
 11. **准确性双线验证**：真实项目验证必须并行生成分析器结果与独立 Oracle 结果，只共享同一最终制品、API 身份协议和运行输入，不得复用分析器的解析、筛选或结论实现。必须逐 API 闭集对账；缺失、重复、额外、冲突、错误结论或无法绑定本次最终制品的 Oracle 均不得标记为已验证。接入新项目只增加数据输入和独立证据，不得在生产代码中登记项目、坐标或类名特例。失效的辅助证据必须报告，但不能推翻同一 API 已存在的有效强证据。
@@ -377,7 +379,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 
 ### Phase 4 [CHECKPOINT] Confirm Upgrade Context
 
-- 对应步骤：`step2` 完成后立即进入
+- 对应步骤：`step2` 仅在 JDK、业务源码范围、源码映射歧义等关键事实无法由证据可靠确定、且不同选择会改变分析口径时进入；证据完整时自动跳过本 Phase 并直接进入 `step3`
 - 必须展示：`evidence/context/context.json`、`evidence/context/dep_graph.json` 的关键摘要
 - 必须确认：`base_branch`、`current_branch`、JDK / Spring Boot 口径、升级依赖识别结果是否正确
 - 用户答复前，不得进入 `step3`
@@ -520,31 +522,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
   - `not_analyzed`（未分析）：已知分析能力受限（如缺依赖源码映射、行为变更、反射命中），**不能解释为"未影响"**
   - `not_found_in_static_analysis`（静态未找到）：在当前源码图中未找到调用路径，但不代表确定未影响，仍需结合 `not_analyzed` 与能力边界判断
 
-### Phase 9 [CHECKPOINT] Confirm Impact Judgment
-
-- 对应步骤：`step5` 完成后进入
-- 必须展示：`reachable` / `not_impacted` / `uncertain` / `not_analyzed` / `not_found_in_static_analysis` 摘要，以及关键调用链或符号保留证据
-- 必须确认：当前影响判定是否可接受，是否还要补依赖源码映射后重跑
-- 用户答复前，不得进入 `step6`
-- 允许动作：`continue`、`rerun_current_step`、`cancel`
-- 禁止动作：在未获用户答复前生成最终报告
-- 恢复命令模板：
-
-```bash
-# 用户接受当前影响结论
-python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
-  --project-dir . \
-  --report-dir .upgrade-report \
-  --response-json '{"intent_patch":{"action":"continue","set":{}}}'
-
-# 用户要求先补依赖源码映射，再重跑 Step5
-python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
-  --project-dir . \
-  --report-dir .upgrade-report \
-  --response-json '{"intent_patch":{"action":"rerun_current_step","set":{"dependency_source_dirs":["/abs/path/to/dependency-repo"]},"notes":"补依赖源码目录后复跑 Step5"}}'
-```
-
-### Phase 10 [AUTO] Final Report
+### Phase 9 [AUTO] Final Report
 
 - 对应步骤：`step6`
 - 输入：前面所有产物

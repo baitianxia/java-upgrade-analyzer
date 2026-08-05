@@ -1058,9 +1058,24 @@ def _validate_call_summary_contract(path, summary, diagnostics):
                     "diagnostic_guidance.candidate_evidence contains "
                     "non-object entries"
                 )
-            for field in ("affected_api_count", "observed_failure_count"):
+            count_fallbacks = (
+                ("affected_api_count", 0),
+                ("primary_reason_api_count", "affected_api_count"),
+                ("potentially_affected_api_count", "affected_api_count"),
+                ("observed_failure_count", 0),
+                ("failure_record_count", "observed_failure_count"),
+                ("failure_occurrence_count", 0),
+                ("raw_blocking_failure_count", 0),
+                ("relevant_blocking_failure_count", 0),
+            )
+            for field, fallback in count_fallbacks:
+                default_value = (
+                    normalized.get(fallback, 0)
+                    if isinstance(fallback, str)
+                    else fallback
+                )
                 value = _strict_non_negative_int(
-                    normalized.get(field, 0)
+                    normalized.get(field, default_value)
                 )
                 if value is None:
                     issues.append(
@@ -3653,8 +3668,40 @@ def collect_findings(d):
                 'origin_step': normalized_origin_step or "unknown",
                 'observed_scope': raw_item.get('observed_scope') or 'unknown',
                 'affected_api_count': raw_item.get('affected_api_count') or 0,
+                'affected_api_count_semantics': (
+                    raw_item.get('affected_api_count_semantics') or 'legacy_unknown'
+                ),
+                'primary_reason_api_count': (
+                    raw_item.get('primary_reason_api_count')
+                    if raw_item.get('primary_reason_api_count') is not None
+                    else raw_item.get('affected_api_count') or 0
+                ),
+                'potentially_affected_api_count': (
+                    raw_item.get('potentially_affected_api_count')
+                    if raw_item.get('potentially_affected_api_count') is not None
+                    else raw_item.get('affected_api_count') or 0
+                ),
                 'observed_failure_count': (
                     raw_item.get('observed_failure_count') or 0
+                ),
+                'failure_record_count': (
+                    raw_item.get('failure_record_count')
+                    if raw_item.get('failure_record_count') is not None
+                    else raw_item.get('observed_failure_count') or 0
+                ),
+                'failure_occurrence_count': (
+                    raw_item.get('failure_occurrence_count')
+                    if raw_item.get('failure_occurrence_count') is not None
+                    else 0
+                ),
+                'raw_blocking_failure_count': (
+                    raw_item.get('raw_blocking_failure_count') or 0
+                ),
+                'relevant_blocking_failure_count': (
+                    raw_item.get('relevant_blocking_failure_count') or 0
+                ),
+                'blocking_semantics': (
+                    raw_item.get('blocking_semantics') or 'legacy_unknown'
                 ),
                 'blocking': bool(raw_item.get('blocking')),
                 'affected_classes': list(
@@ -6149,12 +6196,13 @@ def render_diagnostic_guidance(findings):
     ]
     for item in guidance:
         code = _diagnostic_reason_code(item.get('reason_code'))
+        related_api_count = _diagnostic_potential_api_count(item)
         lines.append(
             f"| {_md_cell(_diagnostic_origin_label(item.get('origin_step')), 40)} | "
             f"`{_md_cell(code, 100)}` | "
             f"{_md_cell(_diagnostic_plain_title(item), 120)} | "
             f"{_diagnostic_scope_label(item.get('observed_scope'))} | "
-            f"{_strict_non_negative_int(item.get('affected_api_count')) or 0} | "
+            f"{related_api_count} | "
             f"{'是' if item.get('blocking') else '否'} |"
         )
     lines.append("")
@@ -6265,34 +6313,69 @@ def _objective_diagnostic_text(value, fallback=''):
     return text
 
 
+def _diagnostic_potential_api_count(item):
+    if item.get('potentially_affected_api_count') is not None:
+        return (
+            _strict_non_negative_int(item.get('potentially_affected_api_count'))
+            or 0
+        )
+    return _strict_non_negative_int(item.get('affected_api_count')) or 0
+
+
 def _diagnostic_observed_scope_text(item):
-    affected_count = (
-        _strict_non_negative_int(item.get('affected_api_count')) or 0
+    affected_count = _diagnostic_potential_api_count(item)
+    primary_count = (
+        _strict_non_negative_int(item.get('primary_reason_api_count')) or 0
     )
-    observed_count = (
-        _strict_non_negative_int(item.get('observed_failure_count')) or 0
+    record_count = (
+        _strict_non_negative_int(item.get('failure_record_count'))
+        if item.get('failure_record_count') is not None
+        else _strict_non_negative_int(item.get('observed_failure_count'))
+    ) or 0
+    occurrence_count = (
+        _strict_non_negative_int(item.get('failure_occurrence_count')) or 0
     )
     if affected_count:
-        return (
-            f"与 {affected_count} 个 API 结果直接相关；"
-            f"记录作用域为{_diagnostic_scope_label(item.get('observed_scope'))}。"
-        )
+        text = f"传播范围关联 {affected_count} 个 API"
+        if primary_count:
+            text += f"，其中 {primary_count} 个以该原因为主原因"
+        text += f"；记录作用域为{_diagnostic_scope_label(item.get('observed_scope'))}"
+        if record_count:
+            text += f"；failure 记录 {record_count} 条"
+            if occurrence_count and occurrence_count != record_count:
+                text += f"，包含 {occurrence_count} 个物理位置"
+        return text + "。"
     text = (
-        "未直接归因到单个 API；"
+        "未关联到本轮目标 API；"
         f"记录作用域为{_diagnostic_scope_label(item.get('observed_scope'))}"
     )
-    if observed_count:
-        text += f"；分析过程记录 {observed_count} 次"
+    if record_count:
+        text += f"；failure 记录 {record_count} 条"
+        if occurrence_count and occurrence_count != record_count:
+            text += f"，包含 {occurrence_count} 个物理位置"
     return text + "。"
 
 
 def _diagnostic_objective_impact(item):
     code = _diagnostic_reason_code(item.get("reason_code"))
-    if (_strict_non_negative_int(item.get('affected_api_count')) or 0):
+    affected_count = _diagnostic_potential_api_count(item)
+    if affected_count:
         definition = _diagnostic_definition(item)
         return _objective_diagnostic_text(
             definition.get('semantic_impact'),
             '该诊断限制相关 API 结论的解释范围。',
+        )
+    if (
+        str(item.get('observed_scope') or '').strip() == 'api'
+        and (_strict_non_negative_int(item.get('raw_blocking_failure_count')) or 0)
+        and not (
+            _strict_non_negative_int(item.get('relevant_blocking_failure_count'))
+            or 0
+        )
+    ):
+        return (
+            "该 API 级 failure 未与本轮目标 API 建立关联，不限制本轮 API 结论；"
+            "原始记录仅作为覆盖遥测保留。"
         )
     if bool(item.get('blocking')):
         scope = str(item.get('observed_scope') or '').strip()
