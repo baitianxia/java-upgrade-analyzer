@@ -7862,6 +7862,41 @@ def _build_packaged_dependency_hit_result(result, hits, graph=None):
     return result
 
 
+def _apply_behavior_changed_runtime_verification_to_packaged_hit(result):
+    if str(result.change_type or '').strip() != 'BEHAVIOR_CHANGED':
+        return result
+    if not any(path.complete for path in result.envelope_paths):
+        return result
+    reason_code = 'BEHAVIOR_CHANGED_RUNTIME_VERIFICATION'
+    note = (
+        '当前最终制品中已确认目标 API 调用路径，但签名未变不能证明运行时行为兼容；'
+        '仍需通过相关单元测试或集成测试验证'
+    )
+    _downgrade_reachable_path_details(result, 'not_analyzed', reason_code)
+    result.envelope_paths = tuple(
+        replace(
+            path,
+            complete=False,
+            stop_reason=reason_code,
+            reason_code=reason_code,
+            note=note,
+        )
+        if path.complete else path
+        for path in result.envelope_paths
+    )
+    result.verification_commands = [
+        '行为变更需运行时测试验证',
+        '建议执行相关单元测试或集成测试',
+        '调用链已定位，需确认运行时行为是否受影响',
+    ]
+    return _apply_blocking_failure(
+        result,
+        'behavior-change-analysis',
+        reason_code,
+        note,
+    )
+
+
 def _merge_runtime_framework_paths(result, hits, graph):
     """Keep complete runtime-registration paths alongside source-graph paths.
 
@@ -8581,6 +8616,9 @@ def _collect_trace_api_with_confidence_weighting(
                 for item in scan_hits
             ):
                 packaged_dependency_result = _build_packaged_dependency_hit_result(result, scan_hits, graph)
+                _apply_behavior_changed_runtime_verification_to_packaged_hit(
+                    packaged_dependency_result
+                )
                 _apply_constant_impact(
                     packaged_dependency_result,
                     api_row,
@@ -8639,6 +8677,9 @@ def _collect_trace_api_with_confidence_weighting(
     # 仍应沿用打包依赖命中结论，而不是被后续 CLASS_USAGE_ONLY 覆盖。
     if artifact_dependency_hits and (result.analysis_scope == 'class_usage' or result.symbol_kind == 'class'):
         packaged_dependency_result = _build_packaged_dependency_hit_result(result, artifact_dependency_hits, graph)
+        _apply_behavior_changed_runtime_verification_to_packaged_hit(
+            packaged_dependency_result
+        )
         _debug_trace_result('trace_api_result', packaged_dependency_result)
         return packaged_dependency_result
 
@@ -8747,6 +8788,9 @@ def _collect_trace_api_with_confidence_weighting(
                 result,
                 artifact_dependency_hits,
                 graph,
+            )
+            _apply_behavior_changed_runtime_verification_to_packaged_hit(
+                packaged_dependency_result
             )
             _debug_trace_result(
                 'trace_api_result',
@@ -9250,6 +9294,9 @@ def _collect_trace_api_with_confidence_weighting(
     # 只有在源码图没有产出更强结论时，才回退为打包依赖字节码命中结论。
     if artifact_dependency_hits:
         packaged_dependency_result = _build_packaged_dependency_hit_result(result, artifact_dependency_hits, graph)
+        _apply_behavior_changed_runtime_verification_to_packaged_hit(
+            packaged_dependency_result
+        )
         _apply_constant_impact(
             packaged_dependency_result,
             api_row,

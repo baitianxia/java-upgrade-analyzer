@@ -23122,6 +23122,108 @@ public class com.example.consumer.Adapter {
         self.assertEqual(alert["conclusion"], "结论未确定（存在候选证据）")
         self.assertGreater(alert["path_occurrence_count"], 0)
 
+    def test_business_bytecode_hit_for_behavior_change_requires_runtime_verification(self):
+        api_row = {
+            "coord": "lib:api",
+            "api_name": "lib.Api.call",
+            "api_simple": "call",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "BEHAVIOR_CHANGED",
+            "severity": "P2",
+            "confirmed": "false",
+        }
+        graph = SimpleNamespace(
+            methods_by_id={},
+            reverse_edges={},
+            runtime_dependency_catalog={},
+            source_artifact_alignment={"status": "aligned"},
+        )
+        hit = {
+            "coord": "__business__",
+            "class_fqcn": "app.App",
+            "consumer_method": "run",
+            "consumer_signature": "()",
+            "target_display": "lib.Api.call()",
+            "evidence_type": "bytecode_constant_pool_method_reference",
+            "jar_path": "/tmp/business-classes.jar",
+            "instruction_offset": 4,
+        }
+
+        with patch.object(
+            tracer,
+            "_scan_packaged_runtime_dependencies_for_api",
+            return_value={"status": "hit", "hits": [hit]},
+        ):
+            result = tracer.trace_api_with_confidence_weighting(
+                api_row,
+                graph,
+                {},
+                has_packaged_bytecode_fallback=True,
+            )
+
+        self.assertEqual(result.analysis_status, "not_analyzed")
+        self.assertEqual(
+            result.reason_code,
+            "BEHAVIOR_CHANGED_RUNTIME_VERIFICATION",
+        )
+        self.assertTrue(result.call_paths)
+        self.assertEqual(
+            result.path_details[0]["stop_reason"],
+            "BEHAVIOR_CHANGED_RUNTIME_VERIFICATION",
+        )
+
+    def test_external_bytecode_hit_for_behavior_change_keeps_entry_uncertainty(self):
+        api_row = {
+            "coord": "lib:api",
+            "api_name": "lib.Api.call",
+            "api_simple": "call",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "BEHAVIOR_CHANGED",
+            "severity": "P2",
+            "confirmed": "false",
+        }
+        graph = SimpleNamespace(
+            methods_by_id={},
+            reverse_edges={},
+            runtime_dependency_catalog={},
+            source_artifact_alignment={"status": "aligned"},
+        )
+        hit = {
+            "coord": "lib:consumer",
+            "class_fqcn": "lib.Consumer",
+            "consumer_method": "run",
+            "consumer_signature": "()",
+            "target_display": "lib.Api.call()",
+            "evidence_type": "bytecode_constant_pool_method_reference",
+            "jar_path": "/tmp/consumer.jar",
+            "instruction_offset": 4,
+        }
+
+        with patch.object(
+            tracer,
+            "_scan_packaged_runtime_dependencies_for_api",
+            return_value={"status": "hit", "hits": [hit]},
+        ):
+            result = tracer.trace_api_with_confidence_weighting(
+                api_row,
+                graph,
+                {},
+                has_packaged_bytecode_fallback=True,
+            )
+
+        self.assertEqual(result.analysis_status, "uncertain")
+        self.assertNotEqual(
+            result.reason_code,
+            "BEHAVIOR_CHANGED_RUNTIME_VERIFICATION",
+        )
+        self.assertEqual(result.path_details[0]["path_status"], "uncertain")
+        self.assertEqual(
+            result.path_details[0]["stop_reason"],
+            "BUSINESS_ENTRY_NOT_CONFIRMED",
+        )
+
     def test_constant_field_bytecode_hit_reports_runtime_link_present(self):
         api_row = {
             "coord": "lib:flags", "api_name": "lib.Flags.VALUE", "api_simple": "VALUE",

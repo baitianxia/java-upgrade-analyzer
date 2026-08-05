@@ -2945,6 +2945,14 @@ class Step6ReportObjectivityTest(unittest.TestCase):
                 ),
             })
         )
+        self.assertTrue(
+            s6_report._alert_row_has_reachable_path_evidence({
+                **base,
+                "path_text": (
+                    "业务制品：com.app.Entry.run() → com.vendor.Api.removed()"
+                ),
+            })
+        )
         self.assertFalse(
             s6_report._alert_row_has_reachable_path_evidence({
                 **base,

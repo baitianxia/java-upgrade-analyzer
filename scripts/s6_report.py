@@ -644,7 +644,7 @@ def _alert_target_matches_changed_symbol(target, row):
 
 def _alert_path_entry_matches_business_entry(path_entry, row):
     path_entry = re.sub(
-        r"^(?:业务入口|调用起点|business\s*entry|chain\s*entry)\s*[:：]\s*",
+        r"^(?:业务入口|调用起点|业务制品|business\s*(?:entry|artifact)|chain\s*entry)\s*[:：]\s*",
         "",
         str(path_entry or "").strip(),
         flags=re.IGNORECASE,

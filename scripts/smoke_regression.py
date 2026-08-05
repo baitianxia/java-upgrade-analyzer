@@ -36,7 +36,7 @@ from confidence_weighted_tracer import (
     trace_api_with_confidence_weighting,
 )
 import enhanced_source_analyzer as source_analyzer_module
-from enhanced_output_formatter import explain_reason_code
+from enhanced_output_formatter import ALERTS_CSV_FIELDNAMES, explain_reason_code
 from path_runtime import make_short_temp_dir, short_temporary_directory
 import s1_dep_diff as s1_dep_diff_module
 from enhanced_source_analyzer import (
@@ -58,7 +58,7 @@ from s4_jar_compare import (
     parse_japicmp_output,
     split_parameters_preserving_generics,
 )
-from s4_contract import ALL_CHANGED_APIS_FIELDS
+from s4_contract import ALL_CHANGED_APIS_FIELDS, make_per_dependency_dirname
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -230,6 +230,36 @@ def interaction_path(report_dir):
     return Path(report_dir) / ".runtime" / "state" / "interaction.json"
 
 
+def assert_step5_informational_card(report_dir, scenario):
+    path = interaction_path(report_dir)
+    assert_true(
+        path.exists(),
+        f"{scenario}：Step5 成功后应保留非阻塞阶段结果卡",
+    )
+    payload = read_json(path)
+    assert_true(
+        payload.get("step_id") == "step5"
+        and payload.get("event") == "step_completed_information"
+        and payload.get("status") == "informational",
+        f"{scenario}：Step5 阶段结果卡身份不正确：{payload}",
+    )
+    assert_true(
+        payload.get("checkpoint") is False
+        and payload.get("hard_stop") is False
+        and payload.get("must_wait_for_user_reply") is False
+        and payload.get("awaiting_user_input") is False
+        and payload.get("decision_required") is False
+        and payload.get("exit_code") == 0
+        and not (payload.get("options") or []),
+        f"{scenario}：Step5 阶段结果卡不得形成用户确认点：{payload}",
+    )
+    card_text = "\n".join(payload.get("user_decision_card") or [])
+    assert_true(
+        "本卡无需回复" in card_text,
+        f"{scenario}：Step5 阶段结果卡未明确说明无需回复：{payload}",
+    )
+
+
 def dep_changes_path(report_dir):
     return Path(report_dir) / "evidence" / "dependencies" / "dep_changes.csv"
 
@@ -331,6 +361,76 @@ def create_fake_boot_jar(path, embedded_deps):
             )
 
 
+def refresh_scoped_runtime_manifest(report_dir):
+    """Retain exact nested/business JARs for a synthetic current final artifact."""
+    report_dir = Path(report_dir)
+    artifact_path = report_dir / "evidence" / "dependencies" / "s1_artifacts" / "current.jar"
+    resolved_path = report_dir / "evidence" / "dependencies" / "deps_current_resolved.csv"
+    retained_dir = report_dir / "evidence" / "dependencies" / "s1_dependency_jars" / "current"
+    retained_dir.mkdir(parents=True, exist_ok=True)
+    outer_sha = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+    items = []
+    business_entries = {}
+    with zipfile.ZipFile(artifact_path) as outer:
+        for row in read_csv(resolved_path):
+            lib_entry = row.get("lib_entry") or ""
+            nested_bytes = outer.read(lib_entry)
+            nested_sha = hashlib.sha256(nested_bytes).hexdigest()
+            retained_path = retained_dir / f"{nested_sha[:16]}-{Path(lib_entry).name}"
+            retained_path.write_bytes(nested_bytes)
+            items.append({
+                "side": "current",
+                "coord": row.get("coord") or "",
+                "classifier": "",
+                "version": row.get("version") or "",
+                "scope": row.get("scope") or "runtime",
+                "lib_entry": lib_entry,
+                "retained_path": str(retained_path),
+                "nested_jar_sha256": nested_sha,
+                "outer_artifact_path": str(artifact_path),
+                "outer_artifact_sha256": outer_sha,
+                "identity_source": "runtime-artifact-inventory",
+                "purposes": ["step4_change", "step5_runtime"],
+            })
+        for info in outer.infolist():
+            if (
+                info.filename.startswith("BOOT-INF/classes/")
+                and not info.is_dir()
+            ):
+                business_entries[info.filename.removeprefix("BOOT-INF/classes/")] = (
+                    outer.read(info.filename)
+                )
+
+    business_artifact = retained_dir / "business-classes.jar"
+    with zipfile.ZipFile(business_artifact, "w") as business_jar:
+        for relative, class_bytes in sorted(business_entries.items()):
+            business_jar.writestr(relative, class_bytes)
+    business_sha = hashlib.sha256(business_artifact.read_bytes()).hexdigest()
+    write_text(
+        report_dir / "evidence" / "dependencies" / "dependency_jars.json",
+        json.dumps(
+            {
+                "schema": "java-upgrade-analyzer.step1-dependency-jars.v2",
+                "items": items,
+                "business_artifacts": [{
+                    "side": "current",
+                    "kind": "business_content",
+                    "retained_path": str(business_artifact),
+                    "sha256": business_sha,
+                    "entry_count": len(business_entries),
+                    "class_count": sum(
+                        name.endswith(".class") for name in business_entries
+                    ),
+                    "outer_artifact_path": str(artifact_path),
+                    "outer_artifact_sha256": outer_sha,
+                }],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ) + "\n",
+    )
+
+
 def create_scoped_runtime_evidence(report_dir, dependencies):
     """Create a final-artifact fixture whose dependency classes match source fixtures."""
     report_dir = Path(report_dir)
@@ -368,6 +468,7 @@ def create_scoped_runtime_evidence(report_dir, dependencies):
         )
         writer.writeheader()
         writer.writerows(resolved_rows)
+    refresh_scoped_runtime_manifest(report_dir)
     digest = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
     write_text(
         report_dir / "evidence" / "dependencies" / "build_provenance.json",
@@ -499,6 +600,7 @@ def refresh_fixture_business_bytecode(report_dir, source_files):
                     updated.writestr(f"BOOT-INF/classes/{relative}", class_bytes)
         os.replace(replacement, artifact_path)
 
+    refresh_scoped_runtime_manifest(report_dir)
     provenance_path = report_dir / "evidence" / "dependencies" / "build_provenance.json"
     provenance = read_json(provenance_path)
     current = next(item for item in provenance.get("sides") or [] if item.get("side") == "current")
@@ -507,6 +609,165 @@ def refresh_fixture_business_bytecode(report_dir, source_files):
         provenance_path,
         json.dumps(provenance, ensure_ascii=False, indent=2) + "\n",
     )
+
+
+def refresh_fixture_business_source_bytecode(report_dir, source_files, dependency_sources=None):
+    """Compile selected business sources into the retained Step1 artifact fixture."""
+    report_dir = Path(report_dir)
+    dependency_sources = dict(dependency_sources or {})
+    source_types = []
+    declaration_pattern = re.compile(
+        r"^\s*(?:public\s+)?(?:(?:abstract|final|sealed|non-sealed)\s+)*"
+        r"(?:class|interface|enum|record)\s+([A-Za-z_$][A-Za-z0-9_$]*)\b",
+        re.MULTILINE,
+    )
+    package_pattern = re.compile(
+        r"^\s*package\s+([A-Za-z_$][A-Za-z0-9_$.]*)\s*;",
+        re.MULTILINE,
+    )
+    normalized_sources = [Path(path) for path in source_files]
+    for source_file in normalized_sources:
+        source_text = source_file.read_text(encoding="utf-8")
+        declaration = declaration_pattern.search(source_text)
+        if not declaration:
+            continue
+        package_match = package_pattern.search(source_text)
+        package_name = package_match.group(1) if package_match else ""
+        class_name = declaration.group(1)
+        class_prefix = "/".join(
+            [part for part in package_name.split(".") if part] + [class_name]
+        )
+        source_types.append(class_prefix)
+    assert_true(source_types, "动态业务源码 fixture 未发现可编译的顶层类型")
+
+    with short_temporary_directory(prefix="smoke-business-bytecode") as tmp:
+        stub_root = Path(tmp) / "src"
+        classes_dir = Path(tmp) / "classes"
+        classes_dir.mkdir()
+        stub_files = []
+        for relative_path, source_text in sorted(dependency_sources.items()):
+            stub_file = stub_root / relative_path
+            write_text(stub_file, source_text)
+            stub_files.append(stub_file)
+        stdout, stderr, rc = compat_run_cmd(
+            [
+                "javac", "-source", "17", "-target", "17",
+                "-d", str(classes_dir),
+                *map(str, normalized_sources),
+                *map(str, stub_files),
+            ],
+            cwd=str(report_dir.parent),
+        )
+        if rc != 0:
+            raise RuntimeError(
+                "dynamic business bytecode compilation failed\n"
+                f"stdout:\n{stdout}\nstderr:\n{stderr}"
+            )
+        compiled_classes = {
+            class_file.relative_to(classes_dir).as_posix(): class_file.read_bytes()
+            for class_file in sorted(classes_dir.rglob("*.class"))
+            if any(
+                class_file.relative_to(classes_dir).as_posix() == f"{prefix}.class"
+                or class_file.relative_to(classes_dir).as_posix().startswith(f"{prefix}$")
+                for prefix in source_types
+            )
+        }
+    assert_true(compiled_classes, "动态业务源码 fixture 未产出业务 class")
+
+    manifest_path = (
+        report_dir / "evidence" / "dependencies" / "dependency_jars.json"
+    )
+    manifest = read_json(manifest_path)
+    current_items = [
+        item
+        for item in manifest.get("items") or []
+        if item.get("side") == "current"
+    ]
+    business_items = [
+        item
+        for item in manifest.get("business_artifacts") or []
+        if item.get("side") == "current"
+    ]
+    assert_true(current_items, "动态业务源码 fixture 缺少 current 依赖制品 manifest")
+    assert_true(business_items, "动态业务源码 fixture 缺少 current 业务制品 manifest")
+
+    outer_artifact = Path(
+        business_items[0].get("outer_artifact_path")
+        or current_items[0].get("outer_artifact_path")
+        or ""
+    )
+    business_artifact = Path(business_items[0].get("retained_path") or "")
+    assert_true(outer_artifact.is_file(), "动态业务源码 fixture 缺少 current 最终制品")
+
+    replacement = outer_artifact.with_suffix(".tmp.jar")
+    with zipfile.ZipFile(outer_artifact) as original, zipfile.ZipFile(replacement, "w") as updated:
+        for info in original.infolist():
+            relative = info.filename.removeprefix("BOOT-INF/classes/")
+            if not (
+                info.filename.startswith("BOOT-INF/classes/")
+                and relative in compiled_classes
+            ):
+                updated.writestr(info, original.read(info.filename))
+        for relative, class_bytes in compiled_classes.items():
+            updated.writestr(f"BOOT-INF/classes/{relative}", class_bytes)
+    os.replace(replacement, outer_artifact)
+
+    business_artifact.parent.mkdir(parents=True, exist_ok=True)
+    business_replacement = business_artifact.with_suffix(".tmp.jar")
+    with zipfile.ZipFile(business_replacement, "w") as business_jar:
+        if business_artifact.is_file():
+            with zipfile.ZipFile(business_artifact) as original:
+                for info in original.infolist():
+                    if info.filename not in compiled_classes:
+                        business_jar.writestr(info, original.read(info.filename))
+        for relative, class_bytes in compiled_classes.items():
+            business_jar.writestr(relative, class_bytes)
+    os.replace(business_replacement, business_artifact)
+
+    outer_sha = hashlib.sha256(outer_artifact.read_bytes()).hexdigest()
+    business_sha = hashlib.sha256(business_artifact.read_bytes()).hexdigest()
+    with zipfile.ZipFile(business_artifact) as business_jar:
+        business_entries = [
+            info.filename for info in business_jar.infolist()
+            if not info.is_dir()
+        ]
+    for item in current_items:
+        item["outer_artifact_path"] = str(outer_artifact)
+        item["outer_artifact_sha256"] = outer_sha
+    for item in business_items:
+        item.update({
+            "retained_path": str(business_artifact),
+            "sha256": business_sha,
+            "entry_count": len(business_entries),
+            "class_count": sum(name.endswith(".class") for name in business_entries),
+            "outer_artifact_path": str(outer_artifact),
+            "outer_artifact_sha256": outer_sha,
+        })
+    write_text(
+        manifest_path,
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+    )
+
+    provenance_path = (
+        report_dir / "evidence" / "dependencies" / "build_provenance.json"
+    )
+    if provenance_path.is_file():
+        provenance = read_json(provenance_path)
+        current = next(
+            (
+                item
+                for item in provenance.get("sides") or []
+                if item.get("side") == "current"
+            ),
+            None,
+        )
+        if current is not None:
+            current["artifact_path"] = str(outer_artifact)
+            current["artifact_sha256"] = outer_sha
+            write_text(
+                provenance_path,
+                json.dumps(provenance, ensure_ascii=False, indent=2) + "\n",
+            )
 
 
 def create_plain_jar(path):
@@ -2655,13 +2916,18 @@ return ExtraApi.callLegacy();
         multi_bridge_rc == 0,
         f"只有一个变化依赖时应自动以全量范围执行 Step5: {multi_bridge_stderr}",
     )
-    assert_true(
-        not interaction_path(runtime_full_expand_report).exists(),
-        "Step5 成功后不应残留例行确认 interaction.json",
+    assert_step5_informational_card(
+        runtime_full_expand_report,
+        "单一变化依赖自动完成流程",
     )
     multi_bridge_summary = read_json(runtime_full_expand_report / "evidence" / "call_chain" / "summary.json")
     multi_bridge_per_dependency = read_json(
-        runtime_full_expand_report / "evidence" / "api_changes" / run_step_module.PER_DEPENDENCY_DIRNAME / "com.example_demo-lib" / "summary.json"
+        runtime_full_expand_report
+        / "evidence"
+        / "api_changes"
+        / run_step_module.PER_DEPENDENCY_DIRNAME
+        / make_per_dependency_dirname("com.example:demo-lib")
+        / "summary.json"
     )
     multi_bridge_api = (multi_bridge_summary.get("not_found_apis") or [{}])[0]
     assert_true(
@@ -2885,9 +3151,9 @@ return ExtraApi.callLegacy();
         and main_state_meta(interactive_step4_restart_ckpt).get("current_step") == "done",
         "restart_from_step=step2 后应从 Step2 重建后续产物并完成流程",
     )
-    assert_true(
-        not interaction_path(interactive_step4_restart_report).exists(),
-        "restart_from_step=step2 后输入完整时不应留下无实质决策的交互点",
+    assert_step5_informational_card(
+        interactive_step4_restart_report,
+        "restart_from_step=step2 后完成流程",
     )
 
     s4_dir = report_dir / "evidence" / "api_changes"
@@ -2975,16 +3241,9 @@ return ExtraApi.callLegacy();
         "Step 5 smoke 的业务字节码补边不应再因 fake class 触发 Bad magic number",
     )
 
-    # 后续用例专门验证源码图解析，不再复用上面故意制造为过期的制品契约。
-    # 缺少制品时，正向源码证据仍可成立，但负向结论必须保持覆盖不足。
-    for stale_contract in (
-        report_dir / "build_provenance.json",
-        report_dir / "s1_deps_current_resolved.csv",
-        report_dir / "evidence" / "dependencies" / "build_provenance.json",
-        report_dir / "evidence" / "dependencies" / "deps_current_resolved.csv",
-    ):
-        if stale_contract.exists():
-            stale_contract.unlink()
+    # 后续用例专门验证源码图解析。每次动态追加源码后，都提交 fixture
+    # 并把真实调用字节码写回 Step1 留存的业务制品，使 revision、SHA 和
+    # 调用边保持一致，避免用仅含空类的制品伪造源码/制品对齐状态。
 
     instance_changed_apis = report_dir / "evidence" / "api_changes" / "all_changed_instance_apis.csv"
     with open_csv_write(instance_changed_apis) as f:
@@ -3020,6 +3279,21 @@ api.doWork();
     }
     """,
     )
+    commit_business_fixture_and_update_provenance(
+        project_dir,
+        report_dir,
+        "instance call fixture",
+    )
+    refresh_fixture_business_source_bytecode(
+        report_dir,
+        [source_dir / "InstanceApp.java"],
+        {
+            "com/example/lib/InstanceApi.java": (
+                "package com.example.lib;\n"
+                "public class InstanceApi { public void doWork() {} }\n"
+            ),
+        },
+    )
     instance_chain_dir = report_dir / "s5_call_chain_instance"
     run_script(
         "s5_call_chain.py",
@@ -3034,7 +3308,10 @@ api.doWork();
     instance_summary = read_json(instance_chain_dir / "summary.json")
     assert_true(instance_summary.get("reachable") == 1, "Step 5 未将实例方法调用识别为可达")
     instance_api = instance_summary.get("reachable_apis", [])[0]
-    assert_true(instance_api.get("reason_code") == "SYSTEM_CODE_REACHED", "实例方法调用不应退化为 uncertain")
+    assert_true(
+        instance_api.get("reason_code") == "BUSINESS_ARTIFACT_BYTECODE_USAGE",
+        "实例方法调用应由当前业务制品字节码确认，而不是退化为源码候选证据",
+    )
 
     write_text(
         source_dir / "DirectService.java",
@@ -3069,6 +3346,21 @@ DirectApi.doWork();
                 "source": "japicmp",
             }
         )
+    commit_business_fixture_and_update_provenance(
+        project_dir,
+        report_dir,
+        "direct third-party call fixture",
+    )
+    refresh_fixture_business_source_bytecode(
+        report_dir,
+        [source_dir / "DirectService.java"],
+        {
+            "com/thirdparty/api/DirectApi.java": (
+                "package com.thirdparty.api;\n"
+                "public class DirectApi { public static void doWork() {} }\n"
+            ),
+        },
+    )
     direct_thirdparty_dir = report_dir / "s5_call_chain_direct_thirdparty"
     run_script(
         "s5_call_chain.py",
@@ -3382,6 +3674,26 @@ return service.doWork();
                 "source": "japicmp",
             }
         )
+    commit_business_fixture_and_update_provenance(
+        project_dir,
+        report_dir,
+        "interface call fixture",
+    )
+    refresh_fixture_business_source_bytecode(
+        report_dir,
+        [
+            service_dir / "DemoService.java",
+            service_dir / "DemoServiceImpl.java",
+            source_dir / "InterfaceApp.java",
+            source_dir / "AutowiredApp.java",
+        ],
+        {
+            "org/springframework/beans/factory/annotation/Autowired.java": (
+                "package org.springframework.beans.factory.annotation;\n"
+                "public @interface Autowired {}\n"
+            ),
+        },
+    )
     interface_chain_dir = report_dir / "s5_call_chain_interface"
     run_script(
         "s5_call_chain.py",
@@ -3463,6 +3775,18 @@ return repository.search(page, keyword);
                 "source": "japicmp",
             }
         )
+    commit_business_fixture_and_update_provenance(
+        project_dir,
+        report_dir,
+        "helper call-chain fixture",
+    )
+    refresh_fixture_business_source_bytecode(
+        report_dir,
+        [
+            source_dir / "SearchRepository.java",
+            source_dir / "SearchController.java",
+        ],
+    )
     helper_chain_dir = report_dir / "s5_call_chain_helper_chain"
     run_script(
         "s5_call_chain.py",
@@ -3559,6 +3883,27 @@ new ConstructedService();
                 "source": "japicmp",
             }
         )
+    commit_business_fixture_and_update_provenance(
+        project_dir,
+        report_dir,
+        "overload call fixture",
+    )
+    refresh_fixture_business_source_bytecode(
+        report_dir,
+        [
+            service_dir / "OverloadService.java",
+            service_dir / "ConstructedService.java",
+            source_dir / "OverloadApp.java",
+            source_dir / "OverloadFallbackApp.java",
+            source_dir / "ConstructorApp.java",
+        ],
+        {
+            "com/example/UnknownRequest.java": (
+                "package com.example;\n"
+                "public class UnknownRequest { public String getParam() { return \"demo\"; } }\n"
+            ),
+        },
+    )
     overload_chain_dir = report_dir / "s5_call_chain_overload"
     run_script(
         "s5_call_chain.py",
@@ -3584,6 +3929,25 @@ return "noop";
       }
     }
     """,
+    )
+    commit_business_fixture_and_update_provenance(
+        project_dir,
+        report_dir,
+        "overload fallback fixture",
+    )
+    refresh_fixture_business_source_bytecode(
+        report_dir,
+        [
+            service_dir / "OverloadService.java",
+            source_dir / "OverloadApp.java",
+            source_dir / "OverloadFallbackApp.java",
+        ],
+        {
+            "com/example/UnknownRequest.java": (
+                "package com.example;\n"
+                "public class UnknownRequest { public String getParam() { return \"demo\"; } }\n"
+            ),
+        },
     )
     overload_fallback_chain_dir = report_dir / "s5_call_chain_overload_fallback"
     run_script(
@@ -3800,24 +4164,18 @@ return "noop";
             "--source-dirs", str(project_dir / "src" / "main" / "java"),
             "--output-dir", str(not_found_chain_dir),
             "--max-depth", "3",
-            "--allow-degraded",
         ],
         cwd=project_dir,
     )
     not_found_summary = read_json(not_found_chain_dir / "summary.json")
-    not_found_api = not_found_summary.get("not_analyzed_apis", [])[0]
+    not_found_api = not_found_summary.get("not_found_apis", [])[0]
     assert_true(
-        not_found_summary.get("not_analyzed", 0) >= 1,
-        "缺少依赖映射且允许降级时，未找到路径场景应进入 not_analyzed",
+        not_found_summary.get("not_found_in_static_analysis") == 1,
+        "当前业务制品和运行时依赖证据完整时，未找到路径应形成明确的静态未命中结论",
     )
     assert_true(
-        not_found_api.get("reason_code") in {
-            "DEPENDENCY_SOURCE_MAPPING_MISSING",
-            "RUNTIME_DEPENDENCY_JARS_UNAVAILABLE",
-            "ARTIFACT_BYTECODE_COVERAGE_INCOMPLETE",
-            "CURRENT_FINAL_ARTIFACT_REQUIRED",
-        },
-        "缺少依赖映射或最终制品字节码时应输出明确的覆盖不足原因",
+        not_found_api.get("reason_code") == "NO_STATIC_PATH",
+        "完整静态证据未命中时应输出 NO_STATIC_PATH",
     )
     assert_true(
         "deprecated_aliases" in not_found_summary,
@@ -4090,29 +4448,38 @@ BridgeFacade.callAdapter();
         "多级跨依赖 Step 5 未正确记录依赖链"
     )
 
-    # Step6 的这组断言专门验证 reachable 证据透传。沿用冲突用例中已经生成的
-    # 源码路径证据，但显式构造 reachable 分类，避免把两个独立测试目标混在一起。
-    step6_reachable_entry = dict(conflict_api)
-    step6_reachable_entry.update({
-        "analysis_status": "reachable",
-        "reason_code": "SYSTEM_CODE_REACHED",
-        "reason": "已回溯到系统代码",
-        "reachable_note": "已回溯到系统代码",
-    })
-    step6_summary = dict(summary)
-    step6_summary.update({
-        "reachable": 1,
-        "uncertain": 0,
-        "not_analyzed": 0,
-        "not_found_in_static_analysis": 0,
-        "reachable_apis": [step6_reachable_entry],
-        "uncertain_apis": [],
-        "not_analyzed_apis": [],
-        "not_found_apis": [],
-    })
-    write_text(
-        report_dir / "evidence" / "call_chain" / "summary.json",
-        json.dumps(step6_summary, ensure_ascii=False, indent=2) + "\n",
+    # Step6 的这组断言验证完整的 reachable 证据透传。重新编译 App 的真实
+    # 调用并重跑 Step5，让 summary、alerts 和逐 API 台账保持同一证据身份。
+    commit_business_fixture_and_update_provenance(
+        project_dir,
+        report_dir,
+        "step6 reachable fixture",
+    )
+    refresh_fixture_business_source_bytecode(
+        report_dir,
+        [source_dir / "App.java"],
+        {
+            "com/example/lib/LegacyApi.java": (
+                "package com.example.lib;\n"
+                "public class LegacyApi { public static void oldMethod() {} }\n"
+            ),
+        },
+    )
+    run_script(
+        "s5_call_chain.py",
+        [
+            "--all-changed-apis", str(s4_dir / "all_changed_apis.csv"),
+            "--report-dir", str(report_dir),
+            "--source-dirs", str(project_dir / "src" / "main" / "java"),
+            "--output-dir", str(report_dir / "evidence" / "call_chain"),
+            "--max-depth", "3",
+        ],
+        cwd=project_dir,
+    )
+    step6_summary = read_json(report_dir / "evidence" / "call_chain" / "summary.json")
+    assert_true(
+        step6_summary.get("reachable") == 1,
+        "Step6 fixture 的真实业务制品调用未被 Step5 识别为 reachable",
     )
 
     run_script(
@@ -4162,7 +4529,10 @@ BridgeFacade.callAdapter();
         and "alerts.csv" in report_text,
         "Step 6 用户可见文件说明未区分 Markdown、CSV 和原始分析记录",
     )
-    assert_true(findings.get("p0", [])[0].get("reason_code") == "SYSTEM_CODE_REACHED", "Step 6 未透传 reachable 风险的 reason_code")
+    assert_true(
+        findings.get("p0", [])[0].get("reason_code") == "BUSINESS_ARTIFACT_BYTECODE_USAGE",
+        "Step 6 未透传业务制品确认的 reachable reason_code",
+    )
     assert_true(findings.get("p0", [])[0].get("evidence_paths"), "Step 6 未透传 reachable 风险的 evidence_paths")
     assert_true(
         findings.get("scan_stats", {}).get("call_chain_not_analyzed") == 0,
@@ -4172,12 +4542,76 @@ BridgeFacade.callAdapter();
         "call_chain_not_found_in_static_analysis" in findings.get("scan_stats", {}),
         "Step 6 findings 未暴露新的 not_found_in_static_analysis 统计字段",
     )
-    user_conclusion_report = report_dir / "s6_report_user_conclusions.md"
-    user_conclusion_findings = report_dir / "s6_findings_user_conclusions.json"
-    synthetic_s5_dir = report_dir / "evidence" / "call_chain"
+    synthetic_report_dir = project_dir / ".upgrade-report-s6-user-conclusions"
+    user_conclusion_report = synthetic_report_dir / "s6_report_user_conclusions.md"
+    user_conclusion_findings = synthetic_report_dir / "s6_findings_user_conclusions.json"
+    synthetic_s5_dir = synthetic_report_dir / "evidence" / "call_chain"
+    synthetic_apis = [
+        {
+            "coord": "com.example:demo-lib",
+            "old_version": "1.0.0",
+            "new_version": "2.0.0",
+            "api": "com.example.lib.LegacyApi.behaviorChanged",
+            "api_name": "com.example.lib.LegacyApi.behaviorChanged",
+            "api_simple": "behaviorChanged",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "BEHAVIOR_CHANGED",
+            "severity": "P2",
+            "confirmed": "true",
+            "source": "japicmp",
+            "analysis_status": "not_analyzed",
+            "reason_code": "BEHAVIOR_CHANGED_RUNTIME_VERIFICATION",
+            "reason": "behavior changed",
+            "user_conclusion": "可能影响",
+            "decision_bucket": "probable_impact",
+            "recommended_action": "运行相关业务测试",
+        },
+        {
+            "coord": "com.example:demo-lib",
+            "old_version": "1.0.0",
+            "new_version": "2.0.0",
+            "api": "com.example.lib.LegacyApi.bridgeMissing",
+            "api_name": "com.example.lib.LegacyApi.bridgeMissing",
+            "api_simple": "bridgeMissing",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+            "severity": "P1",
+            "confirmed": "true",
+            "source": "japicmp",
+            "analysis_status": "not_analyzed",
+            "reason_code": "DEPENDENCY_SOURCE_MAPPING_MISSING",
+            "reason": "缺失依赖源码映射",
+            "user_conclusion": "需要补充输入",
+            "decision_bucket": "input_required",
+            "recommended_action": "补 dependency_source_dirs",
+        },
+        {
+            "coord": "com.example:demo-lib",
+            "old_version": "1.0.0",
+            "new_version": "2.0.0",
+            "api": "com.example.lib.LegacyApi.reflective",
+            "api_name": "com.example.lib.LegacyApi.reflective",
+            "api_simple": "reflective",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+            "severity": "P1",
+            "confirmed": "true",
+            "source": "japicmp",
+            "analysis_status": "not_analyzed",
+            "reason_code": "RESOURCE_OR_REFLECTION",
+            "reason": "资源或反射调用",
+            "user_conclusion": "当前无法确认",
+            "decision_bucket": "inconclusive",
+        },
+    ]
     synthetic_summary = {
         "status": "done",
+        "total_apis": 3,
         "reachable": 0,
+        "not_impacted": 0,
         "uncertain": 0,
         "not_analyzed": 3,
         "not_found_in_static_analysis": 0,
@@ -4192,52 +4626,55 @@ BridgeFacade.callAdapter();
             "inconclusive": 1,
             "needs_input": 1,
         },
-        "not_analyzed_apis": [
-            {
-                "coord": "com.example:demo-lib",
-                "api": "com.example.lib.LegacyApi.behaviorChanged",
-                "api_name": "com.example.lib.LegacyApi.behaviorChanged",
-                "api_signature": "()",
-                "symbol_kind": "method",
-                "change_type": "BEHAVIOR_CHANGED",
-                "severity": "P2",
-                "reason_code": "BEHAVIOR_CHANGED_RUNTIME_VERIFICATION",
-                "reason": "behavior changed",
-                "user_conclusion": "可能影响",
-                "recommended_action": "运行相关业务测试",
-            },
-            {
-                "coord": "com.example:demo-lib",
-                "api": "com.example.lib.LegacyApi.bridgeMissing",
-                "api_name": "com.example.lib.LegacyApi.bridgeMissing",
-                "api_signature": "()",
-                "symbol_kind": "method",
-                "change_type": "REMOVED",
-                "severity": "P1",
-                "reason_code": "DEPENDENCY_SOURCE_MAPPING_MISSING",
-                "reason": "缺失依赖源码映射",
-                "user_conclusion": "需要补充输入",
-                "recommended_action": "补 dependency_source_dirs",
-            },
-            {
-                "coord": "com.example:demo-lib",
-                "api": "com.example.lib.LegacyApi.reflective",
-                "api_name": "com.example.lib.LegacyApi.reflective",
-                "api_signature": "()",
-                "symbol_kind": "method",
-                "change_type": "REMOVED",
-                "severity": "P1",
-                "reason_code": "RESOURCE_OR_REFLECTION",
-                "reason": "资源或反射调用",
-                "user_conclusion": "当前无法确认",
-            },
-        ],
+        "reachable_apis": [],
+        "not_impacted_apis": [],
+        "uncertain_apis": [],
+        "not_analyzed_apis": synthetic_apis,
+        "not_found_apis": [],
     }
-    write_text(synthetic_s5_dir / "summary.json", json.dumps(synthetic_summary, ensure_ascii=False, indent=2))
+    write_text(
+        synthetic_s5_dir / "summary.json",
+        json.dumps(synthetic_summary, ensure_ascii=False, indent=2) + "\n",
+    )
+    synthetic_changed_path = (
+        synthetic_report_dir / "evidence" / "api_changes" / "all_changed_apis.csv"
+    )
+    synthetic_changed_path.parent.mkdir(parents=True, exist_ok=True)
+    with open_csv_write(synthetic_changed_path) as f:
+        writer = csv.DictWriter(f, fieldnames=ALL_CHANGED_APIS_FIELDS)
+        writer.writeheader()
+        writer.writerows(
+            {
+                field: item.get(field, "")
+                for field in ALL_CHANGED_APIS_FIELDS
+            }
+            for item in synthetic_apis
+        )
+    with open_csv_write(synthetic_s5_dir / "alerts.csv") as f:
+        writer = csv.DictWriter(f, fieldnames=ALERTS_CSV_FIELDNAMES)
+        writer.writeheader()
+        for item in synthetic_apis:
+            writer.writerow({
+                "conclusion": item.get("user_conclusion") or "",
+                "review_reason": item.get("reason") or "",
+                "api_identity": build_api_identity_key(item),
+                "target_coord": item.get("coord") or "",
+                "changed_symbol": item.get("api") or "",
+                "api_signature": item.get("api_signature") or "",
+                "symbol_kind": item.get("symbol_kind") or "",
+                "change_type": item.get("change_type") or "",
+                "severity": item.get("severity") or "",
+                "path_status": "not_analyzed",
+                "path_occurrence_count": 0,
+            })
+    copy_file(
+        dep_changes_path(report_dir),
+        dep_changes_path(synthetic_report_dir),
+    )
     run_script(
         "s6_report.py",
         [
-            "--report-dir", str(report_dir),
+            "--report-dir", str(synthetic_report_dir),
             "--output-findings", str(user_conclusion_findings),
             "--output-report", str(user_conclusion_report),
         ],
@@ -4331,8 +4768,8 @@ BridgeFacade.callAdapter();
     assert_true(behavior_summary.get("not_analyzed") >= 1, "行为变更命中业务路径时应进入 not_analyzed，而非 reachable/uncertain")
     behavior_api = behavior_summary.get("not_analyzed_apis", [])[0]
     assert_true(
-        behavior_api.get("reason_code") == "ARTIFACT_BYTECODE_COVERAGE_INCOMPLETE",
-        "缺少最终制品时，API 级裁决应优先暴露字节码覆盖不完整",
+        behavior_api.get("reason_code") == "BEHAVIOR_CHANGED_RUNTIME_VERIFICATION",
+        "业务制品命中行为变更 API 时，仍应要求运行时验证",
     )
     assert_true(
         any(
@@ -4347,6 +4784,12 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
     base_tmp = workspace.base_tmp
     project_dir = workspace.project_dir
     dep_repo = workspace.dep_repo
+    wrapper_name = "mvnw.cmd" if os.name == "nt" else "mvnw"
+    wrapper_source = workspace.fake_bin / ("mvn.cmd" if os.name == "nt" else "mvn")
+    local_wrapper = project_dir / wrapper_name
+    copy_file(wrapper_source, local_wrapper)
+    if os.name != "nt":
+        local_wrapper.chmod(0o755)
 
     orchestrated_report = project_dir / ".upgrade-report-orchestrated"
     stdout, stderr, rc = run_script_with_rc(
@@ -4715,7 +5158,13 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
     blocked_interaction = read_json(interaction_path(blocked_report))
     assert_true(main_state_meta(blocked_ckpt).get("status") == "awaiting_user_input", "Maven 环境阻塞时主状态应进入 awaiting_user_input")
     assert_true(blocked_interaction.get("kind") == "execution_blocked", "Maven 环境阻塞时应暴露 execution_blocked")
-    assert_true(blocked_interaction.get("reason_code") == "step1_maven_command_blocked", "Maven 环境阻塞时 reason_code 不正确")
+    assert_true(
+        blocked_interaction.get("reason_code") == "STEP1_MAVEN_COMMAND_BLOCKED"
+        and "step1_maven_command_blocked" in (
+            blocked_interaction.get("reason_code_aliases") or []
+        ),
+        "Maven 环境阻塞时应输出规范原因码并保留旧别名",
+    )
     assert_true("JDK Home 无效" in json.dumps(blocked_interaction, ensure_ascii=False), "Maven 环境阻塞时未暴露真实错误摘要")
     assert_true(
         "base_jdk_home" in json.dumps(blocked_interaction.get("response_schema") or {}, ensure_ascii=False),
@@ -4778,8 +5227,11 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         "Step1 前置输入契约交互时不应把 step1 记成已完成",
     )
     assert_true(
-        step1_preflight_interaction.get("reason_code") == "missing_step1_entry_inputs",
-        "Step1 前置输入契约交互的 reason_code 不正确",
+        step1_preflight_interaction.get("reason_code") == "MISSING_STEP1_ENTRY_INPUTS"
+        and "missing_step1_entry_inputs" in (
+            step1_preflight_interaction.get("reason_code_aliases") or []
+        ),
+        "Step1 前置输入契约交互应输出规范原因码并保留旧别名",
     )
     missing_coord_interaction = s1_dep_diff_module.build_step1_missing_input_interaction(
         [
@@ -5016,8 +5468,11 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         "artifact + base_source_project_dir 模式在缺少 primary_module 时应停留在 step1",
     )
     assert_true(
-        artifact_base_source_interaction.get("reason_code") == "missing_step1_target_module",
-        "artifact + base_source_project_dir 模式的待补参 reason_code 不正确",
+        artifact_base_source_interaction.get("reason_code") == "MISSING_STEP1_TARGET_MODULE"
+        and "missing_step1_target_module" in (
+            artifact_base_source_interaction.get("reason_code_aliases") or []
+        ),
+        "artifact + base_source_project_dir 模式应输出规范原因码并保留旧别名",
     )
     assert_true(
         "target_module" in json.dumps(artifact_base_source_interaction.get("response_schema") or {}, ensure_ascii=False),
@@ -5069,8 +5524,12 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         "Step1 缺业务信息时 interaction.step_id 不正确",
     )
     assert_true(
-        "current_branch" in json.dumps(artifact_missing_interaction.get("response_schema") or {}, ensure_ascii=False),
-        "Step1 缺业务信息时未优先请求 current_branch",
+        artifact_missing_interaction.get("reason_code") == "DEPENDENCY_COORDINATES_UNRESOLVED"
+        and "manual_artifact_identities" in json.dumps(
+            artifact_missing_interaction.get("response_schema") or {},
+            ensure_ascii=False,
+        ),
+        "Step1 无法从制品确认版本时应请求物理条目完整身份",
     )
     missing_inputs = artifact_missing_interaction.get("missing_inputs") or []
     assert_true(
@@ -5078,16 +5537,16 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         "Step1 缺业务信息时 interaction.json 未写入 missing_inputs",
     )
     assert_true(
-        missing_inputs[0].get("field") == "current_branch",
-        "Step1 缺业务信息时首要缺失字段应为 current_branch",
+        missing_inputs[0].get("field") == "manual_artifact_identities",
+        "Step1 无法确认制品版本时首要缺失字段应为 manual_artifact_identities",
     )
     assert_true(
         missing_inputs[0].get("side") == "current",
         "Step1 缺业务信息时 missing_inputs.side 应标记为 current",
     )
     assert_true(
-        "pom.properties" in str(missing_inputs[0].get("reason") or ""),
-        "Step1 缺业务信息时 missing_inputs.reason 应说明缺失原因",
+        "版本" in str(missing_inputs[0].get("reason") or ""),
+        "Step1 无法确认制品版本时 missing_inputs.reason 应说明证据缺口",
     )
     artifact_followup_report = project_dir / ".upgrade-report-artifact-followup"
     artifact_followup_report.mkdir(parents=True, exist_ok=True)
@@ -5248,12 +5707,14 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
     )
     fallback_inputs = artifact_missing_interaction.get("fallback_inputs") or []
     assert_true(
-        fallback_inputs and fallback_inputs[0].get("field") == "current_source_project_dir",
-        "Step1 缺业务信息时 fallback_inputs 应明确 current_source_project_dir",
+        not fallback_inputs,
+        "版本真相无法确认时不应再把源码目录误列为可补齐该证据的 fallback",
     )
     assert_true(
-        "current_branch" in str(artifact_missing_interaction.get("question") or ""),
-        "Step1 缺业务信息时交互问题文案未明确输出缺失字段",
+        "manual_artifact_identities" in str(
+            artifact_missing_interaction.get("question") or ""
+        ),
+        "Step1 制品身份交互问题文案未明确输出缺失字段",
     )
     assert_true(
         "JUA_STEP_INTERACTION_JSON:" not in stdout and "JUA_STEP_INTERACTION_JSON:" not in stderr,
@@ -5265,8 +5726,14 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         json.dumps(
             {
                 "action": "continue",
-                "current_branch": "current",
-                "notes": "补充当前侧分支后重跑 step1",
+                "manual_artifact_identities": [{
+                    "side": "current",
+                    "lib_entry": "BOOT-INF/lib/demo-lib-2.0.0.jar",
+                    "group_id": "com.example",
+                    "artifact_id": "demo-lib",
+                    "version": "2.0.0",
+                }],
+                "notes": "确认当前侧嵌套制品完整身份后重跑 step1",
             },
             ensure_ascii=False,
             indent=2,
@@ -5285,25 +5752,25 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
     )
     assert_true(
         rc == EXIT_AWAITING_USER,
-        "Step1 缺业务信息后补充分支，应先重跑 step1 并停在 step1 确认点",
+        "Step1 补充制品身份后，应先重跑 step1 并停在 step1 确认点",
     )
     artifact_missing_resume_ckpt = read_json(main_state_path(artifact_missing_input_report))
     artifact_missing_resume_interaction = read_json(interaction_path(artifact_missing_input_report))
     assert_true(
         main_state_meta(artifact_missing_resume_ckpt).get("completed_step") == "step1",
-        "Step1 缺业务信息后补充分支，恢复执行后应先完成 step1",
+        "Step1 补充制品身份后，恢复执行应先完成 step1",
     )
     assert_true(
         artifact_missing_resume_interaction.get("step_id") == "step1",
-        "Step1 缺业务信息后补充分支，恢复执行后 interaction 应仍指向 step1",
+        "Step1 补充制品身份后，恢复执行的 interaction 应仍指向 step1",
     )
     assert_true(
         not (context_path(artifact_missing_input_report)).exists(),
-        "Step1 缺业务信息后补充分支，首次恢复不应直接执行 step2",
+        "Step1 补充制品身份后，首次恢复不应直接执行 step2",
     )
     assert_true(
         "正在分析：分析对象与依赖范围" in stderr and "正在分析：升级上下文" not in stderr,
-        "Step1 缺业务信息后补充分支，恢复日志应只显示 step1，不能直接跳到 step2",
+        "Step1 补充制品身份后，恢复日志应只显示 step1，不能直接跳到 step2",
     )
     artifact_branch_fallback_report = project_dir / ".upgrade-report-artifact-branch-fallback"
     artifact_branch_fallback_report.mkdir(parents=True, exist_ok=True)
@@ -5533,9 +6000,9 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         and main_state_meta(step2_resume_ckpt).get("current_step") == "done",
         "上下文完整且只有单一变化依赖时应连续完成流程",
     )
-    assert_true(
-        not interaction_path(step2_resume_report).exists(),
-        "无实质决策的后续流程不应留下交互文件",
+    assert_step5_informational_card(
+        step2_resume_report,
+        "补齐 Step2 上下文后完成流程",
     )
     assert_true(step2_resume_ctx.get("base_branch") == "base", "Step2 恢复后未回写 s2_context.json.base_branch")
     assert_true(step2_resume_ctx.get("current_branch") == "current", "Step2 恢复后未回写 s2_context.json.current_branch")
@@ -5579,13 +6046,16 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
             ),
         ],
         cwd=project_dir,
-        env={},
+        env={**dep_env},
     )
     assert_true(rc == EXIT_AWAITING_USER, "source_repo_hints 生成映射建议时 Step2 应等待明确采用或拒绝")
     step2_hint_interaction = read_json(interaction_path(step2_hint_accept_report))
     assert_true(
         step2_hint_interaction.get("step_id") == "step2"
-        and step2_hint_interaction.get("reason_code") == "step2_source_mapping_decision_required",
+        and step2_hint_interaction.get("reason_code") == "STEP2_SOURCE_MAPPING_DECISION_REQUIRED"
+        and "step2_source_mapping_decision_required" in (
+            step2_hint_interaction.get("reason_code_aliases") or []
+        ),
         "source_repo_hints 建议不得被静默接受，也不应制造无关的上下文确认",
     )
     stdout, stderr, rc = run_script_with_rc(
@@ -5631,9 +6101,12 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
     )
     assert_true(
         main_state_meta(step2_hint_accept_ckpt).get("completed_step") == "step6"
-        and main_state_meta(step2_hint_accept_ckpt).get("current_step") == "done"
-        and not interaction_path(step2_hint_accept_report).exists(),
+        and main_state_meta(step2_hint_accept_ckpt).get("current_step") == "done",
         "接受源码映射建议后，单一变化依赖不应制造范围选择点",
+    )
+    assert_step5_informational_card(
+        step2_hint_accept_report,
+        "接受源码映射建议后完成流程",
     )
 
     module_report = project_dir / ".upgrade-report-module-scope"
@@ -5818,6 +6291,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
             json.dumps({"action": "continue", "notes": "继续进入 Step2"}, ensure_ascii=False),
         ],
         cwd=project_dir,
+        env={**dep_env},
     )
     assert_true(
         rc in {0, EXIT_AWAITING_USER},
@@ -5916,6 +6390,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
                 json.dumps({"action": "continue", "notes": "确认依赖范围，继续"}, ensure_ascii=False),
             ],
             cwd=project_dir,
+            env={**dep_env},
             allow_awaiting=True,  # 允许进入下一个 checkpoint
         )
 
@@ -6028,11 +6503,19 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
     assert_true(orchestrated_all_changed, "orchestrated step5 未产出分析结果")
     orchestrated_summary = read_json(orchestrated_report / "evidence" / "call_chain" / "summary.json")
     orchestrated_per_dependency = read_json(
-        orchestrated_report / "evidence" / "api_changes" / run_step_module.PER_DEPENDENCY_DIRNAME / "com.example_demo-lib" / "summary.json"
+        orchestrated_report
+        / "evidence"
+        / "api_changes"
+        / run_step_module.PER_DEPENDENCY_DIRNAME
+        / make_per_dependency_dirname("com.example:demo-lib")
+        / "summary.json"
     )
     orchestrated_total = orchestrated_summary.get("total_apis", 0)
     assert_true(orchestrated_total >= 1, "orchestrated step5 应处理 all_changed_apis.csv 中的全部 API")
-    assert_true(not interaction_path(orchestrated_report).exists(), "Step5 成功后不应生成例行确认 interaction.json")
+    assert_step5_informational_card(
+        orchestrated_report,
+        "orchestrated Step5/Step6 完成流程",
+    )
     assert_true(
         orchestrated_per_dependency.get("step5", {}).get("final_status"),
         "orchestrated Step5 未写出 per_dependency final_status",
@@ -6046,6 +6529,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
             "--report-dir", str(orchestrated_report),
         ],
         cwd=project_dir,
+        env={**dep_env},
     )
     orchestrated_ckpt = read_json(main_state_path(orchestrated_report))
     assert_true(main_state_meta(orchestrated_ckpt).get("completed_step") == "step6", "run_step Step6 未写入完成状态")
