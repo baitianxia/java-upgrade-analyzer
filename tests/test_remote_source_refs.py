@@ -116,7 +116,7 @@ class RemoteSourceRefsTest(unittest.TestCase):
         self.assertEqual(after_delete["resolved_commit"], self.current_commit)
         self.assertEqual(
             after_delete["resolution_mode"],
-            "live_remote_expected_commit",
+            "pinned_commit",
         )
 
     def test_explicit_remote_ref_only_matches_requested_remote(self):
@@ -129,6 +129,51 @@ class RemoteSourceRefsTest(unittest.TestCase):
         self.assertEqual(result["remote"], "upstream")
         self.assertEqual(result["resolved_commit"], self.current_commit)
 
+    def test_multiple_remotes_without_origin_require_explicit_remote(self):
+        self.add_remote("first", {"release": self.base_commit})
+        self.add_remote("second", {"release": self.current_commit})
+
+        result = resolve_remote_source_ref(self.repo, "release")
+
+        self.assertEqual(result["status"], "remote_source_ambiguous")
+        self.assertEqual(result["query_mode"], "local_remote_selection")
+        self.assertEqual(
+            result["failures"][0]["reason_code"],
+            "remote_selection_ambiguous",
+        )
+
+    def test_repository_without_remote_has_precise_configuration_failure(self):
+        result = resolve_remote_source_ref(self.repo, "release")
+
+        self.assertEqual(result["status"], "remote_configuration_missing")
+        self.assertEqual(result["configured_remotes"], [])
+        self.assertEqual(
+            result["failures"][0]["reason_code"],
+            "remote_configuration_missing",
+        )
+        self.assertEqual(result["repository_path"], str(self.repo.resolve()))
+
+    def test_non_git_directory_is_not_reported_as_missing_remote(self):
+        plain_dir = self.root / "plain-source"
+        plain_dir.mkdir()
+
+        result = resolve_remote_source_ref(plain_dir, "release")
+
+        self.assertEqual(result["status"], "repository_not_git")
+        self.assertEqual(
+            result["failures"][0]["reason_code"],
+            "repository_not_git",
+        )
+
+    def test_explicit_local_commit_does_not_require_a_remote(self):
+        result = resolve_remote_source_ref(self.repo, self.current_commit)
+
+        self.assertEqual(result["status"], "remote_source_resolved")
+        self.assertEqual(result["resolved_ref"], self.current_commit)
+        self.assertEqual(result["resolved_commit"], self.current_commit)
+        self.assertEqual(result["resolution_mode"], "explicit_commit")
+        self.assertEqual(result["query_mode"], "local_commit")
+
     def test_annotated_remote_tag_resolves_to_peeled_commit(self):
         self.add_remote("origin", {"main": self.current_commit})
         self.git(self.repo, "tag", "-a", "v2.0.0", self.current_commit, "-m", "release")
@@ -140,25 +185,26 @@ class RemoteSourceRefsTest(unittest.TestCase):
         self.assertEqual(result["resolved_commit"], self.current_commit)
         self.assertEqual(result["remote_ref"], "refs/tags/v2.0.0")
 
-    def test_same_commit_on_multiple_remotes_resolves_and_keeps_all_candidates(self):
+    def test_unqualified_ref_prefers_origin_without_querying_other_remotes(self):
         self.add_remote("origin", {"release": self.current_commit})
         self.add_remote("upstream", {"release": self.current_commit})
 
         result = resolve_remote_source_ref(self.repo, "release")
 
         self.assertEqual(result["status"], "remote_source_resolved")
-        self.assertEqual(len(result["candidates"]), 2)
-        self.assertEqual({row["commit"] for row in result["candidates"]}, {self.current_commit})
+        self.assertEqual(result["remote"], "origin")
+        self.assertEqual(len(result["candidates"]), 1)
+        self.assertEqual(result["query_mode"], "targeted_exact")
 
-    def test_different_commits_on_multiple_remotes_are_ambiguous(self):
+    def test_unqualified_ref_does_not_compare_origin_with_other_remotes(self):
         self.add_remote("origin", {"release": self.base_commit})
         self.add_remote("upstream", {"release": self.current_commit})
 
         result = resolve_remote_source_ref(self.repo, "release")
 
-        self.assertEqual(result["status"], "remote_source_ambiguous")
-        self.assertEqual(result["resolved_commit"], "")
-        self.assertEqual({row["commit"] for row in result["candidates"]}, {self.base_commit, self.current_commit})
+        self.assertEqual(result["status"], "remote_source_resolved")
+        self.assertEqual(result["remote"], "origin")
+        self.assertEqual(result["resolved_commit"], self.base_commit)
 
     def test_missing_remote_ref_does_not_fall_back_to_local(self):
         self.git(self.repo, "branch", "release", self.current_commit)
@@ -166,7 +212,7 @@ class RemoteSourceRefsTest(unittest.TestCase):
 
         result = resolve_remote_source_ref(self.repo, "release")
 
-        self.assertEqual(result["status"], "remote_source_unavailable")
+        self.assertEqual(result["status"], "remote_ref_not_found")
         self.assertEqual(result["resolved_commit"], "")
 
     def test_local_ref_requires_explicit_confirmation(self):

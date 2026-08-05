@@ -946,6 +946,45 @@ class RunStepMainStateTest(unittest.TestCase):
                 first_round + ["asm-util:7.1 -> org.ow2.asm:asm-util"],
             )
 
+    def test_user_response_replaces_manual_identity_for_same_physical_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            state = run_step.new_main_state(project_dir / ".upgrade-report")
+            state["step1"]["input"] = {
+                "manual_artifact_identities": [{
+                    "side": "current",
+                    "lib_entry": "BOOT-INF/lib/renamed.jar",
+                    "group_id": "org.example",
+                    "artifact_id": "demo",
+                    "version": "1.0",
+                    "classifier": "",
+                }],
+            }
+
+            _, updated = run_step.apply_user_response_to_main_state(
+                state,
+                {"step_id": "step1", "kind": "input_request"},
+                {
+                    "action": "rerun_current_step",
+                    "manual_artifact_identities": [{
+                        "side": "current",
+                        "lib_entry": "BOOT-INF/lib/renamed.jar",
+                        "group_id": "org.example",
+                        "artifact_id": "demo",
+                        "version": "2.0",
+                        "classifier": "",
+                    }],
+                },
+                project_dir,
+                target_step_id="step1",
+            )
+
+            self.assertEqual(len(updated["manual_artifact_identities"]), 1)
+            self.assertEqual(
+                updated["manual_artifact_identities"][0]["version"],
+                "2.0",
+            )
+
     def test_user_response_primary_module_overrides_stale_modules(self):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
@@ -5775,6 +5814,42 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertEqual(
             raised.exception.reason_codes,
             ["STEP1_REMOTE_EXPECTED_COMMIT_UNMATERIALIZABLE"],
+        )
+
+    def test_step1_remote_operation_failure_is_system_error_not_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            context = {
+                "analysis_mode": "checkout_build",
+                "base_branch": "release",
+            }
+            resolution = {
+                "status": "fetch_failed",
+                "source_status": "remote_query_failed",
+                "repository_path": str(project_dir),
+                "failures": [{
+                    "remote": "origin",
+                    "stage": "targeted_ls_remote",
+                    "reason": "ssh handshake timed out",
+                    "reason_code": "transient_network_failure",
+                    "attempts": [{"attempt": 1}, {"attempt": 2}, {"attempt": 3}],
+                }],
+            }
+
+            with patch.object(
+                run_step,
+                "resolve_step1_ref",
+                return_value=resolution,
+            ), self.assertRaises(run_step.StepError) as raised:
+                run_step.resolve_step1_refs_for_execution(
+                    context,
+                    project_dir,
+                )
+
+        self.assertIn("ssh handshake timed out", str(raised.exception))
+        self.assertEqual(
+            raised.exception.reason_codes,
+            ["STEP1_REMOTE_OPERATION_FAILED"],
         )
 
     def test_step1_input_change_invalidates_bound_ref_snapshot(self):

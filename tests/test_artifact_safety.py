@@ -53,6 +53,52 @@ class ArtifactSafetyTest(unittest.TestCase):
         self.assertEqual(result.entry_count, 2)
         self.assertEqual(result.reason_codes, ())
 
+    def test_default_internal_policy_allows_high_expansion_ratio(self):
+        payload = _archive_bytes([("large.bin", b"0" * 1024 * 1024)])
+
+        default_result = artifact_safety.inspect_archive_bytes(payload)
+        strict_result = artifact_safety.inspect_archive_bytes(
+            payload,
+            max_expansion_ratio=200,
+        )
+
+        self.assertTrue(default_result.safe)
+        self.assertIn(
+            "ARCHIVE_EXPANSION_RATIO_EXCEEDED",
+            strict_result.reason_codes,
+        )
+
+    def test_empty_and_nonempty_stored_entries_are_safe(self):
+        result = artifact_safety.inspect_archive_bytes(
+            _archive_bytes(
+                [("empty.bin", b""), ("nonempty.bin", b"content")],
+                compression=zipfile.ZIP_STORED,
+            )
+        )
+
+        self.assertTrue(result.safe)
+        self.assertEqual(result.reason_codes, ())
+
+    def test_nonempty_entry_with_zero_compressed_size_is_invalid_metadata(self):
+        invalid_info = zipfile.ZipInfo("broken.bin")
+        invalid_info.compress_type = zipfile.ZIP_STORED
+        invalid_info.file_size = 7
+        invalid_info.compress_size = 0
+
+        with patch.object(
+            zipfile.ZipFile,
+            "infolist",
+            return_value=[invalid_info],
+        ):
+            result = artifact_safety.inspect_archive_bytes(_archive_bytes([]))
+
+        self.assertFalse(result.safe)
+        self.assertIn("ARCHIVE_SIZE_METADATA_INVALID", result.reason_codes)
+        self.assertTrue(any(
+            detail.endswith("<root>!/broken.bin")
+            for detail in result.details
+        ))
+
     def test_rejects_traversal_duplicate_and_high_expansion_entries(self):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
@@ -458,7 +504,10 @@ class ArtifactSafetyTest(unittest.TestCase):
                 "open",
                 side_effect=AssertionError("unsafe entry must not be decompressed"),
             ) as open_mock:
-                result = artifact_safety.inspect_archive(artifact)
+                result = artifact_safety.inspect_archive(
+                    artifact,
+                    max_expansion_ratio=200,
+                )
 
             self.assertFalse(result.safe)
             self.assertIn("ARCHIVE_EXPANSION_RATIO_EXCEEDED", result.reason_codes)

@@ -180,6 +180,26 @@ def resolve_step1_ref(
     allow_dirty_local_source=False,
 ):
     """Resolve Step1 auxiliary source from live remotes, with confirmed local fallback."""
+    if str(requested_ref or "").strip() == "HEAD" and not allow_local_source:
+        local = resolve_local_source_ref(
+            repo_dir,
+            requested_ref,
+            allow_local_source=False,
+            allow_dirty_local_source=allow_dirty_local_source,
+        )
+        return {
+            **local,
+            "status": (
+                "dirty_confirmation_required"
+                if local.get("status")
+                == "awaiting_dirty_local_source_confirmation"
+                else "not_found"
+            ),
+            "source_status": str(
+                local.get("status")
+                or "awaiting_local_source_confirmation"
+            ),
+        }
     remote_kwargs = {"expected_commit": expected_commit}
     if expected_remote:
         remote_kwargs["expected_remote"] = expected_remote
@@ -212,6 +232,18 @@ def resolve_step1_ref(
             "source_status": str(remote.get("status") or "remote_fetch_failed"),
         }
 
+    if not allow_local_source:
+        return {
+            **remote,
+            "status": "not_found",
+            "source_status": str(
+                remote.get("status") or "remote_ref_not_found"
+            ),
+            "remote_source_status": str(remote.get("status") or ""),
+            "local_candidate_commit": "",
+            "dirty": False,
+        }
+
     local = resolve_local_source_ref(
         repo_dir,
         requested_ref,
@@ -223,6 +255,7 @@ def resolve_step1_ref(
             **local,
             "status": "resolved",
             "source_status": "user_confirmed_local_source",
+            "remote_source_status": str(remote.get("status") or ""),
             "remote_failures": list(remote.get("failures") or []),
         }
     status = (
@@ -238,6 +271,7 @@ def resolve_step1_ref(
             if remote_operational_failure
             else str(local.get("status") or "awaiting_local_source_confirmation")
         ),
+        "remote_source_status": str(remote.get("status") or ""),
         "local_candidate_commit": str(local.get("local_candidate_commit") or ""),
         "dirty": bool(local.get("dirty")),
     }

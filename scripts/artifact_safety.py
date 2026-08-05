@@ -50,12 +50,27 @@ def is_allowed_duplicate_archive_entry(
     )
 
 
+def _archive_entry_expansion_ratio(info):
+    """Return a trustworthy expansion ratio or a metadata-integrity error."""
+    file_size = max(int(info.file_size), 0)
+    compressed_size = max(int(info.compress_size), 0)
+    if info.compress_type == zipfile.ZIP_STORED:
+        if compressed_size != file_size:
+            return None, "ARCHIVE_SIZE_METADATA_INVALID"
+        return 1.0, None
+    if file_size == 0:
+        return 1.0, None
+    if compressed_size == 0:
+        return None, "ARCHIVE_SIZE_METADATA_INVALID"
+    return file_size / compressed_size, None
+
+
 def _inspect_archive_source(
     source,
     *,
     max_entries=100_000,
     max_total_uncompressed_bytes=2 * 1024 * 1024 * 1024,
-    max_expansion_ratio=200,
+    max_expansion_ratio=None,
     max_nested_depth=3,
     max_nested_archive_bytes=64 * 1024 * 1024,
     inspect_nested_archives=True,
@@ -107,11 +122,19 @@ def _inspect_archive_source(
                     if total_size > max_total_uncompressed_bytes:
                         reasons.add("ARCHIVE_UNCOMPRESSED_SIZE_EXCEEDED")
                         entry_rejected = True
-                    compressed = max(int(info.compress_size), 0)
-                    ratio = float("inf") if compressed == 0 and info.file_size else (
-                        info.file_size / max(compressed, 1)
+                    ratio, size_metadata_error = (
+                        _archive_entry_expansion_ratio(info)
                     )
-                    if ratio > max_expansion_ratio:
+                    if size_metadata_error:
+                        reasons.add(size_metadata_error)
+                        details.add(
+                            f"{size_metadata_error}:{location}!/{info.filename}"
+                        )
+                        entry_rejected = True
+                    elif (
+                        max_expansion_ratio is not None
+                        and ratio > max_expansion_ratio
+                    ):
                         reasons.add("ARCHIVE_EXPANSION_RATIO_EXCEEDED")
                         entry_rejected = True
                     if info.is_dir():

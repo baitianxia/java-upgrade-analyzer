@@ -143,25 +143,43 @@ class Step1RefResolutionTest(unittest.TestCase):
         self.assertEqual(result["source_status"], "remote_source_ambiguous")
         local_resolver.assert_not_called()
 
-    def test_remote_unavailable_requires_local_confirmation(self):
+    def test_remote_unavailable_does_not_create_local_fallback_checkpoint(self):
         remote = {
             "status": "remote_source_unavailable",
             "requested_ref": "release",
             "failures": [{"stage": "ls_remote", "reason": "offline"}],
         }
-        local = {
-            "status": "awaiting_local_source_confirmation",
-            "local_candidate_commit": "c" * 40,
-            "dirty": False,
-        }
         with patch("step1_ref_resolution.resolve_remote_source_ref", return_value=remote), patch(
-            "step1_ref_resolution.resolve_local_source_ref", return_value=local
-        ):
+            "step1_ref_resolution.resolve_local_source_ref"
+        ) as local_resolver:
             result = resolve_step1_ref("/repo", "release")
 
         self.assertEqual(result["status"], "not_found")
-        self.assertEqual(result["source_status"], "awaiting_local_source_confirmation")
-        self.assertEqual(result["local_candidate_commit"], "c" * 40)
+        self.assertEqual(result["source_status"], "remote_source_unavailable")
+        self.assertEqual(result["local_candidate_commit"], "")
+        local_resolver.assert_not_called()
+
+    def test_missing_remote_configuration_remains_distinct(self):
+        remote = {
+            "status": "remote_configuration_missing",
+            "requested_ref": "release",
+            "repository_path": "/repo",
+            "configured_remotes": [],
+        }
+        with patch(
+            "step1_ref_resolution.resolve_remote_source_ref",
+            return_value=remote,
+        ), patch(
+            "step1_ref_resolution.resolve_local_source_ref",
+        ) as local_resolver:
+            result = resolve_step1_ref("/repo", "release")
+
+        self.assertEqual(result["status"], "not_found")
+        self.assertEqual(
+            result["source_status"],
+            "remote_configuration_missing",
+        )
+        local_resolver.assert_not_called()
 
     def test_confirmed_local_fallback_is_explicit_in_provenance(self):
         remote = {

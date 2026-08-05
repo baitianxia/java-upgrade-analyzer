@@ -127,6 +127,7 @@ INTENT_PATCH_ALLOWED_SET_FIELDS = {
     "dependency_source_dirs",
     "retry_remote_fetch",
     "manual_coord_overrides",
+    "manual_artifact_identities",
     "max_depth",
     "modules",
     "primary_module",
@@ -1513,6 +1514,30 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
         updated["manual_coord_overrides"] = _dedupe_strings(
             list(updated.get("manual_coord_overrides") or []) + incoming_coord_overrides
         )
+    manual_artifact_identities = normalize_manual_artifact_identities(
+        response.get("manual_artifact_identities"),
+        "manual_artifact_identities",
+    )
+    if manual_artifact_identities is not None:
+        previous_identities = normalize_manual_artifact_identities(
+            updated.get("manual_artifact_identities") or [],
+            "manual_artifact_identities",
+        ) or []
+        merged_identities = {
+            (
+                item.get("side", ""),
+                item.get("lib_entry") or item.get("entry_id", ""),
+            ): dict(item)
+            for item in previous_identities
+        }
+        for item in manual_artifact_identities:
+            merged_identities[(
+                item.get("side", ""),
+                item.get("lib_entry") or item.get("entry_id", ""),
+            )] = dict(item)
+        updated["manual_artifact_identities"] = list(
+            merged_identities.values()
+        )
     if str(response.get("action") or "").strip() == "confirm_unresolved":
         updated["allow_unresolved"] = True
 
@@ -2607,6 +2632,53 @@ def _dedupe_strings(items):
     return ordered
 
 
+def normalize_manual_artifact_identities(raw_value, field_name):
+    if raw_value is None:
+        return None
+    values = [raw_value] if isinstance(raw_value, dict) else raw_value
+    if not isinstance(values, list):
+        raise StepError(f"{field_name} 仅支持 JSON 对象或对象数组")
+    normalized = []
+    seen = set()
+    for raw_item in values:
+        if not isinstance(raw_item, dict):
+            raise StepError(f"{field_name} 的每一项必须是 JSON 对象")
+        side = str(raw_item.get("side") or "").strip()
+        entry_id = str(raw_item.get("entry_id") or "").strip()
+        lib_entry = str(raw_item.get("lib_entry") or "").strip()
+        group_id = str(raw_item.get("group_id") or "").strip()
+        artifact_id = str(raw_item.get("artifact_id") or "").strip()
+        version = str(raw_item.get("version") or "").strip()
+        classifier = str(raw_item.get("classifier") or "").strip()
+        if side not in {"base", "current"}:
+            raise StepError(f"{field_name}.side 必须是 base 或 current")
+        if not (entry_id or lib_entry):
+            raise StepError(f"{field_name} 的每一项必须包含 lib_entry 或 entry_id")
+        if not group_id or not artifact_id or not version:
+            raise StepError(
+                f"{field_name} 的每一项必须包含 group_id/artifact_id/version"
+            )
+        item = {
+            "side": side,
+            "entry_id": entry_id or lib_entry,
+            "lib_entry": lib_entry or entry_id,
+            "group_id": group_id,
+            "artifact_id": artifact_id,
+            "version": version,
+            "classifier": classifier,
+        }
+        key = (
+            item["side"], item["entry_id"], item["lib_entry"],
+            item["group_id"], item["artifact_id"], item["version"],
+            item["classifier"],
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(item)
+    return normalized
+
+
 def normalize_step5_target_list(raw_value, field_name):
     if raw_value is None:
         return None
@@ -2930,6 +3002,7 @@ def infer_non_pending_target_step_from_payload(user_response):
                 "current_jdk_home",
                 "current_source_project_dir",
                 "manual_coord_overrides",
+                "manual_artifact_identities",
                 "modules",
                 "primary_module",
                 "target_module",
@@ -3917,6 +3990,10 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
     manual_coord_overrides = _dedupe_strings(
         resolve_value(cli_list(getattr(args, "manual_coord_overrides", [])), merged, "manual_coord_overrides", []) or []
     )
+    manual_artifact_identities = normalize_manual_artifact_identities(
+        resolve_value(None, merged, "manual_artifact_identities", []) or [],
+        "manual_artifact_identities",
+    ) or []
     allow_unresolved = resolve_value(cli_scalar(getattr(args, "allow_unresolved", None)), merged, "allow_unresolved", False)
     allow_unresolved = parse_bool_like(allow_unresolved, "allow_unresolved")
     confirmed_unresolved_items = list(resolve_value(None, merged, "confirmed_unresolved_items", []) or [])
@@ -4096,6 +4173,7 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
         ),
         "primary_module": resolve_value(cli_scalar(args.primary_module), merged, "primary_module", ""),
         "manual_coord_overrides": manual_coord_overrides,
+        "manual_artifact_identities": manual_artifact_identities,
         "allow_unresolved": allow_unresolved,
         "confirmed_unresolved_items": confirmed_unresolved_items,
         "artifact_input_mode": artifact_input_mode,
@@ -4741,6 +4819,19 @@ def build_step1_response_properties():
                 "artifact:version -> group:artifact；系统会与前几轮已提交的坐标合并。"
             ),
         },
+        "manual_artifact_identities": {
+            "type": "array",
+            "description": (
+                "可选。当 fat JAR 物理条目无法自身确认版本时，"
+                "按 side + lib_entry 提交人工确认的完整制品身份。"
+            ),
+            "items": {
+                "type": "object",
+                "required": [
+                    "side", "lib_entry", "group_id", "artifact_id", "version"
+                ],
+            },
+        },
         "tool": {
             "type": "string",
             "enum": ["maven", "gradle"],
@@ -5201,6 +5292,9 @@ def _step1_ref_request(
         "dirty": bool(resolution.get("dirty")),
         "expected_commit": str(resolution.get("expected_commit") or ""),
         "observed_commit": str(resolution.get("observed_commit") or ""),
+        "repository_path": str(resolution.get("repository_path") or source_dir or ""),
+        "configured_remotes": list(resolution.get("configured_remotes") or []),
+        "query_mode": str(resolution.get("query_mode") or ""),
     }
     detected_commit = str(
         resolution.get("resolved_commit") or resolution.get("local_candidate_commit") or ""
@@ -5258,8 +5352,25 @@ def build_step1_ref_confirmation_interaction(run_context, requests):
         summary = "仅有源码目录不能证明其对应 base 或 current 制品，必须先确认并固定 commit。"
     elif "ambiguous" in reason_codes:
         reason_code = "ambiguous_step1_source_ref"
-        title = "Step1 分支存在多个候选"
-        summary = "提供的分支名称在远程仓库匹配到多个不同 commit，不能自动选择。"
+        title = "Step1 源码 ref 存在歧义"
+        summary = (
+            "未指定 remote 且仓库中没有默认 origin，或同名 branch/tag 指向不同 commit；"
+            "必须明确选择。"
+        )
+    elif any(
+        item.get("source_status") == "repository_not_git"
+        for item in requests
+    ):
+        reason_code = "step1_source_directory_not_git"
+        title = "Step1 源码目录不是 Git 仓库"
+        summary = "实际执行解析的源码目录不是 Git 仓库；请修正源码目录。"
+    elif any(
+        item.get("source_status") == "remote_configuration_missing"
+        for item in requests
+    ):
+        reason_code = "step1_remote_configuration_missing"
+        title = "Step1 源码目录未配置 Git remote"
+        summary = "实际执行解析的源码目录没有配置 remote；请修正源码目录或 Git remote。"
     elif any(item.get("source_status") == "awaiting_dirty_local_source_confirmation" for item in requests):
         reason_code = "step1_dirty_local_source_confirmation_required"
         title = "Step1 本地源码包含未提交修改"
@@ -5271,7 +5382,7 @@ def build_step1_ref_confirmation_interaction(run_context, requests):
     else:
         reason_code = "step1_source_ref_not_found"
         title = "Step1 无法定位源码分支"
-        summary = "提供的分支无法从远程仓库解析并固定为 commit。"
+        summary = "所选 remote 上不存在输入的精确 branch/tag；请核对 ref 或 remote。"
     properties = {
         "action": {"type": "string", "enum": ["continue", "confirm_local_source", "cancel"]},
         "source_ref_selections": {
@@ -5338,6 +5449,14 @@ def build_step1_ref_confirmation_interaction(run_context, requests):
             checklist_lines.append(
                 f"{side_cn}实际解析目录: {request.get('source_project_dir')}"
             )
+        if request.get("configured_remotes"):
+            checklist_lines.append(
+                f"{side_cn}已配置 remote: {', '.join(request.get('configured_remotes') or [])}"
+            )
+        if request.get("query_mode"):
+            checklist_lines.append(
+                f"{side_cn}Git 查询模式: {request.get('query_mode')}"
+            )
         if request.get("detected_commit"):
             checklist_lines.append(
                 f"{side_cn}源码目录当前 revision: {request.get('detected_ref')} "
@@ -5383,7 +5502,7 @@ def build_step1_ref_confirmation_interaction(run_context, requests):
     continue_option = (
         {"id": "continue", "label": "重试远端 fetch", "description": "保持已唯一定位的 ref，并重新执行受控 fetch。"}
         if fetch_only
-        else {"id": "continue", "label": "确认 ref 后继续", "description": "重新查询远程，并验证所选 ref 仍指向确认卡中的 commit。"}
+        else {"id": "continue", "label": "确认 ref 后继续", "description": "把所选 ref 固定为不可变 commit 后继续。"}
     )
     return {
         "schema": "java-upgrade-analyzer.interaction.v2",
@@ -5502,6 +5621,24 @@ def resolve_step1_refs_for_execution(run_context, project_dir):
                         reason_codes=[
                             "STEP1_REMOTE_EXPECTED_COMMIT_UNMATERIALIZABLE",
                         ],
+                    )
+                if resolution.get("status") == "fetch_failed":
+                    failures = list(
+                        resolution.get("failures")
+                        or resolution.get("remote_failures")
+                        or []
+                    )
+                    last_failure = failures[-1] if failures else {}
+                    failure_reason = str(
+                        last_failure.get("reason")
+                        or resolution.get("reason")
+                        or resolution.get("source_status")
+                        or "未知 Git 远端错误"
+                    ).strip()
+                    raise StepError(
+                        f"Step1 {side} 侧 Git 远端操作在受控重试后仍失败"
+                        f"（仓库: {repo_dir}）：{failure_reason}",
+                        reason_codes=["STEP1_REMOTE_OPERATION_FAILED"],
                     )
                 if resolution.get("expected_commit"):
                     updated[f"{side}_expected_commit"] = str(resolution.get("expected_commit") or "")

@@ -11,7 +11,7 @@ s1_dep_diff.py — Step 1：依赖变更全景扫描
 实现原则：
   - 编译产物是版本真相源
   - `mvn dependency:list` 仅用于补充 groupId/artifactId/classifier 等坐标信息
-  - 除非只是纠正 filename-only 场景下的同一文件名解释方式，否则不能用 runtime 结果改写编译产物中已观察到的版本事实
+  - runtime 结果中的版本只参与候选匹配与冲突诊断，不能写入或确认最终制品版本
 
 Windows 兼容：通过 compat.py 统一处理编码，不会因 GBK/UTF-8 不匹配崩溃。
 """
@@ -34,6 +34,7 @@ from analysis_contract import (
     sha256_file,
 )
 from artifact_safety import (
+    _archive_entry_expansion_ratio,
     _unsafe_entry_name,
     is_allowed_duplicate_archive_entry,
     require_safe_archive,
@@ -69,7 +70,6 @@ PACKAGED_INVENTORY_CACHE_SCHEMA_VERSION = 3
 PACKAGED_INVENTORY_CACHE_DIRNAME = 'step1_packaged_inventory'
 STEP1_MAX_DEPENDENCY_JAR_BYTES = 1024 * 1024 * 1024
 STEP1_MAX_TOTAL_DEPENDENCY_BYTES = 2 * 1024 * 1024 * 1024
-STEP1_MAX_DEPENDENCY_EXPANSION_RATIO = 200
 # A cold Maven/Gradle cache can legitimately spend more than 30 minutes
 # downloading dependencies and wrapper distributions. Build tools already own
 # repository connection/read timeouts, so Step1 must not impose a total
@@ -555,6 +555,30 @@ class PinnedCommitMaterializationError(RuntimeError):
         )
 
 
+class Step1RemoteOperationError(RuntimeError):
+    def __init__(self, side, source_project_dir, resolution):
+        self.side = str(side or "")
+        self.source_project_dir = str(source_project_dir or "")
+        self.resolution = dict(resolution or {})
+        failures = list(
+            self.resolution.get("failures")
+            or self.resolution.get("remote_failures")
+            or []
+        )
+        last_failure = failures[-1] if failures else {}
+        reason = str(
+            last_failure.get("reason")
+            or self.resolution.get("reason")
+            or self.resolution.get("source_status")
+            or "未知 Git 远端错误"
+        ).strip()
+        super().__init__(
+            f"STEP1_REMOTE_OPERATION_FAILED: "
+            f"{self.side or '该侧'} Git 远端操作在受控重试后仍失败"
+            f"（仓库: {self.source_project_dir or '-'}）：{reason}"
+        )
+
+
 def build_step1_ref_resolution_interaction(error):
     side = str(error.side or "").strip() or "current"
     field = f"{side}_branch"
@@ -590,10 +614,22 @@ def build_step1_ref_resolution_interaction(error):
         summary = f"{side_cn}远端 ref 已指向新的 commit，需要基于刷新后的候选重新确认。"
     elif status == "ambiguous":
         reason_code = "ambiguous_step1_source_ref"
-        summary = f"{side_cn}分支匹配到多个不同 commit，不能自动选择。"
+        summary = (
+            f"{side_cn}未指定 remote 且没有默认 origin，"
+            "或同名 branch/tag 指向不同 commit，不能自动选择。"
+        )
+    elif source_status == "repository_not_git":
+        reason_code = "step1_source_directory_not_git"
+        summary = f"{side_cn}实际执行解析的源码目录不是 Git 仓库；请修正源码目录。"
+    elif source_status == "remote_configuration_missing":
+        reason_code = "step1_remote_configuration_missing"
+        summary = (
+            f"{side_cn}实际执行解析的源码目录没有配置 Git remote；"
+            "请修正源码目录或 remote。"
+        )
     else:
         reason_code = "step1_source_ref_not_found"
-        summary = f"{side_cn}分支无法从实际源码仓库的实时远端清单中解析并固定为 commit。"
+        summary = f"{side_cn}所选 remote 上不存在输入的精确 branch/tag。"
     summary = f"{summary}{query_scope_note}"
     request = {
         "side": side,
@@ -609,6 +645,11 @@ def build_step1_ref_resolution_interaction(error):
         "remote_failures": [dict(item) for item in (resolution.get("failures") or [])],
         "local_candidate_commit": str(resolution.get("local_candidate_commit") or ""),
         "dirty": bool(resolution.get("dirty")),
+        "repository_path": str(
+            resolution.get("repository_path") or error.source_project_dir or ""
+        ),
+        "configured_remotes": list(resolution.get("configured_remotes") or []),
+        "query_mode": str(resolution.get("query_mode") or ""),
         "resolution_trigger": "artifact_coordinate_enrichment",
         "remote_query_scope": side,
         "other_side_remote_status": "not_evaluated_by_this_interaction",
@@ -694,6 +735,14 @@ def build_step1_ref_resolution_interaction(error):
             *(
                 [f"{side_cn}实际解析目录: {error.source_project_dir}"]
                 if error.source_project_dir else []
+            ),
+            *(
+                [f"{side_cn}已配置 remote: {', '.join(request.get('configured_remotes') or [])}"]
+                if request.get("configured_remotes") else []
+            ),
+            *(
+                [f"{side_cn}Git 查询模式: {request.get('query_mode')}"]
+                if request.get("query_mode") else []
             ),
             *(
                 [f"{side_cn}源码目录当前 revision: {request.get('detected_ref')} ({request.get('detected_commit')})"]
@@ -809,6 +858,7 @@ def normalize_unresolved_items(unresolved_items):
                 "lib_name": str(item.get("lib_name") or "").strip(),
                 "side": str(item.get("side") or "").strip(),
                 "source": str(item.get("source") or "").strip(),
+                "reason_code": str(item.get("reason_code") or "").strip(),
             }
             normalized_item["label"] = _normalize_unresolved_label(normalized_item)
         else:
@@ -825,6 +875,7 @@ def normalize_unresolved_items(unresolved_items):
                 "lib_name": "",
                 "side": "",
                 "source": "",
+                "reason_code": "",
                 "label": label,
             }
         dedupe_key = (
@@ -835,6 +886,7 @@ def normalize_unresolved_items(unresolved_items):
             normalized_item.get("lib_entry", ""),
             normalized_item.get("side", ""),
             normalized_item.get("source", ""),
+            normalized_item.get("reason_code", ""),
             normalized_item.get("label", ""),
         )
         if dedupe_key in seen:
@@ -852,8 +904,10 @@ class UnresolvedPackagedCoordinatesError(RuntimeError):
             item.get("label", "") for item in self.unresolved_items[:10] if item.get("label")
         )
         super().__init__(
-            "最终制品中存在无法确认坐标的依赖，已停止输出以避免错误对比："
-            f"{unresolved_text}。请检查嵌套 jar 的 pom.properties，或确认构建工具的 runtime 依赖报告可正常生成。"
+            "最终制品中存在无法确认完整身份的依赖，已停止输出以避免错误对比："
+            f"{unresolved_text}。请检查嵌套 jar 的 pom.properties；"
+            "坐标缺失时可使用 runtime 依赖报告补全，"
+            "版本无法从最终制品确认时必须人工确认。"
         )
 
 
@@ -1088,6 +1142,16 @@ def build_step1_coordinate_followup_interaction(
     _ = branch_field
     unresolved_items = normalize_unresolved_items(unresolved_items)
     unresolved_labels = [item.get("label", "") for item in unresolved_items if item.get("label")]
+    has_unconfirmed_version = any(
+        str(item.get("reason_code") or "").strip()
+        == "PACKAGED_VERSION_UNCONFIRMED"
+        for item in unresolved_items
+    )
+    has_unresolved_coordinate = any(
+        str(item.get("reason_code") or "").strip()
+        != "PACKAGED_VERSION_UNCONFIRMED"
+        for item in unresolved_items
+    )
     properties = {
         "action": {
             "type": "string",
@@ -1104,17 +1168,47 @@ def build_step1_coordinate_followup_interaction(
                 "系统会与前几轮已提交的坐标合并。"
             ),
         },
+        "manual_artifact_identities": {
+            "type": "array",
+            "description": (
+                "可选。仅当最终制品无法确认版本或完整身份时，"
+                "按 fat JAR 物理条目提交人工确认。"
+            ),
+            "items": {
+                "type": "object",
+                "required": [
+                    "side", "lib_entry", "group_id", "artifact_id", "version"
+                ],
+                "properties": {
+                    "side": {"type": "string", "enum": ["base", "current"]},
+                    "lib_entry": {"type": "string"},
+                    "group_id": {"type": "string"},
+                    "artifact_id": {"type": "string"},
+                    "version": {"type": "string"},
+                    "classifier": {"type": "string"},
+                },
+            },
+        },
     }
     missing_inputs = []
     fallback_inputs = []
     required_fields = []
     checklist_lines = [
-        f"{side_cn}产物中的部分嵌套依赖即使在已提供补全信息后仍无法安全识别坐标。",
+        f"{side_cn}产物中的部分嵌套依赖即使在已提供补全信息后仍无法安全确认完整身份。",
         f"{side_cn}产物: {artifact_path}",
     ]
     if unresolved_labels:
         checklist_lines.append("未识别的嵌套依赖: " + ", ".join(unresolved_labels[:10]))
         checklist_lines.append("允许人工补充坐标，格式：artifact:version[:classifier] -> group:artifact")
+        if any(
+            str(item.get("reason_code") or "").strip()
+            == "PACKAGED_VERSION_UNCONFIRMED"
+            for item in unresolved_items
+        ):
+            checklist_lines.append(
+                "最终制品未能确认版本的条目，必须使用 "
+                "manual_artifact_identities 按 side + lib_entry 确认完整身份。"
+            )
         checklist_lines.append("未补齐的 unresolved 会保留在 s1_dep_changes.csv，并标记为 unresolved；后续步骤会跳过这些行。")
     if branch_value:
         checklist_lines.append(f"已尝试的 {side_cn}分支: {branch_value}")
@@ -1123,7 +1217,25 @@ def build_step1_coordinate_followup_interaction(
     if primary_module:
         checklist_lines.append(f"当前 primary_module: {primary_module}")
 
-    if not str(primary_module or "").strip():
+    if has_unconfirmed_version:
+        missing_inputs.append(
+            {
+                "field": "manual_artifact_identities",
+                "label": "物理条目完整身份确认",
+                "side": side,
+                "required": True,
+                "recommended": True,
+                "reason": (
+                    "fat JAR 本身无法唯一确认版本；"
+                    "dependency:list 只能补齐坐标，不能作为版本真相源。"
+                ),
+                "artifact_path": artifact_path,
+                "value_type": "artifact_identity_array",
+            }
+        )
+        required_fields.append("manual_artifact_identities")
+
+    if has_unresolved_coordinate and not str(primary_module or "").strip():
         properties["primary_module"] = {
             "type": "string",
             "description": "目标模块名。仅支持单模块；应与用户提供的编译产物所属模块一致。",
@@ -1143,7 +1255,11 @@ def build_step1_coordinate_followup_interaction(
         required_fields.append("primary_module")
         checklist_lines.append("优先补充: primary_module（与该产物所属模块保持一致）")
 
-    if source_field and not str(source_value or "").strip():
+    if (
+        has_unresolved_coordinate
+        and source_field
+        and not str(source_value or "").strip()
+    ):
         properties[source_field] = {
             "type": "string",
             "description": f"{side_cn}源码工程目录。用于在当前补全口径仍不足时，直接从该侧源码工程执行 Maven 解析。",
@@ -1168,12 +1284,16 @@ def build_step1_coordinate_followup_interaction(
 
     kind = "input_request" if missing_inputs or fallback_inputs else "review"
     question = (
-        f"{side_cn}产物里仍有嵌套依赖缺少 Maven 坐标，"
-        "skill 已尝试使用当前业务信息补全，但结果仍不足以安全输出。"
+        f"{side_cn}产物里仍有嵌套依赖无法安全确认完整 Maven 身份。"
     )
     if unresolved_labels:
         question += f" 未识别项包括：{', '.join(unresolved_labels[:10])}。"
-    if "primary_module" in required_fields:
+    if "manual_artifact_identities" in required_fields:
+        question += (
+            " 请按 `side + lib_entry` 补充 "
+            "`manual_artifact_identities`。"
+        )
+    elif "primary_module" in required_fields:
         question += " 请先补充 `primary_module`。"
     elif source_field and source_field in required_fields:
         question += f" 请补充 `{source_field}`。"
@@ -1198,8 +1318,8 @@ def build_step1_coordinate_followup_interaction(
         "diagnostic_guidance": guidance_for_reason_code(
             DEPENDENCY_COORDINATES_UNRESOLVED
         ),
-        "summary": "Step1 已尝试根据已有 branch/source 信息补全嵌套依赖坐标，但仍无法安全确认全部 Maven 坐标。",
-        "title": "step1 仍需进一步确认坐标补全信息",
+        "summary": "Step1 已尝试根据最终制品与已有 branch/source 信息补全身份，但仍有条目无法安全确认坐标或版本。",
+        "title": "step1 仍需进一步确认制品身份",
         "question": question,
         "files_to_review": [artifact_path] if artifact_path else [],
         "required_fields": required_fields,
@@ -1243,10 +1363,11 @@ def build_step1_coordinate_followup_interaction(
                 "如果用户补充了 primary_module，应确保它与编译产物所属模块一致。",
                 "若用户未提供能改变补全结果的新信息，不要直接继续重试。",
                 "如果用户人工补充坐标，统一整理成 artifact:version[:classifier] -> group:artifact。",
+                "如果 reason_code 为 PACKAGED_VERSION_UNCONFIRMED，必须按 side + lib_entry 整理为 manual_artifact_identities，不得使用 dependency:list 版本代替人工确认。",
                 "如果用户明确接受 unresolved 保留并继续，应使用 action=confirm_unresolved。",
             ],
         },
-        "resume_hint": "可补充模块范围、源码目录、人工补充坐标，或显式确认 unresolved 后继续执行 Step1。",
+        "resume_hint": "可补充模块范围、源码目录、人工坐标或物理条目完整身份，也可显式确认 unresolved 后继续执行 Step1。",
         "runtime_rules": [
             f"看到 {DEPENDENCY_COORDINATES_UNRESOLVED} 后，必须先向用户暴露未识别的嵌套依赖和已尝试的补全来源。",
             "禁止把这类失败压成通用 rc=1 或继续盲重试。",
@@ -1292,6 +1413,96 @@ def parse_manual_coord_overrides(raw_values):
             "raw": text,
         }
     return overrides, invalid_entries
+
+
+def parse_manual_artifact_identities(raw_values):
+    """Normalize user-confirmed identities keyed by one physical fat-JAR entry."""
+    identities = []
+    invalid_entries = []
+    seen = set()
+    for raw in raw_values or []:
+        item = raw
+        if isinstance(raw, str):
+            try:
+                item = json.loads(raw)
+            except Exception:
+                invalid_entries.append(raw)
+                continue
+        if not isinstance(item, dict):
+            invalid_entries.append(str(raw))
+            continue
+        side = str(item.get('side') or '').strip()
+        entry_id = str(item.get('entry_id') or '').strip()
+        lib_entry = str(item.get('lib_entry') or '').strip()
+        group_id = str(item.get('group_id') or '').strip()
+        artifact_id = str(item.get('artifact_id') or '').strip()
+        version = str(item.get('version') or '').strip()
+        classifier = str(item.get('classifier') or '').strip()
+        if (
+            side not in {'base', 'current'}
+            or not (entry_id or lib_entry)
+            or not group_id
+            or not artifact_id
+            or not version
+        ):
+            invalid_entries.append(
+                json.dumps(item, ensure_ascii=False, sort_keys=True)
+            )
+            continue
+        normalized = {
+            'side': side,
+            'entry_id': entry_id or lib_entry,
+            'lib_entry': lib_entry or entry_id,
+            'group_id': group_id,
+            'artifact_id': artifact_id,
+            'version': version,
+            'classifier': classifier,
+            'coord': normalize_artifact_coord(
+                f'{group_id}:{artifact_id}', classifier
+            ),
+        }
+        key = (
+            normalized['side'], normalized['entry_id'], normalized['lib_entry'],
+            normalized['coord'], normalized['version'],
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        identities.append(normalized)
+    return identities, invalid_entries
+
+
+def _manual_artifact_identity_for_entry(
+    packaged_item,
+    manual_artifact_identities,
+    side="",
+):
+    packaged_entry_id = str((packaged_item or {}).get('entry_id') or '').strip()
+    packaged_lib_entry = str((packaged_item or {}).get('lib_entry') or '').strip()
+    packaged_side = str(
+        (packaged_item or {}).get('side') or side or ''
+    ).strip()
+    matches = []
+    for identity in manual_artifact_identities or []:
+        if identity.get('side') != packaged_side:
+            continue
+        selectors = {
+            str(identity.get('entry_id') or '').strip(),
+            str(identity.get('lib_entry') or '').strip(),
+        } - {''}
+        packaged_selectors = {
+            packaged_entry_id, packaged_lib_entry,
+        } - {''}
+        if selectors.intersection(packaged_selectors):
+            matches.append(identity)
+    distinct = {
+        (item.get('coord'), item.get('version')): item
+        for item in matches
+    }
+    return (
+        next(iter(distinct.values())) if len(distinct) == 1 else None,
+        list(distinct.values()),
+    )
 
 
 def parse_confirmed_unresolved_items(raw_values):
@@ -2034,30 +2245,60 @@ def _classifier_from_filename(name, artifact_id, version):
     return ''
 
 
+def _physical_version_from_filename_coordinate(
+    name,
+    artifact_id,
+    classifier='',
+):
+    """Read a version literal from a fat-JAR entry using coordinate fields only."""
+    stem = _filename_stem(name)
+    artifact_id = str(artifact_id or '').strip()
+    classifier = str(classifier or '').strip()
+    if not stem or not artifact_id:
+        return ''
+    prefix = f'{artifact_id}-'
+    if not stem.startswith(prefix):
+        return ''
+    remainder = stem[len(prefix):]
+    if not remainder:
+        return ''
+    if not classifier:
+        return remainder if remainder[:1].isdigit() else ''
+    classifier_prefix = f'{classifier}-'
+    classifier_suffix = f'-{classifier}'
+    if remainder.startswith(classifier_prefix):
+        version = remainder[len(classifier_prefix):]
+        return version if version[:1].isdigit() else ''
+    if remainder.endswith(classifier_suffix):
+        version = remainder[:-len(classifier_suffix)]
+        return version if version[:1].isdigit() else ''
+    return ''
+
+
 def _runtime_candidate_filename_stems(item):
     group_id = str(item.get('group_id') or '').strip()
     artifact_id = str(item.get('artifact_id') or '').strip()
-    version = str(item.get('version') or '').strip()
     classifier = str(item.get('classifier') or '').strip()
-    if not artifact_id or not version:
+    versions = _runtime_artifact_versions(item)
+    if not artifact_id or not versions:
         return set()
-    stems = {
-        f"{artifact_id}-{version}",
-    }
-    if group_id:
-        stems.add(f"{group_id}-{artifact_id}-{version}")
-    if classifier:
-        stems.add(f"{artifact_id}-{classifier}-{version}")
-        stems.add(f"{artifact_id}-{version}-{classifier}")
+    stems = set()
+    for version in versions:
+        stems.add(f"{artifact_id}-{version}")
+        if group_id:
+            stems.add(f"{group_id}-{artifact_id}-{version}")
+        if classifier:
+            stems.add(f"{artifact_id}-{classifier}-{version}")
+            stems.add(f"{artifact_id}-{version}-{classifier}")
     return stems
 
 
 def _match_runtime_artifact_filename(name, artifact_id, version):
-    """Match one physical JAR name against an already resolved module version.
+    """Use one runtime version only to test a possible filename interpretation.
 
-    The runtime dependency report is authoritative for ``artifact_id`` and
-    ``version``.  Any non-empty remainder in a conventional artifact filename
-    is therefore an artifact classifier, not part of the version.
+    A successful match can identify a coordinate/classifier candidate, but it
+    never confirms the packaged version; that must be read independently from
+    the physical entry or supplied by a human.
     """
     stem = _filename_stem(name)
     artifact_id = str(artifact_id or '').strip()
@@ -2103,14 +2344,15 @@ def _runtime_dependency_for_packaged_filename(packaged_item, runtime_deps):
         )[-1]
         or ''
     ).strip()
+    packaged_version = str((packaged_item or {}).get('version') or '').strip()
     inventory_matches = {}
     inferred_matches = {}
     for raw_item in (runtime_deps or {}).values():
         candidate = dict(raw_item or {})
         group_id = str(candidate.get('group_id') or '').strip()
         artifact_id = str(candidate.get('artifact_id') or '').strip()
-        version = str(candidate.get('version') or '').strip()
-        if not group_id or not artifact_id or not version:
+        versions = _runtime_artifact_versions(candidate)
+        if not group_id or not artifact_id or not versions:
             continue
         inventory_filenames = {
             re.split(r'[\\/]', str(value or ''))[-1]
@@ -2121,64 +2363,84 @@ def _runtime_dependency_for_packaged_filename(packaged_item, runtime_deps):
             if str(value or '').strip()
         }
         exact_inventory_match = lib_name in inventory_filenames
-        matched, filename_classifier, layout = (
-            _match_runtime_artifact_filename(
-                lib_name,
-                artifact_id,
-                version,
+        for version in versions:
+            conventional_match, filename_classifier, conventional_layout = (
+                _match_runtime_artifact_filename(
+                    lib_name,
+                    artifact_id,
+                    version,
+                )
             )
-            if not exact_inventory_match
-            else (True, '', 'artifact-inventory')
-        )
-        if not matched:
-            continue
-        declared_classifier = str(candidate.get('classifier') or '').strip()
-        if exact_inventory_match and not declared_classifier:
-            (
-                _conventional_match,
-                filename_classifier,
-                conventional_layout,
-            ) = _match_runtime_artifact_filename(
-                lib_name,
-                artifact_id,
-                version,
+            matched = exact_inventory_match or conventional_match
+            layout = (
+                conventional_layout
+                if conventional_match
+                else 'artifact-inventory'
             )
-            if conventional_layout:
-                layout = conventional_layout
-            if len(inventory_filenames) > 1 and not filename_classifier:
+            if not matched:
+                continue
+            declared_classifier = str(candidate.get('classifier') or '').strip()
+            if (
+                exact_inventory_match
+                and not declared_classifier
+                and len(inventory_filenames) > 1
+                and not filename_classifier
+                and not conventional_match
+            ):
                 # A component may expose multiple physical artifacts.  When
                 # neither the build tool nor the conventional filename
                 # identifies their classifiers, mapping all of them to the
                 # same GA would silently collapse distinct artifacts.
                 continue
-        if (
-            declared_classifier
-            and filename_classifier
-            and filename_classifier != declared_classifier
-        ):
-            continue
-        effective_classifier = declared_classifier or filename_classifier
-        coord = normalize_artifact_coord(
-            candidate.get('coord') or f'{group_id}:{artifact_id}',
-            effective_classifier,
-        )
-        identity = (coord, version)
-        candidate.update({
-            'coord': coord,
-            'classifier': effective_classifier,
-            'packaged_match_source': (
-                'runtime-artifact-inventory'
-                if exact_inventory_match
-                else (
-                    'runtime-filename-classifier'
-                    if effective_classifier
-                    else 'runtime-filename'
-                )
-            ),
-            'filename_layout': layout,
-        })
-        target = inventory_matches if exact_inventory_match else inferred_matches
-        target.setdefault(identity, candidate)
+            if (
+                declared_classifier
+                and filename_classifier
+                and filename_classifier != declared_classifier
+            ):
+                continue
+            effective_classifier = declared_classifier or filename_classifier
+            coord = normalize_artifact_coord(
+                candidate.get('coord') or f'{group_id}:{artifact_id}',
+                effective_classifier,
+            )
+            candidate_match = dict(candidate)
+            candidate_match.update({
+                'coord': coord,
+                'classifier': effective_classifier,
+                'classifier_source': (
+                    'runtime-coordinate'
+                    if declared_classifier
+                    else (
+                        'runtime-version-filename-inference'
+                        if filename_classifier
+                        else 'none'
+                    )
+                ),
+                # Kept only as matching provenance.  Enrichment must never use
+                # this value as the packaged artifact's version truth.
+                'matched_runtime_version': version,
+                'physical_filename_version_match': conventional_match,
+                'packaged_match_source': (
+                    'runtime-artifact-inventory'
+                    if exact_inventory_match
+                    else (
+                        'runtime-filename-classifier'
+                        if effective_classifier
+                        else 'runtime-filename'
+                    )
+                ),
+                'filename_layout': layout,
+            })
+            target = inventory_matches if exact_inventory_match else inferred_matches
+            # Version variants of one coordinate are intentionally one
+            # coordinate candidate. dependency:list is not a version source.
+            existing_match = target.get(coord)
+            if existing_match is None or (
+                packaged_version
+                and candidate_match.get('matched_runtime_version') == packaged_version
+                and existing_match.get('matched_runtime_version') != packaged_version
+            ):
+                target[coord] = candidate_match
 
     matches = inventory_matches or inferred_matches
     ordered = [
@@ -2186,21 +2448,6 @@ def _runtime_dependency_for_packaged_filename(packaged_item, runtime_deps):
         for key in sorted(matches)
     ]
     return (ordered[0] if len(ordered) == 1 else None), ordered
-
-
-def _should_use_runtime_version_for_filename_match(item, runtime_match):
-    if str(item.get('match_source') or '').strip() != 'filename':
-        return False
-    if (
-        str(runtime_match.get('packaged_match_source') or '').strip()
-        == 'runtime-artifact-inventory'
-    ):
-        return True
-    filename_stem = (item.get('filename_stem') or '').strip()
-    if not filename_stem:
-        return False
-    runtime_stems = _runtime_candidate_filename_stems(runtime_match)
-    return filename_stem in runtime_stems
 
 
 def _build_packaged_entry(entry_name):
@@ -2574,23 +2821,21 @@ def _scan_packaged_archive(artifact_path):
 
             for info in dependency_infos:
                 name = info.filename
-                compressed = max(int(info.compress_size), 0)
-                ratio = (
-                    float('inf') if compressed == 0 and info.file_size
-                    else info.file_size / max(compressed, 1)
+                _ratio, size_metadata_error = (
+                    _archive_entry_expansion_ratio(info)
                 )
+                if size_metadata_error:
+                    failures.append({
+                        'stage': 'archive_safety',
+                        'entry': name,
+                        'error': size_metadata_error,
+                    })
+                    continue
                 if info.file_size > STEP1_MAX_DEPENDENCY_JAR_BYTES:
                     failures.append({
                         'stage': 'archive_safety',
                         'entry': name,
                         'error': 'ARCHIVE_NESTED_SIZE_EXCEEDED',
-                    })
-                    continue
-                if ratio > STEP1_MAX_DEPENDENCY_EXPANSION_RATIO:
-                    failures.append({
-                        'stage': 'archive_safety',
-                        'entry': name,
-                        'error': 'ARCHIVE_EXPANSION_RATIO_EXCEEDED',
                     })
                     continue
                 try:
@@ -3017,6 +3262,8 @@ def _merge_runtime_artifact_record(deps, item):
         return
     existing = deps.get(key)
     if existing is None:
+        version = str(item.get('version') or '').strip()
+        item['observed_versions'] = [version] if version else []
         names = [
             str(item.get('artifact_file_name') or '').strip()
         ]
@@ -3027,11 +3274,18 @@ def _merge_runtime_artifact_record(deps, item):
         item['artifact_file_paths'] = [value for value in paths if value]
         deps[key] = item
         return
-    if str(existing.get('version') or '') != str(item.get('version') or ''):
-        raise RuntimeError(
-            f"构建工具 artifact inventory 对 {key} 返回多个版本："
-            f"{existing.get('version')}、{item.get('version')}"
-        )
+    # dependency:list/runtime inventory is only a coordinate-enrichment source.
+    # Reactor modules can legitimately resolve different versions of the same
+    # coordinate, so retain those versions as diagnostics without selecting one
+    # or blocking final-artifact analysis.
+    observed_versions = list(existing.get('observed_versions') or [])
+    existing_version = str(existing.get('version') or '').strip()
+    incoming_version = str(item.get('version') or '').strip()
+    for version in (existing_version, incoming_version):
+        if version and version not in observed_versions:
+            observed_versions.append(version)
+    existing['observed_versions'] = observed_versions
+    existing['runtime_version_conflict'] = len(observed_versions) > 1
     for singular, plural in (
         ('artifact_file_name', 'artifact_file_names'),
         ('artifact_file_path', 'artifact_file_paths'),
@@ -3043,6 +3297,18 @@ def _merge_runtime_artifact_record(deps, item):
         existing[plural] = values
         if not existing.get(singular) and value:
             existing[singular] = value
+
+
+def _runtime_artifact_versions(item):
+    versions = []
+    for value in (
+        list((item or {}).get('observed_versions') or [])
+        + [(item or {}).get('version')]
+    ):
+        version = str(value or '').strip()
+        if version and version not in versions:
+            versions.append(version)
+    return versions
 
 
 def parse_gradle_artifact_inventory(text, project_modules=None):
@@ -3200,6 +3466,7 @@ def _enrich_packaged_deps_with_runtime(
     packaged_deps,
     runtime_deps,
     manual_coord_overrides=None,
+    manual_artifact_identities=None,
     confirmed_unresolved_items=None,
     side="",
 ):
@@ -3222,22 +3489,32 @@ def _enrich_packaged_deps_with_runtime(
             )
         normalized_runtime_deps[item.get('coord') or str(runtime_coord)] = item
         artifact_id = item.get('artifact_id')
-        version = item.get('version')
-        if artifact_id and version:
-            runtime_by_artifact_version[(artifact_id, version)].append(item)
-            runtime_by_filename_artifact_version[(artifact_id, version)].append(item)
-            classifier = (item.get('classifier') or '').strip()
-            if classifier:
-                runtime_by_filename_artifact_version[(f"{artifact_id}-{classifier}", version)].append(item)
-            for stem in _runtime_candidate_filename_stems(item):
-                runtime_by_filename_stem[stem].append(item)
+        for version in _runtime_artifact_versions(item):
+            if artifact_id and version:
+                runtime_by_artifact_version[(artifact_id, version)].append(item)
+                runtime_by_filename_artifact_version[(artifact_id, version)].append(item)
+                classifier = (item.get('classifier') or '').strip()
+                if classifier:
+                    runtime_by_filename_artifact_version[(f"{artifact_id}-{classifier}", version)].append(item)
+        for stem in _runtime_candidate_filename_stems(item):
+            runtime_by_filename_stem[stem].append(item)
 
     runtime_deps = normalized_runtime_deps
 
     manual_coord_overrides = manual_coord_overrides or {}
+    manual_artifact_identities, _invalid_manual_identities = (
+        parse_manual_artifact_identities(manual_artifact_identities or [])
+    )
     confirmed_unresolved_items = normalize_unresolved_items(
         confirmed_unresolved_items
     )
+
+    def manual_identity_for(packaged_item):
+        return _manual_artifact_identity_for_entry(
+            packaged_item,
+            manual_artifact_identities,
+            side,
+        )
 
     def confirmed_unresolved_for(packaged_item):
         artifact_id = str(packaged_item.get('artifact_id') or '').strip()
@@ -3275,13 +3552,36 @@ def _enrich_packaged_deps_with_runtime(
     for item in packaged_deps:
         enriched = dict(item)
         packaged_version = (item.get('version') or '').strip()
+        version_confirmed = str(item.get('match_source') or '').strip() in {
+            'embedded-pom',
+            'embedded-pom-filename-match',
+            'pom.properties',
+        }
         runtime_match = None
         manual_override = None
+        manual_identity, manual_identity_candidates = manual_identity_for(item)
         filename_runtime_candidates = []
+        if manual_identity is not None:
+            enriched.update({
+                'group_id': manual_identity.get('group_id', ''),
+                'artifact_id': manual_identity.get('artifact_id', ''),
+                'version': manual_identity.get('version', ''),
+                'classifier': manual_identity.get('classifier', ''),
+                'coord': manual_identity.get('coord', ''),
+                'match_source': 'manual_artifact_identity',
+            })
+            packaged_version = str(manual_identity.get('version') or '').strip()
+            version_confirmed = True
+        elif len(manual_identity_candidates) > 1:
+            anomaly = 'manual_artifact_identity_ambiguous:' + '|'.join(
+                f"{candidate.get('coord')}@{candidate.get('version')}"
+                for candidate in manual_identity_candidates
+            )
+            enriched['metadata_anomalies'] = list(
+                enriched.get('metadata_anomalies') or []
+            ) + [anomaly]
         coord = (item.get('coord') or '').strip()
-        if coord and coord in runtime_deps:
-            runtime_match = runtime_deps.get(coord)
-        if runtime_match is None and item.get('match_source') == 'filename':
+        if manual_identity is None and not coord and item.get('match_source') == 'filename':
             runtime_match, filename_runtime_candidates = (
                 _runtime_dependency_for_packaged_filename(
                     item,
@@ -3289,6 +3589,10 @@ def _enrich_packaged_deps_with_runtime(
                 )
             )
         if (
+            manual_identity is None
+            and
+            not coord
+            and
             runtime_match is None
             and item.get('artifact_id')
             and item.get('version')
@@ -3312,11 +3616,11 @@ def _enrich_packaged_deps_with_runtime(
                 candidates = runtime_by_artifact_version.get((item.get('artifact_id'), item.get('version')), [])
             if len(candidates) == 1:
                 runtime_match = candidates[0]
-        if runtime_match is None and item.get('match_source') == 'filename':
+        if manual_identity is None and not coord and runtime_match is None and item.get('match_source') == 'filename':
             stem_candidates = runtime_by_filename_stem.get((item.get('filename_stem') or '').strip(), [])
             if len(stem_candidates) == 1:
                 runtime_match = stem_candidates[0]
-        if runtime_match is None and item.get('artifact_id') and item.get('version'):
+        if manual_identity is None and not coord and runtime_match is None and item.get('artifact_id') and item.get('version'):
             item_classifier = str(item.get('classifier') or '').strip()
             manual_override = (
                 manual_coord_overrides.get((
@@ -3345,6 +3649,15 @@ def _enrich_packaged_deps_with_runtime(
                 enriched.get('classifier'),
             )
             enriched['match_source'] = 'manual_override'
+            physical_version = _physical_version_from_filename_coordinate(
+                enriched.get('lib_name') or enriched.get('lib_entry'),
+                enriched.get('artifact_id'),
+                enriched.get('classifier'),
+            )
+            if physical_version:
+                enriched['version'] = physical_version
+                packaged_version = physical_version
+            version_confirmed = bool(physical_version)
         confirmed_unresolved = confirmed_unresolved_for(item)
         stale_filename_confirmation = bool(
             confirmed_unresolved
@@ -3362,6 +3675,7 @@ def _enrich_packaged_deps_with_runtime(
         if (
             confirmed_unresolved
             and manual_override is None
+            and manual_identity is None
             and not stale_filename_confirmation
         ):
             unresolved_item = {
@@ -3410,32 +3724,42 @@ def _enrich_packaged_deps_with_runtime(
             enriched['artifact_id'] = runtime_match.get('artifact_id') or enriched.get('artifact_id', '')
             if runtime_match.get('packaged_match_source'):
                 enriched['match_source'] = runtime_match['packaged_match_source']
-            runtime_version = (runtime_match.get('version') or '').strip()
-            normalized_packaged_version = packaged_version
-            if (
-                runtime_version
-                and packaged_version
-                and packaged_version != runtime_version
-                and _should_use_runtime_version_for_filename_match(item, runtime_match)
-            ):
-                # For filename-only nested jars, runtime may help normalize classifier-aware
-                # filename layouts such as artifact-version-classifier without changing the
-                # underlying packaged artifact identity.
-                normalized_packaged_version = runtime_version
-            # Step1 keeps the packaged-artifact version whenever it is already trustworthy.
-            enriched['version'] = normalized_packaged_version or runtime_version or enriched.get('version', '')
             classifier = runtime_match.get('classifier') or ''
             enriched['coord'] = normalize_artifact_coord(
                 f"{enriched.get('group_id')}:{enriched.get('artifact_id')}",
                 classifier,
             )
             enriched['classifier'] = classifier
+            # dependency:list contributes only group/artifact/classifier.  The
+            # version is re-read from the physical filename under that
+            # coordinate interpretation; the runtime version is never copied.
+            physical_version = (
+                ''
+                if runtime_match.get('classifier_source')
+                == 'runtime-version-filename-inference'
+                else _physical_version_from_filename_coordinate(
+                    enriched.get('lib_name') or enriched.get('lib_entry'),
+                    enriched.get('artifact_id'),
+                    classifier,
+                )
+            )
+            if physical_version:
+                enriched['version'] = physical_version
+                packaged_version = physical_version
+            else:
+                enriched['version'] = packaged_version
+            version_confirmed = bool(physical_version)
 
         coord = (enriched.get('coord') or '').strip()
         group_id = (enriched.get('group_id') or '').strip()
         artifact_id = (enriched.get('artifact_id') or '').strip()
         version = (enriched.get('version') or '').strip()
-        if not coord:
+        if not coord or not version or not version_confirmed:
+            reason_code = (
+                'PACKAGED_VERSION_UNCONFIRMED'
+                if not version or not version_confirmed
+                else 'DEPENDENCY_COORDINATES_UNRESOLVED'
+            )
             unresolved_item = {
                 'artifact_id': artifact_id or '<unknown-artifact>',
                 'version': version or '<unknown-version>',
@@ -3444,9 +3768,14 @@ def _enrich_packaged_deps_with_runtime(
                 'entry_id': enriched.get('entry_id', ''),
                 'lib_entry': enriched.get('lib_entry', ''),
                 'lib_name': enriched.get('lib_name', ''),
+                'side': str(side or '').strip(),
+                'reason_code': reason_code,
             }
             unresolved.append(unresolved_item)
-            display_coord = (
+            display_coord = normalize_artifact_coord(
+                coord,
+                unresolved_item.get('classifier'),
+            ) or (
                 f"{unresolved_item['artifact_id']}:{unresolved_item['version']}"
                 f"{':' + unresolved_item['classifier'] if unresolved_item.get('classifier') else ''}"
             ).strip(':')
@@ -3470,6 +3799,9 @@ def _enrich_packaged_deps_with_runtime(
                 'match_source': enriched.get('match_source', ''),
                 'read_error': enriched.get('read_error', ''),
                 'metadata_anomalies': list(enriched.get('metadata_anomalies') or []),
+                'version_confirmation_status': (
+                    'confirmed' if version_confirmed else 'unconfirmed'
+                ),
             })
             continue
         key = coord or f"{artifact_id}:{version}"
@@ -3502,6 +3834,7 @@ def _enrich_packaged_deps_with_runtime(
             'match_source': enriched.get('match_source', ''),
             'read_error': enriched.get('read_error', ''),
             'metadata_anomalies': list(enriched.get('metadata_anomalies') or []),
+            'version_confirmation_status': 'confirmed',
         })
     return entries, resolved, unresolved
 
@@ -4070,6 +4403,7 @@ def collect_maven_deps_for_workspace(
     modules=None,
     env=None,
     manual_coord_overrides=None,
+    manual_artifact_identities=None,
     allow_unresolved=False,
     confirmed_unresolved_items=None,
     observer=None,
@@ -4077,6 +4411,9 @@ def collect_maven_deps_for_workspace(
     active_maven_profiles=None,
 ):
     work_dir = str(Path(work_dir).resolve())
+    manual_artifact_identities, _ = parse_manual_artifact_identities(
+        manual_artifact_identities or []
+    )
     target_selector = _resolve_single_module_selector(primary_module, modules, work_dir)
     module_dir = _resolve_module_dir_for_packaging(target_selector, work_dir)
     if not module_dir:
@@ -4115,20 +4452,6 @@ def collect_maven_deps_for_workspace(
         )
         if rc != 0:
             raise RuntimeError(f"mvn package 失败（退出码 {rc}）：\n{stderr[:1000] or stdout[:1000]}")
-    post_build_scope = build_project_scope(
-        work_dir,
-        target_selector or ".",
-        active_profiles=set(active_maven_profiles or []),
-    )
-    if (
-        build_scope.get("source_state_hash")
-        != post_build_scope.get("source_state_hash")
-    ):
-        raise RuntimeError(
-            "MAVEN_SOURCE_STATE_CHANGED_DURING_BUILD: "
-            "POM/effective-model/profile state changed while packaging"
-        )
-
     with _observed_phase(
         observer,
         "artifact_discovery",
@@ -4173,7 +4496,13 @@ def collect_maven_deps_for_workspace(
             _require_complete_packaged_archive_scan(cache_stats, artifact_path)
             if not packaged_raw:
                 continue
-        if any(not (item.get('coord') or '').strip() for item in packaged_raw):
+        if any(
+            not (item.get('coord') or '').strip()
+            and _manual_artifact_identity_for_entry(
+                item, manual_artifact_identities, side
+            )[0] is None
+            for item in packaged_raw
+        ):
             need_runtime_enrichment = True
         if need_runtime_enrichment and not runtime_deps:
             runtime_deps, list_command_text = collect_runtime_deps_for_workspace(
@@ -4199,6 +4528,7 @@ def collect_maven_deps_for_workspace(
                 packaged_raw,
                 runtime_deps,
                 manual_coord_overrides=manual_coord_overrides,
+                manual_artifact_identities=manual_artifact_identities,
                 confirmed_unresolved_items=confirmed_unresolved_items,
                 side=side,
             )
@@ -4234,12 +4564,16 @@ def collect_gradle_deps_for_workspace(
     modules=None,
     env=None,
     manual_coord_overrides=None,
+    manual_artifact_identities=None,
     allow_unresolved=False,
     confirmed_unresolved_items=None,
     observer=None,
     side="",
 ):
     work_dir = str(Path(work_dir).resolve())
+    manual_artifact_identities, _ = parse_manual_artifact_identities(
+        manual_artifact_identities or []
+    )
     target_selector = _resolve_single_module_selector(primary_module, modules, work_dir)
     target_model = _gradle_target_model(work_dir, target_selector)
     module_dir = Path(target_model['module_dir'])
@@ -4280,15 +4614,6 @@ def collect_gradle_deps_for_workspace(
                 return_code=rc,
                 attempts=build_attempts,
             )
-    post_build_scope = build_project_scope(
-        work_dir, target_selector or '.', build_tool='gradle'
-    )
-    if build_scope.get('source_state_hash') != post_build_scope.get('source_state_hash'):
-        raise RuntimeError(
-            "GRADLE_SOURCE_STATE_CHANGED_DURING_BUILD: "
-            "settings/build scripts/source-set state changed while packaging"
-        )
-
     with _observed_phase(
         observer,
         "artifact_discovery",
@@ -4332,7 +4657,13 @@ def collect_gradle_deps_for_workspace(
             _require_complete_packaged_archive_scan(cache_stats, artifact_path)
             if not packaged_raw:
                 continue
-        if any(not (item.get('coord') or '').strip() for item in packaged_raw) and not runtime_deps:
+        if any(
+            not (item.get('coord') or '').strip()
+            and _manual_artifact_identity_for_entry(
+                item, manual_artifact_identities, side
+            )[0] is None
+            for item in packaged_raw
+        ) and not runtime_deps:
             runtime_deps, list_cmd_text = collect_runtime_deps_for_workspace(
                 work_dir,
                 primary_module=primary_module,
@@ -4354,6 +4685,7 @@ def collect_gradle_deps_for_workspace(
                 packaged_raw,
                 runtime_deps,
                 manual_coord_overrides=manual_coord_overrides,
+                manual_artifact_identities=manual_artifact_identities,
                 confirmed_unresolved_items=confirmed_unresolved_items,
                 side=side,
             )
@@ -4393,11 +4725,15 @@ def collect_packaged_deps_from_artifact_path(
     work_dir=None,
     runtime_deps_loader=None,
     manual_coord_overrides=None,
+    manual_artifact_identities=None,
     confirmed_unresolved_items=None,
     allow_unresolved=False,
     observer=None,
     side="",
 ):
+    manual_artifact_identities, _ = parse_manual_artifact_identities(
+        manual_artifact_identities or []
+    )
     artifact_file = Path(artifact_path).expanduser()
     if not artifact_file.is_absolute():
         if work_dir:
@@ -4441,7 +4777,13 @@ def collect_packaged_deps_from_artifact_path(
             )
 
     resolved_runtime_deps = runtime_deps or {}
-    if any(not (item.get('coord') or '').strip() for item in packaged_raw):
+    if any(
+        not (item.get('coord') or '').strip()
+        and _manual_artifact_identity_for_entry(
+            item, manual_artifact_identities, side
+        )[0] is None
+        for item in packaged_raw
+    ):
         if not resolved_runtime_deps and runtime_deps_loader is not None:
             resolved_runtime_deps = runtime_deps_loader() or {}
     with _observed_phase(
@@ -4456,6 +4798,7 @@ def collect_packaged_deps_from_artifact_path(
             packaged_raw,
             resolved_runtime_deps,
             manual_coord_overrides=manual_coord_overrides,
+            manual_artifact_identities=manual_artifact_identities,
             confirmed_unresolved_items=confirmed_unresolved_items,
             side=side,
         )
@@ -4532,6 +4875,8 @@ def _collect_runtime_deps_for_artifact_input(
                 "remote_ref_moved",
             }:
                 raise PinnedCommitMaterializationError(side, resolution)
+            if resolution.get("status") == "fetch_failed":
+                raise Step1RemoteOperationError(side, repo_dir, resolution)
             raise Step1RefResolutionRequiredError(
                 side, repo_dir, artifact_path, resolution,
             )
@@ -4619,6 +4964,7 @@ def get_packaged_deps_by_switching_branch(
     jdk_home="",
     side="",
     manual_coord_overrides=None,
+    manual_artifact_identities=None,
     allow_unresolved=False,
     confirmed_unresolved_items=None,
     artifact_cache_dir=None,
@@ -4678,6 +5024,7 @@ def get_packaged_deps_by_switching_branch(
                 'modules': modules,
                 'env': add_branch_hint_to_env(env, branch),
                 'manual_coord_overrides': manual_coord_overrides,
+                'manual_artifact_identities': manual_artifact_identities,
                 'allow_unresolved': allow_unresolved,
                 'confirmed_unresolved_items': confirmed_unresolved_items,
                 'observer': observer,
@@ -5139,6 +5486,11 @@ def main():
                     help='显式激活 Maven profile，可重复传入。正式流程从主状态读取。')
     ap.add_argument('--manual-coord-override', action='append', default=[],
                     help='人工补充坐标，格式 artifact:version[:classifier] -> group:artifact，可重复传入。')
+    ap.add_argument('--manual-artifact-identity', action='append', default=[],
+                    help=(
+                        '人工确认 fat JAR 物理条目的完整身份，值为包含 '
+                        'side/lib_entry/group_id/artifact_id/version 的 JSON 对象，可重复传入。'
+                    ))
     ap.add_argument('--confirmed-unresolved-item', action='append', default=[],
                     help='已由人工确认保留的 unresolved 项，内部使用，值为 JSON 对象。')
     ap.add_argument('--allow-unresolved', action='store_true',
@@ -5177,6 +5529,13 @@ def main():
             )
         if not args.manual_coord_override:
             args.manual_coord_override = list(orchestrated_input.get("manual_coord_overrides") or [])
+        if not args.manual_artifact_identity:
+            args.manual_artifact_identity = [
+                json.dumps(item, ensure_ascii=False)
+                for item in (
+                    orchestrated_input.get("manual_artifact_identities") or []
+                )
+            ]
         if not args.confirmed_unresolved_item:
             args.confirmed_unresolved_item = [
                 json.dumps(item, ensure_ascii=False)
@@ -5190,6 +5549,18 @@ def main():
     if invalid_manual_overrides:
         print("❌ 以下人工坐标格式不合法（应为 artifact:version[:classifier] -> group:artifact）：", file=sys.stderr)
         for item in invalid_manual_overrides:
+            print(f"  - {item}", file=sys.stderr)
+        sys.exit(1)
+    manual_artifact_identities, invalid_manual_artifact_identities = (
+        parse_manual_artifact_identities(args.manual_artifact_identity)
+    )
+    if invalid_manual_artifact_identities:
+        print(
+            "❌ 以下人工制品身份格式不合法（应为包含 "
+            "side/lib_entry/group_id/artifact_id/version 的 JSON 对象）：",
+            file=sys.stderr,
+        )
+        for item in invalid_manual_artifact_identities:
             print(f"  - {item}", file=sys.stderr)
         sys.exit(1)
     confirmed_unresolved_items, invalid_confirmed_unresolved_items = parse_confirmed_unresolved_items(
@@ -5340,6 +5711,7 @@ def main():
                 work_dir=args.work_dir,
                 runtime_deps_loader=load_base_runtime_deps,
                 manual_coord_overrides=manual_coord_overrides,
+                manual_artifact_identities=manual_artifact_identities,
                 confirmed_unresolved_items=confirmed_unresolved_items,
                 allow_unresolved=unresolved_confirmed,
                 observer=observer,
@@ -5351,6 +5723,7 @@ def main():
                 work_dir=args.work_dir,
                 runtime_deps_loader=load_current_runtime_deps,
                 manual_coord_overrides=manual_coord_overrides,
+                manual_artifact_identities=manual_artifact_identities,
                 confirmed_unresolved_items=confirmed_unresolved_items,
                 allow_unresolved=unresolved_confirmed,
                 observer=observer,
@@ -5388,6 +5761,11 @@ def main():
             current_artifact = str(Path(args.current_artifact_path).expanduser().resolve())
             unresolved_items = list(e.unresolved_items or [])
             unresolved_records = normalize_unresolved_items(unresolved_items)
+            has_unconfirmed_version = any(
+                str(item.get("reason_code") or "").strip()
+                == "PACKAGED_VERSION_UNCONFIRMED"
+                for item in unresolved_records
+            )
             missing_items = []
             if e.artifact_path == base_artifact and not (args.base_source_project_dir or args.base_branch):
                 missing_items.append(
@@ -5407,7 +5785,7 @@ def main():
                         "branch_field": "current_branch",
                     }
                 )
-            if missing_items:
+            if missing_items and not has_unconfirmed_version:
                 interaction = build_step1_missing_input_interaction(missing_items, unresolved_items=unresolved_items)
                 print("当前输入无法补全最终产物中的全部依赖坐标。", file=sys.stderr)
                 for item in interaction.get("missing_inputs", []) or []:
@@ -5501,6 +5879,7 @@ def main():
                     "base_jdk_home",
                     args.base_jdk_home, "base",
                     manual_coord_overrides=manual_coord_overrides,
+                    manual_artifact_identities=manual_artifact_identities,
                     allow_unresolved=unresolved_confirmed,
                     confirmed_unresolved_items=confirmed_unresolved_items,
                     artifact_cache_dir=Path(args.output).parent / STEP1_ARTIFACTS_DIRNAME if args.output else None,
@@ -5512,6 +5891,7 @@ def main():
                     args.current_branch, args.work_dir, args.primary_module, args.modules,
                     "current_jdk_home", args.current_jdk_home, "current",
                     manual_coord_overrides=manual_coord_overrides,
+                    manual_artifact_identities=manual_artifact_identities,
                     allow_unresolved=unresolved_confirmed,
                     confirmed_unresolved_items=confirmed_unresolved_items,
                     artifact_cache_dir=Path(args.output).parent / STEP1_ARTIFACTS_DIRNAME if args.output else None,

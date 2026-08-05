@@ -129,6 +129,31 @@ class Step1PackagedDepsTest(unittest.TestCase):
             interaction["diagnostic_guidance"]["reason_code"],
         )
 
+    def test_unconfirmed_packaged_version_requires_entry_identity_confirmation(self):
+        interaction = s1_dep_diff.build_step1_coordinate_followup_interaction(
+            side="current",
+            side_cn="当前侧",
+            artifact_path="/tmp/app.jar",
+            unresolved_items=[{
+                "artifact_id": "renamed",
+                "version": "<unknown-version>",
+                "entry_id": "BOOT-INF/lib/renamed.jar",
+                "lib_entry": "BOOT-INF/lib/renamed.jar",
+                "side": "current",
+                "reason_code": "PACKAGED_VERSION_UNCONFIRMED",
+            }],
+        )
+
+        self.assertIn(
+            "manual_artifact_identities",
+            interaction["required_fields"],
+        )
+        self.assertIn(
+            "manual_artifact_identities",
+            interaction["response_schema"]["properties"],
+        )
+        self.assertNotIn("primary_module", interaction["required_fields"])
+
     def test_spring_boot_classpath_index_is_parsed_as_runtime_order(self):
         with tempfile.TemporaryDirectory() as tmp:
             artifact = Path(tmp) / "app.jar"
@@ -705,6 +730,11 @@ class Step1PackagedDepsTest(unittest.TestCase):
                 "read_error": "",
             }]
             with patch.object(s1_dep_diff, "run_cmd", side_effect=fake_run), \
+                    patch.object(
+                        s1_dep_diff,
+                        "build_project_scope",
+                        wraps=s1_dep_diff.build_project_scope,
+                    ) as scope_builder, \
                     patch.object(s1_dep_diff, "_discover_packaged_archives", return_value=[artifact_path]), \
                     patch.object(s1_dep_diff, "_detect_archive_packaging_type", return_value="boot_jar"), \
                     patch.object(s1_dep_diff, "_inspect_packaged_archive", return_value=packaged_raw):
@@ -718,6 +748,11 @@ class Step1PackagedDepsTest(unittest.TestCase):
         self.assertIsNone(call_options[0]["timeout"])
         self.assertEqual(meta["build_tool"], "gradle")
         self.assertTrue(meta["gradle_model_hash"])
+        self.assertEqual(
+            scope_builder.call_count,
+            1,
+            "successful Gradle builds must not be blocked by a post-build scope recheck",
+        )
 
     def test_explicit_profile_is_used_even_when_target_module_is_unprofiled(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -891,9 +926,14 @@ class Step1PackagedDepsTest(unittest.TestCase):
             runtime_deps["com.acme:common"]["artifact_file_name"],
             "custom-internal.jar",
         )
-        self.assertEqual(unresolved, [])
-        self.assertEqual(set(resolved), {"com.acme:common"})
+        self.assertEqual(resolved, {})
+        self.assertEqual(len(unresolved), 1)
+        self.assertEqual(
+            unresolved[0]["reason_code"],
+            "PACKAGED_VERSION_UNCONFIRMED",
+        )
         self.assertEqual(entries[0]["coord"], "com.acme:common")
+        self.assertEqual(entries[0]["resolution_status"], "unresolved")
         self.assertEqual(
             entries[0]["packaged_match_source"],
             "runtime-artifact-inventory",
@@ -951,6 +991,40 @@ class Step1PackagedDepsTest(unittest.TestCase):
             for failure in result.failures
         ), result.failures)
 
+    def test_packaged_archive_allows_highly_compressible_internal_dependency(self):
+        nested_buffer = io.BytesIO()
+        with zipfile.ZipFile(
+            nested_buffer,
+            "w",
+            compression=zipfile.ZIP_STORED,
+        ) as nested:
+            nested.writestr(
+                "META-INF/maven/org.example/demo/pom.properties",
+                "groupId=org.example\nartifactId=demo\nversion=1.0\n",
+            )
+            nested.writestr("assets/generated.txt", b"0" * 1024 * 1024)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "app.jar"
+            with zipfile.ZipFile(
+                artifact,
+                "w",
+                compression=zipfile.ZIP_DEFLATED,
+            ) as outer:
+                outer.writestr(
+                    "BOOT-INF/lib/demo-1.0.jar",
+                    nested_buffer.getvalue(),
+                )
+            with zipfile.ZipFile(artifact) as outer:
+                info = outer.getinfo("BOOT-INF/lib/demo-1.0.jar")
+                self.assertGreater(info.file_size / info.compress_size, 200)
+
+            result = s1_dep_diff._scan_packaged_archive(artifact)
+
+        self.assertTrue(result.complete, result.failures)
+        self.assertEqual(len(result.rows), 1)
+        self.assertEqual(result.rows[0]["coord"], "org.example:demo")
+
     def test_dependency_list_parser_preserves_custom_scope_and_classifier(self):
         parsed = s1_dep_diff._parse_maven_dependency_list_line(
             "[INFO] org.example:native-lib:jar:linux-x86_64:1.2.3:company-runtime"
@@ -984,6 +1058,25 @@ class Step1PackagedDepsTest(unittest.TestCase):
             "renamed-helper.jar",
         )
         self.assertTrue(windows["artifact_file_path"].startswith("C:"))
+
+    def test_maven_dependency_list_keeps_version_conflict_as_diagnostic_only(self):
+        parsed = s1_dep_diff.parse_maven_dependency_list(
+            "\n".join((
+                "[INFO] org.example:demo:jar:1.0:runtime:"
+                "/repo/org/example/demo/1.0/demo-1.0.jar",
+                "[INFO] org.example:demo:jar:2.0:runtime:"
+                "/repo/org/example/demo/2.0/demo-2.0.jar",
+            ))
+        )
+
+        self.assertEqual(set(parsed), {"org.example:demo"})
+        self.assertEqual(
+            parsed["org.example:demo"]["observed_versions"],
+            ["1.0", "2.0"],
+        )
+        self.assertTrue(
+            parsed["org.example:demo"]["runtime_version_conflict"]
+        )
 
     def test_dependency_list_parser_ignores_absolute_artifact_filename(self):
         samples = (
@@ -1761,7 +1854,7 @@ class Step1PackagedDepsTest(unittest.TestCase):
             {"org.apache.shiro:shiro-core", "org.apache.shiro:shiro-core:jakarta"},
         )
 
-    def test_filename_only_classifier_is_derived_from_runtime_version(self):
+    def test_filename_only_classifier_does_not_take_version_from_runtime(self):
         nested = self._nested_jar_bytes([
             ("jnr/ffi/Provider.class", b"class"),
         ])
@@ -1791,26 +1884,25 @@ class Step1PackagedDepsTest(unittest.TestCase):
             )
         )
 
-        self.assertEqual(unresolved, [])
+        self.assertEqual(set(resolved), {"com.github.jnr:jffi"})
+        self.assertEqual(len(unresolved), 1)
         self.assertEqual(
-            set(resolved),
-            {
-                "com.github.jnr:jffi",
-                "com.github.jnr:jffi:native",
-            },
+            unresolved[0]["reason_code"],
+            "PACKAGED_VERSION_UNCONFIRMED",
         )
         native = next(
             item for item in entries
-            if item["coord"] == "com.github.jnr:jffi:native"
+            if item["lib_entry"].endswith("jffi-1.2.23-native.jar")
         )
-        self.assertEqual(native["version"], "1.2.23")
+        self.assertEqual(native["version"], "1.2.23-native")
         self.assertEqual(native["classifier"], "native")
+        self.assertEqual(native["resolution_status"], "unresolved")
         self.assertEqual(
             native["packaged_match_source"],
             "runtime-filename-classifier",
         )
 
-    def test_artifact_inventory_corrects_misleading_packaged_filename(self):
+    def test_artifact_inventory_does_not_correct_misleading_packaged_version(self):
         nested = self._nested_jar_bytes([
             ("example/Real.class", b"class"),
         ])
@@ -1832,13 +1924,136 @@ class Step1PackagedDepsTest(unittest.TestCase):
             )
         )
 
-        self.assertEqual(unresolved, [])
-        self.assertEqual(set(resolved), {"org.example:real-library"})
-        self.assertEqual(entries[0]["version"], "1.4.0")
+        self.assertEqual(resolved, {})
+        self.assertEqual(len(unresolved), 1)
+        self.assertEqual(
+            unresolved[0]["reason_code"],
+            "PACKAGED_VERSION_UNCONFIRMED",
+        )
+        self.assertEqual(entries[0]["version"], "9")
+        self.assertEqual(entries[0]["resolution_status"], "unresolved")
         self.assertEqual(
             entries[0]["packaged_match_source"],
             "runtime-artifact-inventory",
         )
+
+    def test_runtime_inventory_cannot_fill_version_absent_from_fat_jar(self):
+        nested = self._nested_jar_bytes([("example/Real.class", b"class")])
+        packaged = [
+            s1_dep_diff._extract_packaged_dep_from_nested_jar(
+                nested,
+                "BOOT-INF/lib/renamed.jar",
+            )
+        ]
+        runtime = s1_dep_diff.parse_maven_dependency_list(
+            "[INFO] org.example:real-library:jar:1.4.0:runtime:"
+            "/repo/org/example/real-library/1.4.0/renamed.jar"
+        )
+
+        entries, resolved, unresolved = (
+            s1_dep_diff._enrich_packaged_deps_with_runtime(
+                packaged,
+                runtime,
+                side="current",
+            )
+        )
+
+        self.assertEqual(resolved, {})
+        self.assertEqual(len(unresolved), 1)
+        self.assertEqual(
+            unresolved[0]["reason_code"],
+            "PACKAGED_VERSION_UNCONFIRMED",
+        )
+        self.assertEqual(entries[0]["version"], "")
+        self.assertEqual(entries[0]["resolution_status"], "unresolved")
+
+    def test_runtime_version_conflict_does_not_override_fat_jar_version(self):
+        nested = self._nested_jar_bytes([("example/Demo.class", b"class")])
+        packaged = [
+            s1_dep_diff._extract_packaged_dep_from_nested_jar(
+                nested,
+                "BOOT-INF/lib/demo-2.0.jar",
+            )
+        ]
+        runtime = s1_dep_diff.parse_maven_dependency_list(
+            "\n".join((
+                "[INFO] org.example:demo:jar:1.0:runtime:"
+                "/repo/org/example/demo/1.0/demo-1.0.jar",
+                "[INFO] org.example:demo:jar:2.0:runtime:"
+                "/repo/org/example/demo/2.0/demo-2.0.jar",
+            ))
+        )
+
+        entries, resolved, unresolved = (
+            s1_dep_diff._enrich_packaged_deps_with_runtime(
+                packaged,
+                runtime,
+            )
+        )
+
+        self.assertEqual(unresolved, [])
+        self.assertEqual(set(resolved), {"org.example:demo"})
+        self.assertEqual(entries[0]["version"], "2.0")
+        self.assertEqual(entries[0]["resolution_status"], "resolved")
+
+    def test_manual_artifact_identity_confirms_version_by_physical_entry(self):
+        nested = self._nested_jar_bytes([("example/Demo.class", b"class")])
+        packaged = [
+            s1_dep_diff._extract_packaged_dep_from_nested_jar(
+                nested,
+                "BOOT-INF/lib/renamed.jar",
+            )
+        ]
+
+        entries, resolved, unresolved = (
+            s1_dep_diff._enrich_packaged_deps_with_runtime(
+                packaged,
+                {},
+                manual_artifact_identities=[{
+                    "side": "current",
+                    "lib_entry": "BOOT-INF/lib/renamed.jar",
+                    "group_id": "org.example",
+                    "artifact_id": "demo",
+                    "version": "2.0",
+                    "classifier": "",
+                }],
+                side="current",
+            )
+        )
+
+        self.assertEqual(unresolved, [])
+        self.assertEqual(set(resolved), {"org.example:demo"})
+        self.assertEqual(entries[0]["version"], "2.0")
+        self.assertEqual(
+            entries[0]["packaged_match_source"],
+            "manual_artifact_identity",
+        )
+
+    def test_manual_artifact_identity_skips_runtime_coordinate_loader(self):
+        nested = self._nested_jar_bytes([("example/Demo.class", b"class")])
+        runtime_loader = Mock(side_effect=AssertionError("must not run"))
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_path = Path(tmp) / "app.jar"
+            with zipfile.ZipFile(artifact_path, "w") as outer:
+                outer.writestr("BOOT-INF/lib/renamed.jar", nested)
+
+            packaged, meta = s1_dep_diff.collect_packaged_deps_from_artifact_path(
+                artifact_path,
+                runtime_deps_loader=runtime_loader,
+                manual_artifact_identities=[{
+                    "side": "current",
+                    "lib_entry": "BOOT-INF/lib/renamed.jar",
+                    "group_id": "org.example",
+                    "artifact_id": "demo",
+                    "version": "2.0",
+                    "classifier": "",
+                }],
+                side="current",
+            )
+
+        runtime_loader.assert_not_called()
+        self.assertEqual(set(packaged), {"org.example:demo"})
+        self.assertEqual(meta["unresolved_items"], [])
 
     def test_artifact_inventory_precedes_plausible_filename_identity(self):
         nested = self._nested_jar_bytes([
@@ -1873,9 +2088,11 @@ class Step1PackagedDepsTest(unittest.TestCase):
             )
         )
 
-        self.assertEqual(unresolved, [])
-        self.assertEqual(set(resolved), {"org.example:real-library"})
-        self.assertEqual(entries[0]["version"], "1.4.0")
+        self.assertEqual(resolved, {})
+        self.assertEqual(len(unresolved), 1)
+        self.assertEqual(entries[0]["coord"], "org.example:real-library")
+        self.assertEqual(entries[0]["version"], "9")
+        self.assertEqual(entries[0]["resolution_status"], "unresolved")
         self.assertEqual(
             entries[0]["packaged_match_source"],
             "runtime-artifact-inventory",
@@ -1954,7 +2171,7 @@ class Step1PackagedDepsTest(unittest.TestCase):
         self.assertEqual(entries[0]["version"], "1.2.3-native")
         self.assertEqual(entries[0]["classifier"], "")
 
-    def test_classifier_first_filename_is_derived_from_runtime_version(self):
+    def test_classifier_first_filename_requires_manual_version_confirmation(self):
         nested = self._nested_jar_bytes([
             ("example/Native.class", b"class"),
         ])
@@ -1980,10 +2197,19 @@ class Step1PackagedDepsTest(unittest.TestCase):
             )
         )
 
-        self.assertEqual(unresolved, [])
-        self.assertEqual(set(resolved), {"org.example:native-lib:linux"})
+        self.assertEqual(resolved, {})
+        self.assertEqual(len(unresolved), 1)
+        self.assertEqual(
+            unresolved[0]["reason_code"],
+            "PACKAGED_VERSION_UNCONFIRMED",
+        )
         self.assertEqual(entries[0]["version"], "1.0")
         self.assertEqual(entries[0]["classifier"], "linux")
+        self.assertEqual(entries[0]["resolution_status"], "unresolved")
+        self.assertEqual(
+            entries[0]["version_confirmation_status"],
+            "unconfirmed",
+        )
 
     def test_runtime_filename_classifier_inference_refuses_ambiguous_ga(self):
         nested = self._nested_jar_bytes([
@@ -2059,14 +2285,15 @@ class Step1PackagedDepsTest(unittest.TestCase):
             )
         )
 
-        self.assertEqual(unresolved, [])
-        self.assertEqual(set(resolved), {"com.github.jnr:jffi:native"})
+        self.assertEqual(resolved, {})
+        self.assertEqual(len(unresolved), 1)
+        self.assertEqual(entries[0]["coord"], "com.github.jnr:jffi:native")
         self.assertEqual(
             entries[0]["packaged_match_source"],
             "runtime-filename-classifier",
         )
 
-    def test_new_runtime_evidence_supersedes_stale_confirmed_unresolved(self):
+    def test_new_runtime_coordinate_evidence_does_not_confirm_version(self):
         nested = self._nested_jar_bytes([
             ("jnr/ffi/Provider.class", b"class"),
         ])
@@ -2098,11 +2325,15 @@ class Step1PackagedDepsTest(unittest.TestCase):
             )
         )
 
-        self.assertEqual(unresolved, [])
-        self.assertEqual(set(resolved), {"com.github.jnr:jffi:native"})
-        self.assertEqual(entries[0]["resolution_status"], "resolved")
+        self.assertEqual(resolved, {})
+        self.assertEqual(len(unresolved), 1)
+        self.assertEqual(
+            unresolved[0]["reason_code"],
+            "PACKAGED_VERSION_UNCONFIRMED",
+        )
+        self.assertEqual(entries[0]["resolution_status"], "unresolved")
 
-    def test_artifact_inventory_supersedes_stale_filename_unresolved(self):
+    def test_artifact_inventory_does_not_supersede_unconfirmed_version(self):
         nested = self._nested_jar_bytes([
             ("example/Real.class", b"class"),
         ])
@@ -2129,11 +2360,15 @@ class Step1PackagedDepsTest(unittest.TestCase):
             )
         )
 
-        self.assertEqual(unresolved, [])
-        self.assertEqual(set(resolved), {"org.example:real-library"})
-        self.assertEqual(entries[0]["resolution_status"], "resolved")
+        self.assertEqual(resolved, {})
+        self.assertEqual(len(unresolved), 1)
+        self.assertEqual(
+            unresolved[0]["reason_code"],
+            "PACKAGED_VERSION_UNCONFIRMED",
+        )
+        self.assertEqual(entries[0]["resolution_status"], "unresolved")
 
-    def test_direct_fat_jar_and_source_runtime_catalog_resolve_jffi_pair(self):
+    def test_direct_fat_jar_keeps_classifier_version_ambiguous_after_runtime_catalog(self):
         nested = self._nested_jar_bytes([
             ("jnr/ffi/Provider.class", b"class"),
         ])
@@ -2161,6 +2396,7 @@ class Step1PackagedDepsTest(unittest.TestCase):
                 s1_dep_diff.collect_packaged_deps_from_artifact_path(
                     artifact_path,
                     runtime_deps_loader=runtime_loader,
+                    allow_unresolved=True,
                 )
             )
 
@@ -2169,10 +2405,13 @@ class Step1PackagedDepsTest(unittest.TestCase):
             set(packaged_deps),
             {
                 "com.github.jnr:jffi",
-                "com.github.jnr:jffi:native",
             },
         )
-        self.assertEqual(meta["unresolved_items"], [])
+        self.assertEqual(len(meta["unresolved_items"]), 1)
+        self.assertEqual(
+            meta["unresolved_items"][0]["reason_code"],
+            "PACKAGED_VERSION_UNCONFIRMED",
+        )
 
     def test_final_artifact_is_authoritative_for_bom_and_exclusion_resolution(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2764,6 +3003,40 @@ class Step1PackagedDepsTest(unittest.TestCase):
             resolver.call_args.kwargs["expected_remote_ref"],
             "refs/heads/release",
         )
+        branch_call.assert_not_called()
+
+    def test_artifact_enrichment_remote_failure_is_not_a_user_checkpoint(self):
+        resolution = {
+            "status": "fetch_failed",
+            "source_status": "remote_query_failed",
+            "failures": [{
+                "remote": "origin",
+                "stage": "targeted_ls_remote",
+                "reason": "connection reset after retries",
+                "reason_code": "transient_network_failure",
+            }],
+        }
+        with patch.object(
+            s1_dep_diff,
+            "resolve_step1_ref",
+            return_value=resolution,
+        ), patch.object(
+            s1_dep_diff,
+            "get_runtime_deps_by_switching_branch",
+        ) as branch_call:
+            with self.assertRaises(
+                s1_dep_diff.Step1RemoteOperationError
+            ) as raised:
+                s1_dep_diff._collect_runtime_deps_for_artifact_input(
+                    "/same/project",
+                    "release",
+                    "/same/project",
+                    side="current",
+                    artifact_path="/tmp/current.jar",
+                )
+
+        self.assertIn("STEP1_REMOTE_OPERATION_FAILED", str(raised.exception))
+        self.assertIn("connection reset after retries", str(raised.exception))
         branch_call.assert_not_called()
 
     def test_source_only_artifact_enrichment_requires_revision_confirmation(self):

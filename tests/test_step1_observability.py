@@ -212,6 +212,11 @@ class Step1ObservabilityTest(unittest.TestCase):
                 "read_error": "",
             }]
             with patch.object(s1_dep_diff, "run_cmd", side_effect=fake_run_cmd), \
+                 patch.object(
+                     s1_dep_diff,
+                     "build_project_scope",
+                     wraps=s1_dep_diff.build_project_scope,
+                 ) as scope_builder, \
                  patch.object(s1_dep_diff, "_resolve_module_dir_for_packaging", return_value=str(root)), \
                  patch.object(s1_dep_diff, "_discover_packaged_archives", return_value=[artifact]), \
                  patch.object(s1_dep_diff, "_detect_archive_packaging_type", return_value="boot_jar"), \
@@ -231,6 +236,11 @@ class Step1ObservabilityTest(unittest.TestCase):
                 for row in rows
             ))
             self.assertTrue(any(row["phase"] == "artifact_parse" for row in rows))
+            self.assertEqual(
+                scope_builder.call_count,
+                1,
+                "successful Maven builds must not be blocked by a post-build scope recheck",
+            )
             self.assertTrue(any(
                 row["phase"] == "artifact_coordinate_resolution" for row in rows
             ))
