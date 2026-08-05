@@ -59,12 +59,14 @@ from s4_contract import (
 from progress_logging import PhaseTimer, emit_progress
 from pipeline_constants import (
     EVIDENCE_API_CHANGES_DIRNAME,
+    EVIDENCE_DEPENDENCIES_DIRNAME,
     EVIDENCE_DIRNAME,
     RUNTIME_CACHE_DIRNAME,
     RUNTIME_DIRNAME,
     RUNTIME_OBSERVABILITY_DIRNAME,
     RUNTIME_STATE_DIRNAME,
     STEP1_DEPENDENCY_JARS_MANIFEST_FILE,
+    STEP5_ARTIFACT_BYTECODE_INDEX_FILE,
 )
 from signature_utils import normalize_signature_for_lookup
 from data_contract_analysis import compare_jar_data_contracts
@@ -116,6 +118,9 @@ DEPENDENCY_ANALYSIS_STATUS_JSON = "dependency_analysis_status.json"
 DEPENDENCY_ANALYSIS_STATUS_MD = "dependency_analysis_status.md"
 JAPICMP_COMPARISON_CACHE_SCHEMA_VERSION = 2
 JAPICMP_COMPARISON_CACHE_DIRNAME = "step4_japicmp"
+BUSINESS_BYTECODE_CHANGED_API_REFS_CSV = "business_bytecode_changed_api_refs.csv"
+BUSINESS_BYTECODE_PRIORITY_EVIDENCE_JSON = "business_bytecode_priority_evidence.json"
+STEP4_RECOMMENDED_DEPENDENCY_LIMIT = 10
 
 
 _CHANGE_TYPE_LABELS = {
@@ -578,6 +583,10 @@ def cleanup_step4_generated_outputs(output_dir):
         "all_changed_apis.csv",
         "all_changed_apis_raw.csv",
         "all_changed_apis_alerts.csv",
+        CHANGED_DEPENDENCIES_CSV,
+        CHANGED_DEPENDENCIES_MD,
+        BUSINESS_BYTECODE_CHANGED_API_REFS_CSV,
+        BUSINESS_BYTECODE_PRIORITY_EVIDENCE_JSON,
         "changed_classes.json",
         "timeouts.json",
         "git_ref_pending.json",
@@ -5664,6 +5673,338 @@ def _is_high_risk_api_row(row):
     }
 
 
+def _normalized_bytecode_owner(value):
+    return str(value or "").strip().replace("/", ".").replace("$", ".")
+
+
+def _changed_api_reference_target(row, row_index):
+    row = row or {}
+    api_name = str(row.get("api_name") or "").strip()
+    symbol_kind = str(row.get("symbol_kind") or "").strip().lower()
+    if not api_name or symbol_kind not in {"method", "constructor", "field", "class"}:
+        return None
+    if symbol_kind == "class":
+        owner = _normalized_bytecode_owner(api_name)
+        member = ""
+    elif "." in api_name:
+        owner, member = api_name.rsplit(".", 1)
+        owner = _normalized_bytecode_owner(owner)
+        if symbol_kind == "constructor":
+            member = "<init>"
+        elif row.get("api_simple"):
+            member = str(row.get("api_simple") or "").strip()
+    else:
+        return None
+    signature = str(row.get("api_signature") or "").strip()
+    normalized_signature = normalize_signature_for_lookup(signature) or signature
+    return {
+        "row_index": row_index,
+        "coord": str(row.get("coord") or "").strip(),
+        "api_name": api_name,
+        "api_signature": signature,
+        "symbol_kind": symbol_kind,
+        "change_type": str(row.get("change_type") or "").strip(),
+        "owner": owner,
+        "member": member,
+        "normalized_signature": normalized_signature,
+    }
+
+
+def _business_bytecode_edge_target(edge):
+    edge = edge or {}
+    evidence_type = str(edge.get("evidence_type") or "").strip()
+    # Constant-pool/signature-only class entries have no owning executable
+    # instruction.  They are useful telemetry but are not direct usage evidence.
+    if evidence_type == "bytecode_class_reference":
+        return None
+    callee_key = str(edge.get("callee_key") or "").strip()
+    if not callee_key or callee_key.startswith("invokedynamic:"):
+        return None
+    if callee_key.startswith("class:"):
+        return {
+            "kind": "class",
+            "owner": _normalized_bytecode_owner(callee_key[6:]),
+            "member": "",
+            "normalized_signature": "",
+        }
+    if "field" in evidence_type:
+        owner, separator, member = callee_key.rpartition(".")
+        if not separator:
+            return None
+        return {
+            "kind": "field",
+            "owner": _normalized_bytecode_owner(owner),
+            "member": member,
+            "normalized_signature": "",
+        }
+    signature_offset = callee_key.find("(")
+    if signature_offset >= 0:
+        qualified_member = callee_key[:signature_offset]
+        signature = callee_key[signature_offset:]
+        owner, separator, member = qualified_member.rpartition(".")
+        if not separator:
+            return None
+        owner = _normalized_bytecode_owner(owner)
+        if "constructor" in evidence_type:
+            member = "<init>"
+        return {
+            "kind": "method",
+            "owner": owner,
+            "member": member,
+            "normalized_signature": (
+                normalize_signature_for_lookup(signature) or signature
+            ),
+        }
+    return {
+        "kind": "class",
+        "owner": _normalized_bytecode_owner(callee_key),
+        "member": "",
+        "normalized_signature": "",
+    }
+
+
+def summarize_business_bytecode_changed_api_references(api_rows, evidence):
+    """Match direct executable business-bytecode edges to changed APIs.
+
+    Exact method matches require a recorded API signature.  A method change
+    without a signature is retained as a candidate reference instead of being
+    promoted to exact evidence.  This summary is only a Step4 ordering signal;
+    it is not a replacement for Step5 reachability analysis.
+    """
+    targets = {}
+    class_targets = defaultdict(list)
+    field_targets = defaultdict(list)
+    exact_method_targets = defaultdict(list)
+    candidate_method_targets = defaultdict(list)
+    for row_index, row in enumerate(api_rows or []):
+        target = _changed_api_reference_target(row, row_index)
+        if not target or not target["coord"]:
+            continue
+        targets[row_index] = target
+        owner = target["owner"]
+        if target["symbol_kind"] == "class":
+            class_targets[owner].append(row_index)
+        elif target["symbol_kind"] == "field":
+            field_targets[(owner, target["member"])].append(row_index)
+        elif target["normalized_signature"]:
+            exact_method_targets[(
+                owner,
+                target["member"],
+                target["normalized_signature"],
+            )].append(row_index)
+        else:
+            candidate_method_targets[(owner, target["member"])].append(row_index)
+
+    by_coord = defaultdict(lambda: {
+        "exact_api_indexes": set(),
+        "candidate_api_indexes": set(),
+        "exact_reference_occurrence_count": 0,
+        "candidate_reference_occurrence_count": 0,
+    })
+    evidence_rows = []
+    for edge in evidence or []:
+        edge_target = _business_bytecode_edge_target(edge)
+        if not edge_target or not edge_target["owner"]:
+            continue
+        exact_indexes = set(class_targets.get(edge_target["owner"], ()))
+        candidate_indexes = set()
+        if edge_target["kind"] == "field":
+            exact_indexes.update(field_targets.get((
+                edge_target["owner"], edge_target["member"],
+            ), ()))
+        elif edge_target["kind"] == "method":
+            exact_indexes.update(exact_method_targets.get((
+                edge_target["owner"],
+                edge_target["member"],
+                edge_target["normalized_signature"],
+            ), ()))
+            candidate_indexes.update(candidate_method_targets.get((
+                edge_target["owner"], edge_target["member"],
+            ), ()))
+
+        for match_quality, indexes in (
+            ("exact", sorted(exact_indexes)),
+            ("signature_incomplete_candidate", sorted(candidate_indexes - exact_indexes)),
+        ):
+            for row_index in indexes:
+                target = targets[row_index]
+                aggregate = by_coord[target["coord"]]
+                if match_quality == "exact":
+                    aggregate["exact_api_indexes"].add(row_index)
+                    aggregate["exact_reference_occurrence_count"] += 1
+                else:
+                    aggregate["candidate_api_indexes"].add(row_index)
+                    aggregate["candidate_reference_occurrence_count"] += 1
+                evidence_rows.append({
+                    "coord": target["coord"],
+                    "api_name": target["api_name"],
+                    "api_signature": target["api_signature"],
+                    "symbol_kind": target["symbol_kind"],
+                    "change_type": target["change_type"],
+                    "match_quality": match_quality,
+                    "caller_class": str(edge.get("caller_owner") or ""),
+                    "caller_method": str(edge.get("caller_name") or ""),
+                    "caller_signature": str(edge.get("caller_signature") or ""),
+                    "instruction_offset": edge.get("instruction_offset", edge.get("line", "")),
+                    "callee_key": str(edge.get("callee_key") or ""),
+                    "evidence_type": str(edge.get("evidence_type") or ""),
+                    "artifact_entry": str(edge.get("class_file") or ""),
+                })
+
+    public_by_coord = {}
+    for coord, item in by_coord.items():
+        public_by_coord[coord] = {
+            "business_exact_referenced_api_count": len(item["exact_api_indexes"]),
+            "business_candidate_referenced_api_count": len(
+                item["candidate_api_indexes"] - item["exact_api_indexes"]
+            ),
+            "business_exact_reference_occurrence_count": int(
+                item["exact_reference_occurrence_count"]
+            ),
+            "business_candidate_reference_occurrence_count": int(
+                item["candidate_reference_occurrence_count"]
+            ),
+        }
+    evidence_rows.sort(key=lambda row: (
+        row["coord"],
+        row["api_name"],
+        row["api_signature"],
+        row["match_quality"],
+        row["caller_class"],
+        row["caller_method"],
+        int(row["instruction_offset"] or 0),
+    ))
+    return {
+        "by_coord": public_by_coord,
+        "evidence_rows": evidence_rows,
+    }
+
+
+def _step4_business_artifact(report_dir):
+    manifest_path = (
+        Path(report_dir)
+        / EVIDENCE_DIRNAME
+        / EVIDENCE_DEPENDENCIES_DIRNAME
+        / STEP1_DEPENDENCY_JARS_MANIFEST_FILE
+    )
+    if not manifest_path.is_file():
+        return {}, "step1_dependency_jar_manifest_missing", manifest_path
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}, "step1_dependency_jar_manifest_unreadable", manifest_path
+    candidates = [
+        dict(item)
+        for item in (payload.get("business_artifacts") or [])
+        if str((item or {}).get("side") or "").strip() == "current"
+        and str((item or {}).get("kind") or "").strip() == "business_content"
+    ]
+    identities = {
+        (
+            str(item.get("retained_path") or "").strip(),
+            str(item.get("sha256") or "").strip().lower(),
+        )
+        for item in candidates
+    }
+    identities.discard(("", ""))
+    if not identities:
+        return {}, "current_business_artifact_missing", manifest_path
+    if len(identities) != 1:
+        return {}, "current_business_artifact_ambiguous", manifest_path
+    retained_path, artifact_sha256 = next(iter(identities))
+    artifact_path = Path(retained_path)
+    if not artifact_path.is_absolute():
+        artifact_path = (manifest_path.parent / artifact_path).resolve()
+    return {
+        "coord": "__business__",
+        "jar_path": str(artifact_path),
+        "sha256": artifact_sha256,
+    }, "", manifest_path
+
+
+def collect_business_bytecode_priority_evidence(api_rows, output_dir):
+    output_path = Path(output_dir)
+    report_dir = infer_report_dir_from_output_dir(output_path)
+    evidence_csv = output_path / BUSINESS_BYTECODE_CHANGED_API_REFS_CSV
+    summary_json = output_path / BUSINESS_BYTECODE_PRIORITY_EVIDENCE_JSON
+    evidence_fields = [
+        "coord", "api_name", "api_signature", "symbol_kind", "change_type",
+        "match_quality", "caller_class", "caller_method", "caller_signature",
+        "instruction_offset", "callee_key", "evidence_type", "artifact_entry",
+    ]
+    business_artifact, artifact_error, manifest_path = _step4_business_artifact(report_dir)
+    evidence = []
+    metrics = {}
+    reason_codes = []
+    if artifact_error:
+        reason_codes.append(artifact_error)
+        scan_status = "unavailable"
+    else:
+        try:
+            # Lazy import keeps standalone Step4 utilities light while sharing
+            # the exact cache consumed by Step5, so the bytecode scan is not paid twice.
+            from business_bytecode_graph import collect_business_bytecode_edges
+            catalog = {
+                "entries": [business_artifact],
+                "by_coord": {"__business__": business_artifact},
+                "jar_paths": {"__business__": business_artifact["jar_path"]},
+            }
+            evidence, metrics = collect_business_bytecode_edges(
+                [],
+                artifact_catalog=catalog,
+                cache_path=(
+                    Path(report_dir)
+                    / RUNTIME_DIRNAME
+                    / RUNTIME_CACHE_DIRNAME
+                    / STEP5_ARTIFACT_BYTECODE_INDEX_FILE
+                ),
+            )
+            reason_codes.extend(str(item) for item in (metrics.get("failures") or []))
+            scan_status = "complete" if not reason_codes else "incomplete"
+        except Exception as exc:
+            scan_status = "unavailable"
+            reason_codes.append(
+                f"business_bytecode_priority_scan_failed:{type(exc).__name__}:{exc}"
+            )
+
+    matched = summarize_business_bytecode_changed_api_references(api_rows, evidence)
+    with open_csv_write(evidence_csv) as fh:
+        writer = csv.DictWriter(fh, fieldnames=evidence_fields)
+        writer.writeheader()
+        writer.writerows(matched["evidence_rows"])
+    payload = {
+        "schema": "java-upgrade-analyzer.step4-business-priority-evidence.v1",
+        "scan_status": scan_status,
+        "reason_codes": reason_codes,
+        "business_artifact": business_artifact,
+        "manifest_file": str(manifest_path),
+        "evidence_file": str(evidence_csv),
+        "metrics": metrics,
+        "matched_dependency_count": len(matched["by_coord"]),
+        "exact_referenced_api_count": sum(
+            int(item.get("business_exact_referenced_api_count") or 0)
+            for item in matched["by_coord"].values()
+        ),
+        "candidate_referenced_api_count": sum(
+            int(item.get("business_candidate_referenced_api_count") or 0)
+            for item in matched["by_coord"].values()
+        ),
+    }
+    summary_json.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    return {
+        **matched,
+        "scan_status": scan_status,
+        "reason_codes": reason_codes,
+        "evidence_file": str(evidence_csv),
+        "summary_file": str(summary_json),
+        "metrics": metrics,
+    }
+
+
 def build_changed_dependency_rows(api_rows):
     grouped = {}
     for row in api_rows or []:
@@ -5706,7 +6047,14 @@ def build_changed_dependency_rows(api_rows):
                 "detail": f"{PER_DEPENDENCY_DIRNAME}/{make_per_dependency_dirname(item['coord'])}/{PER_DEPENDENCY_SUMMARY_FILE}",
             }
         )
-    return sorted(result, key=lambda row: (-int(row["high_risk_api_count"]), row["coord"]))
+    # This helper only groups change facts. Impact ordering is applied later,
+    # after business-bytecode evidence has been joined. Keeping change type or
+    # severity out of this provisional order prevents callers from accidentally
+    # treating removals as inherently more important than other API changes.
+    return sorted(
+        result,
+        key=lambda row: (-int(row["changed_api_count"]), row["coord"]),
+    )
 
 
 DEPENDENCY_ANALYSIS_STATUS_FIELDS = [
@@ -6249,34 +6597,124 @@ def write_dependency_analysis_status(
 
 
 def _dependency_review_focus(row):
-    high_risk = int((row or {}).get("high_risk_api_count") or 0)
+    exact = int((row or {}).get("business_exact_referenced_api_count") or 0)
+    candidate = int((row or {}).get("business_candidate_referenced_api_count") or 0)
+    exact_occurrences = int(
+        (row or {}).get("business_exact_reference_occurrence_count") or 0
+    )
+    candidate_occurrences = int(
+        (row or {}).get("business_candidate_reference_occurrence_count") or 0
+    )
     changed = int((row or {}).get("changed_api_count") or 0)
-    change_types = str((row or {}).get("change_types") or "").lower()
-    if high_risk:
-        return "含高风险 API，优先做系统触达分析"
-    if "removed" in change_types or "signature" in change_types:
-        return "包含删除或签名变化，优先确认系统是否调用"
-    if changed >= 20:
-        return "变化 API 较多，建议按依赖包复核"
-    return "低风险变化，可在全量分析时覆盖"
-
-
-def _is_recommended_dependency(row):
-    high_risk = int((row or {}).get("high_risk_api_count") or 0)
-    changed = int((row or {}).get("changed_api_count") or 0)
-    change_types = str((row or {}).get("change_types") or "").lower()
-    return bool(
-        high_risk
-        or "removed" in change_types
-        or "signature" in change_types
-        or changed >= 20
+    scan_status = str((row or {}).get("business_bytecode_scan_status") or "").strip()
+    if exact:
+        focus = (
+            f"业务最终制品直接引用 {exact} 个变更 API"
+            f"（{exact_occurrences} 处精确字节码指令）"
+        )
+        if candidate:
+            focus += (
+                f"；另有 {candidate} 个签名不完整候选 API"
+                f"（{candidate_occurrences} 处指令）"
+            )
+        return focus
+    if candidate:
+        return (
+            f"业务最终制品存在 {candidate} 个签名不完整的候选引用"
+            f"（{candidate_occurrences} 处字节码指令）；"
+            "需 Step5 继续消歧"
+        )
+    if scan_status == "complete":
+        return (
+            f"未观察到业务字节码直接引用；按 {changed} 个变更 API 的规模排序，"
+            "不代表无影响"
+        )
+    scan_status_label = {
+        "incomplete": "不完整",
+        "unavailable": "不可用",
+        "not_collected": "未采集",
+    }.get(scan_status, scan_status or "不可用")
+    return (
+        f"业务字节码排序证据{scan_status_label}；"
+        f"暂按 {changed} 个变更 API 的规模排序"
     )
 
 
-def write_changed_dependencies(api_rows, output_dir, dependency_status_rows=None):
+def _is_recommended_dependency(row):
+    rank = int((row or {}).get("impact_priority_rank") or 0)
+    return bool(rank and rank <= STEP4_RECOMMENDED_DEPENDENCY_LIMIT)
+
+
+def write_changed_dependencies(
+    api_rows,
+    output_dir,
+    dependency_status_rows=None,
+    business_reference_summary=None,
+):
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     dependency_rows = build_changed_dependency_rows(api_rows)
+    business_reference_summary = business_reference_summary or {}
+    business_by_coord = business_reference_summary.get("by_coord") or {}
+    scan_status = str(
+        business_reference_summary.get("scan_status") or "not_collected"
+    ).strip()
+    status_by_coord = {
+        str((item or {}).get("coord") or "").strip(): item
+        for item in (dependency_status_rows or [])
+        if str((item or {}).get("coord") or "").strip()
+    }
+    for row in dependency_rows:
+        reference = business_by_coord.get(row["coord"]) or {}
+        exact_count = int(
+            reference.get("business_exact_referenced_api_count") or 0
+        )
+        candidate_count = int(
+            reference.get("business_candidate_referenced_api_count") or 0
+        )
+        exact_occurrences = int(
+            reference.get("business_exact_reference_occurrence_count") or 0
+        )
+        candidate_occurrences = int(
+            reference.get("business_candidate_reference_occurrence_count") or 0
+        )
+        status_row = status_by_coord.get(row["coord"])
+        if status_row is None:
+            source_status = "unknown"
+        elif str(status_row.get("implementation_data_available") or "").strip().lower() in {
+            "1", "true", "yes", "y", "是",
+        }:
+            source_status = "available"
+        elif str(status_row.get("implementation_check_status") or "").strip() == "not_applicable":
+            source_status = "not_applicable"
+        else:
+            source_status = "unavailable"
+        row.update({
+            "business_exact_referenced_api_count": exact_count,
+            "business_candidate_referenced_api_count": candidate_count,
+            "business_exact_reference_occurrence_count": exact_occurrences,
+            "business_candidate_reference_occurrence_count": candidate_occurrences,
+            "business_reference_occurrence_count": (
+                exact_occurrences + candidate_occurrences
+            ),
+            "business_bytecode_scan_status": scan_status,
+            "dependency_source_status": source_status,
+        })
+    # Impact evidence determines dependency order. Change kind and source
+    # availability remain visible facts but never receive an impact bonus.
+    dependency_rows.sort(
+        key=lambda row: (
+            -int(row["business_exact_referenced_api_count"]),
+            -int(row["business_candidate_referenced_api_count"]),
+            -int(row["business_reference_occurrence_count"]),
+            -int(row["changed_api_count"]),
+            row["coord"],
+        )
+    )
+    for rank, row in enumerate(dependency_rows, start=1):
+        row["impact_priority_rank"] = rank
+        row["review_focus"] = _dependency_review_focus(row)
+        row["recommended"] = "true" if _is_recommended_dependency(row) else "false"
     csv_path = output_path / CHANGED_DEPENDENCIES_CSV
     md_path = output_path / CHANGED_DEPENDENCIES_MD
     fieldnames = [
@@ -6285,23 +6723,20 @@ def write_changed_dependencies(api_rows, output_dir, dependency_status_rows=None
         "dependency_name",
         "changed_api_count",
         "high_risk_api_count",
+        "business_exact_referenced_api_count",
+        "business_candidate_referenced_api_count",
+        "business_exact_reference_occurrence_count",
+        "business_candidate_reference_occurrence_count",
+        "business_reference_occurrence_count",
+        "business_bytecode_scan_status",
+        "dependency_source_status",
+        "impact_priority_rank",
         "recommended",
         "change_types",
         "symbol_kinds",
         "review_focus",
         "detail",
     ]
-    for row in dependency_rows:
-        row["review_focus"] = _dependency_review_focus(row)
-        row["recommended"] = "true" if _is_recommended_dependency(row) else "false"
-    dependency_rows.sort(
-        key=lambda row: (
-            row["recommended"] != "true",
-            -int(row["high_risk_api_count"]),
-            -int(row["changed_api_count"]),
-            row["coord"],
-        )
-    )
     with open_csv_write(csv_path) as fh:
         writer = csv.DictWriter(fh, fieldnames=fieldnames)
         writer.writeheader()
@@ -6317,28 +6752,45 @@ def write_changed_dependencies(api_rows, output_dir, dependency_status_rows=None
         "## 如何选择定向分析范围",
         "",
         "1. 可以直接全量分析全部候选依赖包。",
-        "2. 仅当明确需要控制耗时时，可以先从“部分分析优先项”为“是”的依赖包中选择。排序依据是：含高风险 API、删除或签名变化，或变化 API 数不少于 20 个。",
-        "3. “部分分析优先项”只用于部分范围取舍，不表示系统建议缩小范围，也不代表已经确认影响。",
-        "4. 还可以从本文件列出的全部候选中选择；复制“依赖包”列中的完整坐标即可。",
-        "5. 定向分析可直接回复，例如：`只分析 com.example:demo-lib`。",
+        (
+            "2. 仅当明确需要控制耗时时，可以先看 Top 10 影响复核优先项。"
+            "依赖先按业务最终制品精确直接引用的变更 API 数排序，再按签名不完整候选引用数、"
+            "引用指令数和变更 API 总数排序。"
+        ),
+        "3. 删除、签名变化等类型不获得额外权重；依赖源码是否可用只表示分析条件，不参与影响排序。",
+        "4. 该排序只用于部分范围取舍，不表示系统建议缩小范围，也不代表 Step5 已确认影响；未观察到直接引用也不等于无影响。",
+        "5. 还可以从本文件列出的全部候选中选择；复制“依赖包”列中的完整坐标即可。",
+        "6. 定向分析可直接回复，例如：`只分析 com.example:demo-lib`。",
         "",
         "完整 API 明细：`all_changed_apis.csv`。",
+        f"业务字节码直接引用证据：`{BUSINESS_BYTECODE_CHANGED_API_REFS_CSV}`。",
+        f"排序证据状态：`{BUSINESS_BYTECODE_PRIORITY_EVIDENCE_JSON}`。",
         f"全部依赖的直接结论：`{DEPENDENCY_ANALYSIS_STATUS_MD}`。",
         "依赖包明细目录：`s4_per_dependency/`。",
         "",
-        "| 部分分析优先项 | 依赖包 | 变化 API 数 | 高风险 API 数 | 为什么先看 | 主要变化类型 | 明细 |",
-        "|---|---|---:|---:|---|---|---|",
+        "| 排名 | Top 10 | 依赖包 | 精确直接引用 API | 候选引用 API | 引用指令 | 变化 API 数 | 依赖源码 | 为什么先看 | 主要变化类型 | 明细 |",
+        "|---:|:---:|---|---:|---:|---:|---:|---|---|---|---|",
     ]
     if dependency_rows:
         for row in dependency_rows:
+            source_label = {
+                "available": "可用",
+                "unavailable": "不可用",
+                "not_applicable": "不适用",
+                "unknown": "未知",
+            }.get(row["dependency_source_status"], row["dependency_source_status"])
             lines.append(
-                f"| {'是' if row['recommended'] == 'true' else '否'} | `{row['coord']}` | "
-                f"{row['changed_api_count']} | {row['high_risk_api_count']} | "
+                f"| {row['impact_priority_rank']} | "
+                f"{'是' if row['recommended'] == 'true' else '否'} | `{row['coord']}` | "
+                f"{row['business_exact_referenced_api_count']} | "
+                f"{row['business_candidate_referenced_api_count']} | "
+                f"{row['business_reference_occurrence_count']} | "
+                f"{row['changed_api_count']} | {source_label} | "
                 f"{row['review_focus']} | "
                 f"{row['change_types'] or '-'} | `{row['detail']}` |"
             )
     else:
-        lines.append("| - | - | 0 | 0 | - | - | - |")
+        lines.append("| - | - | - | 0 | 0 | 0 | 0 | - | - | - | - |")
     failed_rows = [
         row for row in (dependency_status_rows or [])
         if row.get("comparison_status") == "failed"
@@ -8473,10 +8925,39 @@ def main():
     )
     csv_file, valid_count, invalid_count = write_all_changed_apis(
         all_apis, args.output_dir)
+    normalized_api_rows = load_csv(csv_file)
+    timing.record(
+        "rank.business_bytecode",
+        status="running",
+        message="正在收集业务最终制品对变更 API 的直接字节码引用，用于依赖优先级排序",
+        details={"changed_api_count": len(normalized_api_rows)},
+    )
+    priority_started_at = time.perf_counter()
+    business_reference_summary = collect_business_bytecode_priority_evidence(
+        normalized_api_rows,
+        args.output_dir,
+    )
+    timing.record(
+        "rank.business_bytecode",
+        status=(
+            "success"
+            if business_reference_summary.get("scan_status") == "complete"
+            else "partial"
+        ),
+        elapsed=time.perf_counter() - priority_started_at,
+        details={
+            "scan_status": business_reference_summary.get("scan_status"),
+            "matched_dependencies": len(
+                business_reference_summary.get("by_coord") or {}
+            ),
+            "reason_codes": business_reference_summary.get("reason_codes") or [],
+        },
+    )
     write_changed_dependencies(
-        load_csv(csv_file),
+        normalized_api_rows,
         args.output_dir,
         dependency_status_rows=dependency_status_rows,
+        business_reference_summary=business_reference_summary,
     )
     timing.record(
         "write.all_changed_apis",

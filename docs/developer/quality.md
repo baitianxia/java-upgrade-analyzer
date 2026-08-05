@@ -143,7 +143,7 @@ python3 scripts/quality_signal_audit.py <real-project-result.json> --json-out <q
 - JDK 标准类、第三方无关类不能误归入目标依赖 API 变化；
 - removed jar 场景必须导出旧版 public/protected 符号。
 - Step4 内部源码 ref 故障不得要求用户修复：应验证 `DEPENDENCY_SOURCE_REF_UNAVAILABLE` 可追溯、最终 JAR 方法字节码兜底会发现同签名实现变化，并且成功兜底后 `behavior_diff=complete`。若兜底失败，应验证 `behavior_diff` 进入 `critical_incomplete`，报告不出现完整或无影响结论；只有不同 commit pair 会改变源码范围时才允许进入确认 checkpoint。
-- Step4 成功后必须生成有实际意义的范围确认，让用户选择 Step5 全量或部分分析；部分分析必须限制最终结论范围。Step5 成功后不生成例行确认，直接生成报告。Step4 超时和 Step5 依赖源码缺失在标准模式下自动记录证据缺口后继续，不得伪装成范围选择要求用户修复；严格模式或关键覆盖约束仍必须阻止无边界结论。
+- Step4 成功后必须生成有实际意义的范围确认，让用户选择 Step5 全量或部分分析；部分分析必须限制最终结论范围。范围卡必须保留依赖坐标，默认展示按业务最终制品直接字节码引用证据排序的 Top 10；删除等变更类型和源码可用性不得参与排序，证据不完整时必须显式降级为按变更 API 数排序。Step5 成功后不生成例行确认，直接生成报告，但必须把五态摘要写成非阻塞 `interaction.json/user_decision_card`。Step4 超时和 Step5 依赖源码缺失在标准模式下自动记录证据缺口后继续，不得伪装成范围选择要求用户修复；严格模式或关键覆盖约束仍必须阻止无边界结论。
 - `--step auto` 必须连续运行到下一个必要确认点或流程完成：Step2 只有在 JDK、业务源码范围或源码映射歧义等会改变分析口径的事实无法可靠确定时暂停；Step3 和 Step5 不得生成例行成功确认。默认 manifest 的流程控制语义必须有端到端测试覆盖。
 - JApiCmp、tree-sitter 等内部能力在自动准备失败后必须进入 `blocked_by_system`，不得生成伪业务 checkpoint 要求用户确认“修复后继续”；同时不得为保持流程表面连续而降低准确性。
 - 应验证 Step4 即使误配 `auto_continue_on_success` 也不会跳过范围确认；Step5 必须写入 `.runtime/cache/step5_selection.json`，Step6 对部分范围或范围快照缺失都不得输出全量/全局无影响措辞。
@@ -169,7 +169,7 @@ python3 scripts/quality_signal_audit.py <real-project-result.json> --json-out <q
 - 已执行分析但未发现当前系统调用关系属于已完成分析；缺少关键输入或分析过程未完成才进入未完成分析，并逐项显示原因；
 - 正文只展示部分明细时必须同时给出展示数、总数、未展示数量和对应全量文件；
 - 本轮范围内全部依赖结果进入 `all-affected-dependencies.md`，本轮范围内全部 API 结果及完整调用关系进入 `all-impact-details.md`，两者不得合并为同一个链接；
-- 依赖明细必须按“确认影响 → 未确认影响 → 确认不受影响”排列，同类结论按调用链数量降序；API 明细必须先按依赖分组，组内使用相同的结论顺序和调用链数量降序；主报告、完整 Markdown 和 CSV 的相同对象顺序必须一致；
+- 主报告必须按依赖坐标分组完整展示本轮全部 `reachable` 和 `uncertain` API，依赖之间及依赖内部都按影响/复核优先证据排序；`not_found_in_static_analysis` 在主报告只展示统计且必须明确不等于安全。完整依赖/API 明细仍按“确认影响 → 未确认影响 → 确认不受影响”组织，并覆盖本轮范围内全部状态；
 - `all-affected-dependencies.md` 和 `all-impact-details.md` 必须分别生成同数据、同顺序的 `all-affected-dependencies.csv` 和 `all-impact-details.csv`，CSV 使用与 Markdown 相同的用户可读字段；
 - `alerts.csv` 是一行一条的原始分析记录，必须保留全量记录；`report.md` 的文件说明必须解释它与用户可读 API 明细的区别；
 - `s6_findings.json` 保持结构化消费能力。

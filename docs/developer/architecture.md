@@ -54,7 +54,7 @@
 - 影响证明依赖业务源码与依赖源码构成的静态图
 - 正式流程只有一个调度入口：`scripts/run_step.py`
 - 正式流程只有一个业务参数与状态真相源：`.upgrade-report/.runtime/state/main_state.json`
-- `interaction.json` 只负责展示待交互信息，不参与求值
+- `interaction.json` 只负责展示待交互信息或非阻塞阶段结果，不参与求值
 - Step5 的目标是高精度影响证明，不是最大召回
 - 证据不足时系统进入保守状态，不将“未覆盖”误写成“未影响”
 
@@ -273,7 +273,7 @@ Step5 的两条 `javap` 路径已迁移到 `tool_execution.py`。命令启动失
 - `main_state.json`
   - 运行真相
 - `interaction.json`
-  - 当前待交互展示
+  - 当前待交互展示，或最近一份需要标准化转述的非阻塞阶段结果
 - 各类 CSV、JSON、报告和摘要
   - 证据文件和汇总产物
 
@@ -354,7 +354,7 @@ Step5 的两条 `javap` 路径已迁移到 `tool_execution.py`。命令启动失
 - `seed_next_step_input()`
   - 将当前步骤对下游有效的正式输入播种到下一步 `input`
 - `persist_completed_step()`
-  - 在步骤完成后统一写回主状态并清理 `interaction.json`
+  - 在步骤完成后统一写回主状态并清理失效的待交互信息；Step5 的非阻塞阶段结果可保留到 Step6 完成
 - `persist_step_interaction()`
   - 在步骤进入 checkpoint 时统一写回主状态并落盘 `interaction.json`
 
@@ -420,6 +420,7 @@ Step4 的职责是构建 Step5 可稳定消费的变化证据池。
 - 对 `removed jar` 场景导出旧版 jar 的 public/protected 符号集合
 - 自动识别依赖源码目录与仓库映射
 - 聚合生成 `all_changed_apis.csv`
+- 扫描当前业务最终制品的直接字节码引用，生成仅供范围取舍使用的依赖影响排序证据
 - 按单个 `coord` 落盘 `s4_per_dependency/<coord>/` 目录，作为 Step4/Step5 的桥接视图
 
 #### Step4 的正式语义
@@ -433,6 +434,8 @@ Step4 是变化识别层，不负责调用链分析。它定义“变更 API 池
 - `dependency_source_dirs` 是推荐入口，同时接受本地目录和 Git 地址；Git 地址先物化到 `.runtime/cache/dependency_source_git/`。模块定位仅针对 Step1 已有变化 GAV，对构建清单做一次有深度和数量上限的扫描；源码不得新增依赖行
 - `dependency_repo_mappings` 是内部派生结果
 - `s4_contract.py` 固定 `all_changed_apis.csv` 字段契约
+- `changed_dependencies.csv/.md` 保留依赖坐标维度并按影响证据排序：先比较精确直接引用的变更 API 数，再比较签名不完整候选引用数、引用指令数和变更 API 总数；删除、签名变化等变更类型不额外加权，源码可用性只表示分析条件
+- `business_bytecode_changed_api_refs.csv` 保存排序所用的物理调用位置；`business_bytecode_priority_evidence.json` 保存扫描完整性。该扫描复用 Step5 字节码缓存，只是 Step4 的选择辅助信号，不替代跨依赖、框架或运行时路径分析，也不能把“未直接引用”解释为安全
 - `removed jar` 不走旁路逻辑；正式语义是把旧版 jar 的 `class / method / constructor` 符号集导出为 Step5 目标池
 - Step4 在报告根目录下为每个依赖写出 `s4_per_dependency/<coord>/removed_jar_symbols.csv`、`resolved_targets.csv`、`summary.json`
 - 同一 JAR 条目内重复但内容一致的 `pom.properties` / `pom.xml` 只归一化为一个 GAV，不生成重复依赖；只有元数据声明彼此冲突时才记录异常。源码不能覆盖这项制品判断
@@ -533,6 +536,10 @@ Step5 负责证明 Step4 发现的 API 变化是否已经触达当前业务系�
 - `evidence/api_changes/s4_per_dependency/<coord>/summary.json` 中的单依赖结果视图
 
 五态属于正式语义，不是展示标签。`not_impacted` 仅在当前制品中的其他运行时依赖以完全相同的类字节码保留目标 API 时成立；它不等于宽泛的“没有风险”。
+
+Step5 成功后，即使流程按默认策略直接进入 Step6，也会先把五态摘要写为
+`interaction.json` 中的非阻塞 `user_decision_card`。该卡不进入
+`main_state.pending_interaction`、不要求用户回复，只作为 Agent 的标准化展示来源。
 
 #### Step5 的 per-dependency 汇总
 
@@ -957,7 +964,7 @@ Step6 负责把 Step1 到 Step5 的结构化产物收敛成最终交付结果。
 - `deliverables/all-impact-details.md`
 - `deliverables/all-impact-details.csv`
 
-`report.md` 固定按“依赖层面结论 → API 及调用关系 → 用户可见文件说明”组织。依赖层和 API 层统一使用“变化总数、已完成分析、未完成分析、确认影响、确认不受影响、尚未确认影响”六列统计，再给逐项结论和正文中选取的调用关系。统计母集是 Step5 本轮分析范围：全量模式使用全部变化对象，部分模式只使用 `included_dependency_coords` 及其变化 API；未选择对象不得进入“未完成分析”。部分模式下 `available_dependency_count` / `total_api_count` 只用于范围说明，结果统计分别使用 `included_dependency_count` / `analyzed_api_count`。变化总数等于已完成与未完成之和。API 层后三类结果划分已完成分析；依赖层只要已有 API 确认影响就保留确认影响计数，因此仍有其他已选 API 未完成的依赖会同时计入“确认影响”和“未完成分析”。依赖明细固定使用“依赖、版本变化、API 分析（已完成/总数）、当前系统调用关系、分析结果、结果说明”，API 明细固定使用“依赖、API、新版本中的变化、当前系统调用关系、分析结果、结果说明”；已完成与未完成只改变单元格内容，不改变表头和列顺序。依赖明细按“确认影响 → 未确认影响 → 确认不受影响”排序，同类结论按调用链数量降序；API 明细先按依赖分组，组内使用相同的结论顺序和调用链数量降序。主报告列表、完整 Markdown 和 CSV 共用排序模型。正文没有展开的依赖进入 `all-affected-dependencies.md`，正文没有展开的 API 及完整调用关系进入 `all-impact-details.md`；两份 Markdown 分别生成同数据、同顺序的 CSV。两类完整明细相互独立，且都只覆盖本轮分析范围。选择前的全量依赖/API 仍保留在 Step1/Step4 原始清单，未纳入对象和原因记录在 `analysis-scope.md`。
+`report.md` 固定按“依赖层面结论 → API 及调用关系 → 用户可见文件说明”组织。依赖层和 API 层统一使用“变化总数、已完成分析、未完成分析、确认影响、确认不受影响、尚未确认影响”六列统计，并给出五态语义和行动边界。统计母集是 Step5 本轮分析范围：全量模式使用全部变化对象，部分模式只使用 `included_dependency_coords` 及其变化 API；未选择对象不得进入“未完成分析”。部分模式下 `available_dependency_count` / `total_api_count` 只用于范围说明，结果统计分别使用 `included_dependency_count` / `analyzed_api_count`。变化总数等于已完成与未完成之和。API 层后三类结果划分已完成分析；依赖层只要已有 API 确认影响就保留确认影响计数，因此仍有其他已选 API 未完成的依赖会同时计入“确认影响”和“未完成分析”。依赖明细固定使用“依赖、版本变化、API 分析（已完成/总数）、当前系统调用关系、分析结果、结果说明”，API 明细固定使用“依赖、API、新版本中的变化、当前系统调用关系、分析结果、结果说明”；已完成与未完成只改变单元格内容，不改变表头和列顺序。主报告按依赖坐标分组完整展开全部 `reachable` 和 `uncertain` API：先按依赖的已确认触达、最高/累计复核优先分数和调用关系强度排序，再在依赖内部按结论与复核优先分数排序；`not_found_in_static_analysis` 只给统计并明确不等于安全。完整 Markdown 和 CSV 继续覆盖本轮范围内全部状态，正文未展开的明细可从 `all-impact-details.*` 查阅。正文没有展开的依赖进入 `all-affected-dependencies.md`；两份 Markdown 分别生成同数据、同顺序的 CSV。两类完整明细相互独立，且都只覆盖本轮分析范围。选择前的全量依赖/API 仍保留在 Step1/Step4 原始清单，未纳入对象和原因记录在 `analysis-scope.md`。
 
 `alerts.csv` 是 Step5 的原始分析记录，一条原始记录一行；它保留分析状态、调用起点、完整调用关系和证据文件。`all-impact-details.md` 与 `all-impact-details.csv` 将这些原始记录按变化 API 归并成用户可读的全量明细，因此它们与原始记录的用途不同，都需要在 `report.md` 的“用户可见文件说明”中解释。
 

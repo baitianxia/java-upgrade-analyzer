@@ -457,7 +457,26 @@ public class com.acme.Api {
                 }
             ]
 
-            csv_path, md_path = step4.write_changed_dependencies(rows, output_dir)
+            csv_path, md_path = step4.write_changed_dependencies(
+                rows,
+                output_dir,
+                dependency_status_rows=[{
+                    "coord": "com.acme:alpha",
+                    "implementation_data_available": True,
+                    "implementation_check_status": "changes_detected",
+                }],
+                business_reference_summary={
+                    "scan_status": "complete",
+                    "by_coord": {
+                        "com.acme:alpha": {
+                            "business_exact_referenced_api_count": 1,
+                            "business_candidate_referenced_api_count": 0,
+                            "business_exact_reference_occurrence_count": 2,
+                            "business_candidate_reference_occurrence_count": 0,
+                        }
+                    },
+                },
+            )
 
             self.assertTrue(csv_path.exists())
             self.assertTrue(md_path.exists())
@@ -469,14 +488,204 @@ public class com.acme.Api {
             self.assertIn("## 如何选择定向分析范围", md_text)
             self.assertIn("复制“依赖包”列中的完整坐标", md_text)
             self.assertIn("只分析 com.example:demo-lib", md_text)
-            self.assertIn("排序依据是：含高风险 API、删除或签名变化，或变化 API 数不少于 20 个", md_text)
+            self.assertIn("精确直接引用的变更 API 数排序", md_text)
+            self.assertIn("删除、签名变化等类型不获得额外权重", md_text)
+            self.assertIn("依赖源码是否可用只表示分析条件，不参与影响排序", md_text)
             self.assertIn("不表示系统建议缩小范围", md_text)
-            self.assertIn("| 部分分析优先项 | 依赖包 |", md_text)
-            self.assertIn("| 是 | `com.acme:alpha` |", md_text)
+            self.assertIn("| 排名 | Top 10 | 依赖包 |", md_text)
+            self.assertIn("| 1 | 是 | `com.acme:alpha` | 1 | 0 | 2 |", md_text)
             self.assertIn("为什么先看", md_text)
-            self.assertIn("含高风险 API，优先做系统触达分析", md_text)
+            self.assertIn("业务最终制品直接引用 1 个变更 API", md_text)
             self.assertIn("`com.acme:alpha`", md_text)
             self.assertIn("完整 API 明细", md_text)
+
+    def test_business_bytecode_priority_separates_exact_and_signature_incomplete_matches(self):
+        api_rows = [
+            {
+                "coord": "com.acme:exact",
+                "api_name": "com.acme.Api.call",
+                "api_simple": "call",
+                "api_signature": "(java.lang.String)",
+                "symbol_kind": "method",
+                "change_type": "BEHAVIOR_CHANGED",
+            },
+            {
+                "coord": "com.acme:candidate",
+                "api_name": "com.acme.Api.other",
+                "api_simple": "other",
+                "api_signature": "",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+            },
+        ]
+        evidence = [
+            {
+                "caller_owner": "com.app.UseApi",
+                "caller_name": "run",
+                "caller_signature": "()",
+                "callee_key": "com.acme.Api.call(java.lang.String)",
+                "evidence_type": "bytecode_method_invocation",
+                "instruction_offset": 4,
+            },
+            {
+                "caller_owner": "com.app.UseApi",
+                "caller_name": "run",
+                "caller_signature": "()",
+                "callee_key": "com.acme.Api.other(java.lang.Integer)",
+                "evidence_type": "bytecode_method_invocation",
+                "instruction_offset": 9,
+            },
+        ]
+
+        result = step4.summarize_business_bytecode_changed_api_references(
+            api_rows, evidence
+        )
+
+        self.assertEqual(
+            result["by_coord"]["com.acme:exact"][
+                "business_exact_referenced_api_count"
+            ],
+            1,
+        )
+        self.assertEqual(
+            result["by_coord"]["com.acme:candidate"][
+                "business_candidate_referenced_api_count"
+            ],
+            1,
+        )
+        self.assertEqual(
+            [row["match_quality"] for row in result["evidence_rows"]],
+            ["signature_incomplete_candidate", "exact"],
+        )
+
+    def test_business_bytecode_priority_writes_physical_evidence_and_reuses_step5_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / ".upgrade-report"
+            output_dir = report_dir / "evidence" / "api_changes"
+            dependencies_dir = report_dir / "evidence" / "dependencies"
+            output_dir.mkdir(parents=True)
+            dependencies_dir.mkdir(parents=True)
+            business_jar = dependencies_dir / "business-classes.jar"
+            business_jar.write_bytes(b"business artifact")
+            artifact_sha = hashlib.sha256(business_jar.read_bytes()).hexdigest()
+            (dependencies_dir / "dependency_jars.json").write_text(
+                json.dumps({
+                    "business_artifacts": [{
+                        "side": "current",
+                        "kind": "business_content",
+                        "retained_path": str(business_jar),
+                        "sha256": artifact_sha,
+                    }],
+                }),
+                encoding="utf-8",
+            )
+            edges = [{
+                "caller_owner": "com.app.OrderService",
+                "caller_name": "submit",
+                "caller_signature": "()",
+                "callee_key": "com.acme.Api.call(java.lang.String)",
+                "evidence_type": "bytecode_method_invocation",
+                "instruction_offset": 12,
+                "class_file": "business-classes.jar!/com/app/OrderService.class",
+            }]
+            with patch(
+                "business_bytecode_graph.collect_business_bytecode_edges",
+                return_value=(edges, {"failures": [], "classes_scanned": 1}),
+            ) as collect_edges:
+                result = step4.collect_business_bytecode_priority_evidence(
+                    [{
+                        "coord": "com.acme:api",
+                        "api_name": "com.acme.Api.call",
+                        "api_simple": "call",
+                        "api_signature": "(java.lang.String)",
+                        "symbol_kind": "method",
+                        "change_type": "BEHAVIOR_CHANGED",
+                    }],
+                    output_dir,
+                )
+
+            call_kwargs = collect_edges.call_args.kwargs
+            expected_cache = (
+                report_dir.resolve()
+                / ".runtime"
+                / "cache"
+                / step4.STEP5_ARTIFACT_BYTECODE_INDEX_FILE
+            )
+            self.assertEqual(call_kwargs["cache_path"], expected_cache)
+            with Path(result["evidence_file"]).open(
+                encoding="utf-8-sig", newline=""
+            ) as handle:
+                evidence_rows = list(csv.DictReader(handle))
+            summary_bytes = Path(result["summary_file"]).read_bytes()
+            summary = json.loads(summary_bytes.decode("utf-8"))
+
+        self.assertEqual(result["scan_status"], "complete")
+        self.assertEqual(len(evidence_rows), 1)
+        self.assertEqual(evidence_rows[0]["caller_class"], "com.app.OrderService")
+        self.assertEqual(evidence_rows[0]["caller_method"], "submit")
+        self.assertEqual(evidence_rows[0]["instruction_offset"], "12")
+        self.assertEqual(
+            evidence_rows[0]["callee_key"],
+            "com.acme.Api.call(java.lang.String)",
+        )
+        self.assertFalse(summary_bytes.startswith(b"\xef\xbb\xbf"))
+        self.assertEqual(summary["exact_referenced_api_count"], 1)
+
+    def test_changed_dependency_order_does_not_weight_change_kind_or_source_availability(self):
+        rows = [
+            {
+                "coord": "com.acme:direct",
+                "change_type": "BEHAVIOR_CHANGED",
+                "severity": "P2",
+                "api_name": "com.acme.Direct.call",
+                "symbol_kind": "method",
+            },
+            *[
+                {
+                    "coord": "com.acme:removed",
+                    "change_type": "REMOVED",
+                    "severity": "P0",
+                    "api_name": f"com.acme.Removed.call{index}",
+                    "symbol_kind": "method",
+                }
+                for index in range(3)
+            ],
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path, _md_path = step4.write_changed_dependencies(
+                rows,
+                tmp,
+                dependency_status_rows=[
+                    {
+                        "coord": "com.acme:direct",
+                        "implementation_data_available": False,
+                        "implementation_check_status": "not_configured",
+                    },
+                    {
+                        "coord": "com.acme:removed",
+                        "implementation_data_available": True,
+                        "implementation_check_status": "changes_detected",
+                    },
+                ],
+                business_reference_summary={
+                    "scan_status": "complete",
+                    "by_coord": {
+                        "com.acme:direct": {
+                            "business_exact_referenced_api_count": 1,
+                            "business_exact_reference_occurrence_count": 1,
+                        }
+                    },
+                },
+            )
+            with csv_path.open(encoding="utf-8-sig", newline="") as handle:
+                written = list(csv.DictReader(handle))
+
+        self.assertEqual(
+            [row["coord"] for row in written],
+            ["com.acme:direct", "com.acme:removed"],
+        )
+        self.assertEqual(written[0]["dependency_source_status"], "unavailable")
+        self.assertEqual(written[1]["dependency_source_status"], "available")
 
     def test_dependency_analysis_status_distinguishes_zero_change_from_failure(self):
         dep_rows = [
@@ -3764,15 +3973,25 @@ public class com.acme.Api {
             output_dir = Path(tmp)
             stale_gitdiff = output_dir / "demo-lib_gitdiff_api_changes.txt"
             stale_summary = output_dir / "summary.txt"
+            stale_changed_dependencies = (
+                output_dir / step4.CHANGED_DEPENDENCIES_CSV
+            )
+            stale_priority_evidence = (
+                output_dir / step4.BUSINESS_BYTECODE_PRIORITY_EVIDENCE_JSON
+            )
             unrelated = output_dir / "keep.me"
             stale_gitdiff.write_text("old diff", encoding="utf-8")
             stale_summary.write_text("old summary", encoding="utf-8")
+            stale_changed_dependencies.write_text("old rows", encoding="utf-8")
+            stale_priority_evidence.write_text("{}", encoding="utf-8")
             unrelated.write_text("keep", encoding="utf-8")
 
             step4.cleanup_step4_generated_outputs(output_dir)
 
             self.assertFalse(stale_gitdiff.exists())
             self.assertFalse(stale_summary.exists())
+            self.assertFalse(stale_changed_dependencies.exists())
+            self.assertFalse(stale_priority_evidence.exists())
             self.assertTrue(unrelated.exists())
 
     def test_main_prefers_step1_packaged_jars_for_japicmp(self):

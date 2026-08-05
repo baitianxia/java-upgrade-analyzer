@@ -619,12 +619,92 @@ class RunStepMainStateTest(unittest.TestCase):
                 exit_code = run_step.main()
 
             saved = run_step.load_main_state(report_dir)
+            informational = run_step.read_json(
+                report_dir / ".runtime" / "state" / "interaction.json"
+            )
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(saved["state"]["current_step"], "step6")
         self.assertEqual(saved["state"]["completed_step"], "step5")
         self.assertEqual(saved["state"]["status"], "ready")
         self.assertIsNone(saved["state"]["pending_interaction"])
+        self.assertEqual(informational["status"], "informational")
+        self.assertEqual(informational["event"], "step_completed_information")
+        self.assertFalse(informational["must_wait_for_user_reply"])
+        self.assertEqual(informational["exit_code"], 0)
+        card = "\n".join(informational["user_decision_card"])
+        self.assertIn("阶段结果：", card)
+        self.assertIn("本卡无需回复", card)
+        self.assertNotIn("为什么暂停", card)
+
+    def test_step5_generates_standard_five_state_card_when_manifest_skips_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp) / "project"
+            report_dir = project_dir / ".upgrade-report"
+            call_chain_dir = report_dir / "evidence" / "call_chain"
+            call_chain_dir.mkdir(parents=True)
+            (call_chain_dir / "summary.json").write_text(
+                json.dumps({
+                    "reachable": 2,
+                    "not_impacted": 3,
+                    "uncertain": 4,
+                    "not_analyzed": 5,
+                    "not_found_in_static_analysis": 6,
+                }),
+                encoding="utf-8",
+            )
+            payload = run_step.build_interaction_payload(
+                "step5",
+                report_dir,
+                {
+                    "step5": {
+                        "title": "系统触达证据",
+                        "interaction": None,
+                        "auto_continue_on_success": True,
+                    }
+                },
+                project_dir,
+                run_context={},
+                main_state=run_step.new_main_state(report_dir),
+            )
+
+        self.assertIsNotNone(payload)
+        informational = run_step.build_informational_success_interaction(
+            "step5", payload
+        )
+        self.assertEqual(informational["status"], "informational")
+        card = "\n".join(informational["user_decision_card"])
+        self.assertIn("reachable（已确认静态触达）=2", card)
+        self.assertIn("not_impacted（已确认不受 API 调用影响）=3", card)
+        self.assertIn("uncertain（存在候选证据或已知分析边界）=4", card)
+        self.assertIn("not_analyzed（输入不足或分析未完成）=5", card)
+        self.assertIn("not_found_in_static_analysis（当前静态范围未找到路径）=6", card)
+        self.assertIn("不表示安全", card)
+        self.assertFalse(informational["decision_required"])
+
+    def test_completion_cleanup_preserves_step5_informational_card_when_requested(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / ".upgrade-report"
+            informational = run_step.build_informational_success_interaction(
+                "step5",
+                {
+                    "step_id": "step5",
+                    "checklist_lines": ["reachable=1", "uncertain=2"],
+                },
+            )
+            run_step.save_interaction_file(report_dir, informational)
+
+            run_step.clear_interaction_file(
+                report_dir,
+                preserve_informational=True,
+            )
+            preserved = run_step.read_json(
+                report_dir / ".runtime" / "state" / "interaction.json"
+            )
+
+        self.assertEqual(preserved["status"], "informational")
+        self.assertEqual(preserved["step_id"], "step5")
+        self.assertEqual(preserved["event"], "step_completed_information")
 
     def test_legacy_nonterminal_completed_state_normalizes_to_ready(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1346,9 +1426,9 @@ class RunStepMainStateTest(unittest.TestCase):
             api_dir = report_dir / "evidence" / "api_changes"
             api_dir.mkdir(parents=True, exist_ok=True)
             (api_dir / "changed_dependencies.csv").write_text(
-                "selection_key,coord,dependency_name,changed_api_count,high_risk_api_count,change_types,symbol_kinds,recommended,detail\n"
-                "coord:com.acme:alpha,com.acme:alpha,alpha,42,5,removed,method,true,s4_per_dependency/com.acme__alpha/summary.json\n"
-                "coord:com.acme:beta,com.acme:beta,beta,3,0,modified,method,false,s4_per_dependency/com.acme__beta/summary.json\n",
+                "selection_key,coord,dependency_name,changed_api_count,high_risk_api_count,business_exact_referenced_api_count,business_candidate_referenced_api_count,business_reference_occurrence_count,business_bytecode_scan_status,dependency_source_status,impact_priority_rank,change_types,symbol_kinds,recommended,review_focus,detail\n"
+                "coord:com.acme:alpha,com.acme:alpha,alpha,42,5,2,1,4,complete,available,1,removed,method,true,业务最终制品直接引用 2 个变更 API,s4_per_dependency/com.acme__alpha/summary.json\n"
+                "coord:com.acme:beta,com.acme:beta,beta,3,0,0,0,0,complete,unavailable,2,modified,method,true,未观察到业务字节码直接引用,s4_per_dependency/com.acme__beta/summary.json\n",
                 encoding="utf-8",
             )
 
@@ -1359,9 +1439,15 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertEqual(selection_resolution["options"][0]["coord"], "com.acme:alpha")
             self.assertEqual(selection_resolution["options"][0]["api_count"], 42)
             self.assertEqual(selection_resolution["options"][0]["high_risk_api_count"], 5)
+            self.assertEqual(
+                selection_resolution["options"][0][
+                    "business_exact_referenced_api_count"
+                ],
+                2,
+            )
 
             summary = run_step.build_step5_dependency_selection_summary(report_dir)
-            self.assertEqual(summary["recommended_target_count"], 1)
+            self.assertEqual(summary["recommended_target_count"], 2)
             self.assertEqual(summary["recommended_targets"][0]["coord"], "com.acme:alpha")
 
             _, manifest_steps = run_step.load_manifest(ROOT_DIR / "scripts" / "step_manifest.json")
@@ -1385,6 +1471,8 @@ class RunStepMainStateTest(unittest.TestCase):
                     "available_dependency_count": 2,
                     "total_api_count": 45,
                     "high_risk_api_count": 5,
+                    "business_exact_referenced_api_count": 2,
+                    "business_candidate_referenced_api_count": 1,
                     "partial_scope_effect": "未选择的变化依赖不会进入系统触达分析；最终报告只适用于所选范围。",
                 },
             )
@@ -1396,7 +1484,7 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertIn("`com.acme:alpha`", card_text)
             self.assertIn("`com.acme:beta`", card_text)
             self.assertIn("完整依赖选择清单", card_text)
-            self.assertIn("直接回复依赖名称或完整坐标", card_text)
+            self.assertIn("从“依赖包”列复制名称或完整坐标", card_text)
             self.assertNotIn("selected_targets", card_text)
             self.assertNotIn("selection_key", card_text)
 
@@ -2100,6 +2188,12 @@ class RunStepMainStateTest(unittest.TestCase):
                     "coord": "com.acme:alpha",
                     "api_count": 42,
                     "high_risk_api_count": 5,
+                    "business_exact_referenced_api_count": 3,
+                    "business_candidate_referenced_api_count": 1,
+                    "business_reference_occurrence_count": 7,
+                    "dependency_source_status": "available",
+                    "impact_priority_rank": 1,
+                    "recommendation_reason": "业务最终制品直接引用 3 个变更 API",
                 }
             ],
             "selection_resolution": {"enabled": True},
@@ -2131,7 +2225,13 @@ class RunStepMainStateTest(unittest.TestCase):
                 "coord": f"com.acme:lib-{index}",
                 "api_count": index + 1,
                 "high_risk_api_count": index % 3,
-                "recommended": index < 12,
+                "business_exact_referenced_api_count": max(10 - index, 0),
+                "business_candidate_referenced_api_count": 0,
+                "business_reference_occurrence_count": max(10 - index, 0),
+                "dependency_source_status": "available" if index % 2 else "unavailable",
+                "impact_priority_rank": index + 1,
+                "recommendation_reason": f"优先级依据 {index + 1}",
+                "recommended": index < 10,
             }
             for index in range(37)
         ]
@@ -2139,9 +2239,9 @@ class RunStepMainStateTest(unittest.TestCase):
             "step_id": "step4",
             "question": "请选择系统触达证据的分析范围。",
             "options": [{"id": "continue", "label": "全部分析"}],
-            "selection_options": all_candidates[:20],
-            "recommended_selection_options": all_candidates[:12],
-            "recommended_candidate_count": 12,
+            "selection_options": all_candidates[:10],
+            "recommended_selection_options": all_candidates[:10],
+            "recommended_candidate_count": 10,
             "selection_resolution": {
                 "enabled": True,
                 "options": all_candidates,
@@ -2161,13 +2261,11 @@ class RunStepMainStateTest(unittest.TestCase):
         text = "\n".join(run_step.build_user_decision_card(interaction))
 
         self.assertIn("覆盖全部 37 个变化依赖", text)
-        self.assertIn("推荐 12 个，展示 10 / 12 个", text)
-        self.assertIn(
-            "其余 2 个高优先级项见 `/project/.upgrade-report/evidence/api_changes/changed_dependencies.md` 的“部分分析优先项”列",
-            text,
-        )
-        self.assertIn("展示 20 / 37 个", text)
-        self.assertIn("还有 17 个候选未在卡片中展示", text)
+        self.assertIn("Top 10 影响复核优先项，展示 10 / 10 个", text)
+        self.assertIn("精确直接引用 API", text)
+        self.assertIn("删除、签名变化等变更类型不额外加权", text)
+        self.assertIn("依赖源码是否可用只展示分析条件，不参与影响排序", text)
+        self.assertIn("其余 27 个候选未在卡片中展开", text)
         self.assertIn(
             "该文件不是普通复核材料；需要选择未展示的依赖时",
             text,
@@ -2190,6 +2288,12 @@ class RunStepMainStateTest(unittest.TestCase):
                     "coord": "com.acme:alpha",
                     "api_count": 42,
                     "high_risk_api_count": 5,
+                    "business_exact_referenced_api_count": 3,
+                    "business_candidate_referenced_api_count": 1,
+                    "business_reference_occurrence_count": 7,
+                    "dependency_source_status": "available",
+                    "impact_priority_rank": 1,
+                    "recommendation_reason": "业务最终制品直接引用 3 个变更 API",
                 }
             ],
             "recommended_selection_options": [
@@ -2198,6 +2302,12 @@ class RunStepMainStateTest(unittest.TestCase):
                     "coord": "com.acme:alpha",
                     "api_count": 42,
                     "high_risk_api_count": 5,
+                    "business_exact_referenced_api_count": 3,
+                    "business_candidate_referenced_api_count": 1,
+                    "business_reference_occurrence_count": 7,
+                    "dependency_source_status": "available",
+                    "impact_priority_rank": 1,
+                    "recommendation_reason": "业务最终制品直接引用 3 个变更 API",
                 }
             ],
             "recommended_candidate_count": 1,
@@ -2225,11 +2335,10 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertIn("1. 全量分析", text)
         self.assertIn("覆盖全部 2 个变化依赖", text)
         self.assertIn("2. 部分分析（仅在明确控制耗时时）", text)
-        self.assertIn("推荐 1 个，展示 1 / 1 个", text)
-        self.assertIn("高优先级项依据：含高风险 API、删除或签名变化，或变化 API 数不少于 20 个", text)
+        self.assertIn("Top 1 影响复核优先项，展示 1 / 1 个", text)
+        self.assertIn("先比较业务最终制品精确直接引用的变更 API 数", text)
         self.assertIn("不表示系统建议缩小范围，也不代表已经确认影响", text)
-        self.assertIn("可直接选择的依赖（展示 1 / 2 个", text)
-        self.assertIn("| `com.acme:alpha` | 42 | 5 |", text)
+        self.assertIn("| 1 | `com.acme:alpha` | 3 | 1 | 7 | 42 | 可用 |", text)
         self.assertIn(
             "完整依赖选择清单：`/project/.upgrade-report/evidence/api_changes/changed_dependencies.md`",
             text,
@@ -3524,9 +3633,12 @@ class RunStepMainStateTest(unittest.TestCase):
 
         checklist_text = "\n".join(payload.get("checklist_lines") or [])
         self.assertIn("需人工复核=3", checklist_text)
-        self.assertIn("缺少依赖源码/构建产物=4", checklist_text)
-        self.assertIn("本次未完成分析=1", checklist_text)
-        self.assertIn("未发现调用路径=1", checklist_text)
+        self.assertIn("缺少输入=4", checklist_text)
+        self.assertIn("not_analyzed（输入不足或分析未完成）=1", checklist_text)
+        self.assertIn(
+            "not_found_in_static_analysis（当前静态范围未找到路径）=1",
+            checklist_text,
+        )
         self.assertIn("需人工复核示例", checklist_text)
         self.assertIn("缺少依赖源码/构建产物示例", checklist_text)
         self.assertNotIn("当前无法确认=", checklist_text)
@@ -4846,7 +4958,7 @@ class RunStepMainStateTest(unittest.TestCase):
                 main_state=run_step.new_main_state(report_dir),
             )
 
-        self.assertEqual(len(payload["selection_options"]), 20)
+        self.assertEqual(len(payload["selection_options"]), 10)
         self.assertEqual(len(payload["selection_resolution"]["options"]), 21)
         self.assertEqual(
             payload["selection_resolution"]["options"][-1]["selection_key"],
@@ -5490,7 +5602,7 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertTrue(main_state.exists())
             self.assertTrue(interaction.exists())
 
-    def test_cleanup_step_outputs_removes_all_step5_artifacts(self):
+    def test_cleanup_step_outputs_preserves_reusable_business_bytecode_index(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
             step5_dir = self._call_chain_dir(report_dir)
@@ -5530,7 +5642,7 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertFalse(step5_dir.exists())
             self.assertFalse(artifact_bytecode_dir.exists())
             self.assertFalse(artifact_catalog.exists())
-            self.assertFalse(artifact_index.exists())
+            self.assertTrue(artifact_index.exists())
             self.assertFalse(framework_adapters.exists())
             self.assertFalse(source_alignment.exists())
             self.assertFalse(diagnostics.exists())

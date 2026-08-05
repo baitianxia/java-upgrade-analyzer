@@ -1051,6 +1051,90 @@ class Step6ReportObjectivityTest(unittest.TestCase):
             ["com.acme.Api.high", "com.acme.Api.low"],
         )
 
+    def test_main_report_fully_expands_reachable_and_uncertain_by_dependency(self):
+        reachable = [
+            {
+                "coord": "com.acme:reachable",
+                "api": f"com.acme.Api.reachable{index}",
+                "api_signature": "()",
+                "symbol_kind": "method",
+                "change_type": "BEHAVIOR_CHANGED",
+                "severity": "P1",
+                "conclusion": "已确认影响",
+                "path_count": 1,
+            }
+            for index in range(13)
+        ]
+        uncertain = [
+            {
+                "coord": "com.beta:uncertain",
+                "api": "com.beta.Api.low",
+                "api_signature": "()",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+                "severity": "P0",
+                "conclusion": s6_report.UNCERTAIN_CANDIDATE_CONCLUSION,
+                "priority_score": 3,
+            },
+            {
+                "coord": "com.beta:uncertain",
+                "api": "com.beta.Api.high",
+                "api_signature": "()",
+                "symbol_kind": "method",
+                "change_type": "BEHAVIOR_CHANGED",
+                "severity": "P2",
+                "conclusion": s6_report.UNCERTAIN_CANDIDATE_CONCLUSION,
+                "priority_score": 19,
+            },
+        ]
+        not_found = {
+            "coord": "com.gamma:not-found",
+            "api": "com.gamma.Api.notFoundSentinel",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+            "severity": "P1",
+            "conclusion": "未发现调用路径",
+        }
+        not_impacted = {
+            "coord": "com.delta:not-impacted",
+            "api": "com.delta.Api.notImpactedSentinel",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+            "severity": "P1",
+            "conclusion": "已确认不受影响",
+        }
+        completed = [*reachable, *uncertain, not_found, not_impacted]
+        api_model = {
+            "rows": completed,
+            "completed": completed,
+            "incomplete": [],
+            "total_count": len(completed),
+            "completed_count": len(completed),
+            "incomplete_count": 0,
+            "confirmed_count": len(reachable),
+            "confirmed_no_impact_count": 1,
+            "unconfirmed_count": 3,
+            "confirmed_relationship_count": len(reachable),
+            "population_unconfirmed": False,
+        }
+
+        report = "\n".join(
+            s6_report.render_api_and_calls({}, api_model=api_model)
+        )
+
+        self.assertIn("### 五态语义与用户行动", report)
+        self.assertIn("`not_found_in_static_analysis` 只表示当前静态范围没有找到路径", report)
+        self.assertIn("完整展示 15/15", report)
+        for index in range(13):
+            self.assertIn(f"com.acme.Api.reachable{index}", report)
+        self.assertLess(report.index("com.beta.Api.high"), report.index("com.beta.Api.low"))
+        self.assertLess(report.index("`com.acme:reachable`"), report.index("`com.beta:uncertain`"))
+        self.assertNotIn("notFoundSentinel", report)
+        self.assertNotIn("notImpactedSentinel", report)
+        self.assertIn("| `not_found_in_static_analysis` | 1 | 仅统计，不展开 API", report)
+
     def test_core_conclusion_translates_partial_coverage_without_raw_status(self):
         text = "\n".join(
             s6_report.render_core_conclusion(
@@ -1639,7 +1723,8 @@ class Step6ReportObjectivityTest(unittest.TestCase):
             detail = detail_path.read_text(encoding="utf-8")
 
         self.assertIn("完整 API 分析与调用关系明细", report)
-        self.assertNotIn("com.acme.Api.method9", report)
+        self.assertIn("完整展示 15/15", report)
+        self.assertIn("com.acme.Api.method9", report)
         self.assertIn("com.acme.Api.method14", detail)
         self.assertIn("1.0.0 → 2.0.0", detail)
 

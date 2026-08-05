@@ -6780,6 +6780,83 @@ def _api_result_is_incomplete(row):
     )
 
 
+def _api_five_state(row):
+    if _api_result_is_incomplete(row):
+        return "not_analyzed"
+    conclusion = str((row or {}).get("conclusion") or "").strip()
+    if conclusion == "已确认影响":
+        return "reachable"
+    if conclusion == "已确认不受影响":
+        return "not_impacted"
+    if conclusion == "未发现调用路径":
+        return "not_found_in_static_analysis"
+    # A completed result that cannot support a positive or negative conclusion
+    # belongs to uncertain. Unknown labels must never fall through to a safe state.
+    return "uncertain"
+
+
+def _five_state_counts(api_model):
+    counts = defaultdict(int)
+    for row in (api_model or {}).get("rows") or []:
+        counts[_api_five_state(row)] += int(row.get("aggregate_count") or 1)
+    return counts
+
+
+def render_five_state_semantics(api_model):
+    counts = _five_state_counts(api_model)
+    rows = [
+        (
+            "reachable",
+            "静态证据已从当前系统触达到该变更 API；确认的是调用关系，不等同于已发生运行时故障。",
+            "否",
+            "优先核对兼容方案，修复后执行相关业务回归。",
+        ),
+        (
+            "not_impacted",
+            "当前制品中有足以支持“不受本次 API 调用变化影响”的相同类字节码证据；结论只覆盖已检查范围。",
+            "仅限已检查范围",
+            "保留证据，并用目标部署制品完成回归验证。",
+        ),
+        (
+            "uncertain",
+            "已有候选关系，或系统已识别出阻止确定结论的静态分析边界。",
+            "否",
+            "按复核优先分数检查证据链，并补充定向测试或必要输入。",
+        ),
+        (
+            "not_analyzed",
+            "输入、制品或分析过程不完整，本轮没有形成有效结论。",
+            "否",
+            "修复对应证据缺口后重跑相关阶段。",
+        ),
+        (
+            "not_found_in_static_analysis",
+            "本轮已执行的静态搜索中没有找到路径；与 uncertain 的区别是当前没有候选路径或已识别的特定阻断证据。",
+            "否",
+            "结合反射、配置、SPI、生成代码、常量内联及运行时装配场景做定向验证。",
+        ),
+    ]
+    lines = [
+        "### 五态语义与用户行动",
+        "",
+        (
+            "五态互斥。`uncertain` 表示已有候选证据或明确的分析能力边界；"
+            "`not_found_in_static_analysis` 只表示当前静态范围没有找到路径，"
+            "不能解释为安全。"
+        ),
+        "",
+        "| 内部状态 | 本轮数量 | 含义 | 可视为安全 | 用户行动 |",
+        "|---|---:|---|---|---|",
+    ]
+    for status, meaning, safe, action in rows:
+        lines.append(
+            f"| `{status}` | {int(counts.get(status) or 0)} | "
+            f"{meaning} | {safe} | {action} |"
+        )
+    lines.append("")
+    return lines
+
+
 def _api_result_priority(row):
     """Prefer a completed structural result when duplicate evidence exists."""
     ranks = {
@@ -8169,81 +8246,18 @@ def render_dependency_conclusions(findings, dependency_model=None):
 
 
 def _main_completed_api_rows(rows):
-    confirmed = [
-        row for row in rows if row.get("conclusion") == "已确认影响"
+    actionable = [
+        row
+        for row in rows or []
+        if _api_five_state(row) in {"reachable", "uncertain"}
     ]
-    uncertain_conclusions = {
-        "可能影响",
-        UNCERTAIN_CANDIDATE_CONCLUSION,
-        UNCERTAIN_ANALYSIS_LIMITATION_CONCLUSION,
-    }
-    uncertain_rows = _order_uncertain_items_by_dependency([
+    return [
         row
-        for row in rows
-        if str(row.get("conclusion") or "") in uncertain_conclusions
-    ])
-    non_uncertain_rows = sorted(
-        (
-            row
-            for row in rows
-            if row.get("conclusion") != "已确认影响"
-            and str(row.get("conclusion") or "") not in uncertain_conclusions
-        ),
-        key=_report_result_sort_key,
-    )
-    other = [*uncertain_rows, *non_uncertain_rows]
-    selected = []
-    remaining = S6_MAIN_RESULT_LIMIT
-    seen_coords = set()
-    for row in confirmed:
-        if remaining <= 0:
-            break
-        coord = str(row.get("coord") or "")
-        if coord in seen_coords:
-            continue
-        selected.append(row)
-        seen_coords.add(coord)
-        remaining -= 1
-    if remaining:
-        selected_identities = {
-            build_api_identity_key(row) for row in selected
-        }
-        for row in confirmed:
-            if remaining <= 0:
-                break
-            if build_api_identity_key(row) in selected_identities:
-                continue
-            selected.append(row)
-            selected_identities.add(build_api_identity_key(row))
-            remaining -= 1
-    if remaining:
-        for row in other:
-            if remaining <= 0:
-                break
-            selected.append(row)
-            remaining -= 1
-    selected_confirmed = sorted(
-        (
-            row for row in selected
-            if str(row.get("conclusion") or "") == "已确认影响"
-        ),
-        key=_report_result_sort_key,
-    )
-    selected_uncertain = _order_uncertain_items_by_dependency([
-        row
-        for row in selected
-        if str(row.get("conclusion") or "") in uncertain_conclusions
-    ])
-    selected_other = sorted(
-        (
-            row
-            for row in selected
-            if str(row.get("conclusion") or "") != "已确认影响"
-            and str(row.get("conclusion") or "") not in uncertain_conclusions
-        ),
-        key=_report_result_sort_key,
-    )
-    return [*selected_confirmed, *selected_uncertain, *selected_other]
+        for _coord, dependency_rows in _completed_api_rows_by_dependency({
+            "completed": actionable,
+        })
+        for row in dependency_rows
+    ]
 
 
 def _main_relationship_cell(row):
@@ -8414,6 +8428,7 @@ def render_api_and_calls(findings, api_model=None):
             api_model["count_note"],
             "",
         ])
+    lines.extend(render_five_state_semantics(api_model))
     if api_model["incomplete"]:
         displayed = api_model["incomplete"][:S6_MAIN_INCOMPLETE_LIMIT]
         displayed_count = sum(
@@ -8445,31 +8460,78 @@ def render_api_and_calls(findings, api_model=None):
         ])
     completed = api_model["completed"]
     if completed:
-        displayed = _main_completed_api_rows(completed)
-        displayed_count = sum(
-            int(row.get("aggregate_count") or 1) for row in displayed
+        actionable = _main_completed_api_rows(completed)
+        actionable_count = sum(
+            int(row.get("aggregate_count") or 1) for row in actionable
         )
         lines.extend([
             (
-                "### 已完成分析的 API"
-                f"（展示 {displayed_count}/{api_model['completed_count']}）"
+                "### 已确认触达与结论未确定的 API"
+                f"（完整展示 {actionable_count}/{actionable_count}）"
             ),
             "",
             (
-                (
-                    f"正文展示 {displayed_count}/{api_model['completed_count']} "
-                    "个已完成分析的 API；"
-                    f"未展开 {api_model['completed_count'] - displayed_count} 个。"
-                    if displayed_count < api_model["completed_count"]
-                    else ""
-                )
-                + f"完整 {api_model['completed_count']} 个结果及 "
-                f"{api_model['confirmed_relationship_count']} 条已确认调用关系"
-                "见[完整 API 分析与调用关系明细]"
-                "(all-impact-details.md)。"
+                "本节按依赖坐标分组，完整展示全部 `reachable` 和 `uncertain` API。"
+                "依赖之间按已确认影响、复核优先分数和调用关系强度排序；"
+                "每个依赖内部再按结论与复核优先分数排序。"
             ),
             "",
-            *_api_completed_table(displayed, findings),
+        ])
+        if not actionable:
+            lines.extend([
+                "本轮没有 `reachable` 或 `uncertain` API。",
+                "",
+            ])
+        for index, (coord, dependency_rows) in enumerate(
+            _completed_api_rows_by_dependency({"completed": actionable}),
+            start=1,
+        ):
+            reachable_count = sum(
+                int(row.get("aggregate_count") or 1)
+                for row in dependency_rows
+                if _api_five_state(row) == "reachable"
+            )
+            uncertain_count = sum(
+                int(row.get("aggregate_count") or 1)
+                for row in dependency_rows
+                if _api_five_state(row) == "uncertain"
+            )
+            lines.extend([
+                f"#### {index}. `{_full_md_cell(coord or '依赖身份未记录')}`",
+                "",
+                (
+                    f"本依赖完整展示 {reachable_count} 个 `reachable`、"
+                    f"{uncertain_count} 个 `uncertain` API。"
+                ),
+                "",
+                *_api_completed_table(dependency_rows, findings),
+                "",
+            ])
+
+        five_state_counts = _five_state_counts(api_model)
+        not_impacted_count = int(five_state_counts.get("not_impacted") or 0)
+        not_found_count = int(
+            five_state_counts.get("not_found_in_static_analysis") or 0
+        )
+        lines.extend([
+            "### 其他已完成状态统计",
+            "",
+            "| 状态 | 数量 | 正文展示方式 |",
+            "|---|---:|---|",
+            (
+                f"| `not_impacted` | {not_impacted_count} | "
+                "仅统计；完整逐项记录见明细文件。 |"
+            ),
+            (
+                f"| `not_found_in_static_analysis` | {not_found_count} | "
+                "仅统计，不展开 API；该状态不等于安全。 |"
+            ),
+            "",
+            (
+                f"全部 {api_model['completed_count']} 个已完成结果及 "
+                f"{api_model['confirmed_relationship_count']} 条已确认调用关系见"
+                "[完整 API 分析与调用关系明细](all-impact-details.md)。"
+            ),
             "",
         ])
     return lines
@@ -8731,19 +8793,31 @@ def _completed_api_rows_by_dependency(api_model):
     for row in api_model.get("completed") or []:
         grouped[_canonical_identity_coord(row.get("coord"))].append(row)
 
-    uncertain_conclusions = {
-        "可能影响",
-        UNCERTAIN_CANDIDATE_CONCLUSION,
-        UNCERTAIN_ANALYSIS_LIMITATION_CONCLUSION,
-    }
-
     def row_sort_key(row):
-        conclusion = str(row.get("conclusion") or "")
-        result_rank = _api_result_rank(row)
-        is_uncertain = conclusion in uncertain_conclusions
+        state = _api_five_state(row)
+        if state == "reachable":
+            return (
+                0,
+                _severity_rank(row.get("severity")),
+                -_api_call_relationship_count(row),
+                0,
+                str(row.get("api") or ""),
+                str(row.get("api_signature") or ""),
+                str(row.get("change_type") or ""),
+            )
+        if state == "uncertain":
+            return (
+                1,
+                -int(row.get("priority_score") or 0),
+                _severity_rank(row.get("severity")),
+                -_api_call_relationship_count(row),
+                str(row.get("api") or ""),
+                str(row.get("api_signature") or ""),
+                str(row.get("change_type") or ""),
+            )
         return (
-            result_rank,
-            -int(row.get("priority_score") or 0) if is_uncertain else 0,
+            2,
+            _api_result_rank(row),
             _severity_rank(row.get("severity")),
             -_api_call_relationship_count(row),
             str(row.get("api") or ""),
@@ -8767,7 +8841,7 @@ def _completed_api_rows_by_dependency(api_model):
         uncertain_scores = [
             int(row.get("priority_score") or 0)
             for row in ordered_rows
-            if str(row.get("conclusion") or "") in uncertain_conclusions
+            if _api_five_state(row) == "uncertain"
         ]
         dependency_groups.append({
             "coord": coord,
@@ -8777,6 +8851,10 @@ def _completed_api_rows_by_dependency(api_model):
             "top_priority_score": max(uncertain_scores, default=0),
             "total_priority_score": sum(uncertain_scores),
             "uncertain_count": len(uncertain_scores),
+            "reachable_count": sum(
+                _api_five_state(row) == "reachable"
+                for row in ordered_rows
+            ),
             "relationship_count": sum(
                 _api_call_relationship_count(row) for row in ordered_rows
             ),
@@ -8788,9 +8866,18 @@ def _completed_api_rows_by_dependency(api_model):
             not bool(group["coord"]),
             str(group["coord"]),
         )
-        if result_rank == 1 and int(group["uncertain_count"]):
+        if int(group["reachable_count"]):
             return (
-                result_rank,
+                0,
+                int(group["best_severity_rank"]),
+                -int(group["relationship_count"]),
+                -int(group["reachable_count"]),
+                -int(group["top_priority_score"]),
+                *stable_tail,
+            )
+        if int(group["uncertain_count"]):
+            return (
+                1,
                 -int(group["top_priority_score"]),
                 -int(group["total_priority_score"]),
                 -int(group["uncertain_count"]),
@@ -8799,6 +8886,7 @@ def _completed_api_rows_by_dependency(api_model):
                 *stable_tail,
             )
         return (
+            2,
             result_rank,
             int(group["best_severity_rank"]),
             -int(group["relationship_count"]),

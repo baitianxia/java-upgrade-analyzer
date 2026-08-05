@@ -338,11 +338,15 @@
       ],
       "outputs": [
         "evidence/api_changes/all_changed_apis.csv",
+        "evidence/api_changes/changed_dependencies.csv",
+        "evidence/api_changes/changed_dependencies.md",
+        "evidence/api_changes/business_bytecode_changed_api_refs.csv",
+        "evidence/api_changes/business_bytecode_priority_evidence.json",
         "evidence/api_changes/git_ref_matches.txt",
         "evidence/api_changes/git_ref_matches.json"
       ],
       "notes": [
-        "本步骤输出 all_changed_apis.csv；存在至少两个候选依赖时由用户选择 Step5 全量或部分分析范围，0/1 个候选时直接继续。范围选择会影响覆盖率、耗时和最终结论边界。"
+        "本步骤输出 all_changed_apis.csv，并基于业务最终制品的直接字节码引用证据按依赖坐标生成 Top 10 影响复核顺序；存在至少两个候选依赖时由用户选择 Step5 全量或部分分析范围，0/1 个候选时直接继续。范围选择会影响覆盖率、耗时和最终结论边界。"
       ]
     },
     {

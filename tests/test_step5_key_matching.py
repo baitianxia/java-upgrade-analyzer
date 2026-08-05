@@ -1047,8 +1047,9 @@ class Step5KeyMatchingTest(unittest.TestCase):
         self.assertIn("复制“依赖包”列中的完整坐标", md_text)
         self.assertIn("完整 API 明细：`all_changed_apis.csv`", md_text)
         self.assertIn("依赖包明细目录：`s4_per_dependency/`", md_text)
-        self.assertIn("| 部分分析优先项 | 依赖包 | 变化 API 数 | 高风险 API 数 | 为什么先看 | 主要变化类型 | 明细 |", md_text)
-        self.assertIn("含高风险 API，优先做系统触达分析", md_text)
+        self.assertIn("| 排名 | Top 10 | 依赖包 | 精确直接引用 API |", md_text)
+        self.assertIn("删除、签名变化等类型不获得额外权重", md_text)
+        self.assertIn("未观察到直接引用也不等于无影响", md_text)
 
     def test_alerts_generation_does_not_write_low_value_summary_markdown(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -13277,6 +13278,12 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
                 encoding="utf-8",
             )
             findings = s6_report.collect_findings(str(report))
+            artifacts, _api_model, _dependency_model = (
+                s6_report.write_primary_report_artifacts(str(report), findings)
+            )
+            full_api_report = (
+                report / artifacts["full_api_analysis_md"]
+            ).read_text(encoding="utf-8")
             final_report = s6_report.generate_report(findings)
 
         self.assertIsNone(summary_path)
@@ -13293,11 +13300,15 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
         self.assertIn("| 变化依赖总数 | 已完成分析 | 未完成分析 | 确认影响 | 确认不受影响 | 尚未确认影响 |", final_report)
         self.assertIn("| 变化 API 总数 | 已完成分析 | 未完成分析 | 确认影响 | 确认不受影响 | 尚未确认影响 |", final_report)
         self.assertIn("确认不受 API 调用影响", final_report)
+        self.assertNotIn("`com.vendor.LegacyApi.removed()`", final_report)
         self.assertIn(
             "| `com.vendor:legacy` | `com.vendor.LegacyApi.removed()` | "
-            "删除方法，参数：无参数 | 无已确认受影响调用关系 | "
-            "确认不受影响 | 当前制品中的相同类字节码保留该 API。 |",
-            final_report,
+            "删除方法，参数：无参数 |",
+            full_api_report,
+        )
+        self.assertIn(
+            "| 确认不受影响 | 当前制品中的相同类字节码保留该 API。 |",
+            full_api_report,
         )
         self.assertIn("相同类字节码保留记录", final_report)
 
@@ -13728,9 +13739,9 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
             report_text.index("## 一、依赖层面结论"),
             report_text.index("## 二、API 及调用关系"),
         )
-        self.assertIn("未发现当前系统调用关系", report_text)
+        self.assertNotIn("未发现当前系统调用关系", report_text)
         self.assertIn("删除方法，参数：String", report_text)
-        self.assertIn("删除方法，参数：Long", report_text)
+        self.assertNotIn("删除方法，参数：Long", report_text)
         self.assertNotIn("REMOVED / method", report_text)
         self.assertNotIn("`REMOVED` / `method`", report_text)
         self.assertIn(
@@ -13742,6 +13753,8 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
             report_text,
         )
         self.assertIn("`com.example.Demo.call(Long)`", full_api_md)
+        self.assertIn("当前静态分析范围内未找到调用关系", full_api_md)
+        self.assertIn("删除方法，参数：Long", full_api_md)
         self.assertIn(
             "`Other.run → com.example.Demo.call(Long)`",
             full_api_md,
@@ -14502,11 +14515,11 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
             )
             self.assertIn("未展开 391 个", report_text)
             self.assertIn(
-                "### 已完成分析的 API（展示 12/100）",
+                "### 已确认触达与结论未确定的 API（完整展示 0/0）",
                 report_text,
             )
             self.assertIn(
-                "未展开 88 个",
+                "| `not_found_in_static_analysis` | 100 | 仅统计，不展开 API；该状态不等于安全。 |",
                 report_text,
             )
             self.assertIn(
@@ -14540,10 +14553,8 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
             self.assertNotIn("待办", report_text)
             self.assertNotIn("完成标准", report_text)
             self.assertNotIn("建议", report_text)
-            self.assertIn("com.example.Api0.removed", report_text)
-            self.assertIn("com.example.Api11.removed", report_text)
-            self.assertIn("com.example.Api19.removed", report_text)
-            self.assertNotIn("com.example.Api2.removed", report_text)
+            self.assertNotIn("com.example.Api0.removed", report_text)
+            self.assertNotIn("com.example.Api11.removed", report_text)
             self.assertNotIn("com.example.Api99.removed", report_text)
             self.assertEqual(report_text.count("### `com.example.Api"), 0)
             full_api_text = full_api_md.read_text(encoding="utf-8")
@@ -14664,20 +14675,17 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
                 report_text,
             )
             self.assertIn(
-                "### 已完成分析的 API（展示 12/60）",
+                "### 已确认触达与结论未确定的 API（完整展示 60/60）",
                 report_text,
             )
             self.assertIn("未展开 50 个", report_text)
-            self.assertIn(
-                "未展开 48 个",
-                report_text,
-            )
             self.assertIn("com.example.Probable0.changed", report_text)
             self.assertIn("com.example.Probable11.changed", report_text)
             self.assertIn("com.example.Probable19.changed", report_text)
-            self.assertNotIn("com.example.Probable2.changed", report_text)
-            self.assertNotIn("com.example.Uncertain0.changed", report_text)
-            self.assertNotIn("com.example.Uncertain29.changed", report_text)
+            self.assertIn("com.example.Probable2.changed", report_text)
+            self.assertIn("com.example.Probable29.changed", report_text)
+            self.assertIn("com.example.Uncertain0.changed", report_text)
+            self.assertIn("com.example.Uncertain29.changed", report_text)
             self.assertEqual(report_text.count("### `com.example.Uncertain"), 0)
             self.assertNotIn("主报告按结论类型各展示前 20 条", report_text)
             self.assertNotIn("Probable action", report_text)
@@ -14951,7 +14959,7 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
         self.assertIn("## 二、API 及调用关系", report_text)
         self.assertIn("### 未完成分析的 API（展示 2/2）", report_text)
         self.assertIn(
-            "### 已完成分析的 API（展示 1/1）",
+            "### 已确认触达与结论未确定的 API（完整展示 1/1）",
             report_text,
         )
         self.assertIn("com.example.Demo.behavior", report_text)

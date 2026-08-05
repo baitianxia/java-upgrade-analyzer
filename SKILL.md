@@ -145,6 +145,7 @@ if gate failed or step blocked:
 7. `scope_mode`、`selected_targets`、`selection_key`、`action=continue` 等是机器协议，禁止出现在面向用户的决策卡、动作说明和回复示例中。用户只需回复“全量分析”或“只分析 <依赖名称/完整坐标>”，系统负责转换内部字段。
 8. 候选未全部展示时，不能只把 `changed_dependencies.md` 列为“待复核产物”；必须明确说明它是完整依赖选择清单，并指引用户从“依赖包”列取得未展示候选后直接回复。
 9. 若 `JUA_CONFIRMATION_JSON` 提供 `user_decision_card`，必须优先展示该字段；`response_schema`、`selection_resolution`、`selected_targets` 只用于把用户自然语言答复转换成恢复输入。
+10. `interaction.json` 的 `status=informational` 表示系统生成的非阻塞阶段结果卡，不是 checkpoint：可直接转述 `user_decision_card`，不得要求用户回复，也不得把它写入 `pending_interaction`。Step5 成功自动进入 Step6 时仍必须生成这张卡，避免 Agent 自行拼装五态摘要。
 
 优先使用统一调度入口 `scripts/run_step.py`。不要要求自己一次记住所有命令；具体命令、参数、产物清单统一按需查看 `RUNBOOK.md`。
 
@@ -445,7 +446,8 @@ python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 - 对应步骤：`step4` 成功后
 - 当 `changed_dependencies.md/csv` 中存在至少两个候选依赖时必须停下，让用户选择全部分析或只分析所选依赖；0 个候选时 Step5 没有范围可选，1 个候选时“全量”和“选择该候选”等价，均直接继续
 - 面向用户只能表述为“全量分析”或“只分析指定依赖名称/完整坐标”；`scope_mode`、`selected_targets` 仅由系统在恢复时生成，禁止要求用户理解或填写这些内部字段
-- 决策卡必须展示全量依赖数、变化 API 数和高风险 API 数，并说明取舍：全量分析覆盖最完整但耗时可能更长；部分分析降低耗时，但 Step6 结论只能适用于所选依赖，不能表述为全局无影响
+- 决策卡必须展示全量依赖数、变化 API 数，以及按影响证据排序的 Top 10 依赖并附理由。排序先比较业务最终制品精确直接引用的变更 API 数，再比较签名不完整候选引用数、引用指令数和变更 API 总数；删除、签名变化等 `change_type` 不额外加权，依赖源码是否可用只展示分析条件、不参与影响排序。全量分析覆盖最完整但耗时可能更长；部分分析降低耗时，但 Step6 结论只能适用于所选依赖，不能表述为全局无影响
+- Step4 的直接字节码引用只是范围选择优先级证据，不是 Step5 可达性结论；未观察到直接引用不能解释为无影响。引用证据必须落到 `business_bytecode_changed_api_refs.csv`，至少包含调用类、调用方法、指令偏移和目标 API
 - 真实 commit pair 歧义仍由 Step4 的专用 checkpoint 在耗时分析前处理；内部超时或证据故障记录覆盖缺口后继续，不得作为本范围 checkpoint 的用户修复问题
 - `selection_options` 只反映 Step4 依赖包维度候选；内部每个候选都应带稳定 `selection_key`，但用户卡片只展示名称或完整坐标
 - 用户选择的解析必须基于完整候选集；完整坐标严格匹配唯一目标，仅提供依赖名称时按 `artifactId` 名称匹配
@@ -540,12 +542,14 @@ python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 ### Phase 9 [AUTO] Final Report
 
 - 对应步骤：`step6`
+- Step5 成功后不新增人工 checkpoint，但 `run_step.py` 必须先在 `.runtime/state/interaction.json` 持久化一份 `status=informational` 的五态 `user_decision_card`，然后自动执行本阶段；Step6 完成后该信息卡仍应可读
 - 输入：前面所有产物
 - 输出：`.upgrade-report/.runtime/findings/s6_findings.json`、`.upgrade-report/deliverables/report.md`、`.upgrade-report/deliverables/all-affected-dependencies.md`、`.upgrade-report/deliverables/all-impact-details.md`
 - 规则：主报告固定按“依赖层面结论 → API 及调用关系 → 用户可见文件说明”组织；依赖结论必须先于 API 结论
 - 规则：依赖和 API 都分别展示变化总数、已完成分析和未完成分析；确认影响是已完成结果的子集。已完成但未发现当前系统调用关系不得归入未完成分析
-- 规则：已完成分析结果合并展示；只有真正未完成的项单列并直接说明原因。主报告节选之外的依赖和 API 必须分别链接到两份不同的全量 Markdown
-- 规则：主报告只陈述客观事实，不得生成建议、待办清单、完成标准、发布判断、修改判断或具体实现与验证指令
+- 规则：主报告必须先给出五态语义、结论边界和每种状态的用户行动；`uncertain` 表示已有候选证据或已识别的分析能力边界，`not_found_in_static_analysis` 只表示当前静态范围没有找到路径，不能解释为安全
+- 规则：主报告按依赖坐标分组，完整展示本轮全部 `reachable` 和 `uncertain` API；依赖之间按影响程度排序，依赖内部按结论和复核优先分数排序。`not_found_in_static_analysis` 只展示统计数字，逐项记录保留在完整 API 明细中
+- 规则：只有真正未完成的项单列并直接说明原因。主报告之外的依赖和 API 必须分别链接到两份不同的全量 Markdown；用户行动必须与状态边界一致，不得把静态结论扩大成发布判断
 
 ## 恢复与压缩
 

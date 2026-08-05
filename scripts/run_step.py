@@ -1541,14 +1541,25 @@ def save_interaction_file(report_dir, interaction):
         origin_step=(interaction or {}).get("step_id"),
     )
     payload["status"] = normalize_interaction_status(payload.get("status"))
-    payload.setdefault("exit_code", EXIT_AWAITING_USER)
+    payload.setdefault(
+        "exit_code",
+        0 if payload.get("status") == "informational" else EXIT_AWAITING_USER,
+    )
     write_json(runtime_state_dir(report_dir) / "interaction.json", payload)
 
 
-def clear_interaction_file(report_dir):
+def clear_interaction_file(report_dir, *, preserve_informational=False):
     interaction_file = runtime_state_dir(report_dir) / "interaction.json"
-    if interaction_file.exists():
-        interaction_file.unlink()
+    if not interaction_file.exists():
+        return
+    if preserve_informational:
+        try:
+            existing = read_json(interaction_file)
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            existing = {}
+        if str(existing.get("status") or "").strip() == "informational":
+            return
+    interaction_file.unlink()
 
 
 def load_manifest(path):
@@ -3361,6 +3372,29 @@ def build_interaction_selection_options(selection_options):
                 "label": str((item or {}).get("label") or coord or name or selection_key).strip(),
                 "api_count": (item or {}).get("api_count"),
                 "high_risk_api_count": (item or {}).get("high_risk_api_count"),
+                "business_exact_referenced_api_count": _parse_int_or_zero(
+                    (item or {}).get("business_exact_referenced_api_count")
+                ),
+                "business_candidate_referenced_api_count": _parse_int_or_zero(
+                    (item or {}).get("business_candidate_referenced_api_count")
+                ),
+                "business_reference_occurrence_count": _parse_int_or_zero(
+                    (item or {}).get("business_reference_occurrence_count")
+                ),
+                "business_bytecode_scan_status": str(
+                    (item or {}).get("business_bytecode_scan_status") or ""
+                ).strip(),
+                "dependency_source_status": str(
+                    (item or {}).get("dependency_source_status") or "unknown"
+                ).strip(),
+                "impact_priority_rank": _parse_int_or_zero(
+                    (item or {}).get("impact_priority_rank")
+                ),
+                "recommendation_reason": str(
+                    (item or {}).get("recommendation_reason")
+                    or (item or {}).get("review_focus")
+                    or ""
+                ).strip(),
                 "recommended": _parse_bool((item or {}).get("recommended")),
                 "change_types": str((item or {}).get("change_types") or "").strip(),
                 "detail": str((item or {}).get("detail") or "").strip(),
@@ -3411,6 +3445,21 @@ def build_report_dir_step5_selection_resolution(report_dir):
                 "name": item.get("name"),
                 "api_count": item.get("api_count"),
                 "high_risk_api_count": item.get("high_risk_api_count"),
+                "business_exact_referenced_api_count": item.get(
+                    "business_exact_referenced_api_count"
+                ),
+                "business_candidate_referenced_api_count": item.get(
+                    "business_candidate_referenced_api_count"
+                ),
+                "business_reference_occurrence_count": item.get(
+                    "business_reference_occurrence_count"
+                ),
+                "business_bytecode_scan_status": item.get(
+                    "business_bytecode_scan_status"
+                ),
+                "dependency_source_status": item.get("dependency_source_status"),
+                "impact_priority_rank": item.get("impact_priority_rank"),
+                "recommendation_reason": item.get("recommendation_reason"),
                 "change_types": item.get("change_types"),
                 "detail": item.get("detail"),
                 "label": item.get("coord") or item.get("name"),
@@ -3441,10 +3490,8 @@ def _parse_bool(value):
 def _is_recommended_selection_target(row):
     if str((row or {}).get("recommended") or "").strip():
         return _parse_bool((row or {}).get("recommended"))
-    high_risk = _parse_int_or_zero((row or {}).get("high_risk_api_count"))
-    changed = _parse_int_or_zero((row or {}).get("changed_api_count") or (row or {}).get("api_count"))
-    change_types = str((row or {}).get("change_types") or "").lower()
-    return bool(high_risk or "removed" in change_types or "signature" in change_types or changed >= 20)
+    rank = _parse_int_or_zero((row or {}).get("impact_priority_rank"))
+    return bool(rank and rank <= 10)
 
 
 def _is_high_risk_selection_api_row(row):
@@ -3471,16 +3518,41 @@ def build_step5_dependency_selection_summary(report_dir):
             if not coord:
                 continue
             target = {
-                    "selection_key": str(row.get("selection_key") or f"coord:{coord}").strip(),
-                    "coord": coord,
-                    "name": str(row.get("dependency_name") or _artifact_name_from_coord(coord)).strip(),
-                    "api_count": _parse_int_or_zero(row.get("changed_api_count")),
-                    "high_risk_api_count": _parse_int_or_zero(row.get("high_risk_api_count")),
-                    "change_types": str(row.get("change_types") or "").strip(),
-                    "detail": str(row.get("detail") or "").strip(),
-                    "recommended": _is_recommended_selection_target(row),
-                }
+                "selection_key": str(row.get("selection_key") or f"coord:{coord}").strip(),
+                "coord": coord,
+                "name": str(row.get("dependency_name") or _artifact_name_from_coord(coord)).strip(),
+                "api_count": _parse_int_or_zero(row.get("changed_api_count")),
+                "high_risk_api_count": _parse_int_or_zero(row.get("high_risk_api_count")),
+                "business_exact_referenced_api_count": _parse_int_or_zero(
+                    row.get("business_exact_referenced_api_count")
+                ),
+                "business_candidate_referenced_api_count": _parse_int_or_zero(
+                    row.get("business_candidate_referenced_api_count")
+                ),
+                "business_reference_occurrence_count": _parse_int_or_zero(
+                    row.get("business_reference_occurrence_count")
+                ),
+                "business_bytecode_scan_status": str(
+                    row.get("business_bytecode_scan_status") or ""
+                ).strip(),
+                "dependency_source_status": str(
+                    row.get("dependency_source_status") or "unknown"
+                ).strip(),
+                "impact_priority_rank": _parse_int_or_zero(
+                    row.get("impact_priority_rank")
+                ),
+                "recommendation_reason": str(
+                    row.get("review_focus") or ""
+                ).strip(),
+                "change_types": str(row.get("change_types") or "").strip(),
+                "detail": str(row.get("detail") or "").strip(),
+                "recommended": _is_recommended_selection_target(row),
+            }
             available_targets.append(target)
+        available_targets.sort(key=lambda item: (
+            _parse_int_or_zero(item.get("impact_priority_rank")) or 10**9,
+            str(item.get("coord") or ""),
+        ))
         recommended_targets = [item for item in available_targets if item.get("recommended")]
         return {
             "available_targets": available_targets,
@@ -3526,11 +3598,24 @@ def build_step5_selection_summary(all_rows, selected_coords=None, selected_names
             item["change_type_set"].add(change_type)
     for item in per_coord_counts.values():
         item["change_types"] = ", ".join(sorted(item.pop("change_type_set")))
-        item["recommended"] = _is_recommended_selection_target(item)
     available_targets = sorted(
         per_coord_counts.values(),
-        key=lambda item: (item.get("coord") or ""),
+        key=lambda item: (
+            -_parse_int_or_zero(item.get("api_count")),
+            item.get("coord") or "",
+        ),
     )
+    for rank, item in enumerate(available_targets, start=1):
+        item["impact_priority_rank"] = rank
+        item["business_exact_referenced_api_count"] = 0
+        item["business_candidate_referenced_api_count"] = 0
+        item["business_reference_occurrence_count"] = 0
+        item["business_bytecode_scan_status"] = "not_collected"
+        item["dependency_source_status"] = "unknown"
+        item["recommendation_reason"] = (
+            "缺少 changed_dependencies.csv 的字节码排序证据；暂按变更 API 数排序"
+        )
+        item["recommended"] = rank <= 10
     selected_coord_set = {item.lower() for item in selected_coords}
     selected_name_set = {item.lower() for item in selected_names}
     matched_coords = []
@@ -6851,13 +6936,26 @@ def _decision_card_reply_examples(interaction, selection_options, options):
 def build_user_decision_card(interaction):
     lines = []
     interaction = interaction or {}
+    informational = str(interaction.get("status") or "").strip() == "informational"
     question = _humanize_interaction_text(interaction.get("question") or "请确认当前结果，然后继续。").strip()
-    lines.append(f"当前需要确认：{question}")
+    lines.append(
+        f"阶段结果：{question}"
+        if informational
+        else f"当前需要确认：{question}"
+    )
 
     reason = _humanize_interaction_text(interaction.get("user_reason") or interaction.get("reason") or "").strip()
     if not reason:
-        reason = "分析已暂停，等待你确认当前结果或补充信息。"
-    lines.append(f"为什么暂停：{reason}")
+        reason = (
+            "本卡仅用于标准化记录阶段结果，流程无需等待回复。"
+            if informational
+            else "分析已暂停，等待你确认当前结果或补充信息。"
+        )
+    lines.append(
+        f"说明：{reason}"
+        if informational
+        else f"为什么暂停：{reason}"
+    )
 
     recommended = _humanize_interaction_text(interaction.get("recommended_action") or "").strip()
     if recommended:
@@ -7003,23 +7101,36 @@ def build_user_decision_card(interaction):
             if scope_preview.get("total_api_count") is not None
             else sum(_parse_int_or_zero(item.get("api_count")) for item in all_selection_options)
         )
-        total_high_risk_count = int(
-            scope_preview.get("high_risk_api_count")
-            if scope_preview.get("high_risk_api_count") is not None
+        total_exact_reference_count = int(
+            scope_preview.get("business_exact_referenced_api_count")
+            if scope_preview.get("business_exact_referenced_api_count") is not None
             else sum(
-                _parse_int_or_zero(item.get("high_risk_api_count"))
+                _parse_int_or_zero(
+                    item.get("business_exact_referenced_api_count")
+                )
+                for item in all_selection_options
+            )
+        )
+        total_candidate_reference_count = int(
+            scope_preview.get("business_candidate_referenced_api_count")
+            if scope_preview.get("business_candidate_referenced_api_count") is not None
+            else sum(
+                _parse_int_or_zero(
+                    item.get("business_candidate_referenced_api_count")
+                )
                 for item in all_selection_options
             )
         )
         recommended_options = list(interaction.get("recommended_selection_options") or [])
         if not recommended_options:
-            recommended_options = [
-                item for item in selection_options if _is_recommended_selection_target(item)
-            ]
-        recommended_total = int(
-            interaction.get("recommended_candidate_count")
-            if interaction.get("recommended_candidate_count") is not None
-            else len(recommended_options)
+            recommended_options = list(selection_options[:10])
+        recommended_total = min(
+            10,
+            int(
+                interaction.get("recommended_candidate_count")
+                if interaction.get("recommended_candidate_count") is not None
+                else len(recommended_options)
+            ),
         )
         displayed_recommended = min(10, len(recommended_options))
         full_candidate_file = next(
@@ -7035,63 +7146,80 @@ def build_user_decision_card(interaction):
         lines.append("请选择分析范围：")
         lines.append("1. 全量分析（默认，完整性优先）")
         lines.append(
-            f"- 覆盖全部 {total_candidates} 个变化依赖、{total_api_count} 个变化 API，"
-            f"其中高风险 API {total_high_risk_count} 个。"
+            f"- 覆盖全部 {total_candidates} 个变化依赖、{total_api_count} 个变化 API。"
+        )
+        lines.append(
+            f"- 业务最终制品精确直接引用 {total_exact_reference_count} 个变更 API；"
+            f"另有 {total_candidate_reference_count} 个签名不完整候选引用。"
         )
         lines.append("- 没有明确耗时约束时选择这一项。")
         lines.append("- 直接回复：全量分析")
         lines.append("2. 部分分析（仅在明确控制耗时时）")
         lines.append("- 未选择的依赖及其变化 API 不会进入系统触达分析，最终报告只适用于所选范围。")
-        lines.append("- 高优先级项依据：含高风险 API、删除或签名变化，或变化 API 数不少于 20 个。")
-        lines.append("- 该排序只帮助部分分析时取舍，不表示系统建议缩小范围，也不代表已经确认影响。")
+        lines.append(
+            "- 排序依据：先比较业务最终制品精确直接引用的变更 API 数，"
+            "再比较签名不完整候选引用数、引用指令数和变更 API 总数。"
+        )
+        lines.append(
+            "- 删除、签名变化等变更类型不额外加权；依赖源码是否可用只展示分析条件，不参与影响排序。"
+        )
+        lines.append(
+            "- 该排序只帮助部分分析时取舍，不表示系统建议缩小范围，也不代表已经确认影响；"
+            "未观察到直接引用也不等于无影响。"
+        )
         if recommended_total:
             lines.append(
-                f"- 推荐 {recommended_total} 个，展示 {displayed_recommended} / {recommended_total} 个。"
+                f"- Top {recommended_total} 影响复核优先项，展示 "
+                f"{displayed_recommended} / {recommended_total} 个。"
             )
-            lines.append("| 部分分析高优先级依赖 | 变化 API 数 | 高风险 API 数 |")
-            lines.append("|---|---:|---:|")
+            lines.append(
+                "| 排名 | 依赖坐标 | 精确直接引用 API | 候选引用 API | "
+                "引用指令 | 变化 API 数 | 依赖源码 | 推荐理由 |"
+            )
+            lines.append("|---:|---|---:|---:|---:|---:|---|---|")
             for item in recommended_options[:10]:
-                lines.append(
-                    f"| `{item.get('coord') or item.get('name') or ''}` | "
-                    f"{item.get('api_count') or 0} | {item.get('high_risk_api_count') or 0} |"
+                source_label = {
+                    "available": "可用",
+                    "unavailable": "不可用",
+                    "not_applicable": "不适用",
+                    "unknown": "未知",
+                }.get(
+                    str(item.get("dependency_source_status") or "unknown"),
+                    str(item.get("dependency_source_status") or "unknown"),
                 )
-            first_recommended_coord = str(
-                recommended_options[0].get("coord")
-                or recommended_options[0].get("name")
-                or ""
-            ).strip()
-            if first_recommended_coord:
-                lines.append(f"- 直接回复，例如：只分析 {first_recommended_coord}")
+                lines.append(
+                    f"| {item.get('impact_priority_rank') or '-'} | "
+                    f"`{item.get('coord') or item.get('name') or ''}` | "
+                    f"{item.get('business_exact_referenced_api_count') or 0} | "
+                    f"{item.get('business_candidate_referenced_api_count') or 0} | "
+                    f"{item.get('business_reference_occurrence_count') or 0} | "
+                    f"{item.get('api_count') or 0} | {source_label} | "
+                    f"{item.get('recommendation_reason') or '按现有影响证据排序'} |"
+                )
             if recommended_total > displayed_recommended:
                 remaining_recommended = recommended_total - displayed_recommended
                 if full_candidate_file:
                     lines.append(
-                        f"- 其余 {remaining_recommended} 个高优先级项见 `{full_candidate_file}` 的“部分分析优先项”列。"
+                        f"- 其余 {remaining_recommended} 个优先项见 `{full_candidate_file}` 的 Top 10 列。"
                     )
         else:
-            lines.append("- 当前没有符合高优先级规则的候选依赖包。")
-        displayed_candidates = selection_options[:20]
-        lines.append(
-            f"- 可直接选择的依赖（展示 {len(displayed_candidates)} / {total_candidates} 个；"
-            "直接回复依赖名称或完整坐标）："
-        )
-        lines.append("| 依赖包 | 变化 API 数 | 高风险 API 数 |")
-        lines.append("|---|---:|---:|")
-        for item in displayed_candidates:
-            lines.append(
-                f"| `{item.get('coord') or item.get('name') or ''}` | "
-                f"{item.get('api_count') or 0} | {item.get('high_risk_api_count') or 0} |"
-            )
+            lines.append("- 当前没有可展示的影响复核优先项。")
+        displayed_candidates = recommended_options[:10]
         visible_targets = [
             str(item.get("coord") or item.get("name") or "").strip()
             for item in displayed_candidates[:2]
             if str(item.get("coord") or item.get("name") or "").strip()
         ]
         if visible_targets:
-            lines.append("- 直接回复，例如：只分析 " + " 和 ".join(visible_targets))
+            lines.append(
+                "- 直接回复依赖名称或完整坐标，例如：只分析 "
+                + " 和 ".join(visible_targets)
+            )
         if total_candidates > len(displayed_candidates):
             remaining = total_candidates - len(displayed_candidates)
-            lines.append(f"- 还有 {remaining} 个候选未在卡片中展示。")
+            lines.append(
+                f"- 其余 {remaining} 个候选未在卡片中展开；完整清单仍按同一影响口径排序。"
+            )
         if full_candidate_file:
             lines.append(
                 f"- 完整依赖选择清单：`{full_candidate_file}`。"
@@ -7133,7 +7261,9 @@ def build_user_decision_card(interaction):
 
     files_to_review = list(interaction.get("files_to_review") or [])
     if files_to_review:
-        lines.append("完整候选或证据文件：")
+        lines.append(
+            "结果证据文件：" if informational else "完整候选或证据文件："
+        )
         for path in files_to_review:
             if selection_options and str(path).endswith("changed_dependencies.md"):
                 lines.append(
@@ -7144,16 +7274,24 @@ def build_user_decision_card(interaction):
                 lines.append(f"- `{path}`")
 
     checklist_lines = [
-        _humanize_interaction_text(item).strip()
+        (
+            str(item or "").strip()
+            if informational
+            else _humanize_interaction_text(item).strip()
+        )
         for item in (interaction.get("checklist_lines") or [])
         if str(item or "").strip()
     ]
     if checklist_lines:
-        lines.append("复核提示：")
-        for item in checklist_lines[:8]:
+        lines.append("结果摘要：" if informational else "复核提示：")
+        for item in checklist_lines[:12 if informational else 8]:
             lines.append(f"- {item.lstrip('- ').strip()}")
 
-    reply_examples = _decision_card_reply_examples(interaction, selection_options, options)
+    reply_examples = (
+        []
+        if informational
+        else _decision_card_reply_examples(interaction, selection_options, options)
+    )
     if reply_examples:
         lines.append("你可以直接回复：")
         for item in reply_examples:
@@ -7426,7 +7564,11 @@ def annotate_dependency_source_dirs_interaction(interaction, run_context, report
 def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, run_context=None, main_state=None):
     step_meta = manifest_steps.get(step_id) or {}
     scope_confirmation_only = bool(step_meta.get("requires_scope_confirmation"))
-    if "interaction" in step_meta and step_meta.get("interaction") is None:
+    if (
+        "interaction" in step_meta
+        and step_meta.get("interaction") is None
+        and step_id != "step5"
+    ):
         return None
     interaction_meta = step_meta.get("interaction")
     if not interaction_meta and step_meta.get("confirm") is False:
@@ -7722,6 +7864,21 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
                     "name": item.get("name"),
                     "api_count": item.get("api_count"),
                     "high_risk_api_count": item.get("high_risk_api_count"),
+                    "business_exact_referenced_api_count": item.get(
+                        "business_exact_referenced_api_count"
+                    ),
+                    "business_candidate_referenced_api_count": item.get(
+                        "business_candidate_referenced_api_count"
+                    ),
+                    "business_reference_occurrence_count": item.get(
+                        "business_reference_occurrence_count"
+                    ),
+                    "business_bytecode_scan_status": item.get(
+                        "business_bytecode_scan_status"
+                    ),
+                    "dependency_source_status": item.get("dependency_source_status"),
+                    "impact_priority_rank": item.get("impact_priority_rank"),
+                    "recommendation_reason": item.get("recommendation_reason"),
                     "recommended": item.get("recommended"),
                     "change_types": item.get("change_types"),
                     "detail": item.get("detail"),
@@ -7730,12 +7887,12 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
                 for item in target_summary.get("available_targets", [])
             ]
         )
-        selection_options = full_selection_options[:20]
+        selection_options = full_selection_options[:10]
         recommended_selection_options = build_interaction_selection_options(
             [item for item in full_selection_options if item.get("recommended")]
         )
         interaction_meta["selection_options"] = selection_options
-        interaction_meta["recommended_selection_options"] = recommended_selection_options[:20]
+        interaction_meta["recommended_selection_options"] = recommended_selection_options[:10]
         interaction_meta["recommended_candidate_count"] = len(recommended_selection_options)
         interaction_meta["selection_resolution"] = build_selection_resolution(full_selection_options)
         total_api_count = len(available_rows) or sum(
@@ -7747,6 +7904,18 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
             "total_api_count": total_api_count,
             "high_risk_api_count": sum(
                 _parse_int_or_zero(item.get("high_risk_api_count"))
+                for item in full_selection_options
+            ),
+            "business_exact_referenced_api_count": sum(
+                _parse_int_or_zero(
+                    item.get("business_exact_referenced_api_count")
+                )
+                for item in full_selection_options
+            ),
+            "business_candidate_referenced_api_count": sum(
+                _parse_int_or_zero(
+                    item.get("business_candidate_referenced_api_count")
+                )
                 for item in full_selection_options
             ),
             "partial_scope_effect": (
@@ -7764,8 +7933,9 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
         for item in selection_options[:10]:
             checklist_lines.append(
                 f"  - 可选择 `{item.get('coord') or item.get('name')}`："
-                f"变化 API {item.get('api_count') or 0}，"
-                f"高风险 API {item.get('high_risk_api_count') or 0}"
+                f"业务字节码精确直接引用 {item.get('business_exact_referenced_api_count') or 0} 个变更 API，"
+                f"候选引用 {item.get('business_candidate_referenced_api_count') or 0} 个，"
+                f"变化 API 共 {item.get('api_count') or 0} 个"
             )
         if target_summary.get("available_target_count", 0) > 10:
             checklist_lines.append(
@@ -7806,9 +7976,10 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
         checklist_lines = [
             "请选择系统触达证据的分析范围：",
             f"  - 全部分析：覆盖 {available_target_count} 个发生 API 变化的依赖包。",
-            f"  - 全部变化 API：{total_api_count} 个；其中高风险 API："
-            f"{interaction_meta['scope_preview']['high_risk_api_count']} 个。",
-            "  - 定向分析：从下面的候选依赖包中选择一个或多个。",
+            f"  - 全部变化 API：{total_api_count} 个；业务字节码精确直接引用："
+            f"{interaction_meta['scope_preview']['business_exact_referenced_api_count']} 个；"
+            f"候选引用：{interaction_meta['scope_preview']['business_candidate_referenced_api_count']} 个。",
+            "  - 定向分析：优先参考卡片中的 Top 10，再从完整清单选择一个或多个依赖。",
             "  - 未选依赖不会进入系统触达分析，最终报告只适用于所选范围。",
             "  - 完整依赖包清单见 changed_dependencies.md；API 级明细不作为普通选择入口。",
             "  - 本卡只确认分析范围；源码/ref/超时等内部证据故障已由系统记录和处理，不需要在这里修复。",
@@ -7836,19 +8007,42 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
         uncertain_apis = list(call_summary.get("uncertain_apis") or [])
         not_analyzed_apis = list(call_summary.get("not_analyzed_apis") or [])
         reachable_apis = list(call_summary.get("reachable_apis") or [])
+        not_impacted_apis = list(call_summary.get("not_impacted_apis") or [])
         not_found_apis = list(call_summary.get("not_found_apis") or [])
+        reachable_count = max(
+            len(reachable_apis), _parse_int_or_zero(call_summary.get("reachable"))
+        )
+        not_impacted_count = max(
+            len(not_impacted_apis), _parse_int_or_zero(call_summary.get("not_impacted"))
+        )
+        uncertain_count = max(
+            len(uncertain_apis), _parse_int_or_zero(call_summary.get("uncertain"))
+        )
+        not_analyzed_count = max(
+            len(not_analyzed_apis), _parse_int_or_zero(call_summary.get("not_analyzed"))
+        )
+        not_found_count = max(
+            len(not_found_apis),
+            _parse_int_or_zero(call_summary.get("not_found_in_static_analysis")),
+        )
         checklist_lines.extend(
             [
-                "调用链结论摘要：",
-                f"  - 已确认影响={user_conclusion_summary.get('confirmed_impact', call_summary.get('reachable', 0))}",
-                f"  - 可能影响={user_conclusion_summary.get('probable_impact', 0)}",
-                f"  - 已确认不受影响={user_conclusion_summary.get('confirmed_no_impact', call_summary.get('not_impacted', 0))}",
-                f"  - 需人工复核={user_conclusion_summary.get('inconclusive', 0)}",
-                f"  - 缺少依赖源码/构建产物={user_conclusion_summary.get('input_required', 0)}",
+                "调用关系五态摘要（五类互斥）：",
+                f"  - reachable（已确认静态触达）={reachable_count}",
+                f"  - not_impacted（已确认不受 API 调用影响）={not_impacted_count}",
+                f"  - uncertain（存在候选证据或已知分析边界）={uncertain_count}",
+                f"  - not_analyzed（输入不足或分析未完成）={not_analyzed_count}",
+                f"  - not_found_in_static_analysis（当前静态范围未找到路径）={not_found_count}",
+                "not_found_in_static_analysis 不表示安全；反射、配置、SPI、生成代码或常量内联等仍需结合运行时验证。",
+                (
+                    "用户结论补充：可能影响="
+                    f"{user_conclusion_summary.get('probable_impact', 0)}，"
+                    "需人工复核="
+                    f"{user_conclusion_summary.get('inconclusive', 0)}，"
+                    "缺少输入="
+                    f"{user_conclusion_summary.get('input_required', 0)}。"
+                ),
                 f"  - 已提供依赖源码目录={len(dependency_source_dirs)} 个",
-                "覆盖缺口（可能与上面的结论重叠，不要相加）：",
-                f"  - 本次未完成分析={len(not_analyzed_apis)}",
-                f"  - 未发现调用路径={len(not_found_apis)}",
             ]
         )
         if step5_selected_coords:
@@ -9456,7 +9650,10 @@ def persist_completed_step(main_state, step_id, report_dir, run_context):
     )
     save_main_state(report_dir, main_state)
     write_coverage_report(runtime_coverage_dir(report_dir), project_scope=run_context.get("project_scope"))
-    clear_interaction_file(report_dir)
+    clear_interaction_file(
+        report_dir,
+        preserve_informational=(step_id == "step6"),
+    )
     write_resume_snapshot(
         main_state,
         step_id,
@@ -9485,6 +9682,54 @@ def should_auto_continue_success_review(step_id, interaction, manifest_steps):
         for item in (interaction or {}).get("options") or []
     }
     return "continue" in option_ids
+
+
+def build_informational_success_interaction(step_id, interaction):
+    """Convert an auto-continued success review into a durable information card."""
+    payload = dict(interaction or {})
+    for field in (
+        "selection_options",
+        "recommended_selection_options",
+        "recommended_candidate_count",
+        "selection_resolution",
+        "scope_preview",
+        "input_normalization",
+        "resume_command_examples",
+        "action_requirements",
+    ):
+        payload.pop(field, None)
+    payload.update({
+        "schema": "java-upgrade-analyzer.interaction.v2",
+        "event": "step_completed_information",
+        "checkpoint": False,
+        "hard_stop": False,
+        "status": "informational",
+        "kind": "information",
+        "step_id": step_id,
+        "title": f"{USER_TASK_NAMES.get(step_id, step_id)}阶段结果",
+        "reason_code": "",
+        "question": (
+            "调用关系分析已完成；系统已自动进入最终报告生成，"
+            "本卡无需回复。"
+            if step_id == "step5"
+            else "本阶段已完成；流程按安全默认值自动继续，本卡无需回复。"
+        ),
+        "user_reason": "系统已生成标准阶段结果卡；该卡不是确认点，不会阻塞后续步骤。",
+        "options": [],
+        "required_fields": [],
+        "missing_inputs": [],
+        "fallback_inputs": [],
+        "response_schema": {"type": "object", "properties": {}},
+        "runtime_rules": [],
+        "next_action_rule": "无需等待用户回复；按既定流程继续。",
+        "must_wait_for_user_reply": False,
+        "awaiting_user_input": False,
+        "decision_required": False,
+        "exit_code": 0,
+        "resume_hint": "无需恢复交互；可直接读取本卡转述阶段结果。",
+    })
+    payload["user_decision_card"] = build_user_decision_card(payload)
+    return payload
 
 
 def print_auto_continue_success_review(step_id, run_context):
@@ -9716,7 +9961,9 @@ def step_output_paths_for_cleanup(step_id, report_dir):
             runtime_observability_dir(report_dir) / STEP5_DIAGNOSTICS_FILE,
             runtime_observability_dir(report_dir) / STEP5_PROGRESS_FILE,
             runtime_cache_dir(report_dir) / STEP5_ARTIFACT_BYTECODE_CATALOG_FILE,
-            runtime_cache_dir(report_dir) / STEP5_ARTIFACT_BYTECODE_INDEX_FILE,
+            # Step4 precomputes the content-addressed, integrity-checked
+            # business-bytecode index. It is intentionally not a cleanup target:
+            # Step5 validates SHA/schema before reuse and avoids a duplicate scan.
             runtime_cache_dir(report_dir) / STEP5_ARTIFACT_BYTECODE_DIRNAME,
             step5_query_index_path(report_dir),
             evidence_call_chain_dir(report_dir) / "framework_adapters.json",
@@ -9887,15 +10134,9 @@ def execute_step(step_id, args, manifest_steps, run_context, main_state=None):
     refreshed_run_context = build_run_context(args, run_context, {}, allow_external_seed=False)
     gate_name = manifest_steps[step_id].get("gate")
     run_gate(gate_name, report_dir, project_dir, strict_risk_gate=bool(refreshed_run_context.get("strict_risk_gate")))
-    # Step5 的成功结果可直接进入最终报告。Step4 的全量/部分范围选择会
-    # 实质改变覆盖率与结论边界，即使误配自动继续也必须构造确认载荷。
-    step_meta = manifest_steps.get(step_id) or {}
-    if (
-        step_meta.get("auto_continue_on_success")
-        and not step_meta.get("requires_scope_confirmation")
-        and not step_meta.get("conditional_confirmation")
-    ):
-        return None
+    # Even when a successful step can auto-continue, construct the standardized
+    # payload first. The orchestrator can turn it into a non-blocking
+    # informational card instead of forcing agents to reconstruct a summary.
     return build_interaction_payload(
         step_id,
         report_dir,
@@ -10126,7 +10367,12 @@ def main(argv=None, _skip_environment_contract=False):
         interaction = execute_step(step_id, args, manifest_steps, run_context, main_state=main_state)
         run_context = build_run_context(args, run_context, {}, allow_external_seed=False)
         auto_continued_success_review = False
+        informational_interaction = None
         if should_auto_continue_success_review(step_id, interaction, manifest_steps):
+            if step_id == "step5":
+                informational_interaction = build_informational_success_interaction(
+                    step_id, interaction
+                )
             interaction = None
             auto_continued_success_review = True
         elif (
@@ -10147,6 +10393,8 @@ def main(argv=None, _skip_environment_contract=False):
         completion_summary = persist_completed_step(
             main_state, step_id, report_dir, run_context
         )
+        if informational_interaction:
+            save_interaction_file(report_dir, informational_interaction)
         for line in build_user_runtime_message(
             "complete", step_id, completion_summary=completion_summary
         ):

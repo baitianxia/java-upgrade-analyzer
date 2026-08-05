@@ -111,8 +111,12 @@ class UserVisibleOutputContractTest(unittest.TestCase):
         self.assertIn("selected_targets", manifest)
         self.assertIn("changed_dependencies.md", manifest)
         self.assertIn("完整坐标", manifest)
-        self.assertIn("不少于 20", readme)
-        self.assertIn("不少于 20", outputs)
+        self.assertIn("Top 10", readme)
+        self.assertIn("Top 10", outputs)
+        self.assertIn("精确直接引用", readme)
+        self.assertIn("精确直接引用", outputs)
+        self.assertNotIn("不少于 20", readme)
+        self.assertNotIn("不少于 20", outputs)
 
 
 if __name__ == "__main__":
