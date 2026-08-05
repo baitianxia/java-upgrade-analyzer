@@ -244,9 +244,10 @@ def context_path(report_dir):
 
 def minimal_valid_app_class_bytes():
     # 由 `public class App {}` 编译得到的最小合法 class，用于让 smoke 的
-    # 最终制品能被 javap 正常读取，避免把 fake 字节串误当成业务字节码回归。
+    # 最终制品能被 javap 正常读取。class major 固定为 61（Java 17），与
+    # initialize_smoke_project 中 pom.xml 的 java.version 保持一致。
     return base64.b64decode(
-        "yv66vgAAAEQADQoAAgADBwAEDAAFAAYBABBqYXZhL2xhbmcvT2JqZWN0AQAGPGluaXQ+AQADKClW"
+        "yv66vgAAAD0ADQoAAgADBwAEDAAFAAYBABBqYXZhL2xhbmcvT2JqZWN0AQAGPGluaXQ+AQADKClW"
         "BwAIAQADQXBwAQAEQ29kZQEAD0xpbmVOdW1iZXJUYWJsZQEAClNvdXJjZUZpbGUBAAhBcHAuamF2"
         "YQAhAAcAAgAAAAAAAQABAAUABgABAAkAAAAdAAEAAQAAAAUqtwABsQAAAAEACgAAAAYAAQAAAAEA"
         "AQALAAAAAgAM"
@@ -936,8 +937,9 @@ def create_plain_jar(path):
 
 
 def minimal_valid_app_class_bytes():
+    # Java 17 / class major 61；必须与 smoke 项目 pom.xml 的 java.version 一致。
     return base64.b64decode(
-        "yv66vgAAAEQADQoAAgADBwAEDAAFAAYBABBqYXZhL2xhbmcvT2JqZWN0AQAGPGluaXQ+AQADKClW"
+        "yv66vgAAAD0ADQoAAgADBwAEDAAFAAYBABBqYXZhL2xhbmcvT2JqZWN0AQAGPGluaXQ+AQADKClW"
         "BwAIAQADQXBwAQAEQ29kZQEAD0xpbmVOdW1iZXJUYWJsZQEAClNvdXJjZUZpbGUBAAhBcHAuamF2"
         "YQAhAAcAAgAAAAAAAQABAAUABgABAAkAAAAdAAEAAQAAAAUqtwABsQAAAAEACgAAAAYAAQAAAAEA"
         "AQALAAAAAgAM"

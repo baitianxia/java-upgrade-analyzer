@@ -41,12 +41,23 @@ class SmokeCoreTest(SmokeRegressionTestCase):
 
             artifact = root / "target" / "demo-app-2.0.0.jar"
             with zipfile.ZipFile(artifact) as outer:
+                application_class = outer.read(
+                    "BOOT-INF/classes/com/example/App.class"
+                )
                 nested_bytes = outer.read("BOOT-INF/lib/demo-lib-2.0.0.jar")
             with zipfile.ZipFile(io.BytesIO(nested_bytes)) as nested:
                 names = set(nested.namelist())
 
         self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8", errors="replace"))
+        self.assertEqual(application_class[:4], b"\xca\xfe\xba\xbe")
+        self.assertEqual(int.from_bytes(application_class[6:8], "big"), 61)
         self.assertIn("META-INF/spring.factories", names)
+
+    def test_in_process_fixture_application_class_targets_java_17(self):
+        application_class = smoke_regression.minimal_valid_app_class_bytes()
+
+        self.assertEqual(application_class[:4], b"\xca\xfe\xba\xbe")
+        self.assertEqual(int.from_bytes(application_class[6:8], "big"), 61)
 
     def test_checkpoint_distinguishes_gate_stage(self):
         self.assertEqual(
