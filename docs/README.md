@@ -10,7 +10,7 @@
 | Claude Code | [../SKILL.md](../SKILL.md) | 执行协议、交互硬规则、状态机约束 |
 | 人工复核人 | [user/outputs.md](user/outputs.md) | `.upgrade-report/` 产物、复核顺序、状态语义 |
 | 所有维护者 | [developer/constitution.md](developer/constitution.md) | 工程宪法、不可违背的原则性约束 |
-| 新接手维护者 | [developer/handoff.md](developer/handoff.md) | 当前状态、原则摘要、待办和接手顺序 |
+| 新接手维护者 | [../TODO.md](../TODO.md)、[developer/architecture.md](developer/architecture.md) | 当前待办和架构阅读入口 |
 | 维护者 | [developer/architecture.md](developer/architecture.md) | 当前架构、Step1~Step6 职责、状态模型 |
 | Step5 修改者 | [developer/step5-design.md](developer/step5-design.md) | 调用链、字节码、反射、alerts 台账语义 |
 | 测试/发布负责人 | [developer/quality.md](developer/quality.md) | 质量门禁、测试矩阵、真实项目验证口径 |
@@ -24,7 +24,6 @@ docs/
 │   └── outputs.md
 ├── developer/                # 面向维护、设计和质量保障
 │   ├── constitution.md
-│   ├── handoff.md
 │   ├── architecture.md
 │   ├── step5-design.md
 │   ├── quality.md
