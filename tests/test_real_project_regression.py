@@ -628,12 +628,12 @@ class RealProjectRegressionTest(unittest.TestCase):
 
     def test_project_asset_health_records_revision_without_fake_git_error(self):
         completed = [
-            subprocess.CompletedProcess([], 0, stdout="true\n", stderr=""),
-            subprocess.CompletedProcess([], 0, stdout="a" * 40 + "\n", stderr=""),
-            subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+            ("true\n", "", 0),
+            ("a" * 40 + "\n", "", 0),
+            ("", "", 0),
         ]
         with tempfile.TemporaryDirectory() as tmp, patch.object(
-            realreg.subprocess, "run", side_effect=completed
+            realreg, "run_cmd", side_effect=completed
         ):
             health = realreg.collect_project_asset_health(Path(tmp))
 
@@ -715,6 +715,56 @@ class RealProjectRegressionTest(unittest.TestCase):
 
         self.assertFalse(result["passed"])
         self.assertIn("materialization_contract_missing", result["errors"])
+
+    def test_source_build_asset_gate_accepts_sha256_repository_revision(self):
+        revision = "a" * 64
+        manifest = {
+            "schema": "java-upgrade-analyzer.real-project-guard.v4",
+            "case": "sha256-source",
+            "guard_lifecycle": "core",
+            "capability_ids": ["business_direct"],
+            "required_topologies": ["business_direct"],
+            "git_revision": revision,
+            "artifact_path": "target/application.jar",
+            "canonical_edge_binding": "semantic",
+            "materialization": {
+                "kind": "source_build",
+                "artifact_verification": "runtime",
+                "repository_url": "https://github.com/example/project.git",
+                "working_directory": ".",
+                "command": ["mvn", "package"],
+                "artifact_path": "target/application.jar",
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = root / manifest["artifact_path"]
+            artifact.parent.mkdir(parents=True)
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("app/App.class", b"class")
+            with patch.object(realreg, "run_cmd", return_value=(revision + "\n", "", 0)):
+                gate = realreg.validate_pinned_asset(manifest, root)
+
+        self.assertTrue(gate["passed"], gate["errors"])
+        self.assertEqual(gate["expected_git_revision"], revision)
+
+    def test_source_build_asset_gate_rejects_nonstandard_git_object_id_length(self):
+        revision = "a" * 48
+        manifest = {
+            "git_revision": revision,
+            "artifact_path": "target/application.jar",
+            "materialization": {
+                "kind": "source_build",
+                "repository_url": "https://github.com/example/project.git",
+                "working_directory": ".",
+                "command": ["mvn", "package"],
+                "artifact_path": "target/application.jar",
+            },
+        }
+
+        errors = realreg.validate_reproducible_asset_contract(manifest)
+
+        self.assertIn("source_build_artifact_0_revision_invalid", errors)
 
     def test_mybatis_cases_audit_dependency_apis_not_business_mapper_contracts(self):
         expected = {
@@ -7886,10 +7936,8 @@ class RealProjectRegressionTests(unittest.TestCase):
             artifact.parent.mkdir(parents=True)
             with zipfile.ZipFile(artifact, "w") as archive:
                 archive.writestr("app/App.class", b"class")
-            completed = realreg.subprocess.CompletedProcess(
-                args=[], returncode=0, stdout="c" * 40 + "\n", stderr=""
-            )
-            with patch.object(realreg.subprocess, "run", return_value=completed):
+            completed = ("c" * 40 + "\n", "", 0)
+            with patch.object(realreg, "run_cmd", return_value=completed):
                 gate = realreg.validate_pinned_asset(manifest, root)
 
         self.assertFalse(gate["passed"])
@@ -7923,10 +7971,8 @@ class RealProjectRegressionTests(unittest.TestCase):
             with zipfile.ZipFile(artifact, "w") as archive:
                 archive.writestr("app/App.class", b"class")
             actual_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
-            completed = realreg.subprocess.CompletedProcess(
-                args=[], returncode=0, stdout="a" * 40 + "\n", stderr=""
-            )
-            with patch.object(realreg.subprocess, "run", return_value=completed):
+            completed = ("a" * 40 + "\n", "", 0)
+            with patch.object(realreg, "run_cmd", return_value=completed):
                 gate = realreg.validate_pinned_asset(manifest, root)
 
         self.assertTrue(gate["passed"], gate["errors"])

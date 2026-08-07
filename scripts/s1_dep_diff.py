@@ -6211,13 +6211,43 @@ def main():
         provenance_sides.append({
             'side': side,
             'source_mode': 'provided_artifact' if (args.base_artifact_path and args.current_artifact_path) else 'checkout_build',
-            'ref': str((meta or {}).get('resolved_ref') or branch or ''),
-            'requested_ref': str((meta or {}).get('requested_ref') or branch or ''),
-            'ref_resolution_mode': str((meta or {}).get('ref_resolution_mode') or ''),
-            'ref_source_status': str((meta or {}).get('ref_source_status') or ''),
-            'ref_remote': str((meta or {}).get('ref_remote') or ''),
-            'ref_remote_ref': str((meta or {}).get('ref_remote_ref') or ''),
-            'revision': str((meta or {}).get('revision') or ''),
+            'ref': str(
+                (meta or {}).get('resolved_ref')
+                or orchestrated_input.get(f'{side}_resolved_ref')
+                or branch
+                or ''
+            ),
+            'requested_ref': str(
+                (meta or {}).get('requested_ref')
+                or orchestrated_input.get(f'{side}_requested_ref')
+                or branch
+                or ''
+            ),
+            'ref_resolution_mode': str(
+                (meta or {}).get('ref_resolution_mode')
+                or orchestrated_input.get(f'{side}_ref_resolution_mode')
+                or ''
+            ),
+            'ref_source_status': str(
+                (meta or {}).get('ref_source_status')
+                or orchestrated_input.get(f'{side}_ref_source_status')
+                or ''
+            ),
+            'ref_remote': str(
+                (meta or {}).get('ref_remote')
+                or orchestrated_input.get(f'{side}_ref_remote')
+                or ''
+            ),
+            'ref_remote_ref': str(
+                (meta or {}).get('ref_remote_ref')
+                or orchestrated_input.get(f'{side}_ref_remote_ref')
+                or ''
+            ),
+            'revision': str(
+                (meta or {}).get('revision')
+                or orchestrated_input.get(f'{side}_resolved_commit')
+                or ''
+            ),
             'target_module': str(args.primary_module or ''),
             'jdk_home': str((meta or {}).get('jdk_home') or resolve_effective_jdk_home(configured_jdk) or ''),
             'build_command': str((meta or {}).get('build_command') or ''),

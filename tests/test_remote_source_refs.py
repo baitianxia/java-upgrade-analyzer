@@ -1,8 +1,10 @@
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -62,6 +64,26 @@ class RemoteSourceRefsTest(unittest.TestCase):
         self.assertEqual(result["resolved_commit"], self.current_commit)
         self.assertEqual(result["resolution_mode"], "live_remote")
 
+    def test_remote_resolution_ignores_inherited_git_repository_routing(self):
+        self.add_remote("origin", {"release": self.current_commit})
+        foreign = self.root / "foreign"
+        foreign.mkdir()
+        self.git(foreign, "init")
+
+        with patch.dict(
+            os.environ,
+            {
+                "GIT_DIR": str(foreign / ".git"),
+                "GIT_WORK_TREE": str(foreign),
+            },
+            clear=False,
+        ):
+            result = resolve_remote_source_ref(self.repo, "release")
+
+        self.assertEqual(result["status"], "remote_source_resolved")
+        self.assertEqual(result["remote"], "origin")
+        self.assertEqual(result["resolved_commit"], self.current_commit)
+
     def test_base_and_current_refs_resolve_sequentially_from_same_repo(self):
         self.add_remote(
             "origin",
@@ -96,10 +118,8 @@ class RemoteSourceRefsTest(unittest.TestCase):
         )
         after_move = resolve_remote_source_ref(
             self.repo,
-            "release",
+            selected["resolved_ref"],
             expected_commit=selected["resolved_commit"],
-            expected_remote=selected["remote"],
-            expected_remote_ref=selected["remote_ref"],
         )
         self.git(self.repo, "push", "origin", ":refs/heads/release")
         after_delete = resolve_remote_source_ref(
@@ -112,6 +132,8 @@ class RemoteSourceRefsTest(unittest.TestCase):
 
         self.assertEqual(after_move["status"], "remote_source_resolved")
         self.assertEqual(after_move["resolved_commit"], self.current_commit)
+        self.assertEqual(after_move["observed_commit"], self.base_commit)
+        self.assertEqual(after_move["resolution_mode"], "pinned_commit")
         self.assertEqual(after_delete["status"], "remote_source_resolved")
         self.assertEqual(after_delete["resolved_commit"], self.current_commit)
         self.assertEqual(
@@ -129,17 +151,30 @@ class RemoteSourceRefsTest(unittest.TestCase):
         self.assertEqual(result["remote"], "upstream")
         self.assertEqual(result["resolved_commit"], self.current_commit)
 
-    def test_multiple_remotes_without_origin_require_explicit_remote(self):
+    def test_multiple_remotes_without_origin_compare_remote_commits(self):
         self.add_remote("first", {"release": self.base_commit})
         self.add_remote("second", {"release": self.current_commit})
 
         result = resolve_remote_source_ref(self.repo, "release")
 
         self.assertEqual(result["status"], "remote_source_ambiguous")
-        self.assertEqual(result["query_mode"], "local_remote_selection")
+        self.assertEqual(result["query_mode"], "targeted_exact")
         self.assertEqual(
-            result["failures"][0]["reason_code"],
-            "remote_selection_ambiguous",
+            {candidate["commit"] for candidate in result["candidates"]},
+            {self.base_commit, self.current_commit},
+        )
+
+    def test_peer_remotes_with_same_commit_are_merged_as_aliases(self):
+        self.add_remote("first", {"release": self.current_commit})
+        self.add_remote("second", {"release": self.current_commit})
+
+        result = resolve_remote_source_ref(self.repo, "release")
+
+        self.assertEqual(result["status"], "remote_source_resolved")
+        self.assertEqual(result["resolved_commit"], self.current_commit)
+        self.assertEqual(
+            {alias["remote"] for alias in result["candidates"][0]["aliases"]},
+            {"first", "second"},
         )
 
     def test_repository_without_remote_has_precise_configuration_failure(self):
@@ -165,14 +200,22 @@ class RemoteSourceRefsTest(unittest.TestCase):
             "repository_not_git",
         )
 
-    def test_explicit_local_commit_does_not_require_a_remote(self):
+    def test_explicit_local_commit_without_remote_is_not_remote_source(self):
+        result = resolve_remote_source_ref(self.repo, self.current_commit)
+
+        self.assertEqual(result["status"], "remote_configuration_missing")
+        self.assertEqual(result["resolved_commit"], "")
+
+    def test_explicit_commit_requires_and_records_remote_proof(self):
+        self.add_remote("origin", {"release": self.current_commit})
+
         result = resolve_remote_source_ref(self.repo, self.current_commit)
 
         self.assertEqual(result["status"], "remote_source_resolved")
-        self.assertEqual(result["resolved_ref"], self.current_commit)
         self.assertEqual(result["resolved_commit"], self.current_commit)
-        self.assertEqual(result["resolution_mode"], "explicit_commit")
-        self.assertEqual(result["query_mode"], "local_commit")
+        self.assertEqual(result["remote"], "origin")
+        self.assertEqual(result["resolution_mode"], "explicit_remote_commit")
+        self.assertEqual(result["query_mode"], "explicit_commit_remote")
 
     def test_annotated_remote_tag_resolves_to_peeled_commit(self):
         self.add_remote("origin", {"main": self.current_commit})
@@ -185,7 +228,7 @@ class RemoteSourceRefsTest(unittest.TestCase):
         self.assertEqual(result["resolved_commit"], self.current_commit)
         self.assertEqual(result["remote_ref"], "refs/tags/v2.0.0")
 
-    def test_unqualified_ref_prefers_origin_without_querying_other_remotes(self):
+    def test_unqualified_ref_stops_after_successful_origin_tier(self):
         self.add_remote("origin", {"release": self.current_commit})
         self.add_remote("upstream", {"release": self.current_commit})
 
@@ -194,9 +237,10 @@ class RemoteSourceRefsTest(unittest.TestCase):
         self.assertEqual(result["status"], "remote_source_resolved")
         self.assertEqual(result["remote"], "origin")
         self.assertEqual(len(result["candidates"]), 1)
+        self.assertNotIn("aliases", result["candidates"][0])
         self.assertEqual(result["query_mode"], "targeted_exact")
 
-    def test_unqualified_ref_does_not_compare_origin_with_other_remotes(self):
+    def test_origin_tier_wins_over_different_lower_tier_commit(self):
         self.add_remote("origin", {"release": self.base_commit})
         self.add_remote("upstream", {"release": self.current_commit})
 
@@ -206,11 +250,83 @@ class RemoteSourceRefsTest(unittest.TestCase):
         self.assertEqual(result["remote"], "origin")
         self.assertEqual(result["resolved_commit"], self.base_commit)
 
+    def test_global_remote_config_does_not_count_as_repository_remote(self):
+        global_config = self.root / "global.gitconfig"
+        global_config.write_text(
+            "[remote \"injected\"]\n\turl = /does/not/matter.git\n",
+            encoding="utf-8",
+        )
+
+        with patch.dict(
+            os.environ,
+            {"GIT_CONFIG_GLOBAL": str(global_config)},
+            clear=False,
+        ):
+            result = resolve_remote_source_ref(self.repo, "release")
+
+        self.assertEqual(result["status"], "remote_configuration_missing")
+        self.assertEqual(result["configured_remotes"], [])
+
+    def test_repository_remote_from_included_local_config_is_discovered(self):
+        bare = self.root / "included-origin.git"
+        self.git(self.root, "init", "--bare", str(bare))
+        self.git(
+            self.repo,
+            "push",
+            str(bare),
+            f"{self.current_commit}:refs/heads/release",
+        )
+        included_config = self.root / "repository-remotes.gitconfig"
+        included_config.write_text(
+            f'[remote "origin"]\n\turl = {bare}\n',
+            encoding="utf-8",
+        )
+        self.git(
+            self.repo,
+            "config",
+            "--local",
+            "include.path",
+            str(included_config),
+        )
+
+        result = resolve_remote_source_ref(self.repo, "release")
+
+        self.assertEqual(result["status"], "remote_source_resolved")
+        self.assertEqual(result["remote"], "origin")
+        self.assertEqual(result["resolved_commit"], self.current_commit)
+
+    def test_sha256_length_commit_uses_remote_proof_path(self):
+        sha256_commit = "b" * 64
+        materialized = {
+            "status": "remote_source_resolved",
+            "resolved_commit": sha256_commit,
+            "expected_commit": sha256_commit,
+            "attempts": [],
+            "resolution_mode": "explicit_remote_commit",
+            "candidate": {
+                "remote": "origin",
+                "ref": sha256_commit,
+                "canonical_ref": "",
+                "kind": "commit",
+                "commit": sha256_commit,
+            },
+        }
+        with patch("remote_source_refs._remote_names", return_value=(["origin"], [])), patch(
+            "remote_source_refs._materialize_explicit_commit_from_remote",
+            return_value=materialized,
+        ) as proof:
+            result = resolve_remote_source_ref(self.repo, sha256_commit)
+
+        self.assertEqual(result["status"], "remote_source_resolved")
+        self.assertEqual(result["resolved_commit"], sha256_commit)
+        proof.assert_called_once()
+
     def test_missing_remote_ref_does_not_fall_back_to_local(self):
         self.git(self.repo, "branch", "release", self.current_commit)
         self.add_remote("origin", {"other": self.current_commit})
 
-        result = resolve_remote_source_ref(self.repo, "release")
+        with patch("remote_source_refs.time.sleep"):
+            result = resolve_remote_source_ref(self.repo, "release")
 
         self.assertEqual(result["status"], "remote_ref_not_found")
         self.assertEqual(result["resolved_commit"], "")

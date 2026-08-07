@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import re
 import unittest
 
 from topology_coverage import STABLE_TOPOLOGY_IDS
@@ -47,6 +48,12 @@ ALLOWED_ROOT_CAUSE_FAMILIES = {
     "test_asset_invalid",
     "workflow_gate",
 }
+FULL_GIT_OBJECT_ID_RE = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})")
+
+
+def _is_full_git_object_id(value: object) -> bool:
+    """Accept full object IDs from either SHA-1 or SHA-256 repositories."""
+    return bool(FULL_GIT_OBJECT_ID_RE.fullmatch(str(value or "")))
 
 
 def _canonical_json(value) -> str:
@@ -246,7 +253,7 @@ def _project_provenance_complete(results: list[dict]) -> bool:
     for result in results:
         health = result.get("project_asset_health") or {}
         revision = str(health.get("git_revision") or "")
-        if len(revision) != 40 or any(char not in "0123456789abcdefABCDEF" for char in revision):
+        if not _is_full_git_object_id(revision):
             return False
         if health.get("git_dirty") is not False:
             return False

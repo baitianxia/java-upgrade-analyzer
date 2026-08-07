@@ -14,8 +14,10 @@ import threading
 import time
 import traceback
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -28,7 +30,11 @@ from compat import (
 )
 from compat import git_cmd
 from artifact_coordinates import artifact_ga
-from path_runtime import git_with_long_paths
+from path_runtime import (
+    create_detached_worktree,
+    git_with_long_paths,
+    remove_detached_worktree,
+)
 from csv_io import open_csv_read, open_csv_write
 from analysis_contract import build_project_scope, discover_project_modules, write_coverage_report
 from diagnostic_contract import canonical_reason_code, normalize_diagnostic_payload
@@ -68,6 +74,7 @@ from s4_contract import (
     STEP3_RISK_CANDIDATES_FILE,
 )
 from step1_ref_resolution import resolve_step1_ref
+from remote_source_refs import classify_fetch_failure
 from runtime_contract import contract_payload
 from progress_logging import emit_progress
 from reason_guidance import REASON_GUIDANCE_SCHEMA, guidance_for_reason_code
@@ -144,6 +151,7 @@ INTENT_PATCH_ALLOWED_SET_FIELDS = {
     "jdk_current",
     "dependency_git_ref_overrides",
     "dependency_git_ref_selections",
+    "dependency_source_clone_timeout",
     "source_ref_selections",
     "dependency_source_dirs",
     "retry_remote_fetch",
@@ -338,28 +346,136 @@ def read_json(path):
 
 
 def write_json(path, data):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-def _write_background_json(path, data):
-    """Atomically publish launcher state while parent and child may both update it."""
+    """Durably publish JSON without exposing readers to a partial file."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.with_name(
-        f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
     )
     try:
         with open(temp_path, "w", encoding="utf-8", newline="\n") as handle:
             json.dump(data, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(temp_path, path)
+        if os.name != "nt":
+            try:
+                directory_fd = os.open(path.parent, os.O_RDONLY)
+            except OSError:
+                directory_fd = None
+            if directory_fd is not None:
+                try:
+                    try:
+                        os.fsync(directory_fd)
+                    except OSError:
+                        # Some network/virtual filesystems do not support
+                        # directory fsync; the file itself is already synced
+                        # and atomically replaced.
+                        pass
+                finally:
+                    os.close(directory_fd)
     finally:
         try:
             temp_path.unlink()
         except FileNotFoundError:
             pass
+
+
+_PERSISTED_GIT_SECRET_KEYS = {
+    "authorization",
+    "proxyauthorization",
+    "extraheader",
+    "httpsextraheader",
+    "httpextraheader",
+    "token",
+    "accesstoken",
+    "authtoken",
+    "oauthtoken",
+    "oauth2token",
+    "privatetoken",
+    "deploytoken",
+    "refreshtoken",
+    "password",
+    "passwd",
+    "credential",
+    "credentials",
+    "secret",
+}
+
+
+def _normalized_secret_key(value):
+    return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+
+def _is_persisted_git_secret_key(value):
+    normalized = _normalized_secret_key(value)
+    if normalized in _PERSISTED_GIT_SECRET_KEYS:
+        return True
+    return normalized.endswith((
+        "accesstoken",
+        "authtoken",
+        "privatetoken",
+        "deploytoken",
+        "password",
+        "credential",
+    ))
+
+
+def _redact_git_sensitive_text(value):
+    """Remove transport credentials from text before durable/user-visible use."""
+    text = _redact_git_url(value)
+    text = re.sub(
+        r"(?i)\b((?:proxy[-_ ]?)?authorization)\s*[:=]\s*"
+        r"(?:basic|bearer|token)?\s*[^\s,;\"']+",
+        lambda match: f"{match.group(1)}: ***",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\b((?:[a-z0-9.-]+\.)?extra[-_]?header)\s*[:=]\s*[^\r\n,;]+",
+        lambda match: f"{match.group(1)}=***",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\b((?:(?:access|auth|private|deploy|refresh|oauth2?)[-_]?)?token|"
+        r"password|passwd|secret)\s*[:=]\s*[^\s,;&#\"']+",
+        lambda match: f"{match.group(1)}=***",
+        text,
+    )
+    return text
+
+
+def _sanitize_git_persistence_payload(value, key_hint=""):
+    """Deep-copy a payload while removing Git transport secrets.
+
+    Git errors and ref candidates are nested differently across Step1 paths,
+    so persistence boundaries intentionally sanitize recursively instead of
+    relying on every producer to remember a field-specific redaction step.
+    """
+    if _is_persisted_git_secret_key(key_hint):
+        return "***"
+    if isinstance(value, dict):
+        return {
+            key: _sanitize_git_persistence_payload(item, key_hint=key)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _sanitize_git_persistence_payload(item, key_hint=key_hint)
+            for item in value
+        ]
+    if isinstance(value, tuple):
+        return [
+            _sanitize_git_persistence_payload(item, key_hint=key_hint)
+            for item in value
+        ]
+    if isinstance(value, str):
+        return _redact_git_sensitive_text(value)
+    return value
+
+
+def _write_background_json(path, data):
+    """Atomically publish launcher state while parent and child may both update it."""
+    write_json(path, data)
 
 
 def _read_background_json(path):
@@ -693,6 +809,12 @@ def write_resume_snapshot(
     error="",
 ):
     """Publish a bounded cross-session index after every durable state change."""
+    main_state = _sanitize_git_persistence_payload(main_state or {})
+    interaction = _sanitize_git_persistence_payload(interaction or {})
+    completion_summary = _sanitize_git_persistence_payload(
+        completion_summary or {}
+    )
+    error = _redact_git_sensitive_text(error)
     report_dir = Path(report_dir).resolve()
     state_view = dict((main_state or {}).get("state") or {})
     needs_user_input = event in {
@@ -1346,6 +1468,7 @@ def load_main_state(report_dir, manifest_path=""):
 def save_main_state(report_dir, state):
     normalized = ensure_main_state_structure(state, report_dir, manifest_path=(state.get("state") or {}).get("manifest_path", ""))
     normalized["state"]["saved_at"] = datetime.now().isoformat()
+    normalized = _sanitize_git_persistence_payload(normalized)
     write_json(main_state_path(report_dir), normalized)
     write_report_landing_docs(report_dir, normalized)
     return normalized
@@ -1445,7 +1568,9 @@ def should_reset_for_explicit_step_run(main_state, step_id, requested_step):
 
 
 def store_step_input(main_state, step_id, run_context):
-    main_state[step_id]["input"] = dict(run_context or {})
+    main_state[step_id]["input"] = _sanitize_git_persistence_payload(
+        dict(run_context or {})
+    )
 
 
 def build_step_derived_snapshot(step_id, run_context, report_dir):
@@ -1504,15 +1629,21 @@ def build_step_derived_snapshot(step_id, run_context, report_dir):
 
 
 def store_step_output(main_state, step_id, run_context, report_dir):
-    main_state[step_id]["derived"] = build_step_derived_snapshot(step_id, run_context, report_dir)
-    main_state[step_id]["output"] = dict(run_context or {})
+    main_state[step_id]["derived"] = _sanitize_git_persistence_payload(
+        build_step_derived_snapshot(step_id, run_context, report_dir)
+    )
+    main_state[step_id]["output"] = _sanitize_git_persistence_payload(
+        dict(run_context or {})
+    )
 
 
 def seed_next_step_input(main_state, step_id, run_context):
     next_step_id = next_step_id_for(step_id)
     if not next_step_id:
         return
-    main_state[next_step_id]["input"] = dict(run_context or {})
+    main_state[next_step_id]["input"] = _sanitize_git_persistence_payload(
+        dict(run_context or {})
+    )
 
 
 def update_main_state_state(main_state, **updates):
@@ -1523,7 +1654,7 @@ def update_main_state_state(main_state, **updates):
 
 def record_last_user_response(main_state, pending_interaction, action, payload):
     pending_step_id = str((pending_interaction or {}).get("step_id") or "").strip()
-    stored_payload = dict(payload or {})
+    stored_payload = _sanitize_git_persistence_payload(dict(payload or {}))
     intent_patch = stored_payload.pop("__intent_patch", None)
     clear_fields = stored_payload.pop("__clear_fields", None)
     if intent_patch:
@@ -1552,7 +1683,7 @@ def save_interaction_file(report_dir, interaction):
     if not interaction:
         return
     payload = normalize_diagnostic_payload(
-        interaction,
+        _sanitize_git_persistence_payload(interaction),
         origin_step=(interaction or {}).get("step_id"),
     )
     payload["status"] = normalize_interaction_status(payload.get("status"))
@@ -1743,6 +1874,7 @@ def apply_user_response_clears(updated, clear_fields):
         if field == "source_dirs":
             result.pop("source_dirs", None)
             result.pop("source_dirs_status", None)
+            result.pop("pinned_source_snapshot", None)
             continue
         if field == "dependency_source_dirs":
             result.pop("dependency_source_dirs", None)
@@ -1790,6 +1922,8 @@ def _clear_step1_ref_state(context, side):
         updated.pop(f"{side}_{suffix}", None)
     updated.pop(f"{side}_allow_local_source", None)
     updated.pop(f"{side}_allow_dirty_local_source", None)
+    if side == "current":
+        updated.pop("pinned_source_snapshot", None)
     return updated
 
 
@@ -1861,6 +1995,69 @@ def _sanitize_step1_ref_state(context, side, repo_dir):
     return updated, binding
 
 
+def _durable_step1_ref_binding_from_failure(
+    resolution,
+    repo_dir,
+    requested_ref,
+    *,
+    artifact_path="",
+    existing_binding=None,
+):
+    """Retain a remotely selected immutable SHA even when local fetch failed.
+
+    A successful remote lookup and a failed object materialization are two
+    separate facts.  Losing the former would make a retry follow the moving ref
+    again, defeating the Step1 snapshot contract.
+    """
+    expected_commit = str((resolution or {}).get("expected_commit") or "").strip()
+    if not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", expected_commit):
+        return {}
+
+    existing_binding = dict(existing_binding or {})
+    remote = str((resolution or {}).get("remote") or "").strip()
+    canonical_ref = str((resolution or {}).get("remote_ref") or "").strip()
+    candidates = [
+        dict(item)
+        for item in ((resolution or {}).get("candidates") or [])
+        if isinstance(item, dict)
+    ]
+    matching_candidates = [
+        item
+        for item in candidates
+        if str(item.get("commit") or "").strip().lower()
+        == expected_commit.lower()
+    ]
+    if not remote and len(matching_candidates) == 1:
+        remote = str(matching_candidates[0].get("remote") or "").strip()
+    if not canonical_ref and len(matching_candidates) == 1:
+        canonical_ref = str(
+            matching_candidates[0].get("canonical_ref") or ""
+        ).strip()
+
+    # A retry of an already-bound snapshot may return only the pinned SHA and
+    # failure evidence.  In that case, preserve the previously proven remote
+    # identity instead of discarding it.
+    if (
+        str(existing_binding.get("expected_commit") or "").strip().lower()
+        == expected_commit.lower()
+    ):
+        remote = remote or str(existing_binding.get("remote") or "").strip()
+        canonical_ref = canonical_ref or str(
+            existing_binding.get("canonical_ref") or ""
+        ).strip()
+
+    if not remote or not canonical_ref:
+        return {}
+    return _step1_ref_binding(
+        repo_dir,
+        requested_ref,
+        expected_commit,
+        remote=remote,
+        canonical_ref=canonical_ref,
+        artifact_path=artifact_path,
+    )
+
+
 def merge_user_response_into_run_context(run_context, user_response, project_dir):
     updated = dict(run_context or {})
     response = dict(user_response or {})
@@ -1906,6 +2103,10 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
                 primary_module_explicit = True
                 updated["target_module"] = value.strip()
                 updated["primary_module"] = value.strip()
+                updated.pop("pinned_source_snapshot", None)
+            if key == "tool":
+                updated["tool_explicit"] = True
+                updated.pop("pinned_source_snapshot", None)
             if key in ("base_branch", "current_branch"):
                 updated[f"{key}_explicit"] = True
     for key in ("jdk_base", "jdk_current", "springboot_base", "springboot_current"):
@@ -1941,6 +2142,7 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
         # the next Step1 run can re-detect module-specific source directories.
         updated.pop("source_dirs", None)
         updated.pop("source_dirs_status", None)
+        updated.pop("pinned_source_snapshot", None)
 
     if response.get("active_maven_profiles") is not None:
         previous_profiles = list(updated.get("active_maven_profiles") or [])
@@ -1950,10 +2152,13 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
         if updated["active_maven_profiles"] != previous_profiles:
             updated.pop("source_dirs", None)
             updated.pop("source_dirs_status", None)
+            updated.pop("pinned_source_snapshot", None)
 
     source_dirs = normalize_source_dirs(response.get("source_dirs"), project_dir)
     if source_dirs is not None:
         updated["source_dirs"] = source_dirs
+        updated["source_dirs_status"] = "explicit"
+        updated.pop("pinned_source_snapshot", None)
 
     dependency_source_dirs = normalize_dependency_source_dirs(
         response.get("dependency_source_dirs"),
@@ -2731,6 +2936,7 @@ def looks_like_remote_repo(path_value):
     return (
         value.startswith(("http://", "https://", "ssh://", "git://", "file://", "git@"))
         or bool(re.match(r"^[^/@\s]+@[^:\s]+:.+", value))
+        or bool(re.match(r"^(?![A-Za-z]:[\\/])[^/:\s]+:.+", value))
         or value.endswith(".git")
     )
 
@@ -2744,6 +2950,8 @@ def is_dependency_source_git_url(path_value, project_dir=None):
         return True
     if re.match(r"^[^/@\s]+@[^:\s]+:.+", value):
         return True
+    if re.match(r"^(?![A-Za-z]:[\\/])[^/:\s]+:.+", value):
+        return True
     local_path = Path(value).expanduser()
     if not local_path.is_absolute() and project_dir is not None:
         local_path = Path(project_dir) / local_path
@@ -2752,32 +2960,223 @@ def is_dependency_source_git_url(path_value, project_dir=None):
 
 def _redact_git_url(value):
     text = str(value or "")
-    return re.sub(r"(?i)(https?://)[^/@\s]+@", r"\1***@", text)
+    text = re.sub(
+        r"(?i)([a-z][a-z0-9+.-]*://)[^/@\s]+@",
+        r"\1***@",
+        text,
+    )
+    text = re.sub(
+        r"(?i)([?&](?:access[_-]?token|auth[_-]?token|private[_-]?token|"
+        r"deploy[_-]?token|token|password|secret)=)[^&#\s]+",
+        r"\1***",
+        text,
+    )
+    # Also cover SCP-style Git addresses (``user@host:path``) embedded in a
+    # larger diagnostic.  The leading delimiter avoids rewriting ordinary
+    # e-mail addresses.
+    text = re.sub(
+        r"(^|[\s'\"(=])[^/@:\s]+@([^/:\s]+:[^\s'\"),]+)",
+        r"\1***@\2",
+        text,
+    )
+    return text
 
 
-def _dependency_source_git_origin(repo_path):
+def _is_redacted_git_display_url(value):
+    text = str(value or "")
+    return "***@" in text or bool(re.search(
+        r"(?i)[?&](?:access[_-]?token|auth[_-]?token|private[_-]?token|"
+        r"deploy[_-]?token|token|password|secret)=\*\*\*",
+        text,
+    ))
+
+
+def _is_sensitive_git_query_key(value):
+    normalized = _normalized_secret_key(value)
+    return (
+        _is_persisted_git_secret_key(value)
+        or normalized in {
+            "apikey",
+            "clientsecret",
+            "jwt",
+            "sas",
+            "sig",
+            "signature",
+            "xamzcredential",
+            "xamzsignature",
+            "xamzsecuritytoken",
+        }
+        or normalized.endswith(("signature", "securitytoken"))
+    )
+
+
+def _canonical_git_endpoint(value):
+    """Return a stable credential-free identity for a Git endpoint."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if re.match(r"(?i)^[a-z][a-z0-9+.-]*://", text):
+        parts = urlsplit(text)
+        netloc = parts.netloc.rsplit("@", 1)[-1].lower()
+        query_items = sorted(
+            (key, item_value)
+            for key, item_value in parse_qsl(
+                parts.query,
+                keep_blank_values=True,
+            )
+            if not _is_sensitive_git_query_key(key)
+        )
+        return urlunsplit((
+            parts.scheme.lower(),
+            netloc,
+            parts.path,
+            urlencode(query_items, doseq=True),
+            "",
+        ))
+    scp_match = re.fullmatch(r"[^/@:\s]+@([^:\s]+):(.+)", text)
+    if scp_match:
+        return f"{scp_match.group(1).lower()}:{scp_match.group(2)}"
+    return text
+
+
+def _dependency_source_remaining_timeout(deadline, cap=10):
+    if deadline is None:
+        return float(cap)
+    return max(0.0, min(float(cap), float(deadline) - time.monotonic()))
+
+
+def _dependency_source_git_origin(repo_path, *, deadline=None):
+    timeout = _dependency_source_remaining_timeout(deadline)
+    if timeout <= 0:
+        return ""
     stdout, _stderr, rc = run_cmd(
         git_cmd() + ["-C", str(repo_path), "remote", "get-url", "origin"],
-        timeout=10,
+        timeout=timeout,
         env={"GIT_TERMINAL_PROMPT": "0"},
     )
     return str(stdout or "").strip() if rc == 0 else ""
 
 
-def _is_materialized_dependency_source_repo(repo_path, git_url):
+def _same_git_transport_url(left, right):
+    return str(left or "").strip().rstrip("/") == str(right or "").strip().rstrip("/")
+
+
+def _is_materialized_dependency_source_repo(repo_path, git_url, *, deadline=None):
     repo_path = Path(repo_path)
     if not repo_path.is_dir() or repo_path.is_symlink():
         return False
+    timeout = _dependency_source_remaining_timeout(deadline)
+    if timeout <= 0:
+        return False
     stdout, _stderr, rc = run_cmd(
         git_cmd() + ["-C", str(repo_path), "rev-parse", "--is-inside-work-tree"],
-        timeout=10,
+        timeout=timeout,
         env={"GIT_TERMINAL_PROMPT": "0"},
     )
-    return (
-        rc == 0
-        and str(stdout or "").strip().lower() == "true"
-        and _dependency_source_git_origin(repo_path) == str(git_url or "").strip()
+    if rc != 0 or str(stdout or "").strip().lower() != "true":
+        return False
+    timeout = _dependency_source_remaining_timeout(deadline)
+    if timeout <= 0:
+        return False
+    head, _head_stderr, head_rc = run_cmd(
+        git_cmd() + [
+            "-C", str(repo_path), "rev-parse", "--verify", "HEAD^{commit}",
+        ],
+        timeout=timeout,
+        env={"GIT_TERMINAL_PROMPT": "0"},
     )
+    if head_rc != 0 or not re.fullmatch(
+        r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})",
+        str(head or "").strip(),
+    ):
+        return False
+    origin = _dependency_source_git_origin(repo_path, deadline=deadline)
+    expected = _canonical_git_endpoint(git_url)
+    return _same_git_transport_url(
+        _canonical_git_endpoint(origin),
+        expected,
+    )
+
+
+def _scrub_materialized_dependency_source_origin(repo_path, git_url, *, deadline=None):
+    """Ensure clone credentials are not retained in the local Git config."""
+    endpoint = _canonical_git_endpoint(git_url)
+    if endpoint == str(git_url or "").strip():
+        return True, ""
+    timeout = _dependency_source_remaining_timeout(deadline)
+    if timeout <= 0:
+        return False, "dependency source clone total deadline exhausted"
+    stdout, stderr, rc = run_cmd(
+        git_cmd() + [
+            "-C", str(repo_path), "config", "--local",
+            "remote.origin.url", endpoint,
+        ],
+        timeout=timeout,
+        env={"GIT_TERMINAL_PROMPT": "0"},
+    )
+    if rc == 0:
+        return True, ""
+    return False, _redact_git_sensitive_text(
+        stderr or stdout or f"git config exited with {rc}"
+    )
+
+
+@contextmanager
+def _dependency_source_cache_lock(cache_entry, timeout=300):
+    """Serialize clone/cache replacement across analyzer processes."""
+    cache_entry = Path(cache_entry)
+    lock_dir = cache_entry / ".materialize.lock"
+    deadline = time.monotonic() + max(0.001, float(timeout or 0.001))
+    acquired = False
+    while time.monotonic() < deadline:
+        try:
+            lock_dir.mkdir()
+            acquired = True
+            try:
+                write_json(
+                    lock_dir / "owner.json",
+                    {
+                        "pid": os.getpid(),
+                        "created_at": datetime.now().isoformat(),
+                    },
+                )
+            except Exception:
+                shutil.rmtree(lock_dir, ignore_errors=True)
+                acquired = False
+                raise
+            break
+        except FileExistsError:
+            owner = _read_background_json(lock_dir / "owner.json")
+            owner_pid = owner.get("pid")
+            try:
+                owner_pid = int(owner_pid)
+            except (TypeError, ValueError):
+                owner_pid = 0
+            try:
+                age = max(0.0, time.time() - lock_dir.stat().st_mtime)
+            except OSError:
+                age = 0.0
+            owner_is_dead = owner_pid > 0 and not _pid_is_running(owner_pid)
+            owner_never_initialized = owner_pid <= 0 and age > 5
+            if owner_is_dead or owner_never_initialized:
+                stale_dir = cache_entry / f".materialize.stale-{uuid.uuid4().hex}"
+                try:
+                    lock_dir.replace(stale_dir)
+                except OSError:
+                    pass
+                else:
+                    shutil.rmtree(stale_dir, ignore_errors=True)
+                continue
+            time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+    if not acquired:
+        raise StepError(
+            f"等待依赖源码 Git 缓存锁超时：{cache_entry}",
+            reason_codes=["DEPENDENCY_SOURCE_GIT_CACHE_LOCK_TIMEOUT"],
+        )
+    try:
+        yield
+    finally:
+        shutil.rmtree(lock_dir, ignore_errors=True)
 
 
 def materialize_dependency_source_git_url(git_url, report_dir, clone_timeout=300):
@@ -2790,90 +3189,216 @@ def materialize_dependency_source_git_url(git_url, report_dir, clone_timeout=300
         "dependency_source_clone_timeout",
     )
 
-    cache_key = hashlib.sha256(git_url.encode("utf-8")).hexdigest()[:24]
-    cache_entry = runtime_cache_dir(report_dir) / "dependency_source_git" / cache_key
+    git_endpoint = _canonical_git_endpoint(git_url)
+    git_endpoint_sha256 = hashlib.sha256(
+        git_endpoint.encode("utf-8")
+    ).hexdigest()
+    cache_key = git_endpoint_sha256[:24]
+    cache_root = runtime_cache_dir(report_dir) / "dependency_source_git"
+    if cache_root.is_symlink():
+        raise StepError(
+            f"依赖源码 Git 缓存根目录不能是符号链接：{cache_root}",
+            reason_codes=["DEPENDENCY_SOURCE_GIT_CACHE_PATH_UNSAFE"],
+        )
+    cache_root.mkdir(parents=True, exist_ok=True)
+    cache_entry = cache_root / cache_key
+    if cache_entry.is_symlink():
+        raise StepError(
+            f"依赖源码 Git 缓存项不能是符号链接：{cache_entry}",
+            reason_codes=["DEPENDENCY_SOURCE_GIT_CACHE_PATH_UNSAFE"],
+        )
     repo_path = cache_entry / "repository"
     metadata_path = cache_entry / "metadata.json"
     cache_entry.mkdir(parents=True, exist_ok=True)
+    display_url = git_endpoint
+    deadline = time.monotonic() + clone_timeout
+    with _dependency_source_cache_lock(
+        cache_entry,
+        timeout=max(0.001, deadline - time.monotonic()),
+    ):
+        if time.monotonic() >= deadline:
+            raise StepError(
+                f"依赖源码 Git 操作超过总时限：{display_url}",
+                reason_codes=["DEPENDENCY_SOURCE_GIT_OPERATION_DEADLINE_EXCEEDED"],
+            )
+        # A killed clone may leave credentials in a report-owned temporary
+        # repository.  The cache lock proves no live writer owns these exact
+        # analyzer-generated paths, so recover them before reuse/retry.
+        for orphan in cache_entry.glob("repository.clone-*"):
+            if orphan.is_dir() and not orphan.is_symlink():
+                shutil.rmtree(orphan)
+        if _is_materialized_dependency_source_repo(
+            repo_path, git_url, deadline=deadline,
+        ):
+            write_json(
+                metadata_path,
+                {
+                    "schema": "java-upgrade-analyzer.dependency-source-git.v3",
+                    "git_url": display_url,
+                    "git_endpoint": git_endpoint,
+                    "git_url_sha256": git_endpoint_sha256,
+                    "git_endpoint_sha256": git_endpoint_sha256,
+                    "repo_path": str(repo_path.resolve()),
+                    "status": "ready",
+                    "attempts": [],
+                },
+            )
+            return {
+                "git_url": display_url,
+                "git_endpoint": git_endpoint,
+                "git_url_sha256": git_endpoint_sha256,
+                "git_endpoint_sha256": git_endpoint_sha256,
+                "repo_path": str(repo_path.resolve()),
+                "metadata_path": str(metadata_path.resolve()),
+                "reused": True,
+                "clone_attempts": 0,
+            }
 
-    if _is_materialized_dependency_source_repo(repo_path, git_url):
+        if time.monotonic() >= deadline:
+            raise StepError(
+                f"校验依赖源码 Git 缓存超过总时限：{display_url}",
+                reason_codes=["DEPENDENCY_SOURCE_GIT_OPERATION_DEADLINE_EXCEEDED"],
+            )
+        if repo_path.exists() or repo_path.is_symlink():
+            if repo_path.is_symlink():
+                raise StepError(
+                    "依赖源码 Git 缓存路径异常（检测到符号链接），为避免覆盖未知内容已停止："
+                    f"{repo_path}"
+                )
+            shutil.rmtree(repo_path)
+
+        attempts = []
+        temp_repo = None
+        last_reason = ""
+        valid = False
+        for attempt_number in range(1, 4):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                last_reason = "dependency source clone total deadline exhausted"
+                attempts.append({
+                    "attempt": attempt_number,
+                    "status": "remote_operation_deadline_exceeded",
+                    "reason": last_reason,
+                    "retryable": False,
+                })
+                break
+            temp_repo = cache_entry / (
+                f"repository.clone-{os.getpid()}-{threading.get_ident()}-"
+                f"{uuid.uuid4().hex}"
+            )
+            stdout, stderr, rc = run_cmd(
+                git_with_long_paths() + [
+                    "clone",
+                    "--origin",
+                    "origin",
+                    git_url,
+                    str(temp_repo),
+                ],
+                cwd=str(cache_entry),
+                timeout=remaining,
+                env={"GIT_TERMINAL_PROMPT": "0"},
+            )
+            valid = rc == 0 and _is_materialized_dependency_source_repo(
+                temp_repo, git_url, deadline=deadline,
+            )
+            if valid:
+                valid, scrub_reason = _scrub_materialized_dependency_source_origin(
+                    temp_repo,
+                    git_url,
+                    deadline=deadline,
+                )
+                if not valid:
+                    stderr = scrub_reason
+                    rc = 1
+            if valid:
+                attempts.append({
+                    "attempt": attempt_number,
+                    "status": "success",
+                    "reason": "",
+                    "retryable": False,
+                })
+                break
+            last_reason = str(
+                stderr or stdout or (
+                    "clone completed but repository validation failed"
+                    if rc == 0 else f"git clone exited with {rc}"
+                )
+            ).strip()
+            failure_type, retryable = classify_fetch_failure(last_reason, rc)
+            attempts.append({
+                "attempt": attempt_number,
+                "status": failure_type,
+                "reason": _redact_git_sensitive_text(
+                    last_reason.replace(git_url, display_url)
+                )[:1000],
+                "retryable": bool(retryable),
+            })
+            if temp_repo.exists() and not temp_repo.is_symlink():
+                shutil.rmtree(temp_repo)
+            temp_repo = None
+            if not retryable or attempt_number >= 3 or time.monotonic() >= deadline:
+                break
+            time.sleep(min(0.25 * (2 ** (attempt_number - 1)), max(0, deadline - time.monotonic())))
+
+        if temp_repo is None or not valid:
+            write_json(
+                metadata_path,
+                {
+                    "schema": "java-upgrade-analyzer.dependency-source-git.v3",
+                    "git_url": display_url,
+                    "git_endpoint": git_endpoint,
+                    "git_url_sha256": git_endpoint_sha256,
+                    "git_endpoint_sha256": git_endpoint_sha256,
+                    "repo_path": str(repo_path.resolve()),
+                    "status": "clone_failed",
+                    "attempts": _sanitize_git_persistence_payload(attempts),
+                },
+            )
+            reason = _redact_git_sensitive_text(
+                last_reason.replace(git_url, display_url)
+            )
+            raise StepError(
+                f"无法克隆依赖源码 Git 地址 {display_url}：{reason[:1000]}。"
+                f"已执行 {len(attempts)} 次受控尝试；已有分析产物不会被修改。",
+                reason_codes=["DEPENDENCY_SOURCE_GIT_CLONE_FAILED"],
+            )
+
+        if repo_path.exists():
+            if _is_materialized_dependency_source_repo(
+                repo_path, git_url, deadline=deadline,
+            ):
+                shutil.rmtree(temp_repo)
+            else:
+                shutil.rmtree(temp_repo)
+                raise StepError(
+                    f"依赖源码 Git 缓存被并发写入且结果无效：{repo_path}"
+                )
+        else:
+            temp_repo.replace(repo_path)
+
         write_json(
             metadata_path,
             {
-                "schema": "java-upgrade-analyzer.dependency-source-git.v1",
-                "git_url": git_url,
+                "schema": "java-upgrade-analyzer.dependency-source-git.v3",
+                "git_url": display_url,
+                "git_endpoint": git_endpoint,
+                "git_url_sha256": git_endpoint_sha256,
+                "git_endpoint_sha256": git_endpoint_sha256,
                 "repo_path": str(repo_path.resolve()),
                 "status": "ready",
+                "attempts": _sanitize_git_persistence_payload(attempts),
             },
         )
         return {
-            "git_url": git_url,
+            "git_url": display_url,
+            "git_endpoint": git_endpoint,
+            "git_url_sha256": git_endpoint_sha256,
+            "git_endpoint_sha256": git_endpoint_sha256,
             "repo_path": str(repo_path.resolve()),
             "metadata_path": str(metadata_path.resolve()),
-            "reused": True,
+            "reused": False,
+            "clone_attempts": len(attempts),
         }
-
-    if repo_path.exists() or repo_path.is_symlink():
-        if repo_path.is_symlink():
-            raise StepError(
-                "依赖源码 Git 缓存路径异常（检测到符号链接），为避免覆盖未知内容已停止："
-                f"{repo_path}"
-            )
-        shutil.rmtree(repo_path)
-
-    temp_repo = cache_entry / f"repository.clone-{os.getpid()}-{threading.get_ident()}"
-    if temp_repo.exists() or temp_repo.is_symlink():
-        if temp_repo.is_symlink():
-            temp_repo.unlink()
-        else:
-            shutil.rmtree(temp_repo)
-    stdout, stderr, rc = run_cmd(
-        git_with_long_paths() + [
-            "clone",
-            "--no-tags",
-            "--origin",
-            "origin",
-            git_url,
-            str(temp_repo),
-        ],
-        cwd=str(cache_entry),
-        timeout=clone_timeout,
-        env={"GIT_TERMINAL_PROMPT": "0"},
-    )
-    if rc != 0 or not _is_materialized_dependency_source_repo(temp_repo, git_url):
-        if temp_repo.exists() and not temp_repo.is_symlink():
-            shutil.rmtree(temp_repo)
-        reason = str(stderr or stdout or f"git clone exited with {rc}").strip()
-        reason = _redact_git_url(reason.replace(git_url, _redact_git_url(git_url)))
-        raise StepError(
-            f"无法克隆依赖源码 Git 地址 {_redact_git_url(git_url)}：{reason[:1000]}。"
-            "请确认地址和访问权限后重试；已有分析产物不会被修改。"
-        )
-
-    if repo_path.exists():
-        if _is_materialized_dependency_source_repo(repo_path, git_url):
-            shutil.rmtree(temp_repo)
-        else:
-            shutil.rmtree(temp_repo)
-            raise StepError(f"依赖源码 Git 缓存被并发写入且结果无效：{repo_path}")
-    else:
-        temp_repo.replace(repo_path)
-
-    write_json(
-        metadata_path,
-        {
-            "schema": "java-upgrade-analyzer.dependency-source-git.v1",
-            "git_url": git_url,
-            "repo_path": str(repo_path.resolve()),
-            "status": "ready",
-        },
-    )
-    return {
-        "git_url": git_url,
-        "repo_path": str(repo_path.resolve()),
-        "metadata_path": str(metadata_path.resolve()),
-        "reused": False,
-    }
 
 
 def materialize_dependency_source_inputs(source_inputs, project_dir, report_dir, clone_timeout=300):
@@ -2890,7 +3415,7 @@ def materialize_dependency_source_inputs(source_inputs, project_dir, report_dir,
                 report_dir,
                 clone_timeout=clone_timeout,
             )
-            git_urls.append(value)
+            git_urls.append(materialized["git_url"])
             local_dirs.append(materialized["repo_path"])
             materializations.append(materialized)
         else:
@@ -4657,6 +5182,156 @@ def _matching_repo_mappings_from_source_plan(coord_hint, repo_path, derived_repo
     return _dedupe_strings(matches)
 
 
+PINNED_SOURCE_SNAPSHOT_SCHEMA = "java-upgrade-analyzer.pinned-source-snapshot.v1"
+_FULL_GIT_COMMIT_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+
+
+def _normalized_pinned_relative_path(value, *, allow_root=True):
+    """Normalize one persisted repository-relative path without touching disk."""
+    text = str(value or "").strip().replace("\\", "/")
+    if text in ("", ".", "./"):
+        return "." if allow_root else ""
+    if text.startswith("/") or re.match(r"^[A-Za-z]:/", text):
+        return ""
+    parts = [part for part in text.split("/") if part not in ("", ".")]
+    if not parts or any(part == ".." for part in parts):
+        return ""
+    return "/".join(parts)
+
+
+def _pinned_snapshot_matches_context(snapshot, run_context):
+    if not isinstance(snapshot, dict):
+        return False
+    commit = str(snapshot.get("commit") or "").strip().lower()
+    current_commit = str(
+        (run_context or {}).get("current_resolved_commit") or ""
+    ).strip().lower()
+    if (
+        snapshot.get("schema") != PINNED_SOURCE_SNAPSHOT_SCHEMA
+        or not _FULL_GIT_COMMIT_RE.fullmatch(commit)
+        or commit != current_commit
+    ):
+        return False
+    project_path = _normalized_pinned_relative_path(
+        snapshot.get("project_path"), allow_root=True,
+    )
+    if not project_path:
+        return False
+    target_module = str((run_context or {}).get("target_module") or "").strip()
+    snapshot_target = str(snapshot.get("target_module") or "").strip()
+    if target_module != snapshot_target:
+        return False
+    profiles = _dedupe_strings(
+        (run_context or {}).get("active_maven_profiles") or []
+    )
+    snapshot_profiles = _dedupe_strings(snapshot.get("active_maven_profiles") or [])
+    return profiles == snapshot_profiles
+
+
+def _semantic_source_project_root(run_context, project_dir):
+    configured = str(
+        (run_context or {}).get("current_source_project_dir") or ""
+    ).strip()
+    return Path(configured).resolve() if configured else Path(project_dir).resolve()
+
+
+def _stable_path_from_project_relative(project_root, relative):
+    normalized = _normalized_pinned_relative_path(relative, allow_root=True)
+    if not normalized:
+        raise StepError(
+            f"固定源码快照包含非法相对路径：{relative}",
+            reason_codes=["PINNED_SOURCE_PATH_INVALID"],
+        )
+    return str(
+        Path(project_root).resolve()
+        if normalized == "."
+        else (Path(project_root).resolve() / normalized).resolve()
+    )
+
+
+def _materialize_project_scope_paths(logical_scope, project_root):
+    scope = dict(logical_scope or {})
+    if not scope:
+        return scope
+    scope["system_source"] = str(Path(project_root).resolve())
+    for key in ("source_roots", "resource_roots", "missing_declared_roots"):
+        scope[key] = [
+            _stable_path_from_project_relative(project_root, item)
+            for item in scope.get(key) or []
+        ]
+    details = []
+    for raw_item in scope.get("candidate_module_details") or []:
+        if not isinstance(raw_item, dict):
+            details.append(raw_item)
+            continue
+        item = dict(raw_item)
+        module_dir = str(item.get("module_dir") or "").strip()
+        if module_dir:
+            item["module_dir"] = _stable_path_from_project_relative(
+                project_root, module_dir,
+            )
+        details.append(item)
+    if details:
+        scope["candidate_module_details"] = details
+    canonical_scope = dict(scope)
+    canonical_scope.pop("scope_hash", None)
+    scope["scope_hash"] = hashlib.sha256(json.dumps(
+        canonical_scope,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    return scope
+
+
+def _apply_pinned_source_snapshot(run_context, project_dir):
+    updated = dict(run_context or {})
+    snapshot = dict(updated.get("pinned_source_snapshot") or {})
+    if not _pinned_snapshot_matches_context(snapshot, updated):
+        return None
+    project_root = _semantic_source_project_root(updated, project_dir)
+    source_roots = [
+        _stable_path_from_project_relative(project_root, item)
+        for item in snapshot.get("source_roots") or []
+    ]
+    updated["tool"] = str(snapshot.get("build_tool") or updated.get("tool") or "")
+    updated["project_scope"] = _materialize_project_scope_paths(
+        snapshot.get("project_scope") or {},
+        project_root,
+    )
+    updated["source_dirs"] = _dedupe_strings(source_roots)
+    updated["source_dirs_status"] = str(
+        snapshot.get("source_dirs_status") or "missing"
+    )
+    return updated
+
+
+def _discard_unpinned_local_source_discovery(run_context):
+    """Keep pre-ref checkpoints free of checkout-derived business scope."""
+    updated = dict(run_context or {})
+    if _pinned_snapshot_matches_context(
+        updated.get("pinned_source_snapshot"), updated,
+    ):
+        return updated
+    updated["project_scope"] = {
+        "schema": "java-upgrade-analyzer.project-scope.v1",
+        "status": "insufficient",
+        "reason_codes": ["current_source_not_pinned"],
+        "target_module": str(updated.get("target_module") or "").strip(),
+        "candidate_modules": [],
+        "candidate_module_details": [],
+        "included_modules": [],
+        "source_roots": [],
+        "resource_roots": [],
+    }
+    if str(updated.get("source_dirs_status") or "") != "explicit":
+        updated["source_dirs"] = []
+        updated["source_dirs_status"] = "missing"
+    if not updated.get("tool_explicit"):
+        updated["tool"] = ""
+    return updated
+
+
 def load_seed_json_arg(raw_value, project_dir):
     value = str(raw_value or "").strip()
     if not value:
@@ -4686,8 +5361,6 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
     merged = {**seed_input, **previous}
     merged = apply_explicit_step1_mode_selection(merged)
     project_dir = Path(args.project_dir).resolve()
-    detected_current_branch = detect_current_branch(project_dir)
-    _ = detect_base_branch(project_dir, detected_current_branch)
     detected_tool = detect_build_tool(project_dir)
     cli_scalar = (lambda value: value) if allow_external_seed else (lambda _value: None)
     cli_list = (lambda value: value) if allow_external_seed else (lambda _value: [])
@@ -4707,6 +5380,17 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
     confirmed_unresolved_items = list(resolve_value(None, merged, "confirmed_unresolved_items", []) or [])
     base_branch_explicit = _has_explicit_string_value(cli_scalar(args.base_branch), seed_input, previous, "base_branch")
     current_branch_explicit = _has_explicit_string_value(cli_scalar(args.current_branch), seed_input, previous, "current_branch")
+    tool_explicit = bool(
+        (
+            isinstance(cli_scalar(args.tool), str)
+            and str(cli_scalar(args.tool) or "").strip()
+        )
+        or (
+            isinstance(seed_input.get("tool"), str)
+            and str(seed_input.get("tool") or "").strip()
+        )
+        or previous.get("tool_explicit")
+    )
     # Branches are analysis inputs, not safe defaults.
     # Keep auto-detection out of the formal run context unless the user/runtime
     # explicitly provided them in a previous confirmed step.
@@ -4763,6 +5447,12 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
         ),
         "current_ref_candidate_count": resolve_value(None, merged, "current_ref_candidate_count", 0),
         "current_ref_source_status": resolve_value(None, merged, "current_ref_source_status", ""),
+        "pinned_source_snapshot": resolve_value(
+            None,
+            merged,
+            "pinned_source_snapshot",
+            {},
+        ),
         "current_allow_local_source": (
             parse_bool_like(merged.get("current_allow_local_source"), "current_allow_local_source")
             if "current_allow_local_source" in merged else False
@@ -4814,6 +5504,7 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
             else args.max_depth
         ),
         "tool": resolve_value(cli_scalar(args.tool), merged, "tool", detected_tool),
+        "tool_explicit": tool_explicit,
         "allow_degraded": (
             parse_bool_like(merged.get("allow_degraded"), "allow_degraded")
             if "allow_degraded" in merged
@@ -4841,6 +5532,12 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
             cli_scalar(getattr(args, "step4_fetch_timeout", None)),
             merged,
             "step4_fetch_timeout",
+            None,
+        ),
+        "dependency_source_clone_timeout": resolve_value(
+            cli_scalar(getattr(args, "dependency_source_clone_timeout", None)),
+            merged,
+            "dependency_source_clone_timeout",
             None,
         ),
         "step4_tool_install_timeout": resolve_value(
@@ -4915,12 +5612,23 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
         project_dir,
         "dependency_source_git_urls",
     ) or []
-    dependency_source_inputs = _dedupe_strings(
-        dependency_source_inputs + remembered_git_urls
-    )
-    clone_timeout_value = result.get("step4_fetch_timeout")
+    # New checkpoints keep Git URLs for display only and resume from the local
+    # materialized repository.  The fallback is solely for legacy checkpoints
+    # that stored a raw URL without a local path; a redacted address is never
+    # sent back to ``git clone``.
+    if not dependency_source_inputs:
+        dependency_source_inputs = [
+            value
+            for value in remembered_git_urls
+            if not _is_redacted_git_display_url(value)
+        ]
+    dependency_source_inputs = _dedupe_strings(dependency_source_inputs)
+    clone_timeout_value = result.get("dependency_source_clone_timeout")
     clone_timeout = (
-        parse_positive_int_like(clone_timeout_value, "step4_fetch_timeout")
+        parse_positive_int_like(
+            clone_timeout_value,
+            "dependency_source_clone_timeout",
+        )
         if clone_timeout_value not in (None, "")
         else 300
     )
@@ -4929,6 +5637,16 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
         project_dir,
         result["report_dir"],
         clone_timeout=clone_timeout,
+    )
+    dependency_source_materialization["dependency_source_git_urls"] = (
+        _dedupe_strings(
+            list(
+                dependency_source_materialization.get(
+                    "dependency_source_git_urls"
+                ) or []
+            )
+            + [_canonical_git_endpoint(value) for value in remembered_git_urls]
+        )
     )
     dependency_source_dirs = list(
         dependency_source_materialization.get("dependency_source_dirs") or []
@@ -4996,36 +5714,40 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
         result["target_module"] = modules_value[0]
     if result.get("primary_module") and not result.get("target_module"):
         result["target_module"] = result["primary_module"]
-    if result.get("target_module"):
-        result["project_scope"] = build_project_scope(
-            project_dir,
-            result["target_module"],
-            active_profiles=set(result["active_maven_profiles"]),
-            build_tool=result.get("tool", ""),
-        )
+    pinned_result = _apply_pinned_source_snapshot(result, project_dir)
+    if pinned_result is not None:
+        result = pinned_result
     else:
-        discovery = discover_project_modules(
-            project_dir, build_tool=result.get("tool", "")
+        if result.get("target_module"):
+            result["project_scope"] = build_project_scope(
+                project_dir,
+                result["target_module"],
+                active_profiles=set(result["active_maven_profiles"]),
+                build_tool=result.get("tool", ""),
+            )
+        else:
+            discovery = discover_project_modules(
+                project_dir, build_tool=result.get("tool", "")
+            )
+            result["project_scope"] = {
+                "schema": "java-upgrade-analyzer.project-scope.v1",
+                "status": "insufficient",
+                "reason_codes": ["target_module_unconfirmed"],
+                "target_module": "",
+                "candidate_modules": [item.get("module") for item in discovery.get("modules") or []],
+                "candidate_module_details": list(discovery.get("modules") or []),
+                "included_modules": [],
+                "source_roots": [],
+                "resource_roots": [],
+            }
+        source_dir_plan = _resolve_source_dirs_plan(
+            project_dir,
+            source_dirs=result.get("source_dirs"),
+            modules=result.get("modules"),
+            project_scope=result.get("project_scope"),
         )
-        result["project_scope"] = {
-            "schema": "java-upgrade-analyzer.project-scope.v1",
-            "status": "insufficient",
-            "reason_codes": ["target_module_unconfirmed"],
-            "target_module": "",
-            "candidate_modules": [item.get("module") for item in discovery.get("modules") or []],
-            "candidate_module_details": list(discovery.get("modules") or []),
-            "included_modules": [],
-            "source_roots": [],
-            "resource_roots": [],
-        }
-    source_dir_plan = _resolve_source_dirs_plan(
-        project_dir,
-        source_dirs=result.get("source_dirs"),
-        modules=result.get("modules"),
-        project_scope=result.get("project_scope"),
-    )
-    result["source_dirs"] = list(source_dir_plan.get("source_dirs") or [])
-    result["source_dirs_status"] = source_dir_plan.get("status") or "missing"
+        result["source_dirs"] = list(source_dir_plan.get("source_dirs") or [])
+        result["source_dirs_status"] = source_dir_plan.get("status") or "missing"
     source_plan_input_dirs = list(dependency_source_dirs)
     for item in list(result.get("dependency_repo_mappings") or []):
         coord_hint, repo_path = _split_dependency_repo_mapping_value(item)
@@ -5152,44 +5874,6 @@ def detect_build_tool(project_dir):
     if (project_dir / "gradlew").is_file() or (project_dir / "gradlew.bat").is_file():
         return "gradle"
     return "maven"
-
-
-def _git_try(project_dir, args):
-    stdout, _stderr, rc = run_cmd(git_cmd() + list(args), cwd=str(project_dir))
-    if rc != 0:
-        return None
-    out = (stdout or "").strip()
-    return out or None
-
-
-def is_git_repo(project_dir):
-    if not (project_dir / ".git").exists():
-        return False
-    inside = _git_try(project_dir, ["rev-parse", "--is-inside-work-tree"])
-    return (inside or "").lower() == "true"
-
-
-def detect_current_branch(project_dir):
-    if not (project_dir / ".git").exists():
-        return None
-    name = _git_try(project_dir, ["rev-parse", "--abbrev-ref", "HEAD"])
-    if not name or name == "HEAD":
-        return None
-    return name
-
-
-def detect_base_branch(project_dir, current_branch):
-    if not (project_dir / ".git").exists():
-        return None
-    upstream = _git_try(project_dir, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
-    if upstream:
-        return upstream
-    for candidate in ("main", "master", "develop"):
-        local = _git_try(project_dir, ["show-ref", "--verify", f"refs/heads/{candidate}"])
-        remote = _git_try(project_dir, ["show-ref", "--verify", f"refs/remotes/origin/{candidate}"])
-        if local or remote:
-            return candidate if local else f"origin/{candidate}"
-    return current_branch
 
 
 def _response_example_value(field, meta=None):
@@ -5868,10 +6552,18 @@ def build_step1_preflight_interaction(run_context):
         else "missing_step1_entry_inputs"
     )
     project_scope = dict(run_context.get("project_scope") or {})
-    module_candidates = list(
-        project_scope.get("candidate_module_details")
-        or project_scope.get("candidate_modules")
-        or []
+    pinned_snapshot = dict(run_context.get("pinned_source_snapshot") or {})
+    # Module candidates influence the user's scope choice.  Never present
+    # candidates discovered from HEAD/dirty files as if they described the
+    # remote current ref; only the pinned current snapshot is authoritative.
+    module_candidates = (
+        list(
+            project_scope.get("candidate_module_details")
+            or project_scope.get("candidate_modules")
+            or []
+        )
+        if _pinned_snapshot_matches_context(pinned_snapshot, run_context)
+        else []
     )
     if module_candidates and all(isinstance(item, dict) for item in module_candidates):
         module_candidates.sort(
@@ -5962,8 +6654,335 @@ def build_step1_preflight_interaction(run_context):
 
 
 def _step1_ref_repository(run_context, side, project_dir):
+    binding = (run_context or {}).get(f"{side}_ref_binding")
+    if isinstance(binding, dict):
+        bound_repo = str(binding.get("repo_dir") or "").strip()
+        if bound_repo:
+            return Path(bound_repo).resolve()
     source_dir = str(run_context.get(f"{side}_source_project_dir") or "").strip()
     return Path(source_dir).resolve() if source_dir else Path(project_dir).resolve()
+
+
+def _pinned_source_git_root(repo_dir):
+    stdout, stderr, rc = run_cmd(
+        git_cmd() + ["-C", str(Path(repo_dir).resolve()), "rev-parse", "--show-toplevel"],
+        timeout=30,
+    )
+    root = str(stdout or "").strip()
+    if rc != 0 or not root:
+        raise StepError(
+            "无法确定固定源码所在 Git 仓库根目录："
+            f"{str(stderr or stdout or f'git exited with {rc}').strip()}",
+            reason_codes=["PINNED_SOURCE_REPOSITORY_UNAVAILABLE"],
+        )
+    return Path(root).resolve()
+
+
+def _relative_path_inside(root, path, *, label):
+    root = Path(root).resolve()
+    path = Path(path).resolve()
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise StepError(
+            f"{label} 必须位于固定源码项目目录内：{path}（项目目录：{root}）",
+            reason_codes=["PINNED_SOURCE_PATH_OUTSIDE_PROJECT"],
+        ) from exc
+    normalized = _normalized_pinned_relative_path(
+        relative.as_posix(), allow_root=True,
+    )
+    if not normalized:
+        raise StepError(
+            f"{label} 无法转换为安全的项目相对路径：{path}",
+            reason_codes=["PINNED_SOURCE_PATH_INVALID"],
+        )
+    return normalized
+
+
+def _logicalize_project_scope_paths(scope, snapshot_project_root):
+    """Remove every temporary worktree path before checkpoint persistence."""
+    logical = dict(scope or {})
+    snapshot_project_root = Path(snapshot_project_root).resolve()
+    logical["system_source"] = "."
+    outside_paths = []
+    for key in ("source_roots", "resource_roots", "missing_declared_roots"):
+        relative_values = []
+        for value in logical.get(key) or []:
+            try:
+                relative_values.append(_relative_path_inside(
+                    snapshot_project_root,
+                    value,
+                    label=f"project_scope.{key}",
+                ))
+            except StepError:
+                outside_paths.append(str(value))
+        logical[key] = _dedupe_strings(relative_values)
+
+    details = []
+    for raw_item in logical.get("candidate_module_details") or []:
+        if not isinstance(raw_item, dict):
+            details.append(raw_item)
+            continue
+        item = dict(raw_item)
+        module_dir = str(item.get("module_dir") or "").strip()
+        if module_dir:
+            item["module_dir"] = _relative_path_inside(
+                snapshot_project_root,
+                module_dir,
+                label="candidate module",
+            )
+        details.append(item)
+    if details:
+        logical["candidate_module_details"] = details
+    if outside_paths:
+        logical["reason_codes"] = _dedupe_strings(
+            list(logical.get("reason_codes") or [])
+            + ["pinned_source_root_outside_project"]
+        )
+        if logical.get("status") != "insufficient":
+            logical["status"] = "partial"
+    logical.pop("scope_hash", None)
+    logical["scope_hash"] = hashlib.sha256(json.dumps(
+        logical,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    return logical
+
+
+@contextmanager
+def materialize_pinned_source_workspace(
+    run_context,
+    project_dir,
+    *,
+    label="pinned-src",
+):
+    """Map persisted logical source roots to a short immutable worktree."""
+    snapshot = dict((run_context or {}).get("pinned_source_snapshot") or {})
+    if not _pinned_snapshot_matches_context(snapshot, run_context):
+        raise StepError(
+            "固定源码快照缺失、已过期或与 current_resolved_commit 不一致。",
+            reason_codes=["PINNED_SOURCE_SNAPSHOT_MISMATCH"],
+        )
+    repo_dir = _step1_ref_repository(run_context, "current", project_dir)
+    git_root = _pinned_source_git_root(repo_dir)
+    commit = str(snapshot.get("commit") or "").strip().lower()
+    project_path = _normalized_pinned_relative_path(
+        snapshot.get("project_path"), allow_root=True,
+    )
+    worktree = None
+    try:
+        worktree = create_detached_worktree(
+            commit,
+            git_root,
+            label=label,
+            runner=run_cmd,
+            git_command=git_cmd(),
+        )
+        snapshot_project_root = (
+            worktree
+            if project_path == "."
+            else worktree / project_path
+        )
+        if not snapshot_project_root.is_dir():
+            raise StepError(
+                "固定 commit 中不存在源码项目目录："
+                f"{project_path}@{commit}",
+                reason_codes=["PINNED_SOURCE_PROJECT_MISSING_AT_COMMIT"],
+            )
+        mapped_source_dirs = []
+        for relative in snapshot.get("source_roots") or []:
+            normalized = _normalized_pinned_relative_path(
+                relative, allow_root=True,
+            )
+            if not normalized:
+                raise StepError(
+                    f"固定源码快照包含非法 source root：{relative}",
+                    reason_codes=["PINNED_SOURCE_PATH_INVALID"],
+                )
+            mapped = (
+                snapshot_project_root
+                if normalized == "."
+                else snapshot_project_root / normalized
+            )
+            if not mapped.is_dir():
+                raise StepError(
+                    "固定 commit 中不存在业务源码目录："
+                    f"{normalized}@{commit}",
+                    reason_codes=["PINNED_SOURCE_ROOT_MISSING_AT_COMMIT"],
+                )
+            mapped_source_dirs.append(str(mapped.resolve()))
+        yield {
+            "git_root": git_root,
+            "worktree": worktree,
+            "project_root": snapshot_project_root.resolve(),
+            "source_dirs": mapped_source_dirs,
+            "snapshot": snapshot,
+        }
+    finally:
+        if worktree is not None:
+            remove_detached_worktree(
+                worktree,
+                git_root,
+                runner=run_cmd,
+                git_command=git_cmd(),
+            )
+
+
+def rebuild_current_pinned_source_context(run_context, project_dir):
+    """Discover business structure exclusively from the pinned current SHA."""
+    updated = dict(run_context or {})
+    commit = str(updated.get("current_resolved_commit") or "").strip().lower()
+    if not _FULL_GIT_COMMIT_RE.fullmatch(commit):
+        # Direct-artifact runs may not yet have supplied a source ref.  Do not
+        # invent remote-backed scope from the mutable checkout in that case.
+        updated.pop("pinned_source_snapshot", None)
+        return updated
+
+    repo_dir = _step1_ref_repository(updated, "current", project_dir)
+    git_root = _pinned_source_git_root(repo_dir)
+    project_path = _relative_path_inside(
+        git_root,
+        repo_dir,
+        label="current source project",
+    )
+    worktree = None
+    try:
+        worktree = create_detached_worktree(
+            commit,
+            git_root,
+            label="s1-scope",
+            runner=run_cmd,
+            git_command=git_cmd(),
+        )
+        snapshot_project_root = (
+            worktree
+            if project_path == "."
+            else worktree / project_path
+        )
+        if not snapshot_project_root.is_dir():
+            raise StepError(
+                f"current 固定 commit 中不存在项目目录：{project_path}@{commit}",
+                reason_codes=["PINNED_SOURCE_PROJECT_MISSING_AT_COMMIT"],
+            )
+
+        detected_tool = detect_build_tool(snapshot_project_root)
+        configured_tool = (
+            str(updated.get("tool") or "").strip().lower()
+            if updated.get("tool_explicit")
+            else ""
+        )
+        build_tool = configured_tool or detected_tool
+        updated["tool"] = build_tool
+        target_module = str(updated.get("target_module") or "").strip()
+        active_profiles = set(updated.get("active_maven_profiles") or [])
+        if target_module:
+            scope = build_project_scope(
+                snapshot_project_root,
+                target_module,
+                active_profiles=active_profiles,
+                build_tool=build_tool,
+            )
+        else:
+            discovery = discover_project_modules(
+                snapshot_project_root,
+                build_tool=build_tool,
+                active_profiles=active_profiles,
+            )
+            scope = {
+                "schema": "java-upgrade-analyzer.project-scope.v1",
+                "build_tool": build_tool,
+                "status": "insufficient",
+                "reason_codes": ["target_module_unconfirmed"],
+                "system_source": str(snapshot_project_root.resolve()),
+                "source_revision": commit,
+                "target_module": "",
+                "candidate_modules": [
+                    item.get("module") for item in discovery.get("modules") or []
+                ],
+                "candidate_module_details": list(discovery.get("modules") or []),
+                "included_modules": [],
+                "source_roots": [],
+                "resource_roots": [],
+                "active_maven_profiles": sorted(active_profiles),
+            }
+
+        explicit_source_dirs = []
+        if str(updated.get("source_dirs_status") or "").strip() == "explicit":
+            semantic_project_root = _semantic_source_project_root(updated, project_dir)
+            for source_dir in updated.get("source_dirs") or []:
+                relative = _relative_path_inside(
+                    semantic_project_root,
+                    source_dir,
+                    label="source_dirs",
+                )
+                candidate = (
+                    snapshot_project_root
+                    if relative == "."
+                    else snapshot_project_root / relative
+                )
+                if not candidate.is_dir():
+                    raise StepError(
+                        "显式 source_dirs 在 current 固定 commit 中不存在："
+                        f"{relative}@{commit}",
+                        reason_codes=["PINNED_SOURCE_ROOT_MISSING_AT_COMMIT"],
+                    )
+                explicit_source_dirs.append(str(candidate.resolve()))
+        source_plan = _resolve_source_dirs_plan(
+            snapshot_project_root,
+            source_dirs=explicit_source_dirs or None,
+            modules=updated.get("modules"),
+            project_scope=scope,
+        )
+        relative_source_roots = [
+            _relative_path_inside(
+                snapshot_project_root,
+                path,
+                label="source root",
+            )
+            for path in source_plan.get("source_dirs") or []
+        ]
+        logical_scope = _logicalize_project_scope_paths(
+            scope,
+            snapshot_project_root,
+        )
+        snapshot = {
+            "schema": PINNED_SOURCE_SNAPSHOT_SCHEMA,
+            "side": "current",
+            "commit": commit,
+            "project_path": project_path,
+            "build_tool": build_tool,
+            "target_module": target_module,
+            "active_maven_profiles": sorted(active_profiles),
+            "source_roots": _dedupe_strings(relative_source_roots),
+            "resource_roots": list(logical_scope.get("resource_roots") or []),
+            "source_dirs_status": str(source_plan.get("status") or "missing"),
+            "project_scope": logical_scope,
+        }
+        updated["pinned_source_snapshot"] = snapshot
+        materialized = _apply_pinned_source_snapshot(updated, project_dir)
+        if materialized is None:
+            raise StepError(
+                "固定源码快照生成后未能通过一致性校验。",
+                reason_codes=["PINNED_SOURCE_SNAPSHOT_MISMATCH"],
+            )
+        return materialized
+    except StepError:
+        raise
+    except RuntimeError as exc:
+        raise StepError(
+            f"无法为 current 固定 commit 创建源码发现工作区：{exc}",
+            reason_codes=["PINNED_SOURCE_WORKTREE_FAILED"],
+        ) from exc
+    finally:
+        if worktree is not None:
+            remove_detached_worktree(
+                worktree,
+                git_root,
+                runner=run_cmd,
+                git_command=git_cmd(),
+            )
 
 
 def _step1_ref_request(
@@ -6280,8 +7299,17 @@ def build_step1_ref_confirmation_interaction(run_context, requests):
     }
 
 
-def resolve_step1_refs_for_execution(run_context, project_dir):
-    """Resolve explicit Step1 refs before Maven/Gradle execution."""
+def resolve_step1_refs_for_execution(
+    run_context,
+    project_dir,
+    *,
+    on_side_resolved=None,
+):
+    """Resolve every explicit Step1 ref and pin it before any build starts.
+
+    ``on_side_resolved`` is invoked after each side reaches a durable state.  A
+    base-side snapshot therefore survives a later current-side Git failure.
+    """
     updated = dict(run_context or {})
     bindings = {}
     for side in ("base", "current"):
@@ -6291,10 +7319,6 @@ def resolve_step1_refs_for_execution(run_context, project_dir):
             side,
             repo_dir,
         )
-    if updated.get("base_artifact_path") and updated.get("current_artifact_path"):
-        # Direct artifacts are parsed first. Ref resolution is deferred until a
-        # concrete unresolved nested JAR actually needs build-tool coordinate fallback.
-        return updated, None
     requests = []
     for side in ("base", "current"):
         branch_field = f"{side}_branch"
@@ -6317,6 +7341,46 @@ def resolve_step1_refs_for_execution(run_context, project_dir):
                 allow_dirty_local_source=bool(updated.get(f"{side}_allow_dirty_local_source")),
             )
             if resolution.get("status") != "resolved":
+                durable_binding = _durable_step1_ref_binding_from_failure(
+                    resolution,
+                    repo_dir,
+                    requested_ref,
+                    artifact_path=updated.get(f"{side}_artifact_path"),
+                    existing_binding=binding,
+                )
+                if durable_binding:
+                    # Persist the remote selection before reporting the local
+                    # materialization failure.  A later process must retry the
+                    # exact SHA, never resolve the branch again.
+                    updated[f"{side}_requested_ref"] = requested_ref
+                    updated[f"{side}_expected_commit"] = durable_binding[
+                        "expected_commit"
+                    ]
+                    updated[f"{side}_ref_resolution_fingerprint"] = str(
+                        resolution.get("fingerprint") or ""
+                    )
+                    updated[f"{side}_ref_candidate_count"] = len(
+                        resolution.get("candidates") or []
+                    )
+                    updated[f"{side}_ref_source_status"] = str(
+                        resolution.get("source_status")
+                        or resolution.get("status")
+                        or "remote_expected_commit_unmaterializable"
+                    )
+                    updated[f"{side}_ref_remote"] = durable_binding["remote"]
+                    updated[f"{side}_ref_remote_ref"] = durable_binding[
+                        "canonical_ref"
+                    ]
+                    updated[f"{side}_ref_queried_at"] = str(
+                        resolution.get("queried_at") or ""
+                    )
+                    updated[f"{side}_ref_binding"] = durable_binding
+                elif resolution.get("expected_commit"):
+                    updated[f"{side}_expected_commit"] = str(
+                        resolution.get("expected_commit") or ""
+                    )
+                if on_side_resolved is not None:
+                    on_side_resolved(dict(updated), side, dict(resolution))
                 if resolution.get("source_status") in {
                     "remote_expected_commit_unmaterializable",
                     "remote_ref_moved",
@@ -6348,8 +7412,6 @@ def resolve_step1_refs_for_execution(run_context, project_dir):
                         f"（仓库: {repo_dir}）：{failure_reason}",
                         reason_codes=["STEP1_REMOTE_OPERATION_FAILED"],
                     )
-                if resolution.get("expected_commit"):
-                    updated[f"{side}_expected_commit"] = str(resolution.get("expected_commit") or "")
                 requests.append(
                     _step1_ref_request(
                         side,
@@ -6386,6 +7448,8 @@ def resolve_step1_refs_for_execution(run_context, project_dir):
                 ),
                 artifact_path=updated.get(f"{side}_artifact_path"),
             )
+            if on_side_resolved is not None:
+                on_side_resolved(dict(updated), side, dict(resolution))
             continue
         if source_dir:
             resolution = resolve_step1_ref(repo_dir, "HEAD")
@@ -8412,7 +9476,11 @@ def expand_step1_ref_selections(pending_interaction, user_response):
 
     if response.get("retry_remote_fetch") is True:
         for side, item in decision_items.items():
-            if str(item.get("source_status") or "") != "remote_fetch_failed":
+            if str(item.get("source_status") or "") not in {
+                "remote_fetch_failed",
+                "remote_query_failed",
+                "remote_expected_commit_unmaterializable",
+            }:
                 continue
             candidates = list(item.get("candidates") or [])
             commits = {str(candidate.get("commit") or "") for candidate in candidates if candidate.get("commit")}
@@ -9246,6 +10314,67 @@ def maybe_return_pending_interaction(report_dir, pending_interaction):
     return EXIT_AWAITING_USER
 
 
+_STEP1_REVALIDATABLE_GIT_REASONS = {
+    "step1_remote_configuration_missing",
+    "step1_remote_fetch_failed",
+    "step1_remote_source_unavailable",
+    "step1_source_ref_not_found",
+}
+_STEP1_REVALIDATABLE_GIT_STATUSES = {
+    "remote_configuration_missing",
+    "remote_fetch_failed",
+    "remote_query_failed",
+    "remote_source_unavailable",
+    "awaiting_local_source_confirmation",
+}
+
+
+def pending_interaction_needs_git_recheck(pending_interaction):
+    """Return true when a saved Step1 card describes mutable Git state.
+
+    Such a card is evidence from an earlier process, not a durable user
+    decision.  Replaying it without touching Git can keep reporting a network
+    or remote-configuration failure after the condition has recovered.
+    """
+    interaction = dict(pending_interaction or {})
+    if str(interaction.get("step_id") or "").strip() != "step1":
+        return False
+    reason_code = str(interaction.get("reason_code") or "").strip().lower()
+    if reason_code in _STEP1_REVALIDATABLE_GIT_REASONS:
+        return True
+    for request in interaction.get("ref_resolution_requests") or []:
+        if not isinstance(request, dict):
+            continue
+        source_status = str(request.get("source_status") or "").strip().lower()
+        if source_status in _STEP1_REVALIDATABLE_GIT_STATUSES:
+            return True
+    return False
+
+
+def clear_stale_git_interaction_for_recheck(
+    main_state,
+    report_dir,
+    pending_interaction,
+):
+    state = (main_state or {}).get("state") or {}
+    if str(state.get("status") or "").strip() == "paused_by_user":
+        return False
+    if not pending_interaction_needs_git_recheck(pending_interaction):
+        return False
+    update_main_state_state(
+        main_state,
+        current_step="step1",
+        completed_step=state.get("completed_step"),
+        status="ready",
+        blocking_reason=None,
+        blocking_reason_codes=[],
+        pending_interaction=None,
+    )
+    save_main_state(report_dir, main_state)
+    clear_interaction_file(report_dir)
+    return True
+
+
 def handle_step2_resume_followups(
     main_state,
     report_dir,
@@ -9405,6 +10534,9 @@ def maybe_emit_step1_preflight_interaction(step_id, main_state, report_dir, pref
         project_dir=Path(report_dir).resolve().parent,
         report_dir=report_dir,
     )
+    preflight_interaction = _sanitize_git_persistence_payload(
+        preflight_interaction
+    )
     update_main_state_state(
         main_state,
         current_step=step_id,
@@ -9436,6 +10568,7 @@ def persist_step_interaction(main_state, step_id, report_dir, run_context, inter
         project_dir=Path(report_dir).resolve().parent,
         report_dir=report_dir,
     )
+    interaction = _sanitize_git_persistence_payload(interaction)
     update_main_state_state(
         main_state,
         current_step=current_step_for_pending_interaction(step_id, interaction),
@@ -9770,6 +10903,7 @@ def persist_interaction_required_error(main_state, step_id, report_dir, interact
         report_dir=report_dir,
     )
     interaction = annotate_dependency_source_dirs_interaction(interaction, runtime_view, report_dir)
+    interaction = _sanitize_git_persistence_payload(interaction)
     update_main_state_state(
         main_state,
         current_step=step_id,
@@ -9791,12 +10925,13 @@ def persist_interaction_required_error(main_state, step_id, report_dir, interact
 
 
 def persist_step_error(main_state, step_id, report_dir, exc):
+    safe_error = _redact_git_sensitive_text(str(exc))
     update_main_state_state(
         main_state,
         current_step=step_id,
         completed_step=(main_state.get("state") or {}).get("completed_step"),
         status="blocked_by_system",
-        blocking_reason=str(exc),
+        blocking_reason=safe_error,
         blocking_reason_codes=list(getattr(exc, "reason_codes", []) or []),
         pending_interaction=None,
     )
@@ -9807,7 +10942,7 @@ def persist_step_error(main_state, step_id, report_dir, exc):
         step_id,
         report_dir,
         event="step_failed",
-        error=str(exc),
+        error=safe_error,
     )
 
 
@@ -10045,8 +11180,8 @@ def execute_step(step_id, args, manifest_steps, run_context, main_state=None):
         ensure_exists(dep_changes, "Step2 缺少 evidence/dependencies/dep_changes.csv，请先执行 Step1")
         base_branch = run_context.get("base_branch")
         current_branch = run_context.get("current_branch")
-        base_revision = str(run_context.get("base_resolved_commit") or base_branch or "").strip()
-        current_revision = str(run_context.get("current_resolved_commit") or current_branch or "").strip()
+        base_revision = str(run_context.get("base_resolved_commit") or "").strip().lower()
+        current_revision = str(run_context.get("current_resolved_commit") or "").strip().lower()
         if not (base_branch and current_branch):
             if run_context.get("artifact_input_mode"):
                 raise StepError(
@@ -10058,10 +11193,19 @@ def execute_step(step_id, args, manifest_steps, run_context, main_state=None):
                 "Step2 需要基准分支和当前分支。请检查 .runtime/state/main_state.json 中的 step2.input / step1.output，"
                 "或回到最近的 checkpoint 通过 --response-json / --response-file 把分支写回主状态后再继续。"
             )
-        if is_git_repo(project_dir) and base_revision == current_revision:
+        if not all(
+            re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", revision)
+            for revision in (base_revision, current_revision)
+        ):
+            raise StepError(
+                "Step2 拒绝使用可移动的 branch/ref：Step1 必须先从远端分别解析并持久化 "
+                "base_resolved_commit/current_resolved_commit，后续分析只消费固定 commit。",
+                reason_codes=["STEP2_SOURCE_COMMIT_NOT_PINNED"],
+            )
+        if base_revision == current_revision:
             raise StepError(
                 f"Step2 检测到 base/current 执行 revision 相同（{base_revision}），无法进行 git diff/推断。"
-                "请回到最近的 checkpoint 或修正 .runtime/state/main_state.json，明确写入两个不同分支后再继续。"
+                "请回到最近的 checkpoint 或修正远端 ref，确保两侧固定到不同 commit 后再继续。"
             )
         cmd = [
             "--dep-changes", str(dep_changes),
@@ -10088,7 +11232,25 @@ def execute_step(step_id, args, manifest_steps, run_context, main_state=None):
             cmd.extend(["--dep-current", str(dep_current)])
         elif dep_changes.exists():
             cmd.extend(["--dep-changes", str(dep_changes)])
-        run_python("s3_scan.py", cmd, project_dir, report_dir=report_dir)
+        if _pinned_snapshot_matches_context(
+            run_context.get("pinned_source_snapshot"), run_context,
+        ):
+            with materialize_pinned_source_workspace(
+                run_context, project_dir, label="s3-src",
+            ) as workspace:
+                pinned_cmd = list(cmd)
+                if workspace.get("source_dirs"):
+                    pinned_cmd.extend(
+                        ["--source-dirs", *workspace["source_dirs"]]
+                    )
+                run_python(
+                    "s3_scan.py",
+                    pinned_cmd,
+                    workspace["project_root"],
+                    report_dir=report_dir,
+                )
+        else:
+            run_python("s3_scan.py", cmd, project_dir, report_dir=report_dir)
 
     elif step_id == "step4":
         validate_run_context_for_step(step_id, run_context)
@@ -10189,6 +11351,7 @@ def main(argv=None, _skip_environment_contract=False):
     ap.add_argument("--step4-git-diff-timeout", type=int, default=None)
     ap.add_argument("--step4-japicmp-timeout", type=int, default=None)
     ap.add_argument("--step4-fetch-timeout", type=int, default=None)
+    ap.add_argument("--dependency-source-clone-timeout", type=int, default=None)
     ap.add_argument("--step4-tool-install-timeout", type=int, default=None)
     ap.add_argument("--step4-workers", type=int, default=None)
     ap.add_argument("--step5-timeout", type=int, default=None)
@@ -10261,14 +11424,20 @@ def main(argv=None, _skip_environment_contract=False):
     manifest_data, manifest_steps = load_manifest(args.manifest)
     pending_interaction = (main_state.get("state") or {}).get("pending_interaction")
     if pending_interaction:
+        original_pending_interaction = pending_interaction
+        pending_interaction = _sanitize_git_persistence_payload(
+            pending_interaction
+        )
         enhanced_pending_interaction = apply_interaction_protocol_enhancements(
             pending_interaction,
             str(pending_interaction.get("step_id") or ""),
             project_dir=project_dir,
             report_dir=report_dir,
         )
-        if enhanced_pending_interaction != pending_interaction:
-            pending_interaction = enhanced_pending_interaction
+        pending_interaction = _sanitize_git_persistence_payload(
+            enhanced_pending_interaction
+        )
+        if pending_interaction != original_pending_interaction:
             main_state["state"]["pending_interaction"] = dict(pending_interaction)
             save_main_state(report_dir, main_state)
             save_interaction_file(report_dir, pending_interaction)
@@ -10325,6 +11494,17 @@ def main(argv=None, _skip_environment_contract=False):
     if response_result["early_exit_code"] is not None:
         return response_result["early_exit_code"]
 
+    if (
+        structured_user_response is None
+        and clear_stale_git_interaction_for_recheck(
+            main_state,
+            report_dir,
+            pending_interaction,
+        )
+    ):
+        pending_interaction = None
+        resumed_interaction_step_id = ""
+
     early_exit = maybe_return_pending_interaction(report_dir, pending_interaction)
     if early_exit is not None:
         return early_exit
@@ -10352,18 +11532,50 @@ def main(argv=None, _skip_environment_contract=False):
         seed_payload,
         allow_external_seed=not bool(base_context),
     )
+    if step_id == "step1":
+        run_context = _discard_unpinned_local_source_discovery(run_context)
     store_step_input(main_state, step_id, run_context)
     save_main_state(report_dir, main_state)
-    preflight_exit = maybe_emit_step1_preflight_interaction(
-        step_id,
-        main_state,
-        report_dir,
-        build_step1_preflight_interaction(run_context),
+    initial_preflight = build_step1_preflight_interaction(run_context)
+    # If refs are present and only target_module is missing, pin current first
+    # so module candidates come from the remote-selected SHA.  Entry fields
+    # such as branches/artifacts still block before any Git work is attempted.
+    initial_missing_fields = set(
+        (initial_preflight or {}).get("required_fields") or []
     )
-    if preflight_exit is not None:
-        return preflight_exit
+    should_defer_target_only_preflight = bool(
+        step_id == "step1"
+        and initial_preflight
+        and initial_missing_fields == {"target_module"}
+        and run_context.get("current_branch")
+    )
+    if not should_defer_target_only_preflight:
+        preflight_exit = maybe_emit_step1_preflight_interaction(
+            step_id,
+            main_state,
+            report_dir,
+            initial_preflight,
+        )
+        if preflight_exit is not None:
+            return preflight_exit
     if step_id == "step1":
-        run_context, ref_interaction = resolve_step1_refs_for_execution(run_context, project_dir)
+        def persist_ref_snapshot(partial_context, _side, _resolution):
+            store_step_input(main_state, step_id, partial_context)
+            save_main_state(report_dir, main_state)
+
+        try:
+            run_context, ref_interaction = resolve_step1_refs_for_execution(
+                run_context,
+                project_dir,
+                on_side_resolved=persist_ref_snapshot,
+            )
+        except StepError as exc:
+            persist_step_error(main_state, step_id, report_dir, exc)
+            for line in build_user_runtime_message(
+                "failed", step_id, reason=exc,
+            ):
+                print(line, file=sys.stderr)
+            return 1
         store_step_input(main_state, step_id, run_context)
         save_main_state(report_dir, main_state)
         ref_preflight_exit = maybe_emit_step1_preflight_interaction(
@@ -10374,6 +11586,51 @@ def main(argv=None, _skip_environment_contract=False):
         )
         if ref_preflight_exit is not None:
             return ref_preflight_exit
+        try:
+            run_context = rebuild_current_pinned_source_context(
+                run_context,
+                project_dir,
+            )
+        except StepError as exc:
+            persist_step_error(main_state, step_id, report_dir, exc)
+            for line in build_user_runtime_message(
+                "failed", step_id, reason=exc,
+            ):
+                print(line, file=sys.stderr)
+            return 1
+        store_step_input(main_state, step_id, run_context)
+        save_main_state(report_dir, main_state)
+        pinned_scope_preflight_exit = maybe_emit_step1_preflight_interaction(
+            step_id,
+            main_state,
+            report_dir,
+            build_step1_preflight_interaction(run_context),
+        )
+        if pinned_scope_preflight_exit is not None:
+            return pinned_scope_preflight_exit
+    elif (
+        step_id == "step2"
+        and _FULL_GIT_COMMIT_RE.fullmatch(
+            str(run_context.get("current_resolved_commit") or "").strip().lower()
+        )
+        and not _pinned_snapshot_matches_context(
+            run_context.get("pinned_source_snapshot"), run_context,
+        )
+    ):
+        try:
+            run_context = rebuild_current_pinned_source_context(
+                run_context,
+                project_dir,
+            )
+        except StepError as exc:
+            persist_step_error(main_state, step_id, report_dir, exc)
+            for line in build_user_runtime_message(
+                "failed", step_id, reason=exc,
+            ):
+                print(line, file=sys.stderr)
+            return 1
+        store_step_input(main_state, step_id, run_context)
+        save_main_state(report_dir, main_state)
 
     task_name = USER_TASK_NAMES.get(step_id, "当前分析")
     print("", file=sys.stderr)

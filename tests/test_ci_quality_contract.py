@@ -130,10 +130,11 @@ class CiQualityContractTest(unittest.TestCase):
     def test_git_change_check_prefers_github_base_branch(self):
         def fake_git(*args):
             candidate = args[-1]
-            return type("Result", (), {
-                "returncode": 0 if candidate == "origin/release" else 1,
-                "stdout": "feature\n" if args[:2] == ("branch", "--show-current") else "",
-            })()
+            return (
+                "feature\n" if args[:2] == ("branch", "--show-current") else "",
+                "",
+                0 if candidate == "origin/release" else 1,
+            )
 
         with patch.dict(git_change_check.os.environ, {"GITHUB_BASE_REF": "release"}), \
                 patch.object(git_change_check, "_git", side_effect=fake_git):
@@ -142,11 +143,8 @@ class CiQualityContractTest(unittest.TestCase):
     def test_git_change_check_uses_previous_commit_on_main(self):
         def fake_git(*args):
             if args[:2] == ("branch", "--show-current"):
-                return type("Result", (), {"returncode": 0, "stdout": "main\n"})()
-            return type("Result", (), {
-                "returncode": 0 if args[-1] == "HEAD^" else 1,
-                "stdout": "",
-            })()
+                return "main\n", "", 0
+            return "", "", 0 if args[-1] == "HEAD^" else 1
 
         with patch.dict(git_change_check.os.environ, {}, clear=True), \
                 patch.object(git_change_check, "_git", side_effect=fake_git):

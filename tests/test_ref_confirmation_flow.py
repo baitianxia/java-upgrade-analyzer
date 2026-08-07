@@ -15,23 +15,79 @@ import s2_context_from_deps as step2  # noqa: E402
 
 
 class RefConfirmationFlowTest(unittest.TestCase):
+    def test_step2_requires_full_materialized_commit_before_git_queries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            import subprocess
+
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(
+                [
+                    "git", "-C", str(repo), "-c", "user.name=Test",
+                    "-c", "user.email=test@example.invalid", "commit",
+                    "--allow-empty", "-qm", "snapshot",
+                ],
+                check=True,
+            )
+            commit = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+            self.assertEqual(
+                step2.require_pinned_git_commit(commit, repo, side="base"),
+                commit,
+            )
+            with self.assertRaisesRegex(
+                RuntimeError, "STEP2_BASE_COMMIT_NOT_PINNED",
+            ):
+                step2.require_pinned_git_commit("origin/main", repo, side="base")
+            with self.assertRaisesRegex(
+                RuntimeError, "STEP2_CURRENT_COMMIT_UNAVAILABLE",
+            ):
+                step2.require_pinned_git_commit(
+                    "f" * 40, repo, side="current",
+                )
+
+    def test_step2_strict_git_diff_does_not_turn_failure_into_no_changes(self):
+        with patch.object(
+            step2, "is_git_repo", return_value=True,
+        ), patch.object(
+            step2, "run_cmd", return_value=("", "fatal: bad object", 128),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "STEP2_GIT_DIFF_FAILED"):
+                step2.detect_jvm_param_changes(
+                    "a" * 40,
+                    "b" * 40,
+                    "/repo",
+                    strict_git=True,
+                )
+
     def test_step4_remote_commit_override_matches_live_remote_commit(self):
         commit = "a" * 40
         record = {
             "ref": "origin/release",
             "short_name": "release",
+            "kind": "branch",
             "commit": commit,
             "canonical_ref": "refs/heads/release",
             "remote": "origin",
         }
-        inventory = {
-            "remotes": [record["ref"]],
-            "remote_records": [record],
-            "remote_failures": [],
-            "heads": [],
-            "tags": [],
+        remote_resolution = {
+            "status": "remote_source_resolved",
+            "resolved_ref": record["ref"],
+            "resolved_commit": commit,
+            "remote": record["remote"],
+            "remote_ref": record["canonical_ref"],
+            "candidates": [record],
         }
-        with patch.object(step4, "_list_repo_refs", return_value=inventory), patch.object(
+        with patch.object(
+            step4,
+            "resolve_remote_source_ref",
+            return_value=remote_resolution,
+        ) as remote_resolver, patch.object(
             step4, "resolve_local_source_ref"
         ) as local_resolver:
             resolved, reason, candidates = step4.resolve_repo_ref_for_version(
@@ -44,42 +100,47 @@ class RefConfirmationFlowTest(unittest.TestCase):
         self.assertEqual(resolved, "origin/release")
         self.assertIn("kind=remote_commit", reason)
         self.assertEqual(candidates[0]["commit"], commit)
+        self.assertEqual(
+            remote_resolver.call_args.kwargs["expected_commit"], commit
+        )
         local_resolver.assert_not_called()
 
     def test_step4_remote_commit_override_materializes_as_remote_source(self):
         old_commit = "a" * 40
         new_commit = "b" * 40
-        records = [
+        remote_resolutions = [
             {
-                "ref": "origin/release-1",
-                "short_name": "release-1",
-                "commit": old_commit,
-                "canonical_ref": "refs/heads/release-1",
+                "status": "remote_source_resolved",
+                "resolved_ref": commit,
+                "resolved_commit": commit,
                 "remote": "origin",
-            },
-            {
-                "ref": "origin/release-2",
-                "short_name": "release-2",
-                "commit": new_commit,
-                "canonical_ref": "refs/heads/release-2",
-                "remote": "origin",
-            },
+                "remote_ref": "",
+                "candidates": [{
+                    "ref": commit,
+                    "kind": "commit",
+                    "commit": commit,
+                    "canonical_ref": "",
+                    "remote": "origin",
+                }],
+            }
+            for commit in (old_commit, new_commit)
         ]
-        inventory = {
-            "remotes": [item["ref"] for item in records],
-            "remote_records": records,
-            "remote_failures": [],
-            "heads": [],
-            "tags": [],
-        }
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / ".git").mkdir()
-            with patch.object(step4, "_list_repo_refs", return_value=inventory), patch.object(
+            with patch.object(
                 step4,
-                "materialize_remote_source_candidate",
+                "resolve_remote_source_ref",
+                side_effect=remote_resolutions,
+            ) as remote_resolver, patch.object(
+                step4,
+                "_is_git_worktree",
+                return_value=True,
+            ), patch.object(
+                step4,
+                "_materialize_resolved_remote_ref",
                 side_effect=[
-                    {"status": "remote_source_resolved", "resolved_commit": old_commit},
-                    {"status": "remote_source_resolved", "resolved_commit": new_commit},
+                    ({"status": "remote_source_resolved", "resolved_commit": old_commit}, ""),
+                    ({"status": "remote_source_resolved", "resolved_commit": new_commit}, ""),
                 ],
             ):
                 plan = step4.resolve_gitdiff_ref_plan_for_row(
@@ -101,17 +162,19 @@ class RefConfirmationFlowTest(unittest.TestCase):
         self.assertEqual(plan["new_source"]["status"], "remote_source_resolved")
         self.assertEqual(plan["base_ref"], old_commit)
         self.assertEqual(plan["cur_ref"], new_commit)
+        self.assertEqual(remote_resolver.call_count, 2)
 
     def test_step4_unavailable_remote_keeps_local_candidate_as_metadata(self):
         local_commit = "b" * 40
-        inventory = {
-            "remotes": [],
-            "remote_records": [],
-            "remote_failures": [],
-            "heads": [],
-            "tags": [],
-        }
-        with patch.object(step4, "_list_repo_refs", return_value=inventory), patch.object(
+        with patch.object(
+            step4,
+            "resolve_remote_source_ref",
+            return_value={
+                "status": "remote_ref_not_found",
+                "candidates": [],
+                "failures": [],
+            },
+        ), patch.object(
             step4,
             "resolve_local_source_ref",
             return_value={
@@ -132,14 +195,15 @@ class RefConfirmationFlowTest(unittest.TestCase):
 
     def test_step4_explicit_local_authorization_is_required_before_adoption(self):
         local_commit = "c" * 40
-        inventory = {
-            "remotes": [],
-            "remote_records": [],
-            "remote_failures": [],
-            "heads": [],
-            "tags": [],
-        }
-        with patch.object(step4, "_list_repo_refs", return_value=inventory), patch.object(
+        with patch.object(
+            step4,
+            "resolve_remote_source_ref",
+            return_value={
+                "status": "remote_ref_not_found",
+                "candidates": [],
+                "failures": [],
+            },
+        ), patch.object(
             step4,
             "resolve_local_source_ref",
             return_value={
@@ -171,7 +235,7 @@ class RefConfirmationFlowTest(unittest.TestCase):
         local_commit = "d" * 40
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / ".git").mkdir()
-            with patch.object(
+            with patch.object(step4, "_is_git_worktree", return_value=True), patch.object(
                 step4,
                 "resolve_repo_ref_pair_for_versions",
                 return_value=(
@@ -228,7 +292,7 @@ class RefConfirmationFlowTest(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / ".git").mkdir()
-            with patch.object(
+            with patch.object(step4, "_is_git_worktree", return_value=True), patch.object(
                 step4,
                 "resolve_repo_ref_pair_for_versions",
                 return_value=(
@@ -291,26 +355,31 @@ class RefConfirmationFlowTest(unittest.TestCase):
     def test_canonical_remote_ref_with_different_remote_commits_is_ambiguous(self):
         records = [
             {
-                "ref": "origin/release",
+                "ref": "first/release",
                 "short_name": "release",
+                "kind": "branch",
                 "commit": "a" * 40,
                 "canonical_ref": "refs/heads/release",
-                "remote": "origin",
+                "remote": "first",
             },
             {
-                "ref": "upstream/release",
+                "ref": "second/release",
                 "short_name": "release",
+                "kind": "branch",
                 "commit": "b" * 40,
                 "canonical_ref": "refs/heads/release",
-                "remote": "upstream",
+                "remote": "second",
             },
         ]
-        with patch.object(step4, "_list_repo_refs", return_value={
-            "remotes": [item["ref"] for item in records],
-            "remote_records": records,
-            "heads": [],
-            "tags": [],
-        }):
+        with patch.object(
+            step4,
+            "resolve_remote_source_ref",
+            return_value={
+                "status": "remote_source_ambiguous",
+                "candidates": records,
+                "failures": [],
+            },
+        ), patch.object(step4, "resolve_local_source_ref") as local_resolver:
             resolved, reason, _candidates = step4.resolve_repo_ref_for_version(
                 "/repo",
                 "1.0.0",
@@ -319,8 +388,9 @@ class RefConfirmationFlowTest(unittest.TestCase):
 
         self.assertIsNone(resolved)
         self.assertEqual(reason, "ambiguous_explicit_remote_ref=refs/heads/release")
+        local_resolver.assert_not_called()
 
-    def test_failed_remote_prevents_automatic_version_match(self):
+    def test_unrelated_failed_remote_does_not_poison_unique_healthy_match(self):
         record = {
             "ref": "origin/release-1.0.0",
             "short_name": "release-1.0.0",
@@ -332,19 +402,58 @@ class RefConfirmationFlowTest(unittest.TestCase):
             "remotes": [record["ref"]],
             "remote_records": [record],
             "remote_failures": [{"remote": "upstream", "reason": "timed out"}],
+            "configured_remotes": ["origin", "upstream"],
             "heads": [],
             "tags": [],
         }
-        with patch.object(step4, "_list_repo_refs", return_value=inventory):
+        with patch.object(
+            step4,
+            "_list_repo_refs",
+            return_value=inventory,
+        ), patch.object(
+            step4,
+            "resolve_remote_source_ref",
+            return_value={
+                "status": "remote_source_resolved",
+                "resolved_ref": record["ref"],
+                "resolved_commit": record["commit"],
+                "remote": record["remote"],
+                "remote_ref": record["canonical_ref"],
+                "candidates": [record],
+            },
+        ):
             resolved, reason, _candidates = step4.resolve_repo_ref_for_version("/repo", "1.0.0")
             explicit, explicit_reason, _ = step4.resolve_repo_ref_for_version(
                 "/repo", "1.0.0", selected_ref="origin/release-1.0.0"
             )
 
-        self.assertIsNone(resolved)
-        self.assertEqual(reason, "remote_query_failed=timed out")
+        self.assertEqual(resolved, "origin/release-1.0.0")
+        self.assertIn("matched_by_version", reason)
         self.assertEqual(explicit, "origin/release-1.0.0")
         self.assertIn("selected_by_user", explicit_reason)
+
+    def test_failure_on_selected_remote_still_blocks_automatic_match(self):
+        record = {
+            "ref": "origin/release-1.0.0",
+            "short_name": "release-1.0.0",
+            "commit": "a" * 40,
+            "canonical_ref": "refs/heads/release-1.0.0",
+            "remote": "origin",
+        }
+        with patch.object(step4, "_list_repo_refs", return_value={
+            "remotes": [record["ref"]],
+            "remote_records": [record],
+            "remote_failures": [{"remote": "origin", "reason": "timed out"}],
+            "heads": [],
+            "tags": [],
+        }):
+            resolved, reason, _candidates = step4.resolve_repo_ref_for_version(
+                "/repo",
+                "1.0.0",
+            )
+
+        self.assertIsNone(resolved)
+        self.assertEqual(reason, "remote_query_failed=timed out")
 
     def test_compact_step4_selection_preserves_expected_commits(self):
         pending_item = {
@@ -454,6 +563,34 @@ class RefConfirmationFlowTest(unittest.TestCase):
         )
         run_step.validate_pending_interaction_response(interaction, response)
 
+    def test_step1_remote_query_retry_preserves_the_unique_pinned_candidate(self):
+        resolution = {
+            "status": "fetch_failed",
+            "requested_ref": "release",
+            "source_status": "remote_query_failed",
+            "candidates": [{
+                "ref": "origin/release",
+                "commit": "a" * 40,
+                "remote": "origin",
+                "canonical_ref": "refs/heads/release",
+            }],
+            "failures": [{"stage": "ls_remote", "reason": "timed out"}],
+        }
+        request = run_step._step1_ref_request(
+            "current", "current_branch", "/repo", resolution,
+        )
+        interaction = run_step.build_step1_ref_confirmation_interaction(
+            {}, [request],
+        )
+
+        response = run_step.expand_step1_ref_selections(interaction, {
+            "action": "continue",
+            "retry_remote_fetch": True,
+        })
+
+        self.assertEqual(response["current_branch"], "origin/release")
+        self.assertEqual(response["current_expected_commit"], "a" * 40)
+
     def test_step2_uses_fixed_commits_but_keeps_branch_labels(self):
         with tempfile.TemporaryDirectory() as tmp:
             dep_changes = Path(tmp) / "deps.csv"
@@ -516,7 +653,7 @@ class RefConfirmationFlowTest(unittest.TestCase):
         moved_commit = "c" * 40
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / ".git").mkdir()
-            with patch.object(
+            with patch.object(step4, "_is_git_worktree", return_value=True), patch.object(
                 step4,
                 "resolve_repo_ref_pair_for_versions",
                 return_value=(
@@ -557,7 +694,7 @@ class RefConfirmationFlowTest(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / ".git").mkdir()
-            with patch.object(
+            with patch.object(step4, "_is_git_worktree", return_value=True), patch.object(
                 step4,
                 "resolve_repo_ref_pair_for_versions",
                 return_value=(

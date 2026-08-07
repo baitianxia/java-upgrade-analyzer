@@ -19,6 +19,8 @@ import subprocess
 import locale
 import io
 import re
+import shlex
+import signal
 import shutil
 import threading
 import safe_xml as ET
@@ -94,6 +96,155 @@ def _detect_subprocess_encoding():
 _SUBPROCESS_ENCODING = _detect_subprocess_encoding()
 _PROCESS_OBSERVER = None
 _GIT_EXECUTABLE_CACHE = {}
+_GIT_EXECUTABLE_CACHE_LOCK = threading.RLock()
+
+_GIT_REPOSITORY_ENV_KEYS = frozenset({
+    'GIT_DIR',
+    'GIT_WORK_TREE',
+    'GIT_COMMON_DIR',
+    'GIT_INDEX_FILE',
+    'GIT_OBJECT_DIRECTORY',
+    'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+    'GIT_NAMESPACE',
+    'GIT_SHALLOW_FILE',
+    'GIT_CONFIG',
+    'GIT_CEILING_DIRECTORIES',
+    'GIT_DISCOVERY_ACROSS_FILESYSTEM',
+    'GIT_PREFIX',
+    'GIT_IMPLICIT_WORK_TREE',
+    'GIT_QUARANTINE_PATH',
+    'GIT_REPLACE_REF_BASE',
+    'GIT_GRAFT_FILE',
+    'GIT_NO_REPLACE_OBJECTS',
+    'GIT_EXEC_PATH',
+    'GIT_TEMPLATE_DIR',
+    'GIT_ATTR_NOSYSTEM',
+    'GIT_ATTR_SOURCE',
+    'GIT_EXTERNAL_DIFF',
+})
+_GIT_CONFIG_ENV_PREFIXES = (
+    'GIT_CONFIG_KEY_',
+    'GIT_CONFIG_VALUE_',
+)
+_GIT_CONFIG_ENV_KEYS = frozenset({
+    'GIT_CONFIG_COUNT',
+    'GIT_CONFIG_PARAMETERS',
+})
+_MAX_INHERITED_GIT_CONFIG_ITEMS = 1024
+
+
+def _git_config_key_is_transport_safe(key):
+    """Allow inherited config needed to reach/authenticate to a remote only."""
+    normalized = str(key or '').strip().lower()
+    if normalized.startswith(('http.', 'credential.')):
+        return True
+    if normalized in {'core.sshcommand', 'ssh.variant'}:
+        return True
+    if re.fullmatch(r'url\..+\.(?:insteadof|pushinsteadof)', normalized):
+        return True
+    if re.fullmatch(r'remote\..+\.(?:proxy|proxyauthmethod)', normalized):
+        return True
+    return bool(re.fullmatch(r'protocol\.(?:http|https|ssh|git)\.allow', normalized))
+
+
+def _case_insensitive_env_items(environment):
+    """Return the last value for each environment key, independent of case."""
+    return {
+        str(key or '').upper(): value
+        for key, value in environment.items()
+    }
+
+
+def _parse_inherited_git_config(environment):
+    """Extract only transport/auth config from Git's process-local config APIs."""
+    normalized_environment = _case_insensitive_env_items(environment)
+    inherited = []
+
+    raw_count = str(normalized_environment.get('GIT_CONFIG_COUNT', '') or '').strip()
+    try:
+        count = int(raw_count) if raw_count else 0
+    except (TypeError, ValueError):
+        count = 0
+    if 0 <= count <= _MAX_INHERITED_GIT_CONFIG_ITEMS:
+        for index in range(count):
+            key_name = f'GIT_CONFIG_KEY_{index}'
+            value_name = f'GIT_CONFIG_VALUE_{index}'
+            if key_name not in normalized_environment or value_name not in normalized_environment:
+                continue
+            key = str(normalized_environment[key_name] or '').strip()
+            value = str(normalized_environment[value_name] or '')
+            if _git_config_key_is_transport_safe(key):
+                inherited.append((key, value))
+
+    raw_parameters = str(
+        normalized_environment.get('GIT_CONFIG_PARAMETERS', '') or ''
+    ).strip()
+    if raw_parameters:
+        try:
+            parameters = shlex.split(raw_parameters, posix=True)
+        except ValueError:
+            # Malformed quoting is untrusted process state. Fail closed rather
+            # than passing an only-partially-understood config expression on.
+            parameters = []
+        for parameter in parameters[:_MAX_INHERITED_GIT_CONFIG_ITEMS]:
+            key, separator, value = parameter.partition('=')
+            key = key.strip()
+            if separator and _git_config_key_is_transport_safe(key):
+                inherited.append((key, value))
+
+    deduped = []
+    seen = set()
+    for key, value in inherited:
+        identity = (str(key).strip().lower(), str(value))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        deduped.append((key, value))
+    return deduped[:_MAX_INHERITED_GIT_CONFIG_ITEMS]
+
+
+def _redact_git_text(value):
+    """Remove credentials from Git diagnostics before they leave this boundary."""
+    text = str(value or '')
+    # Git may echo config in either ``key=value`` or ``key value`` form. Mask
+    # the complete extraHeader value because it can carry arbitrary cookies or
+    # private headers, not just an Authorization header.
+    text = re.sub(
+        r'(?im)(\bhttp\.[^\s=]*extraheader\b\s*(?:=|:|\s)\s*)[^\r\n]*',
+        r'\1<redacted>',
+        text,
+    )
+    text = re.sub(
+        r'(?im)(\b(?:proxy-)?authorization\s*[:=]\s*)[^\r\n]*',
+        r'\1<redacted>',
+        text,
+    )
+    # Mask the entire URL userinfo component. Keeping even the username is
+    # unsafe because tokens are commonly placed in that position.
+    text = re.sub(
+        r'(?i)\b([a-z][a-z0-9+.-]*://)[^\s/@]+@',
+        r'\1<redacted>@',
+        text,
+    )
+    text = re.sub(
+        r'(?i)([?&](?:access[_-]?token|auth[_-]?token|private[_-]?token|'
+        r'deploy[_-]?token|refresh[_-]?token|oauth2?[_-]?token|token|password|'
+        r'passwd|secret)=)[^&#\s]+',
+        r'\1<redacted>',
+        text,
+    )
+    # SCP-style remotes have no URI scheme.  Require a command/log delimiter
+    # before user@host:path so normal e-mail prose is not rewritten.
+    text = re.sub(
+        r'(^|[\s\'"(=])[^/@:\s]+@([^/:\s]+:[^\s\'"),]+)',
+        r'\1<redacted>@\2',
+        text,
+    )
+    return text
+
+
+def _redact_git_command(command):
+    return [_redact_git_text(argument) for argument in command]
 
 
 def set_process_observer(observer):
@@ -181,6 +332,130 @@ def _decode_subprocess_output(raw_bytes):
     return raw_bytes.decode('utf-8', errors='replace')
 
 
+def _normalized_executable_path(value):
+    """Return a stable absolute executable path without requiring it to exist."""
+    text = os.path.expandvars(os.path.expanduser(str(value or '').strip()))
+    if not text:
+        return ''
+    candidate = Path(text)
+    if not candidate.is_absolute() and candidate.parent == Path('.'):
+        discovered = shutil.which(text)
+        if discovered:
+            text = discovered
+    return os.path.abspath(text)
+
+
+def _command_uses_git(cmd):
+    """Return whether ``cmd`` targets the Git executable selected by this module."""
+    if not isinstance(cmd, (list, tuple)) or not cmd:
+        return False
+    executable = str(cmd[0] or '').strip()
+    if not executable:
+        return False
+    if Path(executable).name.lower() in {'git', 'git.exe'}:
+        return True
+    normalized_executable = os.path.normcase(_normalized_executable_path(executable))
+    configured = os.environ.get('JUA_GIT_EXECUTABLE', '').strip()
+    known_candidates = [configured] if configured else []
+    with _GIT_EXECUTABLE_CACHE_LOCK:
+        cached_candidates = tuple(_GIT_EXECUTABLE_CACHE.values())
+    known_candidates.extend(
+        candidate
+        for candidate in cached_candidates
+        if candidate
+    )
+    return any(
+        normalized_executable
+        == os.path.normcase(_normalized_executable_path(candidate))
+        for candidate in known_candidates
+    )
+
+
+def _sanitize_git_environment(proc_env):
+    """Remove inherited repository routing while preserving credential transport."""
+    inherited_config = _parse_inherited_git_config(proc_env)
+    for key in list(proc_env):
+        normalized = str(key or '').upper()
+        if (
+            normalized in _GIT_REPOSITORY_ENV_KEYS
+            or normalized in _GIT_CONFIG_ENV_KEYS
+            or any(normalized.startswith(prefix) for prefix in _GIT_CONFIG_ENV_PREFIXES)
+            or normalized.startswith('GIT_TRACE')
+        ):
+            proc_env.pop(key, None)
+
+    if inherited_config:
+        proc_env['GIT_CONFIG_COUNT'] = str(len(inherited_config))
+        for index, (key, value) in enumerate(inherited_config):
+            proc_env[f'GIT_CONFIG_KEY_{index}'] = key
+            proc_env[f'GIT_CONFIG_VALUE_{index}'] = value
+
+    # These values are deliberately assigned rather than setdefault: callers
+    # must not make product Git commands interactive or locale-dependent.
+    proc_env['GIT_TERMINAL_PROMPT'] = '0'
+    proc_env['GCM_INTERACTIVE'] = 'Never'
+    proc_env['GIT_PAGER'] = 'cat'
+    proc_env['PAGER'] = 'cat'
+    proc_env['GIT_MERGE_AUTOEDIT'] = 'no'
+    proc_env['GIT_TRACE_REDACT'] = '1'
+    proc_env['LC_ALL'] = 'C'
+    proc_env['LANG'] = 'C'
+    proc_env['LANGUAGE'] = 'C'
+    return proc_env
+
+
+def _git_process_group_kwargs(is_git):
+    """Start Git in an isolated process group so timeouts can reap helpers too."""
+    if not is_git:
+        return {}
+    if IS_WINDOWS:
+        creation_flag = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
+        return {'creationflags': creation_flag} if creation_flag else {}
+    return {'start_new_session': True}
+
+
+def _terminate_subprocess(proc, *, process_group=False):
+    """Best-effort termination with process-tree cleanup for isolated Git groups."""
+    if process_group and IS_WINDOWS:
+        try:
+            subprocess.run(
+                ['taskkill', '/PID', str(proc.pid), '/T', '/F'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+    elif process_group:
+        try:
+            # start_new_session=True makes the child PID the process-group ID.
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (AttributeError, OSError):
+            pass
+
+    if proc.poll() is None:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _close_subprocess_pipes(proc):
+    """Close captured pipes after a forced exit when their output is discarded."""
+    for pipe in (proc.stdin, proc.stdout, proc.stderr):
+        if pipe is None:
+            continue
+        try:
+            pipe.close()
+        except OSError:
+            pass
+
+
 def run_cmd(
     cmd, cwd=None, timeout=300, input_text=None, env=None,
     stream_output=False, stream_stdout=True,
@@ -200,12 +475,29 @@ def run_cmd(
       stream_output 将子进程 stdout/stderr 实时转发到当前 stderr，同时仍完整捕获返回
       stream_stdout 流式模式下是否转发 stdout；协议型子进程可仅转发 stderr
     """
+    raw_command_is_git = _command_uses_git(cmd)
     cmd = resolve_command(cmd)
+    command_is_git = raw_command_is_git or _command_uses_git(cmd)
+    process_group_kwargs = _git_process_group_kwargs(command_is_git)
     observer = _PROCESS_OBSERVER
     try:
-        observer_token = observer.command_started(cmd) if observer is not None else None
+        observed_command = _redact_git_command(cmd) if command_is_git else cmd
+        observer_token = (
+            observer.command_started(observed_command)
+            if observer is not None else None
+        )
     except (AttributeError, TypeError, ValueError):
         observer_token = None
+
+    def finish(result):
+        if command_is_git:
+            stdout, stderr, returncode = result
+            result = (
+                stdout,
+                _redact_git_text(stderr),
+                returncode,
+            )
+        return _finish_observed_command(observer, observer_token, result)
 
     # 构建环境变量：强制 Maven/Git 使用 UTF-8 输出
     proc_env = os.environ.copy()
@@ -222,10 +514,12 @@ def run_cmd(
     if 'file.encoding' not in existing_opts:
         proc_env['JAVA_TOOL_OPTIONS'] = (existing_opts + ' -Dfile.encoding=UTF-8').strip()
 
-    # 强制 Git 使用 UTF-8
-    proc_env.setdefault('GIT_TERMINAL_PROMPT', '0')  # 禁止 git 弹出密码提示
-    proc_env.setdefault('LC_ALL', 'en_US.UTF-8')
-    proc_env.setdefault('LANG', 'en_US.UTF-8')
+    if command_is_git:
+        _sanitize_git_environment(proc_env)
+    else:
+        proc_env.setdefault('GIT_TERMINAL_PROMPT', '0')
+        proc_env.setdefault('LC_ALL', 'en_US.UTF-8')
+        proc_env.setdefault('LANG', 'en_US.UTF-8')
 
     try:
         if stream_output:
@@ -236,6 +530,7 @@ def run_cmd(
                 stderr=subprocess.PIPE,
                 stdin=subprocess.PIPE if input_text is not None else None,
                 env=proc_env,
+                **process_group_kwargs,
             )
             stdout_chunks = []
             stderr_chunks = []
@@ -248,7 +543,10 @@ def run_cmd(
                             break
                         chunks.append(chunk)
                         if relay:
-                            sys.stderr.write(_decode_subprocess_output(chunk))
+                            relay_text = _decode_subprocess_output(chunk)
+                            if command_is_git:
+                                relay_text = _redact_git_text(relay_text)
+                            sys.stderr.write(relay_text)
                             sys.stderr.flush()
                 finally:
                     pipe.close()
@@ -267,28 +565,52 @@ def run_cmd(
             try:
                 return_code = proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
+                _terminate_subprocess(proc, process_group=command_is_git)
                 stdout_thread.join(timeout=5)
                 stderr_thread.join(timeout=5)
-                return _finish_observed_command(observer, observer_token, ('', f'命令超时（{timeout}秒）：{" ".join(str(c) for c in cmd)}', -1))
+                return finish(('', f'命令超时（{timeout}秒）：{" ".join(str(c) for c in cmd)}', -1))
             except KeyboardInterrupt:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
+                _terminate_subprocess(proc, process_group=command_is_git)
                 stdout_thread.join(timeout=5)
                 stderr_thread.join(timeout=5)
                 raise
             stdout_thread.join()
             stderr_thread.join()
-            return _finish_observed_command(observer, observer_token, (
+            return finish((
                 _decode_subprocess_output(b''.join(stdout_chunks)),
                 _decode_subprocess_output(b''.join(stderr_chunks)),
                 return_code,
             ))
+        input_bytes = input_text.encode('utf-8') if input_text is not None else None
+        if command_is_git:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.PIPE if input_bytes is not None else None,
+                env=proc_env,
+                **process_group_kwargs,
+            )
+            try:
+                stdout_bytes, stderr_bytes = proc.communicate(
+                    input=input_bytes,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired:
+                _terminate_subprocess(proc, process_group=True)
+                _close_subprocess_pipes(proc)
+                return finish(
+                    ('', f'命令超时（{timeout}秒）：{" ".join(str(c) for c in cmd)}', -1),
+                )
+            except KeyboardInterrupt:
+                _terminate_subprocess(proc, process_group=True)
+                _close_subprocess_pipes(proc)
+                raise
+            stdout = _decode_subprocess_output(stdout_bytes)
+            stderr = _decode_subprocess_output(stderr_bytes)
+            return finish((stdout, stderr, proc.returncode))
+
         proc = subprocess.run(
             cmd,
             cwd=cwd,
@@ -296,26 +618,26 @@ def run_cmd(
             capture_output=True,
             # 不使用 text=True，手动解码以控制错误处理
             env=proc_env,
-            input=input_text.encode('utf-8') if input_text else None,
+            input=input_bytes,
         )
 
         # 解码输出：先尝试 UTF-8，失败则用系统编码，再失败则替换非法字符
         stdout = _decode_subprocess_output(proc.stdout)
         stderr = _decode_subprocess_output(proc.stderr)
-        return _finish_observed_command(observer, observer_token, (stdout, stderr, proc.returncode))
+        return finish((stdout, stderr, proc.returncode))
 
     except KeyboardInterrupt:
-        _finish_observed_command(observer, observer_token, ('', '', 130))
+        finish(('', '', 130))
         raise
     except subprocess.TimeoutExpired:
-        return _finish_observed_command(observer, observer_token, ('', f'命令超时（{timeout}秒）：{" ".join(str(c) for c in cmd)}', -1))
+        return finish(('', f'命令超时（{timeout}秒）：{" ".join(str(c) for c in cmd)}', -1))
     except FileNotFoundError:
         cmd_name = cmd[0] if cmd else '(空命令)'
-        return _finish_observed_command(observer, observer_token, ('', f'命令未找到：{cmd_name}（请确认已安装并在 PATH 中）', -1))
+        return finish(('', f'命令未找到：{cmd_name}（请确认已安装并在 PATH 中）', -1))
     except PermissionError:
-        return _finish_observed_command(observer, observer_token, ('', f'权限不足，无法执行：{cmd[0]}', -1))
+        return finish(('', f'权限不足，无法执行：{cmd[0]}', -1))
     except Exception as e:
-        return _finish_observed_command(observer, observer_token, ('', f'执行异常：{type(e).__name__}: {e}', -1))
+        return finish(('', f'执行异常：{type(e).__name__}: {e}', -1))
 
 
 def open_text(path, mode='r', encoding='utf-8', errors='replace'):
@@ -390,6 +712,8 @@ def _git_executable_works(path):
     candidate = str(path or '').strip()
     if not candidate or not Path(candidate).is_file():
         return False
+    probe_environment = os.environ.copy()
+    _sanitize_git_environment(probe_environment)
     try:
         completed = subprocess.run(
             [candidate, '--version'],
@@ -397,42 +721,74 @@ def _git_executable_works(path):
             stderr=subprocess.PIPE,
             timeout=5,
             check=False,
+            env=probe_environment,
         )
     except (OSError, subprocess.SubprocessError):
         return False
     return completed.returncode == 0
 
 
+def _git_platform_fallback_candidates():
+    executable_name = 'git.exe' if IS_WINDOWS else 'git'
+    candidates = [Path.home() / '.local' / 'bin' / executable_name]
+    if sys.platform == 'darwin':
+        candidates.extend((
+            Path('/opt/homebrew/bin/git'),
+            Path('/usr/local/bin/git'),
+            Path('/usr/bin/git'),
+        ))
+    elif IS_WINDOWS:
+        for root_name in ('ProgramFiles', 'ProgramFiles(x86)', 'LOCALAPPDATA'):
+            root = os.environ.get(root_name, '').strip()
+            if not root:
+                continue
+            root_path = Path(root)
+            if root_name == 'LOCALAPPDATA':
+                candidates.append(root_path / 'Programs' / 'Git' / 'cmd' / 'git.exe')
+            else:
+                candidates.extend((
+                    root_path / 'Git' / 'cmd' / 'git.exe',
+                    root_path / 'Git' / 'bin' / 'git.exe',
+                ))
+    else:
+        candidates.extend((Path('/usr/local/bin/git'), Path('/usr/bin/git')))
+    return [str(candidate) for candidate in candidates]
+
+
 def _find_working_git():
-    """Choose a working Git instead of trusting the first PATH entry on macOS."""
+    """Choose explicit Git, then current PATH, then platform fallbacks."""
     cache_key = (
         os.environ.get('JUA_GIT_EXECUTABLE', '').strip(),
         os.environ.get('PATH', ''),
         str(Path.home()),
         sys.platform,
+        os.environ.get('ProgramFiles', ''),
+        os.environ.get('ProgramFiles(x86)', ''),
+        os.environ.get('LOCALAPPDATA', ''),
     )
-    if cache_key in _GIT_EXECUTABLE_CACHE:
-        return _GIT_EXECUTABLE_CACHE[cache_key]
+    with _GIT_EXECUTABLE_CACHE_LOCK:
+        if cache_key in _GIT_EXECUTABLE_CACHE:
+            return _GIT_EXECUTABLE_CACHE[cache_key]
 
-    executable_name = 'git.exe' if IS_WINDOWS else 'git'
     candidates = [
         os.environ.get('JUA_GIT_EXECUTABLE', '').strip(),
-        str(Path.home() / '.local' / 'bin' / executable_name),
+        shutil.which('git') or '',
+        *_git_platform_fallback_candidates(),
     ]
-    if sys.platform == 'darwin':
-        candidates.extend(('/opt/homebrew/bin/git', '/usr/local/bin/git'))
-    candidates.append(shutil.which('git') or '')
 
     seen = set()
     for candidate in candidates:
-        normalized = os.path.normcase(os.path.abspath(candidate)) if candidate else ''
+        normalized_candidate = _normalized_executable_path(candidate)
+        normalized = os.path.normcase(normalized_candidate) if normalized_candidate else ''
         if not normalized or normalized in seen:
             continue
         seen.add(normalized)
-        if _git_executable_works(candidate):
-            _GIT_EXECUTABLE_CACHE[cache_key] = candidate
-            return candidate
-    _GIT_EXECUTABLE_CACHE[cache_key] = None
+        if _git_executable_works(normalized_candidate):
+            with _GIT_EXECUTABLE_CACHE_LOCK:
+                _GIT_EXECUTABLE_CACHE[cache_key] = normalized_candidate
+            return normalized_candidate
+    with _GIT_EXECUTABLE_CACHE_LOCK:
+        _GIT_EXECUTABLE_CACHE[cache_key] = None
     return None
 
 
@@ -499,7 +855,7 @@ def resolve_command(cmd):
     if not isinstance(cmd, (list, tuple)) or not cmd:
         return cmd
     first = str(cmd[0] or '')
-    if Path(first).name.lower() not in {'git', 'git.exe'} or Path(first).parent != Path('.'):
+    if first.lower() not in {'git', 'git.exe'}:
         return cmd
     resolved = find_executable('git')
     return [resolved, *cmd[1:]] if resolved else list(cmd)

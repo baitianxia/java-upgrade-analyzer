@@ -76,6 +76,118 @@ class Step1RefResolutionTest(unittest.TestCase):
         self.assertEqual(result["resolved_commit"], "c" * 40)
         self.assertTrue(local_resolver.call_args.kwargs["allow_local_source"])
 
+    def test_explicit_commit_remote_failure_is_not_silently_treated_as_local(self):
+        commit = "c" * 40
+        remote = {
+            "status": "remote_expected_commit_unmaterializable",
+            "requested_ref": commit,
+            "expected_commit": commit,
+            "failures": [{"stage": "fetch_explicit_commit", "reason": "not our ref"}],
+        }
+        with patch(
+            "step1_ref_resolution.resolve_remote_source_ref",
+            return_value=remote,
+        ), patch(
+            "step1_ref_resolution.resolve_local_source_ref",
+        ) as local_resolver:
+            result = resolve_step1_ref("/repo", commit)
+
+        self.assertEqual(result["status"], "fetch_failed")
+        self.assertEqual(
+            result["source_status"],
+            "remote_expected_commit_unmaterializable",
+        )
+        local_resolver.assert_not_called()
+
+    def test_explicit_commit_can_use_only_an_authorized_local_fallback(self):
+        commit = "d" * 40
+        remote = {
+            "status": "remote_expected_commit_unmaterializable",
+            "requested_ref": commit,
+            "expected_commit": commit,
+            "failures": [{"stage": "fetch_explicit_commit", "reason": "not our ref"}],
+        }
+        local = {
+            "status": "user_confirmed_local_source",
+            "requested_ref": commit,
+            "resolved_ref": commit,
+            "resolved_commit": commit,
+            "resolution_mode": "user_confirmed_local_source",
+            "dirty": False,
+        }
+        with patch(
+            "step1_ref_resolution.resolve_remote_source_ref",
+            return_value=remote,
+        ), patch(
+            "step1_ref_resolution.resolve_local_source_ref",
+            return_value=local,
+        ) as local_resolver:
+            result = resolve_step1_ref(
+                "/repo",
+                commit,
+                allow_local_source=True,
+            )
+
+        self.assertEqual(result["status"], "resolved")
+        self.assertEqual(result["source_status"], "user_confirmed_local_source")
+        self.assertEqual(
+            result["remote_source_status"],
+            "remote_expected_commit_unmaterializable",
+        )
+        local_resolver.assert_called_once()
+
+    def test_authorized_local_status_failure_is_not_reported_as_ref_not_found(self):
+        remote = {
+            "status": "remote_ref_not_found",
+            "requested_ref": "release",
+            "failures": [],
+        }
+        local = {
+            "status": "local_status_unavailable",
+            "requested_ref": "release",
+            "failures": [{
+                "stage": "local_status",
+                "reason_code": "local_status_unavailable",
+                "reason": "git status timed out",
+            }],
+        }
+        with patch(
+            "step1_ref_resolution.resolve_remote_source_ref",
+            return_value=remote,
+        ), patch(
+            "step1_ref_resolution.resolve_local_source_ref",
+            return_value=local,
+        ):
+            result = resolve_step1_ref(
+                "/repo",
+                "release",
+                allow_local_source=True,
+            )
+
+        self.assertEqual(result["status"], "fetch_failed")
+        self.assertEqual(result["source_status"], "local_status_unavailable")
+        self.assertEqual(result["remote_source_status"], "remote_ref_not_found")
+        self.assertEqual(result["failures"][0]["stage"], "local_status")
+
+    def test_head_local_resolution_process_failure_is_not_reported_as_not_found(self):
+        local = {
+            "status": "local_ref_resolution_failed",
+            "requested_ref": "HEAD",
+            "failures": [{
+                "stage": "local_rev_parse",
+                "reason_code": "local_ref_resolution_failed",
+                "reason": "git rev-parse failed",
+            }],
+        }
+        with patch(
+            "step1_ref_resolution.resolve_local_source_ref",
+            return_value=local,
+        ):
+            result = resolve_step1_ref("/repo", "HEAD")
+
+        self.assertEqual(result["status"], "fetch_failed")
+        self.assertEqual(result["source_status"], "local_ref_resolution_failed")
+
     def test_legacy_remote_ref_movement_is_a_system_error_not_a_checkpoint(self):
         remote = {
             "status": "remote_ref_moved",

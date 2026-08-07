@@ -1,12 +1,15 @@
 import json
 import io
+from concurrent.futures import ThreadPoolExecutor
 import subprocess
 import stat
 import sys
 import tempfile
+import threading
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -247,6 +250,174 @@ class DependencySourceAlignmentTest(unittest.TestCase):
 
             self.assertEqual(first["mappings"], second["mappings"])
             self.assertTrue(second["records"][0]["snapshot_reused"])
+
+    def test_snapshot_cache_identity_uses_the_full_commit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._make_repo(tmp)
+            report_dir = Path(tmp) / ".upgrade-report"
+            commit = self._git(repo, "rev-parse", "jar-version")
+
+            snapshot = alignment.materialize_detached_snapshot(
+                report_dir,
+                "com.example:dep",
+                repo,
+                commit,
+                ".",
+            )
+
+            self.assertEqual(Path(snapshot["snapshot_path"]).name, commit)
+            self.assertNotEqual(Path(snapshot["snapshot_path"]).name, commit[:12])
+
+    def test_corrupt_snapshot_content_is_rebuilt_instead_of_reused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._make_repo(tmp)
+            report_dir = Path(tmp) / ".upgrade-report"
+            commit = self._git(repo, "rev-parse", "jar-version")
+            first = alignment.materialize_detached_snapshot(
+                report_dir, "com.example:dep", repo, commit, ".",
+            )
+            source = (
+                Path(first["snapshot_path"])
+                / "src/main/java/com/example/RightOnly.java"
+            )
+            expected = source.read_text(encoding="utf-8")
+            source.write_text("corrupt\n", encoding="utf-8")
+
+            repaired = alignment.materialize_detached_snapshot(
+                report_dir, "com.example:dep", repo, commit, ".",
+            )
+
+            self.assertFalse(repaired["snapshot_reused"])
+            self.assertEqual(source.read_text(encoding="utf-8"), expected)
+            valid, reason = alignment._validate_snapshot(
+                Path(repaired["snapshot_path"]), commit,
+            )
+            self.assertTrue(valid, reason)
+
+    def test_concurrent_publication_reuses_the_atomic_winner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._make_repo(tmp)
+            report_dir = Path(tmp) / ".upgrade-report"
+            commit = self._git(repo, "rev-parse", "jar-version")
+            both_callers_ready = threading.Barrier(2)
+
+            def materialize():
+                both_callers_ready.wait(timeout=10)
+                return alignment.materialize_detached_snapshot(
+                    report_dir, "com.example:dep", repo, commit, ".",
+                )
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                results = list(executor.map(lambda _index: materialize(), range(2)))
+
+            self.assertEqual(
+                {item["snapshot_path"] for item in results},
+                {str(
+                    alignment.runtime_storage_root(report_dir, "source_snapshots")
+                    / alignment._safe_coord("com.example:dep")
+                    / commit
+                )},
+            )
+            self.assertEqual(
+                sorted(item["snapshot_reused"] for item in results),
+                [False, True],
+            )
+            valid, reason = alignment._validate_snapshot(
+                Path(results[0]["snapshot_path"]), commit,
+            )
+            self.assertTrue(valid, reason)
+
+    def test_ref_execution_failure_is_not_reported_as_missing_ref(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            alignment,
+            "_run_git",
+            return_value=("", "command timed out", -1),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"^dependency_source_ref_resolution_timeout:",
+            ):
+                alignment.materialize_detached_snapshot(
+                    Path(tmp) / "report",
+                    "com.example:dep",
+                    Path(tmp) / "repo",
+                    "missing",
+                    ".",
+                )
+
+    def test_archive_failure_has_a_distinct_reason_from_ref_resolution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._make_repo(tmp)
+            report_dir = Path(tmp) / ".upgrade-report"
+            commit = self._git(repo, "rev-parse", "jar-version")
+            original_run_cmd = alignment.run_cmd
+
+            def fail_archive(command, **kwargs):
+                if "archive" in command:
+                    return "", "archive read failed", 128
+                return original_run_cmd(command, **kwargs)
+
+            with patch.object(alignment, "run_cmd", side_effect=fail_archive):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    r"^dependency_source_snapshot_git_archive_failed:",
+                ):
+                    alignment.materialize_detached_snapshot(
+                        report_dir,
+                        "com.example:dep",
+                        repo,
+                        commit,
+                        ".",
+                    )
+
+    def test_repository_discovery_execution_failure_is_not_called_not_a_repo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._make_repo(tmp)
+            report_dir = Path(tmp) / ".upgrade-report"
+            jar_path = self._make_runtime_jar(tmp)
+            self._write_ref_evidence(report_dir, repo)
+
+            with patch.object(
+                alignment,
+                "_run_git",
+                return_value=("", "git process unavailable", -1),
+            ):
+                result = alignment.align_dependency_source_mappings(
+                    report_dir,
+                    [f"com.example:dep={repo}"],
+                    self._catalog(jar_path),
+                )
+
+            self.assertEqual(result["mappings"], [])
+            self.assertEqual(
+                result["records"][0]["reason_code"],
+                "dependency_source_git_unavailable",
+            )
+
+    def test_workspace_recheck_failure_is_not_called_workspace_changed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._make_repo(tmp)
+            report_dir = Path(tmp) / ".upgrade-report"
+            jar_path = self._make_runtime_jar(tmp)
+            self._write_ref_evidence(report_dir, repo)
+            before = alignment.repository_fingerprint(repo)
+
+            with patch.object(
+                alignment,
+                "repository_fingerprint",
+                side_effect=[before, None],
+            ):
+                result = alignment.align_dependency_source_mappings(
+                    report_dir,
+                    [f"com.example:dep={repo}"],
+                    self._catalog(jar_path),
+                )
+
+            self.assertEqual(result["mappings"], [])
+            self.assertEqual(
+                result["records"][0]["reason_code"],
+                "dependency_source_workspace_recheck_failed",
+            )
 
     def test_alignment_collapses_duplicate_paths_for_same_coord_module_and_commit(self):
         with tempfile.TemporaryDirectory() as tmp:

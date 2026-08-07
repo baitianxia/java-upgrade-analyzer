@@ -12,12 +12,30 @@ import run_step
 
 
 class TargetModuleContractTest(unittest.TestCase):
+    def pinned_context(self, project_scope, **extra):
+        commit = "c" * 40
+        return {
+            "base_branch": "main",
+            "current_branch": "upgrade",
+            "current_resolved_commit": commit,
+            "active_maven_profiles": [],
+            "project_scope": project_scope,
+            "pinned_source_snapshot": {
+                "schema": run_step.PINNED_SOURCE_SNAPSHOT_SCHEMA,
+                "commit": commit,
+                "project_path": ".",
+                "target_module": "",
+                "active_maven_profiles": [],
+            },
+            **extra,
+        }
+
     def test_ready_entry_inputs_still_require_target_module_confirmation(self):
-        interaction = run_step.build_step1_preflight_interaction({
-            'base_branch': 'main',
-            'current_branch': 'upgrade',
-            'project_scope': {'candidate_modules': ['service-a', 'service-b']},
-        })
+        interaction = run_step.build_step1_preflight_interaction(
+            self.pinned_context({
+                'candidate_modules': ['service-a', 'service-b'],
+            })
+        )
         self.assertEqual(interaction['reason_code'], 'missing_step1_target_module')
         self.assertEqual(interaction['required_fields'], ['target_module'])
         self.assertEqual(interaction['module_candidates'], ['service-a', 'service-b'])
@@ -62,12 +80,10 @@ class TargetModuleContractTest(unittest.TestCase):
             )
 
             interaction = run_step.build_step1_preflight_interaction(
-                {
-                    'base_branch': 'main',
-                    'current_branch': 'upgrade',
-                    'report_dir': str(report_dir),
-                    'project_scope': {'candidate_module_details': candidates},
-                }
+                self.pinned_context(
+                    {'candidate_module_details': candidates},
+                    report_dir=str(report_dir),
+                )
             )
             candidate_file = Path(interaction['files_to_review'][0])
             text = candidate_file.read_text(encoding='utf-8')

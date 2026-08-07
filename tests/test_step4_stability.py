@@ -1288,12 +1288,16 @@ public class com.acme.Api {
         self.assertNotIn("java.lang.annotation.Annotation", api_names)
         self.assertNotIn("org.external.Marker", api_names)
 
-    def test_step4_default_timeouts_are_unbounded(self):
-        self.assertIsNone(step4.DEFAULT_GIT_DIFF_TIMEOUT)
+    def test_step4_git_default_timeouts_are_bounded(self):
+        self.assertGreater(step4.DEFAULT_GIT_DIFF_TIMEOUT, 0)
+        self.assertGreater(step4.DEFAULT_FETCH_TIMEOUT, 0)
         self.assertIsNone(step4.DEFAULT_JAPICMP_TIMEOUT)
-        self.assertIsNone(step4.DEFAULT_FETCH_TIMEOUT)
+        self.assertEqual(
+            step4._bounded_git_timeout(900, step4.DEFAULT_FETCH_TIMEOUT),
+            900,
+        )
 
-    def test_run_gitdiff_uses_no_timeout_by_default(self):
+    def test_run_gitdiff_uses_bounded_defaults_and_disables_diff_hooks(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo_dir = Path(tmp) / "repo"
             repo_dir.mkdir(parents=True)
@@ -1313,14 +1317,93 @@ public class com.acme.Api {
 
             def fake_run_cmd(cmd, cwd=None, timeout=None, **_kwargs):
                 captured.append({"cmd": list(cmd), "cwd": cwd, "timeout": timeout})
+                if "--is-inside-work-tree" in cmd:
+                    return "true\n", "", 0
                 return "", "", 0
 
             with patch.object(step4, "run_cmd", side_effect=fake_run_cmd):
                 result = step4.run_gitdiff(lib_info, tmp)
 
         self.assertEqual(result["status"], "success")
-        self.assertTrue(captured)
-        self.assertIsNone(captured[0]["timeout"])
+        diff_call = next(item for item in captured if "diff" in item["cmd"])
+        self.assertEqual(diff_call["timeout"], step4.DEFAULT_GIT_DIFF_TIMEOUT)
+        self.assertIn("--no-ext-diff", diff_call["cmd"])
+        self.assertIn("--no-textconv", diff_call["cmd"])
+        self.assertIn("--no-color", diff_call["cmd"])
+
+    def test_run_gitdiff_requires_zero_exit_code_and_preserves_explicit_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_dir = Path(tmp) / "repo"
+            repo_dir.mkdir(parents=True)
+            lib_info = {
+                "coord": "com.example:demo",
+                "repo_path": str(repo_dir),
+                "module_path": str(repo_dir),
+                "old_version": "1.0.0",
+                "new_version": "2.0.0",
+                "base_ref": "a" * 40,
+                "cur_ref": "b" * 40,
+            }
+            calls = []
+
+            def failed_diff(cmd, cwd=None, timeout=None, **_kwargs):
+                calls.append({"cmd": list(cmd), "timeout": timeout})
+                return "partial output", "diff failed", 1
+
+            with patch.object(step4, "_is_git_worktree", return_value=True), patch.object(
+                step4, "run_cmd", side_effect=failed_diff
+            ):
+                result = step4.run_gitdiff(lib_info, tmp, git_diff_timeout=900)
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual({item["timeout"] for item in calls}, {900})
+        for item in calls:
+            self.assertIn("--no-ext-diff", item["cmd"])
+            self.assertIn("--no-textconv", item["cmd"])
+            self.assertIn("--no-color", item["cmd"])
+
+    def test_run_gitdiff_accepts_linked_worktree_with_gitfile(self):
+        def git(repo, *args):
+            stdout, stderr, rc = compat.run_cmd(
+                compat.git_cmd() + list(args),
+                cwd=str(repo),
+                timeout=20,
+            )
+            self.assertEqual(rc, 0, stderr or stdout)
+            return str(stdout or "").strip()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo_dir = root / "repo"
+            linked_dir = root / "linked"
+            output_dir = root / "out"
+            repo_dir.mkdir()
+            output_dir.mkdir()
+            git(repo_dir, "init")
+            git(repo_dir, "config", "user.email", "tests@example.invalid")
+            git(repo_dir, "config", "user.name", "Step4 Tests")
+            (repo_dir / "Demo.java").write_text("public class Demo {}\n", encoding="utf-8")
+            git(repo_dir, "add", "Demo.java")
+            git(repo_dir, "commit", "-m", "initial")
+            commit = git(repo_dir, "rev-parse", "HEAD")
+            git(repo_dir, "worktree", "add", "-b", "linked-test", str(linked_dir))
+
+            self.assertTrue((linked_dir / ".git").is_file())
+            result = step4.run_gitdiff(
+                {
+                    "coord": "com.example:demo",
+                    "repo_path": str(linked_dir),
+                    "module_path": str(linked_dir),
+                    "old_version": "1.0.0",
+                    "new_version": "1.0.0",
+                    "base_ref": commit,
+                    "cur_ref": commit,
+                },
+                str(output_dir),
+            )
+
+        self.assertEqual(result["status"], "success")
 
     def test_run_japicmp_uses_no_timeout_by_default(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2022,20 +2105,14 @@ public class com.acme.Api {
         commit = "a" * 40
         with tempfile.TemporaryDirectory() as tmp, patch.object(
             step4,
-            "_list_repo_refs",
+            "resolve_remote_source_ref",
             return_value={
-                "tags": [],
-                "heads": [],
-                "remotes": ["origin/production-stable"],
-                "remote_records": [
-                    {
-                        "ref": "origin/production-stable",
-                        "short_name": "production-stable",
-                        "commit": commit,
-                        "canonical_ref": "refs/heads/production-stable",
-                        "remote": "origin",
-                    }
-                ],
+                "status": "remote_source_resolved",
+                "resolved_ref": "origin/production-stable",
+                "resolved_commit": commit,
+                "remote": "origin",
+                "remote_ref": "refs/heads/production-stable",
+                "candidates": [],
             },
         ):
             resolved, reason, candidates = step4.resolve_repo_ref_for_version(
@@ -2046,6 +2123,30 @@ public class com.acme.Api {
 
         self.assertEqual(resolved, "origin/production-stable")
         self.assertEqual(reason, "selected_by_user(kind=remote,score=-1,version=3.0.7)")
+        self.assertEqual(candidates[0]["commit"], commit)
+
+    def test_resolve_repo_ref_for_version_accepts_explicit_sha256_commit(self):
+        commit = "a" * 64
+        with patch.object(
+            step4,
+            "resolve_remote_source_ref",
+            return_value={
+                "status": "remote_source_resolved",
+                "resolved_ref": commit,
+                "resolved_commit": commit,
+                "remote": "origin",
+                "remote_ref": "",
+                "candidates": [],
+            },
+        ):
+            resolved, reason, candidates = step4.resolve_repo_ref_for_version(
+                "/repo",
+                "3.0.7",
+                selected_ref=commit,
+            )
+
+        self.assertEqual(resolved, commit)
+        self.assertIn("kind=remote_commit", reason)
         self.assertEqual(candidates[0]["commit"], commit)
 
     def test_resolve_repo_ref_for_version_does_not_demote_non_dev_substring(self):
@@ -2110,10 +2211,52 @@ public class com.acme.Api {
             ["origin/release-1.0.0", "upstream/release-1.0.0"],
         )
 
-    def test_remote_materialization_is_reused_within_one_step4_run(self):
-        candidate = {
+    def test_remote_materialization_cache_is_keyed_by_repo_and_commit(self):
+        first_candidate = {
             "ref": "origin/release-1.0.0",
             "commit": "a" * 40,
+            "canonical_ref": "refs/heads/release-1.0.0",
+            "remote": "origin",
+        }
+        second_candidate = {
+            "ref": "upstream/v1.0.0",
+            "commit": "a" * 40,
+            "canonical_ref": "refs/tags/v1.0.0",
+            "remote": "upstream",
+        }
+        step4._REMOTE_SOURCE_MATERIALIZATION_CACHE.clear()
+        with patch.object(
+            step4,
+            "materialize_remote_source_candidate",
+            return_value={
+                "status": "remote_source_resolved",
+                "resolved_commit": "a" * 40,
+                "attempts": [{
+                    "attempt": 0,
+                    "stage": "verify_local_commit",
+                    "status": "success",
+                }],
+            },
+        ) as materializer:
+            first, first_error = step4._materialize_resolved_remote_ref(
+                "/repo/demo", first_candidate["ref"], [first_candidate]
+            )
+            second, second_error = step4._materialize_resolved_remote_ref(
+                "/repo/demo", second_candidate["ref"], [second_candidate]
+            )
+
+        self.assertEqual(first_error, "")
+        self.assertEqual(second_error, "")
+        self.assertEqual(first["resolved_commit"], second["resolved_commit"])
+        self.assertEqual(second["resolved_ref"], second_candidate["ref"])
+        self.assertEqual(second["remote_ref"], second_candidate["canonical_ref"])
+        materializer.assert_called_once()
+
+    def test_remote_snapshot_delegates_to_shared_materializer_with_total_timeout(self):
+        commit = "a" * 40
+        candidate = {
+            "ref": "origin/release-1.0.0",
+            "commit": commit,
             "canonical_ref": "refs/heads/release-1.0.0",
             "remote": "origin",
         }
@@ -2123,22 +2266,115 @@ public class com.acme.Api {
             "materialize_remote_source_candidate",
             return_value={
                 "status": "remote_source_resolved",
-                "resolved_commit": "a" * 40,
-                "remote": "origin",
-                "remote_ref": "refs/heads/release-1.0.0",
+                "resolved_commit": commit,
+                "attempts": [{
+                    "attempt": 1,
+                    "stage": "fetch_canonical_ref",
+                    "status": "success",
+                }],
             },
-        ) as materialize:
-            first, first_error = step4._materialize_resolved_remote_ref(
-                "/repo/demo", candidate["ref"], [candidate]
-            )
-            second, second_error = step4._materialize_resolved_remote_ref(
-                "/repo/demo", candidate["ref"], [candidate]
+        ) as materializer:
+            result, error = step4._materialize_resolved_remote_ref(
+                "/repo/demo",
+                candidate["ref"],
+                [candidate],
+                fetch_timeout=900,
             )
 
-        self.assertEqual(first_error, "")
-        self.assertEqual(second_error, "")
-        self.assertEqual(first, second)
-        materialize.assert_called_once()
+        self.assertEqual(error, "")
+        self.assertEqual(result["resolved_commit"], commit)
+        self.assertEqual(result["resolution_mode"], "live_remote")
+        self.assertEqual(result["materialization_mode"], "live_remote_snapshot_fetch")
+        materializer.assert_called_once_with(
+            "/repo/demo",
+            candidate,
+            timeout=900,
+            expected_commit=commit,
+        )
+
+    def test_remote_snapshot_materializes_pinned_commit_after_branch_moves(self):
+        observed = "b" * 40
+        expected = "a" * 40
+        candidate = {
+            "ref": "origin/release-1.0.0",
+            "commit": observed,
+            "canonical_ref": "refs/heads/release-1.0.0",
+            "remote": "origin",
+        }
+        step4._REMOTE_SOURCE_MATERIALIZATION_CACHE.clear()
+        with patch.object(
+            step4,
+            "materialize_remote_source_candidate",
+            return_value={
+                "status": "remote_source_resolved",
+                "resolved_commit": expected,
+                "attempts": [{
+                    "attempt": 1,
+                    "stage": "fetch_commit",
+                    "status": "success",
+                }],
+            },
+        ) as materializer:
+            result, error = step4._materialize_resolved_remote_ref(
+                "/repo/demo",
+                candidate["ref"],
+                [candidate],
+                expected_commit=expected,
+            )
+
+        self.assertEqual(error, "")
+        self.assertEqual(result["resolved_commit"], expected)
+        self.assertEqual(result["observed_commit"], observed)
+        passed_candidate = materializer.call_args.args[1]
+        self.assertEqual(passed_candidate["commit"], expected)
+
+    def test_remote_snapshot_commit_materializes_from_local_git_remote(self):
+        def git(repo, *args):
+            stdout, stderr, rc = compat.run_cmd(
+                compat.git_cmd() + list(args),
+                cwd=str(repo),
+                timeout=20,
+            )
+            self.assertEqual(rc, 0, stderr or stdout)
+            return str(stdout or "").strip()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            origin = root / "origin"
+            consumer = root / "consumer"
+            origin.mkdir()
+            consumer.mkdir()
+            git(origin, "init")
+            git(origin, "config", "user.email", "tests@example.invalid")
+            git(origin, "config", "user.name", "Step4 Tests")
+            (origin / "Demo.java").write_text("public class Demo {}\n", encoding="utf-8")
+            git(origin, "add", "Demo.java")
+            git(origin, "commit", "-m", "initial")
+            commit = git(origin, "rev-parse", "HEAD")
+            branch = git(origin, "symbolic-ref", "--short", "HEAD")
+
+            git(consumer, "init")
+            git(consumer, "remote", "add", "origin", str(origin))
+            candidate = {
+                "ref": f"origin/{branch}",
+                "commit": commit,
+                "canonical_ref": f"refs/heads/{branch}",
+                "remote": "origin",
+            }
+            step4._REMOTE_SOURCE_MATERIALIZATION_CACHE.clear()
+            result, error = step4._materialize_resolved_remote_ref(
+                str(consumer),
+                candidate["ref"],
+                [candidate],
+            )
+
+        self.assertEqual(error, "")
+        self.assertEqual(result["resolved_commit"], commit)
+        self.assertEqual(result["resolution_mode"], "live_remote")
+        self.assertEqual(
+            result["materialization_mode"],
+            "live_remote_snapshot_fetch",
+        )
 
     def test_preflight_gitdiff_refs_reports_pending_before_expensive_work(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2165,7 +2401,7 @@ public class com.acme.Api {
                 }
             }
 
-            with patch.object(
+            with patch.object(step4, "_is_git_worktree", return_value=True), patch.object(
                 step4,
                 "resolve_repo_ref_pair_for_versions",
                 return_value=(None, None, "miss-old", "miss-new", [], []),
@@ -2274,7 +2510,7 @@ public class com.acme.Api {
                 "canonical_ref": "refs/heads/release-2.0.0",
                 "remote": "origin",
             }
-            with patch.object(
+            with patch.object(step4, "_is_git_worktree", return_value=True), patch.object(
                 step4,
                 "resolve_repo_ref_pair_for_versions",
                 return_value=(
@@ -2287,10 +2523,10 @@ public class com.acme.Api {
                 ),
             ), patch.object(
                 step4,
-                "materialize_remote_source_candidate",
+                "_materialize_resolved_remote_ref",
                 side_effect=[
-                    {"status": "remote_source_resolved", "resolved_commit": "a" * 40, "remote": "origin", "remote_ref": old_candidate["canonical_ref"]},
-                    {"status": "remote_source_resolved", "resolved_commit": "b" * 40, "remote": "origin", "remote_ref": new_candidate["canonical_ref"]},
+                    ({"status": "remote_source_resolved", "resolved_commit": "a" * 40, "remote": "origin", "remote_ref": old_candidate["canonical_ref"]}, ""),
+                    ({"status": "remote_source_resolved", "resolved_commit": "b" * 40, "remote": "origin", "remote_ref": new_candidate["canonical_ref"]}, ""),
                 ],
             ):
                 plan = step4.resolve_gitdiff_ref_plan_for_row(
@@ -2318,7 +2554,7 @@ public class com.acme.Api {
                 "ref": "origin/release-2.0.0", "commit": "b" * 40,
                 "canonical_ref": "refs/heads/release-2.0.0", "remote": "origin",
             }
-            with patch.object(
+            with patch.object(step4, "_is_git_worktree", return_value=True), patch.object(
                 step4,
                 "resolve_repo_ref_pair_for_versions",
                 return_value=(
@@ -2327,10 +2563,10 @@ public class com.acme.Api {
                 ),
             ), patch.object(
                 step4,
-                "materialize_remote_source_candidate",
+                "_materialize_resolved_remote_ref",
                 side_effect=[
-                    {"status": "remote_source_resolved", "resolved_commit": "a" * 40},
-                    {"status": "remote_source_resolved", "resolved_commit": "b" * 40},
+                    ({"status": "remote_source_resolved", "resolved_commit": "a" * 40}, ""),
+                    ({"status": "remote_source_resolved", "resolved_commit": "b" * 40}, ""),
                 ],
             ):
                 matched, pending = step4.preflight_gitdiff_refs(
@@ -2385,7 +2621,7 @@ public class com.acme.Api {
                 {"ref": "origin/support-2", "commit": "d" * 40, "score": 140},
             ]
 
-            with patch.object(
+            with patch.object(step4, "_is_git_worktree", return_value=True), patch.object(
                 sys,
                 "argv",
                 [
@@ -2807,6 +3043,7 @@ public class com.acme.Api {
     def test_list_repo_refs_uses_live_remote_inventory_not_tracking_refs(self):
         inventory = {
             "queried_at": "2026-07-17T00:00:00Z",
+            "remotes": ["origin"],
             "failures": [],
             "refs": [
                 {
@@ -2816,6 +3053,14 @@ public class com.acme.Api {
                     "short_name": "release-1.0.0",
                     "kind": "branch",
                     "commit": "a" * 40,
+                },
+                {
+                    "remote": "origin",
+                    "ref": "origin/v1.0.0",
+                    "canonical_ref": "refs/tags/v1.0.0",
+                    "short_name": "v1.0.0",
+                    "kind": "tag",
+                    "commit": "b" * 40,
                 }
             ],
         }
@@ -2826,18 +3071,197 @@ public class com.acme.Api {
             refs = step4._list_repo_refs(tmp)
 
         self.assertEqual(refs["remotes"], ["origin/release-1.0.0"])
+        self.assertEqual(refs["tags"], ["origin/v1.0.0"])
+        self.assertEqual(refs["configured_remotes"], ["origin"])
+        self.assertEqual(len(refs["remote_records"]), 2)
         self.assertEqual(refs["remote_records"][0]["commit"], "a" * 40)
         query.assert_called_once()
+
+    def test_live_ref_resolution_uses_origin_before_failed_lower_tier(self):
+        with patch.object(
+            step4,
+            "_list_repo_refs",
+            return_value={
+                "configured_remotes": ["origin", "backup"],
+                "remote_records": [{
+                    "remote": "origin",
+                    "ref": "origin/release-1.2.3",
+                    "canonical_ref": "refs/heads/release-1.2.3",
+                    "kind": "branch",
+                    "commit": "a" * 40,
+                }],
+                "remote_failures": [{"remote": "backup", "reason": "network timeout"}],
+            },
+        ):
+            candidates, _version, error = step4.list_repo_ref_candidates_for_version(
+                "/repo", "1.2.3"
+            )
+
+        self.assertIsNone(error)
+        self.assertEqual([item["ref"] for item in candidates], ["origin/release-1.2.3"])
+
+    def test_live_ref_resolution_does_not_fall_through_failed_origin(self):
+        with patch.object(
+            step4,
+            "_list_repo_refs",
+            return_value={
+                "configured_remotes": ["origin", "backup"],
+                "remote_records": [{
+                    "remote": "backup",
+                    "ref": "backup/release-1.2.3",
+                    "canonical_ref": "refs/heads/release-1.2.3",
+                    "kind": "branch",
+                    "commit": "b" * 40,
+                }],
+                "remote_failures": [{"remote": "origin", "reason": "network timeout"}],
+            },
+        ):
+            candidates, _version, error = step4.list_repo_ref_candidates_for_version(
+                "/repo", "1.2.3"
+            )
+
+        self.assertEqual([item["ref"] for item in candidates], ["backup/release-1.2.3"])
+        self.assertEqual(error, "remote_query_failed=network timeout")
+
+    def test_live_peer_remote_failure_is_symmetric_and_blocks_selection(self):
+        for healthy, failed in (("backup", "upstream"), ("upstream", "backup")):
+            with self.subTest(healthy=healthy, failed=failed), patch.object(
+                step4,
+                "_list_repo_refs",
+                return_value={
+                    "configured_remotes": ["backup", "upstream"],
+                    "remote_records": [{
+                        "remote": healthy,
+                        "ref": f"{healthy}/release-1.2.3",
+                        "canonical_ref": "refs/heads/release-1.2.3",
+                        "kind": "branch",
+                        "commit": "c" * 40,
+                    }],
+                    "remote_failures": [{"remote": failed, "reason": "network timeout"}],
+                },
+            ):
+                candidates, _version, error = step4.list_repo_ref_candidates_for_version(
+                    "/repo", "1.2.3"
+                )
+
+            self.assertEqual([item["remote"] for item in candidates], [healthy])
+            self.assertEqual(error, "remote_query_failed=network timeout")
+
+    def test_live_peer_tier_requires_all_peers_after_origin_has_no_match(self):
+        with patch.object(
+            step4,
+            "_list_repo_refs",
+            return_value={
+                "configured_remotes": ["origin", "backup", "upstream"],
+                "remote_records": [{
+                    "remote": "backup",
+                    "ref": "backup/release-1.2.3",
+                    "canonical_ref": "refs/heads/release-1.2.3",
+                    "kind": "branch",
+                    "commit": "d" * 40,
+                }],
+                "remote_failures": [{"remote": "upstream", "reason": "network timeout"}],
+            },
+        ):
+            candidates, _version, error = step4.list_repo_ref_candidates_for_version(
+                "/repo", "1.2.3"
+            )
+
+        self.assertEqual([item["remote"] for item in candidates], ["backup"])
+        self.assertEqual(error, "remote_query_failed=network timeout")
+
+    def test_resolve_repo_ref_for_version_keeps_live_remote_tag_candidate(self):
+        commit = "b" * 40
+        with patch.object(
+            step4,
+            "_list_repo_refs",
+            return_value={
+                "heads": [],
+                "remotes": [],
+                "tags": ["origin/v1.2.3"],
+                "remote_failures": [],
+                "remote_records": [{
+                    "remote": "origin",
+                    "ref": "origin/v1.2.3",
+                    "canonical_ref": "refs/tags/v1.2.3",
+                    "short_name": "v1.2.3",
+                    "kind": "tag",
+                    "commit": commit,
+                }],
+            },
+        ):
+            resolved, reason, candidates = step4.resolve_repo_ref_for_version(
+                "/repo",
+                "1.2.3",
+            )
+
+        self.assertEqual(resolved, "origin/v1.2.3")
+        self.assertIn("kind=tag", reason)
+        self.assertEqual(candidates[0]["kind"], "tag")
+        self.assertEqual(candidates[0]["commit"], commit)
+
+    def test_ref_pair_prefers_branch_family_but_retains_tag_candidates(self):
+        records = [
+            {
+                "remote": "origin",
+                "ref": "origin/release-1.0",
+                "canonical_ref": "refs/heads/release-1.0",
+                "kind": "branch",
+                "commit": "a" * 40,
+            },
+            {
+                "remote": "origin",
+                "ref": "origin/v1.0",
+                "canonical_ref": "refs/tags/v1.0",
+                "kind": "tag",
+                "commit": "c" * 40,
+            },
+            {
+                "remote": "origin",
+                "ref": "origin/release-2.0",
+                "canonical_ref": "refs/heads/release-2.0",
+                "kind": "branch",
+                "commit": "b" * 40,
+            },
+            {
+                "remote": "origin",
+                "ref": "origin/v2.0",
+                "canonical_ref": "refs/tags/v2.0",
+                "kind": "tag",
+                "commit": "d" * 40,
+            },
+        ]
+        with patch.object(
+            step4,
+            "_list_repo_refs",
+            return_value={
+                "heads": [],
+                "remotes": [item["ref"] for item in records if item["kind"] == "branch"],
+                "tags": [item["ref"] for item in records if item["kind"] == "tag"],
+                "remote_records": records,
+                "remote_failures": [],
+            },
+        ):
+            old_ref, new_ref, old_reason, new_reason, old_candidates, new_candidates = (
+                step4.resolve_repo_ref_pair_for_versions("/repo", "1.0", "2.0")
+            )
+
+        self.assertEqual(old_ref, "origin/release-1.0")
+        self.assertEqual(new_ref, "origin/release-2.0")
+        self.assertIn("kind=remote", old_reason)
+        self.assertIn("kind=remote", new_reason)
+        self.assertEqual({item["kind"] for item in old_candidates}, {"remote", "tag"})
+        self.assertEqual({item["kind"] for item in new_candidates}, {"remote", "tag"})
 
     def test_resolve_repo_ref_for_version_keeps_remote_failure_primary_with_unconfirmed_local_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(
                 step4,
-                "_list_repo_refs",
+                "resolve_remote_source_ref",
                 return_value={
-                    "tags": [],
-                    "heads": [],
-                    "remotes": [],
+                    "status": "remote_ref_not_found",
+                    "candidates": [],
+                    "failures": [],
                 },
             ), patch.object(
                 step4,
@@ -2863,8 +3287,12 @@ public class com.acme.Api {
     def test_resolve_repo_ref_for_version_accepts_confirmed_local_override(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(
             step4,
-            "_list_repo_refs",
-            return_value={"tags": [], "heads": [], "remotes": []},
+            "resolve_remote_source_ref",
+            return_value={
+                "status": "remote_ref_not_found",
+                "candidates": [],
+                "failures": [],
+            },
         ), patch.object(
             step4,
             "resolve_local_source_ref",
@@ -3516,7 +3944,9 @@ public class com.acme.Api {
             output_dir = repo_dir / "out"
             output_dir.mkdir()
 
-            with patch.object(step4, "resolve_repo_ref_for_version", side_effect=[(None, "miss-old", []), (None, "miss-new", [])]):
+            with patch.object(step4, "_is_git_worktree", return_value=True), patch.object(
+                step4, "resolve_repo_ref_for_version", side_effect=[(None, "miss-old", []), (None, "miss-new", [])]
+            ):
                 with patch.object(step4, "_list_repo_refs", return_value={"tags": ["v1.0.0"], "heads": [], "remotes": ["origin/2.0.0"]}):
                     result = step4.run_gitdiff(
                         {

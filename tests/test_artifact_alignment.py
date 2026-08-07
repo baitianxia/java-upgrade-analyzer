@@ -96,6 +96,34 @@ class ArtifactAlignmentTest(unittest.TestCase):
         self.assertEqual(record.status, "unverified")
         self.assertIn("source_worktree_dirty", record.reasons)
 
+    def test_git_status_failure_cannot_be_interpreted_as_clean(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project, artifact, revision, sha = self.make_project(tmp)
+            real_run_cmd = artifact_alignment.run_cmd
+
+            def fail_status(command, **kwargs):
+                if "status" in command:
+                    return "", "fatal: transient index lock failure", 128
+                return real_run_cmd(command, **kwargs)
+
+            with patch.object(
+                artifact_alignment,
+                "run_cmd",
+                side_effect=fail_status,
+            ):
+                record = artifact_alignment.build_artifact_alignment(
+                    project,
+                    artifact,
+                    target_module="app",
+                    expected_revision=revision,
+                    expected_sha256=sha,
+                    internally_built=True,
+                )
+
+        self.assertEqual(record.status, "unverified")
+        self.assertIn("source_worktree_status_unavailable", record.reasons)
+        self.assertIn("transient index lock failure", record.git_failures[0])
+
     def test_revision_sha_and_module_mismatches_are_explicit(self):
         with tempfile.TemporaryDirectory() as tmp:
             project, artifact, _revision, _sha = self.make_project(tmp)
@@ -271,22 +299,27 @@ class Step5BusinessSourceWorkspaceTest(unittest.TestCase):
         ).stdout.strip()
         return project, source, java_file, base_revision, current_revision
 
-    def write_current_provenance(self, report, revision):
+    def write_current_provenance(
+        self, report, revision, *, source_mode="checkout_build", build_tool="",
+    ):
         dependencies = Path(report) / "evidence" / "dependencies"
         dependencies.mkdir(parents=True)
+        side = {
+            "side": "current",
+            "source_mode": source_mode,
+            "revision": revision,
+        }
+        if build_tool:
+            side["build_tool"] = build_tool
         (dependencies / "build_provenance.json").write_text(
             json.dumps({
                 "schema": "java-upgrade-analyzer.build-provenance.v1",
-                "sides": [{
-                    "side": "current",
-                    "source_mode": "checkout_build",
-                    "revision": revision,
-                }],
+                "sides": [side],
             }),
             encoding="utf-8",
         )
 
-    def test_clean_matching_checkout_is_reused(self):
+    def test_clean_matching_checkout_still_uses_pinned_detached_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp:
             project, source, _java_file, _base, current = self.make_project_history(tmp)
             report = Path(tmp) / "report"
@@ -295,9 +328,9 @@ class Step5BusinessSourceWorkspaceTest(unittest.TestCase):
             with step5.materialize_step5_business_source_workspace(
                 report, [str(source)]
             ) as workspace:
-                self.assertEqual(workspace["mode"], "existing_matching_checkout")
-                self.assertEqual(workspace["source_dirs"], [str(source.resolve())])
-                self.assertEqual(workspace["temporary_worktree"], "")
+                self.assertEqual(workspace["mode"], "detached_commit_workspace")
+                self.assertNotEqual(workspace["source_dirs"], [str(source.resolve())])
+                self.assertTrue(Path(workspace["temporary_worktree"]).is_dir())
 
             worktrees = subprocess.run(
                 ["git", "-C", str(project), "worktree", "list", "--porcelain"],
@@ -305,7 +338,36 @@ class Step5BusinessSourceWorkspaceTest(unittest.TestCase):
             ).stdout
             self.assertEqual(worktrees.count("worktree "), 1)
 
-    def test_matching_checkout_reuses_untracked_generated_mybatis_sources(self):
+    def test_provided_artifact_with_remote_revision_uses_pinned_source_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project, source, java_file, base, _current = self.make_project_history(tmp)
+            report = Path(tmp) / "report"
+            self.write_current_provenance(
+                report,
+                base,
+                source_mode="provided_artifact",
+                build_tool="maven",
+            )
+            java_file.write_text(
+                "class Demo { int value = 99; }\n", encoding="utf-8"
+            )
+
+            with patch.object(
+                step5,
+                "run_step5_detached_maven_compile",
+            ) as compile_sources:
+                with step5.materialize_step5_business_source_workspace(
+                    report, [str(source)]
+                ) as workspace:
+                    self.assertEqual(workspace["mode"], "detached_commit_workspace")
+                    mapped = Path(workspace["source_dirs"][0]) / "Demo.java"
+                    self.assertIn("value = 1", mapped.read_text(encoding="utf-8"))
+                    self.assertNotIn("value = 99", mapped.read_text(encoding="utf-8"))
+                compile_sources.assert_not_called()
+
+            self.assertIn("value = 99", java_file.read_text(encoding="utf-8"))
+
+    def test_matching_checkout_regenerates_sources_in_pinned_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp) / "project"
             project.mkdir()
@@ -347,15 +409,27 @@ class Step5BusinessSourceWorkspaceTest(unittest.TestCase):
             self.assertIn("GeneratedDao.java", untracked)
             self.assertIn("pom.xml", untracked)
 
-            with step5.materialize_step5_business_source_workspace(
-                report, [str(generated_source)]
-            ) as workspace:
-                self.assertEqual(workspace["mode"], "existing_matching_checkout")
-                self.assertEqual(
-                    workspace["source_dirs"], [str(generated_source.resolve())]
+            def fake_compile(_report, root, detached, *, side, runner=step5.run_cmd):
+                mapped = Path(detached) / generated_source.relative_to(project)
+                mapped.mkdir(parents=True)
+                (mapped / "GeneratedDao.java").write_text(
+                    "interface GeneratedDao {}\n", encoding="utf-8"
                 )
-                self.assertTrue(generated_dao.is_file())
-                self.assertEqual(workspace["temporary_worktree"], "")
+                return {"side": side, "build_tool": "maven"}
+
+            with patch.object(
+                step5,
+                "run_step5_detached_maven_compile",
+                side_effect=fake_compile,
+            ):
+                with step5.materialize_step5_business_source_workspace(
+                    report, [str(generated_source)]
+                ) as workspace:
+                    self.assertEqual(workspace["mode"], "detached_commit_workspace")
+                    mapped_source = Path(workspace["source_dirs"][0])
+                    self.assertNotEqual(mapped_source, generated_source.resolve())
+                    self.assertTrue((mapped_source / "GeneratedDao.java").is_file())
+                    self.assertTrue(generated_dao.is_file())
 
             worktrees = subprocess.run(
                 ["git", "-C", str(project), "worktree", "list", "--porcelain"],
@@ -368,19 +442,38 @@ class Step5BusinessSourceWorkspaceTest(unittest.TestCase):
             root = Path(tmp)
             project = root / "project"
             worktree = root / "worktree"
-            project.mkdir()
-            worktree.mkdir()
-            wrapper = project / ("mvnw.cmd" if step5.IS_WINDOWS else "mvnw")
+            source_project = project / "services" / "api"
+            detached_project = worktree / "services" / "api"
+            source_project.mkdir(parents=True)
+            detached_project.mkdir(parents=True)
+            original_wrapper = source_project / (
+                "mvnw.cmd" if step5.IS_WINDOWS else "mvnw"
+            )
+            original_wrapper.write_text(
+                "@exit /b 9\r\n" if step5.IS_WINDOWS else "#!/bin/sh\nexit 9\n",
+                encoding="utf-8",
+            )
+            wrapper = detached_project / (
+                "mvnw.cmd" if step5.IS_WINDOWS else "mvnw"
+            )
             wrapper.write_text(
                 "@exit /b 0\r\n" if step5.IS_WINDOWS else "#!/bin/sh\nexit 0\n",
                 encoding="utf-8",
             )
             if not step5.IS_WINDOWS:
+                original_wrapper.chmod(0o755)
                 wrapper.chmod(0o755)
-            settings = project / ".mvn" / "settings.xml"
+            settings = detached_project / ".mvn" / "settings.xml"
             settings.parent.mkdir()
             settings.write_text("<settings/>\n", encoding="utf-8")
-            (worktree / "pom.xml").write_text("<project/>\n", encoding="utf-8")
+            original_settings = source_project / ".mvn" / "settings.xml"
+            original_settings.parent.mkdir()
+            original_settings.write_text(
+                "<settings><!-- mutable --></settings>\n", encoding="utf-8",
+            )
+            (detached_project / "pom.xml").write_text(
+                "<project/>\n", encoding="utf-8",
+            )
             base_jdk = root / "base-jdk"
             current_jdk = root / "current-jdk"
             for jdk in (base_jdk, current_jdk):
@@ -398,6 +491,7 @@ class Step5BusinessSourceWorkspaceTest(unittest.TestCase):
                             "jdk_home": str(root / "stale-base-jdk"),
                             "target_module": "app",
                             "active_maven_profiles": ["base-profile"],
+                            "build_command": f"mvn -s {original_settings}",
                         },
                         {
                             "side": "current",
@@ -440,10 +534,18 @@ class Step5BusinessSourceWorkspaceTest(unittest.TestCase):
                 clear=False,
             ):
                 base_result = step5.run_step5_detached_maven_compile(
-                    report, project, worktree, side="base", runner=fake_runner
+                    report,
+                    source_project,
+                    detached_project,
+                    side="base",
+                    runner=fake_runner,
                 )
                 current_result = step5.run_step5_detached_maven_compile(
-                    report, project, worktree, side="current", runner=fake_runner
+                    report,
+                    source_project,
+                    detached_project,
+                    side="current",
+                    runner=fake_runner,
                 )
 
         self.assertEqual(len(calls), 2)
@@ -454,9 +556,15 @@ class Step5BusinessSourceWorkspaceTest(unittest.TestCase):
             )
             self.assertEqual(command[-2:], ["-DskipTests", "compile"])
             self.assertEqual(kwargs["timeout"], 73)
-            self.assertEqual(kwargs["cwd"], str(worktree.resolve()))
+            self.assertNotEqual(command[0], str(original_wrapper.resolve()))
+            self.assertEqual(kwargs["cwd"], str(detached_project.resolve()))
             self.assertEqual(
-                kwargs["env"]["MAVEN_PROJECTBASEDIR"], str(worktree.resolve())
+                kwargs["env"]["MAVEN_PROJECTBASEDIR"],
+                str(detached_project.resolve()),
+            )
+            self.assertEqual(
+                kwargs["env"]["MAVEN_BASEDIR"],
+                str(detached_project.resolve()),
             )
         self.assertEqual(calls[0][1]["env"]["JAVA_HOME"], str(base_jdk.resolve()))
         self.assertEqual(calls[1][1]["env"]["JAVA_HOME"], str(current_jdk.resolve()))
@@ -464,6 +572,68 @@ class Step5BusinessSourceWorkspaceTest(unittest.TestCase):
         self.assertIn("-Pcurrent-profile", calls[1][0])
         self.assertEqual(base_result["jdk_home"], str(base_jdk.resolve()))
         self.assertEqual(current_result["jdk_home"], str(current_jdk.resolve()))
+
+    def test_missing_detached_wrapper_never_executes_mutable_checkout_wrapper(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_project = root / "checkout" / "nested"
+            detached_project = root / "detached" / "nested"
+            source_project.mkdir(parents=True)
+            detached_project.mkdir(parents=True)
+            original_wrapper = source_project / (
+                "mvnw.cmd" if step5.IS_WINDOWS else "mvnw"
+            )
+            original_wrapper.write_text("mutable wrapper must not run\n", encoding="utf-8")
+            original_pom = source_project / "pom.xml"
+            original_pom.write_text(
+                "<project><!-- mutable --></project>\n", encoding="utf-8",
+            )
+            (detached_project / "pom.xml").write_text(
+                "<project/>\n", encoding="utf-8",
+            )
+            report = root / "report"
+            dependencies = report / "evidence" / "dependencies"
+            dependencies.mkdir(parents=True)
+            (dependencies / "build_provenance.json").write_text(
+                json.dumps({"sides": [{"side": "current"}]}),
+                encoding="utf-8",
+            )
+            captured = {}
+
+            def fake_runner(command, **kwargs):
+                captured["command"] = list(command)
+                captured["kwargs"] = dict(kwargs)
+                return "", "", 0
+
+            with patch.object(
+                step5, "mvn_cmd", return_value=["system-maven"]
+            ) as maven_command, patch.object(
+                step5, "load_orchestrated_step5_input", return_value={}
+            ), patch.dict(
+                os.environ,
+                {
+                    "JAVA_HOME": "",
+                    "MAVEN_ARGS": f"--file {original_pom} -Dkeep=yes",
+                },
+                clear=False,
+            ):
+                step5.run_step5_detached_maven_compile(
+                    report,
+                    source_project,
+                    detached_project,
+                    side="current",
+                    runner=fake_runner,
+                )
+
+            maven_command.assert_called_once_with(detached_project.resolve())
+            self.assertEqual(captured["command"][0], "system-maven")
+            self.assertNotIn(str(original_wrapper.resolve()), captured["command"])
+            self.assertNotIn(str(original_pom.resolve()), captured["command"])
+            self.assertIn("-Dkeep=yes", captured["command"])
+            self.assertEqual(captured["kwargs"]["env"]["MAVEN_ARGS"], "")
+            self.assertEqual(
+                captured["kwargs"]["cwd"], str(detached_project.resolve()),
+            )
 
     def test_detached_maven_compile_has_no_default_timeout(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -572,6 +742,114 @@ class Step5BusinessSourceWorkspaceTest(unittest.TestCase):
             self.assertEqual(calls[0][0], project.resolve())
             self.assertEqual(calls[0][2], "current")
 
+    def test_pinned_nested_project_is_the_detached_maven_build_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "project"
+            nested_project = project / "services" / "api"
+            nested_project.mkdir(parents=True)
+            (nested_project / "pom.xml").write_text(
+                "<project/>\n", encoding="utf-8",
+            )
+            subprocess.run(["git", "init", "-q", str(project)], check=True)
+            subprocess.run(["git", "-C", str(project), "add", "."], check=True)
+            subprocess.run(
+                [
+                    "git", "-C", str(project), "-c", "user.name=Test",
+                    "-c", "user.email=test@example.com", "commit", "-qm",
+                    "nested project",
+                ],
+                check=True,
+            )
+            revision = subprocess.run(
+                ["git", "-C", str(project), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            generated_relative = Path("target/generated-sources/java")
+            stable_source = nested_project / generated_relative
+            report = root / "report"
+            dependencies = report / "evidence" / "dependencies"
+            dependencies.mkdir(parents=True)
+            (dependencies / "build_provenance.json").write_text(
+                json.dumps({
+                    "sides": [{
+                        "side": "current",
+                        "source_mode": "checkout_build",
+                        "revision": revision,
+                        "build_tool": "maven",
+                    }],
+                }),
+                encoding="utf-8",
+            )
+            state_path = report / ".runtime" / "state" / "main_state.json"
+            state_path.parent.mkdir(parents=True)
+            state_path.write_text(
+                json.dumps({
+                    "step5": {
+                        "input": {
+                            "pinned_source_snapshot": {
+                                "schema": step5.PINNED_SOURCE_SNAPSHOT_SCHEMA,
+                                "commit": revision,
+                                "project_path": "services/api",
+                                "source_roots": [generated_relative.as_posix()],
+                            },
+                            "current_ref_binding": {"repo_dir": str(project)},
+                            "source_dirs": [str(stable_source)],
+                        },
+                    },
+                }),
+                encoding="utf-8",
+            )
+            calls = []
+
+            def fake_compile(_report, source_root, detached_root, *, side, runner=step5.run_cmd):
+                calls.append((Path(source_root), Path(detached_root), side))
+                generated = Path(detached_root) / generated_relative
+                generated.mkdir(parents=True)
+                (generated / "Generated.java").write_text(
+                    "class Generated {}\n", encoding="utf-8",
+                )
+                return {"side": side, "build_tool": "maven"}
+
+            temporary_worktree = ""
+            with patch.dict(os.environ, {"JUA_ORCHESTRATED": "1"}), patch.object(
+                step5,
+                "run_step5_detached_maven_compile",
+                side_effect=fake_compile,
+            ):
+                with step5.materialize_step5_business_source_workspace(
+                    report, [str(stable_source)],
+                ) as workspace:
+                    temporary_worktree = workspace["temporary_worktree"]
+                    expected_detached_project = (
+                        Path(temporary_worktree) / "services" / "api"
+                    ).resolve()
+                    self.assertEqual(
+                        Path(workspace["project_root"]),
+                        expected_detached_project,
+                    )
+                    self.assertTrue(
+                        (Path(workspace["source_dirs"][0]) / "Generated.java").is_file()
+                    )
+
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0][0], nested_project.resolve())
+            self.assertEqual(
+                calls[0][1],
+                (Path(temporary_worktree) / "services" / "api").resolve(),
+            )
+            self.assertEqual(calls[0][2], "current")
+            self.assertFalse(Path(temporary_worktree).exists())
+            worktrees = subprocess.run(
+                ["git", "-C", str(project), "worktree", "list", "--porcelain"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            self.assertEqual(worktrees.count("worktree "), 1)
+
     def test_mismatched_checkout_uses_expected_commit_and_cleans_worktree(self):
         with tempfile.TemporaryDirectory() as tmp:
             project, source, _java_file, base, _current = self.make_project_history(tmp)
@@ -599,7 +877,7 @@ class Step5BusinessSourceWorkspaceTest(unittest.TestCase):
             ).stdout
             self.assertEqual(worktrees.count("worktree "), 1)
 
-    def test_matching_checkout_preserves_tracked_post_compile_changes(self):
+    def test_matching_checkout_excludes_uncommitted_tracked_changes(self):
         with tempfile.TemporaryDirectory() as tmp:
             project, source, java_file, _base, current = self.make_project_history(tmp)
             report = Path(tmp) / "report"
@@ -609,10 +887,10 @@ class Step5BusinessSourceWorkspaceTest(unittest.TestCase):
             with step5.materialize_step5_business_source_workspace(
                 report, [str(source)]
             ) as workspace:
-                self.assertEqual(workspace["mode"], "existing_matching_checkout")
+                self.assertEqual(workspace["mode"], "detached_commit_workspace")
                 mapped_file = Path(workspace["source_dirs"][0]) / "Demo.java"
-                self.assertIn("value = 99", mapped_file.read_text())
-                self.assertEqual(workspace["worktree_dirty_check"], "skipped")
+                self.assertIn("value = 2", mapped_file.read_text())
+                self.assertNotIn("value = 99", mapped_file.read_text())
 
             self.assertIn("value = 99", java_file.read_text())
             worktrees = subprocess.run(

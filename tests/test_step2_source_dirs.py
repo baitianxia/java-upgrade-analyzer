@@ -1,5 +1,7 @@
 import csv
 import json
+import shutil
+import subprocess
 import sys
 import tempfile
 import zipfile
@@ -16,6 +18,125 @@ import gate  # noqa: E402
 
 
 class Step2SourceDirsTest(unittest.TestCase):
+    def test_strict_git_repository_probe_failure_is_not_not_a_repo(self):
+        with patch.object(
+            step2,
+            "run_cmd",
+            return_value=("", "fatal: transient repository read failure", 128),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "STEP2_GIT_REPOSITORY_PROBE_FAILED",
+            ):
+                step2.is_git_repo("/repo", strict_git=True)
+
+    def test_strict_git_show_distinguishes_absent_path_from_process_failure(self):
+        with patch.object(
+            step2,
+            "run_cmd",
+            return_value=(
+                "",
+                "fatal: path 'pom.xml' does not exist in 'aaaaaaaa'",
+                128,
+            ),
+        ):
+            self.assertEqual(
+                step2.git_show_file(
+                    "a" * 40,
+                    "pom.xml",
+                    "/repo",
+                    strict_git=True,
+                ),
+                "",
+            )
+
+        with patch.object(
+            step2,
+            "run_cmd",
+            return_value=("", "fatal: bad object aaaaaaaa", 128),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "STEP2_GIT_SHOW_FAILED"):
+                step2.git_show_file(
+                    "a" * 40,
+                    "pom.xml",
+                    "/repo",
+                    strict_git=True,
+                )
+
+    def test_strict_effective_model_worktree_failure_is_blocking(self):
+        with patch.object(
+            step2,
+            "get_git_root",
+            return_value="/repo",
+        ), patch.object(
+            step2,
+            "create_detached_worktree",
+            side_effect=RuntimeError("git worktree lock unavailable"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "STEP2_GIT_WORKTREE_CREATE_FAILED",
+            ):
+                step2.resolve_maven_jdk_from_effective_model(
+                    "a" * 40,
+                    "/repo",
+                    strict_git=True,
+                )
+
+    @unittest.skipUnless(shutil.which("git"), "Git is required")
+    def test_fixed_commit_manifest_ignores_checkout_head_and_dirty_files(self):
+        real_git = shutil.which("git")
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+
+            def git(*args):
+                completed = subprocess.run(
+                    [real_git, *args],
+                    cwd=repo,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                return completed.stdout.strip()
+
+            git("init", "-q")
+            git("config", "user.name", "Step2 Test")
+            git("config", "user.email", "step2@example.invalid")
+            (repo / "pom.xml").write_text(
+                "<project><properties><java.version>11</java.version></properties></project>",
+                encoding="utf-8",
+            )
+            git("add", "pom.xml")
+            git("commit", "-qm", "base")
+            base = git("rev-parse", "HEAD")
+            (repo / "pom.xml").write_text(
+                "<project><properties><java.version>17</java.version></properties></project>",
+                encoding="utf-8",
+            )
+            git("commit", "-qam", "current")
+            current = git("rev-parse", "HEAD")
+            # Neither a dirty tracked file nor an untracked manifest may
+            # override immutable tree reads.
+            (repo / "pom.xml").write_text(
+                "<project><properties><java.version>99</java.version></properties></project>",
+                encoding="utf-8",
+            )
+            (repo / "build.gradle").write_text(
+                "sourceCompatibility = 99\n",
+                encoding="utf-8",
+            )
+
+            detected = step2.detect_jdk_versions_from_manifests(
+                base,
+                current,
+                repo,
+                "maven",
+                strict_git=True,
+            )
+
+        self.assertEqual(detected[:2], ("11", "17"))
+
     @staticmethod
     def _class_bytes(major):
         return b"\xca\xfe\xba\xbe\x00\x00" + int(major).to_bytes(2, "big")
@@ -44,6 +165,8 @@ class Step2SourceDirsTest(unittest.TestCase):
             confirmed = {
                 "base_branch": "main",
                 "current_branch": "upgrade",
+                "base_resolved_commit": "a" * 40,
+                "current_resolved_commit": "b" * 40,
                 "source_dirs": [str(source_dir)],
                 "jdk_base": "11",
                 "jdk_current": "21",
@@ -55,6 +178,10 @@ class Step2SourceDirsTest(unittest.TestCase):
                 step2, "load_orchestrated_step2_input", return_value=confirmed
             ), patch.object(
                 step2, "detect_build_tool", return_value="maven"
+            ), patch.object(
+                step2,
+                "require_pinned_git_commit",
+                side_effect=lambda revision, *_args, **_kwargs: revision,
             ), patch.object(
                 step2, "detect_jdk_versions", return_value=("8", "17")
             ), patch.object(

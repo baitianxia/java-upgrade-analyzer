@@ -41,7 +41,7 @@ from datetime import date
 from pathlib import Path, PurePosixPath
 from typing import Iterable
 
-from compat import git_cmd
+from compat import git_cmd, run_cmd
 from csv_io import open_csv_read, open_csv_write
 from path_runtime import short_temp_root, short_temporary_directory
 from analysis_contract import (
@@ -119,6 +119,14 @@ STANDARD_FAULT_INJECTIONS = (
     "corrupt_oracle_digest",
     "truncate_oracle_scan",
 )
+FULL_GIT_OBJECT_ID_RE = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})")
+
+
+def _is_full_git_object_id(value: object) -> bool:
+    """Accept full object IDs from either SHA-1 or SHA-256 repositories."""
+    return bool(FULL_GIT_OBJECT_ID_RE.fullmatch(str(value or "")))
+
+
 ORACLE_INTEGRITY_FAULT_INJECTIONS = (
     "corrupt_oracle_digest",
     "truncate_oracle_scan",
@@ -1770,24 +1778,19 @@ def validate_pinned_asset(manifest: dict, project_root: Path) -> dict:
     artifact = project_root / str(manifest.get("artifact_path") or "")
     actual_revision = ""
     actual_sha = ""
-    if not re.fullmatch(r"[0-9a-f]{40}", expected_revision):
+    if not _is_full_git_object_id(expected_revision):
         errors.append("git_revision_pin_invalid")
     if verification_mode == "sha256" and not _valid_sha256(expected_sha):
         errors.append("final_artifact_sha256_pin_invalid")
     if not project_root.is_dir():
         errors.append("project_checkout_missing")
     else:
-        completed = subprocess.run(
+        stdout, _stderr, rc = run_cmd(
             git_cmd() + ["-C", str(project_root), "rev-parse", "HEAD"],
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
             timeout=30,
         )
-        if completed.returncode == 0:
-            actual_revision = completed.stdout.strip()
+        if rc == 0:
+            actual_revision = stdout.strip()
         if actual_revision != expected_revision:
             errors.append("git_revision_mismatch")
     if not artifact.is_file():
@@ -1883,7 +1886,7 @@ def validate_reproducible_asset_contract(manifest: dict) -> list[str]:
             revision = str(artifact.get("revision") or "")
             artifact_path = Path(str(artifact.get("artifact_path") or ""))
             digest = str(artifact.get("artifact_sha256") or "")
-            if not re.fullmatch(r"[0-9a-f]{40}", revision):
+            if not _is_full_git_object_id(revision):
                 errors.append(f"{prefix}_revision_invalid")
             if not str(artifact_path) or artifact_path.is_absolute() or ".." in artifact_path.parts:
                 errors.append("source_build_artifact_path_not_relative")
@@ -7798,54 +7801,39 @@ def collect_project_asset_health(project_root: Path) -> dict:
         if "/target/generated-sources/" in path.as_posix()
         or "/generated-sources/" in path.as_posix()
     ]
-    git_result = subprocess.run(
+    git_stdout, git_stderr, git_rc = run_cmd(
         git_cmd() + ["-C", str(project_root), "rev-parse", "--is-inside-work-tree"],
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
         timeout=30,
     )
-    valid_git_checkout = git_result.returncode == 0 and git_result.stdout.strip() == "true"
+    valid_git_checkout = git_rc == 0 and git_stdout.strip() == "true"
     revision = ""
     git_dirty = None
     extra_git_errors = []
     if valid_git_checkout:
-        revision_result = subprocess.run(
+        revision_stdout, revision_stderr, revision_rc = run_cmd(
             git_cmd() + ["-C", str(project_root), "rev-parse", "HEAD"],
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
             timeout=30,
         )
-        if revision_result.returncode == 0:
-            revision = revision_result.stdout.strip()
+        if revision_rc == 0:
+            revision = revision_stdout.strip()
         else:
             extra_git_errors.append(
-                (revision_result.stderr or revision_result.stdout or "git revision unavailable").strip()
+                (revision_stderr or revision_stdout or "git revision unavailable").strip()
             )
-        dirty_result = subprocess.run(
+        dirty_stdout, dirty_stderr, dirty_rc = run_cmd(
             git_cmd() + ["-C", str(project_root), "status", "--porcelain"],
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
             timeout=30,
         )
-        if dirty_result.returncode == 0:
-            git_dirty = bool(dirty_result.stdout.strip())
+        if dirty_rc == 0:
+            git_dirty = bool(dirty_stdout.strip())
         else:
             extra_git_errors.append(
-                (dirty_result.stderr or dirty_result.stdout or "git status unavailable").strip()
+                (dirty_stderr or dirty_stdout or "git status unavailable").strip()
             )
     generated_ratio = (len(generated_java_files) / len(java_files)) if java_files else 0.0
     initial_git_error = ""
     if not valid_git_checkout:
-        initial_git_error = (git_result.stderr or git_result.stdout or "").strip()
+        initial_git_error = (git_stderr or git_stdout or "").strip()
     return {
         "valid_git_checkout": valid_git_checkout,
         "git_revision": revision,

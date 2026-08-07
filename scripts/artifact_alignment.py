@@ -4,9 +4,8 @@
 from dataclasses import asdict, dataclass
 import hashlib
 from pathlib import Path
-import subprocess
 
-from compat import git_cmd
+from compat import git_cmd, run_cmd
 
 
 @dataclass(frozen=True)
@@ -25,23 +24,18 @@ class AlignmentRecord:
     expected_revision: str
     expected_sha256: str
     reasons: tuple[str, ...]
+    git_failures: tuple[str, ...]
 
     def to_dict(self):
         return asdict(self)
 
 
 def _git(project, *args):
-    completed = subprocess.run(
+    stdout, stderr, rc = run_cmd(
         git_cmd() + ["-C", str(project), *args],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
+        timeout=30,
     )
-    if completed.returncode != 0:
-        return ""
-    return completed.stdout.strip()
+    return str(stdout or "").strip(), str(stderr or "").strip(), rc
 
 
 def _sha256(path):
@@ -68,16 +62,19 @@ def build_artifact_alignment(
     project = Path(project_root).resolve()
     artifact = Path(artifact_path).resolve()
     relative_artifact = str(artifact_relative_path or "").strip()
-    revision = _git(project, "rev-parse", "HEAD")
-    status_text = (
+    revision, revision_stderr, revision_rc = _git(
+        project, "rev-parse", "--verify", "HEAD^{commit}",
+    )
+    status_text, status_stderr, status_rc = (
         _git(project, "status", "--porcelain=v1", "--untracked-files=all")
         if check_worktree_dirty
-        else ""
+        else ("", "", 0)
     )
     dirty_paths = tuple(
         sorted(line[3:] for line in status_text.splitlines() if len(line) > 3)
-    )
+    ) if status_rc == 0 else ()
     reasons = []
+    git_failures = []
 
     if not artifact.is_file():
         reasons.append("artifact_missing")
@@ -85,8 +82,18 @@ def build_artifact_alignment(
     else:
         artifact_sha = _sha256(artifact)
 
-    if not revision:
+    if revision_rc != 0 or not revision:
         reasons.append("source_revision_unavailable")
+        git_failures.append(
+            "rev_parse:"
+            + (revision_stderr or revision or f"git exited with {revision_rc}")
+        )
+    if check_worktree_dirty and status_rc != 0:
+        reasons.append("source_worktree_status_unavailable")
+        git_failures.append(
+            "status:"
+            + (status_stderr or status_text or f"git exited with {status_rc}")
+        )
     if dirty_paths:
         reasons.append("source_worktree_dirty")
     if expected_revision and revision != expected_revision:
@@ -135,4 +142,5 @@ def build_artifact_alignment(
         expected_revision=str(expected_revision or ""),
         expected_sha256=str(expected_sha256 or ""),
         reasons=tuple(sorted(set(reasons))),
+        git_failures=tuple(git_failures),
     )

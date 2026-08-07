@@ -9,10 +9,9 @@ from importlib import metadata
 from pathlib import Path
 import platform
 import re
-import subprocess
 import sys
 
-from compat import find_executable, gradle_cmd, mvn_cmd
+from compat import find_executable, gradle_cmd, mvn_cmd, run_cmd
 
 
 MINIMUM_PYTHON = (3, 10)
@@ -97,20 +96,11 @@ def _run(command, timeout=15):
     executable = find_executable(command[0])
     if executable is None:
         return None, ""
-    try:
-        completed = subprocess.run(
-            [executable, *command[1:]],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-            timeout=timeout,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        return False, f"{exc.__class__.__name__}: {exc}"
-    return completed.returncode == 0, (completed.stdout or "").strip()
+    stdout, stderr, rc = run_cmd(
+        [executable, *command[1:]], timeout=timeout,
+    )
+    output = "\n".join(part.strip() for part in (stdout, stderr) if part.strip())
+    return rc == 0, output
 
 
 def _version_tuple(text):

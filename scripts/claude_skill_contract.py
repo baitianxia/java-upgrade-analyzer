@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import csv
 import hashlib
@@ -13,6 +14,8 @@ import shutil
 import subprocess
 import sys
 import zipfile
+
+from compat import git_cmd, run_cmd
 
 
 PUBLIC_SCRIPT_RE = re.compile(r"\$\{CLAUDE_SKILL_DIR\}/(scripts/[A-Za-z0-9_./-]+\.py)")
@@ -211,6 +214,56 @@ def _materialize_complete_fixture(
     return base_artifact, current_artifact, app_source.parents[2]
 
 
+def _initialize_fixture_remote(fixture: Path, remote: Path) -> str:
+    """Give the workflow fixture the same reachable-remote contract as users."""
+    fixture = Path(fixture).resolve()
+    remote = Path(remote).resolve()
+
+    def git(cwd, *args):
+        stdout, stderr, rc = run_cmd(
+            git_cmd() + [*args],
+            cwd=str(cwd),
+            timeout=60,
+        )
+        if rc != 0:
+            raise RuntimeError(
+                "skill contract Git fixture failed:"
+                f" {' '.join(args)}: {stderr or stdout or f'rc={rc}'}"
+            )
+        return str(stdout or "").strip()
+
+    git(fixture, "init", "-q")
+    git(fixture, "add", "pom.xml", "src")
+    git(
+        fixture,
+        "-c", "user.name=Skill Contract",
+        "-c", "user.email=skill-contract@example.invalid",
+        "commit", "-qm", "contract fixture base source",
+    )
+    base_commit = git(fixture, "rev-parse", "HEAD")
+    current_marker = fixture / "src" / "main" / "java" / "contract" / "Current.java"
+    current_marker.write_text(
+        "package contract; final class Current {}\n",
+        encoding="utf-8",
+    )
+    git(fixture, "add", str(current_marker.relative_to(fixture)))
+    git(
+        fixture,
+        "-c", "user.name=Skill Contract",
+        "-c", "user.email=skill-contract@example.invalid",
+        "commit", "-qm", "contract fixture current source",
+    )
+    git(remote.parent, "init", "--bare", "-q", str(remote))
+    git(fixture, "remote", "add", "origin", str(remote))
+    git(
+        fixture,
+        "push", "-q", "origin",
+        f"{base_commit}:refs/heads/base-artifact",
+        "HEAD:refs/heads/current-artifact",
+    )
+    return git(fixture, "rev-parse", "HEAD")
+
+
 def _state_completed_step(state_path: Path) -> str:
     if not state_path.is_file():
         return ""
@@ -246,6 +299,10 @@ def run_skill_contract(
     if complete_workflow:
         base_artifact, current_artifact, source_root = _materialize_complete_fixture(
             fixture, artifact_variant
+        )
+        _initialize_fixture_remote(
+            fixture,
+            workspace / "fixture-origin.git",
         )
     clean = not report_dir.exists() and not (skill_root / ".upgrade-report").exists()
     errors = list(audit_public_contract(skill_root))
@@ -428,12 +485,18 @@ def run_skill_contract_metamorphic_matrix(
     repo_root: Path, workspace: Path, variants
 ) -> dict[str, SkillContractReport]:
     workspace = Path(workspace)
-    return {
-        str(variant): run_skill_contract(
+    variant_ids = [str(variant) for variant in variants]
+
+    def run_variant(variant):
+        return variant, run_skill_contract(
             repo_root,
-            workspace / str(variant),
+            workspace / variant,
             complete_workflow=True,
-            artifact_variant=str(variant),
+            artifact_variant=variant,
         )
-        for variant in variants
-    }
+
+    # Every variant owns an isolated checkout, remote and report directory.
+    # A small bounded pool keeps the public contract test practical without
+    # creating a burst of Git/JVM subprocesses on constrained CI workers.
+    with ThreadPoolExecutor(max_workers=min(2, len(variant_ids) or 1)) as executor:
+        return dict(executor.map(run_variant, variant_ids))

@@ -99,19 +99,24 @@ from remote_source_refs import (
     materialize_remote_source_candidate,
     query_live_remote_refs,
     resolve_local_source_ref,
+    resolve_remote_source_ref,
 )
 
 INTERACTION_PREFIX = "JUA_STEP_INTERACTION_JSON:"
 MAIN_STATE_FILE_NAME = "main_state.json"
-DEFAULT_FETCH_TIMEOUT = None
+# Git operations must always be bounded by default.  Callers may raise these
+# values for slow remotes/repositories; timeout normalization intentionally has
+# no internal upper cap.
+DEFAULT_FETCH_TIMEOUT = 60
 DEFAULT_JAPICMP_TIMEOUT = None
-DEFAULT_GIT_DIFF_TIMEOUT = None
+DEFAULT_GIT_DIFF_TIMEOUT = 300
 DEFAULT_JAPICMP_COORD = "com.github.siom79.japicmp:japicmp:0.21.2:jar:jar-with-dependencies"
 _WRITE_RESULT_LOCK = threading.RLock()
 _JAPICMP_TOOL_DIGEST_LOCK = threading.RLock()
 _JAPICMP_TOOL_DIGEST_CACHE = {}
 _REMOTE_SOURCE_MATERIALIZATION_LOCK = threading.RLock()
 _REMOTE_SOURCE_MATERIALIZATION_CACHE = {}
+_REMOTE_SOURCE_MATERIALIZATION_KEY_LOCKS = {}
 STEP4_TIMING_FILE = "step4_timing.csv"
 DEPENDENCY_ANALYSIS_STATUS_CSV = "dependency_analysis_status.csv"
 DEPENDENCY_ANALYSIS_STATUS_JSON = "dependency_analysis_status.json"
@@ -121,6 +126,15 @@ JAPICMP_COMPARISON_CACHE_DIRNAME = "step4_japicmp"
 BUSINESS_BYTECODE_CHANGED_API_REFS_CSV = "business_bytecode_changed_api_refs.csv"
 BUSINESS_BYTECODE_PRIORITY_EVIDENCE_JSON = "business_bytecode_priority_evidence.json"
 STEP4_RECOMMENDED_DEPENDENCY_LIMIT = 10
+
+
+def _bounded_git_timeout(value, default):
+    """Return a positive timeout without truncating an explicit larger value."""
+    try:
+        timeout = int(value)
+    except (TypeError, ValueError):
+        timeout = int(default)
+    return timeout if timeout > 0 else int(default)
 
 
 _CHANGE_TYPE_LABELS = {
@@ -996,6 +1010,8 @@ def rank_repo_ref_pair_candidates(old_candidates, new_candidates, old_version: s
             -int(item["delta_match_kind"] == "partial"),
             -int(item["same_prefix"]),
             -int(item["same_remote"]),
+            _ref_kind_priority(item["old"].get("kind")),
+            _ref_kind_priority(item["new"].get("kind")),
             -int(item["old"].get("score", 0)),
             -int(item["new"].get("score", 0)),
             len(item["old"].get("ref", "")),
@@ -1010,6 +1026,7 @@ def rank_repo_ref_pair_candidates(old_candidates, new_candidates, old_version: s
 def _ref_kind_priority(kind: str):
     return {
         "remote": 0,
+        "tag": 1,
     }.get((kind or "").strip(), 9)
 
 
@@ -1084,23 +1101,39 @@ def _cached_maven_coord_locations(repo_path, cache):
     return cache[cache_key]
 
 
-def _list_repo_refs(repo_dir: str, timeout=30):
+def _list_repo_refs(repo_dir: str, timeout=DEFAULT_FETCH_TIMEOUT):
     repo_dir = os.path.abspath(repo_dir)
     cached = _REPO_REFS_CACHE.get(repo_dir)
     if cached is not None:
         return cached
 
-    inventory = query_live_remote_refs(repo_dir, timeout=timeout)
+    inventory = query_live_remote_refs(
+        repo_dir,
+        timeout=_bounded_git_timeout(timeout, DEFAULT_FETCH_TIMEOUT),
+    )
     remote_records = [
         dict(item) for item in (inventory.get("refs") or [])
-        if item.get("kind") == "branch"
+        if item.get("kind") in {"branch", "tag"}
     ]
     result = {
-        "tags": [],
+        "tags": [
+            item.get("ref") for item in remote_records
+            if item.get("kind") == "tag" and item.get("ref")
+        ],
         "heads": [],
-        "remotes": [item.get("ref") for item in remote_records if item.get("ref")],
+        "remotes": [
+            item.get("ref") for item in remote_records
+            if item.get("kind") == "branch" and item.get("ref")
+        ],
         "remote_records": remote_records,
         "remote_failures": list(inventory.get("failures") or []),
+        # Preserve the configured inventory separately from the refs that
+        # happened to match.  Callers need this to apply deterministic remote
+        # priority without treating a failed peer as an absent remote.
+        "configured_remotes": [
+            str(item).strip() for item in (inventory.get("remotes") or [])
+            if str(item or "").strip()
+        ],
         "queried_at": str(inventory.get("queried_at") or ""),
     }
     _REPO_REFS_CACHE[repo_dir] = result
@@ -1272,58 +1305,180 @@ def _score_ref_match(ref_name: str, version_norm: str):
     }
 
 
-def list_repo_ref_candidates_for_version(repo_dir: str, version: str, *, remote_timeout=30):
+def _top_ref_candidates_have_one_healthy_commit(candidates):
+    candidates = list(candidates or [])
+    if not candidates:
+        return False, set()
+    best = candidates[0]
+    tied = [
+        item for item in candidates
+        if item.get("score") == best.get("score")
+        and _ref_kind_priority(item.get("kind")) == _ref_kind_priority(best.get("kind"))
+    ]
+    commits = {
+        str(item.get("commit") or "").strip().lower()
+        for item in tied
+        if str(item.get("commit") or "").strip()
+    }
+    is_healthy = bool(tied) and len(commits) == 1 and all(
+        str(item.get("commit") or "").strip() for item in tied
+    )
+    remotes = {
+        str(item.get("remote") or item.get("remote_name") or "").strip()
+        for item in tied
+        if str(item.get("remote") or item.get("remote_name") or "").strip()
+    }
+    return is_healthy, remotes
+
+
+def _remote_failure_reason(failures):
+    reasons = "; ".join(
+        str(item.get("reason") or item.get("stage") or "remote query failed")
+        for item in (failures or [])
+    )
+    return f"remote_query_failed={reasons or 'remote query failed'}"
+
+
+def _select_live_remote_tier(candidates, configured_remotes, failures):
+    """Select one deterministic remote tier and fail closed within that tier.
+
+    ``origin`` is the conventional primary when configured.  Every other
+    configured remote is a peer: a failed peer cannot be silently discarded
+    in favour of another peer, because doing so makes the answer depend on
+    transient transport timing.  Failures in a lower tier are irrelevant once
+    a healthy origin supplied matching candidates.
+    """
+    configured = []
+    for remote in configured_remotes or []:
+        name = str(remote or "").strip()
+        if name and name not in configured:
+            configured.append(name)
+    known = set(configured)
+    failures = [dict(item) for item in (failures or [])]
+    origin_candidates = [
+        item for item in candidates
+        if str(item.get("remote") or item.get("remote_name") or "").strip() == "origin"
+    ]
+    unscoped_or_unknown = [
+        item for item in failures
+        if not str(item.get("remote") or "").strip()
+        or str(item.get("remote") or "").strip() not in known
+    ]
+
+    if "origin" in known:
+        origin_failures = [
+            item for item in failures
+            if str(item.get("remote") or "").strip() == "origin"
+        ]
+        if origin_failures or unscoped_or_unknown:
+            blocking = origin_failures + [
+                item for item in unscoped_or_unknown if item not in origin_failures
+            ]
+            return origin_candidates or list(candidates), blocking
+        if origin_candidates:
+            return origin_candidates, []
+
+        # Origin was queried successfully but has no matching ref.  All other
+        # remotes now form one peer tier, so every peer must be healthy.
+        peer_candidates = [
+            item for item in candidates
+            if str(item.get("remote") or item.get("remote_name") or "").strip() != "origin"
+        ]
+        peer_failures = [
+            item for item in failures
+            if str(item.get("remote") or "").strip() != "origin"
+        ]
+        return peer_candidates, peer_failures
+
+    # Without origin there is no implicit ordering among configured remotes.
+    return list(candidates), failures
+
+
+def list_repo_ref_candidates_for_version(
+    repo_dir: str,
+    version: str,
+    *,
+    remote_timeout=DEFAULT_FETCH_TIMEOUT,
+):
     version_norm = _normalize_version_text(version)
     if not version_norm:
         return [], version_norm, "version_empty"
-    refs = _list_repo_refs(repo_dir, timeout=remote_timeout)
-    record_by_ref = {
-        str(item.get("ref") or ""): item
-        for item in (refs.get("remote_records") or [])
+    refs = _list_repo_refs(
+        repo_dir,
+        timeout=_bounded_git_timeout(remote_timeout, DEFAULT_FETCH_TIMEOUT),
+    )
+    remote_records = [
+        dict(item) for item in (refs.get("remote_records") or [])
         if str(item.get("ref") or "")
-    }
-    candidates = []
-    for kind, ref_names in (("remotes", refs.get("remotes", [])),):
-        normalized_kind = kind[:-1] if kind.endswith("s") else kind
-        for ref_name in ref_names:
-            match_info = _score_ref_match(ref_name, version_norm)
-            if match_info:
-                candidates.append(
-                    (
-                        match_info["score"],
-                        _ref_kind_priority(normalized_kind),
-                        0 if match_info["match_kind"] == "exact_boundary" else 1,
-                        -len(match_info["prefix"]),
-                        len(ref_name),
-                        ref_name,
-                        normalized_kind,
-                        match_info,
-                    )
-                )
-    candidates.sort(key=lambda x: (-x[0], x[1], x[2], x[3], x[4], x[5]))
-    result = [
-        {
-            "ref": item[5],
-            "kind": item[6],
-            "score": item[0],
-            "version": version_norm,
-            "match_kind": item[7]["match_kind"],
-            "prefix": item[7]["prefix"],
-            "branch_name": item[7]["branch_name"],
-            "remote_name": item[7]["remote_name"],
-            "commit": str((record_by_ref.get(item[5]) or {}).get("commit") or ""),
-            "canonical_ref": str((record_by_ref.get(item[5]) or {}).get("canonical_ref") or ""),
-            "remote": str((record_by_ref.get(item[5]) or {}).get("remote") or item[7]["remote_name"]),
-        }
-        for item in candidates
     ]
-    if refs.get("remote_failures"):
-        reasons = "; ".join(
-            str(item.get("reason") or item.get("stage") or "remote query failed")
-            for item in refs.get("remote_failures") or []
+    if not remote_records:
+        # Compatibility for older cached/test inventories.  Live inventories
+        # always provide records (including tag commit/canonical-ref metadata).
+        remote_records = [
+            {
+                "ref": str(ref_name),
+                "kind": "branch",
+                "remote": _remote_name(ref_name),
+            }
+            for ref_name in (refs.get("remotes") or [])
+            if str(ref_name or "").strip()
+        ]
+    candidates = []
+    for record in remote_records:
+        ref_name = str(record.get("ref") or "").strip()
+        match_info = _score_ref_match(ref_name, version_norm)
+        if not match_info:
+            continue
+        ref_kind = "tag" if str(record.get("kind") or "").strip() == "tag" else "remote"
+        candidates.append({
+            "ref": ref_name,
+            "kind": ref_kind,
+            "score": match_info["score"],
+            "version": version_norm,
+            "match_kind": match_info["match_kind"],
+            "prefix": match_info["prefix"],
+            "branch_name": match_info["branch_name"],
+            "remote_name": str(record.get("remote") or match_info["remote_name"]),
+            "commit": str(record.get("commit") or ""),
+            "canonical_ref": str(record.get("canonical_ref") or ""),
+            "remote": str(record.get("remote") or match_info["remote_name"]),
+        })
+    candidates.sort(key=lambda item: (
+        -item["score"],
+        _ref_kind_priority(item["kind"]),
+        0 if item["match_kind"] == "exact_boundary" else 1,
+        -len(item["prefix"]),
+        len(item["ref"]),
+        item["ref"],
+        item["canonical_ref"],
+    ))
+    result = candidates
+    configured_remotes = refs.get("configured_remotes")
+    if configured_remotes is not None:
+        result, blocking_failures = _select_live_remote_tier(
+            candidates,
+            configured_remotes,
+            refs.get("remote_failures") or [],
         )
-        return result, version_norm, f"remote_query_failed={reasons}"
-    if not candidates:
+        if blocking_failures:
+            return result, version_norm, _remote_failure_reason(blocking_failures)
+    elif refs.get("remote_failures"):
+        # Compatibility for older cached/test inventories which did not
+        # preserve configured remotes.  New live inventories always use the
+        # deterministic tier rules above.
+        unique_commit, healthy_remotes = _top_ref_candidates_have_one_healthy_commit(result)
+        relevant_failures = [
+            item for item in (refs.get("remote_failures") or [])
+            if not str(item.get("remote") or "").strip()
+            or str(item.get("remote") or "").strip() in healthy_remotes
+        ]
+        # A failure from another configured remote must not invalidate a
+        # unique, commit-pinned result obtained successfully from a healthy
+        # remote.  The failed remote remains in the inventory diagnostics.
+        if not unique_commit or relevant_failures:
+            failures = relevant_failures or list(refs.get("remote_failures") or [])
+            return result, version_norm, _remote_failure_reason(failures)
+    if not result:
         return result, version_norm, f"no_ref_match_for_version={version_norm}"
     return result, version_norm, None
 
@@ -1333,7 +1488,7 @@ def resolve_repo_ref_pair_for_versions(
     old_version: str,
     new_version: str,
     *,
-    remote_timeout=30,
+    remote_timeout=DEFAULT_FETCH_TIMEOUT,
 ):
     old_candidates, old_version_norm, old_error = list_repo_ref_candidates_for_version(
         repo_dir, old_version, remote_timeout=remote_timeout,
@@ -1360,6 +1515,10 @@ def resolve_repo_ref_pair_for_versions(
         and item["delta_match_kind"] == best["delta_match_kind"]
         and item["same_prefix"] == best["same_prefix"]
         and item["same_remote"] == best["same_remote"]
+        and _ref_kind_priority(item["old"].get("kind"))
+        == _ref_kind_priority(best["old"].get("kind"))
+        and _ref_kind_priority(item["new"].get("kind"))
+        == _ref_kind_priority(best["new"].get("kind"))
     ]
     if len(tied_pairs) > 1:
         fixed_commit_pairs = {
@@ -1406,7 +1565,7 @@ def _commit_prefix_matches(candidate_commit, requested_commit):
     return bool(
         candidate
         and requested
-        and re.fullmatch(r"[0-9a-f]{7,40}", requested)
+        and re.fullmatch(r"[0-9a-f]{7,64}", requested)
         and candidate.startswith(requested)
     )
 
@@ -1455,7 +1614,7 @@ def _resolve_local_fallback_after_remote_failure(
 
 def _local_fallback_from_reason(reason):
     match = re.search(
-        r"(?:^|;)local_fallback_available=([0-9a-fA-F]{7,40})(?:;|$)",
+        r"(?:^|;)local_fallback_available=([0-9a-fA-F]{7,64})(?:;|$)",
         str(reason or ""),
     )
     if not match:
@@ -1473,136 +1632,111 @@ def resolve_repo_ref_for_version(
     selected_ref: str = "",
     *,
     expected_commit="",
-    remote_timeout=30,
+    remote_timeout=DEFAULT_FETCH_TIMEOUT,
     allow_local_source=False,
     allow_dirty_local_source=False,
 ):
-    candidates, version_norm, error = list_repo_ref_candidates_for_version(
-        repo_dir, version, remote_timeout=remote_timeout,
-    )
     selected_ref = (selected_ref or "").strip()
     expected_commit = str(expected_commit or "").strip()
+    version_norm = _normalize_version_text(version)
     if selected_ref:
-        # A user override exists precisely to correct/resolve the heuristic.
-        # Validate it against the complete live-remote inventory instead of
-        # requiring it to pass the same version-name matcher again.
-        refs = _list_repo_refs(repo_dir, timeout=remote_timeout)
-        remote_names = {
-            str(item.get("remote") or "")
-            for item in (refs.get("remote_records") or [])
-            if str(item.get("remote") or "")
-        }
-        explicit_remote = ""
-        if "/" in selected_ref and not selected_ref.startswith("refs/"):
-            prefix = selected_ref.split("/", 1)[0]
-            if prefix in remote_names:
-                explicit_remote = prefix
-        relevant_failures = [
-            failure for failure in (refs.get("remote_failures") or [])
-            if not explicit_remote or str(failure.get("remote") or "") in {"", explicit_remote}
-        ]
-        if relevant_failures:
-            reasons = "; ".join(str(item.get("reason") or "remote query failed") for item in relevant_failures)
-            resolved_local, local_reason = _resolve_local_fallback_after_remote_failure(
-                repo_dir,
-                selected_ref,
-                f"remote_query_failed={reasons}",
-                version_norm=version_norm,
-                allow_local_source=allow_local_source,
-                allow_dirty_local_source=allow_dirty_local_source,
-            )
-            return resolved_local, local_reason, candidates
-        remote_records = sorted(
-            (dict(item) for item in (refs.get("remote_records") or [])),
-            key=lambda item: (
-                str(item.get("ref") or ""),
-                str(item.get("canonical_ref") or ""),
-                str(item.get("commit") or ""),
-            ),
+        selected_is_commit = bool(
+            re.fullmatch(r"[0-9a-fA-F]{7,64}", selected_ref)
         )
-        selected_is_commit = bool(re.fullmatch(r"[0-9a-fA-F]{7,40}", selected_ref))
-        matching_records = [
-            item for item in remote_records
-            if selected_ref in {
-                str(item.get("ref") or ""),
-                str(item.get("canonical_ref") or ""),
-            }
-            or (
-                selected_is_commit
-                and _commit_prefix_matches(item.get("commit"), selected_ref)
-            )
+        # An explicit selection is an exact remote lookup, not a version-name
+        # heuristic.  The shared resolver applies explicit -> origin -> peer
+        # tiers and keeps one total deadline, so an unrelated slow remote
+        # cannot consume the selection budget first.
+        remote_result = resolve_remote_source_ref(
+            repo_dir,
+            selected_ref,
+            query_timeout=remote_timeout,
+            fetch_timeout=remote_timeout,
+            expected_commit=expected_commit,
+        )
+        remote_candidates = [
+            dict(item) for item in remote_result.get("candidates") or []
         ]
-        if matching_records:
-            observed_commits = {
-                str(item.get("commit") or "")
-                for item in matching_records
-                if str(item.get("commit") or "")
-            }
-            if expected_commit:
-                matching_expected = [
-                    item for item in matching_records
-                    if _commit_prefix_matches(item.get("commit"), expected_commit)
-                ]
-                if not matching_expected:
-                    observed = ",".join(sorted(observed_commits))
-                    return None, (
-                        f"remote_ref_moved={selected_ref};expected={expected_commit};observed={observed}"
-                    ), candidates + matching_records
-                matching_records = matching_expected
-            elif len(observed_commits) > 1:
-                ambiguity = (
-                    "ambiguous_explicit_remote_commit"
-                    if selected_is_commit
-                    else "ambiguous_explicit_remote_ref"
-                )
-                return None, f"{ambiguity}={selected_ref}", candidates + matching_records
-            item = matching_records[0]
+        if remote_result.get("status") == "remote_source_resolved":
+            resolved_ref = str(
+                remote_result.get("resolved_ref") or selected_ref
+            ).strip()
+            resolved_commit = str(
+                remote_result.get("resolved_commit") or expected_commit
+            ).strip()
+            canonical_ref = str(remote_result.get("remote_ref") or "").strip()
+            remote = str(remote_result.get("remote") or "").strip()
+            selected_kind = (
+                "tag" if canonical_ref.startswith("refs/tags/") else "remote"
+            )
             selected_candidate = {
-                "ref": str(item.get("ref") or selected_ref),
-                "kind": "remote",
+                "ref": resolved_ref,
+                "kind": selected_kind,
                 "score": -1,
                 "version": version_norm,
                 "match_kind": "explicit_user_selection",
                 "prefix": "",
-                "branch_name": str(item.get("short_name") or _remote_branch_name(item.get("ref") or "")),
-                "remote_name": str(item.get("remote") or _remote_name(item.get("ref") or "")),
-                "commit": str(item.get("commit") or ""),
-                "canonical_ref": str(item.get("canonical_ref") or ""),
-                "remote": str(item.get("remote") or _remote_name(item.get("ref") or "")),
+                "branch_name": str(
+                    canonical_ref.removeprefix("refs/heads/")
+                    or _remote_branch_name(resolved_ref)
+                ),
+                "remote_name": remote,
+                "commit": resolved_commit,
+                "canonical_ref": canonical_ref,
+                "remote": remote,
             }
             merged_candidates = [selected_candidate]
             merged_candidates.extend(
-                candidate for candidate in candidates
+                candidate for candidate in remote_candidates
                 if candidate.get("ref") != selected_candidate["ref"]
             )
-            return selected_candidate["ref"], (
+            return resolved_ref, (
                 "selected_by_user("
-                f"kind={'remote_commit' if selected_is_commit else 'remote'},"
+                f"kind={'remote_commit' if selected_is_commit else selected_kind},"
                 f"score=-1,version={version_norm})"
             ), merged_candidates
-        for item in candidates:
-            if item["ref"] == selected_ref:
-                if expected_commit and not _commit_prefix_matches(item.get("commit"), expected_commit):
-                    return None, (
-                        f"remote_ref_moved={selected_ref};expected={expected_commit};"
-                        f"observed={item.get('commit') or ''}"
-                    ), candidates
-                return selected_ref, (
-                    f"selected_by_user(kind={item['kind']},score={item['score']},version={version_norm})"
-                ), candidates
-        if expected_commit:
-            return None, (
-                f"remote_ref_moved={selected_ref};expected={expected_commit};observed="
-            ), candidates
+
+        failures = list(remote_result.get("failures") or [])
+        reasons = "; ".join(
+            str(item.get("reason") or "").strip()
+            for item in failures
+            if str(item.get("reason") or "").strip()
+        )
+        remote_status = str(
+            remote_result.get("status") or "remote_source_unavailable"
+        ).strip()
+        if remote_status == "remote_source_ambiguous":
+            ambiguity = (
+                "ambiguous_explicit_remote_commit"
+                if selected_is_commit
+                else "ambiguous_explicit_remote_ref"
+            )
+            # Ambiguity is a valid remote observation, not a transport failure.
+            # A local checkout must not silently break the tie between different
+            # remote commits, even when local fallback was authorized elsewhere.
+            return None, f"{ambiguity}={selected_ref}", remote_candidates
+        if remote_status in {
+            "remote_query_failed",
+            "remote_fetch_failed",
+            "remote_expected_commit_unmaterializable",
+            "repository_not_git",
+        }:
+            remote_reason = f"{remote_status}={reasons or selected_ref}"
+        else:
+            remote_reason = f"remote_source_unavailable={selected_ref}"
         resolved_local, local_reason = _resolve_local_fallback_after_remote_failure(
             repo_dir,
             selected_ref,
-            f"remote_source_unavailable={selected_ref}",
+            remote_reason,
             version_norm=version_norm,
             allow_local_source=allow_local_source,
             allow_dirty_local_source=allow_dirty_local_source,
         )
-        return resolved_local, local_reason, candidates
+        return resolved_local, local_reason, remote_candidates
+
+    candidates, version_norm, error = list_repo_ref_candidates_for_version(
+        repo_dir, version, remote_timeout=remote_timeout,
+    )
     if error:
         return None, error, candidates
     best = candidates[0]
@@ -4410,6 +4544,40 @@ def classify_git_ref_pending_kind(reason, old_reason="", new_reason=""):
     return "not_found"
 
 
+def _is_git_worktree(repo_path, *, timeout=DEFAULT_FETCH_TIMEOUT):
+    """Recognize normal and linked worktrees through Git itself."""
+    stdout, _stderr, rc = run_cmd(
+        git_cmd() + ["rev-parse", "--is-inside-work-tree"],
+        cwd=repo_path,
+        timeout=_bounded_git_timeout(timeout, DEFAULT_FETCH_TIMEOUT),
+    )
+    return rc == 0 and str(stdout or "").strip().lower() == "true"
+
+
+def _with_remote_snapshot_candidate_metadata(materialized, candidate):
+    result = dict(materialized or {})
+    result.update({
+        "resolved_ref": str(candidate.get("ref") or ""),
+        "remote": str(candidate.get("remote") or candidate.get("remote_name") or ""),
+        "remote_ref": str(candidate.get("canonical_ref") or ""),
+    })
+    if result.get("status") == "remote_source_resolved":
+        used_fetch = any(
+            str(item.get("stage") or "").startswith("fetch")
+            for item in result.get("attempts") or []
+        )
+        # Selection authority remains the immutable remote snapshot.  A local
+        # rev-parse here only proves that the selected object is materialized;
+        # it does not select or validate the user's checkout HEAD.
+        result["resolution_mode"] = "live_remote"
+        result["materialization_mode"] = (
+            "live_remote_snapshot_fetch"
+            if used_fetch
+            else "live_remote_snapshot_local"
+        )
+    return result
+
+
 def _materialize_resolved_remote_ref(
     repo_path,
     resolved_ref,
@@ -4423,35 +4591,56 @@ def _materialize_resolved_remote_ref(
             item for item in (candidates or [])
             if item.get("ref") == resolved_ref
             and item.get("commit")
-            and item.get("canonical_ref")
             and (item.get("remote") or item.get("remote_name"))
         ),
         None,
     )
     if not candidate:
         return None, "remote_candidate_metadata_missing"
+    snapshot_commit = str(candidate.get("commit") or "").strip()
+    expected_commit = str(expected_commit or "").strip()
+    materialization_commit = (
+        snapshot_commit
+        if not expected_commit
+        or _commit_prefix_matches(snapshot_commit, expected_commit)
+        else expected_commit
+    )
+    materialization_candidate = dict(candidate)
+    materialization_candidate["commit"] = materialization_commit
+    timeout = _bounded_git_timeout(fetch_timeout, DEFAULT_FETCH_TIMEOUT)
     cache_key = (
-        os.path.normcase(os.path.abspath(str(repo_path or ""))),
-        str(candidate.get("remote") or candidate.get("remote_name") or ""),
-        str(candidate.get("canonical_ref") or ""),
-        str(expected_commit or candidate.get("commit") or ""),
+        os.path.normcase(os.path.realpath(os.path.abspath(str(repo_path or "")))),
+        materialization_commit.lower(),
     )
     with _REMOTE_SOURCE_MATERIALIZATION_LOCK:
-        cached = _REMOTE_SOURCE_MATERIALIZATION_CACHE.get(cache_key)
-    if cached:
-        return dict(cached), ""
-    materialized = materialize_remote_source_candidate(
-        repo_path,
-        candidate,
-        timeout=fetch_timeout,
-        expected_commit=expected_commit,
-    )
-    if materialized.get("status") != "remote_source_resolved":
-        failure = materialized.get("failure") or {}
-        return materialized, str(failure.get("reason") or "remote fetch failed")
-    with _REMOTE_SOURCE_MATERIALIZATION_LOCK:
-        _REMOTE_SOURCE_MATERIALIZATION_CACHE[cache_key] = dict(materialized)
-    return materialized, ""
+        key_lock = _REMOTE_SOURCE_MATERIALIZATION_KEY_LOCKS.setdefault(
+            cache_key,
+            threading.Lock(),
+        )
+    with key_lock:
+        with _REMOTE_SOURCE_MATERIALIZATION_LOCK:
+            cached = _REMOTE_SOURCE_MATERIALIZATION_CACHE.get(cache_key)
+        if cached:
+            return _with_remote_snapshot_candidate_metadata(cached, candidate), ""
+
+        materialized = materialize_remote_source_candidate(
+            repo_path,
+            materialization_candidate,
+            timeout=timeout,
+            expected_commit=materialization_commit,
+        )
+        materialized = _with_remote_snapshot_candidate_metadata(
+            materialized,
+            candidate,
+        )
+        if snapshot_commit.lower() != materialization_commit.lower():
+            materialized["observed_commit"] = snapshot_commit
+        if materialized.get("status") != "remote_source_resolved":
+            failure = materialized.get("failure") or {}
+            return materialized, str(failure.get("reason") or "remote fetch failed")
+        with _REMOTE_SOURCE_MATERIALIZATION_LOCK:
+            _REMOTE_SOURCE_MATERIALIZATION_CACHE[cache_key] = dict(materialized)
+        return materialized, ""
 
 
 def resolve_gitdiff_ref_plan_for_row(
@@ -4465,6 +4654,7 @@ def resolve_gitdiff_ref_plan_for_row(
     row = row or {}
     source_mapping = source_mapping or {}
     source_meta = source_meta or {}
+    fetch_timeout = _bounded_git_timeout(fetch_timeout, DEFAULT_FETCH_TIMEOUT)
     coord = str(row.get('coord') or '').strip()
     old_ver = str(row.get('old_version') or '').strip()
     new_ver = str(row.get('new_version') or '').strip()
@@ -4485,7 +4675,7 @@ def resolve_gitdiff_ref_plan_for_row(
     reason = ""
     if not repo_path or not os.path.isdir(repo_path):
         reason = "源码路径未提供或不存在"
-    elif not os.path.isdir(os.path.join(repo_path, ".git")):
+    elif not _is_git_worktree(repo_path, timeout=fetch_timeout):
         reason = "非 git 仓库"
     elif override_old_ref or override_new_ref:
         resolved_old_ref, old_reason, old_candidates = resolve_repo_ref_for_version(
@@ -4493,7 +4683,7 @@ def resolve_gitdiff_ref_plan_for_row(
             old_ver,
             selected_ref=override_old_ref,
             expected_commit=expected_old_commit,
-            remote_timeout=fetch_timeout if fetch_timeout not in (None, "") else 30,
+            remote_timeout=fetch_timeout,
             allow_local_source=allow_local_source,
             allow_dirty_local_source=allow_dirty_local_source,
         )
@@ -4502,7 +4692,7 @@ def resolve_gitdiff_ref_plan_for_row(
             new_ver,
             selected_ref=override_new_ref,
             expected_commit=expected_new_commit,
-            remote_timeout=fetch_timeout if fetch_timeout not in (None, "") else 30,
+            remote_timeout=fetch_timeout,
             allow_local_source=allow_local_source,
             allow_dirty_local_source=allow_dirty_local_source,
         )
@@ -4518,7 +4708,7 @@ def resolve_gitdiff_ref_plan_for_row(
             repo_path,
             old_ver,
             new_ver,
-            remote_timeout=fetch_timeout if fetch_timeout not in (None, "") else 30,
+            remote_timeout=fetch_timeout,
         )
 
     module_rel_path = ""
@@ -4857,6 +5047,14 @@ def run_gitdiff(lib_info, output_dir, git_diff_timeout=DEFAULT_GIT_DIFF_TIMEOUT)
     module_path = lib_info.get('module_path') or repo_path
     old_ver    = lib_info.get('old_version', '')
     new_ver    = lib_info.get('new_version', '')
+    fetch_timeout = _bounded_git_timeout(
+        lib_info.get("fetch_timeout", DEFAULT_FETCH_TIMEOUT),
+        DEFAULT_FETCH_TIMEOUT,
+    )
+    git_diff_timeout = _bounded_git_timeout(
+        git_diff_timeout,
+        DEFAULT_GIT_DIFF_TIMEOUT,
+    )
     artifact = _artifact_output_stem(coord)
     artifact_stem = bounded_path_component(
         artifact,
@@ -4883,12 +5081,12 @@ def run_gitdiff(lib_info, output_dir, git_diff_timeout=DEFAULT_GIT_DIFF_TIMEOUT)
             "meta": {},
         }
 
-    if not os.path.isdir(os.path.join(repo_path, ".git")):
+    if not _is_git_worktree(repo_path, timeout=fetch_timeout):
         msg = (
             f"=== 依赖源码目录不是 git 仓库：{coord} ===\n"
             f"路径：{os.path.abspath(repo_path)}\n\n"
             f"需要用户协助：\n"
-            f"  1. 提供该依赖的 git 仓库根目录（包含 .git）\n"
+            f"  1. 提供该依赖的 git 工作树根目录\n"
             f"  2. 或者仅使用 JApiCmp（二进制对比）路径\n"
         )
         write_result(out_file, msg)
@@ -4904,7 +5102,6 @@ def run_gitdiff(lib_info, output_dir, git_diff_timeout=DEFAULT_GIT_DIFF_TIMEOUT)
     override_new_ref = str(lib_info.get("new_ref_override") or "").strip()
     expected_old_commit = str(lib_info.get("expected_old_commit") or "").strip()
     expected_new_commit = str(lib_info.get("expected_new_commit") or "").strip()
-    fetch_timeout = lib_info.get("fetch_timeout", DEFAULT_FETCH_TIMEOUT)
     fixed_base_ref = str(lib_info.get("base_ref") or "").strip()
     fixed_cur_ref = str(lib_info.get("cur_ref") or "").strip()
     if fixed_base_ref and fixed_cur_ref:
@@ -4920,7 +5117,7 @@ def run_gitdiff(lib_info, output_dir, git_diff_timeout=DEFAULT_GIT_DIFF_TIMEOUT)
             old_ver,
             selected_ref=override_old_ref,
             expected_commit=expected_old_commit,
-            remote_timeout=fetch_timeout if fetch_timeout not in (None, "") else 30,
+            remote_timeout=fetch_timeout,
             allow_local_source=bool(lib_info.get("allow_local_source")),
             allow_dirty_local_source=bool(lib_info.get("allow_dirty_local_source")),
         )
@@ -4929,7 +5126,7 @@ def run_gitdiff(lib_info, output_dir, git_diff_timeout=DEFAULT_GIT_DIFF_TIMEOUT)
             new_ver,
             selected_ref=override_new_ref,
             expected_commit=expected_new_commit,
-            remote_timeout=fetch_timeout if fetch_timeout not in (None, "") else 30,
+            remote_timeout=fetch_timeout,
             allow_local_source=bool(lib_info.get("allow_local_source")),
             allow_dirty_local_source=bool(lib_info.get("allow_dirty_local_source")),
         )
@@ -4945,10 +5142,10 @@ def run_gitdiff(lib_info, output_dir, git_diff_timeout=DEFAULT_GIT_DIFF_TIMEOUT)
             repo_path,
             old_ver,
             new_ver,
-            remote_timeout=fetch_timeout if fetch_timeout not in (None, "") else 30,
+            remote_timeout=fetch_timeout,
         )
     if (not resolved_old_ref) or (not resolved_new_ref):
-        refs = _list_repo_refs(repo_path)
+        refs = _list_repo_refs(repo_path, timeout=fetch_timeout)
         sample_remotes = ", ".join(refs.get("remotes", [])[:15])
         msg = (
             f"=== 无法定位 git 对比 ref：{coord} ===\n"
@@ -4958,9 +5155,9 @@ def run_gitdiff(lib_info, output_dir, git_diff_timeout=DEFAULT_GIT_DIFF_TIMEOUT)
             f"new={resolved_new_ref or '(未命中)'} ({new_reason or '-'})\n\n"
             f"已发现远端分支（仅展示前 15 个）：\n"
             f"  remotes: {sample_remotes or '(无)'}\n\n"
-            f"说明：当前仅按远端分支匹配；只去掉版本号末尾的 -SNAPSHOT 后，"
-            f"按“分支名包含版本号”筛选候选，且非 DEV 分支优先于 DEV 分支。\n"
-            f"请修复：在该依赖仓库中提供分支名包含版本号的远端分支"
+            f"说明：当前按远端分支或 tag 匹配；只去掉版本号末尾的 -SNAPSHOT 后，"
+            f"按“ref 名包含版本号”筛选候选，且分支优先于 tag、非 DEV ref 优先于 DEV ref。\n"
+            f"请修复：在该依赖仓库中提供名称包含版本号的远端分支或 tag"
             f"（常见：origin/release-{_normalize_version_text(old_ver) or old_ver}）。\n"
         )
         write_result(out_file, msg)
@@ -5032,26 +5229,31 @@ def run_gitdiff(lib_info, output_dir, git_diff_timeout=DEFAULT_GIT_DIFF_TIMEOUT)
         except Exception:
             module_rel_path = ""
 
-    diff_cmd_primary = git_cmd() + ['diff', '--function-context', '-U0', f'{base_ref}..{cur_ref}', '--']
+    diff_cmd_primary = git_cmd() + [
+        'diff', '--no-ext-diff', '--no-textconv', '--no-color',
+        '--function-context', '-U0', f'{base_ref}..{cur_ref}', '--',
+    ]
     if module_rel_path and module_rel_path != '.':
         diff_cmd_primary.append(module_rel_path)
     else:
         diff_cmd_primary.extend(['*.java', '*.kt'])
     stdout, _stderr, rc = run_cmd(diff_cmd_primary, cwd=repo_path, timeout=git_diff_timeout)
     diff_cmd_used = diff_cmd_primary
-    if rc not in (0, 1):  # git diff 无变更时返回 0，有变更时返回 1
-        diff_cmd_fallback = git_cmd() + ['diff', '-U20', f'{base_ref}..{cur_ref}', '--']
+    if rc != 0:
+        diff_cmd_fallback = git_cmd() + [
+            'diff', '--no-ext-diff', '--no-textconv', '--no-color',
+            '-U20', f'{base_ref}..{cur_ref}', '--',
+        ]
         if module_rel_path and module_rel_path != '.':
             diff_cmd_fallback.append(module_rel_path)
         else:
             diff_cmd_fallback.extend(['*.java', '*.kt'])
         stdout2, stderr2, rc2 = run_cmd(diff_cmd_fallback, cwd=repo_path, timeout=git_diff_timeout)
-        if rc2 not in (0, 1):
+        if rc2 != 0:
             write_result(out_file, f"git diff 执行失败（退出码 {rc2}）：{stderr2}")
             error_text = stderr2[:100]
             if rc2 == -1 and '超时' in (stderr2 or ''):
-                timeout_label = f"{git_diff_timeout}s" if git_diff_timeout not in (None, "") else "unbounded"
-                error_text = f"git diff 超时({timeout_label})"
+                error_text = f"git diff 超时({git_diff_timeout}s)"
             return {
                 "status": "error",
                 "out_file": out_file,
@@ -7408,6 +7610,7 @@ def main():
     _REPO_REFS_CACHE.clear()
     with _REMOTE_SOURCE_MATERIALIZATION_LOCK:
         _REMOTE_SOURCE_MATERIALIZATION_CACHE.clear()
+        _REMOTE_SOURCE_MATERIALIZATION_KEY_LOCKS.clear()
     ap = argparse.ArgumentParser(description='Step 4：jar 包变更全量对比')
     ap.add_argument('--dep-changes',   required=True,
                     help='s1_dep_changes.csv')

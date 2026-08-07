@@ -9,12 +9,14 @@ import json
 import shutil
 import subprocess
 import sys
+import time
 import urllib.request
 import urllib.error
 import zipfile
 from pathlib import Path
 
-from compat import resolve_command
+from compat import run_cmd
+from remote_source_refs import classify_fetch_failure
 
 from real_project_regression import (
     CASES,
@@ -217,18 +219,56 @@ def _download(url: str, destination: Path) -> None:
     temporary.replace(destination)
 
 
+def _execute_git_clone(step: dict, *, retry_delays=(1, 3)) -> None:
+    destination = Path(step["argv"][-1])
+    if destination.is_dir():
+        return
+    if destination.exists():
+        raise RuntimeError(f"materialization_git_clone_destination_conflict:{destination}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    delays = tuple(retry_delays or ())
+    max_attempts = max(1, len(delays) + 1)
+    last_failure_type = "fetch_failed"
+    last_reason = ""
+    for attempt_number in range(1, max_attempts + 1):
+        stdout, stderr, rc = run_cmd(
+            step["argv"], cwd=step["cwd"], timeout=600,
+            stream_output=True,
+        )
+        if rc == 0:
+            return
+        reason = (stderr or stdout or f"exit code {rc}").strip()
+        last_failure_type, retryable = classify_fetch_failure(reason, rc)
+        last_reason = reason
+        # The destination did not exist before this function. Remove only the
+        # partial checkout made by this failed attempt before retrying.
+        if destination.is_dir():
+            shutil.rmtree(destination, ignore_errors=True)
+        if not retryable or attempt_number >= max_attempts:
+            break
+        time.sleep(delays[attempt_number - 1])
+    raise RuntimeError(
+        f"materialization_git_clone_failed:{last_failure_type}:"
+        f"attempts={attempt_number}:{last_reason}"
+    )
+
+
 def execute_materialization_plan(plan: list[dict]) -> list[dict]:
     artifacts = []
     for step in plan:
         operation = step["operation"]
         if operation == "git_clone":
-            destination = Path(step["argv"][-1])
-            if destination.is_dir():
-                continue
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            subprocess.run(resolve_command(step["argv"]), cwd=step["cwd"], check=True)
+            _execute_git_clone(step)
         elif operation == "command":
-            subprocess.run(resolve_command(step["argv"]), cwd=step["cwd"], check=True)
+            _stdout, stderr, rc = run_cmd(
+                step["argv"], cwd=step["cwd"], timeout=1800,
+                stream_output=True,
+            )
+            if rc != 0:
+                raise RuntimeError(
+                    "materialization_command_failed:"
+                    + (stderr.strip() or f"exit code {rc}")
+                )
         elif operation == "download":
             destination = Path(step["destination"])
             destination.parent.mkdir(parents=True, exist_ok=True)

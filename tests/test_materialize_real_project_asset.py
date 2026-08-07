@@ -5,6 +5,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -14,6 +15,55 @@ import materialize_real_project_asset as materializer  # noqa: E402
 
 
 class MaterializeRealProjectAssetTest(unittest.TestCase):
+    def test_git_plan_execution_uses_shared_process_boundary(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            materializer, "run_cmd", return_value=("", "", 0)
+        ) as run:
+            checkout = Path(tmp) / "checkout"
+            materializer.execute_materialization_plan([{
+                "operation": "git_clone",
+                "argv": ["git", "clone", "--no-checkout", "repo", str(checkout)],
+                "cwd": tmp,
+            }])
+
+        run.assert_called_once_with(
+            ["git", "clone", "--no-checkout", "repo", str(checkout)],
+            cwd=tmp,
+            timeout=600,
+            stream_output=True,
+        )
+
+    def test_git_clone_retries_bounded_transient_failure(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            materializer, "run_cmd",
+            side_effect=[("", "HTTP 429", 128), ("", "", 0)],
+        ) as run, patch.object(materializer.time, "sleep") as sleep:
+            checkout = Path(tmp) / "checkout"
+            materializer._execute_git_clone({
+                "argv": ["git", "clone", "repo", str(checkout)],
+                "cwd": tmp,
+            })
+
+        self.assertEqual(run.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+    def test_git_clone_does_not_retry_authentication_failure(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            materializer, "run_cmd",
+            return_value=("", "Authentication failed", 128),
+        ) as run, patch.object(materializer.time, "sleep") as sleep:
+            checkout = Path(tmp) / "checkout"
+            with self.assertRaisesRegex(
+                RuntimeError, "authentication_failed:attempts=1",
+            ):
+                materializer._execute_git_clone({
+                    "argv": ["git", "clone", "repo", str(checkout)],
+                    "cwd": tmp,
+                })
+
+        run.assert_called_once()
+        sleep.assert_not_called()
+
     def test_source_build_plan_is_revision_scoped_and_never_uses_a_shell(self):
         manifest = {
             "case": "source-case",

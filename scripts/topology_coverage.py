@@ -23,7 +23,7 @@ from final_artifact_edge_oracle import (
 )
 from signature_utils import normalize_signature_for_lookup
 from third_party_jdk_oracle import _source_signature
-from compat import git_cmd
+from compat import git_cmd, run_cmd
 from path_runtime import short_temporary_directory
 
 
@@ -48,6 +48,12 @@ REFLECTION_REGISTRATION_RESOURCE = "META-INF/jua/authoritative-reflection-regist
 FRAMEWORK_PROXY_REGISTRATION_RESOURCE = "META-INF/jua/authoritative-framework-proxy-registration.json"
 HIERARCHY_SCAN_TIMEOUT_SEC = 120.0
 HIERARCHY_SCAN_MAX_WORKERS = max(1, min(8, os.cpu_count() or 1))
+FULL_GIT_OBJECT_ID_RE = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})")
+
+
+def _is_full_git_object_id(value: object) -> bool:
+    """Accept full object IDs from either SHA-1 or SHA-256 repositories."""
+    return bool(FULL_GIT_OBJECT_ID_RE.fullmatch(str(value or "")))
 
 
 def descriptor_source_signature(descriptor: str) -> str:
@@ -157,6 +163,67 @@ def compute_source_tree_sha256(source_root: Path) -> str:
     root = Path(source_root)
     for path in sorted(path for path in root.rglob("*") if path.is_file() and not path.is_symlink()):
         digest.update(path.relative_to(root).as_posix().encode() + b"\0" + path.read_bytes())
+    return digest.hexdigest()
+
+
+def compute_git_source_tree_sha256(
+    source_root: Path, revision: str, source_path: str,
+) -> str:
+    """Verify live files against commit blob IDs, then hash their exact bytes."""
+    prefix = str(source_path or "").strip("/") + "/"
+    if prefix == "/":
+        raise ValueError("declared Git source path is empty")
+    listing, stderr, rc = run_cmd(
+        git_cmd() + [
+            "-C", str(source_root), "ls-tree", "-r", "-z",
+            str(revision), "--", str(source_path),
+        ],
+        timeout=60,
+    )
+    if rc != 0:
+        raise ValueError(stderr.strip() or "Git source tree unavailable")
+    entries = []
+    repository_paths = []
+    expected_blob_ids = []
+    for record in listing.split("\0"):
+        if not record:
+            continue
+        metadata, separator, raw_path = record.partition("\t")
+        fields = metadata.split()
+        if (
+            not separator
+            or len(fields) < 3
+            or fields[0] not in {"100644", "100755"}
+            or fields[1] != "blob"
+        ):
+            raise ValueError("invalid Git source tree entry")
+        if not raw_path.startswith(prefix) or "\n" in raw_path:
+            raise ValueError("Git source tree entry escapes declared source path")
+        relative_path = raw_path[len(prefix):]
+        if not relative_path or ".." in Path(relative_path).parts:
+            raise ValueError("invalid Git source tree entry")
+        live_path = (Path(source_root) / raw_path).resolve()
+        try:
+            live_path.relative_to(Path(source_root).resolve())
+        except ValueError as exc:
+            raise ValueError("Git source tree entry escapes repository") from exc
+        entries.append((relative_path, live_path))
+        repository_paths.append(raw_path)
+        expected_blob_ids.append(fields[2])
+    if not entries:
+        raise ValueError("Git source tree is empty")
+    actual_blob_output, hash_stderr, hash_rc = run_cmd(
+        git_cmd() + ["hash-object", "--no-filters", "--stdin-paths"],
+        cwd=str(source_root),
+        input_text="".join(f"{path}\n" for path in repository_paths),
+        timeout=60,
+    )
+    actual_blob_ids = [line.strip() for line in actual_blob_output.splitlines()]
+    if hash_rc != 0 or actual_blob_ids != expected_blob_ids:
+        raise ValueError(hash_stderr.strip() or "live source differs from Git commit")
+    digest = hashlib.sha256()
+    for relative_path, live_path in sorted(entries):
+        digest.update(relative_path.encode() + b"\0" + live_path.read_bytes())
     return digest.hexdigest()
 
 
@@ -1259,51 +1326,32 @@ def _source_attestation_evidence(
         evidence_sha = hashlib.sha256(evidence_bytes).hexdigest()
         evidence = json.loads(evidence_bytes.decode("utf-8"))
         revision = str(attestation.get("git_revision") or "")
-        tree = subprocess.run(
+        tree_stdout, _tree_stderr, tree_rc = run_cmd(
             git_cmd() + ["-C", str(source_root), "rev-parse", f"{revision}^{{tree}}"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=30,
+            timeout=30,
         )
         source_path = Path(source_root) / str(attestation.get("source_path") or ".")
         source_root_resolved = Path(source_root).resolve()
         source_path_resolved = source_path.resolve()
         source_path_text = str(attestation.get("source_path") or "")
-        tracked = subprocess.run(
+        tracked_stdout, _tracked_stderr, tracked_rc = run_cmd(
             git_cmd() + ["-C", str(source_root), "ls-tree", "-d", revision, "--", source_path_text],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=30,
+            timeout=30,
         )
-        git_entries = subprocess.run(
-            git_cmd() + ["-C", str(source_root), "ls-tree", "-r", "-z", revision, "--", source_path_text],
-            capture_output=True, check=False, timeout=30,
+        revision_digest = compute_git_source_tree_sha256(
+            source_root, revision, source_path_text,
         )
-        revision_digest = hashlib.sha256()
-        for record in git_entries.stdout.split(b"\0"):
-            if not record:
-                continue
-            metadata, separator, raw_path = record.partition(b"\t")
-            fields = metadata.split()
-            if not separator or len(fields) < 3 or fields[1] != b"blob":
-                raise ValueError("invalid Git source tree entry")
-            relative_path = raw_path.decode("utf-8").removeprefix(source_path_text.rstrip("/") + "/")
-            if not relative_path or relative_path == raw_path.decode("utf-8"):
-                raise ValueError("Git source tree entry escapes declared source path")
-            blob = subprocess.run(
-                git_cmd() + ["-C", str(source_root), "cat-file", "blob", fields[2].decode("ascii")],
-                capture_output=True, check=False, timeout=30,
-            )
-            if blob.returncode != 0:
-                raise ValueError("Git source tree blob unreadable")
-            revision_digest.update(relative_path.encode() + b"\0" + blob.stdout)
-        worktree_diff = subprocess.run(
+        _worktree_stdout, _worktree_stderr, worktree_rc = run_cmd(
             git_cmd() + ["-C", str(source_root), "diff", "--quiet", revision, "--", source_path_text],
-            capture_output=True, check=False, timeout=30,
+            timeout=30,
         )
-        index_diff = subprocess.run(
+        _index_stdout, _index_stderr, index_rc = run_cmd(
             git_cmd() + ["-C", str(source_root), "diff", "--cached", "--quiet", revision, "--", source_path_text],
-            capture_output=True, check=False, timeout=30,
+            timeout=30,
         )
-        status = subprocess.run(
+        status_stdout, _status_stderr, status_rc = run_cmd(
             git_cmd() + ["-C", str(source_root), "status", "--porcelain", "--untracked-files=all", "--", source_path_text],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=30,
+            timeout=30,
         )
         live_digest = compute_source_tree_sha256(source_path_resolved)
         artifact_binding = str(attestation.get("artifact_binding") or "sha256")
@@ -1319,20 +1367,19 @@ def _source_attestation_evidence(
             and "analyzer" not in str(attestation.get("authority")).lower()
             and attestation.get("authority_version")
             and attestation.get("procedure")
-            and re.fullmatch(r"[0-9a-f]{40}", revision)
-            and tree.returncode == 0
-            and tree.stdout.strip() == attestation.get("git_tree")
+            and _is_full_git_object_id(revision)
+            and tree_rc == 0
+            and tree_stdout.strip() == attestation.get("git_tree")
             and source_path_text not in {"", "."}
             and ".." not in Path(source_path_text).parts
             and source_path_resolved.is_relative_to(source_root_resolved)
-            and tracked.returncode == 0 and bool(tracked.stdout.strip())
+            and tracked_rc == 0 and bool(tracked_stdout.strip())
             and source_path_resolved.is_dir()
-            and git_entries.returncode == 0
-            and revision_digest.hexdigest() == attestation.get("source_tree_sha256")
-            and live_digest == revision_digest.hexdigest()
-            and worktree_diff.returncode == 0
-            and index_diff.returncode == 0
-            and status.returncode == 0 and not status.stdout.strip()
+            and revision_digest == attestation.get("source_tree_sha256")
+            and live_digest == revision_digest
+            and worktree_rc == 0
+            and index_rc == 0
+            and status_rc == 0 and not status_stdout.strip()
             and artifact_binding_valid
             and attestation.get("evidence_sha256") == evidence_sha
         )
@@ -1346,7 +1393,7 @@ def _source_attestation_evidence(
             "artifact_binding": artifact_binding,
             "bound_artifact_sha256": artifact_sha256,
             "computed_evidence_sha256": evidence_sha,
-            "computed_git_source_tree_sha256": revision_digest.hexdigest(),
+            "computed_git_source_tree_sha256": revision_digest,
             "computed_live_source_tree_sha256": live_digest,
             "valid": valid,
         },
@@ -1663,7 +1710,7 @@ def classify_topologies(edges: list[dict], artifact_layout: dict) -> set[str]:
         provenance.get("authority")
         and "analyzer" not in str(provenance.get("authority")).lower()
         and provenance.get("valid") is True
-        and re.fullmatch(r"[0-9a-f]{40}", str(provenance.get("git_revision") or ""))
+        and _is_full_git_object_id(provenance.get("git_revision"))
         and (
             (
                 provenance.get("artifact_binding") == "runtime"

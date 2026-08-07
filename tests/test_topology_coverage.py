@@ -576,11 +576,15 @@ class TopologyCoverageTest(unittest.TestCase):
         return artifact, manifest
 
     def _source_attestation(
-        self, root: Path, artifact: Path, expectations: dict, *, runtime_binding: bool = False
+        self, root: Path, artifact: Path, expectations: dict, *,
+        runtime_binding: bool = False, object_format: str = "",
     ) -> tuple[Path, Path]:
         repository = root / "source-repository"
         shutil.copytree(FIXTURE / "src", repository / "src")
-        subprocess.run(["git", "init", "-q", str(repository)], check=True)
+        init_command = ["git", "init", "-q"]
+        if object_format:
+            init_command.append(f"--object-format={object_format}")
+        subprocess.run(init_command + [str(repository)], check=True)
         subprocess.run(["git", "-C", str(repository), "config", "user.email", "fixture@example.test"], check=True)
         subprocess.run(["git", "-C", str(repository), "config", "user.name", "Topology Fixture"], check=True)
         subprocess.run(["git", "-C", str(repository), "add", "src"], check=True)
@@ -640,6 +644,39 @@ class TopologyCoverageTest(unittest.TestCase):
         self.assertIn(
             "source_bytecode_agree",
             topology_coverage.classify_topologies(evidence["edges"], layout),
+        )
+
+    def test_sha256_repository_source_attestation_is_valid(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifact, expectations = self._build_fixture(root)
+            try:
+                source_root, source_attestation = self._source_attestation(
+                    root, artifact, expectations, object_format="sha256"
+                )
+            except subprocess.CalledProcessError as error:
+                self.skipTest(f"Git SHA-256 repositories unsupported: {error}")
+            evidence = topology_coverage.extract_artifact_topology_evidence(
+                artifact,
+                self._selected_api_rows(expectations),
+                {
+                    "topology:library": [
+                        "BOOT-INF/lib/target.jar", "BOOT-INF/lib/samecoord.jar"
+                    ],
+                    "topology:crossjar": ["BOOT-INF/lib/crossjar.jar"],
+                },
+                source_root=source_root,
+                source_attestation=source_attestation,
+            )
+
+        provenance = evidence["artifact_layout"]["source_provenance"]
+        self.assertEqual(len(provenance["git_revision"]), 64)
+        self.assertTrue(provenance["valid"], provenance)
+        self.assertIn(
+            "source_bytecode_agree",
+            topology_coverage.classify_topologies(
+                evidence["edges"], evidence["artifact_layout"]
+            ),
         )
 
     def test_real_final_artifact_oracle_classifies_every_stable_topology(self):

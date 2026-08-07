@@ -126,7 +126,10 @@ class SmokeCoreTest(SmokeRegressionTestCase):
         self.assertNotEqual(completed.returncode, 0)
         self.assertEqual(payload["status"], "failed")
         self.assertRegex(payload["checkpoint"], r"^[a-z0-9._-]+$")
-        self.assertTrue(payload["checkpoint"].startswith("external-git"))
+        # PATH='' no longer guarantees that Git is missing because the product
+        # deliberately probes platform fallback locations.  This test owns the
+        # machine-readable checkpoint contract, not executable discovery.
+        self.assertNotEqual(payload["checkpoint"], "startup")
 
     def test_fixture_exposes_windows_maven_launcher_and_explicit_local_repository(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shutil
 import tempfile
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -25,6 +27,38 @@ _WINDOWS_RESERVED_NAMES = {
 }
 _SHORT_TEMP_ROOT_CACHE = {}
 _SHORT_TEMP_ROOT_LOCK = threading.Lock()
+_WORKTREE_REPOSITORY_LOCKS = {}
+_WORKTREE_REPOSITORY_LOCKS_GUARD = threading.Lock()
+_WORKTREE_LOCK_RETRY_DELAYS = (0.1, 0.25, 0.5, 1.0)
+_WORKTREE_LEASE_PREFIX = ".jua-worktree-lease-"
+_WORKTREE_LEASE_VERSION = 1
+_MAX_WORKTREE_LEASES_PER_ROOT = 256
+DEFAULT_WORKTREE_TIMEOUT = 300
+WORKTREE_CLEANUP_MARGIN_SECONDS = 30
+_WORKTREE_LOCK_ERROR_MARKERS = (
+    "another git process seems to be running",
+    "could not lock config file",
+    "couldn't lock config file",
+    "cannot lock ref",
+    "could not lock",
+    "failed to lock",
+    "index.lock",
+    "config.lock",
+    "locked by another process",
+    "resource temporarily unavailable",
+    "the process cannot access the file because it is being used by another process",
+)
+_WORKTREE_LOCK_ERROR_PATTERNS = (
+    re.compile(r"unable to create .+\.lock"),
+)
+_WORKTREE_PATH_ERROR_MARKERS = (
+    "filename too long",
+    "file name too long",
+    "path too long",
+    "the specified path, file name, or both are too long",
+    "cannot create a file when that file already exists",
+)
+_FULL_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
 
 
 def _digest(value, length=10):
@@ -236,51 +270,342 @@ def git_with_long_paths(command=None):
     return command
 
 
-def _longest_tracked_path(git, repo_dir, ref, runner):
-    stdout, _stderr, rc = runner(
+def _worktree_repository_key(repo_dir):
+    """Return a process-local lock key shared by linked Git worktrees."""
+    repo_dir = Path(repo_dir).resolve()
+    dot_git = repo_dir / ".git"
+    common_dir = dot_git
+    try:
+        if dot_git.is_file():
+            first_line = dot_git.read_text(
+                encoding="utf-8", errors="replace",
+            ).splitlines()[0]
+            if first_line.lower().startswith("gitdir:"):
+                admin_dir = Path(first_line.split(":", 1)[1].strip())
+                if not admin_dir.is_absolute():
+                    admin_dir = (repo_dir / admin_dir).resolve()
+                common_file = admin_dir / "commondir"
+                if common_file.is_file():
+                    common_dir = Path(common_file.read_text(
+                        encoding="utf-8", errors="replace",
+                    ).strip())
+                    if not common_dir.is_absolute():
+                        common_dir = (admin_dir / common_dir).resolve()
+                else:
+                    common_dir = admin_dir
+    except (OSError, IndexError, ValueError):
+        common_dir = dot_git
+    return os.path.normcase(os.path.abspath(str(common_dir)))
+
+
+def _worktree_repository_lock(repo_dir):
+    key = _worktree_repository_key(repo_dir)
+    with _WORKTREE_REPOSITORY_LOCKS_GUARD:
+        return _WORKTREE_REPOSITORY_LOCKS.setdefault(key, threading.RLock())
+
+
+def _worktree_lease_path(worktree):
+    target = Path(worktree).resolve()
+    return target.parent / (
+        f"{_WORKTREE_LEASE_PREFIX}{_digest(target, length=20)}.json"
+    )
+
+
+def _write_worktree_lease(repo_dir, worktree):
+    """Durably record ownership outside the worktree before Git registers it."""
+    target = Path(worktree).resolve()
+    lease = _worktree_lease_path(target)
+    temporary = lease.with_name(f"{lease.name}.{os.getpid()}.tmp")
+    payload = {
+        "schema_version": _WORKTREE_LEASE_VERSION,
+        "repository_key": _worktree_repository_key(repo_dir),
+        "worktree": str(target),
+        "pid": os.getpid(),
+        "created_at": time.time(),
+    }
+    try:
+        with temporary.open("x", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            temporary.chmod(0o600)
+        except OSError:
+            pass
+        os.replace(temporary, lease)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    return lease
+
+
+def _remove_worktree_lease(worktree):
+    try:
+        _worktree_lease_path(worktree).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _process_is_alive(pid):
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        # Unknown platform-specific errors must not authorize cleanup.
+        return True
+    return True
+
+
+def _is_worktree_lock_contention(stdout, stderr):
+    text = f"{stdout or ''}\n{stderr or ''}".lower()
+    return (
+        any(marker in text for marker in _WORKTREE_LOCK_ERROR_MARKERS)
+        or any(pattern.search(text) for pattern in _WORKTREE_LOCK_ERROR_PATTERNS)
+    )
+
+
+def _remaining_timeout(deadline):
+    remaining = float(deadline) - time.monotonic()
+    if remaining <= 0:
+        return 0
+    return remaining
+
+
+def _run_worktree_mutation(command, *, repo_dir, runner, timeout, deadline=None):
+    """Retry only Git's explicit lock-contention failures, on the same target."""
+    deadline = (
+        float(deadline)
+        if deadline is not None
+        else time.monotonic() + max(1, int(timeout or 1))
+    )
+    history = []
+    for attempt in range(len(_WORKTREE_LOCK_RETRY_DELAYS) + 1):
+        remaining = _remaining_timeout(deadline)
+        if remaining <= 0:
+            history.append({
+                "attempt": attempt + 1,
+                "rc": -1,
+                "stdout": "",
+                "stderr": "worktree operation deadline exceeded",
+            })
+            return "", "worktree operation deadline exceeded", -1, history
+        stdout, stderr, rc = runner(
+            command,
+            cwd=str(Path(repo_dir).resolve()),
+            timeout=min(max(1, int(timeout or 1)), remaining),
+        )
+        history.append({
+            "attempt": attempt + 1,
+            "rc": rc,
+            "stdout": str(stdout or ""),
+            "stderr": str(stderr or ""),
+        })
+        if rc == 0:
+            return stdout, stderr, rc, history
+        if (
+            attempt >= len(_WORKTREE_LOCK_RETRY_DELAYS)
+            or not _is_worktree_lock_contention(stdout, stderr)
+        ):
+            return stdout, stderr, rc, history
+        delay = min(
+            _WORKTREE_LOCK_RETRY_DELAYS[attempt],
+            max(0.0, float(deadline) - time.monotonic()),
+        )
+        if delay <= 0:
+            return stdout, stderr, rc, history
+        time.sleep(delay)
+    return stdout, stderr, rc, history
+
+
+def _registered_worktree_paths(stdout):
+    """Parse both newline and ``-z`` worktree porcelain output."""
+    text = str(stdout or "")
+    records = text.replace("\0", "\n").splitlines()
+    return {
+        os.path.normcase(os.path.abspath(line[len("worktree "):].strip()))
+        for line in records
+        if line.startswith("worktree ") and line[len("worktree "):].strip()
+    }
+
+
+def _worktree_registration_state(
+    git, repo_dir, worktree, runner, *, deadline=None,
+):
+    timeout = (
+        _remaining_timeout(deadline)
+        if deadline is not None
+        else DEFAULT_WORKTREE_TIMEOUT
+    )
+    if timeout <= 0:
+        return None, "worktree registration check deadline exceeded", -1
+    stdout, stderr, rc = runner(
+        git + ["worktree", "list", "--porcelain", "-z"],
+        cwd=str(Path(repo_dir).resolve()),
+        timeout=timeout,
+    )
+    target = os.path.normcase(os.path.abspath(str(worktree)))
+    registered = target in _registered_worktree_paths(stdout) if rc == 0 else None
+    return registered, str(stderr or "").strip(), rc
+
+
+def _mutation_diagnostic(history):
+    if not history:
+        return "attempts=0"
+    last = history[-1]
+    lock_attempts = sum(
+        1
+        for item in history
+        if _is_worktree_lock_contention(item.get("stdout"), item.get("stderr"))
+    )
+    return (
+        f"attempts={len(history)}, lock_contention_attempts={lock_attempts}, "
+        f"last_rc={last.get('rc')}, "
+        f"last_stdout={str(last.get('stdout') or '')[:300]}, "
+        f"last_stderr={str(last.get('stderr') or '')[:500]}"
+    )
+
+
+def _resolve_worktree_commit(git, repo_dir, ref, runner, *, deadline):
+    timeout = _remaining_timeout(deadline)
+    if timeout <= 0:
+        raise RuntimeError("git worktree revision resolution deadline exceeded")
+    stdout, stderr, rc = runner(
+        git + ["rev-parse", "--verify", f"{ref}^{{commit}}"],
+        cwd=str(repo_dir),
+        timeout=timeout,
+    )
+    commit = str(stdout or "").strip().splitlines()
+    commit = commit[-1].strip() if rc == 0 and commit else ""
+    if rc != 0 or not _FULL_COMMIT_RE.fullmatch(commit):
+        raise RuntimeError(
+            "git worktree 固定 revision 失败："
+            f"ref={ref}, rc={rc}, stderr={str(stderr or stdout or '')[:500]}"
+        )
+    return commit.lower()
+
+
+def _longest_tracked_path(git, repo_dir, ref, runner, *, deadline):
+    timeout = _remaining_timeout(deadline)
+    if timeout <= 0:
+        raise RuntimeError("git ls-tree deadline exceeded before worktree creation")
+    stdout, stderr, rc = runner(
         git + ["-c", "core.quotepath=false", "ls-tree", "-rz", "--name-only", ref],
         cwd=str(repo_dir),
-        timeout=300,
+        timeout=timeout,
     )
     if rc != 0:
-        return "", 0
+        raise RuntimeError(
+            "git ls-tree 无法读取固定 snapshot："
+            f"ref={ref}, rc={rc}, stderr={str(stderr or stdout or '')[:500]}"
+        )
     paths = [item for item in stdout.split("\0") if item]
     longest = max(paths, key=len, default="")
     return longest, len(longest)
 
 
-def _cleanup_failed_worktree(git, repo_dir, worktree, runner):
-    _stdout, stderr, rc = runner(
-        git + ["worktree", "remove", "--force", str(worktree)],
-        cwd=str(repo_dir),
-        timeout=300,
+def _cleanup_failed_worktree(
+    git, repo_dir, worktree, runner, *, deadline=None,
+):
+    deadline = (
+        float(deadline)
+        if deadline is not None
+        else time.monotonic() + DEFAULT_WORKTREE_TIMEOUT
+    )
+    _stdout, stderr, rc, history = _run_worktree_mutation(
+        git + ["worktree", "remove", "--force", "--", str(worktree)],
+        repo_dir=repo_dir,
+        runner=runner,
+        timeout=DEFAULT_WORKTREE_TIMEOUT,
+        deadline=deadline,
     )
     if rc == 0:
         shutil.rmtree(worktree, ignore_errors=True)
         return ""
 
-    stdout, list_stderr, list_rc = runner(
-        git + ["worktree", "list", "--porcelain"],
-        cwd=str(repo_dir),
-        timeout=300,
+    registered, list_stderr, list_rc = _worktree_registration_state(
+        git, repo_dir, worktree, runner, deadline=deadline,
     )
-    target = os.path.normcase(os.path.abspath(str(worktree)))
-    registered = False
-    if list_rc == 0:
-        registered = any(
-            os.path.normcase(os.path.abspath(line[len("worktree "):].strip()))
-            == target
-            for line in str(stdout or "").splitlines()
-            if line.startswith("worktree ")
-        )
-    if not registered and list_rc == 0:
+    if registered is False:
         shutil.rmtree(worktree, ignore_errors=True)
         return ""
     return (
-        str(stderr or "").strip()
-        or str(list_stderr or "").strip()
-        or "worktree registration cleanup failed"
+        f"{_mutation_diagnostic(history)}, registered={registered}, "
+        f"registration_check_rc={list_rc}, "
+        f"registration_check_stderr={list_stderr[:300]}, "
+        f"remove_stderr={str(stderr or '').strip()[:500]}"
     )
+
+
+def _recover_stale_worktree_leases(
+    git,
+    repo_dir,
+    roots,
+    runner,
+    *,
+    deadline,
+):
+    """Recover only dead-process worktrees explicitly leased by this product."""
+    repository_key = _worktree_repository_key(repo_dir)
+    diagnostics = []
+    seen_roots = set()
+    for raw_root in roots or []:
+        root = Path(raw_root).resolve()
+        normalized_root = os.path.normcase(str(root))
+        if normalized_root in seen_roots or not root.is_dir():
+            continue
+        seen_roots.add(normalized_root)
+        try:
+            leases = sorted(root.glob(f"{_WORKTREE_LEASE_PREFIX}*.json"))
+        except OSError as exc:
+            diagnostics.append(f"root={root}:lease_scan_failed:{type(exc).__name__}:{exc}")
+            continue
+        for lease in leases[:_MAX_WORKTREE_LEASES_PER_ROOT]:
+            if _remaining_timeout(deadline) <= 0:
+                diagnostics.append("lease_recovery_deadline_exceeded")
+                return diagnostics
+            try:
+                payload = json.loads(lease.read_text(encoding="utf-8"))
+                target = Path(str(payload.get("worktree") or "")).resolve()
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                diagnostics.append(
+                    f"lease={lease}:invalid:{type(exc).__name__}:{exc}"
+                )
+                continue
+            if (
+                payload.get("schema_version") != _WORKTREE_LEASE_VERSION
+                or str(payload.get("repository_key") or "") != repository_key
+                or target.parent != root
+                or _worktree_lease_path(target) != lease
+            ):
+                continue
+            if _process_is_alive(payload.get("pid")):
+                continue
+            cleanup_error = _cleanup_failed_worktree(
+                git,
+                repo_dir,
+                target,
+                runner,
+                deadline=deadline,
+            )
+            if cleanup_error:
+                diagnostics.append(f"path={target}:cleanup_failed:{cleanup_error}")
+                continue
+            _remove_worktree_lease(target)
+    return diagnostics
 
 
 def create_detached_worktree(
@@ -291,60 +616,147 @@ def create_detached_worktree(
     preferred_root=None,
     runner=None,
     git_command=None,
+    timeout=DEFAULT_WORKTREE_TIMEOUT,
 ):
-    """Create a detached worktree with shared Windows path policy and retries."""
+    """Create and verify one immutable detached worktree within one deadline."""
     repo_dir = Path(repo_dir).resolve()
     runner = runner or run_cmd
     git = git_with_long_paths(git_command)
+    timeout = max(1, int(timeout or DEFAULT_WORKTREE_TIMEOUT))
+    deadline = time.monotonic() + timeout
+    expected_commit = _resolve_worktree_commit(
+        git, repo_dir, ref, runner, deadline=deadline,
+    )
     ref_token = _digest(ref, length=8)
     prefix = (
         bounded_path_component(label, max_length=10, default="jua")
         + f"-{ref_token}"
     )
     longest_entry, longest_entry_length = _longest_tracked_path(
-        git, repo_dir, ref, runner,
+        git, repo_dir, expected_commit, runner, deadline=deadline,
     )
     attempts = []
-
-    for root in short_temp_root_candidates(
+    candidate_roots = short_temp_root_candidates(
         preferred_root=preferred_root,
         workspace=repo_dir,
-    ):
-        try:
-            worktree = make_short_temp_dir(
-                prefix,
-                preferred_root=root,
-                strict_preferred=True,
+    )
+
+    with _worktree_repository_lock(repo_dir):
+        attempts.extend(_recover_stale_worktree_leases(
+            git,
+            repo_dir,
+            candidate_roots,
+            runner,
+            deadline=deadline,
+        ))
+        for root in candidate_roots:
+            try:
+                worktree = make_short_temp_dir(
+                    prefix,
+                    preferred_root=root,
+                    strict_preferred=True,
+                )
+            except OSError as exc:
+                attempts.append(f"root={root}:temp_create_failed:{exc}")
+                continue
+            try:
+                _write_worktree_lease(repo_dir, worktree)
+            except OSError as exc:
+                shutil.rmtree(worktree, ignore_errors=True)
+                attempts.append(
+                    f"root={root}:lease_create_failed:{type(exc).__name__}:{exc}"
+                )
+                continue
+            predicted_longest = (
+                len(str(worktree)) + 1 + longest_entry_length
+                if longest_entry_length
+                else 0
             )
-        except OSError as exc:
-            attempts.append(f"root={root}:temp_create_failed:{exc}")
-            continue
-        predicted_longest = (
-            len(str(worktree)) + 1 + longest_entry_length
-            if longest_entry_length
-            else 0
-        )
-        _stdout, stderr, rc = runner(
-            git + ["worktree", "add", "--detach", str(worktree), str(ref)],
-            cwd=str(repo_dir),
-            timeout=1800,
-        )
-        if rc == 0:
-            return worktree
-        cleanup_error = _cleanup_failed_worktree(
-            git, repo_dir, worktree, runner,
-        )
-        attempt = (
-            f"path={worktree}, predicted_longest_path={predicted_longest or 'unknown'}, "
-            f"longest_entry={longest_entry[:200] or '<unknown>'}, "
-            f"stderr={str(stderr or '')[:500]}, cleanup={cleanup_error or 'complete'}"
-        )
-        attempts.append(attempt)
-        if cleanup_error:
-            raise RuntimeError(
-                "git worktree add 失败且本次注册无法安全清理，"
-                "为避免破坏 Git worktree 元数据已停止自动重试：" + attempt
+            _stdout, stderr, rc, history = _run_worktree_mutation(
+                git + [
+                    "worktree", "add", "--detach", "--",
+                    str(worktree), expected_commit,
+                ],
+                repo_dir=repo_dir,
+                runner=runner,
+                timeout=timeout,
+                deadline=deadline,
             )
+            if rc == 0:
+                verify_timeout = _remaining_timeout(deadline)
+                if verify_timeout > 0:
+                    actual_stdout, verify_stderr, verify_rc = runner(
+                        git + ["rev-parse", "--verify", "HEAD^{commit}"],
+                        cwd=str(worktree),
+                        timeout=verify_timeout,
+                    )
+                    actual_lines = str(actual_stdout or "").strip().splitlines()
+                    actual_commit = (
+                        actual_lines[-1].strip().lower()
+                        if verify_rc == 0 and actual_lines
+                        else ""
+                    )
+                else:
+                    verify_rc = -1
+                    verify_stderr = "worktree verification deadline exceeded"
+                    actual_commit = ""
+                if verify_rc == 0 and actual_commit == expected_commit:
+                    return worktree
+                cleanup_deadline = max(
+                    deadline,
+                    time.monotonic() + WORKTREE_CLEANUP_MARGIN_SECONDS,
+                )
+                cleanup_error = _cleanup_failed_worktree(
+                    git,
+                    repo_dir,
+                    worktree,
+                    runner,
+                    deadline=cleanup_deadline,
+                )
+                if not cleanup_error:
+                    _remove_worktree_lease(worktree)
+                raise RuntimeError(
+                    "git worktree snapshot 完整性校验失败："
+                    f"expected={expected_commit}, actual={actual_commit or '<empty>'}, "
+                    f"verify_rc={verify_rc}, "
+                    f"verify_stderr={str(verify_stderr or '')[:500]}, "
+                    f"cleanup={cleanup_error or 'complete'}"
+                )
+            cleanup_deadline = max(
+                deadline,
+                time.monotonic() + WORKTREE_CLEANUP_MARGIN_SECONDS,
+            )
+            cleanup_error = _cleanup_failed_worktree(
+                git,
+                repo_dir,
+                worktree,
+                runner,
+                deadline=cleanup_deadline,
+            )
+            if not cleanup_error:
+                _remove_worktree_lease(worktree)
+            attempt = (
+                f"path={worktree}, predicted_longest_path={predicted_longest or 'unknown'}, "
+                f"longest_entry={longest_entry[:200] or '<unknown>'}, "
+                f"{_mutation_diagnostic(history)}, cleanup={cleanup_error or 'complete'}, "
+                f"stderr={str(stderr or '')[:500]}"
+            )
+            attempts.append(attempt)
+            if cleanup_error:
+                raise RuntimeError(
+                    "git worktree add 失败且本次注册无法安全清理，"
+                    "为避免破坏 Git worktree 元数据已停止自动重试：" + attempt
+                )
+            if not any(
+                marker in f"{_stdout or ''}\n{stderr or ''}".lower()
+                for marker in _WORKTREE_PATH_ERROR_MARKERS
+            ):
+                # Changing the temp root only helps path-length/path-collision
+                # failures.  Retrying auth, object, permission, or repository
+                # errors at more roots merely multiplies the same failure.
+                break
+            if _remaining_timeout(deadline) <= 0:
+                break
 
     budget = f", windows_safe_budget={WINDOWS_SAFE_PATH_LENGTH}" if IS_WINDOWS else ""
     raise RuntimeError(
@@ -358,14 +770,45 @@ def remove_detached_worktree(
     *,
     runner=None,
     git_command=None,
+    timeout=DEFAULT_WORKTREE_TIMEOUT,
 ):
     runner = runner or run_cmd
     git = git_with_long_paths(git_command)
-    _stdout, stderr, rc = runner(
-        git + ["worktree", "remove", "--force", str(worktree)],
-        cwd=str(Path(repo_dir).resolve()),
-        timeout=1800,
-    )
-    if rc != 0:
-        raise RuntimeError(f"git worktree remove 失败：{str(stderr or '')[:500]}")
-    shutil.rmtree(worktree, ignore_errors=True)
+    repo_dir = Path(repo_dir).resolve()
+    timeout = max(1, int(timeout or DEFAULT_WORKTREE_TIMEOUT))
+    deadline = time.monotonic() + timeout
+    with _worktree_repository_lock(repo_dir):
+        _stdout, stderr, rc, history = _run_worktree_mutation(
+            git + ["worktree", "remove", "--force", "--", str(worktree)],
+            repo_dir=repo_dir,
+            runner=runner,
+            timeout=timeout,
+            deadline=deadline,
+        )
+        registered = False
+        list_stderr = ""
+        list_rc = 0
+        if rc != 0:
+            registered, list_stderr, list_rc = _worktree_registration_state(
+                git, repo_dir, worktree, runner, deadline=deadline,
+            )
+            if registered is not False:
+                raise RuntimeError(
+                    "git worktree remove 失败："
+                    f"path={Path(worktree).resolve()}, "
+                    f"{_mutation_diagnostic(history)}, registered={registered}, "
+                    f"registration_check_rc={list_rc}, "
+                    f"registration_check_stderr={list_stderr[:300]}, "
+                    f"remove_stderr={str(stderr or '')[:500]}"
+                )
+
+        try:
+            shutil.rmtree(worktree)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise RuntimeError(
+                "Git worktree 注册已清理，但临时目录删除失败："
+                f"path={Path(worktree).resolve()}, error={type(exc).__name__}:{exc}"
+            ) from exc
+        _remove_worktree_lease(worktree)

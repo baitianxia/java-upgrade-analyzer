@@ -155,6 +155,25 @@ def complete_review(finding_id, **overrides):
 
 
 class TestRoundRetrospectiveTest(unittest.TestCase):
+    def test_project_provenance_accepts_full_sha1_and_sha256_git_object_ids(self):
+        for revision in ("a" * 40, "B" * 64):
+            with self.subTest(length=len(revision)):
+                self.assertTrue(retro._project_provenance_complete([{
+                    "project_asset_health": {
+                        "git_revision": revision,
+                        "git_dirty": False,
+                    },
+                }]))
+
+        for revision in ("a" * 39, "b" * 48, "c" * 63, "g" * 64):
+            with self.subTest(invalid_revision=revision):
+                self.assertFalse(retro._project_provenance_complete([{
+                    "project_asset_health": {
+                        "git_revision": revision,
+                        "git_dirty": False,
+                    },
+                }]))
+
     def test_clean_converged_round_recommends_rotation(self):
         result = retro.build_retrospective(
             clean_real_payload(), audit_payload(), reviews=[], history=[],

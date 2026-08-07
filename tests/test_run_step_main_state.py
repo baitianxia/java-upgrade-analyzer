@@ -53,7 +53,7 @@ class RunStepMainStateTest(unittest.TestCase):
             reason_codes, ["STEP4_JAPICMP_MISSING_NEED_RESOLUTION"]
         )
 
-    def test_step1_artifact_preflight_asks_only_for_missing_module_and_shows_candidates(self):
+    def test_step1_artifact_preflight_does_not_show_unpinned_local_candidates(self):
         interaction = run_step.build_step1_preflight_interaction(
             {
                 "base_artifact_path": "/artifacts/base.jar",
@@ -70,9 +70,9 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertIn("两侧编译产物已经齐全", interaction["question"])
         self.assertNotIn("source_project_dir", interaction["question"])
         self.assertNotIn("补齐缺失侧的 branch", interaction["question"])
-        self.assertIn("检测到的目标模块候选", card)
-        self.assertIn("`app`", card)
-        self.assertIn("`services/order-service`", card)
+        self.assertNotIn("检测到的目标模块候选", card)
+        self.assertNotIn("`app`", card)
+        self.assertNotIn("`services/order-service`", card)
 
     def test_step1_artifact_review_collects_missing_context_refs_in_existing_checkpoint(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -357,8 +357,6 @@ class RunStepMainStateTest(unittest.TestCase):
             ), patch.object(
                 run_step, "detect_integrity_repair_step", return_value=None
             ), patch.object(
-                run_step, "detect_current_branch", return_value=""
-            ), patch.object(
                 run_step, "detect_build_tool", return_value="maven"
             ), patch.object(
                 run_step, "execute_step", side_effect=fake_execute
@@ -436,8 +434,6 @@ class RunStepMainStateTest(unittest.TestCase):
                 ),
             ), patch.object(
                 run_step, "detect_integrity_repair_step", return_value=None
-            ), patch.object(
-                run_step, "detect_current_branch", return_value=""
             ), patch.object(
                 run_step, "detect_build_tool", return_value="maven"
             ), patch.object(
@@ -519,8 +515,6 @@ class RunStepMainStateTest(unittest.TestCase):
                 run_step, "load_manifest", return_value=(manifest, steps)
             ), patch.object(
                 run_step, "detect_integrity_repair_step", return_value=None
-            ), patch.object(
-                run_step, "detect_current_branch", return_value=""
             ), patch.object(
                 run_step, "detect_build_tool", return_value="maven"
             ), patch.object(
@@ -4137,6 +4131,8 @@ class RunStepMainStateTest(unittest.TestCase):
             run_context = {
                 "base_branch": "main",
                 "current_branch": "feature/demo",
+                "base_resolved_commit": "a" * 40,
+                "current_resolved_commit": "b" * 40,
                 "source_dirs": [str((project_dir / "src/main/java").resolve())],
                 "source_dirs_status": "provided",
             }
@@ -4188,16 +4184,44 @@ class RunStepMainStateTest(unittest.TestCase):
             run_context = {
                 "base_branch": "main",
                 "current_branch": "main",
+                "base_resolved_commit": "a" * 40,
+                "current_resolved_commit": "a" * 40,
                 "artifact_input_mode": False,
             }
             manifest_steps = {"step2": {"gate": "context"}}
 
-            with patch.object(run_step, "ensure_exists"), patch.object(run_step, "is_git_repo", return_value=True):
+            with patch.object(run_step, "ensure_exists"):
                 with self.assertRaisesRegex(
                     run_step.StepError,
-                    r"checkpoint 或修正 \.runtime/state/main_state\.json.*两个不同分支",
+                    r"修正远端 ref.*不同 commit",
                 ):
                     run_step.execute_step("step2", args, manifest_steps, run_context)
+
+    def test_execute_step2_rejects_movable_refs_without_pinned_commits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            report_dir = project_dir / ".upgrade-report"
+            report_dir.mkdir(parents=True)
+            args = self._make_default_args(project_dir, report_dir)
+            run_context = {
+                "base_branch": "release-old",
+                "current_branch": "release-new",
+                "artifact_input_mode": False,
+            }
+
+            with patch.object(run_step, "ensure_exists"):
+                with self.assertRaises(run_step.StepError) as raised:
+                    run_step.execute_step(
+                        "step2",
+                        args,
+                        {"step2": {"gate": "context"}},
+                        run_context,
+                    )
+
+        self.assertEqual(
+            raised.exception.reason_codes,
+            ["STEP2_SOURCE_COMMIT_NOT_PINNED"],
+        )
 
     def test_refresh_step2_outputs_does_not_pass_business_inputs_via_cli(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -5935,7 +5959,7 @@ class RunStepMainStateTest(unittest.TestCase):
             ), patch.object(
                 run_step,
                 "resolve_step1_refs_for_execution",
-                side_effect=lambda context, _project: (dict(context), None),
+                side_effect=lambda context, _project, **_kwargs: (dict(context), None),
             ):
                 exit_code = run_step.main()
 
@@ -6161,6 +6185,34 @@ class RunStepMainStateTest(unittest.TestCase):
             },
         )
 
+    def test_stale_remote_configuration_card_is_cleared_for_live_recheck(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / ".upgrade-report"
+            state = run_step.new_main_state(report_dir)
+            pending = {
+                "step_id": "step1",
+                "reason_code": "STEP1_REMOTE_CONFIGURATION_MISSING",
+                "must_wait_for_user_reply": True,
+            }
+            state["state"].update({
+                "current_step": "step1",
+                "status": "awaiting_user_input",
+                "pending_interaction": pending,
+            })
+            run_step.save_main_state(report_dir, state)
+            run_step.save_interaction_file(report_dir, pending)
+
+            cleared = run_step.clear_stale_git_interaction_for_recheck(
+                state,
+                report_dir,
+                pending,
+            )
+            saved = run_step.load_main_state(report_dir)
+
+        self.assertTrue(cleared)
+        self.assertEqual(saved["state"]["status"], "ready")
+        self.assertIsNone(saved["state"]["pending_interaction"])
+
     def test_step1_ref_preflight_discards_unbound_expected_commit_from_old_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
@@ -6286,6 +6338,84 @@ class RunStepMainStateTest(unittest.TestCase):
             ["STEP1_REMOTE_EXPECTED_COMMIT_UNMATERIALIZABLE"],
         )
 
+    def test_step1_persists_remote_binding_before_initial_materialization_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            commit = "a" * 40
+            context = {
+                "analysis_mode": "checkout_build",
+                "base_branch": "release",
+            }
+            first_resolution = {
+                "status": "fetch_failed",
+                "source_status": "remote_expected_commit_unmaterializable",
+                "expected_commit": commit,
+                "queried_at": "2026-08-07T00:00:00Z",
+                "fingerprint": "remote-selection",
+                "candidates": [{
+                    "remote": "origin",
+                    "canonical_ref": "refs/heads/release",
+                    "ref": "origin/release",
+                    "commit": commit,
+                }],
+                "failures": [{
+                    "remote": "origin",
+                    "stage": "fetch_commit",
+                    "reason": "temporary network failure",
+                }],
+            }
+            snapshots = []
+            with patch.object(
+                run_step,
+                "resolve_step1_ref",
+                return_value=first_resolution,
+            ), self.assertRaises(run_step.StepError):
+                run_step.resolve_step1_refs_for_execution(
+                    context,
+                    project_dir,
+                    on_side_resolved=lambda partial, _side, _resolution: snapshots.append(
+                        json.loads(json.dumps(partial))
+                    ),
+                )
+
+            self.assertEqual(len(snapshots), 1)
+            persisted = snapshots[0]
+            self.assertEqual(persisted["base_expected_commit"], commit)
+            self.assertEqual(persisted["base_ref_binding"]["remote"], "origin")
+            self.assertEqual(
+                persisted["base_ref_binding"]["canonical_ref"],
+                "refs/heads/release",
+            )
+
+            resolved = {
+                "status": "resolved",
+                "source_status": "remote_source_resolved",
+                "requested_ref": "release",
+                "resolved_ref": "origin/release",
+                "resolved_commit": commit,
+                "remote": "origin",
+                "remote_ref": "refs/heads/release",
+                "resolution_mode": "pinned_commit",
+            }
+            with patch.object(
+                run_step,
+                "resolve_step1_ref",
+                return_value=resolved,
+            ) as resolver:
+                updated, interaction = run_step.resolve_step1_refs_for_execution(
+                    persisted,
+                    project_dir,
+                )
+
+        self.assertIsNone(interaction)
+        self.assertEqual(updated["base_resolved_commit"], commit)
+        self.assertEqual(resolver.call_args.kwargs["expected_commit"], commit)
+        self.assertEqual(resolver.call_args.kwargs["expected_remote"], "origin")
+        self.assertEqual(
+            resolver.call_args.kwargs["expected_remote_ref"],
+            "refs/heads/release",
+        )
+
     def test_step1_remote_operation_failure_is_system_error_not_checkpoint(self):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
@@ -6321,6 +6451,108 @@ class RunStepMainStateTest(unittest.TestCase):
             raised.exception.reason_codes,
             ["STEP1_REMOTE_OPERATION_FAILED"],
         )
+
+    def test_step1_publishes_base_snapshot_before_current_remote_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            base_resolution = {
+                "status": "resolved",
+                "source_status": "remote_source_resolved",
+                "requested_ref": "base",
+                "resolved_ref": "origin/base",
+                "resolved_commit": "a" * 40,
+                "remote": "origin",
+                "remote_ref": "refs/heads/base",
+                "resolution_mode": "live_remote",
+                "candidates": [],
+            }
+            current_failure = {
+                "status": "fetch_failed",
+                "source_status": "remote_query_failed",
+                "failures": [{"reason": "temporary TLS failure"}],
+            }
+            snapshots = []
+
+            with patch.object(
+                run_step,
+                "resolve_step1_ref",
+                side_effect=[base_resolution, current_failure],
+            ), self.assertRaises(run_step.StepError):
+                run_step.resolve_step1_refs_for_execution(
+                    {
+                        "base_branch": "base",
+                        "current_branch": "current",
+                    },
+                    project_dir,
+                    on_side_resolved=lambda context, side, resolution: snapshots.append(
+                        (side, context, resolution)
+                    ),
+                )
+
+        self.assertEqual([item[0] for item in snapshots], ["base", "current"])
+        self.assertEqual(snapshots[-1][1]["base_resolved_commit"], "a" * 40)
+
+    def test_main_persists_partial_ref_snapshot_when_second_side_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp) / "project"
+            report_dir = project_dir / ".upgrade-report"
+            project_dir.mkdir()
+            report_dir.mkdir()
+            context = {
+                "project_dir": str(project_dir),
+                "report_dir": str(report_dir),
+                "analysis_mode": "checkout_build",
+                "base_branch": "base",
+                "current_branch": "current",
+                "target_module": ".",
+            }
+
+            def fail_after_base(run_context, _project, *, on_side_resolved):
+                partial = dict(run_context)
+                partial["base_resolved_commit"] = "a" * 40
+                partial["base_expected_commit"] = "a" * 40
+                on_side_resolved(partial, "base", {"status": "resolved"})
+                raise run_step.StepError(
+                    "current remote failed",
+                    reason_codes=["STEP1_REMOTE_OPERATION_FAILED"],
+                )
+
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "run_step.py",
+                    "--step", "step1",
+                    "--project-dir", str(project_dir),
+                    "--report-dir", str(report_dir),
+                ],
+            ), patch.object(
+                run_step,
+                "load_manifest",
+                return_value=({}, {"step1": {}}),
+            ), patch.object(
+                run_step,
+                "build_run_context",
+                return_value=context,
+            ), patch.object(
+                run_step,
+                "build_step1_preflight_interaction",
+                return_value=None,
+            ), patch.object(
+                run_step,
+                "resolve_step1_refs_for_execution",
+                side_effect=fail_after_base,
+            ):
+                exit_code = run_step.main()
+
+            saved = run_step.load_main_state(report_dir)
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(
+            saved["step1"]["input"]["base_resolved_commit"],
+            "a" * 40,
+        )
+        self.assertEqual(saved["state"]["status"], "blocked_by_system")
 
     def test_step1_input_change_invalidates_bound_ref_snapshot(self):
         project_dir = Path("/project")
@@ -6412,7 +6644,7 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertEqual(updated["base_ref_remote"], "origin")
         self.assertEqual(updated["current_ref_remote"], "origin")
 
-    def test_step1_direct_artifacts_do_not_resolve_refs_before_coordinate_fallback(self):
+    def test_step1_direct_artifacts_pin_explicit_refs_before_coordinate_fallback(self):
         context = {
             "analysis_mode": "artifact_inputs",
             "base_artifact_path": "/tmp/base.jar",
@@ -6421,14 +6653,28 @@ class RunStepMainStateTest(unittest.TestCase):
             "current_branch": "possibly-ambiguous-current",
         }
 
-        with patch.object(run_step, "resolve_step1_ref") as resolver:
+        resolution = {
+            "status": "resolved",
+            "source_status": "remote_source_resolved",
+            "requested_ref": "release",
+            "resolved_ref": "origin/release",
+            "resolved_commit": "c" * 40,
+            "remote": "origin",
+            "remote_ref": "refs/heads/release",
+            "resolution_mode": "live_remote",
+            "candidates": [],
+        }
+        with patch.object(
+            run_step, "resolve_step1_ref", return_value=resolution,
+        ) as resolver:
             updated, interaction = run_step.resolve_step1_refs_for_execution(
                 context, "/tmp/project"
             )
 
         self.assertIsNone(interaction)
-        self.assertEqual(updated, context)
-        resolver.assert_not_called()
+        self.assertEqual(updated["base_resolved_commit"], "c" * 40)
+        self.assertEqual(updated["current_resolved_commit"], "c" * 40)
+        self.assertEqual(resolver.call_count, 2)
 
     def test_step1_ref_preflight_stops_for_ambiguous_remote_refs(self):
         with tempfile.TemporaryDirectory() as tmp:

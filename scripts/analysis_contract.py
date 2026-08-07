@@ -6,13 +6,12 @@ from __future__ import annotations
 import hashlib
 import csv
 import json
-import subprocess
 import re
 import safe_xml as ET
 from datetime import datetime, timezone
 from pathlib import Path
 
-from compat import git_cmd
+from compat import git_cmd, run_cmd
 from csv_io import open_csv_read
 from diagnostic_contract import (
     diagnostic_contract_metadata,
@@ -922,11 +921,10 @@ def sha256_file(path):
 
 
 def git_revision(project_dir, ref="HEAD"):
-    result = subprocess.run(
-        git_cmd() + ["rev-parse", str(ref)], cwd=str(project_dir), text=True, encoding="utf-8", errors="replace",
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False,
+    stdout, _stderr, rc = run_cmd(
+        git_cmd() + ["rev-parse", str(ref)], cwd=str(project_dir), timeout=30,
     )
-    return result.stdout.strip() if result.returncode == 0 else ""
+    return stdout.strip() if rc == 0 else ""
 
 
 def project_scope_provenance_fields(project_scope):

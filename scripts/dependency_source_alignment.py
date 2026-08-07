@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """Pin dependency source mappings to Step4-confirmed current-version commits."""
 
+import errno
 import hashlib
-import io
 import json
+import os
 import re
 import shutil
 import stat
-import subprocess
+import time
+import uuid
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path, PureWindowsPath
 
 from artifact_coordinates import artifact_classifier, artifact_ga
+from compat import run_cmd
 from path_runtime import (
     bounded_path_component,
     git_with_long_paths,
@@ -21,16 +25,11 @@ from path_runtime import (
 
 
 def _run_git(repo_path, *args):
-    completed = subprocess.run(
+    stdout, stderr, rc = run_cmd(
         git_with_long_paths() + ["-C", str(repo_path), *args],
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
+        timeout=60,
     )
-    return completed.stdout.strip(), completed.stderr.strip(), completed.returncode
+    return stdout.strip(), stderr.strip(), rc
 
 
 def extract_zip_safely(archive, destination_root):
@@ -181,17 +180,32 @@ def resolve_unique_ref_record(coord, records):
 
 
 def repository_fingerprint(repo_path):
-    branch, _stderr, branch_rc = _run_git(repo_path, "branch", "--show-current")
-    head, _stderr, head_rc = _run_git(repo_path, "rev-parse", "HEAD")
-    status, _stderr, status_rc = _run_git(repo_path, "status", "--porcelain")
-    if branch_rc or head_rc or status_rc:
+    status, _stderr, status_rc = _run_git(
+        repo_path, "status", "--porcelain=v2", "--branch",
+    )
+    if status_rc:
         return None
+    branch = ""
+    head = ""
+    dirty_entries = []
+    for line in status.splitlines():
+        if line.startswith("# branch.oid "):
+            head = line[len("# branch.oid "):].strip()
+        elif line.startswith("# branch.head "):
+            branch = line[len("# branch.head "):].strip()
+            if branch == "(detached)":
+                branch = ""
+        elif not line.startswith("# ") and line.strip():
+            dirty_entries.append(line)
+    if not _FULL_OBJECT_ID_RE.fullmatch(head):
+        return None
+    raw_status = "\n".join(dirty_entries)
     return {
         "branch": branch,
-        "head": head,
-        "status_sha256": hashlib.sha256(status.encode("utf-8")).hexdigest(),
-        "dirty_entry_count": len([line for line in status.splitlines() if line.strip()]),
-        "_raw_status": status,
+        "head": head.lower(),
+        "status_sha256": hashlib.sha256(raw_status.encode("utf-8")).hexdigest(),
+        "dirty_entry_count": len(dirty_entries),
+        "_raw_status": raw_status,
     }
 
 
@@ -207,61 +221,371 @@ def _public_fingerprint(fingerprint):
     return {key: value for key, value in fingerprint.items() if not key.startswith("_")}
 
 
+_FULL_OBJECT_ID_RE = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
+_SNAPSHOT_MARKER_NAME = ".jua-source-snapshot.json"
+_SNAPSHOT_MARKER_SCHEMA = 2
+_SNAPSHOT_PUBLISH_ATTEMPTS = 6
+_SNAPSHOT_LOCK_TIMEOUT_SECONDS = 300
+
+
+def _git_failure_detail(stderr, fallback):
+    return str(stderr or "").strip() or str(fallback or "").strip()
+
+
+def _resolve_commit(repo_path, ref):
+    """Resolve a ref without turning an execution failure into "ref missing"."""
+    failures = []
+    revision = f"{ref}^{{commit}}"
+    for _attempt in range(2):
+        commit, stderr, rc = _run_git(
+            repo_path,
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            revision,
+        )
+        candidate = str(commit or "").strip()
+        if rc == 0:
+            if _FULL_OBJECT_ID_RE.fullmatch(candidate):
+                return candidate.lower()
+            raise RuntimeError(
+                "dependency_source_ref_resolution_invalid:"
+                + _git_failure_detail(stderr, "git rev-parse returned a non-object id")
+            )
+        failures.append((stderr, rc))
+
+    last_stderr, last_rc = failures[-1]
+    lowered = str(last_stderr or "").lower()
+    if last_rc == -1:
+        if "超时" in lowered or "timed out" in lowered or "timeout" in lowered:
+            code = "dependency_source_ref_resolution_timeout"
+        elif "命令未找到" in lowered or "not found" in lowered:
+            code = "dependency_source_git_unavailable"
+        else:
+            code = "dependency_source_ref_resolution_failed"
+        raise RuntimeError(
+            f"{code}:{_git_failure_detail(last_stderr, ref)}"
+        )
+
+    _git_dir, health_stderr, health_rc = _run_git(
+        repo_path, "rev-parse", "--git-dir",
+    )
+    if health_rc != 0:
+        raise RuntimeError(
+            "dependency_source_repository_unavailable:"
+            + _git_failure_detail(health_stderr, last_stderr or repo_path)
+        )
+    raise RuntimeError(
+        "dependency_source_ref_not_found:"
+        + _git_failure_detail(last_stderr, ref)
+    )
+
+
+def _snapshot_content_manifest(snapshot, marker_name=_SNAPSHOT_MARKER_NAME):
+    """Hash every cached entry so a matching commit marker is not trusted alone."""
+    snapshot = Path(snapshot)
+    digest = hashlib.sha256()
+    entry_count = 0
+    file_count = 0
+    try:
+        entries = sorted(
+            snapshot.rglob("*"),
+            key=lambda path: path.relative_to(snapshot).as_posix(),
+        )
+        for path in entries:
+            relative = path.relative_to(snapshot).as_posix()
+            if relative == marker_name:
+                continue
+            mode = path.lstat().st_mode
+            if stat.S_ISLNK(mode) or not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
+                raise RuntimeError("dependency_source_snapshot_content_invalid")
+            kind = b"D" if stat.S_ISDIR(mode) else b"F"
+            digest.update(kind + b"\0" + relative.encode("utf-8") + b"\0")
+            entry_count += 1
+            if stat.S_ISREG(mode):
+                file_count += 1
+                size_before = path.stat().st_size
+                digest.update(str(size_before).encode("ascii") + b"\0")
+                with path.open("rb") as source:
+                    while True:
+                        block = source.read(1024 * 1024)
+                        if not block:
+                            break
+                        digest.update(block)
+                if path.stat().st_size != size_before:
+                    raise RuntimeError("dependency_source_snapshot_content_changed")
+                digest.update(b"\0")
+    except OSError as exc:
+        raise RuntimeError(
+            f"dependency_source_snapshot_content_unreadable:{exc}"
+        ) from exc
+    return {
+        "content_sha256": digest.hexdigest(),
+        "entry_count": entry_count,
+        "file_count": file_count,
+    }
+
+
+def _validate_snapshot(snapshot, commit, marker_name=_SNAPSHOT_MARKER_NAME):
+    snapshot = Path(snapshot)
+    if not os.path.lexists(snapshot):
+        return False, "missing"
+    if snapshot.is_symlink() or not snapshot.is_dir():
+        return False, "snapshot_not_directory"
+    marker = snapshot / marker_name
+    try:
+        if marker.is_symlink() or not marker.is_file():
+            return False, "marker_missing"
+        marker_payload = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False, "marker_unreadable"
+    if (
+        marker_payload.get("schema") != _SNAPSHOT_MARKER_SCHEMA
+        or marker_payload.get("commit") != commit
+    ):
+        return False, "marker_identity_mismatch"
+    try:
+        actual = _snapshot_content_manifest(snapshot, marker_name)
+    except RuntimeError as exc:
+        return False, str(exc).split(":", 1)[0]
+    for field in ("content_sha256", "entry_count", "file_count"):
+        if marker_payload.get(field) != actual[field]:
+            return False, f"marker_{field}_mismatch"
+    return True, ""
+
+
+def _remove_cache_entry(path):
+    path = Path(path)
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path, ignore_errors=True)
+        return
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+@contextmanager
+def _snapshot_cache_lock(snapshot):
+    """Serialize validation/repair/publication, including across processes."""
+    snapshot = Path(snapshot)
+    lock_path = snapshot.with_name(f".{snapshot.name}.lock")
+    try:
+        handle = lock_path.open("a+b")
+    except OSError as exc:
+        raise RuntimeError(
+            f"dependency_source_snapshot_lock_failed:{exc}"
+        ) from exc
+    locked = False
+    windows_lock = None
+    posix_lock = None
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            windows_lock = msvcrt
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+            deadline = time.monotonic() + _SNAPSHOT_LOCK_TIMEOUT_SECONDS
+            while True:
+                handle.seek(0)
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    locked = True
+                    break
+                except OSError as exc:
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(
+                            "dependency_source_snapshot_lock_timeout"
+                        ) from exc
+                    time.sleep(0.1)
+        else:
+            try:
+                import fcntl
+            except ImportError as exc:
+                raise RuntimeError(
+                    "dependency_source_snapshot_lock_unsupported"
+                ) from exc
+
+            posix_lock = fcntl
+            deadline = time.monotonic() + _SNAPSHOT_LOCK_TIMEOUT_SECONDS
+            while True:
+                try:
+                    fcntl.flock(
+                        handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+                    locked = True
+                    break
+                except OSError as exc:
+                    if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                        raise RuntimeError(
+                            f"dependency_source_snapshot_lock_failed:{exc}"
+                        ) from exc
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(
+                            "dependency_source_snapshot_lock_timeout"
+                        ) from exc
+                    time.sleep(0.1)
+        yield
+    finally:
+        if locked:
+            try:
+                if windows_lock is not None:
+                    handle.seek(0)
+                    windows_lock.locking(handle.fileno(), windows_lock.LK_UNLCK, 1)
+                elif posix_lock is not None:
+                    posix_lock.flock(handle.fileno(), posix_lock.LOCK_UN)
+            except OSError:
+                pass
+        handle.close()
+
+
+def _quarantine_invalid_snapshot(snapshot):
+    """Atomically move one invalid entry away; concurrent repairers may race."""
+    snapshot = Path(snapshot)
+    quarantine = snapshot.with_name(
+        f".{snapshot.name}.invalid-{uuid.uuid4().hex}"
+    )
+    try:
+        snapshot.rename(quarantine)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        if not os.path.lexists(snapshot):
+            return False
+        raise RuntimeError(
+            f"dependency_source_snapshot_repair_failed:{exc}"
+        ) from exc
+    _remove_cache_entry(quarantine)
+    return True
+
+
+def _create_snapshot_payload(temporary, repo_path, commit, marker_name):
+    temporary = Path(temporary)
+    payload = temporary / "payload"
+    payload.mkdir()
+    archive_path = temporary / "snapshot.zip"
+    last_stderr = ""
+    last_rc = 0
+    for _attempt in range(2):
+        try:
+            archive_path.unlink()
+        except FileNotFoundError:
+            pass
+        _stdout, last_stderr, last_rc = run_cmd(
+            git_with_long_paths() + [
+                "-C", str(repo_path), "archive", "--format=zip",
+                f"--output={archive_path}", commit,
+            ],
+            timeout=120,
+        )
+        if last_rc == 0 and archive_path.is_file():
+            break
+    else:
+        lowered = str(last_stderr or "").lower()
+        if last_rc == -1 and (
+            "超时" in lowered or "timed out" in lowered or "timeout" in lowered
+        ):
+            code = "dependency_source_snapshot_git_archive_timeout"
+        elif last_rc == -1:
+            code = "dependency_source_snapshot_git_archive_unavailable"
+        elif last_rc == 0:
+            code = "dependency_source_snapshot_git_archive_output_missing"
+        else:
+            code = "dependency_source_snapshot_git_archive_failed"
+        raise RuntimeError(
+            f"{code}:"
+            + _git_failure_detail(
+                last_stderr,
+                f"git archive exited with code {last_rc}",
+            )
+        )
+
+    try:
+        with zipfile.ZipFile(archive_path) as archive:
+            extract_zip_safely(archive, payload)
+    except zipfile.BadZipFile as exc:
+        raise RuntimeError(
+            f"dependency_source_snapshot_archive_invalid:{exc}"
+        ) from exc
+    if os.path.lexists(payload / marker_name):
+        raise RuntimeError("dependency_source_snapshot_reserved_path_conflict")
+    manifest = _snapshot_content_manifest(payload, marker_name)
+    marker_payload = {
+        "schema": _SNAPSHOT_MARKER_SCHEMA,
+        "commit": commit,
+        **manifest,
+    }
+    (payload / marker_name).write_text(
+        json.dumps(marker_payload, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return payload
+
+
 def materialize_detached_snapshot(report_dir, coord, repo_path, ref, module_rel_path):
-    commit, stderr, rc = _run_git(repo_path, "rev-parse", f"{ref}^{{commit}}")
-    if rc or not commit:
-        raise RuntimeError(f"dependency_source_ref_not_found:{stderr or ref}")
+    commit = _resolve_commit(repo_path, ref)
     snapshot = (
         runtime_storage_root(report_dir, "source_snapshots")
         / _safe_coord(coord)
-        / commit[:12]
+        / commit
     )
-    marker_name = ".jua-source-snapshot.json"
+    marker_name = _SNAPSHOT_MARKER_NAME
+    snapshot.parent.mkdir(parents=True, exist_ok=True)
     reused = False
-    if snapshot.exists():
-        marker = snapshot / marker_name
-        try:
-            marker_payload = json.loads(marker.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            marker_payload = {}
-        if marker_payload.get("commit") != commit:
-            raise RuntimeError("dependency_source_snapshot_conflict")
-        reused = True
-    else:
-        snapshot.parent.mkdir(parents=True, exist_ok=True)
-        # `git worktree add` leaves a reverse registration in the user's
-        # repository.  Report cleanup by `rm -rf` then creates a stale worktree
-        # record.  Archive the exact commit instead: the source bytes are the
-        # same tracked revision and the user's repository is never mutated.
-        completed = subprocess.run(
-            git_with_long_paths() + [
-                "-C", str(repo_path), "archive", "--format=zip", commit,
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        if completed.returncode != 0:
+    published = False
+    last_validation_error = "missing"
+    with _snapshot_cache_lock(snapshot):
+        for _attempt in range(_SNAPSHOT_PUBLISH_ATTEMPTS):
+            valid, last_validation_error = _validate_snapshot(
+                snapshot, commit, marker_name,
+            )
+            if valid:
+                reused = not published
+                break
+            if os.path.lexists(snapshot):
+                _quarantine_invalid_snapshot(snapshot)
+                continue
+
+            # `git worktree add` leaves a reverse registration in the user's
+            # repository.  Archive the exact commit instead: the source bytes are
+            # the same tracked revision and the user's repository is never mutated.
+            temporary = make_short_temp_dir(
+                prefix=f"source-{commit[:8]}",
+                preferred_root=snapshot.parent,
+                strict_preferred=True,
+            )
+            try:
+                payload = _create_snapshot_payload(
+                    temporary, repo_path, commit, marker_name,
+                )
+                try:
+                    payload.rename(snapshot)
+                    published = True
+                except OSError as exc:
+                    # A process from an older build may not honor this lock but
+                    # can still win the atomic rename. Validate its publication
+                    # on the next iteration instead of reporting a false error.
+                    if not os.path.lexists(snapshot):
+                        raise RuntimeError(
+                            f"dependency_source_snapshot_publish_failed:{exc}"
+                        ) from exc
+            finally:
+                shutil.rmtree(temporary, ignore_errors=True)
+        else:
             raise RuntimeError(
-                "dependency_source_snapshot_create_failed:"
-                + completed.stderr.decode("utf-8", errors="replace").strip()
+                "dependency_source_snapshot_cache_unstable:"
+                + last_validation_error
             )
-        temporary = make_short_temp_dir(
-            prefix=f"source-{commit[:8]}",
-            preferred_root=snapshot.parent,
-            strict_preferred=True,
-        )
-        try:
-            with zipfile.ZipFile(io.BytesIO(completed.stdout)) as archive:
-                extract_zip_safely(archive, temporary)
-            (temporary / marker_name).write_text(
-                json.dumps({"schema": 1, "commit": commit}, sort_keys=True) + "\n",
-                encoding="utf-8",
+
+        valid, validation_error = _validate_snapshot(snapshot, commit, marker_name)
+        if not valid:
+            raise RuntimeError(
+                "dependency_source_snapshot_validation_failed:"
+                + validation_error
             )
-            temporary.rename(snapshot)
-        except Exception:
-            shutil.rmtree(temporary, ignore_errors=True)
-            raise
 
     snapshot_root = snapshot.resolve()
     module_root = (snapshot / (module_rel_path or ".")).resolve()
@@ -408,8 +732,26 @@ def align_dependency_source_mappings(report_dir, dependency_source_mappings, run
             continue
 
         source_git_root, stderr, rc = _run_git(original_path, "rev-parse", "--show-toplevel")
-        if rc or not source_git_root:
-            records.append(_record_failure(coord, original_path, "dependency_source_not_git_repo", stderr or "依赖源码目录不是 Git 工作区"))
+        if rc:
+            reason_code = (
+                "dependency_source_git_unavailable"
+                if rc == -1
+                else "dependency_source_repository_discovery_failed"
+            )
+            records.append(_record_failure(
+                coord,
+                original_path,
+                reason_code,
+                stderr or "Git 无法确定依赖源码仓库根目录",
+            ))
+            continue
+        if not source_git_root:
+            records.append(_record_failure(
+                coord,
+                original_path,
+                "dependency_source_repository_discovery_invalid",
+                "Git 成功退出但没有返回依赖源码仓库根目录",
+            ))
             continue
         expected_repo = Path(ref_record["repo_path"]).resolve()
         actual_repo = Path(source_git_root).resolve()
@@ -454,6 +796,14 @@ def align_dependency_source_mappings(report_dir, dependency_source_mappings, run
             records.append(_record_failure(coord, original_path, reason_code, f"依赖源码版本无法与当前运行时 JAR 对齐：{exc}"))
             continue
         after = repository_fingerprint(actual_repo)
+        if not after:
+            records.append(_record_failure(
+                coord,
+                original_path,
+                "dependency_source_workspace_recheck_failed",
+                "创建隔离快照后无法重新读取依赖源码工作区状态",
+            ))
+            continue
         if not _fingerprints_equal(before, after):
             records.append(_record_failure(coord, original_path, "dependency_source_workspace_changed", "创建隔离快照期间用户依赖源码工作区发生变化"))
             continue

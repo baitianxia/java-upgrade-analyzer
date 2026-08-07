@@ -2891,6 +2891,22 @@ def run_step5_smoke_cases(workspace, dep_env, core_runtime):
     runtime_full_expand_report = core_runtime.runtime_full_expand_report
     dependency_multi_report = core_runtime.dependency_multi_report
     expected_internal_mapping = core_runtime.expected_internal_mapping
+    base_commit, _ = run_external_cmd(
+        git_cmd() + ["rev-parse", "base^{commit}"],
+        project_dir,
+    )
+    current_commit, _ = run_external_cmd(
+        git_cmd() + ["rev-parse", "current^{commit}"],
+        project_dir,
+    )
+    pinned_step1_seed = {
+        # These isolated Step4 fixtures intentionally start after Step1.  Seed
+        # the immutable Step1 outputs so a later restart_from_step=step2 tests
+        # the current remote-snapshot contract instead of reviving branch
+        # fallback behavior.
+        "base_resolved_commit": base_commit.strip(),
+        "current_resolved_commit": current_commit.strip(),
+    }
 
     write_text(
         source_dir / "BridgeApp.java",
@@ -3023,12 +3039,18 @@ return ExtraApi.callLegacy();
         interactive_step4_report / "evidence" / "context" / "context.json",
         json.dumps(runtime_expand_context, ensure_ascii=False, indent=2) + "\n",
     )
+    interactive_step4_seed = interactive_step4_report / "main_state_seed.json"
+    write_text(
+        interactive_step4_seed,
+        json.dumps(pinned_step1_seed, ensure_ascii=False, indent=2) + "\n",
+    )
     stdout, stderr, rc = run_script_with_rc(
         "run_step.py",
         [
             "--step", "step4",
             "--project-dir", str(project_dir),
             "--report-dir", str(interactive_step4_report),
+            "--seed-json", str(interactive_step4_seed),
             "--base-branch", "base",
             "--current-branch", "current",
             "--dependency-repo-mappings", f"com.example:demo-lib={dep_repo}",
@@ -3105,12 +3127,20 @@ return ExtraApi.callLegacy();
         interactive_step4_restart_report / "evidence" / "context" / "context.json",
         json.dumps(runtime_expand_context, ensure_ascii=False, indent=2) + "\n",
     )
+    interactive_step4_restart_seed = (
+        interactive_step4_restart_report / "main_state_seed.json"
+    )
+    write_text(
+        interactive_step4_restart_seed,
+        json.dumps(pinned_step1_seed, ensure_ascii=False, indent=2) + "\n",
+    )
     stdout, stderr, rc = run_script_with_rc(
         "run_step.py",
         [
             "--step", "step4",
             "--project-dir", str(project_dir),
             "--report-dir", str(interactive_step4_restart_report),
+            "--seed-json", str(interactive_step4_restart_seed),
             "--base-branch", "base",
             "--current-branch", "current",
             "--dependency-repo-mappings", f"com.example:demo-lib={dep_repo}",
@@ -4919,10 +4949,16 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
     )
     (fake_current_jdk / "bin" / "java").chmod(0o755)
     worktree_calls = []
+    pinned_worktree_commit = "a" * 40
 
     def fake_worktree_run_cmd(cmd, cwd=None, timeout=300, input_text=None, env=None, **_kwargs):
         joined = " ".join(str(part) for part in cmd)
         worktree_calls.append({"cmd": list(cmd), "cwd": cwd, "env": dict(env or {})})
+        if "rev-parse" in cmd and "--verify" in cmd:
+            target = str(cmd[-1])
+            if target not in {"feature/test^{commit}", "HEAD^{commit}"}:
+                raise AssertionError(f"未预期的 revision 校验: {joined}")
+            return pinned_worktree_commit, "", 0
         if "ls-tree" in cmd:
             return "pom.xml\0", "", 0
         if "worktree" in cmd and "add" in cmd:
@@ -4953,6 +4989,21 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
         )
     assert_true(runtime_meta.get("branch") == "feature/test", "worktree 模式未保留 branch 元信息")
     assert_true(any("worktree" in " ".join(item["cmd"]) and "add" in item["cmd"] for item in worktree_calls), "Step1 分支分析未改用 git worktree add")
+    worktree_add_calls = [
+        item for item in worktree_calls
+        if "worktree" in item["cmd"] and "add" in item["cmd"]
+    ]
+    assert_true(
+        worktree_add_calls and str(worktree_add_calls[0]["cmd"][-1]) == pinned_worktree_commit,
+        "Step1 分支分析必须先固定 commit，再用不可变 SHA 创建 detached worktree",
+    )
+    assert_true(
+        any(
+            "rev-parse" in item["cmd"] and str(item["cmd"][-1]) == "HEAD^{commit}"
+            for item in worktree_calls
+        ),
+        "Step1 分支分析必须校验 detached worktree 的 HEAD 与固定 commit 一致",
+    )
     assert_true(not any("stash" in " ".join(item["cmd"]) for item in worktree_calls), "Step1 分支分析不应再执行 git stash")
     dependency_list_calls = [item for item in worktree_calls if "dependency:list" in " ".join(item["cmd"])]
     assert_true(bool(runtime_deps), "worktree 模式未返回 runtime 依赖")
@@ -5014,6 +5065,11 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
     def fake_host_jdk_run_cmd(cmd, cwd=None, timeout=300, input_text=None, env=None, **_kwargs):
         joined = " ".join(str(part) for part in cmd)
         host_jdk_calls.append({"cmd": list(cmd), "cwd": cwd, "env": dict(env or {})})
+        if "rev-parse" in cmd and "--verify" in cmd:
+            target = str(cmd[-1])
+            if target not in {"feature/base^{commit}", "HEAD^{commit}"}:
+                raise AssertionError(f"未预期的 revision 校验: {joined}")
+            return pinned_worktree_commit, "", 0
         if "ls-tree" in cmd:
             return "pom.xml\0", "", 0
         if "worktree" in cmd and "add" in cmd:
@@ -5435,6 +5491,7 @@ def run_orchestrator_smoke_cases(workspace, dep_env):
                 "base_artifact_path": "artifact-inputs/base-app-no-pom.jar",
                 "current_artifact_path": "artifact-inputs/current-app.jar",
                 "base_source_project_dir": ".",
+                "base_branch": "base",
                 "current_branch": "current",
             },
             ensure_ascii=False,

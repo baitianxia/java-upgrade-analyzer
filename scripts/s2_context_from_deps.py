@@ -19,6 +19,7 @@ Windows 兼容：通过 compat.py 处理编码和 subprocess 调用。
 
 import argparse, csv, json, os, re, sys, zipfile
 from collections import defaultdict
+from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime
 import xml.etree.ElementTree as ET
@@ -30,6 +31,8 @@ from path_runtime import create_detached_worktree, remove_detached_worktree
 
 
 MAIN_STATE_FILE_NAME = "main_state.json"
+PINNED_SOURCE_SNAPSHOT_SCHEMA = "java-upgrade-analyzer.pinned-source-snapshot.v1"
+_FULL_GIT_COMMIT_RE = re.compile(r'(?:[0-9a-f]{40}|[0-9a-f]{64})')
 
 
 def load_orchestrated_step2_input(output_path=""):
@@ -50,6 +53,132 @@ def load_orchestrated_step2_input(output_path=""):
     except Exception:
         return {}
     return dict((((main_state or {}).get("step2") or {}).get("input")) or {})
+
+
+def _normalize_pinned_relative_path(value, *, allow_root=True):
+    text = str(value or '').strip().replace('\\', '/')
+    if text in ('', '.', './'):
+        return '.' if allow_root else ''
+    if text.startswith('/') or re.match(r'^[A-Za-z]:/', text):
+        return ''
+    parts = [part for part in text.split('/') if part not in ('', '.')]
+    if not parts or any(part == '..' for part in parts):
+        return ''
+    return '/'.join(parts)
+
+
+def _valid_pinned_source_snapshot(orchestrated_input, current_revision):
+    snapshot = (orchestrated_input or {}).get('pinned_source_snapshot')
+    if not isinstance(snapshot, dict):
+        return {}
+    commit = str(snapshot.get('commit') or '').strip().lower()
+    if (
+        snapshot.get('schema') != PINNED_SOURCE_SNAPSHOT_SCHEMA
+        or not _FULL_GIT_COMMIT_RE.fullmatch(commit)
+        or commit != str(current_revision or '').strip().lower()
+        or not _normalize_pinned_relative_path(
+            snapshot.get('project_path'), allow_root=True,
+        )
+    ):
+        return {}
+    roots = []
+    for value in snapshot.get('source_roots') or []:
+        normalized = _normalize_pinned_relative_path(value, allow_root=True)
+        if not normalized:
+            return {}
+        roots.append(normalized)
+    normalized = dict(snapshot)
+    normalized['commit'] = commit
+    normalized['project_path'] = _normalize_pinned_relative_path(
+        snapshot.get('project_path'), allow_root=True,
+    )
+    normalized['source_roots'] = list(dict.fromkeys(roots))
+    return normalized
+
+
+def _pinned_source_repository(orchestrated_input, work_dir):
+    binding = (orchestrated_input or {}).get('current_ref_binding')
+    if isinstance(binding, dict):
+        value = str(binding.get('repo_dir') or '').strip()
+        if value:
+            return Path(value).expanduser().resolve()
+    value = str(
+        (orchestrated_input or {}).get('current_source_project_dir') or ''
+    ).strip()
+    return (
+        Path(value).expanduser().resolve()
+        if value
+        else Path(work_dir).expanduser().resolve()
+    )
+
+
+@contextmanager
+def materialize_pinned_step2_source_workspace(
+    orchestrated_input,
+    current_revision,
+    work_dir,
+):
+    """Materialize Step1's logical roots without persisting temp paths."""
+    snapshot = _valid_pinned_source_snapshot(
+        orchestrated_input, current_revision,
+    )
+    if not snapshot:
+        yield None
+        return
+    repo_dir = _pinned_source_repository(orchestrated_input, work_dir)
+    git_root = Path(get_git_root(repo_dir, strict_git=True)).resolve()
+    worktree = None
+    try:
+        worktree = create_detached_worktree(
+            snapshot['commit'],
+            git_root,
+            label='s2-src',
+            runner=run_cmd,
+            git_command=git_cmd(),
+        )
+        project_root = (
+            worktree
+            if snapshot['project_path'] == '.'
+            else worktree / snapshot['project_path']
+        )
+        if not project_root.is_dir():
+            raise RuntimeError(
+                'STEP2_PINNED_PROJECT_MISSING_AT_COMMIT:'
+                f"{snapshot['project_path']}:{snapshot['commit']}"
+            )
+        mapped_source_dirs = []
+        stable_source_dirs = []
+        stable_project_root = repo_dir
+        for relative in snapshot.get('source_roots') or []:
+            mapped = project_root if relative == '.' else project_root / relative
+            if not mapped.is_dir():
+                raise RuntimeError(
+                    'STEP2_PINNED_SOURCE_DIR_MISSING_AT_COMMIT:'
+                    f"{relative}:{snapshot['commit']}"
+                )
+            mapped_source_dirs.append(str(mapped.resolve()))
+            stable = (
+                stable_project_root
+                if relative == '.'
+                else stable_project_root / relative
+            )
+            stable_source_dirs.append(str(stable.resolve()))
+        yield {
+            'snapshot': snapshot,
+            'git_root': git_root,
+            'worktree': worktree,
+            'project_root': project_root.resolve(),
+            'mapped_source_dirs': mapped_source_dirs,
+            'stable_source_dirs': stable_source_dirs,
+        }
+    finally:
+        if worktree is not None:
+            remove_detached_worktree(
+                worktree,
+                git_root,
+                runner=run_cmd,
+                git_command=git_cmd(),
+            )
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -421,39 +550,94 @@ def compute_version_flags(sb_base, sb_cur, jdk_base, jdk_cur):
 # 从 git 补充读取（只读，不切换分支）
 # ══════════════════════════════════════════════════════════════════
 
-def git_show_file(branch, file_path, work_dir='.'):
-    """git show branch:file，返回文件内容字符串，失败返回空字符串"""
-    stdout, _, rc = run_cmd(
+_GIT_PATH_ABSENT_PATTERNS = (
+    "does not exist in",
+    "exists on disk, but not in",
+    "path not in the working tree",
+)
+
+
+def _git_path_is_absent(stderr):
+    text = str(stderr or '').strip().lower()
+    return any(pattern in text for pattern in _GIT_PATH_ABSENT_PATTERNS)
+
+
+def git_show_file(branch, file_path, work_dir='.', *, strict_git=False):
+    """Read one path from a revision; distinguish absence from Git failure."""
+    stdout, stderr, rc = run_cmd(
         git_cmd() + ['show', f'{branch}:{file_path}'],
         cwd=work_dir, timeout=30
     )
-    return stdout if rc == 0 else ''
+    if rc == 0:
+        return stdout
+    if strict_git and not _git_path_is_absent(stderr):
+        raise RuntimeError(
+            "STEP2_GIT_SHOW_FAILED:"
+            f"{branch}:{file_path}:"
+            f"{str(stderr or stdout or f'git exited with {rc}').strip()}"
+        )
+    return ''
 
 
-def is_git_repo(work_dir='.'):
-    """检测当前目录是否为 Git 仓库"""
-    _, _, rc = run_cmd(
+def require_pinned_git_commit(revision, work_dir='.', side=''):
+    """Validate the immutable Step1 object before any Step2 Git query."""
+    revision = str(revision or '').strip().lower()
+    if not re.fullmatch(r'(?:[0-9a-f]{40}|[0-9a-f]{64})', revision):
+        raise RuntimeError(
+            f"STEP2_{str(side or 'SOURCE').upper()}_COMMIT_NOT_PINNED:{revision}"
+        )
+    stdout, stderr, rc = run_cmd(
+        git_cmd() + ['rev-parse', '--verify', f'{revision}^{{commit}}'],
+        cwd=work_dir,
+        timeout=30,
+    )
+    resolved = str(stdout or '').strip().lower()
+    if rc != 0 or resolved != revision:
+        raise RuntimeError(
+            f"STEP2_{str(side or 'SOURCE').upper()}_COMMIT_UNAVAILABLE:"
+            f"{revision}:{str(stderr or stdout or f'git exited with {rc}').strip()}"
+        )
+    return revision
+
+
+def is_git_repo(work_dir='.', *, strict_git=False):
+    """检测当前目录是否为 Git worktree；严格模式保留失败证据。"""
+    stdout, stderr, rc = run_cmd(
         git_cmd() + ['rev-parse', '--is-inside-work-tree'],
         cwd=work_dir, timeout=10
     )
-    return rc == 0
+    inside = rc == 0 and str(stdout or '').strip().lower() == 'true'
+    if strict_git and not inside:
+        raise RuntimeError(
+            "STEP2_GIT_REPOSITORY_PROBE_FAILED:"
+            f"{work_dir}:"
+            f"{str(stderr or stdout or f'git exited with {rc}').strip()}"
+        )
+    return inside
 
 
-def get_git_root(work_dir='.'):
-    """返回 Git 仓库根目录，失败返回空字符串"""
-    stdout, _, rc = run_cmd(
+def get_git_root(work_dir='.', *, strict_git=False):
+    """返回 Git 仓库根目录；严格模式不吞掉 Git/路径失败。"""
+    stdout, stderr, rc = run_cmd(
         git_cmd() + ['rev-parse', '--show-toplevel'],
         cwd=work_dir, timeout=10
     )
-    return stdout.strip() if rc == 0 else ''
+    root = str(stdout or '').strip() if rc == 0 else ''
+    if strict_git and not root:
+        raise RuntimeError(
+            "STEP2_GIT_ROOT_DISCOVERY_FAILED:"
+            f"{work_dir}:"
+            f"{str(stderr or stdout or f'git exited with {rc}').strip()}"
+        )
+    return root
 
 
-def get_repo_relative_prefix(work_dir='.'):
+def get_repo_relative_prefix(work_dir='.', *, strict_git=False):
     """
     返回 work_dir 相对于 Git 仓库根目录的相对路径。
     例：/repo/module-a -> module-a
     """
-    git_root = get_git_root(work_dir)
+    git_root = get_git_root(work_dir, strict_git=strict_git)
     if not git_root:
         return ''
     try:
@@ -461,14 +645,18 @@ def get_repo_relative_prefix(work_dir='.'):
             os.path.realpath(work_dir),
             os.path.realpath(git_root)
         )
-    except ValueError:
+    except ValueError as exc:
+        if strict_git:
+            raise RuntimeError(
+                f"STEP2_GIT_WORKDIR_OUTSIDE_ROOT:{work_dir}:{git_root}:{exc}"
+            ) from exc
         return ''
     return '' if rel == '.' else rel.replace('\\', '/')
 
 
-def build_manifest_candidates(work_dir='.', *filenames):
+def build_manifest_candidates(work_dir='.', *filenames, strict_git=False):
     """按 work_dir 优先级构造构建文件候选路径"""
-    prefix = get_repo_relative_prefix(work_dir)
+    prefix = get_repo_relative_prefix(work_dir, strict_git=strict_git)
     candidates = []
     for name in filenames:
         if prefix:
@@ -929,12 +1117,18 @@ def parse_maven_help_evaluate_jdk(output):
     return normalize_jdk_version(candidates[-1])
 
 
-def resolve_maven_jdk_from_effective_model(branch, work_dir, pom_relpath='pom.xml'):
+def resolve_maven_jdk_from_effective_model(
+    branch,
+    work_dir,
+    pom_relpath='pom.xml',
+    *,
+    strict_git=False,
+):
     """
     当 pom.xml 没有显式声明 JDK 版本时，回退到临时 worktree + mvn help:evaluate，
     读取父 POM / pluginManagement 展开后的 maven.compiler.release/source/target。
     """
-    git_root = get_git_root(work_dir) or work_dir
+    git_root = get_git_root(work_dir, strict_git=strict_git) or work_dir
     pom_relpath = (pom_relpath or 'pom.xml').strip() or 'pom.xml'
     try:
         tmp = create_detached_worktree(
@@ -945,6 +1139,10 @@ def resolve_maven_jdk_from_effective_model(branch, work_dir, pom_relpath='pom.xm
             git_command=git_cmd(),
         )
     except RuntimeError as exc:
+        if strict_git:
+            raise RuntimeError(
+                f"STEP2_GIT_WORKTREE_CREATE_FAILED:{branch}:{exc}"
+            ) from exc
         print(f"  ⚠️ Step2 无法准备 JDK 探测工作区：{exc}", file=sys.stderr)
         return None
 
@@ -981,22 +1179,35 @@ def resolve_maven_jdk_from_effective_model(branch, work_dir, pom_relpath='pom.xm
     return None
 
 
-def detect_jdk_versions_from_manifests(base_branch, cur_branch, work_dir, build_tool):
+def detect_jdk_versions_from_manifests(
+    base_branch,
+    cur_branch,
+    work_dir,
+    build_tool,
+    *,
+    strict_git=False,
+):
     """只读取两个 revision 的构建清单，不启动 Maven/Gradle。"""
     jdk_base, jdk_cur = None, None
     matched_candidate = 'pom.xml'
-    if not is_git_repo(work_dir):
+    if not is_git_repo(work_dir, strict_git=strict_git):
         return jdk_base, jdk_cur, matched_candidate
 
     if build_tool == 'maven':
-        pom_candidates = build_manifest_candidates(work_dir, 'pom.xml')
+        pom_candidates = build_manifest_candidates(
+            work_dir, 'pom.xml', strict_git=strict_git,
+        )
         base_pom = ''
         cur_pom = ''
         for candidate in pom_candidates:
             if not base_pom:
-                base_pom = git_show_file(base_branch, candidate, work_dir)
+                base_pom = git_show_file(
+                    base_branch, candidate, work_dir, strict_git=strict_git,
+                )
             if not cur_pom:
-                cur_pom = git_show_file(cur_branch, candidate, work_dir)
+                cur_pom = git_show_file(
+                    cur_branch, candidate, work_dir, strict_git=strict_git,
+                )
             if base_pom or cur_pom:
                 matched_candidate = candidate
                 break
@@ -1004,42 +1215,73 @@ def detect_jdk_versions_from_manifests(base_branch, cur_branch, work_dir, build_
         jdk_cur  = detect_jdk_from_pom(cur_pom)
     else:
         # Gradle
-        gradle_candidates = build_manifest_candidates(work_dir, 'build.gradle', 'build.gradle.kts')
+        gradle_candidates = build_manifest_candidates(
+            work_dir,
+            'build.gradle',
+            'build.gradle.kts',
+            strict_git=strict_git,
+        )
         for gradle_file in gradle_candidates:
             if not jdk_base:
-                content = git_show_file(base_branch, gradle_file, work_dir)
+                content = git_show_file(
+                    base_branch, gradle_file, work_dir, strict_git=strict_git,
+                )
                 jdk_base = detect_jdk_from_gradle(content)
             if not jdk_cur:
-                content = git_show_file(cur_branch, gradle_file, work_dir)
+                content = git_show_file(
+                    cur_branch, gradle_file, work_dir, strict_git=strict_git,
+                )
                 jdk_cur = detect_jdk_from_gradle(content)
 
     return jdk_base, jdk_cur, matched_candidate
 
 
-def detect_jdk_versions(base_branch, cur_branch, work_dir, build_tool):
+def detect_jdk_versions(
+    base_branch,
+    cur_branch,
+    work_dir,
+    build_tool,
+    *,
+    strict_git=False,
+):
     """从两个 revision 推断 JDK；Maven 静态声明不足时再读取有效模型。"""
     # Without git-backed base/current revisions, using the same local manifest
     # for both sides would create a false "base=current" context.
     jdk_base, jdk_cur, matched_candidate = detect_jdk_versions_from_manifests(
-        base_branch, cur_branch, work_dir, build_tool
+        base_branch,
+        cur_branch,
+        work_dir,
+        build_tool,
+        strict_git=strict_git,
     )
-    if build_tool == 'maven' and is_git_repo(work_dir):
+    if build_tool == 'maven' and is_git_repo(
+        work_dir, strict_git=strict_git,
+    ):
         if not jdk_base:
             jdk_base = resolve_maven_jdk_from_effective_model(
-                base_branch, work_dir, matched_candidate
+                base_branch,
+                work_dir,
+                matched_candidate,
+                strict_git=strict_git,
             )
         if not jdk_cur:
             jdk_cur = resolve_maven_jdk_from_effective_model(
-                cur_branch, work_dir, matched_candidate
+                cur_branch,
+                work_dir,
+                matched_candidate,
+                strict_git=strict_git,
             )
     return jdk_base, jdk_cur
 
 
-def detect_build_tool(cur_branch, work_dir):
+def detect_build_tool(cur_branch, work_dir, *, strict_git=False):
     """通过 git 检测构建工具（只读）"""
     # 固定 commit 存在时不能让当前 checkout 覆盖它；分支模式仍优先尊重
     # work_dir 当前目录，以兼容 Git 仓库中的子模块目录。
-    fixed_commit = bool(re.fullmatch(r"[0-9a-fA-F]{40}", str(cur_branch or "").strip()))
+    fixed_commit = bool(re.fullmatch(
+        r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})",
+        str(cur_branch or "").strip(),
+    ))
     if not fixed_commit:
         base = Path(work_dir)
         if (base / 'pom.xml').exists():
@@ -1047,38 +1289,70 @@ def detect_build_tool(cur_branch, work_dir):
         if (base / 'build.gradle').exists() or (base / 'build.gradle.kts').exists():
             return 'gradle'
 
-    if is_git_repo(work_dir):
-        for candidate in build_manifest_candidates(work_dir, 'pom.xml'):
-            stdout, _, rc = run_cmd(
+    if is_git_repo(work_dir, strict_git=strict_git):
+        for candidate in build_manifest_candidates(
+            work_dir, 'pom.xml', strict_git=strict_git,
+        ):
+            stdout, show_stderr, rc = run_cmd(
                 git_cmd() + ['show', f'{cur_branch}:{candidate}'],
                 cwd=work_dir, timeout=10
             )
             if rc == 0:
                 return 'maven'
+            if strict_git and not _git_path_is_absent(show_stderr):
+                raise RuntimeError(
+                    "STEP2_GIT_SHOW_FAILED:"
+                    f"{cur_branch}:{candidate}:"
+                    f"{str(show_stderr or stdout or f'git exited with {rc}').strip()}"
+                )
 
-        stdout, _, rc = run_cmd(
+        stdout, tree_stderr, rc = run_cmd(
             git_cmd() + ['ls-tree', '-r', '--name-only', cur_branch],
             cwd=work_dir, timeout=10
         )
         if rc == 0:
             files = stdout.splitlines()
-            candidates = build_manifest_candidates(work_dir, 'build.gradle', 'build.gradle.kts')
+            candidates = build_manifest_candidates(
+                work_dir,
+                'build.gradle',
+                'build.gradle.kts',
+                strict_git=strict_git,
+            )
             if any(f in candidates for f in files):
                 return 'gradle'
+        elif strict_git:
+            raise RuntimeError(
+                "STEP2_GIT_LS_TREE_FAILED:"
+                f"{cur_branch}:{str(tree_stderr or stdout or f'git exited with {rc}').strip()}"
+            )
 
     return 'unknown'
 
 
-def detect_jvm_param_changes(base_branch, cur_branch, work_dir):
+def detect_jvm_param_changes(
+    base_branch,
+    cur_branch,
+    work_dir,
+    *,
+    strict_git=False,
+):
     """从 git diff 提取 JVM 启动参数变更（只读）"""
-    if not is_git_repo(work_dir):
+    if not is_git_repo(work_dir, strict_git=strict_git):
         return []
-    stdout, _, rc = run_cmd(
+    stdout, stderr, rc = run_cmd(
         git_cmd() + ['diff', f'{base_branch}..{cur_branch}',
                      '--', '*.sh', 'Dockerfile*', 'docker-compose*.yml', '.env'],
         cwd=work_dir, timeout=30
     )
-    if rc != 0 or not stdout:
+    if rc != 0:
+        if strict_git:
+            raise RuntimeError(
+                "STEP2_GIT_DIFF_FAILED:"
+                f"{base_branch}..{cur_branch}:"
+                f"{str(stderr or stdout or f'git exited with {rc}').strip()}"
+            )
+        return []
+    if not stdout:
         return []
 
     # 提取 -XX: 参数
@@ -1131,6 +1405,19 @@ def main():
         ap.error('the following arguments are required: --base-branch --current-branch')
     base_revision = str(args.base_revision or args.base_branch).strip()
     current_revision = str(args.current_revision or args.current_branch).strip()
+    strict_git_snapshot = bool(orchestrated_input)
+    git_work_dir = (
+        str(_pinned_source_repository(orchestrated_input, args.work_dir))
+        if strict_git_snapshot
+        else args.work_dir
+    )
+    if strict_git_snapshot:
+        base_revision = require_pinned_git_commit(
+            base_revision, git_work_dir, side='base',
+        )
+        current_revision = require_pinned_git_commit(
+            current_revision, git_work_dir, side='current',
+        )
 
     print(f"\nStep 2：推断项目上下文", file=sys.stderr)
     print(f"  基准分支：{args.base_branch}", file=sys.stderr)
@@ -1139,22 +1426,75 @@ def main():
     # ── 1. 读取依赖变更 ─────────────────────────────────────────
     deps = load_dep_changes(args.dep_changes)
 
-    # ── 2. 构建工具识别 ─────────────────────────────────────────
-    build_tool = detect_build_tool(current_revision, args.work_dir)
+    # ── 2. 构建工具与业务源码范围 ────────────────────────────────
+    # 新编排状态携带 Step1 从 remote current SHA 生成的逻辑快照。
+    # 临时 worktree 仅用于验证/发现；context 中继续保存稳定的仓库语义
+    # 路径，绝不泄漏生命周期已经结束的临时绝对路径。
+    pinned_source_snapshot = {}
+    with materialize_pinned_step2_source_workspace(
+        orchestrated_input,
+        current_revision,
+        git_work_dir,
+    ) as pinned_workspace:
+        if pinned_workspace is not None:
+            pinned_source_snapshot = dict(pinned_workspace['snapshot'])
+            build_tool = detect_build_tool(
+                current_revision,
+                pinned_workspace['project_root'],
+                strict_git=True,
+            )
+            declared_tool = str(
+                pinned_source_snapshot.get('build_tool') or ''
+            ).strip().lower()
+            if declared_tool and build_tool != declared_tool:
+                raise RuntimeError(
+                    'STEP2_PINNED_BUILD_TOOL_MISMATCH:'
+                    f"declared={declared_tool}:observed={build_tool}:"
+                    f"commit={current_revision}"
+                )
+            source_dirs = list(pinned_workspace['stable_source_dirs'])
+            if not source_dirs:
+                detected_in_snapshot = auto_detect_source_dirs(
+                    pinned_workspace['project_root'], build_tool,
+                )
+                for detected in detected_in_snapshot:
+                    relative = Path(detected).resolve().relative_to(
+                        pinned_workspace['project_root']
+                    )
+                    source_dirs.append(str(
+                        (_pinned_source_repository(
+                            orchestrated_input, git_work_dir,
+                        ) / relative).resolve()
+                    ))
+            print(
+                "  业务源码目录（current 固定 commit）："
+                f"{source_dirs}",
+                file=sys.stderr,
+            )
+        else:
+            build_tool = (
+                detect_build_tool(
+                    current_revision,
+                    git_work_dir,
+                    strict_git=True,
+                )
+                if strict_git_snapshot
+                else detect_build_tool(current_revision, git_work_dir)
+            )
+            source_dirs = [
+                str(item).strip()
+                for item in (args.source_dirs or [])
+                if str(item).strip()
+            ]
+            if source_dirs:
+                print(f"  业务源码目录（显式指定）：{source_dirs}", file=sys.stderr)
+            else:
+                source_dirs = auto_detect_source_dirs(git_work_dir, build_tool)
+            if source_dirs and not args.source_dirs:
+                print(f"  业务源码目录：{source_dirs}", file=sys.stderr)
+        if not source_dirs:
+            print(f"  业务源码目录：（未检测到，Step5 需手动指定）", file=sys.stderr)
     print(f"  构建工具：{build_tool}", file=sys.stderr)
-
-    # ── 2.5. 业务源码目录自动检测 ────────────────────────────────
-    # 自动检测常见的业务源码目录，供 Step5 跨依赖检测使用
-    source_dirs = [str(item).strip() for item in (args.source_dirs or []) if str(item).strip()]
-    if source_dirs:
-        print(f"  业务源码目录（显式指定）：{source_dirs}", file=sys.stderr)
-    else:
-        source_dirs = auto_detect_source_dirs(args.work_dir, build_tool)
-    if source_dirs:
-        if not args.source_dirs:
-            print(f"  业务源码目录：{source_dirs}", file=sys.stderr)
-    else:
-        print(f"  业务源码目录：（未检测到，Step5 需手动指定）", file=sys.stderr)
 
     # ── 3. Spring Boot 版本（从依赖树，最可靠）─────────────────
     sb_base, sb_cur, sb_source = detect_spring_boot_version(deps)
@@ -1186,12 +1526,16 @@ def main():
         # 或文件锁反过来阻断流程。
         build_jdk_base, build_jdk_cur, _ = detect_jdk_versions_from_manifests(
             base_revision, current_revision,
-            args.work_dir, build_tool
+            git_work_dir, build_tool,
+            strict_git=strict_git_snapshot,
         )
     else:
         build_jdk_base, build_jdk_cur = detect_jdk_versions(
-            base_revision, current_revision,
-            args.work_dir, build_tool
+            base_revision,
+            current_revision,
+            git_work_dir,
+            build_tool,
+            strict_git=strict_git_snapshot,
         )
     selected_jdk = select_jdk_evidence(
         {'base': build_jdk_base, 'current': build_jdk_cur},
@@ -1240,8 +1584,17 @@ def main():
         print(f"  升级依赖：{len(changed_dependencies)} 个", file=sys.stderr)
 
     # ── 9. JVM 参数变更 ──────────────────────────────────────────
-    jvm_changes = detect_jvm_param_changes(
-        base_revision, current_revision, args.work_dir
+    jvm_changes = (
+        detect_jvm_param_changes(
+            base_revision,
+            current_revision,
+            git_work_dir,
+            strict_git=True,
+        )
+        if strict_git_snapshot
+        else detect_jvm_param_changes(
+            base_revision, current_revision, git_work_dir
+        )
     )
 
     # ── 10. 统计变更依赖 ─────────────────────────────────────────
@@ -1304,6 +1657,7 @@ def main():
 
         # 业务源码目录（供 Step5 跨依赖检测使用）
         'source_dirs': source_dirs,
+        'pinned_source_snapshot': pinned_source_snapshot,
     }
 
     # ── 写出 ─────────────────────────────────────────────────────

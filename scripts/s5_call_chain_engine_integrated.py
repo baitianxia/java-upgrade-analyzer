@@ -119,6 +119,7 @@ from artifact_alignment import build_artifact_alignment
 
 STEP_INTERACTION_PREFIX = "JUA_STEP_INTERACTION_JSON:"
 MAIN_STATE_FILE_NAME = "main_state.json"
+PINNED_SOURCE_SNAPSHOT_SCHEMA = "java-upgrade-analyzer.pinned-source-snapshot.v1"
 EVIDENCE_FAILURE_OCCURRENCE_FIELDS = (
     'caller_symbol', 'caller_qualified_key', 'artifact', 'artifact_entry',
     'class_name', 'line', 'instruction_offset', 'detail',
@@ -295,7 +296,70 @@ def _step5_source_git_root(source_dir):
     return Path(stdout).resolve() if rc == 0 and stdout else None
 
 
-def _step5_maven_settings_from_args(command_text, project_root):
+def _normalize_step5_pinned_relative_path(value, *, allow_root=True):
+    text = str(value or "").strip().replace("\\", "/")
+    if text in ("", ".", "./"):
+        return "." if allow_root else ""
+    if text.startswith("/") or re.match(r"^[A-Za-z]:/", text):
+        return ""
+    parts = [part for part in text.split("/") if part not in ("", ".")]
+    if not parts or any(part == ".." for part in parts):
+        return ""
+    return "/".join(parts)
+
+
+def _step5_pinned_source_layout(report_dir, expected_commit):
+    orchestrated = load_orchestrated_step5_input(report_dir)
+    snapshot = orchestrated.get("pinned_source_snapshot")
+    if not isinstance(snapshot, dict):
+        return {}
+    commit = str(snapshot.get("commit") or "").strip().lower()
+    project_path = _normalize_step5_pinned_relative_path(
+        snapshot.get("project_path"), allow_root=True,
+    )
+    source_roots = [
+        _normalize_step5_pinned_relative_path(item, allow_root=True)
+        for item in snapshot.get("source_roots") or []
+    ]
+    if (
+        snapshot.get("schema") != PINNED_SOURCE_SNAPSHOT_SCHEMA
+        or commit != str(expected_commit or "").strip().lower()
+        or not project_path
+        or any(not item for item in source_roots)
+    ):
+        return {}
+    binding = orchestrated.get("current_ref_binding")
+    repo_dir = (
+        str((binding or {}).get("repo_dir") or "").strip()
+        if isinstance(binding, dict)
+        else ""
+    )
+    repo_dir = repo_dir or str(
+        orchestrated.get("current_source_project_dir") or ""
+    ).strip()
+    if not repo_dir:
+        return {}
+    git_root = _step5_source_git_root(repo_dir)
+    if git_root is None:
+        raise RuntimeError(
+            f"STEP5_PINNED_SOURCE_NOT_GIT:{repo_dir}"
+        )
+    return {
+        "git_root": git_root,
+        "project_path": project_path,
+        "source_roots": list(dict.fromkeys(source_roots)),
+    }
+
+
+def _step5_maven_settings_from_args(
+    command_text, project_root, *, source_project_root=None,
+):
+    project_root = Path(project_root).resolve()
+    source_project_root = (
+        Path(source_project_root).resolve()
+        if source_project_root is not None
+        else None
+    )
     try:
         tokens = shlex.split(str(command_text or ""), posix=not IS_WINDOWS)
     except ValueError:
@@ -316,17 +380,31 @@ def _step5_maven_settings_from_args(command_text, project_root):
         ):
             value = value[1:-1]
         path = Path(value).expanduser()
-        if not path.is_absolute():
-            path = Path(project_root) / path
+        if path.is_absolute():
+            resolved = path.resolve()
+            if source_project_root is not None:
+                try:
+                    relative = resolved.relative_to(source_project_root)
+                except ValueError:
+                    relative = None
+                if relative is not None:
+                    resolved = project_root / relative
+            path = resolved
+        else:
+            path = project_root / path
         if path.is_file():
             return path.resolve()
     return None
 
 
-def _step5_maven_settings_context(project_root, provenance):
+def _step5_maven_settings_context(
+    project_root, provenance, *, source_project_root=None,
+):
     project_root = Path(project_root).resolve()
     path = _step5_maven_settings_from_args(
-        (provenance or {}).get("build_command"), project_root,
+        (provenance or {}).get("build_command"),
+        project_root,
+        source_project_root=source_project_root,
     )
     if path is not None:
         return path, True
@@ -336,16 +414,22 @@ def _step5_maven_settings_context(project_root, provenance):
             config_text = maven_config.read_text(encoding="utf-8", errors="replace")
         except OSError:
             config_text = ""
-        path = _step5_maven_settings_from_args(config_text, project_root)
+        path = _step5_maven_settings_from_args(
+            config_text,
+            project_root,
+            source_project_root=source_project_root,
+        )
         if path is not None:
             return path, True
-    # MAVEN_ARGS is inherited by compat.run_cmd; adding a second --settings
-    # would duplicate the option and can make Maven reject the command.
+    # Ambient Maven arguments are moved onto the explicit command below and
+    # MAVEN_ARGS itself is cleared, so a mapped detached setting is passed once.
     path = _step5_maven_settings_from_args(
-        os.environ.get("MAVEN_ARGS"), project_root,
+        os.environ.get("MAVEN_ARGS"),
+        project_root,
+        source_project_root=source_project_root,
     )
     if path is not None:
-        return path, False
+        return path, True
     project_settings = project_root / ".mvn" / "settings.xml"
     if project_settings.is_file():
         return project_settings.resolve(), True
@@ -363,17 +447,51 @@ def _step5_maven_settings_context(project_root, provenance):
     return None, False
 
 
-def _step5_maven_command(project_root, worktree):
-    wrapper_name = "mvnw.cmd" if IS_WINDOWS else "mvnw"
-    project_root = Path(project_root).resolve()
+def _step5_safe_ambient_maven_args(command_text):
+    """Keep ambient options but remove paths that can escape the snapshot."""
+    try:
+        tokens = shlex.split(str(command_text or ""), posix=not IS_WINDOWS)
+    except ValueError as exc:
+        raise RuntimeError("STEP5_MAVEN_ARGS_INVALID") from exc
+    path_options = {
+        "-f", "--file", "-s", "--settings", "-gs", "--global-settings",
+        "-t", "--toolchains",
+    }
+    path_prefixes = (
+        "--file=", "--settings=", "--global-settings=", "--toolchains=",
+    )
+    result = []
+    skip_value = False
+    for token in tokens:
+        if skip_value:
+            skip_value = False
+            continue
+        if token in path_options:
+            skip_value = True
+            continue
+        if token.startswith(path_prefixes):
+            continue
+        # Commons CLI accepts attached short option values such as -fpath.
+        if (
+            (
+                token.startswith("-f")
+                and token not in {"-fae", "-ff", "-fn"}
+            )
+            or any(
+                token.startswith(prefix) and token != prefix
+                for prefix in ("-s", "-gs", "-t")
+            )
+        ):
+            continue
+        result.append(token)
+    return result
+
+
+def _step5_maven_command(worktree):
     worktree = Path(worktree).resolve()
-    # Prefer the wrapper pinned in the detached revision. Preserve an untracked
-    # or locally provisioned wrapper from the original project as the fallback,
-    # and only then use Maven on PATH through compat.mvn_cmd().
-    if (worktree / wrapper_name).is_file():
-        return mvn_cmd(worktree)
-    if (project_root / wrapper_name).is_file():
-        return mvn_cmd(project_root)
+    # The mutable source checkout is never an executable fallback. mvn_cmd()
+    # selects the detached revision's wrapper when present, otherwise Maven on
+    # PATH. This also prevents an untracked checkout wrapper from running code.
     return mvn_cmd(worktree)
 
 
@@ -411,7 +529,9 @@ def _step5_source_generation_timeout(orchestrated_input):
     return timeout
 
 
-def _step5_maven_module_selector(target_module, project_root):
+def _step5_maven_module_selector(
+    target_module, project_root, *, source_project_root=None,
+):
     value = str(target_module or "").strip()
     if value in {"", ".", "./"}:
         return ""
@@ -420,6 +540,15 @@ def _step5_maven_module_selector(target_module, project_root):
         try:
             return candidate.resolve().relative_to(Path(project_root).resolve()).as_posix()
         except ValueError:
+            if source_project_root is not None:
+                try:
+                    source_relative = candidate.resolve().relative_to(
+                        Path(source_project_root).resolve()
+                    )
+                except ValueError:
+                    source_relative = None
+                if source_relative is not None:
+                    return source_relative.as_posix()
             return value
     if any(separator in value for separator in ("/", "\\", ":")):
         return value
@@ -437,10 +566,17 @@ def run_step5_detached_maven_compile(
     """Regenerate one side's Maven sources with its recorded build context."""
     provenance = load_build_provenance_side(report_dir, side)
     orchestrated_input = load_orchestrated_step5_input(report_dir)
-    command = list(_step5_maven_command(project_root, worktree))
+    source_project_root = Path(project_root).resolve()
+    detached_project_root = Path(worktree).resolve()
+    command = list(_step5_maven_command(detached_project_root))
     command.append("--batch-mode")
+    command.extend(_step5_safe_ambient_maven_args(
+        os.environ.get("MAVEN_ARGS"),
+    ))
     settings_path, pass_settings_argument = _step5_maven_settings_context(
-        project_root, provenance,
+        detached_project_root,
+        provenance,
+        source_project_root=source_project_root,
     )
     if settings_path is not None and pass_settings_argument:
         command.extend(["--settings", str(settings_path)])
@@ -460,7 +596,11 @@ def run_step5_detached_maven_compile(
         or (orchestrated_input or {}).get("target_module")
         or (orchestrated_input or {}).get("primary_module")
     )
-    selector = _step5_maven_module_selector(target_module, project_root)
+    selector = _step5_maven_module_selector(
+        target_module,
+        detached_project_root,
+        source_project_root=source_project_root,
+    )
     if selector:
         command.extend(["-pl", selector, "-am"])
     command.extend(["-DskipTests", "compile"])
@@ -468,8 +608,9 @@ def run_step5_detached_maven_compile(
         orchestrated_input, provenance, side,
     )
     env.update({
-        "MAVEN_BASEDIR": str(Path(worktree).resolve()),
-        "MAVEN_PROJECTBASEDIR": str(Path(worktree).resolve()),
+        "MAVEN_BASEDIR": str(detached_project_root),
+        "MAVEN_PROJECTBASEDIR": str(detached_project_root),
+        "MAVEN_ARGS": "",
     })
     timeout = _step5_source_generation_timeout(orchestrated_input)
     emit_progress(
@@ -480,7 +621,7 @@ def run_step5_detached_maven_compile(
     started = time.perf_counter()
     stdout, stderr, rc = runner(
         command,
-        cwd=str(Path(worktree).resolve()),
+        cwd=str(detached_project_root),
         timeout=timeout,
         env=env,
         stream_output=True,
@@ -537,42 +678,59 @@ def materialize_step5_business_source_workspace(
         "git_root": "",
         "temporary_worktree": "",
     }
+    pinned_layout = _step5_pinned_source_layout(report_dir, expected_commit)
 
-    # Direct-artifact inputs can be bound to source in several user-defined ways.
-    # Only checkout_build has a Step1-created commit that we can bind here.
+    # Both checkout builds and provided artifacts can carry the remote commit
+    # pinned by Step1.  The artifact/source relationship remains independently
+    # assessed below; source analysis itself must never follow a moving branch.
     if (
-        source_mode != "checkout_build"
+        source_mode not in {"checkout_build", "provided_artifact"}
         or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", expected_commit)
-        or not original_dirs
+        or not (original_dirs or pinned_layout)
     ):
         yield metadata
         return
 
     source_paths = [Path(item) for item in original_dirs]
-    missing = [str(path) for path in source_paths if not path.is_dir()]
-    if missing:
-        raise RuntimeError(
-            "STEP5_BUSINESS_SOURCE_DIR_MISSING:"
-            + ",".join(missing[:10])
-        )
+    project_path = Path(".")
+    if pinned_layout:
+        git_root = pinned_layout["git_root"]
+        project_path = Path(pinned_layout["project_path"])
+        relative_source_dirs = [
+            (
+                project_path
+                if relative == "."
+                else project_path / relative
+            )
+            for relative in pinned_layout["source_roots"]
+        ]
+        metadata["source_layout"] = "pinned_relative_roots"
+    else:
+        missing = [str(path) for path in source_paths if not path.is_dir()]
+        if missing:
+            raise RuntimeError(
+                "STEP5_BUSINESS_SOURCE_DIR_MISSING:"
+                + ",".join(missing[:10])
+            )
 
-    roots = [_step5_source_git_root(path) for path in source_paths]
-    if any(root is None for root in roots):
-        raise RuntimeError(
-            "STEP5_BUSINESS_SOURCE_NOT_GIT:"
-            + ",".join(
-                str(path)
-                for path, root in zip(source_paths, roots)
-                if root is None
-            )[:1200]
-        )
-    unique_roots = {str(root) for root in roots}
-    if len(unique_roots) != 1:
-        raise RuntimeError(
-            "STEP5_BUSINESS_SOURCE_MULTIPLE_GIT_ROOTS:"
-            + ",".join(sorted(unique_roots))[:1200]
-        )
-    git_root = roots[0]
+        roots = [_step5_source_git_root(path) for path in source_paths]
+        if any(root is None for root in roots):
+            raise RuntimeError(
+                "STEP5_BUSINESS_SOURCE_NOT_GIT:"
+                + ",".join(
+                    str(path)
+                    for path, root in zip(source_paths, roots)
+                    if root is None
+                )[:1200]
+            )
+        unique_roots = {str(root) for root in roots}
+        if len(unique_roots) != 1:
+            raise RuntimeError(
+                "STEP5_BUSINESS_SOURCE_MULTIPLE_GIT_ROOTS:"
+                + ",".join(sorted(unique_roots))[:1200]
+            )
+        git_root = roots[0]
+        relative_source_dirs = [path.relative_to(git_root) for path in source_paths]
     metadata["git_root"] = str(git_root)
 
     resolved_commit, commit_stderr, commit_rc = _step5_git_output(
@@ -588,21 +746,12 @@ def materialize_step5_business_source_workspace(
             f"{expected_commit}:{commit_stderr or resolved_commit or 'not found'}"
         )
 
-    head, _head_stderr, head_rc = _step5_git_output(
-        git_root, "rev-parse", "HEAD",
-    )
-    # Compile-time generators can modify both untracked files (for example
-    # MyBatis DAOs) and tracked files (for example filtered properties).
-    # Git dirty state therefore cannot distinguish build output from user
-    # edits.  Revision identity is the binding used by Step5; when HEAD still
-    # matches the Step1 commit for this side, preserve the complete post-build
-    # workspace instead of replacing it with an incomplete checkout.
-    if head_rc == 0 and head.lower() == expected_commit:
-        metadata["mode"] = "existing_matching_checkout"
-        metadata["worktree_dirty_check"] = "skipped"
-        yield metadata
-        return
-
+    # Never read analysis sources from the user's mutable checkout.  Matching
+    # HEAD only proves the committed parent, not that tracked/untracked files
+    # still represent that commit.  Generated sources are recreated below only
+    # for a checkout that Step1 itself built.  A provided artifact has no
+    # reproducible source-generation contract, even when legacy provenance
+    # happens to contain the default build_tool=maven value.
     worktree = create_detached_worktree(
         expected_commit,
         git_root,
@@ -614,15 +763,46 @@ def materialize_step5_business_source_workspace(
     metadata["temporary_worktree"] = str(worktree)
     mapped_dirs = []
     try:
-        if _step5_detached_build_tool(build_side, worktree) == "maven":
+        source_project_root = (git_root / project_path).resolve()
+        detached_project_root = (worktree / project_path).resolve()
+        try:
+            source_project_root.relative_to(git_root.resolve())
+            detached_project_root.relative_to(worktree.resolve())
+        except ValueError as exc:
+            raise RuntimeError(
+                "STEP5_PINNED_PROJECT_PATH_ESCAPES_WORKTREE:"
+                f"{project_path.as_posix()}"
+            ) from exc
+        if not detached_project_root.is_dir():
+            raise RuntimeError(
+                "STEP5_PINNED_PROJECT_PATH_MISSING:"
+                f"{project_path.as_posix()}:{expected_commit}"
+            )
+        metadata["project_root"] = str(detached_project_root)
+        missing_at_commit = [
+            relative
+            for relative in relative_source_dirs
+            if not (worktree / relative).is_dir()
+        ]
+        # A normal tracked source directory needs no build at all.  Running a
+        # compile merely because provenance says "maven" adds network/toolchain
+        # failure modes to a read-only source analysis.  Compile only when the
+        # configured directory is genuinely generated and absent from the
+        # immutable checkout.
+        if (
+            missing_at_commit
+            and source_mode == "checkout_build"
+            and _step5_detached_build_tool(
+                build_side, detached_project_root,
+            ) == "maven"
+        ):
             metadata["source_generation"] = run_step5_detached_maven_compile(
                 report_dir,
-                git_root,
-                worktree,
+                source_project_root,
+                detached_project_root,
                 side=side,
             )
-        for path in source_paths:
-            relative = path.relative_to(git_root)
+        for relative in relative_source_dirs:
             mapped = worktree / relative
             if not mapped.is_dir():
                 raise RuntimeError(
@@ -3304,10 +3484,14 @@ def assess_source_artifact_alignment(report_dir, business_source_dirs):
     git_root = revision = ''
     dirty = None
     if source_root and os.path.isdir(source_root):
-        stdout, _stderr, rc = run_cmd(['git', '-C', source_root, 'rev-parse', '--show-toplevel'])
+        stdout, _stderr, rc = run_cmd(
+            git_cmd() + ['-C', source_root, 'rev-parse', '--show-toplevel']
+        )
         if rc == 0:
             git_root = stdout.strip()
-            stdout, _stderr, rc = run_cmd(['git', '-C', git_root, 'rev-parse', 'HEAD'])
+            stdout, _stderr, rc = run_cmd(
+                git_cmd() + ['-C', git_root, 'rev-parse', 'HEAD']
+            )
             revision = stdout.strip() if rc == 0 else ''
     expected_revision = str(current.get('revision') or '').strip()
     source_mode = str(current.get('source_mode') or '').strip()

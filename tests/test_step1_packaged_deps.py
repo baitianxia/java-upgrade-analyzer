@@ -45,6 +45,8 @@ class Step1PackagedDepsTest(unittest.TestCase):
 
             def fake_run_cmd(command, cwd=None, timeout=None, **_kwargs):
                 calls.append((list(command), cwd, timeout))
+                if "rev-parse" in command:
+                    return branch, "", 0
                 if "ls-tree" in command:
                     return "src/" + ("nested/" * 20) + "Demo.java\0", "", 0
                 if "add" in command and "worktree" in command:
