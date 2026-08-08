@@ -6878,7 +6878,7 @@ def _api_result_priority(row):
 def _analysis_conclusion_label(row):
     conclusion = str((row or {}).get("conclusion") or "").strip()
     labels = {
-        "已确认影响": "确认影响",
+        "已确认影响": "确认有影响",
         "已确认不受影响": "确认不受影响",
         "可能影响": "未确认影响（存在候选关系）",
         UNCERTAIN_CANDIDATE_CONCLUSION: "未确认影响（存在候选关系）",
@@ -7415,7 +7415,7 @@ def _dependency_basis(api_rows):
     if confirmed_api_count:
         if not confirmed_paths:
             return (
-                f"{confirmed_api_count}/{total} 个变化 API 已形成确认影响结论；"
+                f"{confirmed_api_count}/{total} 个变化 API 已形成确认有影响结论；"
                 "对应调用关系数量未记录。"
             )
         return (
@@ -7467,7 +7467,7 @@ def _dependency_result_rank(row):
         (row or {}).get("analysis_conclusion") or ""
     ).strip()
     if (
-        conclusion == "确认影响"
+        conclusion == "确认有影响"
         or int((row or {}).get("confirmed_api_count") or 0) > 0
     ):
         return 0
@@ -7637,12 +7637,12 @@ def build_human_dependency_analysis(findings, api_model=None):
         ]
         if incomplete:
             conclusion = (
-                "部分结果确认影响；分析未完成"
+                "部分结果确认有影响；分析未完成"
                 if confirmed_api_count
                 else "未完成分析"
             )
         elif confirmed_api_count:
-            conclusion = "确认影响"
+            conclusion = "确认有影响"
         elif api_rows and all(
             row.get("conclusion") == "已确认不受影响"
             for row in api_rows
@@ -7897,7 +7897,7 @@ def build_human_dependency_analysis(findings, api_model=None):
     confirmed_completed_count = sum(
         int(row.get("aggregate_count") or 1)
         for row in completed
-        if row.get("analysis_conclusion") == "确认影响"
+        if row.get("analysis_conclusion") == "确认有影响"
     )
     confirmed_no_impact_completed_count = sum(
         int(row.get("aggregate_count") or 1)
@@ -8162,14 +8162,14 @@ def render_dependency_conclusions(findings, dependency_model=None):
             "这些调用目标在新版本中发生了变化。"
         )
     else:
-        headline = "本轮没有变化依赖形成“确认影响当前系统”的结论。"
+        headline = "本轮没有变化依赖形成“确认对当前系统有影响”的结论。"
     lines = [
         "## 一、依赖层面结论",
         "",
         f"**{headline}**",
         "",
         (
-            "| 变化依赖总数 | 已完成分析 | 未完成分析 | 确认影响 | "
+            "| 变化依赖总数 | 已完成分析 | 未完成分析 | 确认有影响 | "
             "确认不受影响 | 尚未确认影响 |"
         ),
         "|---:|---:|---:|---:|---:|---:|",
@@ -8409,7 +8409,7 @@ def render_api_and_calls(findings, api_model=None):
         "## 二、API 及调用关系",
         "",
         (
-            "| 变化 API 总数 | 已完成分析 | 未完成分析 | 确认影响 | "
+            "| 变化 API 总数 | 已完成分析 | 未完成分析 | 确认有影响 | "
             "确认不受影响 | 尚未确认影响 |"
         ),
         "|---:|---:|---:|---:|---:|---:|",
@@ -8931,7 +8931,7 @@ def write_full_dependency_analysis_artifact(
         range_note,
         "",
         (
-            "| 变化依赖总数 | 已完成分析 | 未完成分析 | 确认影响 | "
+            "| 变化依赖总数 | 已完成分析 | 未完成分析 | 确认有影响 | "
             "确认不受影响 | 尚未确认影响 |"
         ),
         "|---:|---:|---:|---:|---:|---:|",
@@ -9037,7 +9037,7 @@ def write_full_api_analysis_artifact(
         range_note,
         "",
         (
-            "| 变化 API 总数 | 已完成分析 | 未完成分析 | 确认影响 | "
+            "| 变化 API 总数 | 已完成分析 | 未完成分析 | 确认有影响 | "
             "确认不受影响 | 尚未确认影响 |"
         ),
         "|---:|---:|---:|---:|---:|---:|",
@@ -9251,7 +9251,7 @@ def render_user_visible_files(
                     if scope_verified
                     else "现有记录中可识别的变化依赖"
                 )
-                + "的分析状态、确认影响数量、未完成原因，"
+                + "的分析状态、确认有影响数量、未完成原因，"
                 "以及对应 API 明细链接；CSV 使用相同数据和排序"
             ),
             _population_full_range(dependency_model, "变化依赖"),
@@ -9269,7 +9269,7 @@ def render_user_visible_files(
                     else "现有记录中可识别的变化 API"
                 )
                 + "的分析状态；"
-                "确认影响项展示完整调用关系，未完成项记录具体原因；"
+                "确认有影响项展示完整调用关系，未完成项记录具体原因；"
                 "CSV 使用相同数据和排序"
             ),
             (

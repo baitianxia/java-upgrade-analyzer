@@ -8643,7 +8643,7 @@ def _collect_trace_api_with_confidence_weighting(
             else:
                 _apply_source_artifact_miss(direct_usage_result, graph, (
                     '源码中发现了目标调用，但当前打包产物的字节码扫描没有发现对应引用；'
-                    '可能是源码、构建参数或目标模块与本次打包产物不一致，当前不能确认影响'
+                    '可能是源码、构建参数或目标模块与本次打包产物不一致，当前无法确认是否有影响'
                 ))
         if artifact_dependency_hits:
             for hit in artifact_dependency_hits:
@@ -9229,7 +9229,7 @@ def _collect_trace_api_with_confidence_weighting(
             built = build_reachable_result(result, best, graph)
             _apply_source_artifact_miss(built, graph, (
                 '源码中发现了可达调用链，但当前打包产物的字节码扫描没有发现对应引用；'
-                '可能是源码、构建参数或目标模块与本次打包产物不一致，当前不能确认影响'
+                '可能是源码、构建参数或目标模块与本次打包产物不一致，当前无法确认是否有影响'
             ))
             _debug_trace_result('trace_api_result', built)
             return built

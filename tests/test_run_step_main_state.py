@@ -1834,11 +1834,11 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertEqual(summary["api_incomplete_count"], 5)
         self.assertEqual(summary["api_confirmed_count"], 1)
         self.assertIn(
-            "依赖：变化 1，已完成分析 0，未完成分析 1，含确认影响 1。",
+            "依赖：变化 1，已完成分析 0，未完成分析 1，其中确认有影响 1。",
             message,
         )
         self.assertIn(
-            "API：变化 7，已完成分析 2，未完成分析 5，确认影响 1。",
+            "API：变化 7，已完成分析 2，未完成分析 5，确认有影响 1。",
             message,
         )
         self.assertIn(
@@ -1956,11 +1956,11 @@ class RunStepMainStateTest(unittest.TestCase):
 
         self.assertIn("分析范围：部分依赖（1/3）", text)
         self.assertIn(
-            "依赖：变化 3，已完成分析 2，未完成分析 1，含确认影响 1。",
+            "依赖：变化 3，已完成分析 2，未完成分析 1，其中确认有影响 1。",
             text,
         )
         self.assertIn(
-            "API：变化 10，已完成分析 7，未完成分析 3，确认影响 2。",
+            "API：变化 10，已完成分析 7，未完成分析 3，确认有影响 2。",
             text,
         )
         self.assertIn("结论限制：用户选择了部分变化依赖", text)
@@ -2069,11 +2069,11 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertEqual(summary["api_confirmed_count"], 0)
         for text in (terminal, landing):
             self.assertIn(
-                "依赖：变化 1，已完成分析 0，未完成分析 1，含确认影响 0。",
+                "依赖：变化 1，已完成分析 0，未完成分析 1，其中确认有影响 0。",
                 text,
             )
             self.assertIn(
-                "API：变化 3，已完成分析 1，未完成分析 2，确认影响 0。",
+                "API：变化 3，已完成分析 1，未完成分析 2，确认有影响 0。",
                 text,
             )
             self.assertNotIn("建议", text)
@@ -2351,7 +2351,7 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertIn("2. 部分分析（仅在明确控制耗时时）", text)
         self.assertIn("Top 1 影响复核优先项，展示 1 / 1 个", text)
         self.assertIn("先比较业务最终制品精确直接引用的变更 API 数", text)
-        self.assertIn("不表示系统建议缩小范围，也不代表已经确认影响", text)
+        self.assertIn("不表示系统建议缩小范围，也不代表已经确认有影响", text)
         self.assertIn("| 1 | `com.acme:alpha` | 3 | 1 | 7 | 42 | 可用 |", text)
         self.assertIn(
             "完整依赖选择清单：`/project/.upgrade-report/evidence/api_changes/changed_dependencies.md`",

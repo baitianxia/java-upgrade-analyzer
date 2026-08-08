@@ -997,7 +997,7 @@ def _landing_status_lines(state):
                 f"分析范围：{scope_text}",
                 (
                     "依赖：变化 {dependency_total}，已完成分析 {dependency_completed}，"
-                    "未完成分析 {dependency_incomplete}，含确认影响 {dependency_confirmed}。"
+                    "未完成分析 {dependency_incomplete}，其中确认有影响 {dependency_confirmed}。"
                 ).format(
                     dependency_total=int(completion_summary.get("dependency_total_count") or 0),
                     dependency_completed=int(completion_summary.get("dependency_completed_count") or 0),
@@ -1006,7 +1006,7 @@ def _landing_status_lines(state):
                 ),
                 (
                     "API：变化 {api_total}，已完成分析 {api_completed}，"
-                    "未完成分析 {api_incomplete}，确认影响 {api_confirmed}。"
+                    "未完成分析 {api_incomplete}，确认有影响 {api_confirmed}。"
                 ).format(
                     api_total=int(completion_summary.get("api_total_count") or 0),
                     api_completed=int(completion_summary.get("api_completed_count") or 0),
@@ -1270,7 +1270,7 @@ def build_user_runtime_message(event, step_id, reason="", completion_summary=Non
         if summary:
             lines.append(
                 "依赖：变化 {total}，已完成分析 {completed}，"
-                "未完成分析 {incomplete}，含确认影响 {confirmed}。".format(
+                "未完成分析 {incomplete}，其中确认有影响 {confirmed}。".format(
                     total=int(summary.get("dependency_total_count") or 0),
                     completed=int(summary.get("dependency_completed_count") or 0),
                     incomplete=int(summary.get("dependency_incomplete_count") or 0),
@@ -1279,7 +1279,7 @@ def build_user_runtime_message(event, step_id, reason="", completion_summary=Non
             )
             lines.append(
                 "API：变化 {total}，已完成分析 {completed}，"
-                "未完成分析 {incomplete}，确认影响 {confirmed}。".format(
+                "未完成分析 {incomplete}，确认有影响 {confirmed}。".format(
                     total=int(summary.get("api_total_count") or 0),
                     completed=int(summary.get("api_completed_count") or 0),
                     incomplete=int(summary.get("api_incomplete_count") or 0),
@@ -8243,7 +8243,7 @@ def build_user_decision_card(interaction):
             "- 删除、签名变化等变更类型不额外加权；依赖源码是否可用只展示分析条件，不参与影响排序。"
         )
         lines.append(
-            "- 该排序只帮助部分分析时取舍，不表示系统建议缩小范围，也不代表已经确认影响；"
+            "- 该排序只帮助部分分析时取舍，不表示系统建议缩小范围，也不代表已经确认有影响；"
             "未观察到直接引用也不等于无影响。"
         )
         if recommended_total:
@@ -9151,7 +9151,7 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
             if coords:
                 checklist_lines.append(f"  - 建议优先补这些依赖：{', '.join(coords[:10])}")
         if reachable_apis:
-            checklist_lines.append("已确认影响示例（完整结果见 alerts.csv）：")
+            checklist_lines.append("已确认有影响示例（完整结果见 alerts.csv）：")
             for item in reachable_apis[:3]:
                 checklist_lines.append(
                     f"  - {item.get('severity')} {item.get('coord')} | "

@@ -631,8 +631,8 @@ def scenario_delivery_output_journey(workspace: Path) -> ScenarioResult:
         "## 一、依赖层面结论",
         "## 二、API 及调用关系",
         "## 三、用户可见文件说明",
-        "| 变化依赖总数 | 已完成分析 | 未完成分析 | 确认影响 | 确认不受影响 | 尚未确认影响 |",
-        "| 变化 API 总数 | 已完成分析 | 未完成分析 | 确认影响 | 确认不受影响 | 尚未确认影响 |",
+        "| 变化依赖总数 | 已完成分析 | 未完成分析 | 确认有影响 | 确认不受影响 | 尚未确认影响 |",
+        "| 变化 API 总数 | 已完成分析 | 未完成分析 | 确认有影响 | 确认不受影响 | 尚未确认影响 |",
         "| 依赖 | 版本变化 | API 分析（已完成/总数） | 当前系统调用关系 | 分析结果 | 结果说明 |",
         "| 依赖 | API | 新版本中的变化 | 当前系统调用关系 | 分析结果 | 结果说明 |",
         "完整依赖分析明细",
@@ -643,7 +643,7 @@ def scenario_delivery_output_journey(workspace: Path) -> ScenarioResult:
         "1.0.0 → 已移除",
         "com.vendor.LegacyApi.removed(String)",
         "com.app.App.run(String)",
-        "确认影响",
+        "确认有影响",
     ):
         if expected not in report_text:
             failures.append(f"report_missing:{expected}")
@@ -681,7 +681,7 @@ def scenario_delivery_output_journey(workspace: Path) -> ScenarioResult:
     ):
         if expected not in api_detail_text:
             failures.append(f"api_detail_missing:{expected}")
-    if "确认影响" in report_text and "发现 3 条依赖引用，尚未回溯到业务入口" in report_text:
+    if "确认有影响" in report_text and "发现 3 条依赖引用，尚未回溯到业务入口" in report_text:
         failures.append("confirmed_impact_uses_unresolved_evidence_summary")
     for forbidden in (
         "__business__",

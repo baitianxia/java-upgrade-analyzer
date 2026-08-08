@@ -27,7 +27,7 @@ class UserVisibleOutputContractTest(unittest.TestCase):
         self.assertIn("用户可见文件说明", reading_section)
         self.assertIn("已完成分析", reading_section)
         self.assertIn("未完成分析", reading_section)
-        self.assertIn("确认影响", reading_section)
+        self.assertIn("确认有影响", reading_section)
         self.assertNotIn("建议按", reading_section)
         self.assertNotIn("当前无法确认", reading_section)
         self.assertIn("本次未完成分析", text)

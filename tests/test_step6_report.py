@@ -705,7 +705,7 @@ class Step6ReportObjectivityTest(unittest.TestCase):
         report = s6_report.generate_report(self._human_first_findings())
 
         self.assertIn("删除方法，参数：Order", report)
-        self.assertIn("确认影响", report)
+        self.assertIn("确认有影响", report)
         for non_objective_instruction in (
             "下一步复核顺序",
             "复核顺序",
@@ -744,7 +744,7 @@ class Step6ReportObjectivityTest(unittest.TestCase):
             "com.acme:payments-client",
             "com.acme.payments.LegacyClient.charge",
             "删除方法，参数：Order",
-            "确认影响",
+            "确认有影响",
             "com.acme.checkout.PaymentService.submit",
             (
                 "com.acme.checkout.PaymentService.submit → "
@@ -1365,7 +1365,7 @@ class Step6ReportObjectivityTest(unittest.TestCase):
         ))
         self.assertNotIn("### 本轮分析输入记录", report)
         self.assertIn(
-            "| 变化 API 总数 | 已完成分析 | 未完成分析 | 确认影响 | 确认不受影响 | 尚未确认影响 |",
+            "| 变化 API 总数 | 已完成分析 | 未完成分析 | 确认有影响 | 确认不受影响 | 尚未确认影响 |",
             report,
         )
 
@@ -1653,7 +1653,7 @@ class Step6ReportObjectivityTest(unittest.TestCase):
         )
         self.assertIn("未完成分析", report)
         self.assertIn(
-            "本轮没有变化依赖形成“确认影响当前系统”的结论",
+            "本轮没有变化依赖形成“确认对当前系统有影响”的结论",
             report,
         )
 
@@ -1679,7 +1679,7 @@ class Step6ReportObjectivityTest(unittest.TestCase):
         report = s6_report.generate_report(findings)
 
         self.assertIn("未完成分析", report)
-        self.assertNotIn("未完成分析；确认影响", report)
+        self.assertNotIn("未完成分析；确认有影响", report)
 
     def test_confirmed_overflow_has_a_complete_human_readable_markdown(self):
         findings = {
@@ -2537,7 +2537,7 @@ class Step6ReportObjectivityTest(unittest.TestCase):
 
         report = s6_report.generate_report(findings)
 
-        self.assertIn("确认影响", report)
+        self.assertIn("确认有影响", report)
         self.assertIn(
             "com.acme.checkout.PaymentService.submit → "
             "com.acme.payments.LegacyClient.charge(Order)",
@@ -2790,7 +2790,7 @@ class Step6ReportObjectivityTest(unittest.TestCase):
             findings = s6_report.collect_findings(tmp)
             report = s6_report.generate_report(findings)
 
-        self.assertIn("确认影响", report)
+        self.assertIn("确认有影响", report)
         self.assertTrue(any(
             str(item.get("artifact") or "").startswith(
                 "call_chain_by_api:"
@@ -3078,7 +3078,7 @@ class Step6ReportObjectivityTest(unittest.TestCase):
         self.assertIn("1/2", report)
         self.assertIn("| 1 | 0 | 1 | 1 | 0 | 0 |", report)
         self.assertIn("1 个变化 API<br>1 条调用关系", report)
-        self.assertIn("部分结果确认影响；分析未完成", report)
+        self.assertIn("部分结果确认有影响；分析未完成", report)
         self.assertIn("[已完成 API 及调用关系]", dependency_detail)
         self.assertIn("[未完成 API 及原因]", dependency_detail)
 
@@ -3108,11 +3108,11 @@ class Step6ReportObjectivityTest(unittest.TestCase):
         report = s6_report.generate_report(self._human_first_findings())
 
         self.assertIn(
-            "| 变化依赖总数 | 已完成分析 | 未完成分析 | 确认影响 | 确认不受影响 | 尚未确认影响 |",
+            "| 变化依赖总数 | 已完成分析 | 未完成分析 | 确认有影响 | 确认不受影响 | 尚未确认影响 |",
             report,
         )
         self.assertIn(
-            "| 变化 API 总数 | 已完成分析 | 未完成分析 | 确认影响 | 确认不受影响 | 尚未确认影响 |",
+            "| 变化 API 总数 | 已完成分析 | 未完成分析 | 确认有影响 | 确认不受影响 | 尚未确认影响 |",
             report,
         )
         self.assertEqual(

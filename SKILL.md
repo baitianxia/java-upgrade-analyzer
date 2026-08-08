@@ -546,7 +546,7 @@ python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
 - 输入：前面所有产物
 - 输出：`.upgrade-report/.runtime/findings/s6_findings.json`、`.upgrade-report/deliverables/report.md`、`.upgrade-report/deliverables/all-affected-dependencies.md`、`.upgrade-report/deliverables/all-impact-details.md`
 - 规则：主报告固定按“依赖层面结论 → API 及调用关系 → 用户可见文件说明”组织；依赖结论必须先于 API 结论
-- 规则：依赖和 API 都分别展示变化总数、已完成分析和未完成分析；确认影响是已完成结果的子集。已完成但未发现当前系统调用关系不得归入未完成分析
+- 规则：依赖和 API 都分别展示变化总数、已完成分析和未完成分析；确认有影响是已完成结果的子集。已完成但未发现当前系统调用关系不得归入未完成分析
 - 规则：主报告必须先给出五态语义、结论边界和每种状态的用户行动；`uncertain` 表示已有候选证据或已识别的分析能力边界，`not_found_in_static_analysis` 只表示当前静态范围没有找到路径，不能解释为安全
 - 规则：主报告按依赖坐标分组，完整展示本轮全部 `reachable` 和 `uncertain` API；依赖之间按影响程度排序，依赖内部按结论和复核优先分数排序。`not_found_in_static_analysis` 只展示统计数字，逐项记录保留在完整 API 明细中
 - 规则：只有真正未完成的项单列并直接说明原因。主报告之外的依赖和 API 必须分别链接到两份不同的全量 Markdown；用户行动必须与状态边界一致，不得把静态结论扩大成发布判断

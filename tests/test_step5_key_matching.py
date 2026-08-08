@@ -13297,8 +13297,8 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
         )
         self.assertEqual(summary_payload["not_impacted"], 1)
         self.assertEqual(alert_rows[0]["path_status"], "not_impacted")
-        self.assertIn("| 变化依赖总数 | 已完成分析 | 未完成分析 | 确认影响 | 确认不受影响 | 尚未确认影响 |", final_report)
-        self.assertIn("| 变化 API 总数 | 已完成分析 | 未完成分析 | 确认影响 | 确认不受影响 | 尚未确认影响 |", final_report)
+        self.assertIn("| 变化依赖总数 | 已完成分析 | 未完成分析 | 确认有影响 | 确认不受影响 | 尚未确认影响 |", final_report)
+        self.assertIn("| 变化 API 总数 | 已完成分析 | 未完成分析 | 确认有影响 | 确认不受影响 | 尚未确认影响 |", final_report)
         self.assertIn("确认不受 API 调用影响", final_report)
         self.assertNotIn("`com.vendor.LegacyApi.removed()`", final_report)
         self.assertIn(
@@ -13868,11 +13868,11 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
         self.assertIn("## 二、API 及调用关系", report_text)
         self.assertIn("## 三、用户可见文件说明", report_text)
         self.assertIn(
-            "| 变化依赖总数 | 已完成分析 | 未完成分析 | 确认影响 | 确认不受影响 | 尚未确认影响 |",
+            "| 变化依赖总数 | 已完成分析 | 未完成分析 | 确认有影响 | 确认不受影响 | 尚未确认影响 |",
             report_text,
         )
         self.assertIn(
-            "| 变化 API 总数 | 已完成分析 | 未完成分析 | 确认影响 | 确认不受影响 | 尚未确认影响 |",
+            "| 变化 API 总数 | 已完成分析 | 未完成分析 | 确认有影响 | 确认不受影响 | 尚未确认影响 |",
             report_text,
         )
         self.assertLess(
@@ -15147,7 +15147,7 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
         self.assertIn("1.0.0 → 已移除", report_text)
         self.assertIn("删除方法，参数：无参数", report_text)
         self.assertIn("1/1", report_text)
-        self.assertIn("确认影响", report_text)
+        self.assertIn("确认有影响", report_text)
         self.assertIn(
             "com.acme.OrderService.submit → com.example.Demo.call()",
             report_text,
