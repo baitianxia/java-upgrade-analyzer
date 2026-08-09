@@ -3,6 +3,7 @@ import tempfile
 import csv
 import itertools
 import json
+import re
 import unittest
 from pathlib import Path
 
@@ -752,8 +753,90 @@ class Step6ReportObjectivityTest(unittest.TestCase):
             ),
         ):
             self.assertIn(reader_fact, first_screen)
-        self.assertNotIn("## 报告目录", first_screen)
+        self.assertIn("## 报告目录", first_screen)
+        self.assertLess(
+            first_screen.index("## 报告目录"),
+            first_screen.index("1 个变化依赖已确认存在当前系统调用关系"),
+        )
         self.assertNotIn("不替使用者决定", first_screen)
+
+    def test_report_directory_links_to_every_rendered_entry_with_stable_anchors(self):
+        report = s6_report.generate_report(self._human_first_findings())
+        toc = report[
+            report.index("## 报告目录") : report.index("## 一、依赖层面结论")
+        ]
+
+        expected_links = (
+            "[一、依赖层面结论](#dependency-conclusions)",
+            "[已完成分析的依赖](#completed-dependencies)",
+            "[二、API 及调用关系](#api-call-relationships)",
+            (
+                "[已确认触达与结论未确定的 API]"
+                "(#confirmed-and-unconfirmed-apis)"
+            ),
+            "[其他已完成状态统计](#other-completed-api-states)",
+            "[三、用户可见文件说明](#user-visible-files)",
+        )
+        for link in expected_links:
+            self.assertIn(link, toc)
+        self.assertNotIn("未完成分析的依赖](#incomplete-dependencies)", toc)
+        self.assertNotIn("未完成分析的 API](#incomplete-apis)", toc)
+        self.assertNotIn("运行时资源变化及激活关系", toc)
+
+        targets = re.findall(r"\]\(#([a-z-]+)\)", toc)
+        self.assertTrue(targets)
+        for target in targets:
+            self.assertEqual(report.count(f'<a id="{target}"></a>'), 1)
+        self.assertLess(
+            report.index("## 报告目录"),
+            report.index("## 一、依赖层面结论"),
+        )
+
+    def test_report_directory_includes_rendered_conditional_sections(self):
+        findings = self._human_first_findings()
+        existing_api = findings["impact_overview"]["apis"][0]
+        findings["changed_api_inventory"] = [
+            dict(existing_api),
+            {
+                "coord": "com.acme:payments-client",
+                "api": "com.acme.payments.NewClient.missing",
+                "api_signature": "()",
+                "symbol_kind": "method",
+                "change_type": "METHOD_REMOVED",
+                "old_version": "1.0",
+                "new_version": "2.0",
+            },
+        ]
+        findings["dependency_changes"] = [{
+            "coord": "com.acme:payments-client",
+            "old_version": "1.0",
+            "new_version": "2.0",
+            "change_type": "UPDATED",
+        }]
+        findings["resource_impacts"] = [{
+            "coord": "com.acme:payments-client",
+            "old_version": "1.0",
+            "new_version": "2.0",
+            "resource_name": "META-INF/services/com.acme.PaymentProvider",
+            "activation_status": "reachable",
+            "business_entries": ["com.acme.checkout.PaymentService.submit"],
+        }]
+        findings["analysis_scope"].update({
+            "total_api_count": 2,
+            "analyzed_api_count": 2,
+        })
+
+        report = s6_report.generate_report(findings)
+        toc = report[
+            report.index("## 报告目录") : report.index("## 一、依赖层面结论")
+        ]
+
+        for link in (
+            "[未完成分析的依赖](#incomplete-dependencies)",
+            "[未完成分析的 API](#incomplete-apis)",
+            "[运行时资源变化及激活关系](#runtime-resource-impacts)",
+        ):
+            self.assertIn(link, toc)
 
     def test_main_report_summarizes_diagnostics_without_internal_protocol(self):
         findings = self._human_first_findings()

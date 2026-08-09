@@ -9644,10 +9644,106 @@ def render_user_visible_files(
 
 def build_report_sections_for_test_only():
     return [
+        "报告目录",
         "依赖层面结论",
         "API 及调用关系",
         "用户可见文件说明",
     ]
+
+
+_MAIN_REPORT_TOC_ENTRIES = (
+    (
+        "## 一、依赖层面结论",
+        "dependency-conclusions",
+        "一、依赖层面结论",
+        0,
+    ),
+    (
+        "### 未完成分析的依赖",
+        "incomplete-dependencies",
+        "未完成分析的依赖",
+        1,
+    ),
+    (
+        "### 已完成分析的依赖",
+        "completed-dependencies",
+        "已完成分析的依赖",
+        1,
+    ),
+    (
+        "## 二、API 及调用关系",
+        "api-call-relationships",
+        "二、API 及调用关系",
+        0,
+    ),
+    (
+        "### 运行时资源变化及激活关系",
+        "runtime-resource-impacts",
+        "运行时资源变化及激活关系",
+        1,
+    ),
+    (
+        "### 未完成分析的 API",
+        "incomplete-apis",
+        "未完成分析的 API",
+        1,
+    ),
+    (
+        "### 已确认触达与结论未确定的 API",
+        "confirmed-and-unconfirmed-apis",
+        "已确认触达与结论未确定的 API",
+        1,
+    ),
+    (
+        "### 其他已完成状态统计",
+        "other-completed-api-states",
+        "其他已完成状态统计",
+        1,
+    ),
+    (
+        "## 三、用户可见文件说明",
+        "user-visible-files",
+        "三、用户可见文件说明",
+        0,
+    ),
+)
+
+
+def _main_report_heading_entry(line):
+    for prefix, anchor, label, depth in _MAIN_REPORT_TOC_ENTRIES:
+        if line.startswith(prefix):
+            return anchor, label, depth
+    return None
+
+
+def _anchor_main_report_sections(lines):
+    anchored = []
+    for line in lines:
+        entry = _main_report_heading_entry(line)
+        if entry:
+            anchored.append(f'<a id="{entry[0]}"></a>')
+        anchored.append(line)
+    return anchored
+
+
+def _render_main_report_toc(section_lines):
+    present_anchors = {
+        entry[0]
+        for line in section_lines
+        if (entry := _main_report_heading_entry(line))
+    }
+    lines = [
+        '<a id="report-toc"></a>',
+        "## 报告目录",
+        "",
+    ]
+    for _prefix, anchor, label, depth in _MAIN_REPORT_TOC_ENTRIES:
+        if anchor not in present_anchors:
+            continue
+        indent = "  " if depth else ""
+        lines.append(f"{indent}- [{label}](#{anchor})")
+    lines.append("")
+    return lines
 
 
 def generate_report(findings):
@@ -9660,13 +9756,27 @@ def generate_report(findings):
         "",
     ]
     L += render_report_scope_notice(findings)
-    L += render_dependency_conclusions(findings, dependency_model)
-    L += render_api_and_calls(findings, api_model)
-    L += render_user_visible_files(
+    dependency_lines = render_dependency_conclusions(
+        findings,
+        dependency_model,
+    )
+    api_lines = render_api_and_calls(findings, api_model)
+    user_visible_file_lines = render_user_visible_files(
         findings,
         api_model,
         dependency_model,
     )
+    all_section_lines = [
+        *dependency_lines,
+        *api_lines,
+        *user_visible_file_lines,
+    ]
+    # Place navigation at the top of the report, after metadata and any source
+    # or scope notice. Conditional subsections appear only when rendered.
+    L += _render_main_report_toc(all_section_lines)
+    L += _anchor_main_report_sections(dependency_lines)
+    L += _anchor_main_report_sections(api_lines)
+    L += _anchor_main_report_sections(user_visible_file_lines)
 
     return '\n'.join(L)
 
