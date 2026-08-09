@@ -1003,8 +1003,10 @@ def build_provenance(
         scope = build_project_scope(
             project_dir, module, active_profiles=set(active_profiles or [])
         )
+    artifact_available = bool(artifact and artifact.is_file())
+    build_executed_by_system = bool(str(build_command or "").strip())
     return {
-        "schema": "java-upgrade-analyzer.build-provenance.v1",
+        "schema": "java-upgrade-analyzer.build-provenance.v2",
         "side": side,
         "ref": str(ref or ""),
         "revision": git_revision(project_dir, ref or "HEAD"),
@@ -1012,7 +1014,13 @@ def build_provenance(
         "jdk_home": str(jdk_home or ""),
         "build_command": str(build_command or ""),
         "artifact_path": str(artifact) if artifact else "",
-        "artifact_sha256": sha256_file(artifact) if artifact and artifact.is_file() else "",
+        "artifact_sha256": sha256_file(artifact) if artifact_available else "",
+        "artifact_available": artifact_available,
+        "build_executed_by_system": build_executed_by_system,
+        "build_execution_status": (
+            "succeeded" if build_executed_by_system and artifact_available
+            else ("failed" if build_executed_by_system else "not_executed")
+        ),
         **project_scope_provenance_fields(scope),
         "captured_at": datetime.now(timezone.utc).isoformat(),
     }

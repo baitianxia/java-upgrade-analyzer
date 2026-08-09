@@ -18,6 +18,11 @@ from pipeline_constants import (
 )
 from analysis_contract import sha256_file
 from artifact_safety import require_safe_archive
+from binary_compat_output import (
+    ENGINE_DESCRIPTOR_RELATIVE_PATH,
+    load_validated_generation,
+)
+from binary_first_contract import BinaryFirstContractError
 from csv_io import open_csv_read
 GATES = list(GATE_SEQUENCE)
 
@@ -37,6 +42,17 @@ def fail(msg, instructions=None):
     sys.exit(1)
 
 def ok(msg): print(f"✅ {msg}", file=sys.stderr)
+
+
+def _engine_descriptor(report_dir):
+    path = Path(report_dir) / ENGINE_DESCRIPTOR_RELATIVE_PATH
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        fail(f"engine generation 描述无效：{path}: {exc}")
+    return payload if isinstance(payload, dict) else {}
 
 
 def evidence_dependencies_dir(report_dir):
@@ -331,6 +347,25 @@ def gate_scan(d):
 def gate_jar_compare(d, strict_risk_gate=False):
     jar_dir = evidence_api_changes_dir(d)
     csv_path = jar_dir / "all_changed_apis.csv"
+    descriptor = _engine_descriptor(d)
+    if descriptor.get("authoritative_engine") == "binary":
+        try:
+            loaded = load_validated_generation(d)
+        except BinaryFirstContractError as exc:
+            fail(f"binary generation 完整性门禁失败：{exc.reason_code}: {exc}")
+        if not csv_path.is_file():
+            fail("binary Step4 兼容投影 all_changed_apis.csv 缺失")
+        decisions = loaded["decisions"]
+        authoritative = len(decisions.get("authoritative_change_facts") or ())
+        diagnostic = len(decisions.get("diagnostic_candidate_facts") or ())
+        excluded = len(decisions.get("excluded_decisions") or ())
+        if strict_risk_gate and loaded["summary"].get("decision_coverage_status") != "complete":
+            fail("严格门禁要求 binary decision coverage=complete")
+        ok(
+            "jar_compare binary 门控通过："
+            f"正式变化={authoritative} 诊断候选={diagnostic} 排除={excluded}，独立 Oracle 已通过"
+        )
+        return
     ref_txt_path = jar_dir / "git_ref_matches.txt"
     ref_json_path = jar_dir / "git_ref_matches.json"
     pending_ref_path = jar_dir / "git_ref_pending.json"
@@ -395,6 +430,27 @@ def gate_call_chain(d, strict_risk_gate=False):
     summary_path = evidence_call_chain_dir(d) / "summary.json"
     if not summary_path.exists():
         fail("evidence/call_chain/summary.json 不存在，请先执行 Step 5")
+    descriptor = _engine_descriptor(d)
+    if descriptor.get("authoritative_engine") == "binary":
+        try:
+            loaded = load_validated_generation(d)
+        except BinaryFirstContractError as exc:
+            fail(f"binary generation 完整性门禁失败：{exc.reason_code}: {exc}")
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        if summary.get("result_generation_identity") != loaded["manifest"].get(
+            "result_generation_identity"
+        ):
+            fail("Step5 binary 兼容视图与 active generation 不一致")
+        if strict_risk_gate and loaded["summary"].get("trace_coverage_status") != "complete":
+            fail("严格门禁要求 binary trace coverage=complete")
+        ok(
+            "call_chain binary 门控通过："
+            f"reachable={summary.get('reachable', 0)} "
+            f"uncertain={summary.get('uncertain', 0)} "
+            f"not_found={summary.get('not_found_in_static_analysis', 0)} "
+            f"not_analyzed={summary.get('not_analyzed', 0)}"
+        )
+        return
     with open(summary_path, encoding="utf-8", errors="replace") as f:
         summary = json.load(f)
     coverage_file = coverage_path(d)

@@ -1,0 +1,421 @@
+#!/usr/bin/env python3
+"""Immutable whole-generation output writer for the binary authority pipeline."""
+
+from __future__ import annotations
+
+import csv
+from dataclasses import asdict
+import hashlib
+import json
+import os
+from pathlib import Path
+import tempfile
+from typing import Any, Mapping
+
+from binary_decision_engine import BinaryDecisionBundle
+from binary_first_contract import BinaryFirstContractError, canonical_identity
+from binary_first_model import ResultGeneration, RuntimeProfile
+from binary_source_overlay import SourceOverlayResult
+from binary_trace_engine import BinaryTraceBundle
+from csv_io import open_csv_write
+from path_runtime import make_short_temp_dir, short_temporary_directory
+
+
+class BinaryOutputError(BinaryFirstContractError):
+    pass
+
+
+def _identity(namespace: str, payload: Any) -> str:
+    return canonical_identity(namespace, payload, schema_version="1")
+
+
+def _json_bytes(value: Any) -> bytes:
+    return (
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _sha256(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _reported_api_identity(
+    decision: Mapping[str, Any],
+    *,
+    runtime_profile_identity: str,
+    analysis_context_identity: str,
+) -> str:
+    scope = decision.get("fact_scope") or {}
+    return _identity("reported_api_identity", {
+        "analysis_context_identity": analysis_context_identity,
+        "current_runtime_profile_identity": runtime_profile_identity,
+        "initiating_loader_realm_identity": scope.get("initiating_loader_realm_identity"),
+        "class_name": scope.get("class_name"),
+        "member_kind": scope.get("member_kind") or decision.get("fact_kind"),
+        "member_name": scope.get("member_name"),
+        "descriptor": scope.get("descriptor"),
+        "grouping_rule_version": "binary-reported-api-v1",
+    })
+
+
+def _aggregate_by_api(
+    decisions: BinaryDecisionBundle,
+    traces: BinaryTraceBundle,
+    profile: RuntimeProfile,
+) -> list[dict[str, Any]]:
+    decision_by_change = {
+        item["change_fact_identity"]: item for item in decisions.authoritative_decisions
+    }
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for result in traces.formal_results:
+        decision = decision_by_change.get(result["change_fact_identity"])
+        if not decision:
+            raise BinaryOutputError(
+                "BINARY_OUTPUT_TRACE_DECISION_UNBOUND",
+                str(result.get("trace_result_identity")),
+            )
+        reported = _reported_api_identity(
+            decision,
+            runtime_profile_identity=profile.identity,
+            analysis_context_identity=decisions.analysis_context_identity,
+        )
+        groups.setdefault(reported, []).append({"result": result, "decision": decision})
+    priority = {
+        "reachable": 3,
+        "uncertain": 2,
+        "not_found_in_static_analysis": 1,
+        "not_analyzed": 0,
+    }
+    linkage_priority = {
+        "compatible_or_not_applicable": 0,
+        "undetermined": 1,
+        "incompatible_if_executed": 2,
+    }
+    output = []
+    for reported, items in sorted(groups.items()):
+        results = [item["result"] for item in items]
+        primary = max(results, key=lambda item: priority[item["reachability_status"]])
+        scopes = [item["decision"]["fact_scope"] for item in items]
+        output.append({
+            "reported_api_identity": reported,
+            "display_owner": scopes[0].get("class_name"),
+            "display_member": scopes[0].get("member_name"),
+            "display_descriptor": scopes[0].get("descriptor"),
+            "reachability_status": primary["reachability_status"],
+            "is_reachable": any(item["is_reachable"] for item in results),
+            "impact_conclusion": (
+                "probable_impact"
+                if any(item["impact_conclusion"] == "probable_impact" for item in results)
+                else "inconclusive"
+            ),
+            "static_linkage_status": max(
+                (item.get("static_linkage_status") or "undetermined" for item in results),
+                key=lambda value: linkage_priority.get(value, 1),
+            ),
+            "runtime_verification_status": "required_not_executed",
+            "runtime_verification_executed_by_system": False,
+            "path_set_complete": all(item["path_set_complete"] for item in results),
+            "exact_path_exists": any(item["exact_path_exists"] for item in results),
+            "possible_path_exists": any(item["possible_path_exists"] for item in results),
+            "contributing_projection_ids": sorted(item["projection_identity"] for item in results),
+            "contributing_projection_assessment_ids": sorted(
+                item["projection_assessment_identity"] for item in results
+            ),
+            "contributing_change_fact_ids": sorted(item["change_fact_identity"] for item in results),
+            "target_jvm_identities": [profile.identity],
+            "primary_projection_id": primary["projection_identity"],
+            "primary_projection_selection_reason": "highest_reachability_then_stable_input_order_v1",
+            "projection_coverage_statuses": sorted({
+                next(
+                    assessment["projection_coverage_status"]
+                    for assessment in decisions.projection_assessments
+                    if assessment["projection_assessment_identity"]
+                    == item["projection_assessment_identity"]
+                )
+                for item in results
+            }),
+        })
+    return output
+
+
+def build_output_payloads(
+    decisions: BinaryDecisionBundle,
+    traces: BinaryTraceBundle,
+    profile: RuntimeProfile,
+    *,
+    source_overlay: SourceOverlayResult | None = None,
+) -> dict[str, Any]:
+    assessments = {
+        item["projection_assessment_identity"]: item
+        for item in decisions.projection_assessments
+    }
+    unprojectable = [
+        decision
+        for decision in decisions.authoritative_decisions
+        if any(
+            assessment["decision_identity"] == decision["decision_identity"]
+            and assessment["analysis_projection_status"] == "unsupported"
+            for assessment in decisions.projection_assessments
+        )
+    ]
+    by_api = _aggregate_by_api(decisions, traces, profile)
+    summary = {
+        "schema": "java-upgrade-analyzer.binary-summary.v1",
+        "analysis_context_identity": decisions.analysis_context_identity,
+        "current_runtime_profile_identity": profile.identity,
+        "authoritative_change_fact_count": len(decisions.authoritative_decisions),
+        "diagnostic_candidate_fact_count": len(decisions.diagnostic_decisions),
+        "excluded_decision_count": len(decisions.excluded_decisions),
+        "confirmed_unprojectable_fact_count": len(unprojectable),
+        "formal_projection_count": len(decisions.formal_projections),
+        "candidate_projection_plan_count": len(decisions.candidate_projection_plans),
+        "formal_trace_result_count": len(traces.formal_results),
+        "candidate_trace_result_count": len(traces.candidate_results),
+        "unique_reported_api_total": len(by_api),
+        "reachable_total": sum(item["reachability_status"] == "reachable" for item in by_api),
+        "uncertain_total": sum(item["reachability_status"] == "uncertain" for item in by_api),
+        "not_found_in_static_analysis_total": sum(
+            item["reachability_status"] == "not_found_in_static_analysis" for item in by_api
+        ),
+        "not_analyzed_total": sum(item["reachability_status"] == "not_analyzed" for item in by_api),
+        "probable_impact_total": sum(item["impact_conclusion"] == "probable_impact" for item in by_api),
+        "runtime_verified_total": 0,
+        "formal_path_set_complete": all(item["path_set_complete"] for item in by_api),
+        "decision_coverage_status": decisions.coverage_status,
+        "trace_coverage_status": traces.coverage_status,
+    }
+    return {
+        "binary_decisions.json": {
+            "schema": "java-upgrade-analyzer.binary-decisions.v1",
+            "analysis_context_identity": decisions.analysis_context_identity,
+            "active_decision_snapshot_identity": decisions.active_snapshots["decision"].identity,
+            "authoritative_change_facts": list(decisions.authoritative_decisions),
+            "diagnostic_candidate_facts": list(decisions.diagnostic_decisions),
+            "excluded_decisions": list(decisions.excluded_decisions),
+        },
+        "binary_projections.json": {
+            "schema": "java-upgrade-analyzer.binary-projections.v1",
+            "active_assessment_snapshot_identity": decisions.active_snapshots["assessment"].identity,
+            "active_formal_projection_snapshot_identity": decisions.active_snapshots["formal_projection"].identity,
+            "active_candidate_projection_snapshot_identity": decisions.active_snapshots["candidate_projection"].identity,
+            "authoritative_projection_assessments": list(decisions.projection_assessments),
+            "formal_projections": list(decisions.formal_projections),
+            "candidate_projection_plans": list(decisions.candidate_projection_plans),
+            "confirmed_unprojectable_facts": unprojectable,
+        },
+        "binary_formal_results.json": {
+            "schema": "java-upgrade-analyzer.binary-formal-results.v1",
+            "results": list(traces.formal_results),
+            "by_api": by_api,
+        },
+        "binary_candidate_results.json": {
+            "schema": "java-upgrade-analyzer.binary-candidate-results.v1",
+            "results": list(traces.candidate_results),
+        },
+        "binary_coverage.json": {
+            "schema": "java-upgrade-analyzer.binary-coverage.v1",
+            "decision_coverage_status": decisions.coverage_status,
+            "decision_coverage_gaps": list(decisions.coverage_gaps),
+            "trace_coverage_status": traces.coverage_status,
+            "trace_coverage_gaps": list(traces.coverage_gaps),
+            "batch_graph_stats": dict(traces.graph_stats or {}),
+            "source_overlay": asdict(source_overlay) if source_overlay else {
+                "coverage_status": "not_provided",
+            },
+        },
+        "binary_summary.json": summary,
+    }
+
+
+def _csv_bytes(rows: list[dict[str, Any]]) -> bytes:
+    columns = [
+        "reported_api_identity", "display_owner", "display_member", "display_descriptor",
+        "reachability_status", "is_reachable", "impact_conclusion", "static_linkage_status",
+        "runtime_verification_status", "runtime_verification_executed_by_system",
+        "path_set_complete", "exact_path_exists", "possible_path_exists",
+        "primary_projection_id",
+    ]
+    with short_temporary_directory(prefix="binary-output-csv") as temp_text:
+        path = Path(temp_text) / "binary_formal_results.csv"
+        with open_csv_write(path) as handle:
+            writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+        return path.read_bytes()
+
+
+def write_binary_generation(
+    output_root: str | Path,
+    decisions: BinaryDecisionBundle,
+    traces: BinaryTraceBundle,
+    profile: RuntimeProfile,
+    *,
+    engine_mode: str,
+    policy_identities: Mapping[str, str],
+    source_overlay: SourceOverlayResult | None = None,
+    additional_sidecars: Mapping[str, bytes] | None = None,
+    activate: bool = True,
+) -> dict[str, Any]:
+    if engine_mode not in {"binary_strict", "binary_with_legacy_fallback", "shadow"}:
+        raise BinaryOutputError("BINARY_OUTPUT_ENGINE_MODE_INVALID", engine_mode)
+    root = Path(output_root)
+    root.mkdir(parents=True, exist_ok=True)
+    payloads = build_output_payloads(
+        decisions, traces, profile, source_overlay=source_overlay
+    )
+    encoded = {name: _json_bytes(payload) for name, payload in payloads.items()}
+    encoded["binary_formal_results.csv"] = _csv_bytes(payloads["binary_formal_results.json"]["by_api"])
+    for name, content in (additional_sidecars or {}).items():
+        safe_name = Path(str(name or "")).name
+        if not safe_name or safe_name != str(name) or safe_name in encoded:
+            raise BinaryOutputError(
+                "BINARY_OUTPUT_ADDITIONAL_SIDECAR_INVALID", str(name)
+            )
+        if not isinstance(content, bytes):
+            raise BinaryOutputError(
+                "BINARY_OUTPUT_ADDITIONAL_SIDECAR_INVALID", f"{name} must be bytes"
+            )
+        encoded[safe_name] = content
+    sidecar_identities = {name: _sha256(content) for name, content in encoded.items()}
+    generation = ResultGeneration(
+        decisions.analysis_context_identity,
+        engine_mode,
+        decisions.active_snapshots,
+        traces.trace_result_set_digest,
+        sidecar_identities,
+        dict(policy_identities),
+    )
+    generations = root / "binary_generations"
+    generations.mkdir(exist_ok=True)
+    destination = generations / generation.identity
+    manifest = {
+        "schema": "java-upgrade-analyzer.binary-result-generation.v1",
+        "result_generation_identity": generation.identity,
+        "analysis_context_identity": decisions.analysis_context_identity,
+        "engine_mode": engine_mode,
+        "active_snapshot_identities": {
+            layer: snapshot.identity for layer, snapshot in decisions.active_snapshots.items()
+        },
+        "trace_result_set_digest": traces.trace_result_set_digest,
+        "sidecar_content_identities": sidecar_identities,
+        "policy_identities": dict(policy_identities),
+        "attachment_policy": "trace-results-bound-by-generation-attachment-v1",
+    }
+    attachment = {
+        "schema": "java-upgrade-analyzer.binary-generation-attachments.v1",
+        "result_generation_identity": generation.identity,
+        "formal_trace_result_identities": [
+            item["trace_result_identity"] for item in traces.formal_results
+        ],
+        "candidate_trace_result_identities": [
+            item["trace_result_identity"] for item in traces.candidate_results
+        ],
+    }
+    if destination.exists():
+        existing_manifest = destination / "result_generation.json"
+        existing = (
+            json.loads(existing_manifest.read_text(encoding="utf-8"))
+            if existing_manifest.is_file() else {}
+        )
+        content_valid = all(
+            (destination / name).is_file()
+            and _sha256((destination / name).read_bytes()) == expected
+            for name, expected in sidecar_identities.items()
+        )
+        if (
+            existing.get("result_generation_identity") != generation.identity
+            or existing.get("sidecar_content_identities") != sidecar_identities
+            or not content_valid
+        ):
+            raise BinaryOutputError(
+                "BINARY_GENERATION_IDENTITY_COLLISION", str(destination)
+            )
+    else:
+        temp = make_short_temp_dir(
+            prefix="binary-generation",
+            preferred_root=generations,
+            strict_preferred=True,
+        )
+        try:
+            for name, content in encoded.items():
+                (temp / name).write_bytes(content)
+            (temp / "result_generation.json").write_bytes(_json_bytes(manifest))
+            (temp / "generation_attachments.json").write_bytes(_json_bytes(attachment))
+            os.replace(temp, destination)
+        finally:
+            if temp.exists():
+                import shutil
+                shutil.rmtree(temp)
+    active_descriptor = ""
+    if activate:
+        active_descriptor = activate_binary_generation(root, manifest)
+    return {
+        **manifest,
+        "generation_directory": str(destination),
+        "active_generation_descriptor": active_descriptor,
+    }
+
+
+def activate_binary_generation(
+    output_root: str | Path,
+    manifest: Mapping[str, Any],
+    *,
+    validation_result: Mapping[str, Any] | None = None,
+) -> str:
+    root = Path(output_root)
+    generation_identity = str(manifest.get("result_generation_identity") or "")
+    destination = root / "binary_generations" / generation_identity
+    if not generation_identity or not destination.is_dir():
+        raise BinaryOutputError(
+            "BINARY_GENERATION_ACTIVATION_TARGET_INVALID", str(destination)
+        )
+    mode = str(manifest.get("engine_mode") or "")
+    if mode in {"binary_strict", "binary_with_legacy_fallback"}:
+        if (
+            not validation_result
+            or validation_result.get("status") != "passed"
+            or validation_result.get("result_generation_identity") != generation_identity
+        ):
+            raise BinaryOutputError(
+                "BINARY_GENERATION_VALIDATION_REQUIRED", generation_identity
+            )
+    for name, expected in (manifest.get("sidecar_content_identities") or {}).items():
+        path = destination / str(name)
+        if not path.is_file() or _sha256(path.read_bytes()) != expected:
+            raise BinaryOutputError(
+                "BINARY_GENERATION_ACTIVATION_INTEGRITY_FAILED", str(path)
+            )
+    active = {
+        "schema": "java-upgrade-analyzer.active-binary-generation.v1",
+        "result_generation_identity": generation_identity,
+        "generation_directory": f"binary_generations/{generation_identity}",
+        "validation_run_identity": (
+            str((validation_result or {}).get("validation_run_identity") or "")
+        ),
+    }
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".active-generation-", dir=root)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(_json_bytes(active))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_name, root / "active_binary_generation.json")
+    finally:
+        if os.path.exists(temporary_name):
+            os.unlink(temporary_name)
+    return str(root / "active_binary_generation.json")
+
+
+__all__ = [
+    "BinaryOutputError",
+    "activate_binary_generation",
+    "build_output_payloads",
+    "write_binary_generation",
+]

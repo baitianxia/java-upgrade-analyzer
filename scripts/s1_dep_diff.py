@@ -6200,6 +6200,9 @@ def main():
         if observer is not None else None
     )
     provenance_sides = []
+    provided_artifact_mode = bool(
+        args.base_artifact_path and args.current_artifact_path
+    )
     for side, meta, branch, configured_jdk in (
         ('base', base_meta, args.base_branch, args.base_jdk_home),
         ('current', curr_meta, args.current_branch, args.current_jdk_home),
@@ -6208,9 +6211,17 @@ def main():
         artifact_hash = str((meta or {}).get('artifact_sha256') or '').strip()
         if not artifact_hash and artifact_path and Path(artifact_path).is_file():
             artifact_hash = sha256_file(artifact_path)
+        artifact_available = bool(artifact_path and Path(artifact_path).is_file())
+        build_executed_by_system = not provided_artifact_mode
+        build_execution_status = (
+            "not_executed"
+            if provided_artifact_mode
+            else ("succeeded" if artifact_available else "failed")
+        )
         provenance_sides.append({
             'side': side,
-            'source_mode': 'provided_artifact' if (args.base_artifact_path and args.current_artifact_path) else 'checkout_build',
+            'source_mode': 'provided_artifact' if provided_artifact_mode else 'checkout_build',
+            'input_mode': 'provided_artifact' if provided_artifact_mode else 'checkout_build',
             'ref': str(
                 (meta or {}).get('resolved_ref')
                 or orchestrated_input.get(f'{side}_resolved_ref')
@@ -6256,7 +6267,12 @@ def main():
             'original_artifact_path': str((meta or {}).get('original_artifact_path') or artifact_path),
             'artifact_relative_path': str((meta or {}).get('artifact_relative_path') or ''),
             'artifact_sha256': artifact_hash,
-            'build_succeeded': bool(artifact_path),
+            'artifact_available': artifact_available,
+            'build_executed_by_system': build_executed_by_system,
+            'build_execution_status': build_execution_status,
+            # Legacy compatibility only. Consumers must use the three fields
+            # above to distinguish artifact receipt from analyzer execution.
+            'build_succeeded': artifact_available,
             'project_scope_hash': str((meta or {}).get('project_scope_hash') or ''),
             'source_state_hash': str((meta or {}).get('source_state_hash') or ''),
             'maven_model_hash': str((meta or {}).get('maven_model_hash') or ''),
@@ -6276,7 +6292,17 @@ def main():
     provenance_path = out_dir / 'build_provenance.json'
     provenance_path.write_text(
         json.dumps({
-            'schema': 'java-upgrade-analyzer.build-provenance.v1',
+            'schema': 'java-upgrade-analyzer.build-provenance.v2',
+            'both_artifacts_available': all(
+                item.get('artifact_available') for item in provenance_sides
+            ),
+            'both_build_executions_succeeded': all(
+                item.get('build_executed_by_system')
+                and item.get('build_execution_status') == 'succeeded'
+                for item in provenance_sides
+            ),
+            # Legacy compatibility: historically this meant only that both
+            # artifact paths existed, including provided-artifact mode.
             'both_builds_succeeded': all(item.get('build_succeeded') for item in provenance_sides),
             'sides': provenance_sides,
         }, ensure_ascii=False, indent=2) + '\n',

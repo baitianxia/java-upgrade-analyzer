@@ -445,6 +445,18 @@ Step4 是变化识别层，不负责调用链分析。它定义“变更 API 池
 - old/new 两侧同时存在多个候选时，先要求候选各自命中规范化版本，再优先选择能够复现 `old_version -> new_version` 非核心 token 差分、且 remote 一致、版本前缀家族一致的 ref pair；只有剩余两个以上不同 commit pair、且选择会改变 diff 范围时才进入人工确认
 - 远端查询失败、fetch 失败、ref 移动、未匹配、远端不可用或未授权本地兜底属于内部源码证据故障；受控重试后统一转为 `DEPENDENCY_SOURCE_REF_UNAVAILABLE`，不生成用户 checkpoint，不猜测 ref，也不静默使用本地对象。系统改用升级前后最终 JAR：先以 class SHA-256 缩小到共享变化类，再批量运行 `javap -c -s -p`，按方法 JVM descriptor 对齐并比较去除常量池槽位噪声后的指令指纹，生成 `jar_bytecode` / `FINAL_JAR_METHOD_BODY_CHANGED` 证据
 - 源码 git diff 或最终 JAR 方法字节码兜底只要有一项完整，该依赖的 `behavior_diff` 即可计为 complete；两者均不可用时，`behavior_diff` 必须成为 `critical_incomplete`，标准报告只能给受限结论，严格模式必须阻塞
+- `behavior_diff.metrics.planned_dependencies` 以具备 base/current 版本的适用依赖为分母，不再因没有源码映射而把依赖从分母删除
+
+#### binary-first 执行与整代边界
+
+统一入口固定 `engine_mode`：`legacy`、`shadow`、`binary_strict`、`binary_with_legacy_fallback`，四种模式均已实现。默认仍为 `legacy`；启用 binary 必须显式提供 `binary_pipeline_config`，固定 base/current 最终制品与 RuntimeProfile。Step4 之后不得原地改变模式，修改时必须从 Step4 重跑。
+
+- `binary_strict`：Step4A artifact-local diff → Step5A target-independent reconciliation → Step4B decision/projection freeze → Step5B batch trace → Step6 report 使用同一 immutable generation。独立 Oracle、sidecar SHA、support manifest 和 performance gate 任一失败都拒绝激活，并保留上一份完整输出。
+- `binary_with_legacy_fallback`：先执行与 strict 相同的 binary generation；只有整代失败时才丢弃该代，并从 Step4 重新生成一套纯 legacy 结果。descriptor 固定为 `authoritative_engine=legacy_fallback`，不能宣称满足 binary support manifest，禁止逐 API、逐事实或逐边回落。
+- `shadow`：legacy 仍是正式权威；如提供 binary config，另在 `.runtime/binary_shadow/` 运行完整 binary pipeline。shadow 成败都不改变 legacy 目标、Step5/Step6 统计或正式 generation。
+- `legacy`：继续使用旧 source-first 路径，供显式兼容和回滚；它与 binary SQLite、decision、projection 和 trace snapshot 不混用。
+
+binary 权威能力边界由 `scripts/binary_first_support_manifest.json` 失败关闭。当前受支持范围是父优先、显式有序 classpath、完整目标 JDK image、无未建模 runtime transformer 的 JVM direct/type/class-init/dynamic/linkage/dispatch 事实；资源、安全、未知语言 inline 或未注册语义不伪造成 API，占用 candidate、confirmed-unprojectable、coverage gap 或 generation failure 通道。
 
 #### Step4 到 Step5 的正式契约
 

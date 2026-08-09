@@ -78,6 +78,8 @@ python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --describe-step1-contract
 2. **门控强制**：上一步输入不完整或门控失败，不进入下一步。
 3. **结论可追溯**：每条结论都要记录证据来源。
 4. **不猜测**：必须区分五态：`reachable` / `not_impacted` / `uncertain` / `not_analyzed` / `not_found_in_static_analysis`。只有当前制品中的其他依赖以完全相同的类字节码保留目标 API 时才能使用 `not_impacted`；不要把“未覆盖”或“静态未找到”误写成“未影响”。
+5. **引擎整代一致**：默认 `legacy`；只有用户/运行配置显式选择 `binary_strict`、`binary_with_legacy_fallback` 或 `shadow` 时才切换，并在 Step4 前固定。binary 模式必须提供 `binary_pipeline_config`，不能从构建环境猜 RuntimeProfile。strict 失败即停止；fallback 只能丢弃失败 binary generation 后从 Step4 重建整套纯 legacy 结果；shadow 永远不改变 legacy 权威。禁止逐 API、逐事实或逐边混用引擎。
+6. **Binary 四维状态**：binary 权威输出分别保留 `reachability_status`、`static_linkage_status`、`impact_conclusion`、`runtime_verification_status`。静态分析不得写出 confirmed impact/no-impact 或已经执行的运行验证；candidate、confirmed-unprojectable 和 coverage gap 必须保留在独立 sidecar/summary，不能伪造成 API，也不能静默删除。
 5. **影响优先**：主报告优先展示已证明触达当前系统的风险。
 6. **单依赖包主键**：`coord` 是 per-dependency 分析与汇总的正式主键。
 7. **removed 统一语义**：`change_type=removed` 的分析对象不是“空的新 jar”，而是 `old jar symbol_set`。

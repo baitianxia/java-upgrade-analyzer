@@ -16,6 +16,8 @@
   "max_depth": 5,
   "include_test_scope": false,
   "tool": "maven",
+  "engine_mode": "binary_strict",
+  "binary_pipeline_config": "/abs/path/to/binary-pipeline-input.json",
   "allow_degraded": false,
   "strict_risk_gate": false
 }

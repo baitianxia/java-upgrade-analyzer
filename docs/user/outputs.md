@@ -82,7 +82,7 @@ Step1 的职责是确定本次分析实际采用的 base/current 构建产物和
 | `evidence/dependencies/dep_changes.csv` | base/current 依赖差异明细 | 依赖坐标、版本、scope、变化类型是否符合预期 |
 | `evidence/dependencies/dep_summary.txt` | Step1 摘要 | 目标模块、构建产物、依赖变化规模 |
 | `evidence/dependencies/dep_alerts.csv` | 需要优先复核的依赖变化 | 降级、删除、无法解析或高风险依赖 |
-| `evidence/dependencies/build_provenance.json` | base/current 构建产物来源和摘要 | 后续字节码分析是否基于正确制品 |
+| `evidence/dependencies/build_provenance.json` | base/current 构建产物来源和摘要；v2 分开记录产物是否可用、系统是否执行构建及构建执行状态 | 后续字节码分析是否基于正确制品；直接产物模式不得被误读为系统已执行构建 |
 | `evidence/dependencies/s1_artifacts/` | 留存的 base/current 产物 | Step5 业务字节码和运行时依赖 JAR 的来源 |
 | `evidence/dependencies/dependency_jars.json` | Step1 固化的变化依赖 JAR 清单与 SHA-256 | Step4 是否直接消费正确的 base/current JAR |
 | `evidence/dependencies/s1_dependency_jars/` | 从最终制品一次性提取的变化依赖 JAR | Step4 的唯一依赖 JAR 输入 |
@@ -92,6 +92,41 @@ base/current 即使使用同一个源码目录，也会按各自确认后的 com
 `dep_changes.csv` 仍只在完整比较成功后写入；过程日志和耗时文件仅用于监控与诊断，不是未完成分析的部分结果。
 
 从 Step1 开始，最终制品是依赖事实的唯一来源。Step1 先从 fat JAR 读取条目和坐标；内嵌 Maven 元数据无法确定坐标时，工程依赖树只补齐该条目，不替换制品事实。变化依赖 JAR 会在 Step1 固化，正式 Step4 直接读取，不会重新展开 fat JAR。源码只用于解释 Step1 已有 GAV 的源码变化，不会再次发现依赖或制造同 GAV 重复。所有步骤都不使用本地 Maven 仓库中的同坐标文件，也不下载其他版本代替。JApiCmp 自身是分析工具，首次缺失时可以自动安装；这不等于允许下载被分析依赖。最终制品内缺少目标 JAR 时，Step1 门控会明确报错，不会把异常拖到 Step4。
+
+## Binary-first 权威结果
+
+`engine_mode=binary_strict` 或成功的 `binary_with_legacy_fallback` binary generation 需要同时提供 `binary_pipeline_config`；字段示例见仓库根目录的 `binary_pipeline_config.example.json`。该配置固定两侧完整 JDK、最终制品、容器内逻辑位置、有序 classpath、loader realm、资源/安全策略和业务入口。默认模式仍是 `legacy`，不会从普通 Step1 上下文猜测上述运行时事实。
+
+正式结果先写入不可变目录：
+
+```text
+.runtime/binary_authority/binary_generations/<result_generation_identity>/
+```
+
+通过独立 Oracle 和全部 sidecar SHA 校验后，才会切换 `.runtime/binary_authority/active_binary_generation.json`；`.runtime/state/engine_generation.json` 必须指向同一 generation。普通复核仍优先看 `deliverables/report.md`、`evidence/api_changes/` 和 `evidence/call_chain/`，深度审计时再查看：
+
+| 文件 | 含义 |
+|---|---|
+| `binary_decisions.json` | authoritative、diagnostic candidate、excluded 三套互斥裁决；资源/topology 等已确认但不可投影事实也保存在这里 |
+| `binary_projections.json` | authoritative assessment、正式 API projection、candidate plan，以及 confirmed-unprojectable 清单 |
+| `binary_formal_results.json` / `.csv` | 仅正式 projection 的四维结果、exact/possible 路径存在性和路径集合完整性 |
+| `binary_candidate_results.json` | 候选事实的独立诊断触达结果；不进入正式 API 或影响总数 |
+| `binary_coverage.json` | decision/trace/source-overlay 覆盖缺口和批量图/SCC 统计 |
+| `binary_summary.json` | fact、projection、API、四态和完整性守恒汇总 |
+| `binary_pairings.json` / `binary_build_identities.json` | 两侧制品 pairing、构建环境/输入/provenance 和事实输入切片身份 |
+| `binary_phase_manifest.json` | Step4A → Step5A → Step4B → Step5B → Step6 单向阶段身份 |
+| `validation/<validation_run_identity>.json` | 与生产 identity 独立的 Oracle 结果和防篡改校验 |
+
+binary 正式结果不能压缩成旧“确认影响/确认不影响”二元语义。四个轴分别是：
+
+| 轴 | 值与边界 |
+|---|---|
+| `reachability_status` | `reachable`、`uncertain`、`not_found_in_static_analysis`、`not_analyzed` |
+| `static_linkage_status` | `compatible_or_not_applicable`、`incompatible_if_executed`、`undetermined` |
+| `impact_conclusion` | `probable_impact` 或 `inconclusive`；静态分析不产生 `confirmed_impact/no_impact` |
+| `runtime_verification_status` | `required_not_executed` 或 `undetermined`；系统没有执行被分析业务的运行测试 |
+
+`all_changed_apis.csv` 兼容视图只包含有正式 API projection 的变化。confirmed-unprojectable resource/security/topology 事实保留在 binary sidecar 和 summary 中，绝不伪造占位 API。`not_found_in_static_analysis` 只代表当前已声明范围内未发现路径，不代表确认不受影响。若 strict 失败，上一份完整输出不被覆盖；fallback 只有整代重建纯 legacy 结果一种形式，并会明确标记不满足 binary support manifest。
 
 ## 运行监控与性能诊断
 
@@ -159,6 +194,7 @@ evidence/api_changes/
 | `*_binary.txt` / `*_binary.xml` | JApiCmp 原始证据 | 二进制兼容性变化来源 |
 | `*_gitdiff_api_changes.txt` | 依赖源码 git diff 证据 | 行为变化、源码级 API 变化 |
 | `*_removed_symbols.txt` | removed jar 的旧版 public/protected 符号导出 | 删除依赖场景目标池是否完整 |
+| `binary_first_shadow.json` | 仅在 `engine_mode=shadow` 时生成的最终 JAR 方法实现影子对账 | 只用于迁移审计；固定不进入正式 API 目标、影响计数或 Step6，不得当作 runtime-effective 变化结论 |
 
 Step4 还会从 old/current 最终 JAR 识别 DTO/数据对象的实例字段新增、删除和类型变化。`all_changed_apis.csv` 中对应的 `change_type` 为 `DATA_FIELD_ADDED`、`DATA_FIELD_REMOVED` 或 `DATA_FIELD_TYPE_CHANGED`，`old_value` / `new_value` 展示字段类型变化，`data_contract_evidence` 展示为何把该类识别为数据对象。该事实不代表数据库字段已经同步或不匹配。
 

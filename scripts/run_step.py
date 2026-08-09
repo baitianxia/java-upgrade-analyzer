@@ -37,6 +37,16 @@ from path_runtime import (
 )
 from csv_io import open_csv_read, open_csv_write
 from analysis_contract import build_project_scope, discover_project_modules, write_coverage_report
+from binary_first_contract import (
+    BinaryFirstContractError,
+    ENGINE_MODES,
+    require_implemented_engine_mode,
+)
+from binary_compat_output import (
+    BINARY_OUTPUT_RELATIVE_PATH,
+    ENGINE_DESCRIPTOR_RELATIVE_PATH,
+    write_engine_descriptor,
+)
 from diagnostic_contract import canonical_reason_code, normalize_diagnostic_payload
 from pipeline_constants import (
     DELIVERABLES_DIRNAME,
@@ -132,6 +142,8 @@ INTENT_PATCH_ALLOWED_SET_FIELDS = {
     "allow_degraded",
     "accept_suggested_mappings",
     "analysis_mode",
+    "engine_mode",
+    "binary_pipeline_config",
     "active_maven_profiles",
     "base_artifact_path",
     "base_branch",
@@ -2094,6 +2106,16 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
     if "analysis_mode" in response:
         updated["analysis_mode"] = normalize_analysis_mode(response.get("analysis_mode"), allow_empty=True)
         updated = apply_explicit_step1_mode_selection(updated)
+    if "engine_mode" in response:
+        updated["engine_mode"] = normalize_binary_engine_mode(
+            response.get("engine_mode")
+        )
+    if isinstance(response.get("binary_pipeline_config"), str) and response.get(
+        "binary_pipeline_config"
+    ).strip():
+        updated["binary_pipeline_config"] = absolutize_path(
+            response["binary_pipeline_config"].strip(), project_dir
+        )
 
     for key in ("base_branch", "current_branch", "target_module", "primary_module", "tool"):
         value = response.get(key)
@@ -2570,6 +2592,31 @@ def normalize_analysis_mode(raw_value, *, allow_empty=False):
     if value not in {"artifact_inputs", "checkout_build"}:
         raise StepError("analysis_mode 仅支持 artifact_inputs 或 checkout_build")
     return value
+
+
+def normalize_binary_engine_mode(raw_value):
+    try:
+        return require_implemented_engine_mode(raw_value or "legacy")
+    except BinaryFirstContractError as exc:
+        raise StepError(f"{exc.reason_code}: {exc}") from exc
+
+
+def validate_binary_engine_mode_transition(previous_mode, requested_mode, step_id):
+    # Runs created before this field existed were legacy-authoritative. Treat
+    # an absent persisted value as legacy so a resumed Step5/6 cannot silently
+    # opt into shadow without regenerating Step4 evidence.
+    previous = normalize_binary_engine_mode(previous_mode or "legacy")
+    requested = normalize_binary_engine_mode(requested_mode)
+    if (
+        previous != requested
+        and step_id in STEP_SEQUENCE
+        and step_index(step_id) > step_index("step4")
+    ):
+        raise StepError(
+            "BINARY_ENGINE_MODE_CHANGE_REQUIRES_STEP4_RESTART: "
+            f"engine_mode {previous}→{requested} 必须从 step4 重跑"
+        )
+    return requested
 
 
 def apply_explicit_step1_mode_selection(run_context):
@@ -4265,6 +4312,8 @@ def infer_non_pending_target_step_from_payload(user_response):
             "step4",
             {
                 "dependency_git_ref_overrides",
+                "engine_mode",
+                "binary_pipeline_config",
                 "step4_fetch_timeout",
                 "step4_tool_install_timeout",
                 "step4_git_diff_timeout",
@@ -5559,6 +5608,20 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
             None,
         ),
         "analysis_mode": normalize_analysis_mode(merged.get("analysis_mode"), allow_empty=True),
+        "engine_mode": normalize_binary_engine_mode(
+            resolve_value(
+                cli_scalar(getattr(args, "engine_mode", "")),
+                merged,
+                "engine_mode",
+                "legacy",
+            )
+        ),
+        "binary_pipeline_config": resolve_value(
+            cli_scalar(getattr(args, "binary_pipeline_config", "")),
+            merged,
+            "binary_pipeline_config",
+            "",
+        ),
         "base_artifact_path": resolve_value(cli_scalar(args.base_artifact_path), merged, "base_artifact_path", ""),
         "current_artifact_path": resolve_value(cli_scalar(args.current_artifact_path), merged, "current_artifact_path", ""),
         "base_source_project_dir": resolve_value(cli_scalar(args.base_source_project_dir), merged, "base_source_project_dir", ""),
@@ -5598,6 +5661,7 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
         "current_source_project_dir",
         "base_jdk_home",
         "current_jdk_home",
+        "binary_pipeline_config",
     ):
         path_value = result.get(path_key)
         if isinstance(path_value, str) and path_value.strip():
@@ -5801,19 +5865,31 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
 
 
 def validate_run_context_for_step(step_id, run_context):
+    engine_mode = normalize_binary_engine_mode(run_context.get("engine_mode") or "legacy")
+    binary_authoritative = engine_mode in {
+        "binary_strict", "binary_with_legacy_fallback"
+    }
     source_dirs = list(run_context.get("source_dirs") or [])
     source_dirs_status = str(run_context.get("source_dirs_status") or "").strip() or "missing"
     dependency_source_mapping_conflicts = list(run_context.get("dependency_source_mapping_conflicts") or [])
     unmapped_dependency_coords = list(run_context.get("unmapped_dependency_coords") or [])
 
-    if step_id in ("step3", "step4", "step5") and not source_dirs:
+    if step_id in ("step3", "step4", "step5") and not source_dirs and not (
+        binary_authoritative and step_id in {"step4", "step5"}
+    ):
         raise StepError(
             "未确认业务源码目录 source_dirs。请回到 Step2 补充或确认 source_dirs 后再继续；"
             "不要依赖后续步骤临时自动探测。"
         )
-    if step_id in ("step3", "step4", "step5") and source_dirs_status == "missing":
+    if step_id in ("step3", "step4", "step5") and source_dirs_status == "missing" and not (
+        binary_authoritative and step_id in {"step4", "step5"}
+    ):
         raise StepError("业务源码目录仍处于 missing 状态，请先在 Step2 确认 source_dirs。")
-    if step_id in ("step4", "step5") and dependency_source_mapping_conflicts:
+    if (
+        step_id in ("step4", "step5")
+        and dependency_source_mapping_conflicts
+        and not binary_authoritative
+    ):
         conflict_coords = [str(item.get("coord") or "").strip() for item in dependency_source_mapping_conflicts if item.get("coord")]
         raise StepError(
             "dependency_source_dirs 存在坐标冲突，无法保证源码映射正确。"
@@ -9983,6 +10059,19 @@ def apply_user_response_to_main_state(main_state, pending_interaction, user_resp
     step_id = str(target_step_id or pending_step_id or "").strip()
     if not step_id:
         return main_state, {}
+    engine_mode_update_requested = bool(
+        "engine_mode" in user_response
+        or "engine_mode" in set(user_response.get("__clear_fields") or [])
+    )
+    if (
+        engine_mode_update_requested
+        and step_id in STEP_SEQUENCE
+        and step_index(step_id) > step_index("step4")
+    ):
+        raise StepError(
+            "BINARY_ENGINE_MODE_CHANGE_REQUIRES_STEP4_RESTART: "
+            "engine_mode 只能通过 restart_from_step=step4 修改"
+        )
     action = str((user_response or {}).get("action") or "").strip()
     scope_mode = normalize_step5_scope_mode(
         user_response.get("scope_mode"),
@@ -11138,11 +11227,222 @@ def cleanup_step_outputs(step_id, report_dir):
         cleanup_step3_candidate_outputs(report_dir)
 
 
+def _engine_generation_descriptor(report_dir):
+    path = Path(report_dir).resolve() / ENGINE_DESCRIPTOR_RELATIVE_PATH
+    if not path.is_file():
+        return {}
+    try:
+        payload = read_json(path)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise StepError(
+            f"BINARY_ENGINE_DESCRIPTOR_INVALID: {path}: {exc}"
+        ) from exc
+    return payload if isinstance(payload, dict) else {}
+
+
+def _binary_pipeline_config_path(run_context, project_dir):
+    value = str(run_context.get("binary_pipeline_config") or "").strip()
+    if not value:
+        raise StepError(
+            "BINARY_PIPELINE_CONFIG_REQUIRED: binary 模式需要显式的 "
+            "binary_pipeline_config，以固定 base/current runtime closure、"
+            "有序运行路径、目标 JDK、loader/resource policy 和 entrypoint。"
+        )
+    path = Path(value)
+    if not path.is_absolute():
+        path = Path(project_dir) / path
+    path = path.resolve()
+    ensure_exists(path, f"BINARY_PIPELINE_CONFIG_MISSING: {path}")
+    return path
+
+
+def _legacy_step4_command(dep_changes, context_json, s4_dir, report_dir, engine_mode="legacy"):
+    return [
+        "--dep-changes", str(dep_changes),
+        "--context", str(context_json),
+        "--output-dir", str(s4_dir),
+        "--coverage-output", str(runtime_coverage_dir(report_dir) / "s4_coverage.json"),
+        "--engine-mode", engine_mode,
+    ]
+
+
+def _record_binary_failure(report_dir, requested_mode, config_path, exc):
+    failure = {
+        "schema": "java-upgrade-analyzer.binary-generation-failure.v1",
+        "requested_engine_mode": requested_mode,
+        "binary_pipeline_config": str(config_path or ""),
+        "failure_type": type(exc).__name__,
+        "failure_message": str(exc),
+        "failure_reason_codes": list(getattr(exc, "reason_codes", []) or []),
+        "fallback_scope": "whole_generation_only",
+        "per_edge_fallback_allowed": False,
+    }
+    identity = hashlib.sha256(
+        json.dumps(failure, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    failure["binary_failure_identity"] = identity
+    destination = (
+        Path(report_dir).resolve()
+        / BINARY_OUTPUT_RELATIVE_PATH
+        / "binary_failures"
+        / f"{identity}.json"
+    )
+    write_json(destination, failure)
+    return failure, destination
+
+
+def _run_binary_step4(
+    *, requested_mode, run_context, project_dir, report_dir, s4_dir,
+    dep_changes, context_json,
+):
+    config_path = None
+    binary_root = report_dir / BINARY_OUTPUT_RELATIVE_PATH
+    active_path = binary_root / "active_binary_generation.json"
+    engine_path = report_dir / ENGINE_DESCRIPTOR_RELATIVE_PATH
+    previous_active = read_json(active_path) if active_path.is_file() else None
+    previous_engine = read_json(engine_path) if engine_path.is_file() else None
+    try:
+        config_path = _binary_pipeline_config_path(run_context, project_dir)
+        result_path = runtime_state_dir(report_dir) / "binary_pipeline_result.json"
+        run_python(
+            "binary_pipeline.py",
+            [
+                "--config", str(config_path),
+                "--output-root", str(binary_root),
+                "--engine-mode", requested_mode,
+                "--result-json", str(result_path),
+            ],
+            project_dir,
+            report_dir=report_dir,
+        )
+        result = read_json(result_path)
+        if (
+            result.get("validation_status") != "passed"
+            or not result.get("result_generation_identity")
+            or not result.get("analysis_context_identity")
+        ):
+            raise StepError(
+                "BINARY_PIPELINE_RESULT_INVALID: generation 未通过独立验证或身份缺失"
+            )
+        descriptor_path = write_engine_descriptor(report_dir, {
+            "requested_engine_mode": requested_mode,
+            "authoritative_engine": "binary",
+            "result_generation_identity": result["result_generation_identity"],
+            "analysis_context_identity": result["analysis_context_identity"],
+            "validation_run_identity": result.get("validation_run_identity"),
+            "binary_pipeline_config": str(config_path),
+            "binary_pipeline_result": str(result_path),
+            "fallback_used": False,
+        })
+        run_python(
+            "binary_compat_output.py",
+            [
+                "--phase", "step4",
+                "--report-dir", str(report_dir),
+                "--output-dir", str(s4_dir),
+            ],
+            project_dir,
+            report_dir=report_dir,
+        )
+        return {"descriptor": str(descriptor_path), "result": result}
+    except StepError as exc:
+        # Pipeline activation and compatibility publication form one logical
+        # transaction for orchestrator consumers.  If compatibility projection
+        # fails after validation activated a new pointer, restore the prior
+        # complete pointer/engine descriptor; immutable generation data remains
+        # available for audit.
+        if previous_active is None:
+            if active_path.exists():
+                active_path.unlink()
+        else:
+            write_json(active_path, previous_active)
+        if previous_engine is None:
+            if engine_path.exists():
+                engine_path.unlink()
+        else:
+            write_json(engine_path, previous_engine)
+        failure, failure_path = _record_binary_failure(
+            report_dir, requested_mode, config_path, exc
+        )
+        if requested_mode != "binary_with_legacy_fallback":
+            raise StepError(
+                f"BINARY_STRICT_GENERATION_FAILED: {exc}; failure={failure_path}",
+                reason_codes=(
+                    list(getattr(exc, "reason_codes", []) or [])
+                    + ["BINARY_STRICT_GENERATION_FAILED"]
+                ),
+            ) from exc
+        # The binary staging generation is not used.  Rebuild the complete
+        # legacy Step4 output from the beginning; no decision or edge is mixed.
+        cleanup_step_outputs("step4", report_dir)
+        run_python(
+            "s4_jar_compare.py",
+            _legacy_step4_command(
+                dep_changes, context_json, s4_dir, report_dir, "legacy"
+            ),
+            project_dir,
+            report_dir=report_dir,
+        )
+        write_engine_descriptor(report_dir, {
+            "requested_engine_mode": requested_mode,
+            "authoritative_engine": "legacy_fallback",
+            "engine_mode": "legacy_fallback",
+            "binary_failure_identity": failure["binary_failure_identity"],
+            "binary_failure_path": str(failure_path),
+            "binary_pipeline_config": str(config_path or ""),
+            "fallback_used": True,
+            "fallback_scope": "whole_generation_only",
+            "binary_support_manifest_satisfied": False,
+            "accuracy_boundary": (
+                "legacy source-first generation; does not claim binary support-manifest coverage"
+            ),
+        })
+        return {"fallback": True, "failure": failure}
+
+
+def _run_optional_full_shadow(run_context, project_dir, report_dir, s4_dir):
+    value = str(run_context.get("binary_pipeline_config") or "").strip()
+    if not value:
+        return
+    config_path = _binary_pipeline_config_path(run_context, project_dir)
+    shadow_root = runtime_dir(report_dir) / "binary_shadow"
+    shadow_result = s4_dir / "binary_full_shadow_result.json"
+    try:
+        run_python(
+            "binary_pipeline.py",
+            [
+                "--config", str(config_path),
+                "--output-root", str(shadow_root),
+                "--engine-mode", "shadow",
+                "--result-json", str(shadow_result),
+            ],
+            project_dir,
+            report_dir=report_dir,
+        )
+    except StepError as exc:
+        failure, failure_path = _record_binary_failure(
+            report_dir, "shadow", config_path, exc
+        )
+        write_json(s4_dir / "binary_full_shadow_failure.json", {
+            **failure,
+            "failure_path": str(failure_path),
+            "legacy_authority_affected": False,
+        })
+
+
 def execute_step(step_id, args, manifest_steps, run_context, main_state=None):
     project_dir = Path(args.project_dir).resolve()
     report_dir = Path(args.report_dir).resolve()
     report_dir.mkdir(parents=True, exist_ok=True)
-    cleanup_step_outputs(step_id, report_dir)
+    requested_engine_mode = normalize_binary_engine_mode(
+        run_context.get("engine_mode") or "legacy"
+    )
+    preserve_previous_binary_outputs = (
+        requested_engine_mode in {"binary_strict", "binary_with_legacy_fallback"}
+        and step_id in {"step4", "step5", "step6"}
+    )
+    if not preserve_previous_binary_outputs:
+        cleanup_step_outputs(step_id, report_dir)
 
     dep_changes = step1_dep_changes_path(report_dir)
     dep_current = step1_current_resolved_path(report_dir)
@@ -11256,55 +11556,130 @@ def execute_step(step_id, args, manifest_steps, run_context, main_state=None):
         validate_run_context_for_step(step_id, run_context)
         ensure_exists(dep_changes, "Step4 缺少 evidence/dependencies/dep_changes.csv，请先执行 Step1")
         ensure_exists(context_json, "Step4 缺少 evidence/context/context.json，请先执行 Step2")
-        cmd = [
-            "--dep-changes", str(dep_changes),
-            "--context", str(context_json),
-            "--output-dir", str(s4_dir),
-            "--coverage-output", str(runtime_coverage_dir(report_dir) / "s4_coverage.json"),
-        ]
-        run_python("s4_jar_compare.py", cmd, project_dir, report_dir=report_dir)
+        if requested_engine_mode in {
+            "binary_strict", "binary_with_legacy_fallback"
+        }:
+            _run_binary_step4(
+                requested_mode=requested_engine_mode,
+                run_context=run_context,
+                project_dir=project_dir,
+                report_dir=report_dir,
+                s4_dir=s4_dir,
+                dep_changes=dep_changes,
+                context_json=context_json,
+            )
+        else:
+            run_python(
+                "s4_jar_compare.py",
+                _legacy_step4_command(
+                    dep_changes, context_json, s4_dir, report_dir,
+                    requested_engine_mode,
+                ),
+                project_dir,
+                report_dir=report_dir,
+            )
+            write_engine_descriptor(report_dir, {
+                "requested_engine_mode": requested_engine_mode,
+                "authoritative_engine": "legacy",
+                "engine_mode": "legacy",
+                "fallback_used": False,
+                "shadow_enabled": requested_engine_mode == "shadow",
+            })
+            if requested_engine_mode == "shadow":
+                _run_optional_full_shadow(
+                    run_context, project_dir, report_dir, s4_dir
+                )
 
     elif step_id == "step5":
         validate_run_context_for_step(step_id, run_context)
-        all_changed_apis = s4_dir / "all_changed_apis.csv"
-        ensure_exists(all_changed_apis, "Step5 缺少 all_changed_apis.csv，请先执行 Step4")
-        step5_all_changed_apis, _selection_summary = materialize_step5_all_changed_apis_input(
-            all_changed_apis,
-            report_dir,
-            run_context,
+        engine_descriptor = _engine_generation_descriptor(report_dir)
+        authoritative_engine = str(
+            engine_descriptor.get("authoritative_engine") or ""
         )
-        cmd = [
-            "--all-changed-apis", str(step5_all_changed_apis),
-            "--jdk-scan-dir", str(evidence_static_scan_dir(report_dir)),
-            "--report-dir", str(report_dir),
-            "--output-dir", str(step5_call_chain_dir(report_dir)),
-            "--query-index", str(step5_query_index_path(report_dir)),
-        ]
-        step5_timeout = run_context.get("step5_timeout")
-        if step5_timeout not in (None, ""):
-            step5_timeout = parse_positive_int_like(step5_timeout, "step5_timeout")
+        if authoritative_engine == "binary":
+            if requested_engine_mode not in {
+                "binary_strict", "binary_with_legacy_fallback"
+            }:
+                raise StepError(
+                    "BINARY_ENGINE_MODE_CHANGE_REQUIRES_STEP4_RESTART: "
+                    "Step5 请求模式与 Step4 binary generation 不一致"
+                )
+            run_python(
+                "binary_compat_output.py",
+                [
+                    "--phase", "step5",
+                    "--report-dir", str(report_dir),
+                    "--output-dir", str(step5_call_chain_dir(report_dir)),
+                ],
+                project_dir,
+                report_dir=report_dir,
+            )
         else:
-            step5_timeout = None
-        run_python(
-            "s5_call_chain_engine_integrated.py",
-            cmd,
-            project_dir,
-            report_dir=report_dir,
-            timeout=step5_timeout,
-        )
+            if (
+                requested_engine_mode == "binary_strict"
+                or (
+                    requested_engine_mode == "binary_with_legacy_fallback"
+                    and authoritative_engine != "legacy_fallback"
+                )
+            ):
+                raise StepError(
+                    "BINARY_ENGINE_DESCRIPTOR_REQUIRED: Step5 必须消费 Step4 发布的同一代 binary 或整代 fallback 描述。"
+                )
+            cleanup_step_outputs("step5", report_dir)
+            all_changed_apis = s4_dir / "all_changed_apis.csv"
+            ensure_exists(all_changed_apis, "Step5 缺少 all_changed_apis.csv，请先执行 Step4")
+            step5_all_changed_apis, _selection_summary = materialize_step5_all_changed_apis_input(
+                all_changed_apis,
+                report_dir,
+                run_context,
+            )
+            cmd = [
+                "--all-changed-apis", str(step5_all_changed_apis),
+                "--jdk-scan-dir", str(evidence_static_scan_dir(report_dir)),
+                "--report-dir", str(report_dir),
+                "--output-dir", str(step5_call_chain_dir(report_dir)),
+                "--query-index", str(step5_query_index_path(report_dir)),
+            ]
+            step5_timeout = run_context.get("step5_timeout")
+            if step5_timeout not in (None, ""):
+                step5_timeout = parse_positive_int_like(step5_timeout, "step5_timeout")
+            else:
+                step5_timeout = None
+            run_python(
+                "s5_call_chain_engine_integrated.py",
+                cmd,
+                project_dir,
+                report_dir=report_dir,
+                timeout=step5_timeout,
+            )
 
     elif step_id == "step6":
         ensure_exists(step5_call_chain_dir(report_dir) / "summary.json", "Step6 缺少 Step5 的 summary.json，请先执行 Step5")
-        run_python(
-            "s6_report.py",
-            [
-                "--report-dir", str(report_dir),
-                "--output-findings", str(s6_findings_path(report_dir)),
-                "--output-report", str(s6_report_path(report_dir)),
-            ],
-            project_dir,
-            report_dir=report_dir,
-        )
+        engine_descriptor = _engine_generation_descriptor(report_dir)
+        if engine_descriptor.get("authoritative_engine") == "binary":
+            run_python(
+                "binary_compat_output.py",
+                [
+                    "--phase", "step6",
+                    "--report-dir", str(report_dir),
+                    "--output-findings", str(s6_findings_path(report_dir)),
+                    "--output-report", str(s6_report_path(report_dir)),
+                ],
+                project_dir,
+                report_dir=report_dir,
+            )
+        else:
+            cleanup_step_outputs("step6", report_dir)
+            run_python(
+                "s6_report.py",
+                [
+                    "--report-dir", str(report_dir),
+                    "--output-findings", str(s6_findings_path(report_dir)),
+                    "--output-report", str(s6_report_path(report_dir)),
+                ],
+                project_dir,
+                report_dir=report_dir,
+            )
     else:
         raise StepError(f"未知 step: {step_id}")
 
@@ -11361,10 +11736,24 @@ def main(argv=None, _skip_environment_contract=False):
     ap.add_argument("--current-source-project-dir", default="")
     ap.add_argument("--base-jdk-home", default="")
     ap.add_argument("--current-jdk-home", default="")
+    ap.add_argument(
+        "--binary-pipeline-config",
+        default="",
+        help="binary-first v1 输入快照；binary 模式必填，shadow 模式可选。",
+    )
     ap.add_argument("--include-test-scope", action="store_true")
     ap.add_argument("--max-depth", type=int, default=None)
     ap.add_argument("--allow-degraded", action="store_true")
     ap.add_argument("--strict-risk-gate", action="store_true")
+    ap.add_argument(
+        "--engine-mode",
+        choices=ENGINE_MODES,
+        default="",
+        help=(
+            "分析引擎策略；binary_strict 失败关闭，"
+            "binary_with_legacy_fallback 仅允许整代 legacy 回退。"
+        ),
+    )
     ap.add_argument("--primary-module", default="")
     ap.add_argument("--target-module", default="", help="本次分析唯一的目标部署模块；新流程优先使用")
     ap.add_argument("--tool", choices=["maven", "gradle"], default="")
@@ -11531,6 +11920,11 @@ def main(argv=None, _skip_environment_contract=False):
         base_context,
         seed_payload,
         allow_external_seed=not bool(base_context),
+    )
+    run_context["engine_mode"] = validate_binary_engine_mode_transition(
+        base_context.get("engine_mode"),
+        run_context.get("engine_mode"),
+        step_id,
     )
     if step_id == "step1":
         run_context = _discard_unpinned_local_source_discovery(run_context)

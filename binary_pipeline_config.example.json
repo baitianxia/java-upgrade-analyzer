@@ -1,0 +1,161 @@
+{
+  "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+  "base": {
+    "jdk_home": "/abs/path/to/base-full-jdk",
+    "artifacts": [
+      {
+        "path": "/abs/path/to/base/app.jar",
+        "logical_location": "app/app.jar",
+        "loader_realm": "application-loader",
+        "path_kind": "classpath",
+        "slot": 0,
+        "coord": "com.example:app:1.0.0",
+        "lineage": "com.example:app",
+        "runtime_code_source_origin_identity": "deployment-app"
+      },
+      {
+        "path": "/abs/path/to/base/lib/example-api-1.0.0.jar",
+        "logical_location": "lib/example-api.jar",
+        "loader_realm": "application-loader",
+        "path_kind": "classpath",
+        "slot": 1,
+        "coord": "com.example:example-api:1.0.0",
+        "lineage": "com.example:example-api",
+        "runtime_code_source_origin_identity": "deployment-example-api"
+      }
+    ],
+    "runtime_profile": {
+      "container_and_launcher_kind": "java-classpath",
+      "loader_topology": {
+        "coverage_status": "complete",
+        "entrypoint_realms": [
+          "application-loader"
+        ],
+        "realms": [
+          {
+            "identity": "platform-loader",
+            "kind": "platform",
+            "delegation": "parent_first",
+            "module_mode": "named-platform"
+          },
+          {
+            "identity": "application-loader",
+            "kind": "application",
+            "parent": "platform-loader",
+            "delegation": "parent_first",
+            "module_mode": "unnamed"
+          }
+        ]
+      },
+      "runtime_security_and_package_sealing_policy_identity": "standard-unsealed-unsigned-v1",
+      "active_profile_identities": [
+        "production"
+      ],
+      "external_config_snapshot_identities": [],
+      "agent_transformer_plugin_profile_identities": [],
+      "business_entrypoint_profile": {
+        "coverage_status": "complete",
+        "methods": [
+          {
+            "initiating_loader_realm_identity": "application-loader",
+            "class_name": "com/example/app/Main",
+            "member_name": "main",
+            "descriptor": "([Ljava/lang/String;)V"
+          }
+        ]
+      },
+      "runtime_class_closure_coverage_status": "complete",
+      "resource_selection_coverage_status": "complete"
+    }
+  },
+  "current": {
+    "jdk_home": "/abs/path/to/current-full-jdk",
+    "artifacts": [
+      {
+        "path": "/abs/path/to/current/app.jar",
+        "logical_location": "app/app.jar",
+        "loader_realm": "application-loader",
+        "path_kind": "classpath",
+        "slot": 0,
+        "coord": "com.example:app:2.0.0",
+        "lineage": "com.example:app",
+        "runtime_code_source_origin_identity": "deployment-app"
+      },
+      {
+        "path": "/abs/path/to/current/lib/example-api-2.0.0.jar",
+        "logical_location": "lib/example-api.jar",
+        "loader_realm": "application-loader",
+        "path_kind": "classpath",
+        "slot": 1,
+        "coord": "com.example:example-api:2.0.0",
+        "lineage": "com.example:example-api",
+        "runtime_code_source_origin_identity": "deployment-example-api"
+      }
+    ],
+    "runtime_profile": {
+      "container_and_launcher_kind": "java-classpath",
+      "loader_topology": {
+        "coverage_status": "complete",
+        "entrypoint_realms": [
+          "application-loader"
+        ],
+        "realms": [
+          {
+            "identity": "platform-loader",
+            "kind": "platform",
+            "delegation": "parent_first",
+            "module_mode": "named-platform"
+          },
+          {
+            "identity": "application-loader",
+            "kind": "application",
+            "parent": "platform-loader",
+            "delegation": "parent_first",
+            "module_mode": "unnamed"
+          }
+        ]
+      },
+      "runtime_security_and_package_sealing_policy_identity": "standard-unsealed-unsigned-v1",
+      "active_profile_identities": [
+        "production"
+      ],
+      "external_config_snapshot_identities": [],
+      "agent_transformer_plugin_profile_identities": [],
+      "business_entrypoint_profile": {
+        "coverage_status": "complete",
+        "methods": [
+          {
+            "initiating_loader_realm_identity": "application-loader",
+            "class_name": "com/example/app/Main",
+            "member_name": "main",
+            "descriptor": "([Ljava/lang/String;)V"
+          }
+        ]
+      },
+      "runtime_class_closure_coverage_status": "complete",
+      "resource_selection_coverage_status": "complete"
+    }
+  },
+  "runtime_comparison": {
+    "comparison_intent": "same_deployment_profile",
+    "profile_correspondence_policy_version": "v1",
+    "controlled_profile_fields": [
+      "loader_topology"
+    ],
+    "declared_upgrade_payload_scope": [
+      "artifact-bytes"
+    ],
+    "changed_or_unknown_profile_fields": []
+  },
+  "source_overlay": {
+    "source_root": "/abs/path/to/current/source-snapshot",
+    "source_dirs": [
+      "/abs/path/to/current/source-snapshot/src/main/java"
+    ],
+    "owner_type": "business",
+    "owner_coord": "com.example:app:2.0.0",
+    "module": "app"
+  },
+  "max_trace_nodes": 1000000,
+  "max_paths_per_target": 20
+}

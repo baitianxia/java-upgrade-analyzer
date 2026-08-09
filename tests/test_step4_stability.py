@@ -2883,6 +2883,167 @@ public class com.acme.Api {
             "recovered_with_final_jar_method_bytecode_diff",
         )
 
+    def test_shadow_mode_always_compares_final_jars_without_changing_targets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            output_dir = report_dir / "evidence" / "api_changes"
+            japicmp_jar = report_dir / "japicmp.jar"
+            japicmp_jar.write_bytes(b"tool")
+            old_jar = report_dir / "old.jar"
+            new_jar = report_dir / "new.jar"
+            for path, payload in ((old_jar, b"old"), (new_jar, b"new")):
+                with zipfile.ZipFile(path, "w") as archive:
+                    archive.writestr("com/acme/Api.class", payload)
+            dep_changes = report_dir / "dep_changes.csv"
+            context_json = report_dir / "context.json"
+            dep_changes.write_text(
+                "coord,old_version,new_version,change_type,scope\n"
+                "com.acme:acct-sdk,1.0.0,2.0.0,小版本升级,compile\n",
+                encoding="utf-8",
+            )
+            context_json.write_text(
+                json.dumps({"changed_dependencies": [{"coord": "com.acme:acct-sdk"}]}),
+                encoding="utf-8",
+            )
+            evidence_path = output_dir / "acct-sdk_bytecode_behavior.json"
+            binary_row = {
+                "coord": "com.acme:acct-sdk",
+                "old_version": "1.0.0",
+                "new_version": "2.0.0",
+                "change_type": "BEHAVIOR_CHANGED",
+                "api_name": "com.acme.Api.run",
+                "api_simple": "run",
+                "symbol_kind": "method",
+                "api_signature": "()",
+                "confirmed": "true",
+                "severity": "P2",
+                "source": "jar_bytecode",
+                "reason_code": "FINAL_JAR_METHOD_BODY_CHANGED",
+                "evidence_path": str(evidence_path),
+            }
+            binary_info = {
+                "old_jar": str(old_jar),
+                "new_jar": str(new_jar),
+                "external_process_count": 0,
+                "parser_mode": "xml",
+            }
+            comparison = {
+                "status": "complete",
+                "reason_code": "",
+                "rows": [binary_row],
+                "changed_methods": [{
+                    "api_name": "com.acme.Api.run",
+                    "symbol_kind": "method",
+                    "descriptor": "()V",
+                    "old_body_sha256": "a" * 64,
+                    "new_body_sha256": "b" * 64,
+                }],
+                "modified_classes": 1,
+                "scanned_classes": 1,
+                "javap_invocations": 2,
+                "old_jar_sha256": "c" * 64,
+                "new_jar_sha256": "d" * 64,
+                "evidence_path": str(evidence_path),
+                "errors": [],
+            }
+
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "s4_jar_compare.py",
+                    "--dep-changes", str(dep_changes),
+                    "--context", str(context_json),
+                    "--output-dir", str(output_dir),
+                    "--japicmp-jar", str(japicmp_jar),
+                    "--skip-changed-classes",
+                    "--engine-mode", "shadow",
+                ],
+            ), patch.object(
+                step4,
+                "run_japicmp",
+                return_value=(str(output_dir / "binary.txt"), [], binary_info, None),
+            ), patch.object(
+                step4,
+                "collect_data_contract_changes",
+                return_value=[],
+            ), patch.object(
+                step4,
+                "compare_jar_method_bodies",
+                return_value=comparison,
+            ) as compare_behavior:
+                exit_code = step4.main()
+
+            with (output_dir / "all_changed_apis.csv").open(encoding="utf-8-sig") as api_file:
+                api_rows = list(csv.DictReader(api_file))
+            shadow = json.loads(
+                (output_dir / step4.BINARY_FIRST_SHADOW_FILE).read_text(encoding="utf-8")
+            )
+            coverage = json.loads(
+                (report_dir / ".runtime/coverage/s4_coverage.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(exit_code, 0)
+        compare_behavior.assert_called_once()
+        self.assertEqual(api_rows, [])
+        self.assertFalse(shadow["production_target_set_changed"])
+        self.assertEqual(shadow["authority"], "legacy")
+        self.assertEqual(shadow["complete_dependencies"], 1)
+        self.assertEqual(
+            shadow["records"][0]["binary_changed_methods"][0]["descriptor"],
+            "()V",
+        )
+        self.assertEqual(coverage["behavior_diff"]["status"], "insufficient")
+        self.assertEqual(coverage["behavior_diff"]["metrics"]["planned_dependencies"], 1)
+        self.assertEqual(coverage["binary_behavior_shadow"]["status"], "complete")
+        self.assertEqual(
+            coverage["binary_behavior_shadow"]["metrics"]["production_target_rows_added"],
+            0,
+        )
+
+    def test_shadow_consistency_matrix_does_not_guess_overloaded_source_descriptors(self):
+        payload = step4.build_binary_first_shadow_payload(
+            [{
+                "coord": "com.acme:acct-sdk",
+                "old_version": "1.0.0",
+                "new_version": "2.0.0",
+                "status": "complete",
+                "binary_changed_methods": [
+                    {
+                        "api_name": "com.acme.Api.run",
+                        "symbol_kind": "method",
+                        "descriptor": "()V",
+                    },
+                    {
+                        "api_name": "com.acme.Api.run",
+                        "symbol_kind": "method",
+                        "descriptor": "(I)V",
+                    },
+                ],
+            }],
+            {
+                "com.acme:acct-sdk": [{
+                    "coord": "com.acme:acct-sdk",
+                    "change_type": "BEHAVIOR_CHANGED",
+                    "api_name": "com.acme.Api.run",
+                    "symbol_kind": "method",
+                    "api_signature": "(int)",
+                }]
+            },
+            engine_mode="shadow",
+        )
+
+        matrix = payload["records"][0]["consistency_matrix"]
+        self.assertEqual(
+            matrix["comparison_granularity"],
+            "owner_member_name_with_ambiguity_guard",
+        )
+        self.assertEqual(
+            matrix["ambiguous_overload_member_names"],
+            [{"api_name": "com.acme.Api.run", "symbol_kind": "method"}],
+        )
+        self.assertFalse(payload["production_target_set_changed"])
+
     def test_main_recovers_source_ref_failure_that_occurs_after_preflight(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)

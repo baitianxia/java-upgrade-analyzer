@@ -1,0 +1,219 @@
+{
+  "schema": "java-upgrade-analyzer.binary-first-support-manifest.v1",
+  "status": "binary_authority_v1_supported_scope",
+  "authority": "fixed_per_generation_engine_mode",
+  "engine_modes": {
+    "implemented": [
+      "legacy",
+      "shadow",
+      "binary_strict",
+      "binary_with_legacy_fallback"
+    ],
+    "reserved_fail_closed": [],
+    "fallback_contract": "binary failure discards the attempted generation; only binary_with_legacy_fallback may start one complete legacy_fallback generation; per-fact/per-edge mixing is forbidden"
+  },
+  "artifact_diff_support_manifest": {
+    "authority": "artifact_local_observation_then_runtime_selection_decision",
+    "parser_contract": {
+      "implementation": "scripts/java/BinaryFactExtractor.java",
+      "protocol_schema": "binary-fact-frame-v1",
+      "output_schema": "binary-class-fact-v1",
+      "asm_version": "9.9.1",
+      "asm_jar_sha256": "6f3828a215c920059a5efa2fb55c233d6c54ec5cadca99ce1b1bdd10077c7ddd",
+      "visitor_policy_version": "asm-lossless-facts-v1",
+      "supported_classfile_major_min": 45,
+      "supported_classfile_major_max": 70,
+      "unsupported_classfile_behavior": "scoped_parse_failure_no_fallback"
+    },
+    "artifact_safety_policy": {
+      "policy_version": "binary-artifact-safety-v1",
+      "max_archive_entries": 100000,
+      "max_total_uncompressed_bytes": 2147483648,
+      "max_nested_depth": 3,
+      "max_nested_archive_bytes": 67108864,
+      "max_class_bytes": 16777216,
+      "max_protocol_frame_bytes": 67108864,
+      "max_fact_records": 100000,
+      "helper_timeout_seconds": 300,
+      "helper_max_heap": "512m"
+    },
+    "classfile_attribute_policy": {
+      "policy_version": "classfile-attribute-reconciliation-v1",
+      "recognized_by_typed_facts": [
+        "AnnotationDefault",
+        "BootstrapMethods",
+        "Code",
+        "ConstantValue",
+        "Deprecated",
+        "EnclosingMethod",
+        "Exceptions",
+        "InnerClasses",
+        "MethodParameters",
+        "Module",
+        "ModuleMainClass",
+        "ModulePackages",
+        "NestHost",
+        "NestMembers",
+        "PermittedSubclasses",
+        "Record",
+        "RuntimeInvisibleAnnotations",
+        "RuntimeInvisibleParameterAnnotations",
+        "RuntimeInvisibleTypeAnnotations",
+        "RuntimeVisibleAnnotations",
+        "RuntimeVisibleParameterAnnotations",
+        "RuntimeVisibleTypeAnnotations",
+        "Signature",
+        "Synthetic"
+      ],
+      "definition_sensitive_raw": [
+        "StackMapTable"
+      ],
+      "diagnostic_only_raw": [
+        "LineNumberTable",
+        "LocalVariableTable",
+        "LocalVariableTypeTable",
+        "SourceDebugExtension",
+        "SourceFile"
+      ],
+      "unknown_behavior": "comparison_scope_incomplete"
+    },
+    "resource_policy": {
+      "policy_version": "binary-resource-classification-v1",
+      "runtime_topology": [
+        "META-INF/services/*",
+        "META-INF/spring.factories",
+        "META-INF/spring/*.imports"
+      ],
+      "operational_security": [
+        "META-INF/*.SF",
+        "META-INF/*.RSA",
+        "META-INF/*.DSA",
+        "META-INF/*.EC"
+      ],
+      "distribution_metadata": [
+        "META-INF/MANIFEST.MF"
+      ],
+      "build_metadata": [
+        "META-INF/maven/*/*/pom.properties",
+        "META-INF/maven/*/*/pom.xml"
+      ],
+      "native_extensions": [
+        "*.so",
+        "*.dll",
+        "*.dylib",
+        "*.jnilib"
+      ],
+      "unknown_behavior": "diagnostic_candidate"
+    },
+    "method_implementation": {
+      "parser": "version-locked ASM framed helper",
+      "normalization": "asm-lossless-facts-v1",
+      "supported": [
+        "same-owner same-name same-descriptor executable method comparison",
+        "private methods",
+        "constructors",
+        "class initializers",
+        "bridge, synthetic, lambda body, invokedynamic/bootstrap and constant-dynamic ASM facts"
+      ],
+      "unsupported_for_authoritative_decision": [
+        "semantic equivalence of arbitrary method bodies",
+        "signed or sealed runtime security semantics outside the explicit capability policy",
+        "agent/transformer/plugin post-transform class definitions without an explicit supported transformer profile",
+        "business behavior equivalence"
+      ]
+    }
+  },
+  "runtime_loader_support_manifest": {
+    "status": "implemented_supported_scope",
+    "authoritative_runtime_effective_decisions_allowed": true,
+    "policy_version": "binary-runtime-capability-v1",
+    "supported": {
+      "container_loader_policy_versions": [
+        "flat-parent-first-v1"
+      ],
+      "loader_realms": "finite explicitly declared topology with platform parent and unnamed application realms",
+      "delegation_for_binary_authority": [
+        "parent_first"
+      ],
+      "runtime_path_kinds": [
+        "classpath"
+      ],
+      "multi_release": "manifest Multi-Release true plus exact target JDK major",
+      "resource_selection": [
+        "classloader_first",
+        "ordered_all"
+      ],
+      "dispatch": "closed-world exact/proven/possible separation",
+      "security_policy_identities": [
+        "standard-unsealed-unsigned-v1"
+      ],
+      "transformer_profile_identities": []
+    },
+    "required_coverage": [
+      "runtime_class_closure_coverage_status=complete",
+      "resource_selection_coverage_status=complete",
+      "loader_topology.coverage_status=complete",
+      "all RuntimeProfile field_coverage values known"
+    ],
+    "unsupported_behavior": "scoped diagnostic candidate or binary generation failure; never a closed negative conclusion"
+  },
+  "class_definition_support_manifest": {
+    "status": "implemented_target_jvm_verifier_v1",
+    "definition_ready_claims_allowed": true,
+    "implementation": "scripts/java/ClassDefinitionVerifier.java",
+    "requirements": [
+      "full exact target JDK with release, lib/modules, java, javac and jmods",
+      "-Xverify:all",
+      "initialize=false",
+      "reflection member linkage without executing application class initializers"
+    ],
+    "platform_image_identity": "content-bound release/modules/java launcher identity",
+    "unsupported_behavior": "definition status unsupported/failed and affected decisions cannot become complete authoritative negatives"
+  },
+  "oracle_support_manifest": {
+    "status": "implemented_independent_validation_v1",
+    "production_binary_authority_switch_allowed": true,
+    "production_identity_influence": "none_validation_attachment_only",
+    "independent_layers": [
+      "archive and multi-release inventory",
+      "explicit cross-version lineage pairing",
+      "javap direct method/field instruction and bytecode-offset truth",
+      "independent javap structural type and class-initialization truth",
+      "invokedynamic implementation handles and bootstrap linkage inventory",
+      "actual target-JVM provider and non-initializing definition observations",
+      "member resolution and closed-world dispatch",
+      "ordered resource selection",
+      "generation sidecar integrity and tamper detection"
+    ],
+    "supported_closed_scope": [
+      "flat parent-first unsigned/unsealed classpath deployment",
+      "complete explicitly ordered runtime closure",
+      "full target JDK",
+      "direct method/field/type/class-init facts",
+      "invokedynamic implementation handles; bootstrap execution remains possible rather than exact",
+      "Java javac compile-time constant inline binding only with exact source owner+field and base/current bytecode value transition"
+    ],
+    "known_exclusions": [
+      "arbitrary framework/reflection semantic activation without a mechanism-specific verifier",
+      "standalone MethodHandle/VarHandle signature-polymorphic target proof",
+      "Kotlin/Scala inline proof",
+      "post-transform agent/plugin bytecode without a declared supported transformer profile",
+      "signed/sealed security runtime equivalence"
+    ]
+  },
+  "performance_gate": {
+    "status": "passed",
+    "path": "tests/fixtures/binary_first/performance_gate.json",
+    "sha256": "210b23925d80bd9f5fd2472030e4cef39140709610c0ac0f27e46ca89810900e",
+    "dataset": "400 JAR / 100000 class / 10000 indexed API queries",
+    "warm_parser_invocations": 0,
+    "blocks_binary_authority_switch": false
+  },
+  "phase_contract": [
+    "step4a_artifact_local_diff",
+    "step5a_target_independent_reconciliation",
+    "step4b_decision_projection_freeze",
+    "step5b_trace",
+    "step6_report"
+  ]
+}

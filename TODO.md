@@ -2,15 +2,15 @@
 
 本文只记录尚未完成或尚未取得充分验证证据的工作。确认完成的项目直接删除，不在待办文档中保留历史设计正文；历史决策应进入 `docs/archive/` 或 Git 记录。
 
-状态快照日期：2026-08-05。完整原则见 [`AGENTS.md`](AGENTS.md)，当前架构和
+状态快照日期：2026-08-09。完整原则见 [`AGENTS.md`](AGENTS.md)，当前架构和
 质量上下文见 [`docs/developer/`](docs/developer/)。
 
-当前共 7 项：已完成 0、正在执行 0、待执行 7、阻塞 0、失败 0。
+当前共 2 项：已完成 0、正在执行 0、待执行 2、阻塞 0、失败 0。
 
 ## 1. 为归档安全校验建立显式策略等级
 
 - 优先级：P2。执行状态：待执行。验证状态：问题已确认，改造尚未实施或验证。
-- 已核实事实：生产代码有 10 个 `require_safe_archive` 直接调用点，分布在 7 个脚本中；另有 2 个 `inspect_archive` 调用同样继承底层默认值。10 个强制校验调用全部隐式继承条目数、总解压大小、膨胀率、嵌套深度和嵌套归档大小限制；其中 3 个还继承嵌套扫描默认值。
+- 已核实事实：生产代码有 10 个 `require_safe_archive` 直接调用点，分布在 7 个脚本中；另有 3 个直接 `inspect_archive` 调用。旧调用中的 2 个同样继承底层默认值，新 binary artifact 路径已显式传入版本化限制。10 个强制校验调用全部隐式继承条目数、总解压大小、膨胀率、嵌套深度和嵌套归档大小限制；其中 3 个还继承嵌套扫描默认值。
 - 已核实事实：`require_safe_archive(path, **limits)` 支持调用者单独覆盖限制，因此并非技术上无法收紧；缺口是没有按归档来源和消费方式强制选择的命名策略，无法集中审计和防止新调用点遗漏严格限制。
 - 风险：修改通用资源默认值会同时改变现有内部生成制品、Step1 留存依赖和完整制品扫描的性能或兼容性；未来不可信外部归档若沿用当前 `max_expansion_ratio=None` 的内部默认策略，可能引入可避免的 CPU、I/O 和解压资源消耗。
 - 无法确认：当前部署边界是否已允许攻击者可控归档进入这些路径；若已允许，本项应升级为 P1 安全项。
@@ -20,62 +20,14 @@
 历史 ZIP 的所有者决定已归档到
 [`docs/archive/2026-07-22-historical-zip-audit.md`](docs/archive/2026-07-22-historical-zip-audit.md)。
 
-## 2. 将 Step5 主图迁移为最终制品字节码事实图
+## 2. 证明 legacy Step4 源码 diff 的语义解析完整性
 
-- 优先级：P1。执行状态：待执行。验证状态：架构缺口已通过生产代码路径确认，迁移方案尚未实施或验证。
-- 已核实事实：当前 `SourceGraph` 先由业务/依赖源码建立；业务最终制品字节码随后作为 `CollectorBatch` 补边。`step5_evidence_ingestion._resolve_caller()` 要求字节码调用方唯一映射到已有源码方法，找不到或重载不唯一时以 `BYTECODE_CALLER_UNRESOLVED` 拒绝真实字节码边。
-- 已核实事实：Step1 会把 `BOOT-INF/classes` / `WEB-INF/classes` 业务内容和嵌套运行时 JAR 分别留存。业务 class 会被广泛扫描，但嵌套依赖主要围绕已选变更 API 建候选索引并按反向闭包增量扩图；`_collect_exhaustive_runtime_reference_edges()` 当前只有定义，没有进入生产主流程。因此“已为 fat JAR 全部运行时代码构建完整调用图”不是当前架构事实。
-- 已核实事实：运行时依赖扩展已经能创建仅有字节码身份的 `MethodDef`，而业务字节码初始合并仍依赖源码节点，当前实际存在两套节点建立规则。
-- 风险：源码缺失、源码与最终制品不一致、Lombok/编译器生成方法、lambda、bridge/synthetic 方法、内部类规范化和重载签名解析都可能使真实调用链断开；发现一条路径仍能证明“至少一处受影响”，但不能据此证明已经枚举全部业务入口、模块和终止路径。
-- 待办：以经过 SHA-256 验证的 current 最终制品为权威，为 `BOOT-INF/classes` / `WEB-INF/classes` 及全部留存运行时 JAR 的有效 target-JDK class variant 建立统一 JVM 节点身份；身份至少包含制品/容器、owner、member 和 descriptor。方法、字段、类型及直接可执行调用边不得因源码无法映射而丢弃。源码只作为文件、行号、模块、可读签名和源码专属语义的可选覆盖层；Spring、MyBatis、反射、配置、代理等关系保留独立的语义边类型、证据权威和置信度，不得伪装成 JVM 直接调用边。
-- 待办：统一当前源码节点和运行时 synthetic 节点的身份及去重规则；调用目标先按最终运行时 classpath 顺序、fat-JAR 容器条目、multi-release 选择和 provider 身份绑定，源码 alias 只能增强展示，不能改变最终制品事实。
-- 验收：业务或依赖 class 中可解析的真实方法/字段调用边不会再因缺少源码节点而被拒绝；无源码、生成代码、重载、内部类、lambda、bridge/synthetic、构造器、静态初始化和多版本 JAR 均有正反例；同一 JVM 方法不会产生源码/字节码重复节点；现有 `alerts.csv`、`summary.json`、Step6 和只读查询兼容，且独立字节码 Oracle 证明目标直接边无漏失或错误 provider 绑定。
-
-## 3. 持久化 Step5 事实图并改为批量多目标查询
-
-- 优先级：P1。执行状态：待执行。验证状态：性能根因已通过代码路径确认，尚无满足等价性和规模门槛的新实现。
-- 已核实事实：完整 `SourceGraph` 当前主要存在于单次 Step5 进程内；`.runtime/indexes/s5_query_index.json` 在逐 API 追踪完成后才写出，下次 Step5 不会把它作为权威事实图复用。选择单个依赖和选择全部依赖都会重新支付源码构图基线。
-- 已核实事实：运行时 member 候选索引、制品事实缓存和反向 transition 已有局部复用，但生产追踪仍逐 API 调用 `trace_api_with_confidence_weighting()`；多目标计划主要按 `(coord, owner)` 分组，不同依赖/owner 越多，共享比例越低。间接使用分析还存在 source/resource 与 target owner 的批量匹配成本，报告阶段还会按 API 和每条终止路径物化结果。
-- 风险：全量变化 API 的耗时不是“建图后按 key O(1) 查询”，而是候选发现、反向可达性、证据裁决和路径枚举随目标数、不同 owner 数、可达边数及路径数增长；重复运行和全量/部分范围切换会重复构图，影响用户等待时间。
-- 待办：在不新增外部服务依赖的前提下优先评估 SQLite 持久化事实图，至少包含 artifacts、classes、methods、direct_edges、semantic_edges、source_locations 和 coverage；为 callee JVM identity、caller identity、artifact/container 和源码 alias 建反向索引。缓存身份必须绑定最终制品 SHA-256、各留存运行时 JAR SHA-256、target JDK、运行时 classpath 顺序、解析器/模式版本和适用的源码 revision，任何身份变化都必须精确失效，禁止复用陈旧图。
-- 待办：把“所有变更 API”作为一次多源反向传播/标签传播任务，复用跨 coord/owner 的目标无关 transition；每个 API 的 overload、证据权威、置信度和最终状态仍独立裁决。间接引用和资源扫描先建立 owner/member 倒排事实，再按目标投影覆盖矩阵，避免 resource × owner/API 的重复字符串扫描。
-- 验收：冷运行结果与当前权威基线逐 API、逐唯一终止路径等价；暖运行和全量/部分范围切换不重新解析身份未变化的 class；记录冷/暖构图、索引加载、批量传播、逐 API 裁决和缓存失效指标。在至少 400 个 JAR、10 万 class 和大批量 API 的规模档位上验证端到端耗时、峰值 RSS、磁盘占用和查询延迟；性能优化不得降低准确性或把缓存故障静默降级为确定结论。
-
-## 4. 建立可证明的调用图完整性与结论边界
-
-- 优先级：P1。执行状态：待执行。验证状态：已有部分失败关闭保护，但尚不能证明按需闭包等价于完整最终制品图。
-- 已核实事实：当前已有 `max_methods` 截断、每个反向键边上限、业务字节码 class 扫描上限、解析失败、`BYTECODE_CALLER_UNRESOLVED` 和运行时扩展失败等记录；无路径且图不完整时通常会收敛为 `ANALYSIS_INCOMPLETE` / `not_analyzed`，而不是直接宣称未影响。
-- 已核实事实：命中一条可信路径足以证明“至少存在影响”，即使其他图区域不完整；但当前成功命中可以在全局完整性检查之前返回 `reachable`，因此布尔命中和“已完整枚举所有入口/路径”不能视为同一保证。当前也没有生产不变量证明目标驱动闭包与 fat-JAR 全量字节码图上的反向闭包相等。
-- 风险：缺边最直接影响召回率和路径完整性；若覆盖缺口未正确传播到目标 API，会产生假阴性。即使 `reachable` 为真，遗漏其他入口、模块或终止路径仍会使风险范围、整改工作量和报告台账不完整。
-- 待办：建立逐制品、逐 class、逐方法/字段和逐边的完整性账本。至少满足“物理有效 class 总数 = 成功解析 class 数 + 有稳定原因码的失败 class 数”，并记录有效 multi-release 选择、方法/字段清单、可执行边数量、跳过原因、边上限、截断、provider 冲突和动态语义覆盖。任何静默跳过均视为验证失败。
-- 待办：把结论拆成“存在性证明”和“闭集完整性证明”。已验证路径可以保持受影响结论，但必须同时暴露路径枚举是否完整；只有目标相关直接图、语义分析和查询闭包均完整时，才允许输出闭集意义的无影响/完整路径结论。部分覆盖不得仅以全局告警存在，必须可追溯到受影响的 API、路径或能力族。
-- 待办：用独立于生产图构建器和查询器的最终制品 Oracle，对全部 runtime class 建立直接边真值并比较目标反向闭包；加入删边、错 descriptor、错 provider、漏 class、命中上限、解析器失败、缓存污染和路径丢失 mutation，证明质量门能发现回退。
-- 验收：所有测试和真实工程审计中，Oracle 已确认可达但产品输出闭集无影响的数量必须为 0；普通 JVM 方法/字段直接边和目标反向闭包达到全量一致，动态机制按能力族明确适用边界；`reachable` 报告能区分“至少一条路径已证实”和“所有路径已完整枚举”；任何失败或截断都产生稳定原因码、证据位置和可执行恢复建议。
-
-## 5. 收敛静态字段与编译期常量的分析和用户语义
-
-- 优先级：P2。执行状态：待执行。验证状态：底层能力和测试已存在，但用户观察到的通用“静态变量不能分析”表达尚未完成真实场景复现和端到端语义审计。
-- 已核实事实：Step4/Step5 已支持 `symbol_kind=field`、精确 owner/name/descriptor 字段引用、`getstatic` 等当前制品链接证据及 `ConstantValue`/编译期内联常量分类；当直接字段证据未命中时，部分路径仍会回落到通用 `CALL_GRAPH_LIMITATION_SYMBOL_KIND`，编译期内联常量使用点则可能输出 `INLINED_CONSTANT_USAGE_UNDETECTABLE`。
-- 风险：把普通静态字段、实例字段、运行时读取的 `static final` 对象和已内联的 primitive/String 编译期常量统一描述为“静态变量无法分析”，会掩盖已经可确认的影响并让用户误解能力边界；反过来，把当前制品没有 fieldref 解释为未使用，也会漏掉旧调用方字节码中已经内联的常量值。
-- 无法确认：用户遇到的具体字段类型、变更类型、制品证据和触发的 reason code 尚未留存在本任务上下文；实施前必须先用真实输出或最小复现确认是能力缺口、目标身份缺口还是仅报告文案问题。
-- 待办：把字段作为字节码事实图中的一等节点和边，统一 `getstatic`、`putstatic`、`getfield`、`putfield`、反射字段访问、源码/static import 及常量影响证据；明确拆分“运行时链接影响”“重新编译影响”“编译期值已内联且无法仅凭 current fieldref 穷举使用点”和“证据不完整”。只在确有适用能力缺口时使用受限结论，不得对所有 static 字段使用通用调用图限制文案。
-- 验收：普通 static/instance 字段、可变 static 字段、非编译期 `static final`、primitive/String `ConstantValue`、删除/值变化、同名不同 owner、错误 descriptor、反射和 static import 均有端到端正反例；每个结果输出具体字段身份、compile/runtime 两类影响、证据来源和覆盖状态；用户界面不再出现无边界的“静态变量不能分析”，独立常量 Oracle 与生产结论保持一致。
-
-## 6. 降低 Step5 完整报告物化成本而不删减证据
-
-- 优先级：P2。执行状态：待执行。验证状态：已具备分阶段指标和 SQLite 排序实现，尚未证明大规模路径输出已达到合理下界。
-- 已核实事实：Step5 会为每个 API 生成 `by_api/*.txt` 和 `by_api/*.json`，并为每条唯一终止路径生成完整 `alerts.csv`；当前使用临时 SQLite 排序和流式写出部分控制内存，但 `report.elapsed_sec`、`by_api_elapsed_sec` 和路径数量仍会随 API 与终止路径规模增长。
-- 风险：调用路径膨胀时，重复序列化、排序、文件创建和磁盘 I/O 可能超过图查询本身；但把主台账改成样例、首条路径或静默截断会直接损害准确性和可复核性，不是可接受的性能优化。
-- 待办：在保持完整 `alerts.csv`、每个 API 至少一行、每条唯一终止路径独立可审计和现有 Step6 消费合同的前提下，评估共享路径前缀/字典编码、一次规范化后派生 TXT/JSON/CSV、批量文件写入、稳定外部排序、按需人工视图和查询索引直接复用；避免在内存中同时保留图、全部 TraceResult 展示副本和完整排序行。
-- 验收：对同一输入，新旧输出按 API 身份、状态、证据和唯一终止路径规范化后完全等价；故障中断不会留下被误认为完整的主台账；记录结果数、唯一路径数、输出字节数、文件数、排序时间、序列化时间、峰值 RSS 和吞吐量，并在路径高扇出规模档位证明耗时/内存改善。任何压缩或延迟物化都不得删除证据、改变路径顺序合同或降低 Step6/只读查询可用性。
-
-## 7. 证明 Step4 源码 diff 的语义解析完整性
-
-- 优先级：P1。执行状态：待执行。验证状态：显式失败记录路径已确认，静默漏识别风险已确认，具体方案和验收口径需后续继续讨论。
+- 优先级：P2。执行状态：待执行。验证状态：binary 权威路径已消除此依赖；显式 legacy/fallback 路径中的静默漏识别风险仍待修复和验证。
+- 迁移进度（2026-08-09）：`binary_strict` 与成功的 `binary_with_legacy_fallback` binary generation 已使用 ASM 最终制品事实、runtime-effective 裁决和独立 Oracle，源码只作 overlay，因此本项不再影响 binary 权威。`legacy`、`shadow` 以及 binary generation 整体失败后另起的纯 legacy generation 仍会使用旧源码 diff，不能把 binary 能力倒推为旧路径已修复。
 - 已核实事实：依赖源码目录缺失、非 Git 仓库、old/new ref 无法固定、fetch 失败、`git diff` 命令异常和超时等显式失败，会写入逐依赖 gitdiff 证据、`dependency_analysis_status.*`、`summary.txt`、`timeouts.json` / `git_ref_pending.json` 和 `.runtime/observability/step4_timing.csv`。源码 diff 失败后还会自动尝试发布 JAR 方法体字节码对比；兜底也失败时，状态为分析不完整且禁止按无变化处理。
 - 已核实事实：`parse_gitdiff_apis()` 当前主要用正则从 Java/Kotlin diff 提取方法签名和方法体变化，没有输出输入文件/变更块/声明的解析覆盖率、未识别语法数量或 parser completeness。只要 `git diff` 命令成功，非空 diff 解析出 0 条 API 也会作为成功运行进入 `gitdiff_runs`，随后可能显示为 `no_source_change`；错误 module/path 选择导致空 diff 也缺少独立的范围完整性证明。
 - 风险：新语法、复杂或多行声明、注解/泛型/record/Kotlin 特性、路径过滤、错误模块范围及正则未覆盖格式可能静默漏掉实现变化。JApiCmp 能保护二进制 API 结构变化，但源码解析静默漏失不会触发“源码 diff 失败”的发布 JAR 方法体兜底，因此签名不变的行为变化可能被错误解释为未发现源码变化。
-- 待讨论：确定 Step4 源码 diff 的权威定位：是仅作为可选增强证据，还是必须形成可证明的实现变化闭集；确定 Java/Kotlin 分别使用 AST/PSI、编译产物方法体 diff、结构化 Git diff 或组合方案；确定文件重命名、生成源码、模块边界、不可编译 revision 和语言版本不支持时的失败边界。讨论完成前不得把“命令成功且解析结果为 0”自动等同为语义覆盖完整。
+- 已确定边界：源码 diff 仅是 binary 模式的可选 overlay；在 legacy/fallback generation 中仍是权威输入之一。后续需确定 Java/Kotlin 分别使用 AST/PSI、编译产物方法体 diff、结构化 Git diff 或组合方案，以及文件重命名、生成源码、模块边界、不可编译 revision 和语言版本不支持时的失败边界。修复前不得把“命令成功且解析结果为 0”自动等同为语义覆盖完整。
 - 待办：增加 diff 输入清单和解析覆盖账本，至少记录选中的 repo/module/ref/commit、Java/Kotlin 变更文件数、hunk 数、候选声明数、成功解析数、未识别数、过滤文件及稳定原因码；空 diff 必须证明选定模块在固定 commit pair 间确实无适用文件变化。存在未识别适用变更时，自动尝试独立的发布 JAR 方法实现对比；两条路径均不完整时输出 `implementation_check_status=failed/partial`，禁止 `can_treat_as_no_change=true`。
 - 待办：为解析器建立与生产实现独立的 Oracle 和 mutation，包括复杂 Java/Kotlin 声明、注解、泛型、嵌套/匿名类型、record、构造器、字段/静态常量、文件移动、模块路径错误、过滤误命中、非空 diff 返回零行及故意删除解析规则；证明质量门能够发现静默漏识别。
 - 验收：任何适用的非空源码差异必须被解析为具体变化、被明确分类为非 API/非实现差异，或产生带文件/hunk/原因码的覆盖缺口，不能静默消失；`no_source_change` 仅在范围身份和解析覆盖均完整时出现；源码解析缺口能触发 JAR 行为兜底且逐依赖状态保留原始缺口；真实工程中 Oracle 已确认的签名不变实现变化漏报为无变化的数量为 0。

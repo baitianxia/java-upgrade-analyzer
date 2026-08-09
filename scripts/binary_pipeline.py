@@ -1,0 +1,816 @@
+#!/usr/bin/env python3
+"""End-to-end binary-first pipeline with source as an optional overlay."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import replace
+import hashlib
+import json
+from pathlib import Path
+from typing import Any, Mapping
+
+from binary_artifact_diff import ArtifactSnapshot, compare_artifact_snapshots, snapshot_archive
+from binary_decision_engine import BinaryDecisionEngine, DEFAULT_RULES
+from binary_fact_store import BinaryFactStore
+from binary_first_contract import (
+    BinaryFirstContractError,
+    artifact_content_identity,
+    canonical_identity,
+)
+from binary_first_model import (
+    AnalysisContext,
+    AnalysisScope,
+    ArtifactInstance,
+    BuildIdentityBundle,
+    CrossVersionArtifactPairing,
+    FactBuildInputSlice,
+    RuntimeComparison,
+    RuntimeProfile,
+)
+from binary_output import activate_binary_generation, write_binary_generation
+from binary_platform_image import JdkPlatformImage
+from binary_runtime_reconciler import RuntimeCapabilityPolicy, RuntimeReconciler
+from binary_snapshot_cache import cached_snapshot_archive
+from binary_source_overlay import build_inline_consumption_overlay, build_source_overlay
+from binary_trace_engine import BinaryTraceEngine
+from binary_validation_oracle import validate_generation
+from enhanced_source_analyzer import analyze_file
+from path_runtime import short_temporary_directory
+
+
+SUPPORT_MANIFEST_PATH = Path(__file__).with_name("binary_first_support_manifest.json")
+PERFORMANCE_GATE_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "tests" / "fixtures" / "binary_first" / "performance_gate.json"
+)
+
+
+class BinaryPipelineError(BinaryFirstContractError):
+    pass
+
+
+def _identity(namespace: str, payload: Any) -> str:
+    return canonical_identity(namespace, payload, schema_version="1")
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _load_json(path: str | Path) -> dict[str, Any]:
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise BinaryPipelineError("BINARY_PIPELINE_CONFIG_INVALID", str(error)) from error
+    if not isinstance(value, dict):
+        raise BinaryPipelineError("BINARY_PIPELINE_CONFIG_INVALID", "root must be an object")
+    return value
+
+
+def _require_binary_authority_gates(engine_mode: str, support: Mapping[str, Any]) -> None:
+    if engine_mode not in {"binary_strict", "binary_with_legacy_fallback"}:
+        return
+    if engine_mode not in set((support.get("engine_modes") or {}).get("implemented") or ()):
+        raise BinaryPipelineError("BINARY_ENGINE_MODE_NOT_SUPPORTED", engine_mode)
+    oracle = support.get("oracle_support_manifest") or {}
+    if not oracle.get("production_binary_authority_switch_allowed"):
+        raise BinaryPipelineError("BINARY_ORACLE_AUTHORITY_GATE_BLOCKED", engine_mode)
+    performance_contract = support.get("performance_gate") or {}
+    try:
+        performance = _load_json(PERFORMANCE_GATE_PATH)
+    except BinaryPipelineError as error:
+        raise BinaryPipelineError(
+            "BINARY_PERFORMANCE_GATE_UNAVAILABLE", str(error)
+        ) from error
+    if (
+        performance.get("status") != "passed"
+        or performance.get("blocks_binary_authority_switch") is not False
+        or performance_contract.get("status") != "passed"
+        or performance_contract.get("blocks_binary_authority_switch") is not False
+        or _sha256_file(PERFORMANCE_GATE_PATH) != performance_contract.get("sha256")
+    ):
+        raise BinaryPipelineError(
+            "BINARY_PERFORMANCE_AUTHORITY_GATE_BLOCKED",
+            str(PERFORMANCE_GATE_PATH),
+        )
+
+
+def _artifact_descriptors(
+    raw_artifacts: list[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    normalized = []
+    path_descriptors = []
+    slots = set()
+    for raw in raw_artifacts:
+        path = Path(str(raw.get("path") or "")).expanduser().resolve()
+        if not path.is_file():
+            raise BinaryPipelineError("BINARY_PIPELINE_ARTIFACT_MISSING", str(path))
+        slot = int(raw.get("slot"))
+        loader = str(raw.get("loader_realm") or "").strip()
+        logical = str(raw.get("logical_location") or "").strip()
+        if slot < 0 or (loader, slot) in slots:
+            raise BinaryPipelineError(
+                "BINARY_PIPELINE_RUNTIME_SLOT_INVALID", f"duplicate/invalid {loader}:{slot}"
+            )
+        slots.add((loader, slot))
+        sha = _sha256_file(path)
+        item = {
+            **dict(raw), "path": str(path), "content_sha256": sha,
+            "byte_length": path.stat().st_size, "slot": slot,
+        }
+        normalized.append(item)
+        path_descriptors.append({
+            "logical_location": logical,
+            "content_sha256": sha,
+            "path_kind": str(raw.get("path_kind") or "classpath"),
+            "slot": slot,
+            "loader_realm": loader,
+        })
+    normalized.sort(key=lambda item: (item["loader_realm"], item["slot"], item["logical_location"]))
+    path_descriptors.sort(key=lambda item: (item["loader_realm"], item["slot"], item["logical_location"]))
+    return normalized, path_descriptors
+
+
+def _build_identity_bundle(
+    side_config: Mapping[str, Any], artifacts: list[dict[str, Any]]
+) -> BuildIdentityBundle:
+    raw = dict(side_config.get("build_identity") or {})
+    provenance = dict(raw.get("artifact_build_provenance") or {})
+    if not provenance:
+        provenance = {
+            "input_mode": "provided_artifact",
+            "build_executed_by_system": False,
+            "build_execution_status": "not_executed",
+            "clean_output_status": "not_applicable_provided_artifact",
+            "determinism_status": "unknown_no_build_reproduction_claim",
+            "artifact_content_identities": [
+                artifact_content_identity(item["content_sha256"], item["byte_length"])
+                for item in artifacts
+            ],
+        }
+    return BuildIdentityBundle(
+        dict(raw.get("build_environment") or {}),
+        dict(raw.get("build_input_manifest") or {}),
+        provenance,
+    )
+
+
+def _runtime_profile(
+    side_config: Mapping[str, Any],
+    platform: JdkPlatformImage,
+    path_descriptors: list[dict[str, Any]],
+) -> RuntimeProfile:
+    raw = dict(side_config.get("runtime_profile") or {})
+    supplied_platform = raw.get("runtime_platform_image_identity")
+    if supplied_platform and supplied_platform != platform.identity:
+        raise BinaryPipelineError(
+            "BINARY_PIPELINE_PLATFORM_IDENTITY_MISMATCH", str(supplied_platform)
+        )
+    raw["runtime_platform_image_identity"] = platform.identity
+    raw["target_jvm"] = raw.get("target_jvm") or {
+        "vendor": platform.release.get("IMPLEMENTOR", "unknown"),
+        "version": platform.release.get("JAVA_VERSION", "unknown"),
+        "major": platform.java_major,
+    }
+    if int((raw["target_jvm"] or {}).get("major") or 0) != platform.java_major:
+        raise BinaryPipelineError(
+            "BINARY_PIPELINE_TARGET_JVM_MISMATCH", str(raw["target_jvm"])
+        )
+    raw["target_os"] = raw.get("target_os") or platform.release.get("OS_NAME", "unknown")
+    raw["target_arch"] = raw.get("target_arch") or platform.release.get("OS_ARCH", "unknown")
+    raw["ordered_runtime_path_entry_descriptors"] = path_descriptors
+    if not raw.get("runtime_code_source_origin_mapping_identity"):
+        raw["runtime_code_source_origin_mapping_identity"] = _identity(
+            "runtime_code_source_origin_mapping_identity",
+            {
+                "origins": [
+                    {
+                        "logical_location": item["logical_location"],
+                        "origin_identity": next(
+                            str(artifact.get("runtime_code_source_origin_identity") or "")
+                            for artifact in side_config.get("artifacts") or ()
+                            if str(artifact.get("logical_location") or "") == item["logical_location"]
+                        ),
+                    }
+                    for item in path_descriptors
+                ]
+            },
+        )
+    required = RuntimeProfile.REQUIRED_FIELDS
+    supplied_coverage = dict(raw.get("field_coverage") or {})
+    raw["field_coverage"] = {
+        key: supplied_coverage.get(key) or ("known" if key in raw else "unknown")
+        for key in required
+    }
+    return RuntimeProfile(raw)
+
+
+def _artifact_instances(
+    artifacts: list[dict[str, Any]], profile: RuntimeProfile
+) -> list[tuple[dict[str, Any], ArtifactInstance]]:
+    result = []
+    for raw in artifacts:
+        outer_path = Path(str(raw.get("outer_artifact_path") or raw["path"]))
+        outer_sha = _sha256_file(outer_path)
+        instance = ArtifactInstance(
+            outer_artifact_sha256=outer_sha,
+            container_entry=str(raw.get("container_entry") or "<artifact>"),
+            content_sha256=raw["content_sha256"],
+            runtime_profile_identity=profile.identity,
+            path_owner_loader_realm_identity=str(raw.get("loader_realm") or ""),
+            runtime_path_kind=str(raw.get("path_kind") or "classpath"),
+            runtime_classpath_index=int(raw["slot"]),
+            container_loader_policy_version=str(
+                raw.get("container_loader_policy_version") or "flat-parent-first-v1"
+            ),
+            runtime_code_source_origin_identity=str(
+                raw.get("runtime_code_source_origin_identity") or ""
+            ),
+            coord=str(raw.get("coord") or ""),
+        )
+        result.append((raw, instance))
+    return result
+
+
+def _absent_snapshot(identity: str, parser_identity: str) -> ArtifactSnapshot:
+    return ArtifactSnapshot(
+        artifact_instance_identity=identity,
+        artifact_content_sha256="0" * 64,
+        artifact_byte_length=0,
+        archive_comment_sha256=hashlib.sha256(b"").hexdigest(),
+        entries=(),
+        class_records=(),
+        class_payloads=(),
+        safety_reason_codes=(),
+        parse_failure_count=0,
+        unknown_attribute_scopes=(),
+        unknown_resource_scopes=(),
+        inventory_digest=_identity("absent_artifact_inventory", {"identity": identity}),
+        parser_identity=parser_identity,
+        comparison_coverage_status="complete",
+    )
+
+
+def _source_methods(source_config: Mapping[str, Any]):
+    roots = [Path(item).expanduser().resolve() for item in source_config.get("source_dirs") or ()]
+    common_root_value = source_config.get("source_root") or (
+        roots[0] if len(roots) == 1 else None
+    )
+    if common_root_value is None:
+        raise BinaryPipelineError(
+            "BINARY_SOURCE_COMMON_ROOT_REQUIRED",
+            "multiple source_dirs require an explicit stable source_root",
+        )
+    common_root = Path(str(common_root_value)).expanduser().resolve()
+    if not common_root.is_dir():
+        raise BinaryPipelineError("BINARY_SOURCE_ROOT_MISSING", str(common_root))
+    methods = []
+    manifest = []
+    coverage_complete = True
+    for root in roots:
+        if not root.is_dir():
+            raise BinaryPipelineError("BINARY_SOURCE_ROOT_MISSING", str(root))
+        try:
+            root.relative_to(common_root)
+        except ValueError as error:
+            raise BinaryPipelineError(
+                "BINARY_SOURCE_ROOT_OUTSIDE_SNAPSHOT", str(root)
+            ) from error
+        for path in sorted(root.rglob("*.java")):
+            sha = _sha256_file(path)
+            logical = path.relative_to(common_root).as_posix()
+            manifest.append({"logical_path": logical, "sha256": sha})
+            source_root = {
+                "root": str(root),
+                "owner_type": str(source_config.get("owner_type") or "business"),
+                "owner_coord": str(source_config.get("owner_coord") or "BUSINESS"),
+                "module": str(source_config.get("module") or "root"),
+            }
+            parsed, diagnostics = analyze_file(
+                str(path), source_root, prefer_tree_sitter=True, return_diagnostics=True
+            )
+            if diagnostics:
+                # Source is explanatory. Preserve partial coverage but never mutate binary facts.
+                stable_diagnostics = {
+                    key: diagnostics.get(key)
+                    for key in (
+                        "preferred_parser", "actual_parser", "fallback_reason",
+                        "tree_sitter_available", "language", "error_nodes",
+                    )
+                }
+                manifest.append({"logical_path": logical, "diagnostics": stable_diagnostics})
+                if (
+                    stable_diagnostics.get("actual_parser") == "skipped"
+                    or int(stable_diagnostics.get("error_nodes") or 0) > 0
+                ):
+                    coverage_complete = False
+            methods.extend(parsed)
+    snapshot_identity = _identity("source_snapshot_identity", {"files": manifest})
+    return (
+        methods,
+        snapshot_identity,
+        common_root,
+        "complete" if coverage_complete else "partial",
+    )
+
+
+def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path, engine_mode: str) -> dict[str, Any]:
+    if config.get("schema") != "java-upgrade-analyzer.binary-pipeline-input.v1":
+        raise BinaryPipelineError("BINARY_PIPELINE_CONFIG_SCHEMA_INVALID", str(config.get("schema")))
+    asm_jar = config.get("asm_jar") or None
+    output_root = Path(output_root).resolve()
+    cache_root = Path(
+        str(config.get("cache_root") or (output_root / "binary_cache"))
+    ).expanduser().resolve()
+    base_config = dict(config.get("base") or {})
+    current_config = dict(config.get("current") or {})
+    base_platform = JdkPlatformImage(base_config.get("jdk_home", ""), asm_jar=asm_jar)
+    current_platform = JdkPlatformImage(current_config.get("jdk_home", ""), asm_jar=asm_jar)
+    base_artifacts, base_paths = _artifact_descriptors(list(base_config.get("artifacts") or ()))
+    current_artifacts, current_paths = _artifact_descriptors(list(current_config.get("artifacts") or ()))
+    base_config["artifacts"] = base_artifacts
+    current_config["artifacts"] = current_artifacts
+    base_profile = _runtime_profile(base_config, base_platform, base_paths)
+    current_profile = _runtime_profile(current_config, current_platform, current_paths)
+    base_build = _build_identity_bundle(base_config, base_artifacts)
+    current_build = _build_identity_bundle(current_config, current_artifacts)
+    base_instances = _artifact_instances(base_artifacts, base_profile)
+    current_instances = _artifact_instances(current_artifacts, current_profile)
+    comparison_config = dict(config.get("runtime_comparison") or {})
+    runtime_comparison = RuntimeComparison(
+        base_profile,
+        current_profile,
+        str(comparison_config.get("comparison_intent") or "same_deployment_profile"),
+        str(comparison_config.get("profile_correspondence_policy_version") or "v1"),
+        tuple(comparison_config.get("controlled_profile_fields") or ()),
+        tuple(comparison_config.get("declared_upgrade_payload_scope") or ("artifact-bytes",)),
+        tuple(comparison_config.get("changed_or_unknown_profile_fields") or ()),
+    )
+    capability = RuntimeCapabilityPolicy(**dict(config.get("runtime_capability_policy") or {}))
+    support = json.loads(SUPPORT_MANIFEST_PATH.read_text(encoding="utf-8"))
+    _require_binary_authority_gates(engine_mode, support)
+    scope_fields = {
+        "analysis_observability_scope": str(config.get("analysis_observability_scope") or "binary-static-v1"),
+        "artifact_diff_support_manifest_identity": _identity(
+            "artifact_diff_support_manifest_identity", support["artifact_diff_support_manifest"]
+        ),
+        "runtime_loader_support_manifest_identity": _identity(
+            "runtime_loader_support_manifest_identity", support["runtime_loader_support_manifest"]
+        ),
+        "class_definition_support_manifest_identity": _identity(
+            "class_definition_support_manifest_identity", support["class_definition_support_manifest"]
+        ),
+        "runtime_fact_semantic_capability_identity": _identity(
+            "runtime_fact_semantic_capability_identity", {"resource_policy": support["artifact_diff_support_manifest"]["resource_policy"]}
+        ),
+        "runtime_fact_dynamic_capability_identity": _identity(
+            "runtime_fact_dynamic_capability_identity", {"asm": support["artifact_diff_support_manifest"]["parser_contract"]}
+        ),
+        "runtime_fact_transformer_capability_identity": _identity(
+            "runtime_fact_transformer_capability_identity",
+            {"supported": list(capability.supported_transformer_profile_identities)},
+        ),
+        "environment_equivalence_capability_identity": _identity(
+            "environment_equivalence_capability_identity", {"version": "none-v1"}
+        ),
+    }
+    scope_fields["field_coverage"] = {key: "known" for key in AnalysisScope.REQUIRED_FIELDS}
+    analysis_scope = AnalysisScope(scope_fields)
+    context = AnalysisContext(runtime_comparison, analysis_scope)
+
+    with short_temporary_directory(prefix="binary-pipeline") as temp_text:
+        temp = Path(temp_text)
+        base_store = BinaryFactStore(temp / "base.sqlite")
+        current_store = BinaryFactStore(temp / "current.sqlite")
+        try:
+            cache_metrics = {
+                "artifact_snapshot_hits": 0,
+                "artifact_snapshot_misses": 0,
+                "artifact_snapshot_corrupt_rebuilt": 0,
+                "classfile_parser_invocations": 0,
+            }
+            base_snapshots = {}
+            current_snapshots = {}
+            base_by_lineage = {}
+            current_by_lineage = {}
+            for raw, instance in base_instances:
+                cache_outcome = cached_snapshot_archive(
+                    raw["path"], artifact_instance_identity=instance.identity,
+                    expected_sha256=instance.content_sha256, asm_jar=asm_jar,
+                    cache_root=cache_root,
+                )
+                snapshot = cache_outcome.snapshot
+                cache_metrics[
+                    "artifact_snapshot_hits"
+                    if cache_outcome.cache_status == "hit"
+                    else "artifact_snapshot_misses"
+                ] += 1
+                if cache_outcome.cache_status == "corrupt_rebuilt":
+                    cache_metrics["artifact_snapshot_corrupt_rebuilt"] += 1
+                cache_metrics["classfile_parser_invocations"] += cache_outcome.parser_invocation_count
+                base_store.add_artifact_snapshot(instance, snapshot)
+                lineage = str(raw.get("lineage") or raw.get("coord") or raw["logical_location"])
+                if lineage in base_by_lineage:
+                    raise BinaryPipelineError("BINARY_ARTIFACT_LINEAGE_AMBIGUOUS", lineage)
+                base_by_lineage[lineage] = (instance, snapshot)
+                base_snapshots[instance.identity] = snapshot
+            for raw, instance in current_instances:
+                cache_outcome = cached_snapshot_archive(
+                    raw["path"], artifact_instance_identity=instance.identity,
+                    expected_sha256=instance.content_sha256, asm_jar=asm_jar,
+                    cache_root=cache_root,
+                )
+                snapshot = cache_outcome.snapshot
+                cache_metrics[
+                    "artifact_snapshot_hits"
+                    if cache_outcome.cache_status == "hit"
+                    else "artifact_snapshot_misses"
+                ] += 1
+                if cache_outcome.cache_status == "corrupt_rebuilt":
+                    cache_metrics["artifact_snapshot_corrupt_rebuilt"] += 1
+                cache_metrics["classfile_parser_invocations"] += cache_outcome.parser_invocation_count
+                current_store.add_artifact_snapshot(instance, snapshot)
+                lineage = str(raw.get("lineage") or raw.get("coord") or raw["logical_location"])
+                if lineage in current_by_lineage:
+                    raise BinaryPipelineError("BINARY_ARTIFACT_LINEAGE_AMBIGUOUS", lineage)
+                current_by_lineage[lineage] = (instance, snapshot)
+                current_snapshots[instance.identity] = snapshot
+            diffs = []
+            pairings = []
+            for lineage in sorted(set(base_by_lineage) | set(current_by_lineage)):
+                base_pair = base_by_lineage.get(lineage)
+                current_pair = current_by_lineage.get(lineage)
+                if base_pair and current_pair:
+                    status = "exact"
+                    base_instance, base_snapshot = base_pair
+                    current_instance, current_snapshot = current_pair
+                elif base_pair:
+                    status = "base_only"
+                    base_instance, base_snapshot = base_pair
+                    current_instance = None
+                    current_snapshot = _absent_snapshot(
+                        f"ABSENT:current:{lineage}", base_snapshot.parser_identity
+                    )
+                else:
+                    status = "current_only"
+                    current_instance, current_snapshot = current_pair
+                    base_instance = None
+                    base_snapshot = _absent_snapshot(
+                        f"ABSENT:base:{lineage}", current_snapshot.parser_identity
+                    )
+                pairing = CrossVersionArtifactPairing(
+                    status,
+                    lineage,
+                    base_profile.identity,
+                    current_profile.identity,
+                    ({"rule": "explicit-lineage-v1", "lineage": lineage},),
+                    "explicit-lineage-v1",
+                    base_instance.identity if base_instance else "",
+                    current_instance.identity if current_instance else "",
+                )
+                pairings.append(pairing)
+                diffs.append(compare_artifact_snapshots(
+                    base_snapshot,
+                    current_snapshot,
+                    comparison_or_runtime_scope={
+                        "runtime_comparison_identity": runtime_comparison.identity,
+                        "cross_version_artifact_pairing_identity": pairing.identity,
+                    },
+                ))
+            base_runtime = RuntimeReconciler(
+                base_store, base_profile, base_platform,
+                analysis_context_identity=context.identity,
+                capability_policy=capability,
+            ).reconcile()
+            current_runtime = RuntimeReconciler(
+                current_store, current_profile, current_platform,
+                analysis_context_identity=context.identity,
+                capability_policy=capability,
+            ).reconcile()
+            source_overlay = None
+            source_methods = ()
+            if config.get("source_overlay"):
+                methods, source_snapshot, source_root, source_coverage = _source_methods(
+                    dict(config["source_overlay"])
+                )
+                source_overlay = build_source_overlay(
+                    current_store,
+                    methods,
+                    analysis_context_identity=context.identity,
+                    source_snapshot_identity=source_snapshot,
+                    source_root=source_root,
+                    source_snapshot_coverage_status=source_coverage,
+                )
+                source_methods = tuple(methods)
+            decisions = BinaryDecisionEngine(
+                analysis_context_identity=context.identity,
+                runtime_comparison_identity=runtime_comparison.identity,
+                base_store=base_store,
+                current_store=current_store,
+                base_reconciliation=base_runtime,
+                current_reconciliation=current_runtime,
+                artifact_local_diffs=diffs,
+            ).build()
+            inline_overlay = None
+            if source_overlay is not None:
+                inline_overlay = build_inline_consumption_overlay(
+                    base_store,
+                    current_store,
+                    source_methods,
+                    source_overlay,
+                    diffs,
+                    current_runtime,
+                    analysis_context_identity=context.identity,
+                )
+            traces = BinaryTraceEngine(
+                current_store, current_profile, current_runtime, decisions,
+                inline_overlay=inline_overlay,
+                max_visited_nodes=int(config.get("max_trace_nodes") or 1_000_000),
+                max_paths_per_target=int(config.get("max_paths_per_target") or 20),
+            ).build()
+            base_store.connection.commit()
+            current_store.connection.commit()
+            parser_identities = sorted({
+                snapshot.parser_identity
+                for snapshot in (*base_snapshots.values(), *current_snapshots.values())
+            })
+            if len(parser_identities) != 1:
+                raise BinaryPipelineError(
+                    "BINARY_PIPELINE_PARSER_IDENTITY_SET_INVALID",
+                    str(parser_identities),
+                )
+            parser_identity = parser_identities[0]
+            base_input_slice = FactBuildInputSlice(
+                base_build.provenance_identity,
+                tuple(
+                    artifact_content_identity(item["content_sha256"], item["byte_length"])
+                    for item in base_artifacts
+                ),
+                base_profile.identity,
+                parser_identity,
+            )
+            current_input_slice = FactBuildInputSlice(
+                current_build.provenance_identity,
+                tuple(
+                    artifact_content_identity(item["content_sha256"], item["byte_length"])
+                    for item in current_artifacts
+                ),
+                current_profile.identity,
+                parser_identity,
+            )
+            phase_manifest = {
+                "schema": "java-upgrade-analyzer.binary-phase-manifest.v1",
+                "analysis_context_identity": context.identity,
+                "phase_order": [
+                    "step4a_artifact_local_diff",
+                    "step5a_target_independent_reconciliation",
+                    "step4b_decision_projection_freeze",
+                    "step5b_trace",
+                    "step6_report",
+                ],
+                "phases": [
+                    {
+                        "phase": "step4a_artifact_local_diff",
+                        "input_identities": [
+                            runtime_comparison.identity,
+                            base_input_slice.identity,
+                            current_input_slice.identity,
+                            *[item.identity for item in pairings],
+                        ],
+                        "output_identity": _identity(
+                            "artifact_local_diff_set_identity",
+                            [item.get("artifact_local_result_identity") for item in diffs],
+                        ),
+                    },
+                    {
+                        "phase": "step5a_target_independent_reconciliation",
+                        "input_identities": [
+                            base_profile.identity,
+                            current_profile.identity,
+                            base_platform.identity,
+                            current_platform.identity,
+                        ],
+                        "output_identity": _identity(
+                            "runtime_reconciliation_pair_identity",
+                            [base_runtime.identity, current_runtime.identity],
+                        ),
+                    },
+                    {
+                        "phase": "step4b_decision_projection_freeze",
+                        "input_identities": [
+                            context.identity,
+                            base_runtime.identity,
+                            current_runtime.identity,
+                        ],
+                        "output_identity": decisions.identity,
+                        "active_snapshot_identities": {
+                            key: value.identity
+                            for key, value in decisions.active_snapshots.items()
+                        },
+                    },
+                    {
+                        "phase": "step5b_trace",
+                        "input_identities": [
+                            decisions.identity,
+                            current_runtime.identity,
+                        ],
+                        "output_identity": traces.identity,
+                    },
+                    {
+                        "phase": "step6_report",
+                        "input_identities": [traces.identity, decisions.identity],
+                        "output_identity": _identity(
+                            "binary_report_projection_contract_identity",
+                            {
+                                "formatter": "binary-output-v1",
+                                "four_dimension_state": "binary-formal-state-v2",
+                            },
+                        ),
+                    },
+                ],
+                "dependency_direction": "strictly_forward_no_snapshot_rewrite",
+            }
+            additional = {
+                "base_binary_facts.sqlite": (temp / "base.sqlite").read_bytes(),
+                "current_binary_facts.sqlite": (temp / "current.sqlite").read_bytes(),
+                "binary_pairings.json": (
+                    json.dumps(
+                        {
+                            "schema": "java-upgrade-analyzer.binary-pairings.v1",
+                            "runtime_comparison_identity": runtime_comparison.identity,
+                            "pairing_identities": [item.identity for item in pairings],
+                            "pairings": [
+                                {
+                                    "identity": item.identity,
+                                    "status": item.status,
+                                    "logical_dependency_lineage": item.logical_dependency_lineage,
+                                    "base_artifact_instance_identity": item.base_artifact_instance_identity,
+                                    "current_artifact_instance_identity": item.current_artifact_instance_identity,
+                                }
+                                for item in pairings
+                            ],
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ) + "\n"
+                ).encode("utf-8"),
+                "binary_phase_manifest.json": (
+                    json.dumps(
+                        phase_manifest,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ) + "\n"
+                ).encode("utf-8"),
+                "binary_build_identities.json": (
+                    json.dumps(
+                        {
+                            "schema": "java-upgrade-analyzer.binary-build-identities.v1",
+                            "base": {
+                                "build_environment_identity": base_build.environment_identity,
+                                "build_input_manifest_identity": base_build.input_identity,
+                                "artifact_build_provenance_identity": base_build.provenance_identity,
+                                "fact_build_input_slice_identity": base_input_slice.identity,
+                            },
+                            "current": {
+                                "build_environment_identity": current_build.environment_identity,
+                                "build_input_manifest_identity": current_build.input_identity,
+                                "artifact_build_provenance_identity": current_build.provenance_identity,
+                                "fact_build_input_slice_identity": current_input_slice.identity,
+                            },
+                            "domain_separation": "build_environment_build_input_provenance_runtime_profile_analysis_scope",
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ) + "\n"
+                ).encode("utf-8"),
+            }
+            if inline_overlay is not None:
+                additional["binary_inline_overlay.json"] = (
+                    json.dumps(
+                        {
+                            "schema": "java-upgrade-analyzer.binary-inline-overlay.v1",
+                            "inline_overlay_set_identity": inline_overlay.inline_overlay_set_identity,
+                            "coverage_status": inline_overlay.coverage_status,
+                            "proven_count": inline_overlay.proven_count,
+                            "possible_count": inline_overlay.possible_count,
+                            "retained_or_unchanged_count": inline_overlay.retained_or_unchanged_count,
+                            "unbound_count": inline_overlay.unbound_count,
+                            "rows": list(inline_overlay.rows),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ) + "\n"
+                ).encode("utf-8")
+            manifest = write_binary_generation(
+                output_root,
+                decisions,
+                traces,
+                current_profile,
+                engine_mode=engine_mode,
+                policy_identities={
+                    "support_manifest": _sha256_file(SUPPORT_MANIFEST_PATH),
+                    "runtime_capability": capability.identity,
+                    "analysis_scope": analysis_scope.identity,
+                    "runtime_comparison": runtime_comparison.identity,
+                    "projection_registry": _identity(
+                        "projection_registry_identity",
+                        {key: rule.identity for key, rule in DEFAULT_RULES.items()},
+                    ),
+                    "base_platform_image": base_platform.identity,
+                    "current_platform_image": current_platform.identity,
+                    "base_build_environment": base_build.environment_identity,
+                    "current_build_environment": current_build.environment_identity,
+                    "base_build_input_manifest": base_build.input_identity,
+                    "current_build_input_manifest": current_build.input_identity,
+                    "base_artifact_build_provenance": base_build.provenance_identity,
+                    "current_artifact_build_provenance": current_build.provenance_identity,
+                    "base_fact_build_input_slice": base_input_slice.identity,
+                    "current_fact_build_input_slice": current_input_slice.identity,
+                },
+                source_overlay=source_overlay,
+                additional_sidecars=additional,
+                activate=False,
+            )
+            validation = validate_generation(config, manifest["generation_directory"])
+            if validation["status"] != "passed":
+                raise BinaryPipelineError(
+                    "BINARY_INDEPENDENT_VALIDATION_FAILED",
+                    json.dumps(validation["issues"][:20], ensure_ascii=False),
+                )
+            manifest["active_generation_descriptor"] = activate_binary_generation(
+                output_root, manifest, validation_result=validation
+            )
+            observability = output_root / "binary_observability"
+            observability.mkdir(parents=True, exist_ok=True)
+            cache_metrics_path = observability / "latest_cache_metrics.json"
+            cache_metrics_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "java-upgrade-analyzer.binary-cache-metrics.v1",
+                        "result_generation_identity": manifest["result_generation_identity"],
+                        **cache_metrics,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ) + "\n",
+                encoding="utf-8",
+            )
+            return {
+                "schema": "java-upgrade-analyzer.binary-pipeline-result.v1",
+                **manifest,
+                "runtime_comparison_identity": runtime_comparison.identity,
+                "analysis_scope_identity": analysis_scope.identity,
+                "analysis_context_identity": context.identity,
+                "base_runtime_reconciliation_identity": base_runtime.identity,
+                "current_runtime_reconciliation_identity": current_runtime.identity,
+                "decision_bundle_identity": decisions.identity,
+                "trace_bundle_identity": traces.identity,
+                "decision_coverage_status": decisions.coverage_status,
+                "trace_coverage_status": traces.coverage_status,
+                "authoritative_change_fact_count": len(decisions.authoritative_decisions),
+                "diagnostic_candidate_fact_count": len(decisions.diagnostic_decisions),
+                "validation_run_identity": validation["validation_run_identity"],
+                "validation_status": validation["status"],
+                "validation_result_path": validation["validation_result_path"],
+                "cache_metrics": cache_metrics,
+                "cache_metrics_path": str(cache_metrics_path),
+            }
+        finally:
+            base_store.close()
+            current_store.close()
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Run the binary-first analysis generation")
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--output-root", required=True)
+    parser.add_argument(
+        "--engine-mode",
+        choices=("shadow", "binary_strict", "binary_with_legacy_fallback"),
+        default="binary_strict",
+    )
+    parser.add_argument("--result-json", default="")
+    args = parser.parse_args(argv)
+    result = run_pipeline(
+        _load_json(args.config), output_root=args.output_root, engine_mode=args.engine_mode
+    )
+    encoded = json.dumps(result, ensure_ascii=False, indent=2) + "\n"
+    if args.result_json:
+        Path(args.result_json).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.result_json).write_text(encoded, encoding="utf-8")
+    print(encoded, end="")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

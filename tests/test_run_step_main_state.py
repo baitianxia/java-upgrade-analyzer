@@ -21,6 +21,133 @@ import run_step  # noqa: E402
 
 
 class RunStepMainStateTest(unittest.TestCase):
+    def test_binary_engine_modes_are_explicit_and_implemented(self):
+        self.assertEqual(run_step.normalize_binary_engine_mode("shadow"), "shadow")
+        self.assertEqual(
+            run_step.normalize_binary_engine_mode("binary_strict"),
+            "binary_strict",
+        )
+        self.assertEqual(
+            run_step.normalize_binary_engine_mode("binary_with_legacy_fallback"),
+            "binary_with_legacy_fallback",
+        )
+
+    def test_binary_strict_failure_preserves_previous_outputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = root / ".upgrade-report"
+            s4_dir = report / "evidence" / "api_changes"
+            s4_dir.mkdir(parents=True)
+            sentinel = s4_dir / "previous-complete.txt"
+            sentinel.write_text("preserve", encoding="utf-8")
+            config = root / "binary.json"
+            config.write_text("{}", encoding="utf-8")
+            with patch.object(
+                run_step,
+                "run_python",
+                side_effect=run_step.StepError("parser failed"),
+            ):
+                with self.assertRaisesRegex(
+                    run_step.StepError, "BINARY_STRICT_GENERATION_FAILED"
+                ):
+                    run_step._run_binary_step4(
+                        requested_mode="binary_strict",
+                        run_context={"binary_pipeline_config": str(config)},
+                        project_dir=root,
+                        report_dir=report,
+                        s4_dir=s4_dir,
+                        dep_changes=report / "dep.csv",
+                        context_json=report / "context.json",
+                    )
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve")
+
+    def test_binary_fallback_restarts_one_complete_legacy_generation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = root / ".upgrade-report"
+            s4_dir = report / "evidence" / "api_changes"
+            s4_dir.mkdir(parents=True)
+            (s4_dir / "stale.txt").write_text("stale", encoding="utf-8")
+            config = root / "binary.json"
+            config.write_text("{}", encoding="utf-8")
+            calls = []
+
+            def fake_run(script_name, script_args, _cwd, **_kwargs):
+                calls.append((script_name, list(script_args)))
+                if script_name == "binary_pipeline.py":
+                    raise run_step.StepError("binary DB integrity failed")
+                self.assertEqual(script_name, "s4_jar_compare.py")
+                s4_dir.mkdir(parents=True, exist_ok=True)
+                (s4_dir / "all_changed_apis.csv").write_text(
+                    "coord,api_name\n", encoding="utf-8"
+                )
+
+            with patch.object(run_step, "run_python", side_effect=fake_run):
+                result = run_step._run_binary_step4(
+                    requested_mode="binary_with_legacy_fallback",
+                    run_context={"binary_pipeline_config": str(config)},
+                    project_dir=root,
+                    report_dir=report,
+                    s4_dir=s4_dir,
+                    dep_changes=report / "dep.csv",
+                    context_json=report / "context.json",
+                )
+            self.assertTrue(result["fallback"])
+            self.assertEqual(
+                [item[0] for item in calls],
+                ["binary_pipeline.py", "s4_jar_compare.py"],
+            )
+            self.assertFalse((s4_dir / "stale.txt").exists())
+            descriptor = json.loads(
+                (report / run_step.ENGINE_DESCRIPTOR_RELATIVE_PATH).read_text()
+            )
+            self.assertEqual(descriptor["authoritative_engine"], "legacy_fallback")
+            self.assertEqual(descriptor["fallback_scope"], "whole_generation_only")
+            self.assertFalse(descriptor["binary_support_manifest_satisfied"])
+
+    def test_binary_engine_mode_change_after_step4_requires_restart(self):
+        with self.assertRaisesRegex(
+            run_step.StepError,
+            "BINARY_ENGINE_MODE_CHANGE_REQUIRES_STEP4_RESTART",
+        ):
+            run_step.validate_binary_engine_mode_transition(
+                "legacy",
+                "shadow",
+                "step5",
+            )
+        with self.assertRaisesRegex(
+            run_step.StepError,
+            "BINARY_ENGINE_MODE_CHANGE_REQUIRES_STEP4_RESTART",
+        ):
+            run_step.validate_binary_engine_mode_transition(
+                "",
+                "shadow",
+                "step5",
+            )
+
+        self.assertEqual(
+            run_step.validate_binary_engine_mode_transition(
+                "legacy",
+                "shadow",
+                "step4",
+            ),
+            "shadow",
+        )
+
+    def test_binary_engine_mode_intent_targets_step4_and_is_persisted(self):
+        response = {"action": "continue", "engine_mode": "shadow"}
+
+        self.assertEqual(
+            run_step.infer_non_pending_target_step_from_payload(response),
+            "step4",
+        )
+        updated = run_step.merge_user_response_into_run_context(
+            {"engine_mode": "legacy"},
+            response,
+            Path.cwd(),
+        )
+        self.assertEqual(updated["engine_mode"], "shadow")
+
     def test_json_reader_rejects_bom_prefixed_input(self):
         with tempfile.TemporaryDirectory() as tmp:
             invalid_path = Path(tmp) / "invalid.json"

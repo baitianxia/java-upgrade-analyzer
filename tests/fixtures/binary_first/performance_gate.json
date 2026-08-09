@@ -1,0 +1,99 @@
+{
+  "schema": "java-upgrade-analyzer.binary-first-performance-gate.v1",
+  "status": "passed",
+  "blocks_binary_authority_switch": false,
+  "reason_code": "BINARY_PERFORMANCE_GATE_PASSED",
+  "measurement_protocol": {
+    "machine_identity": "c405233ee64bf64dfba5d4b5733f82ff2b7b4dcaefd0f4fd95b8ae596135e69c",
+    "machine": {
+      "platform": "macOS-26.5.1-arm64-arm-64bit-Mach-O",
+      "machine": "arm64",
+      "processor": "arm",
+      "logical_cpu_count": 12
+    },
+    "dataset_schema": "binary-performance-scale-400x250-v1",
+    "dataset_identity": "f1899f437d2a1858796e59e01be142ea1ec55a37cf3b97ad178e6c2a56cfc935",
+    "artifact_identity_set_binding": "dataset_identity binds the ordered SHA-256 list of all 400 generated JARs",
+    "jar_count": 400,
+    "class_count": 100000,
+    "classes_per_jar": 250,
+    "large_api_query_count": 10000,
+    "tool_versions": {
+      "python": "3.14.6",
+      "java": "openjdk version \"21.0.8\" 2025-07-15",
+      "javap": "21.0.8",
+      "asm_jar_sha256": "6f3828a215c920059a5efa2fb55c233d6c54ec5cadca99ce1b1bdd10077c7ddd"
+    },
+    "warmup_runs": 1,
+    "sample_runs": {
+      "cold": 1,
+      "warm": 3,
+      "legacy": 1
+    },
+    "p95_method": "nearest-rank",
+    "cold_cleanup_rule": "delete binary snapshot cache and SQLite before run",
+    "warm_cache_rule": "all content+parser cache entries must pass digest validation; parser_invocations=0",
+    "legacy_baseline": "javap -c -s -p, all 100000 classes, batched once per artifact"
+  },
+  "recorded_measurements": {
+    "captured_at": "2026-08-09",
+    "cold_end_to_end_seconds": 131.282159,
+    "warm_end_to_end_samples_seconds": [
+      56.641780,
+      53.809838,
+      51.897330
+    ],
+    "warm_end_to_end_p95_seconds": 56.641780,
+    "legacy_end_to_end_seconds": 71.307301,
+    "cold_relative_legacy_ratio": 1.841076,
+    "warm_relative_legacy_ratio": 0.794328,
+    "stage_seconds": {
+      "cold_inventory": 0.124322,
+      "cold_parse_and_cache": 84.229144,
+      "cold_db_write_and_index": 46.750035,
+      "warm_parse_and_cache_p95": 7.968490,
+      "warm_db_write_and_index_p95": 48.363277,
+      "batch_query_10000_p95": 0.186453,
+      "report_10000_p95": 0.010554
+    },
+    "peak_rss_bytes": 1232764928,
+    "sqlite_bytes": 1022636032,
+    "cache_bytes": 26629955,
+    "disk_bytes": 1049265987,
+    "bytes_per_class": 10492.65987,
+    "bytes_per_edge": 2556.59008,
+    "class_count": 100000,
+    "member_count": 300000,
+    "edge_count": 400000,
+    "cold_parser_invocations": 400,
+    "warm_parser_invocations": 0,
+    "warm_cache_hits": 400
+  },
+  "thresholds": {
+    "cold_end_to_end_seconds": 170.0,
+    "warm_end_to_end_p95_seconds": 75.0,
+    "stage_p95_seconds": {
+      "inventory": 0.3,
+      "parse_and_cache": 110.0,
+      "db_write_and_index": 65.0,
+      "batch_query_10000": 0.4,
+      "report_10000": 0.05
+    },
+    "peak_rss_bytes": 1717986918,
+    "disk_bytes": 1395864371,
+    "bytes_per_class": 14000,
+    "bytes_per_edge": 3500,
+    "cold_relative_legacy_ratio": 2.25,
+    "warm_relative_legacy_ratio": 1.0
+  },
+  "accuracy_invariants": {
+    "expected_class_count": 100000,
+    "expected_member_count": 300000,
+    "expected_edge_count": 400000,
+    "warm_parser_invocations": 0,
+    "cache_digest_validation_required": true,
+    "class_or_edge_reduction_allowed": false
+  },
+  "rerun_command": "python3 scripts/binary_performance_gate.py --work-root /tmp/jua-binary-performance-400x250 --output /tmp/jua-binary-performance-result.json --gate tests/fixtures/binary_first/performance_gate.json",
+  "scope_note": "The 400-JAR gate measures inventory, ASM parse/cache, SQLite write/index, 10k indexed queries, report serialization, RSS and disk. Runtime reconciliation and Oracle correctness are covered by independent functional fixtures because loading 100k definitions into a target JVM would measure verifier stress rather than the persisted graph scale contract."
+}

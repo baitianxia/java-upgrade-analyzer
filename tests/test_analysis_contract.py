@@ -642,6 +642,10 @@ class AnalysisContractTest(unittest.TestCase):
         self.assertEqual(current["source_state_hash"], scope["source_state_hash"])
         self.assertEqual(current["maven_model_hash"], scope["maven_model_hash"])
         self.assertEqual(current["active_maven_profiles"], ["prod"])
+        self.assertEqual(current["schema"], "java-upgrade-analyzer.build-provenance.v2")
+        self.assertTrue(current["artifact_available"])
+        self.assertTrue(current["build_executed_by_system"])
+        self.assertEqual(current["build_execution_status"], "succeeded")
         provenance = next(
             item for item in coverage["components"]
             if item["id"] == "build_provenance"
@@ -673,6 +677,29 @@ class AnalysisContractTest(unittest.TestCase):
         )
         self.assertEqual(provenance["status"], "insufficient")
         self.assertIn("BUILD_ACTIVE_PROFILES_MISSING", provenance["reason_codes"])
+
+    def test_received_artifact_provenance_does_not_claim_a_system_build(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            artifact = Path(tmp) / "provided.jar"
+            write_pom(root / "pom.xml", "app")
+            (root / "src/main/java").mkdir(parents=True)
+            artifact.write_bytes(b"provided")
+            scope = build_project_scope(root, ".")
+
+            provenance = build_provenance(
+                root,
+                "current",
+                "HEAD",
+                ".",
+                "",
+                artifact_path=artifact,
+                project_scope=scope,
+            )
+
+        self.assertTrue(provenance["artifact_available"])
+        self.assertFalse(provenance["build_executed_by_system"])
+        self.assertEqual(provenance["build_execution_status"], "not_executed")
 
     @staticmethod
     def _write_bound_provenance(report, scope):

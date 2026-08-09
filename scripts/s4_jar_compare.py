@@ -72,6 +72,11 @@ from signature_utils import normalize_signature_for_lookup
 from data_contract_analysis import compare_jar_data_contracts
 from step1_observability import peak_rss_mb
 from analysis_contract import sha256_file
+from binary_first_contract import (
+    BinaryFirstContractError,
+    ENGINE_MODES,
+    require_implemented_engine_mode,
+)
 from artifact_coordinates import (
     artifact_classifier,
     artifact_ga,
@@ -126,6 +131,11 @@ JAPICMP_COMPARISON_CACHE_DIRNAME = "step4_japicmp"
 BUSINESS_BYTECODE_CHANGED_API_REFS_CSV = "business_bytecode_changed_api_refs.csv"
 BUSINESS_BYTECODE_PRIORITY_EVIDENCE_JSON = "business_bytecode_priority_evidence.json"
 STEP4_RECOMMENDED_DEPENDENCY_LIMIT = 10
+BINARY_FIRST_SHADOW_FILE = "binary_first_shadow.json"
+BINARY_FIRST_SHADOW_SCHEMA = "java-upgrade-analyzer.binary-first-shadow.v1"
+BINARY_FIRST_SUPPORT_MANIFEST_PATH = (
+    Path(__file__).resolve().parent / "binary_first_support_manifest.json"
+)
 
 
 def _bounded_git_timeout(value, default):
@@ -2656,6 +2666,141 @@ def compare_jar_method_bodies(
     evidence_path.parent.mkdir(parents=True, exist_ok=True)
     evidence_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return {**payload, "evidence_path": str(evidence_path.resolve())}
+
+
+def _shadow_member_name_key(item):
+    return (
+        str((item or {}).get("api_name") or "").strip(),
+        str((item or {}).get("symbol_kind") or "").strip(),
+    )
+
+
+def _shadow_binary_method_rows(comparison):
+    comparison = comparison or {}
+    changed_methods = list(comparison.get("changed_methods") or [])
+    if changed_methods:
+        return [
+            {
+                "api_name": str(item.get("api_name") or "").strip(),
+                "symbol_kind": str(item.get("symbol_kind") or "").strip(),
+                "descriptor": str(item.get("descriptor") or "").strip(),
+                "old_body_sha256": str(item.get("old_body_sha256") or "").strip(),
+                "new_body_sha256": str(item.get("new_body_sha256") or "").strip(),
+            }
+            for item in changed_methods
+            if str(item.get("api_name") or "").strip()
+        ]
+    return [
+        {
+            "api_name": str(item.get("api_name") or "").strip(),
+            "symbol_kind": str(item.get("symbol_kind") or "").strip(),
+            "descriptor": str(item.get("descriptor") or "").strip(),
+            "old_body_sha256": "",
+            "new_body_sha256": "",
+        }
+        for item in (comparison.get("rows") or [])
+        if str(item.get("api_name") or "").strip()
+    ]
+
+
+def build_binary_first_shadow_payload(
+    runs,
+    source_behavior_rows_by_coord,
+    *,
+    engine_mode,
+):
+    """Build the stage-1 audit sidecar without producing Step5 targets."""
+    records = []
+    for run in sorted(
+        (dict(item or {}) for item in (runs or [])),
+        key=lambda item: (
+            str(item.get("coord") or ""),
+            str(item.get("old_version") or ""),
+            str(item.get("new_version") or ""),
+        ),
+    ):
+        coord = str(run.get("coord") or "").strip()
+        binary_methods = list(run.get("binary_changed_methods") or [])
+        source_methods = [
+            {
+                "api_name": str(item.get("api_name") or "").strip(),
+                "symbol_kind": str(item.get("symbol_kind") or "").strip(),
+                "api_signature": str(item.get("api_signature") or "").strip(),
+                "evidence_path": str(item.get("evidence_path") or "").strip(),
+            }
+            for item in (source_behavior_rows_by_coord.get(coord) or [])
+            if str(item.get("change_type") or "").strip() == "BEHAVIOR_CHANGED"
+        ]
+        binary_by_name = defaultdict(list)
+        source_by_name = defaultdict(list)
+        for item in binary_methods:
+            binary_by_name[_shadow_member_name_key(item)].append(item)
+        for item in source_methods:
+            source_by_name[_shadow_member_name_key(item)].append(item)
+        binary_keys = set(binary_by_name)
+        source_keys = set(source_by_name)
+        shared = binary_keys & source_keys
+        ambiguous = sorted(
+            key for key in shared
+            if len(binary_by_name[key]) != 1 or len(source_by_name[key]) != 1
+        )
+        records.append({
+            "coord": coord,
+            "old_version": str(run.get("old_version") or ""),
+            "new_version": str(run.get("new_version") or ""),
+            "status": str(run.get("status") or "insufficient"),
+            "reason_code": str(run.get("reason_code") or ""),
+            "analysis_eligibility": "shadow_only",
+            "production_target_rows_added": 0,
+            "old_jar_sha256": str(run.get("old_jar_sha256") or ""),
+            "new_jar_sha256": str(run.get("new_jar_sha256") or ""),
+            "modified_classes": int(run.get("modified_classes") or 0),
+            "scanned_classes": int(run.get("scanned_classes") or 0),
+            "binary_changed_methods": binary_methods,
+            "source_promoted_behavior_methods": source_methods,
+            "consistency_matrix": {
+                "comparison_granularity": "owner_member_name_with_ambiguity_guard",
+                "binary_method_count": len(binary_methods),
+                "source_method_count": len(source_methods),
+                "shared_member_names": [
+                    {"api_name": key[0], "symbol_kind": key[1]}
+                    for key in sorted(shared)
+                ],
+                "binary_only_member_names": [
+                    {"api_name": key[0], "symbol_kind": key[1]}
+                    for key in sorted(binary_keys - source_keys)
+                ],
+                "source_only_member_names": [
+                    {"api_name": key[0], "symbol_kind": key[1]}
+                    for key in sorted(source_keys - binary_keys)
+                ],
+                "ambiguous_overload_member_names": [
+                    {"api_name": key[0], "symbol_kind": key[1]}
+                    for key in ambiguous
+                ],
+            },
+            "evidence_path": str(run.get("evidence_path") or ""),
+            "errors": list(run.get("errors") or []),
+        })
+    complete = [item for item in records if item["status"] == "complete"]
+    return {
+        "schema": BINARY_FIRST_SHADOW_SCHEMA,
+        "engine_mode": str(engine_mode or "legacy"),
+        "authority": "legacy",
+        "support_manifest": "scripts/binary_first_support_manifest.json",
+        "support_manifest_sha256": sha256_file(BINARY_FIRST_SUPPORT_MANIFEST_PATH),
+        "production_target_set_changed": False,
+        "comparison_stage": "artifact_local_method_ir_shadow",
+        "runtime_effective_decision_available": False,
+        "runtime_effective_limit": (
+            "artifact-local method differences are not authoritative until the "
+            "base/current runtime-effective provider and selection gate exists"
+        ),
+        "planned_dependencies": len(records),
+        "complete_dependencies": len(complete),
+        "incomplete_dependencies": len(records) - len(complete),
+        "records": records,
+    }
 
 
 def _java_major_version(value):
@@ -7639,6 +7784,8 @@ def main():
                     help='自动安装 JApiCmp 工具的超时时间（秒）；不会用于下载被分析依赖')
     ap.add_argument('--workers', type=int, default=int(os.environ.get("JUA_STEP4_WORKERS", "4") or "4"),
                     help='Step4 依赖级并行 worker 数；设为 1 可恢复串行执行')
+    ap.add_argument('--engine-mode', choices=ENGINE_MODES, default='',
+                    help='执行策略；当前实现 legacy/shadow，binary 模式失败关闭')
     ap.add_argument('--skip-changed-classes', action='store_true',
                     help='跳过 changed_classes.json 的 class hash 计算，减少大批量依赖时的 I/O 开销')
     ap.add_argument('--source-branches', nargs=2,
@@ -7650,6 +7797,8 @@ def main():
     args = ap.parse_args()
     orchestrated_input = load_orchestrated_step4_input(args.output_dir)
     if orchestrated_input:
+        if not args.engine_mode:
+            args.engine_mode = str(orchestrated_input.get("engine_mode") or "").strip()
         if not args.allow_degraded and orchestrated_input.get("allow_degraded"):
             args.allow_degraded = True
         args.japicmp_jar = args.japicmp_jar or str(orchestrated_input.get("japicmp_jar") or "")
@@ -7680,6 +7829,14 @@ def main():
             current_commit = str(orchestrated_input.get("current_resolved_commit") or "").strip()
             if base_commit and current_commit:
                 args.source_revisions = [base_commit, current_commit]
+
+    try:
+        args.engine_mode = require_implemented_engine_mode(
+            args.engine_mode or "legacy"
+        )
+    except BinaryFirstContractError as exc:
+        print(f"❌ {exc.reason_code}: {exc}", file=sys.stderr)
+        return 2
 
     if not args.japicmp_jar:
         args.japicmp_jar = japicmp_default_jar_path()
@@ -8045,6 +8202,8 @@ def main():
     gitdiff_skipped = []
     gitdiff_pending = []
     bytecode_behavior_runs = []
+    binary_behavior_shadow_runs = []
+    source_behavior_shadow_rows_by_coord = defaultdict(list)
     timeout_items = []
     binary_runs = []
 
@@ -8161,6 +8320,8 @@ def main():
             "gitdiff_skipped": [],
             "gitdiff_pending": [],
             "bytecode_behavior_runs": [],
+            "binary_behavior_shadow_runs": [],
+            "source_behavior_shadow_rows": [],
             "timeout_items": [],
             "binary_runs": [],
             "per_dependency_record": None,
@@ -8774,15 +8935,29 @@ def main():
                     api_count=len(contract_apis),
                 )
 
-        if source_skip_for_behavior:
+        should_run_shadow_behavior = (
+            args.engine_mode == "shadow"
+            and not is_removed_dependency
+            and not is_added_dependency
+        )
+        if source_skip_for_behavior or should_run_shadow_behavior:
             behavior_timer = time.perf_counter()
+            behavior_phase = (
+                "dependency.behavior_bytecode_fallback"
+                if source_skip_for_behavior
+                else "dependency.behavior_bytecode_shadow"
+            )
             timing.record(
-                "dependency.behavior_bytecode_fallback",
+                behavior_phase,
                 coord=coord,
                 old_version=old_ver,
                 new_version=new_ver,
                 status="running",
-                message=f"正在检查发布 JAR 的方法实现变化：{coord}",
+                message=(
+                    f"正在检查发布 JAR 的方法实现变化：{coord}"
+                    if source_skip_for_behavior
+                    else f"正在影子检查发布 JAR 的方法实现变化：{coord}"
+                ),
             )
             if dependency_old_jar and dependency_new_jar:
                 try:
@@ -8822,9 +8997,21 @@ def main():
                 "javap_invocations": int(behavior_fallback.get("javap_invocations") or 0),
                 "evidence_path": behavior_fallback.get("evidence_path") or "",
                 "errors": list(behavior_fallback.get("errors") or []),
+                "old_jar_sha256": str(behavior_fallback.get("old_jar_sha256") or ""),
+                "new_jar_sha256": str(behavior_fallback.get("new_jar_sha256") or ""),
+                "binary_changed_methods": _shadow_binary_method_rows(
+                    behavior_fallback
+                ),
             }
-            result["bytecode_behavior_runs"].append(behavior_run)
-            if behavior_run["status"] == "complete":
+            if source_skip_for_behavior:
+                result["bytecode_behavior_runs"].append(behavior_run)
+            if should_run_shadow_behavior:
+                result["binary_behavior_shadow_runs"].append({
+                    **behavior_run,
+                    "analysis_eligibility": "shadow_only",
+                    "production_target_rows_added": 0,
+                })
+            if source_skip_for_behavior and behavior_run["status"] == "complete":
                 dependency_raw_apis.extend(behavior_rows)
                 result["all_apis"].extend(behavior_rows)
                 for skipped_item in result["gitdiff_skipped"]:
@@ -8839,9 +9026,21 @@ def main():
                     f"    → 发布 JAR 的方法实现检查完成：发现 {len(behavior_rows)} 个变化候选",
                     file=sys.stderr,
                 )
-            else:
+            elif source_skip_for_behavior:
                 print(
                     "    ⚠️  发布 JAR 的方法实现检查未完成；当前不能形成完整或无影响结论。",
+                    file=sys.stderr,
+                )
+            elif behavior_run["status"] == "complete":
+                print(
+                    f"    → 影子发布 JAR 方法实现检查完成：发现 {len(behavior_rows)} 个差异；"
+                    "未改变生产目标集",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    "    ⚠️  影子发布 JAR 方法实现检查未完成；已保留覆盖缺口，"
+                    "未改变生产目标集。",
                     file=sys.stderr,
                 )
             emit_progress(
@@ -8857,7 +9056,7 @@ def main():
                 item=coord,
             )
             timing.record(
-                "dependency.behavior_bytecode_fallback",
+                behavior_phase,
                 coord=coord,
                 old_version=old_ver,
                 new_version=new_ver,
@@ -8891,6 +9090,10 @@ def main():
                 new_ver=new_ver,
             )
             dependency_gitdiff_auxiliary_rows = rejected_source_apis
+            result["source_behavior_shadow_rows"].extend(
+                row for row in accepted_source_apis
+                if str(row.get("change_type") or "").strip() == "BEHAVIOR_CHANGED"
+            )
             aux_path = write_gitdiff_auxiliary_rows(args.output_dir, coord, rejected_source_apis)
             dependency_raw_apis.extend(accepted_source_apis)
             result["all_apis"].extend(accepted_source_apis)
@@ -9090,6 +9293,13 @@ def main():
         gitdiff_skipped.extend(item.get("gitdiff_skipped") or [])
         gitdiff_pending.extend(item.get("gitdiff_pending") or [])
         bytecode_behavior_runs.extend(item.get("bytecode_behavior_runs") or [])
+        binary_behavior_shadow_runs.extend(
+            item.get("binary_behavior_shadow_runs") or []
+        )
+        for source_row in item.get("source_behavior_shadow_rows") or []:
+            source_coord = str(source_row.get("coord") or "").strip()
+            if source_coord:
+                source_behavior_shadow_rows_by_coord[source_coord].append(source_row)
         timeout_items.extend(item.get("timeout_items") or [])
         binary_runs.extend(item.get("binary_runs") or [])
         per_record = item.get("per_dependency_record")
@@ -9117,6 +9327,19 @@ def main():
     dependency_status_by_coord = {
         item["coord"]: item for item in dependency_status_rows
     }
+
+    binary_shadow_payload = None
+    if args.engine_mode == "shadow":
+        binary_shadow_payload = build_binary_first_shadow_payload(
+            binary_behavior_shadow_runs,
+            source_behavior_shadow_rows_by_coord,
+            engine_mode=args.engine_mode,
+        )
+        binary_shadow_path = Path(args.output_dir) / BINARY_FIRST_SHADOW_FILE
+        binary_shadow_path.write_text(
+            json.dumps(binary_shadow_payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
 
     # 写入汇总文件
     write_all_timer = time.perf_counter()
@@ -9319,8 +9542,7 @@ def main():
     ) if primary_binary_status_rows else 'not_applicable'
     behavior_expected = [
         row for row in prepared_dep_rows
-        if row.get('coord') in dependency_paths
-        and row.get('old_version') not in ('', '-')
+        if row.get('old_version') not in ('', '-')
         and row.get('new_version') not in ('', '-')
     ]
     behavior_expected_coords = {
@@ -9344,6 +9566,24 @@ def main():
         else ('complete' if not behavior_uncovered_coords
               else ('partial' if behavior_successful_coords else 'insufficient'))
     )
+    shadow_planned = int((binary_shadow_payload or {}).get("planned_dependencies") or 0)
+    shadow_complete = int((binary_shadow_payload or {}).get("complete_dependencies") or 0)
+    if args.engine_mode != "shadow" or shadow_planned == 0:
+        shadow_status = "not_applicable"
+    elif shadow_planned == shadow_complete:
+        shadow_status = "complete"
+    elif shadow_complete:
+        shadow_status = "partial"
+    else:
+        shadow_status = "insufficient"
+    if args.engine_mode != "shadow":
+        shadow_reason_codes = ["BINARY_SHADOW_DISABLED"]
+    elif shadow_status == "not_applicable":
+        shadow_reason_codes = ["BINARY_SHADOW_NO_APPLICABLE_DEPENDENCIES"]
+    elif shadow_status == "complete":
+        shadow_reason_codes = []
+    else:
+        shadow_reason_codes = ["FINAL_JAR_BEHAVIOR_DIFF_UNAVAILABLE"]
     step4_coverage = {
         'schema': 'java-upgrade-analyzer.step4-coverage.v1',
         'binary_api_diff': {
@@ -9400,6 +9640,26 @@ def main():
                 }),
             },
             'runs': bytecode_behavior_runs,
+        },
+        'binary_behavior_shadow': {
+            'status': shadow_status,
+            'authority': 'shadow_only',
+            'production_target_set_changed': False,
+            'reason_codes': shadow_reason_codes,
+            'metrics': {
+                'planned_dependencies': shadow_planned,
+                'complete_dependencies': shadow_complete,
+                'incomplete_dependencies': max(0, shadow_planned - shadow_complete),
+                'artifact_local_changed_methods': sum(
+                    len(item.get('binary_changed_methods') or [])
+                    for item in binary_behavior_shadow_runs
+                ),
+                'production_target_rows_added': 0,
+            },
+            'sidecar': (
+                str((Path(args.output_dir) / BINARY_FIRST_SHADOW_FILE).resolve())
+                if args.engine_mode == 'shadow' else ''
+            ),
         },
     }
     for component_name in ('binary_api_diff', 'behavior_diff'):

@@ -82,6 +82,7 @@ Claude Code 会负责：
 | 升级前后来源 | 必需 | 通常是 base/current 分支，也可以是已有 base/current JAR/WAR |
 | 依赖源码路径或 Git 地址 | 可选但推荐 | 依赖包源码仓库本地路径或 HTTPS/SSH Git 地址，用于提升 API 行为变更和跨依赖调用链分析能力 |
 | 特殊 JDK | 可选 | 如果 base/current 需要不同 JDK 构建，请说明 |
+| Binary runtime 快照 | 启用 binary 权威时必需 | 按 `binary_pipeline_config.example.json` 固定两侧完整 JDK、最终制品、有序 classpath、loader/resource policy 和业务入口 |
 
 说明：
 
@@ -105,6 +106,21 @@ Claude Code 会负责：
 - 如果存在多个可部署模块且无法唯一判断，Claude Code 必须让你选择目标模块。
 - 如果只表达“想分析什么”，但没有提供 base/current 来源或目标模块，Claude Code 会继续追问，不会猜测执行。
 - 如果只是查询某个方法调用链，则需要当前工程已经跑完 Step5 并生成查询索引。
+
+### Binary-first 模式
+
+默认执行模式仍是 `legacy`。需要以最终制品 JVM 事实作为正式权威时，在运行配置中同时设置：
+
+```json
+{
+  "engine_mode": "binary_strict",
+  "binary_pipeline_config": "/abs/path/to/binary-pipeline-input.json"
+}
+```
+
+输入模板见 `binary_pipeline_config.example.json`，完整运行配置见 `runtime_config.example.json`。`binary_strict` 在身份、支持边界、独立 Oracle 或 sidecar 完整性失败时停止，并保留上一份完整结果；`binary_with_legacy_fallback` 仅允许整代失败后从 Step4 重建纯 legacy 结果，不会混合 binary/legacy 的事实或边。`shadow` 保持 legacy 权威，同时在独立目录运行完整 binary 对账。
+
+binary 输出使用 `reachability_status`、`static_linkage_status`、`impact_conclusion`、`runtime_verification_status` 四个独立维度。静态分析最多给出 `probable_impact`，不会伪造 `confirmed_impact`、`confirmed_no_impact` 或已经执行的运行验证。详细文件和复核顺序见 `docs/user/outputs.md`。
 
 ---
 
