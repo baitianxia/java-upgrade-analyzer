@@ -1078,6 +1078,7 @@ class RuntimeReconciler:
             member_records.append(member_record)
 
             executable_dispatch = edge["edge_kind"] == "method" and kind == "method"
+            dispatch_fixed_by_final_declaration = False
             if not executable_dispatch or status != "resolved":
                 dispatch_status = "not_applicable" if not executable_dispatch else "unresolved"
                 targets = ()
@@ -1091,38 +1092,50 @@ class RuntimeReconciler:
                     targets = (payload["resolved_member_identity"],)
                     coverage = "complete"
                 else:
-                    targets_set = set()
-                    for candidate_realm, candidate_name in universe:
-                        candidate_definition = self.definition_records.get((candidate_realm, candidate_name))
-                        if not candidate_definition or candidate_definition["class_definition_status"] != "definition_ready":
-                            continue
-                        if not self._is_subtype(candidate_realm, candidate_name, owner):
-                            continue
-                        candidate_provider = self._provider(candidate_realm, candidate_name)
-                        info = self._class_info(candidate_provider)
-                        if not info or info["access_flags"] & (ACC_INTERFACE | ACC_ABSTRACT):
-                            continue
-                        target, _ = self._resolve_symbolic_member(
-                            candidate_realm,
-                            candidate_name,
-                            "method",
-                            edge["symbolic_name"],
-                            edge["symbolic_descriptor"],
-                        )
-                        if target:
-                            targets_set.add(target["member_identity"])
-                    targets = tuple(sorted(targets_set))
-                    if not targets:
-                        dispatch_status = (
-                            "no_concrete_implementation" if hierarchy_complete else "unresolved"
-                        )
-                        coverage = "complete" if hierarchy_complete else "partial"
-                    elif hierarchy_complete:
-                        dispatch_status = "possible"
+                    resolved_owner_info = self._class_info(member_provider)
+                    dispatch_is_fixed = bool(
+                        int(member.get("access_flags") or 0) & ACC_FINAL
+                        or int((resolved_owner_info or {}).get("access_flags") or 0)
+                        & ACC_FINAL
+                    )
+                    if dispatch_is_fixed:
+                        dispatch_fixed_by_final_declaration = True
+                        dispatch_status = "exact"
+                        targets = (payload["resolved_member_identity"],)
                         coverage = "complete"
                     else:
-                        dispatch_status = "partial_possible_set"
-                        coverage = "partial"
+                        targets_set = set()
+                        for candidate_realm, candidate_name in universe:
+                            candidate_definition = self.definition_records.get((candidate_realm, candidate_name))
+                            if not candidate_definition or candidate_definition["class_definition_status"] != "definition_ready":
+                                continue
+                            if not self._is_subtype(candidate_realm, candidate_name, owner):
+                                continue
+                            candidate_provider = self._provider(candidate_realm, candidate_name)
+                            info = self._class_info(candidate_provider)
+                            if not info or info["access_flags"] & (ACC_INTERFACE | ACC_ABSTRACT):
+                                continue
+                            target, _ = self._resolve_symbolic_member(
+                                candidate_realm,
+                                candidate_name,
+                                "method",
+                                edge["symbolic_name"],
+                                edge["symbolic_descriptor"],
+                            )
+                            if target:
+                                targets_set.add(target["member_identity"])
+                        targets = tuple(sorted(targets_set))
+                        if not targets:
+                            dispatch_status = (
+                                "no_concrete_implementation" if hierarchy_complete else "unresolved"
+                            )
+                            coverage = "complete" if hierarchy_complete else "partial"
+                        elif hierarchy_complete:
+                            dispatch_status = "possible"
+                            coverage = "complete"
+                        else:
+                            dispatch_status = "partial_possible_set"
+                            coverage = "partial"
             dispatch = DispatchResolution(
                 edge["direct_edge_identity"],
                 dispatch_status,
@@ -1131,6 +1144,9 @@ class RuntimeReconciler:
                 {
                     "member_resolution_identity": resolution.identity,
                     "hierarchy_coverage_complete": hierarchy_complete,
+                    "dispatch_fixed_by_final_declaration": (
+                        dispatch_fixed_by_final_declaration
+                    ),
                 },
             )
             dispatch_records.append({

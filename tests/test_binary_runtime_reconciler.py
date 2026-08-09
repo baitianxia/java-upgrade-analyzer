@@ -51,6 +51,7 @@ class BinaryRuntimeReconcilerTest(unittest.TestCase):
         sources = {
             "demo/Api.java": "package demo; public interface Api { String value(); }",
             "demo/Impl.java": "package demo; public class Impl implements Api { public String value(){ return \"ok\"; } }",
+            "demo/FinalApi.java": "package demo; public final class FinalApi { public String value(){ return \"ok\"; } }",
             "demo/Init.java": """
                 package demo;
                 public class Init {
@@ -62,6 +63,7 @@ class BinaryRuntimeReconcilerTest(unittest.TestCase):
                 package demo;
                 public class Caller {
                   public String call(Api api) { return api.value().trim(); }
+                  public String finalCall(FinalApi api) { return api.value(); }
                   public Runnable dynamic(Api api) { return api::value; }
                   public Init create() { return new Init(); }
                   public int staticCall() { return Init.value(); }
@@ -178,6 +180,12 @@ class BinaryRuntimeReconcilerTest(unittest.TestCase):
                 if item["class_name"] == "demo/Init"
                 and item["member_name"] == "<clinit>"
             )
+            final_call_edge_id = next(
+                item["direct_edge_identity"]
+                for item in store.rows("direct_edges")
+                if item["symbolic_owner"] == "demo/FinalApi"
+                and item["symbolic_name"] == "value"
+            )
 
         providers = {
             (item["initiating_loader_realm_identity"], item["class_name"]): item
@@ -210,6 +218,12 @@ class BinaryRuntimeReconcilerTest(unittest.TestCase):
         ]
         self.assertTrue(interface_dispatch)
         self.assertTrue(any(item["implementation_target_identities"] for item in interface_dispatch))
+        final_dispatch = next(
+            item for item in result.dispatch_resolutions
+            if item["direct_edge_identity"] == final_call_edge_id
+        )
+        self.assertEqual(final_dispatch["dispatch_status"], "exact")
+        self.assertEqual(len(final_dispatch["implementation_target_identities"]), 1)
         self.assertTrue(result.linkage_resolutions)
         self.assertTrue(all(
             item["type_resolution_status"] in {"resolved", "primitive_or_array_type"}
