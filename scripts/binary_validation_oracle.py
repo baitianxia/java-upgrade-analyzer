@@ -572,6 +572,49 @@ def _is_subtype(
     )
 
 
+def _oracle_runtime_contexts(
+    observations: Mapping[str, Mapping[str, Any]],
+    initial_classes: Iterable[str],
+    entrypoint_realms: Iterable[str],
+    platform_realm: str,
+) -> tuple[tuple[str, str], ...]:
+    """Mirror JVM initiating-to-defining-loader hierarchy traversal.
+
+    Initial application classes and symbolic targets are requested through an
+    entrypoint realm.  Their superclasses and interfaces are then requested by
+    the selected class's defining loader.  Applying every transitive platform
+    type back to every application realm invents provider obligations that do
+    not exist in the production reconciliation universe.
+    """
+    contexts = set()
+    pending = [
+        (str(realm), str(name).replace(".", "/"))
+        for realm in entrypoint_realms
+        for name in initial_classes
+        if str(realm) and str(name)
+    ]
+    while pending:
+        realm, name = pending.pop()
+        if (realm, name) in contexts:
+            continue
+        contexts.add((realm, name))
+        observation = observations.get(name) or {}
+        if observation.get("status") != "definition_ready":
+            continue
+        defining_realm = (
+            platform_realm
+            if _file_url_path(str(observation.get("provider_url") or "")) is None
+            else realm
+        )
+        for dependency in [
+            observation.get("super_name"), *(observation.get("interfaces") or ())
+        ]:
+            normalized = str(dependency or "").replace(".", "/")
+            if normalized and (defining_realm, normalized) not in contexts:
+                pending.append((defining_realm, normalized))
+    return tuple(sorted(contexts))
+
+
 def _validation_issue(domain: str, code: str, **evidence: Any) -> dict[str, Any]:
     return {"domain": domain, "reason_code": code, "evidence": evidence}
 
@@ -687,6 +730,8 @@ def _validate_runtime_outcomes(
     inventories: list[dict[str, Any]],
     observations: Mapping[str, Mapping[str, Any]],
     entrypoint_realms: Iterable[str],
+    initial_classes: Iterable[str],
+    platform_realm: str,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     issues = []
     artifact_rows = {row["artifact_instance_identity"]: row for row in _rows(connection, "artifact_instances")}
@@ -700,8 +745,11 @@ def _validate_runtime_outcomes(
         (row["initiating_loader_realm_identity"], row["class_name"]): row
         for row in providers
     }
-    for realm in entrypoint_realms:
-      for name, oracle in observations.items():
+    oracle_contexts = _oracle_runtime_contexts(
+        observations, initial_classes, entrypoint_realms, platform_realm
+    )
+    for realm, name in oracle_contexts:
+        oracle = observations.get(name) or {}
         provider = provider_by_key.get((realm, name))
         if not provider:
             issues.append(_validation_issue(
@@ -1018,8 +1066,21 @@ def validate_generation(
                 if item.get("kind") != "platform"
             }
             entrypoint_realms = tuple(topology.get("entrypoint_realms") or sorted(realms))
+            platform_realms = [
+                str(item.get("identity")) for item in topology.get("realms") or ()
+                if item.get("kind") == "platform"
+            ]
+            platform_realm = (
+                platform_realms[0] if len(platform_realms) == 1 else "platform-loader"
+            )
             runtime_issues, runtime_truth = _validate_runtime_outcomes(
-                connection, artifacts, inventories, observations, entrypoint_realms
+                connection,
+                artifacts,
+                inventories,
+                observations,
+                entrypoint_realms,
+                independent_classes,
+                platform_realm,
             )
             resource_issues, resource_truth = _validate_resource_selections(
                 connection, artifacts, inventories, entrypoint_realms

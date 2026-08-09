@@ -54,11 +54,15 @@ class BinaryPipelineTest(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def _jar(self, side, value, *, service_provider=None, manifest=None):
+    def _jar(
+        self, side, value, *, service_provider=None, manifest=None,
+        uses_system_out=False,
+    ):
         source = self.root / side / "src" / "demo" / "Api.java"
         source.parent.mkdir(parents=True)
+        statement = 'System.out.print(""); ' if uses_system_out else ""
         source.write_text(
-            f"package demo; public class Api {{ public int value(){{ return {value}; }} }}",
+            f"package demo; public class Api {{ public int value(){{ {statement}return {value}; }} }}",
             encoding="utf-8",
         )
         classes = self.root / side / "classes"
@@ -237,8 +241,8 @@ class BinaryPipelineTest(unittest.TestCase):
             " continuation\r\n"
             "\r\n"
         )
-        base = self._jar("base", 1, manifest=manifest)
-        current = self._jar("current", 2, manifest=manifest)
+        base = self._jar("base", 1, manifest=manifest, uses_system_out=True)
+        current = self._jar("current", 2, manifest=manifest, uses_system_out=True)
         config = {
             "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
             "asm_jar": str(self.asm_jar),
