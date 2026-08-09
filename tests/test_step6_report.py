@@ -772,7 +772,7 @@ class Step6ReportObjectivityTest(unittest.TestCase):
             "[二、API 及调用关系](#二api-及调用关系)",
             (
                 "[已确认触达与结论未确定的 API]"
-                "(#已确认触达与结论未确定的-api完整展示-11)"
+                "(#已确认触达与结论未确定的-api展示-11)"
             ),
             "[其他已完成状态统计](#其他已完成状态统计)",
             "[三、用户可见文件说明](#三用户可见文件说明)",
@@ -782,6 +782,8 @@ class Step6ReportObjectivityTest(unittest.TestCase):
         self.assertNotIn("[未完成分析的依赖]", toc)
         self.assertNotIn("[未完成分析的 API]", toc)
         self.assertNotIn("运行时资源变化及激活关系", toc)
+        self.assertNotIn("all-affected-dependencies", toc)
+        self.assertNotIn("all-impact-details", toc)
 
         targets = re.findall(r"\]\(#([^)]+)\)", toc)
         self.assertTrue(targets)
@@ -840,9 +842,64 @@ class Step6ReportObjectivityTest(unittest.TestCase):
         for link in (
             "[未完成分析的依赖](#未完成分析的依赖展示-11)",
             "[未完成分析的 API](#未完成分析的-api展示-11)",
-            "[运行时资源变化及激活关系](#运行时资源变化及激活关系)",
+            (
+                "[运行时资源变化及激活关系]"
+                "(#运行时资源变化及激活关系展示-11)"
+            ),
         ):
             self.assertIn(link, toc)
+        self.assertNotIn("all-affected-dependencies", toc)
+        self.assertNotIn("all-impact-details", toc)
+
+    def test_detail_file_locations_are_beside_detail_sections_and_file_index_remains(self):
+        report = s6_report.generate_report(self._human_first_findings())
+        toc = report[
+            report.index("## 报告目录") : report.index("## 一、依赖层面结论")
+        ]
+        dependency_section = report[
+            report.index("## 一、依赖层面结论") : report.index("## 二、API 及调用关系")
+        ]
+        api_section = report[
+            report.index("## 二、API 及调用关系") : report.index("## 三、用户可见文件说明")
+        ]
+
+        self.assertNotIn("all-affected-dependencies", toc)
+        self.assertNotIn("all-impact-details", toc)
+        for filename in (
+            "all-affected-dependencies.md",
+            "all-affected-dependencies.csv",
+        ):
+            self.assertIn(filename, dependency_section)
+        for filename in (
+            "all-impact-details.md",
+            "all-impact-details.csv",
+        ):
+            self.assertIn(filename, api_section)
+        self.assertIn("供人工逐项复核", report)
+        self.assertIn("便于筛选", report)
+        self.assertIn("## 三、用户可见文件说明", report)
+
+    def test_main_report_limits_runtime_resource_detail_rows(self):
+        findings = self._human_first_findings()
+        findings["resource_impacts"] = [
+            {
+                "coord": f"com.acme:resource-{index:02d}",
+                "old_version": "1.0",
+                "new_version": "2.0",
+                "resource_name": f"META-INF/services/com.acme.Provider{index:02d}",
+                "activation_status": "reachable",
+                "business_entries": [f"com.acme.Entry.load{index:02d}"],
+            }
+            for index in range(s6_report.S6_MAIN_RESOURCE_LIMIT + 1)
+        ]
+
+        rendered = "\n".join(s6_report.render_api_and_calls(findings))
+
+        self.assertIn("运行时资源变化及激活关系（展示 12/13）", rendered)
+        self.assertIn("未展开 1 个", rendered)
+        self.assertIn("完整二进制变化裁决", rendered)
+        self.assertIn("系统触达证据", rendered)
+        self.assertNotIn("com.acme.Provider12", rendered)
 
     def test_main_report_summarizes_diagnostics_without_internal_protocol(self):
         findings = self._human_first_findings()
@@ -1152,7 +1209,7 @@ class Step6ReportObjectivityTest(unittest.TestCase):
                 "conclusion": "已确认影响",
                 "path_count": 1,
             }
-            for index in range(13)
+            for index in range(10)
         ]
         uncertain = [
             {
@@ -1219,9 +1276,9 @@ class Step6ReportObjectivityTest(unittest.TestCase):
         self.assertNotIn("uncertain", report)
         self.assertNotIn("not_found_in_static_analysis", report)
         self.assertNotIn("not_analyzed", report)
-        self.assertIn("完整展示 15/15", report)
+        self.assertIn("展示 12/12", report)
         self.assertIn("不表示运行时故障已经发生", report)
-        for index in range(13):
+        for index in range(10):
             self.assertIn(f"com.acme.Api.confirmed{index}", report)
         self.assertLess(report.index("com.beta.Api.high"), report.index("com.beta.Api.low"))
         self.assertLess(report.index("`com.acme:confirmed`"), report.index("`com.beta:review`"))
@@ -1821,10 +1878,16 @@ class Step6ReportObjectivityTest(unittest.TestCase):
             detail = detail_path.read_text(encoding="utf-8")
 
         self.assertIn("完整 API 分析与调用关系明细", report)
-        self.assertIn("完整展示 15/15", report)
-        self.assertIn("com.acme.Api.method9", report)
+        self.assertIn("展示 12/15", report)
+        self.assertIn("未展开 3 个", report)
+        self.assertEqual(
+            report.count("| `com.acme:lib` | `com.acme.Api.method"),
+            s6_report.S6_MAIN_RESULT_LIMIT,
+        )
         self.assertIn("com.acme.Api.method14", detail)
+        self.assertIn("com.acme.Api.method9", detail)
         self.assertIn("1.0.0 → 2.0.0", detail)
+        self.assertNotIn("<a ", detail)
 
     def test_large_confirmed_markdown_is_bounded_and_keeps_full_csv(self):
         total = 1920
@@ -3172,6 +3235,9 @@ class Step6ReportObjectivityTest(unittest.TestCase):
             dependency_detail = (
                 Path(tmp) / artifacts["full_dependency_analysis_md"]
             ).read_text(encoding="utf-8")
+            api_detail = (
+                Path(tmp) / artifacts["full_api_analysis_md"]
+            ).read_text(encoding="utf-8")
 
         self.assertIn("1/2", report)
         self.assertIn("| 1 | 0 | 1 | 1 | 0 | 0 |", report)
@@ -3179,6 +3245,19 @@ class Step6ReportObjectivityTest(unittest.TestCase):
         self.assertIn("部分结果确认有影响；分析未完成", report)
         self.assertIn("[已完成 API 及调用关系]", dependency_detail)
         self.assertIn("[未完成 API 及原因]", dependency_detail)
+        self.assertNotIn("<a ", api_detail)
+        detail_targets = {
+            s6_report._markdown_heading_fragment(line)
+            for line in api_detail.splitlines()
+            if re.match(r"^#{1,6}\s+", line)
+        }
+        linked_targets = re.findall(
+            r"all-impact-details\.md#([^\)]+)",
+            dependency_detail,
+        )
+        self.assertTrue(linked_targets)
+        for target in linked_targets:
+            self.assertIn(target, detail_targets)
 
     def test_file_explanation_counts_input_and_analysis_diagnostics_separately(self):
         findings = self._human_first_findings()

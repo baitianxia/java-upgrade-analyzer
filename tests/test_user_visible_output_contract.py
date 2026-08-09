@@ -35,6 +35,9 @@ class UserVisibleOutputContractTest(unittest.TestCase):
         self.assertNotIn("当前无法确认", reading_section)
         self.assertIn("本次未完成分析", text)
         self.assertNotIn("当前未完成有效分析", text)
+        self.assertIn("顶部目录只承担章节导航", text)
+        self.assertIn("主报告明细都必须设置展示上限", text)
+        self.assertIn("对应位置必须直接给出", text)
 
     def test_outputs_doc_explains_dependency_level_step4_selection(self):
         text = self.read("docs/user/outputs.md")
