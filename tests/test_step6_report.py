@@ -901,6 +901,116 @@ class Step6ReportObjectivityTest(unittest.TestCase):
         self.assertIn("系统触达证据", rendered)
         self.assertNotIn("com.acme.Provider12", rendered)
 
+    def test_report_reading_contract_keeps_navigation_focus_and_complete_details(self):
+        dependency_count = s6_report.S6_MAIN_DEPENDENCY_LIMIT + 5
+        api_count = s6_report.S6_MAIN_RESULT_LIMIT + 3
+        resource_count = s6_report.S6_MAIN_RESOURCE_LIMIT + 1
+        dependencies = [
+            {
+                "coord": f"com.acme:lib-{index:02d}",
+                "old_version": "1.0",
+                "new_version": "2.0",
+                "change_type": "major",
+            }
+            for index in range(dependency_count)
+        ]
+        confirmed_apis = [
+            {
+                "coord": "com.acme:lib-00",
+                "old_version": "1.0",
+                "new_version": "2.0",
+                "api": f"com.acme.Api.changed{index:02d}",
+                "api_signature": "()",
+                "symbol_kind": "method",
+                "change_type": "METHOD_REMOVED",
+                "severity": "P1",
+                "business_entry": f"com.acme.Entry.call{index:02d}()",
+                "reason": "SYSTEM_CODE_REACHED",
+            }
+            for index in range(api_count)
+        ]
+        findings = {
+            "analysis_scope": {
+                "mode": "full",
+                "included_dependency_count": dependency_count,
+                "available_dependency_count": dependency_count,
+                "analyzed_api_count": api_count,
+                "total_api_count": api_count,
+            },
+            "coverage": {"overall_status": "complete"},
+            "dependency_changes": dependencies,
+            "impact_overview": {"apis": []},
+            "p0": [],
+            "p1": confirmed_apis,
+            "p2": [],
+            "probable_impact": [],
+            "uncertain": [],
+            "not_impacted": [],
+            "needs_input": [],
+            "not_analyzed": [],
+            "not_found": [],
+            "resource_impacts": [
+                {
+                    **dependencies[index],
+                    "resource_name": (
+                        f"META-INF/services/com.acme.Provider{index:02d}"
+                    ),
+                    "activation_status": "reachable",
+                    "business_entries": [f"com.acme.Entry.load{index:02d}"],
+                }
+                for index in range(resource_count)
+            ],
+            "artifacts": {},
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            artifacts, _api_model, _dependency_model = (
+                s6_report.write_primary_report_artifacts(tmp, findings)
+            )
+            findings["artifacts"].update(artifacts)
+            report = s6_report.generate_report(findings)
+            with (
+                Path(tmp) / artifacts["full_dependency_analysis_csv"]
+            ).open(encoding="utf-8-sig", newline="") as handle:
+                full_dependency_rows = list(csv.DictReader(handle))
+            with (
+                Path(tmp) / artifacts["full_api_analysis_csv"]
+            ).open(encoding="utf-8-sig", newline="") as handle:
+                full_api_rows = list(csv.DictReader(handle))
+
+        toc = report[
+            report.index("## 报告目录") : report.index("## 一、依赖层面结论")
+        ]
+        dependency_section = report[
+            report.index("## 一、依赖层面结论") : report.index("## 二、API 及调用关系")
+        ]
+        api_section = report[
+            report.index("## 二、API 及调用关系") : report.index("## 三、用户可见文件说明")
+        ]
+
+        self.assertNotIn("all-affected-dependencies", toc)
+        self.assertNotIn("all-impact-details", toc)
+        self.assertIn("已完成分析的依赖（展示 20/25）", dependency_section)
+        self.assertIn("运行时资源变化及激活关系（展示 12/13）", api_section)
+        self.assertIn("API（展示 12/15）", api_section)
+        self.assertIn("未展开 5 个", dependency_section)
+        self.assertIn("未展开 3 个", api_section)
+        self.assertIn("未展开 1 个", api_section)
+        self.assertNotIn("com.acme.Provider12", api_section)
+        for filename in (
+            "all-affected-dependencies.md",
+            "all-affected-dependencies.csv",
+        ):
+            self.assertIn(filename, dependency_section)
+        for filename in (
+            "all-impact-details.md",
+            "all-impact-details.csv",
+        ):
+            self.assertIn(filename, api_section)
+        self.assertIn("## 三、用户可见文件说明", report)
+        self.assertEqual(len(full_dependency_rows), dependency_count)
+        self.assertEqual(len(full_api_rows), api_count)
+
     def test_main_report_summarizes_diagnostics_without_internal_protocol(self):
         findings = self._human_first_findings()
         findings["coverage"] = {
