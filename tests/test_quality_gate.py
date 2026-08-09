@@ -23,6 +23,13 @@ class QualityGateTest(unittest.TestCase):
         command = quality_gate.command_for("release")
         self.assertEqual(command[-3:], ["discover", "-s", "tests"])
 
+    def test_release_authorization_is_blocked_by_unmigrated_capabilities(self):
+        migration = quality_gate.capability_migration_status(ROOT)
+        self.assertTrue(migration["registry_structurally_valid"], migration["issues"])
+        self.assertEqual(migration["release_status"], "blocked")
+        self.assertIn("reproducible_test_assets", migration["incomplete_families"])
+        self.assertIn("spring_xml_activation", migration["missing_mechanisms"])
+
     def test_dry_run_is_non_mutating_and_exposes_exact_command(self):
         completed = subprocess.run(
             [sys.executable, str(ROOT / "scripts/quality_gate.py"),

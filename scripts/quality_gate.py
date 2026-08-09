@@ -15,6 +15,11 @@ from pathlib import Path
 import subprocess
 import sys
 
+from binary_capability_migration_audit import (
+    REGISTRY_PATH as CAPABILITY_MIGRATION_REGISTRY,
+    audit_capability_migration,
+)
+
 
 QUICK_MODULES = (
     "tests.test_binary_first_contract",
@@ -24,6 +29,8 @@ QUICK_MODULES = (
     "tests.test_binary_runtime_reconciler",
     "tests.test_binary_trace_engine",
     "tests.test_binary_output",
+    "tests.test_binary_entrypoint_discovery",
+    "tests.test_binary_capability_migration_audit",
 )
 
 STEP5_MODULES = QUICK_MODULES + (
@@ -47,6 +54,13 @@ def command_for(profile: str) -> list[str]:
     return [sys.executable, "-m", "unittest", "discover", "-s", "tests"]
 
 
+def capability_migration_status(repository_root: str | Path) -> dict:
+    registry = json.loads(
+        CAPABILITY_MIGRATION_REGISTRY.read_text(encoding="utf-8")
+    )
+    return audit_capability_migration(repository_root, registry)
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Binary-first quality gate")
     parser.add_argument("--profile", choices=("quick", "step5", "release"), default="quick")
@@ -59,22 +73,29 @@ def main(argv=None) -> int:
         return 0
     started = datetime.now(timezone.utc)
     completed = subprocess.run(command, check=False)
+    migration = capability_migration_status(Path(__file__).resolve().parents[1])
+    release_blocked = (
+        args.profile == "release"
+        and migration.get("release_status") != "passed"
+    )
+    returncode = completed.returncode or (3 if release_blocked else 0)
     payload = {
         "schema": "java-upgrade-analyzer.binary-quality-gate.v1",
         "profile": args.profile,
-        "status": "passed" if completed.returncode == 0 else "failed",
-        "returncode": completed.returncode,
+        "status": "passed" if returncode == 0 else "failed",
+        "returncode": returncode,
         "command": command,
         "started_at": started.isoformat(),
         "completed_at": datetime.now(timezone.utc).isoformat(),
         "engine": "binary_first",
+        "capability_migration": migration,
     }
     if args.json_out:
         target = Path(args.json_out).resolve()
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(payload, ensure_ascii=False))
-    return completed.returncode
+    return returncode
 
 
 if __name__ == "__main__":

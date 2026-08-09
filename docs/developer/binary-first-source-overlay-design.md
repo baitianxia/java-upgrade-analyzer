@@ -4,6 +4,10 @@
 
 本文是 Step4–Step6 当前实现的最终设计合同，不是迁移方案。
 
+当前能力迁移是否满足合并门，以
+[`binary-first-capability-migration-audit.md`](binary-first-capability-migration-audit.md)
+及其可执行台账为准；设计合同不能替代缺失的生产路径、测试或真实项目证据。
+
 目标是以升级前后最终制品及其真实运行时闭包为唯一事实主线，回答三类问题：
 
 1. 哪个依赖包发生了什么运行时有效变化；

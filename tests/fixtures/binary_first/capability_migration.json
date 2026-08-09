@@ -1,0 +1,508 @@
+{
+  "schema": "java-upgrade-analyzer.binary-capability-migration.v1",
+  "baseline": {
+    "branch": "main",
+    "merge_base": "8cc40d29b932ec86c15aa8c09d4e3f9abae56073",
+    "legacy_capability_family_ids": [
+      "artifact_identity_ownership",
+      "canonical_evidence_identity",
+      "evidence_completeness_visibility",
+      "framework_activation_semantics",
+      "closed_world_pipeline",
+      "reproducible_test_assets",
+      "performance_without_scope_loss",
+      "test_gate_integrity",
+      "module_and_tool_failure_boundaries"
+    ],
+    "monitored_deleted_production_paths": [
+      "scripts/artifact_alignment.py",
+      "scripts/auto_discover_bridge_sources.py",
+      "scripts/branch_coverage_gate.py",
+      "scripts/business_bytecode_graph.py",
+      "scripts/capability_family_closure.py",
+      "scripts/capability_test_catalog.py",
+      "scripts/complexity_gate.py",
+      "scripts/confidence_weighted_tracer.py",
+      "scripts/constant_impact.py",
+      "scripts/constant_impact_oracle.py",
+      "scripts/context_compress.py",
+      "scripts/data_contract_analysis.py",
+      "scripts/dependency_source_alignment.py",
+      "scripts/determinism_gate.py",
+      "scripts/dual_line_accuracy.py",
+      "scripts/enhanced_output_formatter.py",
+      "scripts/error_handler.py",
+      "scripts/execution_faults.py",
+      "scripts/exhaustive_api_oracle.py",
+      "scripts/fault_injection.py",
+      "scripts/framework_adapters.py",
+      "scripts/generated_topology.py",
+      "scripts/generated_topology_regression.py",
+      "scripts/indirect_usage_analyzer.py",
+      "scripts/materialize_real_project_asset.py",
+      "scripts/metamorphic_regression.py",
+      "scripts/mybatis_mapper_oracle.py",
+      "scripts/production_mutation.py",
+      "scripts/quality_signal_audit.py",
+      "scripts/real_project_regression.py",
+      "scripts/runtime_coverage_oracle.py",
+      "scripts/s4_jar_compare.py",
+      "scripts/s5_call_chain.py",
+      "scripts/s5_call_chain_engine_integrated.py",
+      "scripts/smoke_regression.py",
+      "scripts/step5_artifact_fact_store.py",
+      "scripts/step5_diagnostics.py",
+      "scripts/step5_evidence_ingestion.py",
+      "scripts/step5_evidence_model.py",
+      "scripts/step5_graph.py",
+      "scripts/step5_memory_observer.py",
+      "scripts/step5_trace_policy.py",
+      "scripts/test_round_retrospective.py",
+      "scripts/third_party_jdeps_oracle.py",
+      "scripts/third_party_jdk_oracle.py",
+      "scripts/tool_execution.py",
+      "scripts/topology_coverage.py",
+      "scripts/user_scenario_regression.py"
+    ],
+    "monitored_deleted_test_asset_paths": [
+      "tests/fixtures/generated_topologies/seeds.json",
+      "tests/fixtures/real_projects/commons-text.json",
+      "tests/fixtures/real_projects/dubbo-spring6-security.json",
+      "tests/fixtures/real_projects/evidence/commons-text-source-attestation.json",
+      "tests/fixtures/real_projects/evidence/commons-text-source-edges.json",
+      "tests/fixtures/real_projects/evidence/grpc-netty-shaded-source-attestation.json",
+      "tests/fixtures/real_projects/evidence/grpc-netty-shaded-source-edges.json",
+      "tests/fixtures/real_projects/grpc-netty-shaded.json",
+      "tests/fixtures/real_projects/gs-managing-transactions.json",
+      "tests/fixtures/real_projects/gs-messaging-rabbitmq.json",
+      "tests/fixtures/real_projects/gs-multi-module.json",
+      "tests/fixtures/real_projects/mybatis-sample-annotation.json",
+      "tests/fixtures/real_projects/mybatis-sample-xml.json",
+      "tests/fixtures/real_projects/pig-v4-full-artifact-discovery.json",
+      "tests/fixtures/real_projects/ruoyi-full-artifact-discovery.json",
+      "tests/fixtures/real_projects/spring-security-config.json",
+      "tests/fixtures/topologies/manifest.json",
+      "tests/fixtures/topologies/prior_matrix.json"
+    ],
+    "monitored_mechanism_ids": [
+      "automatic_runtime_profile_materialization",
+      "binary_framework_entrypoints",
+      "branch_mutation_flaky_health_gates",
+      "declarative_http_client_dispatch",
+      "dependency_boot_registration",
+      "dependency_source_snapshot_alignment",
+      "dubbo_spi_dispatch",
+      "dynamic_proxy_dispatch",
+      "generated_topology_and_metamorphic_regression",
+      "human_entrypoint_evidence",
+      "implicit_data_contract_dispatch",
+      "java_serviceloader_activation",
+      "javac_constant_inline_binding",
+      "jpa_entity_activation_proof",
+      "mybatis_proxy_dispatch",
+      "nested_executable_materialization",
+      "real_project_rotation",
+      "reflection_and_method_handle_dispatch",
+      "source_overlay_user_choice",
+      "spring_aop_dispatch",
+      "spring_bean_wiring_dispatch",
+      "spring_component_condition_activation",
+      "spring_data_repository_dispatch",
+      "spring_security_filter_dispatch",
+      "spring_transaction_proxy_dispatch",
+      "spring_xml_activation",
+      "typed_tool_failure_matrix"
+    ]
+  },
+  "status_vocabulary": ["enforced", "partial", "missing"],
+  "families": [
+    {
+      "family_id": "artifact_identity_ownership",
+      "migration_status": "partial",
+      "production_paths": [
+        "scripts/binary_first_model.py",
+        "scripts/binary_pipeline.py",
+        "scripts/binary_runtime_reconciler.py"
+      ],
+      "positive_tests": [
+        "tests.test_binary_first_model.RuntimeAndArtifactIdentityTest.test_artifact_instances_preserve_physical_runtime_slot"
+      ],
+      "negative_tests": [
+        "tests.test_binary_first_model.RuntimeAndArtifactIdentityTest.test_pairing_status_enforces_cardinality_and_evidence"
+      ],
+      "independent_tests": [
+        "tests.test_binary_pipeline.BinaryPipelineTest.test_end_to_end_generation_is_content_bound_and_immutable"
+      ],
+      "blocking_gaps": [
+        "The binary pipeline trusts an externally assembled artifact list and has no migrated reactor/nested-module ownership proof.",
+        "The gs-multi-module and RuoYi same-coordinate real-project guards were deleted."
+      ]
+    },
+    {
+      "family_id": "canonical_evidence_identity",
+      "migration_status": "partial",
+      "production_paths": [
+        "scripts/binary_first_contract.py",
+        "scripts/binary_output.py",
+        "scripts/signature_utils.py"
+      ],
+      "positive_tests": [
+        "tests.test_binary_first_contract.BinaryFirstContractTest.test_canonical_identity_is_order_independent_but_list_order_sensitive"
+      ],
+      "negative_tests": [
+        "tests.test_binary_first_contract.BinaryFirstContractTest.test_canonical_identity_rejects_non_string_object_keys"
+      ],
+      "independent_tests": [
+        "tests.test_oracle_independence.OracleIndependenceTest.test_repository_binary_oracle_policy_is_clean"
+      ],
+      "blocking_gaps": [
+        "No migrated cross-project guard proves canonical API and edge identities across inner classes, overloads and multiple dependency coordinates."
+      ]
+    },
+    {
+      "family_id": "evidence_completeness_visibility",
+      "migration_status": "partial",
+      "production_paths": [
+        "scripts/binary_artifact_diff.py",
+        "scripts/binary_runtime_reconciler.py",
+        "scripts/binary_trace_engine.py"
+      ],
+      "positive_tests": [
+        "tests.test_binary_artifact_diff.BinaryArtifactDiffTest.test_unknown_changed_resource_makes_only_that_comparison_scope_partial"
+      ],
+      "negative_tests": [
+        "tests.test_binary_artifact_diff.BinaryArtifactDiffTest.test_unsupported_class_major_is_explicit_incomplete_class_scope"
+      ],
+      "independent_tests": [
+        "tests.test_binary_pipeline.BinaryPipelineTest.test_end_to_end_generation_is_content_bound_and_immutable"
+      ],
+      "blocking_gaps": [
+        "The typed execution-fault registry and parser/tool fault-injection matrix were deleted.",
+        "There is no real-project proof that a scoped parser failure cannot become a negative conclusion."
+      ]
+    },
+    {
+      "family_id": "framework_activation_semantics",
+      "migration_status": "partial",
+      "production_paths": [
+        "scripts/binary_entrypoint_discovery.py",
+        "scripts/binary_trace_engine.py",
+        "scripts/binary_validation_oracle.py"
+      ],
+      "positive_tests": [
+        "tests.test_binary_pipeline.BinaryPipelineTest.test_dependency_scheduled_auto_configuration_is_reachable_without_manual_entrypoint"
+      ],
+      "negative_tests": [
+        "tests.test_binary_pipeline.BinaryPipelineTest.test_dependency_scheduled_method_without_activation_proof_is_not_exact"
+      ],
+      "independent_tests": [
+        "tests.test_binary_pipeline.BinaryPipelineTest.test_dependency_scheduled_auto_configuration_is_reachable_without_manual_entrypoint"
+      ],
+      "blocking_gaps": [
+        "Spring XML scheduled/Quartz registration is not projected into the graph.",
+        "MyBatis mapper proxy, Spring Data, transaction/AOP, security-filter, dynamic-proxy, declarative-client and verified reflection semantic edges are not migrated.",
+        "Java ServiceLoader resource activation is migrated; Dubbo SPI provider callback dispatch is not.",
+        "All framework real-project guards were deleted."
+      ]
+    },
+    {
+      "family_id": "closed_world_pipeline",
+      "migration_status": "partial",
+      "production_paths": [
+        "scripts/binary_decision_engine.py",
+        "scripts/binary_output.py",
+        "scripts/binary_validation_oracle.py"
+      ],
+      "positive_tests": [
+        "tests.test_binary_first_contract.BinaryFirstContractTest.test_projection_assessment_requires_obligation_conservation"
+      ],
+      "negative_tests": [
+        "tests.test_binary_first_model.BindingDecisionAndSnapshotTest.test_each_disposition_obligation_has_exactly_one_owner"
+      ],
+      "independent_tests": [
+        "tests.test_binary_pipeline.BinaryPipelineTest.test_independent_oracle_validates_interface_dispatch_targets"
+      ],
+      "blocking_gaps": [
+        "The independent Oracle does not yet reconcile every formal path, four-dimensional conclusion and human report row as one closed identity set.",
+        "The generated-topology, metamorphic and production-mutation closed-world guards were deleted."
+      ]
+    },
+    {
+      "family_id": "reproducible_test_assets",
+      "migration_status": "missing",
+      "production_paths": [],
+      "positive_tests": [],
+      "negative_tests": [],
+      "independent_tests": [],
+      "blocking_gaps": [
+        "Pinned real-project manifests, materialization code and checksum-bound execution were deleted.",
+        "No binary-first real-project matrix currently runs in release."
+      ]
+    },
+    {
+      "family_id": "performance_without_scope_loss",
+      "migration_status": "partial",
+      "production_paths": [
+        "scripts/binary_performance_gate.py",
+        "scripts/binary_snapshot_cache.py"
+      ],
+      "positive_tests": [
+        "tests.test_binary_performance_gate.BinaryPerformanceGateTest.test_small_fixture_enforces_class_conservation_and_zero_warm_parse"
+      ],
+      "negative_tests": [],
+      "independent_tests": [],
+      "blocking_gaps": [
+        "The committed 100,000-class measurement exists, but release does not rerun a scope-equivalence performance gate.",
+        "No real-project before/after scope contract guards API, artifact, class and edge counts together."
+      ]
+    },
+    {
+      "family_id": "test_gate_integrity",
+      "migration_status": "missing",
+      "production_paths": ["scripts/quality_gate.py"],
+      "positive_tests": [
+        "tests.test_quality_gate.QualityGateTest.test_release_discovers_all_current_tests"
+      ],
+      "negative_tests": [],
+      "independent_tests": [],
+      "blocking_gaps": [
+        "Release currently runs unittest discovery only; branch coverage, mutation, flaky/slow health and declarative capability-reference gates were deleted.",
+        "Before this audit there was no gate detecting deletion of an entire capability family."
+      ]
+    },
+    {
+      "family_id": "module_and_tool_failure_boundaries",
+      "migration_status": "partial",
+      "production_paths": [
+        "scripts/binary_artifact_diff.py",
+        "scripts/binary_trace_engine.py",
+        "scripts/binary_validation_oracle.py"
+      ],
+      "positive_tests": [
+        "tests.test_binary_only_architecture.BinaryOnlyArchitectureTest.test_orchestrator_has_no_gray_release_or_legacy_engine_switch"
+      ],
+      "negative_tests": [
+        "tests.test_binary_artifact_safety.BinaryArtifactSafetyTest.test_path_traversal_duplicate_and_expansion_are_rejected"
+      ],
+      "independent_tests": [
+        "tests.test_oracle_independence.OracleIndependenceTest.test_rejects_direct_aliased_and_dynamic_production_engine_dependencies"
+      ],
+      "blocking_gaps": [
+        "The pure trace-policy boundary and typed subprocess failure contract were deleted rather than migrated.",
+        "No fault matrix proves timeout, missing tool, permission, nonzero and empty output remain scoped and fail closed."
+      ]
+    }
+  ],
+  "mechanism_inventory": [
+    {
+      "mechanism_id": "binary_framework_entrypoints",
+      "migration_status": "enforced",
+      "user_effect": "Scheduled, event, messaging, web, lifecycle, runner, Servlet and Quartz callbacks in final bytecode can seed exact or possible paths.",
+      "evidence_tests": [
+        "tests.test_binary_entrypoint_discovery.BinaryEntrypointDiscoveryTest.test_runtime_annotation_entrypoint_matrix_is_discovered_from_bytecode",
+        "tests.test_binary_entrypoint_discovery.BinaryEntrypointDiscoveryTest.test_interface_callback_matrix_follows_inherited_interfaces"
+      ],
+      "blocking_gaps": []
+    },
+    {
+      "mechanism_id": "dependency_boot_registration",
+      "migration_status": "enforced",
+      "user_effect": "A dependency-only callback becomes exact only when selected Boot registration and business Boot startup are both proved.",
+      "evidence_tests": [
+        "tests.test_binary_pipeline.BinaryPipelineTest.test_dependency_scheduled_auto_configuration_is_reachable_without_manual_entrypoint",
+        "tests.test_binary_entrypoint_discovery.BinaryEntrypointDiscoveryTest.test_boot_registration_without_business_boot_activation_is_only_possible"
+      ],
+      "blocking_gaps": []
+    },
+    {
+      "mechanism_id": "human_entrypoint_evidence",
+      "migration_status": "enforced",
+      "user_effect": "Human call-chain evidence names the framework entry kind and the dependency that owns it.",
+      "evidence_tests": [
+        "tests.test_binary_report_labels.BinaryReportLabelsTest.test_human_call_chain_names_framework_entry_and_owning_dependency"
+      ],
+      "blocking_gaps": []
+    },
+    {
+      "mechanism_id": "java_serviceloader_activation",
+      "migration_status": "enforced",
+      "user_effect": "A reachable ServiceLoader.load call and the selected META-INF/services resource are reconciled and shown as runtime resource activation.",
+      "evidence_tests": [
+        "tests.test_binary_pipeline.BinaryPipelineTest.test_inherited_resolution_and_service_activation_are_human_visible"
+      ],
+      "blocking_gaps": []
+    },
+    {
+      "mechanism_id": "javac_constant_inline_binding",
+      "migration_status": "enforced",
+      "user_effect": "An optional exact source snapshot can prove a javac compile-time constant inline without guessing from equal literals.",
+      "evidence_tests": [
+        "tests.test_binary_pipeline.BinaryPipelineTest.test_source_overlay_proves_javac_constant_inline_without_literal_guessing",
+        "tests.test_binary_pipeline.BinaryPipelineTest.test_retained_base_constant_consumer_never_becomes_exact_inline_edge"
+      ],
+      "blocking_gaps": []
+    },
+    {
+      "mechanism_id": "source_overlay_user_choice",
+      "migration_status": "enforced",
+      "user_effect": "The user is told what source adds, explicitly chooses whether to provide it, and supplied source remains an overlay rather than replacing binary authority.",
+      "evidence_tests": [
+        "tests.test_binary_pipeline.BinaryPipelineTest.test_source_usage_requires_an_explicit_user_decision",
+        "tests.test_binary_pipeline.BinaryPipelineTest.test_skip_source_rejects_an_implicit_overlay",
+        "tests.test_binary_source_overlay.BinarySourceOverlayTest.test_descriptor_mismatch_is_conflict_and_binary_graph_remains_complete"
+      ],
+      "blocking_gaps": []
+    },
+    {
+      "mechanism_id": "dependency_source_snapshot_alignment",
+      "migration_status": "partial",
+      "user_effect": "Explicit source sets are SHA-bound and mapped to binary members, but the old automatic dependency repository/ref/module discovery path is gone.",
+      "evidence_tests": [
+        "tests.test_binary_pipeline.BinaryPipelineTest.test_dependency_source_set_is_published_with_dependency_dimension"
+      ],
+      "blocking_gaps": ["No migrated automatic dependency source discovery and detached snapshot materialization exists."]
+    },
+    {
+      "mechanism_id": "jpa_entity_activation_proof",
+      "migration_status": "partial",
+      "user_effect": "JPA lifecycle callbacks are visible as possible entries, but actual entity registration/use is not proved.",
+      "evidence_tests": [
+        "tests.test_binary_entrypoint_discovery.BinaryEntrypointDiscoveryTest.test_jpa_lifecycle_annotation_remains_possible_without_entity_use_proof"
+      ],
+      "blocking_gaps": ["No independent persistence-unit/entity activation verifier exists."]
+    },
+    {
+      "mechanism_id": "spring_xml_activation",
+      "migration_status": "missing",
+      "user_effect": "Scheduled and Quartz callbacks declared only in dependency or business XML are invisible to the current graph.",
+      "evidence_tests": [],
+      "blocking_gaps": ["No binary-first XML registration parser or independent verifier exists."]
+    },
+    {
+      "mechanism_id": "mybatis_proxy_dispatch",
+      "migration_status": "missing",
+      "user_effect": "Mapper calls backed by annotations or XML cannot reach changed MyBatis/runtime APIs through proxy semantics.",
+      "evidence_tests": [],
+      "blocking_gaps": ["The MyBatis annotation/XML adapter, Oracle and two real-project guards were deleted."]
+    },
+    {
+      "mechanism_id": "spring_transaction_proxy_dispatch",
+      "migration_status": "missing",
+      "user_effect": "Calls that reach changed APIs only through @Transactional proxy/interceptor semantics can be reported as no path.",
+      "evidence_tests": [],
+      "blocking_gaps": ["The packaged transactional-method and proxy dispatch verifier was deleted."]
+    },
+    {
+      "mechanism_id": "spring_data_repository_dispatch",
+      "migration_status": "missing",
+      "user_effect": "Spring Data repository interfaces and custom implementations are not joined through runtime proxy dispatch.",
+      "evidence_tests": [],
+      "blocking_gaps": ["The repository factory/implementation resolution adapter was deleted."]
+    },
+    {
+      "mechanism_id": "spring_aop_dispatch",
+      "migration_status": "missing",
+      "user_effect": "Advice and join-point paths that exist only through Spring AOP activation are absent from the current graph.",
+      "evidence_tests": [],
+      "blocking_gaps": ["The AOP activation collector and independent closure tests were deleted."]
+    },
+    {
+      "mechanism_id": "spring_security_filter_dispatch",
+      "migration_status": "missing",
+      "user_effect": "SecurityFilterChain ordering and filter callback paths are not projected into reachability.",
+      "evidence_tests": [],
+      "blocking_gaps": ["The source/final-artifact security chain collector and real-project guard were deleted."]
+    },
+    {
+      "mechanism_id": "spring_bean_wiring_dispatch",
+      "migration_status": "missing",
+      "user_effect": "@Bean and XML factory/property wiring does not connect injected interface calls to the created implementation unless ordinary bytecode already does so.",
+      "evidence_tests": [],
+      "blocking_gaps": ["Entrypoint discovery sees @Bean methods, but bean creation and injection semantic edges are not implemented."]
+    },
+    {
+      "mechanism_id": "spring_component_condition_activation",
+      "migration_status": "missing",
+      "user_effect": "Component-scan scope and external/property/class conditions cannot prove whether discovered callbacks are active.",
+      "evidence_tests": [],
+      "blocking_gaps": ["The support manifest explicitly excludes component scan and condition evaluation."]
+    },
+    {
+      "mechanism_id": "declarative_http_client_dispatch",
+      "migration_status": "missing",
+      "user_effect": "Feign and other declarative client interface calls do not produce outbound framework dispatch edges.",
+      "evidence_tests": [],
+      "blocking_gaps": ["The declarative HTTP client adapter and its route binding tests were deleted."]
+    },
+    {
+      "mechanism_id": "reflection_and_method_handle_dispatch",
+      "migration_status": "missing",
+      "user_effect": "Even exact class/member literals used by reflection, MethodHandle or VarHandle are not linked to their runtime targets.",
+      "evidence_tests": [],
+      "blocking_gaps": ["The verified reflection/method-handle collector and independent topology oracle were deleted."]
+    },
+    {
+      "mechanism_id": "dynamic_proxy_dispatch",
+      "migration_status": "missing",
+      "user_effect": "Registered InvocationHandler callbacks and proxied interface invocations are not connected.",
+      "evidence_tests": [],
+      "blocking_gaps": ["The dynamic-proxy registration adapter was deleted."]
+    },
+    {
+      "mechanism_id": "dubbo_spi_dispatch",
+      "migration_status": "missing",
+      "user_effect": "Dubbo extension resources and adaptive/provider callbacks cannot seed or extend a reachability path.",
+      "evidence_tests": [],
+      "blocking_gaps": ["Java ServiceLoader resource activation is migrated, but the Dubbo SPI adapter and guard were deleted."]
+    },
+    {
+      "mechanism_id": "implicit_data_contract_dispatch",
+      "migration_status": "missing",
+      "user_effect": "Field/type changes consumed implicitly by serialization or binding frameworks can appear unused when no direct field bytecode edge exists.",
+      "evidence_tests": [],
+      "blocking_gaps": ["The data-contract shape comparison and indirect consumer projection were deleted."]
+    },
+    {
+      "mechanism_id": "automatic_runtime_profile_materialization",
+      "migration_status": "missing",
+      "user_effect": "A normal project/final-artifact input is not automatically converted into the explicit ordered artifact closure, loader realms and runtime entry profile required by the new engine.",
+      "evidence_tests": [],
+      "blocking_gaps": ["The old build/catalog/source bridge was deleted and the current workflow requires a preassembled binary_pipeline_config."]
+    },
+    {
+      "mechanism_id": "nested_executable_materialization",
+      "migration_status": "missing",
+      "user_effect": "A fat JAR supplied as one artifact is not automatically expanded into business classes and ordered dependency artifacts for the binary pipeline.",
+      "evidence_tests": [],
+      "blocking_gaps": ["Step1 can inventory nested JARs, but no migrated bridge creates the explicit binary runtime artifact closure."]
+    },
+    {
+      "mechanism_id": "real_project_rotation",
+      "migration_status": "missing",
+      "user_effect": "Synthetic fixtures can pass while common framework topologies remain untested.",
+      "evidence_tests": [],
+      "blocking_gaps": ["All pinned binary/full-artifact project guards were removed from the branch."]
+    },
+    {
+      "mechanism_id": "generated_topology_and_metamorphic_regression",
+      "migration_status": "missing",
+      "user_effect": "A graph change can pass hand-written examples without being challenged by generated, metamorphic and mutation variants.",
+      "evidence_tests": [],
+      "blocking_gaps": ["Generated topology, determinism, metamorphic and production mutation runners/assets were deleted."]
+    },
+    {
+      "mechanism_id": "typed_tool_failure_matrix",
+      "migration_status": "missing",
+      "user_effect": "Timeout, missing tool, permission, nonzero and empty-output behavior is not exhaustively checked across every external-tool boundary, so a failure may be mistaken for absence.",
+      "evidence_tests": [],
+      "blocking_gaps": ["The typed tool execution contract, boundary registry and failure-injection matrix were deleted."]
+    },
+    {
+      "mechanism_id": "branch_mutation_flaky_health_gates",
+      "migration_status": "missing",
+      "user_effect": "A release can pass ordinary unittest discovery while core branches are untested, production mutations survive, or tests are flaky/too slow.",
+      "evidence_tests": [],
+      "blocking_gaps": ["Branch, mutation, repeat-health, slow-test and declarative catalog gates were deleted."]
+    }
+  ]
+}
