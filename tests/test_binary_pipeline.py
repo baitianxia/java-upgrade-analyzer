@@ -54,7 +54,7 @@ class BinaryPipelineTest(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def _jar(self, side, value, *, service_provider=None):
+    def _jar(self, side, value, *, service_provider=None, manifest=None):
         source = self.root / side / "src" / "demo" / "Api.java"
         source.parent.mkdir(parents=True)
         source.write_text(
@@ -73,6 +73,8 @@ class BinaryPipelineTest(unittest.TestCase):
         jar = self.root / side / "api.jar"
         with zipfile.ZipFile(jar, "w") as archive:
             archive.write(classes / "demo" / "Api.class", "demo/Api.class")
+            if manifest is not None:
+                archive.writestr("META-INF/MANIFEST.MF", manifest)
             if service_provider:
                 archive.writestr(
                     "META-INF/services/demo.Service", f"{service_provider}\n"
@@ -226,6 +228,35 @@ class BinaryPipelineTest(unittest.TestCase):
         ))
         with self.assertRaises(BinaryCompatibilityOutputError):
             load_validated_generation(report)
+
+    def test_manifest_semantics_match_independent_validation(self):
+        manifest = (
+            "Manifest-Version: 1.0\r\n"
+            "Created-By: comparison fixture\r\n"
+            "Long-Value: first-\r\n"
+            " continuation\r\n"
+            "\r\n"
+        )
+        base = self._jar("base", 1, manifest=manifest)
+        current = self._jar("current", 2, manifest=manifest)
+        config = {
+            "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+            "asm_jar": str(self.asm_jar),
+            "base": self._side(base),
+            "current": self._side(current),
+            "runtime_comparison": {
+                "controlled_profile_fields": ["loader_topology"],
+                "declared_upgrade_payload_scope": ["artifact-bytes"],
+            },
+        }
+
+        result = run_pipeline(
+            config,
+            output_root=self.root / "report" / ".runtime" / "binary_authority",
+            engine_mode="binary_strict",
+        )
+
+        self.assertEqual(result["validation_status"], "passed")
 
     def _constant_side(self, side, constant):
         root = self.root / side

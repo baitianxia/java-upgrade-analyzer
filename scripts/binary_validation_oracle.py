@@ -170,6 +170,22 @@ def _independent_resource_digest(name: str, content: bytes) -> str:
 
 
 def _independent_resource_facts(name: str, content: bytes) -> list[list[str]]:
+    if name.upper() == "META-INF/MANIFEST.MF":
+        text = content.decode("utf-8", errors="replace").replace(
+            "\r\n", "\n"
+        ).replace("\r", "\n")
+        unfolded = []
+        for line in text.split("\n"):
+            if line.startswith(" ") and unfolded:
+                unfolded[-1] += line[1:]
+            else:
+                unfolded.append(line)
+        return [
+            [key.strip().lower(), value.strip()]
+            for line in unfolded
+            for key, separator, value in [line.partition(":")]
+            if separator
+        ]
     if not (
         name.startswith("META-INF/services/")
         or (name.startswith("META-INF/spring/") and name.endswith(".imports"))
