@@ -467,7 +467,6 @@ def build_source_overlay(
     *,
     analysis_context_identity: str,
     source_snapshot_identity: str,
-    source_root: str | Path,
     source_snapshot_coverage_status: str = "complete",
 ) -> SourceOverlayResult:
     context = str(analysis_context_identity or "").strip()
@@ -476,12 +475,15 @@ def build_source_overlay(
         raise SourceOverlayError(
             "SOURCE_OVERLAY_IDENTITY_MISSING", "analysis context and source snapshot are required"
         )
-    root = Path(source_root).resolve()
     methods = tuple(source_methods)
     index: dict[tuple[str, str], list[Any]] = {}
     for method in methods:
         key = (_normalized_source_owner(method), _source_method_name(method))
         index.setdefault(key, []).append(method)
+    artifact_coords = {
+        str(item["artifact_instance_identity"]): str(item["coord"] or "")
+        for item in store.rows("artifact_instances")
+    }
 
     rows = []
     for member in store.rows("members", where="member_kind='method'"):
@@ -498,6 +500,7 @@ def build_source_overlay(
         if len(exact) == 1:
             method = exact[0]
             source_path = Path(str(getattr(method, "file", "") or ""))
+            root = Path(str(getattr(method, "source_root", "") or "")).resolve()
             try:
                 logical_path = source_path.resolve().relative_to(root).as_posix()
             except (OSError, ValueError):
@@ -522,6 +525,9 @@ def build_source_overlay(
                         "line": int(getattr(method, "line", 0) or 0),
                         "end_line": int(getattr(method, "end_line", 0) or 0),
                         "language": str(getattr(method, "language", "") or ""),
+                        "owner_type": str(getattr(method, "owner_type", "") or ""),
+                        "owner_coord": str(getattr(method, "owner_coord", "") or ""),
+                        "module": str(getattr(method, "module", "") or ""),
                         "source_symbol_id": str(getattr(method, "symbol_id", "") or ""),
                         "jvm_descriptor": member["descriptor"],
                     }
@@ -562,6 +568,14 @@ def build_source_overlay(
         row = {
             **identity_payload,
             "overlay_identity": overlay_identity,
+            "binary_member": {
+                "class_name": member["class_name"],
+                "member_name": member["member_name"],
+                "descriptor": member["descriptor"],
+                "artifact_coord": artifact_coords.get(
+                    str(member["artifact_instance_identity"]), ""
+                ),
+            },
             "source_location": location,
         }
         store.add_source_overlay(

@@ -26,6 +26,145 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertFalse(hasattr(run_step, "validate_binary_engine_mode_transition"))
         self.assertFalse(hasattr(run_step, "ENGINE_DESCRIPTOR_RELATIVE_PATH"))
 
+    def test_step4_config_source_overlay_is_direct_user_provision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "binary.json"
+            config.write_text(
+                json.dumps({
+                    "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+                    "source_overlay": {
+                        "source_sets": [{
+                            "source_dirs": ["/must-not-be-read"],
+                            "owner_type": "business",
+                            "owner_coord": "business",
+                        }],
+                    },
+                }),
+                encoding="utf-8",
+            )
+            resolved_path = run_step._resolved_binary_pipeline_config_path(
+                {"binary_pipeline_config": str(config)},
+                root,
+                root / ".upgrade-report",
+            )
+            resolved = json.loads(resolved_path.read_text(encoding="utf-8"))
+            self.assertEqual(resolved["source_usage"]["decision"], "use_source")
+            self.assertEqual(
+                resolved["source_usage"]["decision_source"],
+                "user_provided_source",
+            )
+
+    def test_step4_config_without_source_requires_user_decision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "binary.json"
+            config.write_text(
+                json.dumps({
+                    "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+                }),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                run_step.StepError, "BINARY_SOURCE_USAGE_DECISION_REQUIRED"
+            ):
+                run_step._resolved_binary_pipeline_config_path(
+                    {"binary_pipeline_config": str(config)},
+                    root,
+                    root / ".upgrade-report",
+                )
+
+            config.write_text(
+                json.dumps({
+                    "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+                    "source_usage": {
+                        "decision": "skip_source",
+                        "decision_source": "explicit_config",
+                    },
+                }),
+                encoding="utf-8",
+            )
+            resolved_path = run_step._resolved_binary_pipeline_config_path(
+                {"binary_pipeline_config": str(config)},
+                root,
+                root / ".upgrade-report",
+            )
+            resolved = json.loads(resolved_path.read_text(encoding="utf-8"))
+            self.assertEqual(resolved["source_usage"]["decision"], "skip_source")
+            self.assertEqual(
+                resolved["source_usage"]["decision_source"], "explicit_config"
+            )
+
+    def test_user_source_choice_controls_resolved_step4_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = root / ".upgrade-report"
+            source_dir = root / "src" / "main" / "java"
+            source_dir.mkdir(parents=True)
+            dependency_source_dir = root / "dependency" / "src" / "main" / "java"
+            dependency_source_dir.mkdir(parents=True)
+            config = root / "binary.json"
+            config.write_text(
+                json.dumps({
+                    "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+                    "source_overlay": {
+                        "source_sets": [{
+                            "source_dirs": ["/configured/source"],
+                            "source_root": "/configured",
+                            "owner_type": "business",
+                            "owner_coord": "business",
+                        }],
+                    },
+                }),
+                encoding="utf-8",
+            )
+
+            skipped_path = run_step._resolved_binary_pipeline_config_path(
+                {
+                    "binary_pipeline_config": str(config),
+                    "source_usage_decision": "skip_source",
+                },
+                root,
+                report,
+            )
+            skipped = json.loads(skipped_path.read_text())
+            self.assertNotIn("source_overlay", skipped)
+            self.assertEqual(skipped["source_usage"]["decision"], "skip_source")
+
+            config.write_text(
+                json.dumps({
+                    "schema": "java-upgrade-analyzer.binary-pipeline-input.v1"
+                }),
+                encoding="utf-8",
+            )
+            used_path = run_step._resolved_binary_pipeline_config_path(
+                {
+                    "binary_pipeline_config": str(config),
+                    "source_usage_decision": "use_source",
+                    "source_dirs": [str(source_dir)],
+                    "target_module": "app",
+                    "dependency_source_mappings": [
+                        f"com.example:library={dependency_source_dir}"
+                    ],
+                },
+                root,
+                report,
+            )
+            used = json.loads(used_path.read_text())
+            self.assertEqual(used["source_usage"]["decision"], "use_source")
+            self.assertEqual(
+                used["source_overlay"]["source_sets"][0]["source_dirs"],
+                [str(source_dir.resolve())],
+            )
+            self.assertEqual(
+                used["source_overlay"]["source_sets"][1]["owner_coord"],
+                "com.example:library",
+            )
+            self.assertEqual(
+                used["source_overlay"]["source_sets"][1]["owner_type"],
+                "dependency",
+            )
+
     def test_binary_failure_preserves_previous_outputs_and_records_internal_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -45,7 +184,10 @@ class RunStepMainStateTest(unittest.TestCase):
                     run_step.StepError, "BINARY_GENERATION_FAILED"
                 ):
                     run_step._run_binary_step4(
-                        run_context={"binary_pipeline_config": str(config)},
+                        run_context={
+                            "binary_pipeline_config": str(config),
+                            "source_usage_decision": "skip_source",
+                        },
                         project_dir=root,
                         report_dir=report,
                         s4_dir=s4_dir,
@@ -88,7 +230,10 @@ class RunStepMainStateTest(unittest.TestCase):
 
             with patch.object(run_step, "run_python", side_effect=fake_run):
                 result = run_step._run_binary_step4(
-                    run_context={"binary_pipeline_config": str(config)},
+                    run_context={
+                        "binary_pipeline_config": str(config),
+                        "source_usage_decision": "skip_source",
+                    },
                     project_dir=root,
                     report_dir=report,
                     s4_dir=s4_dir,
@@ -98,6 +243,20 @@ class RunStepMainStateTest(unittest.TestCase):
                 [item[0] for item in calls],
                 ["binary_pipeline.py", "binary_report.py"],
             )
+            pipeline_args = calls[0][1]
+            resolved_config_path = Path(
+                pipeline_args[pipeline_args.index("--config") + 1]
+            )
+            resolved_config = json.loads(resolved_config_path.read_text())
+            self.assertEqual(
+                resolved_config["source_usage"],
+                {
+                    "decision": "skip_source",
+                    "decision_source": "user_interaction",
+                    "purpose_version": "source-overlay-purpose-v1",
+                },
+            )
+            self.assertNotIn("source_overlay", resolved_config)
             timing_path = report / ".runtime/observability/step4_timing.csv"
             self.assertTrue(timing_path.read_bytes().startswith(b"\xef\xbb\xbf"))
             with timing_path.open(encoding="utf-8-sig", newline="") as handle:
@@ -236,6 +395,7 @@ class RunStepMainStateTest(unittest.TestCase):
                 project_dir,
                 run_context={
                     "target_module": "app",
+                    "source_usage_decision": "skip_source",
                     "source_dirs": [str(source_dir)],
                     "source_dirs_status": "explicit",
                 },
@@ -294,12 +454,154 @@ class RunStepMainStateTest(unittest.TestCase):
             )
 
         self.assertEqual(payload["reason_code"], "STEP2_CONTEXT_FACTS_UNRESOLVED")
-        self.assertEqual(payload["required_fields"], ["jdk_base", "jdk_current"])
+        self.assertEqual(
+            payload["required_fields"],
+            ["jdk_base", "jdk_current"],
+        )
         self.assertIn("升级前 JDK", payload["question"])
         self.assertIn("升级后 JDK", payload["question"])
         self.assertNotIn("依赖源码目录", payload["question"])
         self.assertIn("jdk_base", payload["response_schema"]["properties"])
         self.assertIn("jdk_current", payload["response_schema"]["properties"])
+
+    def test_step2_requires_informed_source_choice_before_auto_continue(self):
+        confirmation = run_step.build_step2_confirmation_requirements(
+            {"jdk_base": "8", "jdk_current": "17"},
+            {
+                "source_dirs": ["/project/src/main/java"],
+                "source_dirs_status": "context_detected",
+                "source_repo_hint_suggestions": {},
+            },
+            {},
+        )
+        self.assertTrue(confirmation["required"])
+        self.assertEqual(
+            confirmation["reason_code"],
+            "step2_source_usage_decision_required",
+        )
+        self.assertEqual(
+            confirmation["required_fields"], ["source_usage_decision"]
+        )
+
+        skipped = run_step.build_step2_confirmation_requirements(
+            {"jdk_base": "8", "jdk_current": "17"},
+            {
+                "source_dirs": [],
+                "source_dirs_status": "missing",
+                "source_repo_hint_suggestions": {},
+            },
+            {"source_usage_decision": "skip_source"},
+        )
+        self.assertFalse(skipped["required"])
+
+        dependency_only = run_step.build_step2_confirmation_requirements(
+            {"jdk_base": "8", "jdk_current": "17"},
+            {
+                "source_dirs": [],
+                "source_dirs_status": "missing",
+                "dependency_source_dirs": ["/repos/library"],
+                "source_repo_hint_suggestions": {},
+            },
+            {
+                "source_usage_decision": "use_source",
+                "dependency_source_dirs": ["/repos/library"],
+            },
+        )
+        self.assertFalse(dependency_only["required"])
+
+        persisted = run_step.merge_user_response_into_run_context(
+            {},
+            {
+                "action": "continue",
+                "source_usage_decision": "use_source",
+            },
+            Path("/project"),
+        )
+        self.assertEqual(persisted["source_usage_decision"], "use_source")
+        self.assertEqual(
+            persisted["source_usage_purpose_version"],
+            "source-overlay-purpose-v1",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            provided_dir = project_dir / "src" / "main" / "java"
+            provided_dir.mkdir(parents=True)
+            provided = run_step.merge_user_response_into_run_context(
+                {},
+                {
+                    "action": "continue",
+                    "source_dirs": [str(provided_dir)],
+                },
+                project_dir,
+            )
+        self.assertEqual(provided["source_usage_decision"], "use_source")
+        self.assertEqual(
+            provided["source_usage_decision_source"],
+            "user_provided_source",
+        )
+        no_extra_choice = run_step.build_step2_confirmation_requirements(
+            {"jdk_base": "8", "jdk_current": "17"},
+            {
+                "source_dirs": provided["source_dirs"],
+                "source_dirs_status": "explicit",
+                "source_repo_hint_suggestions": {},
+            },
+            provided,
+        )
+        self.assertFalse(no_extra_choice["required"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            report_dir = project_dir / ".upgrade-report"
+            context_dir = report_dir / "evidence" / "context"
+            source_dir = project_dir / "src" / "main" / "java"
+            context_dir.mkdir(parents=True)
+            source_dir.mkdir(parents=True)
+            (context_dir / "context.json").write_text(
+                json.dumps({
+                    "base_branch": "main",
+                    "current_branch": "upgrade",
+                    "jdk_base": "8",
+                    "jdk_current": "17",
+                    "changed_dependencies": [],
+                }),
+                encoding="utf-8",
+            )
+            (context_dir / "dep_graph.json").write_text("{}\n", encoding="utf-8")
+            payload = run_step.build_interaction_payload(
+                "step2",
+                report_dir,
+                {
+                    "step2": {
+                        "title": "升级上下文",
+                        "conditional_confirmation": True,
+                        "interaction": {
+                            "type": "decision",
+                            "question": "请确认上下文。",
+                            "options": [{"id": "continue", "label": "继续"}],
+                        },
+                        "outputs": [],
+                    }
+                },
+                project_dir,
+                run_context={
+                    "target_module": "app",
+                    "source_dirs": [str(source_dir)],
+                    "source_dirs_status": "context_detected",
+                },
+                main_state=run_step.new_main_state(report_dir),
+            )
+
+        self.assertIn("是否为本次分析提供源码", payload["question"])
+        self.assertIn("文件与行号", payload["question"])
+        self.assertIn("不会改变", payload["question"])
+        self.assertIn("不提供源码也可以继续", payload["question"])
+        self.assertEqual(payload["required_fields"], ["source_usage_decision"])
+        self.assertEqual(
+            payload["response_schema"]["properties"]["source_usage_decision"]["enum"],
+            ["use_source", "skip_source"],
+        )
 
     def test_step2_stops_for_explicit_source_hint_decision_without_forcing_acceptance(self):
         confirmation = run_step.build_step2_confirmation_requirements(
@@ -316,6 +618,7 @@ class RunStepMainStateTest(unittest.TestCase):
                     ]
                 },
             },
+            {"source_usage_decision": "use_source"},
         )
         pending = {
             "step_id": "step2",
@@ -365,7 +668,10 @@ class RunStepMainStateTest(unittest.TestCase):
                     "proposed": confirmation["proposed_mappings"]
                 },
             },
-            {"accept_suggested_mappings": False},
+            {
+                "source_usage_decision": "use_source",
+                "accept_suggested_mappings": False,
+            },
         )
         self.assertFalse(declined["required"])
 
@@ -3953,6 +4259,7 @@ class RunStepMainStateTest(unittest.TestCase):
             run_context = {
                 "source_dirs": [str((project_dir / "src/main/java").resolve())],
                 "source_dirs_status": "provided",
+                "source_usage_decision": "use_source",
                 "include_test_scope": True,
             }
             manifest_steps = {"step3": {"gate": "scan"}}
@@ -3976,6 +4283,35 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertNotIn("--jdk-upgraded", captured["script_args"])
         self.assertNotIn("--sb-major-upgrade", captured["script_args"])
         self.assertNotIn("--target-jdk", captured["script_args"])
+        self.assertNotIn("--no-source", captured["script_args"])
+
+    def test_execute_step3_skip_source_disables_source_scan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            report_dir = project_dir / ".upgrade-report"
+            report_dir.mkdir(parents=True)
+            self._write_text(run_step.step2_context_path(report_dir), "{}", encoding="utf-8")
+            args = self._make_default_args(project_dir, report_dir)
+            run_context = {
+                "source_dirs": [str((project_dir / "src/main/java").resolve())],
+                "source_dirs_status": "auto_detected",
+                "source_usage_decision": "skip_source",
+            }
+            manifest_steps = {"step3": {"gate": "scan"}}
+            captured = {}
+
+            def fake_run_python(script_name, script_args, _cwd, **_kwargs):
+                captured["script_name"] = script_name
+                captured["script_args"] = list(script_args)
+
+            with patch.object(run_step, "ensure_exists"), \
+                 patch.object(run_step, "run_python", side_effect=fake_run_python), \
+                 patch.object(run_step, "run_gate"):
+                run_step.execute_step("step3", args, manifest_steps, run_context)
+
+        self.assertEqual(captured["script_name"], "s3_scan.py")
+        self.assertIn("--no-source", captured["script_args"])
+        self.assertNotIn("--source-dirs", captured["script_args"])
 
     def test_execute_step4_does_not_pass_business_inputs_via_cli(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -4014,6 +4350,7 @@ class RunStepMainStateTest(unittest.TestCase):
             config = project_dir / "binary.json"
             config.write_text("{}", encoding="utf-8")
             run_context["binary_pipeline_config"] = str(config)
+            run_context["source_usage_decision"] = "skip_source"
             manifest_steps = {"step4": {"gate": "binary_diff"}}
             captured = []
 
@@ -5110,6 +5447,7 @@ class RunStepMainStateTest(unittest.TestCase):
                         "source_dirs": [str(source_dir.resolve())],
                         "source_dirs_status": "provided",
                         "binary_pipeline_config": str(config),
+                        "source_usage_decision": "use_source",
                         "dependency_git_ref_overrides": [
                             {
                                 "coord": "com.example:demo-lib",

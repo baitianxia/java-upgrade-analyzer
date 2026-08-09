@@ -225,7 +225,9 @@ def build_output_payloads(
     profile: RuntimeProfile,
     *,
     source_overlay: SourceOverlayResult | None = None,
+    source_usage: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
+    source_usage = dict(source_usage or {})
     assessments = {
         item["projection_assessment_identity"]: item
         for item in decisions.projection_assessments
@@ -264,6 +266,7 @@ def build_output_payloads(
         "formal_path_set_complete": all(item["path_set_complete"] for item in by_api),
         "decision_coverage_status": decisions.coverage_status,
         "trace_coverage_status": traces.coverage_status,
+        "source_usage": source_usage,
     }
     return {
         "binary_decisions.json": {
@@ -303,6 +306,7 @@ def build_output_payloads(
             "source_overlay": asdict(source_overlay) if source_overlay else {
                 "coverage_status": "not_provided",
             },
+            "source_usage": source_usage,
         },
         "binary_summary.json": summary,
     }
@@ -333,12 +337,17 @@ def write_binary_generation(
     *,
     policy_identities: Mapping[str, str],
     source_overlay: SourceOverlayResult | None = None,
+    source_usage: Mapping[str, str] | None = None,
     additional_sidecars: Mapping[str, bytes] | None = None,
 ) -> dict[str, Any]:
     root = Path(output_root)
     root.mkdir(parents=True, exist_ok=True)
     payloads = build_output_payloads(
-        decisions, traces, profile, source_overlay=source_overlay
+        decisions,
+        traces,
+        profile,
+        source_overlay=source_overlay,
+        source_usage=source_usage,
     )
     encoded = {name: _json_bytes(payload) for name, payload in payloads.items()}
     encoded["binary_formal_results.csv"] = _csv_bytes(payloads["binary_formal_results.json"]["by_api"])

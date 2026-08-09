@@ -14,7 +14,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR / "scripts"))
 
 import binary_asm_helper  # noqa: E402
-from binary_pipeline import run_pipeline  # noqa: E402
+from binary_pipeline import BinaryPipelineError, run_pipeline  # noqa: E402
 from binary_report import (  # noqa: E402
     BinaryReportError,
     load_validated_generation,
@@ -54,6 +54,41 @@ class BinaryPipelineTest(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_source_usage_requires_an_explicit_user_decision(self):
+        with self.assertRaises(BinaryPipelineError) as raised:
+            run_pipeline(
+                {"schema": "java-upgrade-analyzer.binary-pipeline-input.v1"},
+                output_root=self.root / "missing-source-decision",
+            )
+        self.assertEqual(
+            raised.exception.reason_code,
+            "BINARY_SOURCE_USAGE_DECISION_REQUIRED",
+        )
+
+    def test_skip_source_rejects_an_implicit_overlay(self):
+        with self.assertRaises(BinaryPipelineError) as raised:
+            run_pipeline(
+                {
+                    "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+                    "source_usage": {
+                        "decision": "skip_source",
+                        "decision_source": "explicit_config",
+                    },
+                    "source_overlay": {
+                        "source_sets": [{
+                            "source_dirs": ["/not/read"],
+                            "owner_type": "business",
+                            "owner_coord": "business",
+                        }],
+                    },
+                },
+                output_root=self.root / "unconsented-source",
+            )
+        self.assertEqual(
+            raised.exception.reason_code,
+            "BINARY_SOURCE_OVERLAY_NOT_CONSENTED",
+        )
 
     def _jar(
         self, side, value, *, service_provider=None, manifest=None,
@@ -145,6 +180,10 @@ class BinaryPipelineTest(unittest.TestCase):
         current = self._jar("current", 2, service_provider="demo.NewProvider")
         config = {
             "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+            "source_usage": {
+                "decision": "skip_source",
+                "decision_source": "explicit_config",
+            },
             "asm_jar": str(self.asm_jar),
             "base": self._side(base, "1"),
             "current": self._side(current, "2"),
@@ -197,9 +236,20 @@ class BinaryPipelineTest(unittest.TestCase):
         step4_summary = json.loads(
             (api_dir / "summary.json").read_text()
         )
+        self.assertEqual(
+            step4_summary["source_usage"]["decision"], "skip_source"
+        )
         self.assertEqual(step4_summary["authoritative_change_fact_count"], 2)
         self.assertEqual(step4_summary["published_api_change_count"], 1)
         self.assertEqual(step4_summary["confirmed_unprojectable_fact_count"], 1)
+        self.assertIn(
+            "用户明确选择不提供源码",
+            (api_dir / "source_overlay.md").read_text(encoding="utf-8"),
+        )
+        with (api_dir / "source_overlay.csv").open(
+            encoding="utf-8-sig", newline=""
+        ) as handle:
+            self.assertEqual(list(csv.DictReader(handle)), [])
         self.assertTrue(
             (api_dir / "all_changed_apis.csv").read_bytes().startswith(b"\xef\xbb\xbf")
         )
@@ -220,6 +270,7 @@ class BinaryPipelineTest(unittest.TestCase):
             per_dependency_review.read_text(),
         )
         complete_review = (api_dir / "review.md").read_text()
+        self.assertIn("用户选择不提供源码", complete_review)
         self.assertIn("## com.acme:api\n", complete_review)
         self.assertNotIn("## com.acme:api:1、com.acme:api:2", complete_review)
         self.assertIn("META-INF/services/demo.Service", complete_review)
@@ -246,6 +297,7 @@ class BinaryPipelineTest(unittest.TestCase):
             )
         )
         self.assertIn("not_found_in_static_analysis", final_report.read_text())
+        self.assertIn("用户选择不提供源码", final_report.read_text())
         self.assertTrue((final_report.parent / "all-affected-dependencies.md").is_file())
         self.assertTrue((final_report.parent / "all-affected-dependencies.csv").is_file())
         self.assertTrue((final_report.parent / "all-impact-details.md").is_file())
@@ -284,6 +336,10 @@ class BinaryPipelineTest(unittest.TestCase):
         current = self._jar("current", 2, manifest=manifest, uses_system_out=True)
         config = {
             "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+            "source_usage": {
+                "decision": "skip_source",
+                "decision_source": "explicit_config",
+            },
             "asm_jar": str(self.asm_jar),
             "base": self._side(base),
             "current": self._side(current),
@@ -299,6 +355,63 @@ class BinaryPipelineTest(unittest.TestCase):
         )
 
         self.assertEqual(result["validation_status"], "passed")
+
+    def test_dependency_source_set_is_published_with_dependency_dimension(self):
+        base = self._jar("source-base", 1)
+        current = self._jar("source-current", 2, uses_system_out=True)
+        current_source = self.root / "source-current" / "src"
+        config = {
+            "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+            "source_usage": {
+                "decision": "use_source",
+                "decision_source": "explicit_config",
+            },
+            "asm_jar": str(self.asm_jar),
+            "base": self._side(base, "1"),
+            "current": self._side(current, "2"),
+            "runtime_comparison": {
+                "controlled_profile_fields": ["loader_topology"],
+                "declared_upgrade_payload_scope": ["artifact-bytes"],
+            },
+            "source_overlay": {
+                "source_sets": [{
+                    "source_dirs": [str(current_source)],
+                    "source_root": str(current_source),
+                    "owner_type": "dependency",
+                    "owner_coord": "com.acme:api:2",
+                    "module": "api",
+                }],
+            },
+        }
+        report = self.root / "dependency-source-report"
+
+        result = run_pipeline(
+            config,
+            output_root=report / ".runtime" / "binary_authority",
+        )
+        self.assertEqual(result["source_usage"]["decision"], "use_source")
+        api_dir = report / "evidence" / "api_changes"
+        publish_step4(report, api_dir)
+        with (api_dir / "source_overlay.csv").open(
+            encoding="utf-8-sig", newline=""
+        ) as handle:
+            rows = list(csv.DictReader(handle))
+
+        mapped = next(row for row in rows if row["二进制方法"] == "demo.Api.value()")
+        self.assertEqual(mapped["源码归属"], "com.acme:api:2")
+        self.assertEqual(mapped["二进制制品"], "com.acme:api:2")
+        self.assertEqual(mapped["源码位置"], "demo/Api.java:1")
+        self.assertTrue(mapped["源码声明"])
+        with (api_dir / "source_candidate_relationships.csv").open(
+            encoding="utf-8-sig", newline=""
+        ) as handle:
+            candidate_rows = list(csv.DictReader(handle))
+        self.assertTrue(candidate_rows)
+        self.assertTrue(all(
+            row["源码归属"] == "com.acme:api:2"
+            and row["权威边界"] == "源码候选关系，不是可执行调用边"
+            for row in candidate_rows
+        ))
 
     def _constant_side(self, side, constant):
         root = self.root / side
@@ -372,6 +485,10 @@ class BinaryPipelineTest(unittest.TestCase):
         current_source, current_business, current_vendor = self._constant_side("inline-current", 29)
         config = {
             "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+            "source_usage": {
+                "decision": "use_source",
+                "decision_source": "explicit_config",
+            },
             "asm_jar": str(self.asm_jar),
             "base": self._constant_config_side(_base_source, base_business, base_vendor),
             "current": self._constant_config_side(current_source, current_business, current_vendor),
@@ -380,13 +497,19 @@ class BinaryPipelineTest(unittest.TestCase):
                 "declared_upgrade_payload_scope": ["artifact-bytes"],
             },
             "source_overlay": {
-                "source_dirs": [str(current_source)],
-                "source_root": str(current_source),
-                "owner_type": "business",
-                "owner_coord": "business",
+                "source_sets": [{
+                    "source_dirs": [str(current_source)],
+                    "source_root": str(current_source),
+                    "owner_type": "business",
+                    "owner_coord": "business",
+                }],
             },
         }
-        result = run_pipeline(config, output_root=self.root / "inline-output")
+        inline_report = self.root / "inline-report"
+        result = run_pipeline(
+            config,
+            output_root=inline_report / ".runtime" / "binary_authority",
+        )
         generation = Path(result["generation_directory"])
         inline = json.loads((generation / "binary_inline_overlay.json").read_text())
         self.assertEqual(inline["proven_count"], 1, inline)
@@ -399,6 +522,18 @@ class BinaryPipelineTest(unittest.TestCase):
         ]
         self.assertEqual(len(field_results), 1)
         self.assertEqual(field_results[0]["reachability_status"], "reachable")
+        source_report_dir = inline_report / "evidence" / "api_changes"
+        publish_step4(inline_report, source_report_dir)
+        source_report = (source_report_dir / "source_overlay.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("`business`", source_report)
+        self.assertIn("biz.Main.entry()", source_report)
+        with (source_report_dir / "source_overlay.csv").open(
+            encoding="utf-8-sig", newline=""
+        ) as handle:
+            source_rows = list(csv.DictReader(handle))
+        self.assertTrue(any(row["源码归属"] == "business" for row in source_rows))
 
     def test_retained_base_constant_consumer_never_becomes_exact_inline_edge(self):
         base_source, base_business, base_vendor = self._constant_side("retained-base", 7)
@@ -407,6 +542,10 @@ class BinaryPipelineTest(unittest.TestCase):
         )
         config = {
             "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+            "source_usage": {
+                "decision": "use_source",
+                "decision_source": "explicit_config",
+            },
             "asm_jar": str(self.asm_jar),
             "base": self._constant_config_side(base_source, base_business, base_vendor),
             # Deliberately retain the old consumer bytes while updating the
@@ -419,10 +558,12 @@ class BinaryPipelineTest(unittest.TestCase):
                 "declared_upgrade_payload_scope": ["artifact-bytes"],
             },
             "source_overlay": {
-                "source_dirs": [str(current_source)],
-                "source_root": str(current_source),
-                "owner_type": "business",
-                "owner_coord": "business",
+                "source_sets": [{
+                    "source_dirs": [str(current_source)],
+                    "source_root": str(current_source),
+                    "owner_type": "business",
+                    "owner_coord": "business",
+                }],
             },
         }
         result = run_pipeline(
@@ -488,6 +629,10 @@ class BinaryPipelineTest(unittest.TestCase):
             }
         config = {
             "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+            "source_usage": {
+                "decision": "skip_source",
+                "decision_source": "explicit_config",
+            },
             "asm_jar": str(self.asm_jar),
             "base": base_side,
             "current": current_side,

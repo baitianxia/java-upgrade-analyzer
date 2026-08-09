@@ -328,11 +328,13 @@ def _materialize_complete_fixture(
             "changed_or_unknown_profile_fields": [],
         },
         "source_overlay": {
-            "source_root": str(fixture),
-            "source_dirs": [str(app_source.parents[2])],
-            "owner_type": "business",
-            "owner_coord": "contract:fixture:1",
-            "module": ".",
+            "source_sets": [{
+                "source_root": str(fixture),
+                "source_dirs": [str(app_source.parents[2])],
+                "owner_type": "business",
+                "owner_coord": "contract:fixture:1",
+                "module": ".",
+            }],
         },
     }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return base_artifact, current_artifact, app_source.parents[2], config_path

@@ -25,6 +25,8 @@ Step4–Step6 只存在一个 binary-first 引擎。不存在 legacy、shadow、
 
 ### 2.2 源码只做覆盖层
 
+源码覆盖不是默认行为。用户主动提交源码目录、源码仓库或带 `source_overlay` 的配置，本身构成 `use_source` 授权，系统直接使用且不重复询问。用户没有提交源码时，Step2 必须先用人类可理解的语言说明源码可以增加文件/行号、声明与注解、可读上下文和候选关系，并在受支持的常量内联场景与字节码共同形成证明，同时说明它不能覆盖二进制裁决；随后由用户选择补充源码或明确 `skip_source`。自动发现源码目录不构成使用授权，也不能被解释为默认不使用。
+
 源码覆盖层可以补充名称、声明位置、注释、源码片段和行为解释，但不得：
 
 - 决定一个二进制变化是否存在；
@@ -86,7 +88,8 @@ Step4 必须接收显式 `binary_pipeline_config`。模板见仓库根目录 `bi
 - base/current 完整目标 JDK home；
 - resource/security policy；
 - 业务入口及其方法 descriptor；
-- 可选 source overlay。
+- 必填 `source_usage` 用户决定；
+- 当用户选择 `use_source` 时必填 `source_overlay.source_sets`，每个业务或依赖源码集合必须分别记录 `owner_type`、`owner_coord`、`module`、稳定 `source_root` 和源码目录；选择 `skip_source` 时必须不存在 source overlay。
 
 这些事实决定运行时有效性，不能从当前开发机 classpath 或未固定的构建目录猜测。缺失会改变结论的外部事实时，系统明确指出缺口；身份冲突、重复 provider、JDK 不完整、entrypoint 无法绑定或配置与制品 SHA 不一致时直接失败关闭。
 

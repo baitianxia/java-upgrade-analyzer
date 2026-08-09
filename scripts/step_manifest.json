@@ -117,7 +117,7 @@
       "interaction": {
         "type": "decision",
         "status": "awaiting_user_input",
-        "question": "请确认升级口径、分支信息、目标模块及自动生成的项目范围是否正确；标准 Maven 工程无需填写业务源码目录。若已知相关依赖源码目录，也可以一并补充。",
+        "question": "请确认升级口径和项目范围。已提交源码目录、源码仓库或 source_overlay 时系统会直接使用；尚未提交源码时，请决定补充源码还是明确不提供。源码可增加文件/行号、声明与注解、可读上下文和候选关系，并在受支持的常量内联场景与字节码共同形成证明；不会覆盖最终二进制裁决。不提供源码也可以继续，但报告会标注源码解释覆盖缺失。",
         "required_fields": [
           "action"
         ],
@@ -168,7 +168,15 @@
             },
             "source_dirs": {
               "type": "array",
-              "description": "兼容/异常覆盖字段。仅当 Maven project_scope 无法推导非标准源码布局时使用。"
+              "description": "当 source_usage_decision=use_source 且无法自动推导业务源码范围时提供。"
+            },
+            "source_usage_decision": {
+              "type": "string",
+              "enum": [
+                "use_source",
+                "skip_source"
+              ],
+              "description": "未提交源码时必选。用户已经提交源码目录、源码仓库或 source_overlay 时直接视为 use_source，不重复确认；系统自动识别的目录不能替用户选择。"
             },
             "dependency_source_dirs": {
               "type": "array",
@@ -191,7 +199,7 @@
           {
             "id": "continue",
             "label": "继续",
-            "description": "口径正确；若提供了依赖源码目录或源码线索，系统会自动识别模块并生成映射建议，但不会在 continue 时覆盖已存在映射。"
+            "description": "口径正确；已提交源码时直接使用，未提交时需明确补充源码或不提供。使用源码时系统会建立与最终制品绑定的语义覆盖。"
           },
           {
             "id": "cancel",
@@ -205,7 +213,7 @@
               "dependency_source_dirs",
               "source_repo_hints"
             ],
-            "description": "继续前建议确认 target_module/project_scope，并按需补充依赖源码线索。"
+            "description": "确认 target_module/project_scope；若未提交任何源码输入，继续前必须明确补充源码或不提供。用户已提交源码时直接使用，不需要二次确认。"
           }
         }
       },

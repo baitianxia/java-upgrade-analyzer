@@ -106,7 +106,6 @@ class BinarySourceOverlayTest(unittest.TestCase):
             [method],
             analysis_context_identity="context-1",
             source_snapshot_identity="source-snapshot-1",
-            source_root=self.root / "src",
         )
 
         self.assertEqual(source_method_descriptor(method), "(I[Ljava/lang/String;)Ljava/lang/String;")
@@ -115,6 +114,8 @@ class BinarySourceOverlayTest(unittest.TestCase):
         self.assertEqual(self.store.counts()["members"], before)
         mapped = next(item for item in result.rows if item["mapping_status"] == "mapped")
         self.assertEqual(mapped["source_location"]["logical_path"], "demo/Sample.java")
+        self.assertEqual(mapped["source_location"]["owner_coord"], "BUSINESS")
+        self.assertEqual(mapped["binary_member"]["class_name"], "demo/Sample")
         self.assertNotIn(str(self.root), mapped["overlay_identity"])
 
     def test_descriptor_mismatch_is_conflict_and_binary_graph_remains_complete(self):
@@ -125,7 +126,6 @@ class BinarySourceOverlayTest(unittest.TestCase):
             [wrong],
             analysis_context_identity="context-wrong",
             source_snapshot_identity="source-snapshot-wrong",
-            source_root=self.root / "src",
         )
 
         self.assertEqual(result.conflict_count, 1)
@@ -139,7 +139,6 @@ class BinarySourceOverlayTest(unittest.TestCase):
             [self.method(symbol="one"), self.method(symbol="two")],
             analysis_context_identity="context-ambiguous",
             source_snapshot_identity="source-snapshot-ambiguous",
-            source_root=self.root / "src",
         )
 
         self.assertEqual(result.ambiguous_count, 1)

@@ -132,6 +132,7 @@ def load_validated_generation(report_dir: str | Path) -> dict[str, Any]:
         raise BinaryReportError(
             "BINARY_GENERATION_VALIDATION_ATTACHMENT_INVALID", str(validation_path)
         )
+    source_explanations_path = generation / "binary_source_explanations.json"
     return {
         "report_dir": report,
         "active": active,
@@ -144,6 +145,15 @@ def load_validated_generation(report_dir: str | Path) -> dict[str, Any]:
         "formal": _load_json(generation / "binary_formal_results.json"),
         "candidate": _load_json(generation / "binary_candidate_results.json"),
         "coverage": _load_json(generation / "binary_coverage.json"),
+        "source_explanations": (
+            _load_json(source_explanations_path)
+            if source_explanations_path.is_file()
+            else {
+                "authority": "not_provided",
+                "declarations": [],
+                "candidate_relationships": [],
+            }
+        ),
     }
 
 
@@ -243,6 +253,111 @@ def _change_object(record: Mapping[str, Any]) -> str:
         or record.get("fact_kind")
         or "未知对象"
     )
+
+
+def _source_usage_view(loaded: Mapping[str, Any]) -> dict[str, Any]:
+    coverage = dict(loaded.get("coverage") or {})
+    usage = dict(coverage.get("source_usage") or {})
+    overlay = dict(coverage.get("source_overlay") or {})
+    decision = str(usage.get("decision") or "").strip()
+    decision_source = str(usage.get("decision_source") or "missing")
+    if decision == "use_source":
+        label = (
+            "用户已提供源码，系统直接使用"
+            if decision_source == "user_provided_source"
+            else "用户选择使用源码"
+        )
+        effect = (
+            "源码用于补充文件/行号、声明与语义解释；"
+            "正式变化、运行时解析和精确可执行边仍由最终二进制制品决定。"
+        )
+    elif decision == "skip_source":
+        label = "用户选择不提供源码"
+        effect = (
+            "本次只执行二进制分析；正式结果仍有效，但源码位置、声明/注解、可读上下文和候选关系覆盖缺失。"
+        )
+    else:
+        label = "源码选择记录缺失"
+        effect = "当前 generation 没有可验证的用户源码选择记录。"
+    return {
+        "decision": decision or "missing",
+        "decision_source": decision_source,
+        "purpose_version": str(usage.get("purpose_version") or "missing"),
+        "label": label,
+        "effect": effect,
+        "coverage_status": str(overlay.get("coverage_status") or "not_provided"),
+        "mapped_count": int(overlay.get("mapped_count") or 0),
+        "ambiguous_count": int(overlay.get("ambiguous_count") or 0),
+        "conflict_count": int(overlay.get("conflict_count") or 0),
+    }
+
+
+def _source_review_rows(loaded: Mapping[str, Any]) -> list[dict[str, str]]:
+    overlay = dict((loaded.get("coverage") or {}).get("source_overlay") or {})
+    declarations = {
+        str(item.get("overlay_identity") or ""): dict(item)
+        for item in (loaded.get("source_explanations") or {}).get("declarations") or []
+    }
+    rows = []
+    for item in overlay.get("rows") or []:
+        if str(item.get("mapping_status") or "") != "mapped":
+            continue
+        location = dict(item.get("source_location") or {})
+        member = dict(item.get("binary_member") or {})
+        descriptor = str(member.get("descriptor") or "")
+        signature = (
+            jvm_method_parameter_signature(descriptor)
+            if descriptor.startswith("(") else descriptor
+        )
+        class_name = str(member.get("class_name") or "").replace("/", ".")
+        member_name = str(member.get("member_name") or "")
+        declaration = declarations.get(str(item.get("overlay_identity") or ""), {})
+        line = int(location.get("line") or 0)
+        end_line = int(location.get("end_line") or 0)
+        line_text = str(line) if not end_line or end_line == line else f"{line}-{end_line}"
+        rows.append({
+            "源码归属": str(location.get("owner_coord") or "未标识"),
+            "归属类型": str(location.get("owner_type") or "unknown"),
+            "二进制制品": str(member.get("artifact_coord") or "未标识"),
+            "二进制方法": f"{class_name}.{member_name}{signature}",
+            "源码位置": (
+                f"{location.get('logical_path') or '未知'}:{line_text}"
+                if line_text else str(location.get("logical_path") or "未知")
+            ),
+            "模块": str(location.get("module") or ""),
+            "语言": str(location.get("language") or ""),
+            "源码声明": str(declaration.get("declared_signature") or ""),
+            "注解": "、".join(map(str, declaration.get("annotations") or [])),
+            "修饰符": " ".join(map(str, declaration.get("modifiers") or [])),
+        })
+    return sorted(rows, key=lambda item: (
+        item["源码归属"], item["二进制制品"], item["二进制方法"], item["源码位置"]
+    ))
+
+
+def _source_candidate_review_rows(loaded: Mapping[str, Any]) -> list[dict[str, str]]:
+    rows = []
+    for item in (
+        (loaded.get("source_explanations") or {}).get("candidate_relationships") or []
+    ):
+        descriptor = str(item.get("caller_binary_descriptor") or "")
+        signature = (
+            jvm_method_parameter_signature(descriptor)
+            if descriptor.startswith("(") else descriptor
+        )
+        caller_class = str(item.get("caller_binary_class_name") or "").replace("/", ".")
+        caller_member = str(item.get("caller_binary_member_name") or "")
+        rows.append({
+            "源码归属": str(item.get("source_owner_coord") or "未标识"),
+            "二进制制品": str(item.get("binary_artifact_coord") or "未标识"),
+            "调用方": f"{caller_class}.{caller_member}{signature}",
+            "源码位置": f"{item.get('caller_logical_path') or '未知'}:{item.get('source_line') or 0}",
+            "候选目标": str(item.get("callee_key") or ""),
+            "证据类型": str(item.get("evidence_type") or ""),
+            "置信度": str(item.get("confidence") or ""),
+            "权威边界": "源码候选关系，不是可执行调用边",
+        })
+    return rows
 
 
 def _change_label(record: Mapping[str, Any]) -> str:
@@ -426,6 +541,9 @@ def _trace_metrics_by_change(loaded: Mapping[str, Any]) -> dict[str, dict[str, i
 
 def publish_step4(report_dir: str | Path, output_dir: str | Path) -> dict[str, Any]:
     loaded = load_validated_generation(report_dir)
+    source_usage = _source_usage_view(loaded)
+    source_review_rows = _source_review_rows(loaded)
+    source_candidate_rows = _source_candidate_review_rows(loaded)
     decisions = list(loaded["decisions"].get("authoritative_change_facts") or ())
     assessments = {
         str(item.get("decision_identity") or ""): item
@@ -629,6 +747,60 @@ def publish_step4(report_dir: str | Path, output_dir: str | Path) -> dict[str, A
             ),
         })
 
+        source_fields = (
+            "源码归属", "归属类型", "二进制制品", "二进制方法", "源码位置", "模块", "语言",
+            "源码声明", "注解", "修饰符",
+        )
+        with open_csv_write(stage / "source_overlay.csv") as handle:
+            writer = csv.DictWriter(handle, fieldnames=source_fields)
+            writer.writeheader()
+            writer.writerows(source_review_rows)
+        source_lines = [
+            "# 源码辅助证据", "",
+            f"- 源码状态：{source_usage['label']}",
+            f"- 覆盖状态：`{source_usage['coverage_status']}`",
+            f"- 已映射方法：{source_usage['mapped_count']}", "",
+            source_usage["effect"], "",
+        ]
+        if source_review_rows:
+            source_lines.extend((
+                "| 源码归属 | 二进制制品 | 二进制方法 | 源码位置 | 源码声明 | 注解 |",
+                "|---|---|---|---|---|---|",
+            ))
+            source_lines.extend(
+                f"| `{row['源码归属']}` | `{row['二进制制品']}` | "
+                f"`{row['二进制方法']}` | `{row['源码位置']}` | "
+                f"{row['源码声明'] or '-'} | {row['注解'] or '-'} |"
+                for row in source_review_rows
+            )
+        elif source_usage["decision"] == "skip_source":
+            source_lines.append("本次由用户明确选择不提供源码，因此没有源码映射行；这不影响二进制正式结论。")
+        else:
+            source_lines.append("已使用源码，但没有方法完成精确 descriptor 映射；请结合覆盖状态和冲突计数复核。")
+        candidate_fields = (
+            "源码归属", "二进制制品", "调用方", "源码位置", "候选目标",
+            "证据类型", "置信度", "权威边界",
+        )
+        with open_csv_write(stage / "source_candidate_relationships.csv") as handle:
+            writer = csv.DictWriter(handle, fieldnames=candidate_fields)
+            writer.writeheader()
+            writer.writerows(source_candidate_rows)
+        source_lines.extend(("", "## 源码候选关系", ""))
+        if source_candidate_rows:
+            source_lines.extend((
+                "以下关系用于人工解释和候选复核，不能替代字节码可执行边。", "",
+                "| 源码归属 | 调用方 | 候选目标 | 源码位置 | 置信度 |",
+                "|---|---|---|---|---|",
+            ))
+            source_lines.extend(
+                f"| `{row['源码归属']}` | `{row['调用方']}` | `{row['候选目标']}` | "
+                f"`{row['源码位置']}` | `{row['置信度']}` |"
+                for row in source_candidate_rows
+            )
+        else:
+            source_lines.append("本次没有生成源码候选调用关系。")
+        _atomic_text(stage / "source_overlay.md", "\n".join(source_lines) + "\n")
+
         summary = {
             "schema": "java-upgrade-analyzer.binary-step4-summary.v1",
             "authority": "binary_first",
@@ -648,7 +820,7 @@ def publish_step4(report_dir: str | Path, output_dir: str | Path) -> dict[str, A
             "excluded_decision_count": len(loaded["decisions"].get("excluded_decisions") or ()),
             "dependency_count": len(dependency_rows),
             "published_api_change_count": len(rows),
-            "source_role": "optional_overlay_only",
+            "source_usage": source_usage,
             "decision_coverage_status": loaded["summary"].get(
                 "decision_coverage_status"
             ),
@@ -667,15 +839,25 @@ def publish_step4(report_dir: str | Path, output_dir: str | Path) -> dict[str, A
             f"- 确认但不可投影：{summary['confirmed_unprojectable_fact_count']}",
             f"- 诊断候选事实：{summary['diagnostic_candidate_fact_count']}",
             f"- 排除裁决：{summary['excluded_decision_count']}",
-            f"- 涉及依赖：{summary['dependency_count']}", "",
+            f"- 涉及依赖：{summary['dependency_count']}",
+            f"- 源码选择：{source_usage['label']}",
+            f"- 源码映射：{source_usage['mapped_count']} 个，覆盖状态 `{source_usage['coverage_status']}`",
+            "",
         ]
-        summary_lines.extend(("", "源码仅作可选语义覆盖，不参与运行时权威性裁决。", ""))
+        summary_lines.extend((
+            source_usage["effect"], "",
+            "源码逐方法证据：`source_overlay.md` / `source_overlay.csv`；"
+            "源码候选关系：`source_candidate_relationships.csv`。", "",
+        ))
         _atomic_text(stage / "summary.md", "\n".join(summary_lines))
 
         review_lines = [
             "# 运行时变化人工复核", "",
             "本报告按引起变化的依赖包分组。`正式变化` 来自完整二进制裁决；"
             "`诊断候选` 表示证据仍有缺口，不能解释为无影响。", "",
+            f"- 源码选择：{source_usage['label']}",
+            f"- 源码覆盖：`{source_usage['coverage_status']}`；已映射 {source_usage['mapped_count']} 个方法",
+            f"- 作用边界：{source_usage['effect']}", "",
         ]
         review_dependencies = sorted({row["依赖包"] for row in review_rows})
         for dependency in review_dependencies:
@@ -746,6 +928,7 @@ def publish_step5(
     selected_names: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     loaded = load_validated_generation(report_dir)
+    source_usage = _source_usage_view(loaded)
     by_api = list(loaded["formal"].get("by_api") or ())
     items = [_result_item(item) for item in by_api]
     selected_coord_set = {str(item).strip() for item in selected_coords if str(item).strip()}
@@ -811,6 +994,7 @@ def publish_step5(
             "included_in_formal_totals": False,
         },
         "coverage": loaded["coverage"],
+        "source_usage": source_usage,
     }
     output = Path(output_dir).resolve()
     def write(stage: Path) -> None:
@@ -847,6 +1031,9 @@ def publish_step5(
             f"- 结论不确定：{summary['uncertain']}",
             f"- 静态范围内未发现路径：{summary['not_found_in_static_analysis']}",
             f"- 未完成分析：{summary['not_analyzed']}", "",
+            f"- 源码选择：{source_usage['label']}",
+            f"- 源码映射：{source_usage['mapped_count']} 个，覆盖状态 `{source_usage['coverage_status']}`", "",
+            source_usage["effect"], "",
             "`not_found_in_static_analysis` 不是已确认无影响。", "",
             "## 按依赖汇总", "",
             "| 依赖包 | API 数 | 已发现路径 | 不确定 | 未发现路径 | 未分析 |",
@@ -896,6 +1083,7 @@ def publish_step6(
     output_report: str | Path,
 ) -> dict[str, Any]:
     loaded = load_validated_generation(report_dir)
+    source_usage = _source_usage_view(loaded)
     by_api = list(loaded["formal"].get("by_api") or ())
     rows = [_result_item(item) for item in by_api]
     step5_summary_path = Path(report_dir).resolve() / "evidence" / "call_chain" / "summary.json"
@@ -936,6 +1124,7 @@ def publish_step6(
             "overall_status": "complete" if coverage_complete else "partial",
             "binary": loaded["coverage"],
         },
+        "source_usage": source_usage,
         "analysis_scope": {
             "mode": (step5_summary.get("analysis_scope") or {}).get("mode") or "full",
             "validation_status": "passed",
@@ -976,7 +1165,10 @@ def publish_step6(
         f"- Analysis context：`{loaded['manifest']['analysis_context_identity']}`",
         f"- 独立验证：`{loaded['validation']['status']}`",
         f"- 裁决覆盖：`{loaded['summary'].get('decision_coverage_status')}`",
-        f"- 触达覆盖：`{loaded['summary'].get('trace_coverage_status')}`", "",
+        f"- 触达覆盖：`{loaded['summary'].get('trace_coverage_status')}`",
+        f"- 源码选择：{source_usage['label']}",
+        f"- 源码映射：{source_usage['mapped_count']} 个，覆盖状态 `{source_usage['coverage_status']}`", "",
+        source_usage["effect"], "",
         "## 正式四维结果", "",
         f"- reachable：{len(state('reachable'))}",
         f"- uncertain：{len(state('uncertain'))}",
@@ -1115,8 +1307,11 @@ def publish_step6(
         f"- 独立验证：`{loaded['validation']['status']}`",
         f"- 裁决覆盖：`{loaded['summary'].get('decision_coverage_status')}`",
         f"- 触达覆盖：`{loaded['summary'].get('trace_coverage_status')}`",
-        f"- 源码角色：`{loaded['coverage'].get('source_overlay', {}).get('coverage_status', 'not_provided')}`", "",
-        "源码是可选语义覆盖层，不决定运行时有效制品、变化事实或可执行边。", "",
+        f"- 源码选择：{source_usage['label']}",
+        f"- 源码选择来源：`{source_usage['decision_source']}`",
+        f"- 源码覆盖：`{source_usage['coverage_status']}`",
+        f"- 已映射方法：{source_usage['mapped_count']}", "",
+        source_usage["effect"], "",
         "本报告仅基于已验证的二进制变化事实与静态可执行边，给出静态触达与可能影响结论；运行时行为不在本次分析边界内。", "",
     ]
     _atomic_text(

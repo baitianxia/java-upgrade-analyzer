@@ -36,7 +36,7 @@ from binary_snapshot_cache import cached_snapshot_archive
 from binary_source_overlay import build_inline_consumption_overlay, build_source_overlay
 from binary_trace_engine import BinaryTraceEngine
 from binary_validation_oracle import validate_generation
-from enhanced_source_analyzer import analyze_file
+from enhanced_source_analyzer import analyze_file, extract_call_edges_enhanced
 from path_runtime import short_temporary_directory
 
 
@@ -49,6 +49,15 @@ PERFORMANCE_GATE_PATH = (
 
 class BinaryPipelineError(BinaryFirstContractError):
     pass
+
+
+SOURCE_USAGE_DECISIONS = {"use_source", "skip_source"}
+SOURCE_USAGE_DECISION_SOURCES = {
+    "user_interaction",
+    "user_provided_source",
+    "explicit_config",
+}
+SOURCE_USAGE_PURPOSE_VERSION = "source-overlay-purpose-v1"
 
 
 def _identity(namespace: str, payload: Any) -> str:
@@ -71,6 +80,38 @@ def _load_json(path: str | Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise BinaryPipelineError("BINARY_PIPELINE_CONFIG_INVALID", "root must be an object")
     return value
+
+
+def _source_usage_contract(config: Mapping[str, Any]) -> dict[str, str]:
+    raw = dict(config.get("source_usage") or {})
+    decision = str(raw.get("decision") or "").strip()
+    decision_source = str(raw.get("decision_source") or "").strip()
+    if decision not in SOURCE_USAGE_DECISIONS:
+        raise BinaryPipelineError(
+            "BINARY_SOURCE_USAGE_DECISION_REQUIRED",
+            "source_usage.decision must be use_source or skip_source",
+        )
+    if decision_source not in SOURCE_USAGE_DECISION_SOURCES:
+        raise BinaryPipelineError(
+            "BINARY_SOURCE_USAGE_DECISION_SOURCE_INVALID",
+            "source_usage.decision_source must record user authorization",
+        )
+    has_overlay = bool(config.get("source_overlay"))
+    if decision == "use_source" and not has_overlay:
+        raise BinaryPipelineError(
+            "BINARY_SOURCE_OVERLAY_INPUT_REQUIRED",
+            "the user chose source assistance but source_overlay is missing",
+        )
+    if decision == "skip_source" and has_overlay:
+        raise BinaryPipelineError(
+            "BINARY_SOURCE_OVERLAY_NOT_CONSENTED",
+            "source_overlay must be absent when the user chose skip_source",
+        )
+    return {
+        "decision": decision,
+        "decision_source": decision_source,
+        "purpose_version": SOURCE_USAGE_PURPOSE_VERSION,
+    }
 
 
 def _require_binary_authority_gates(support: Mapping[str, Any]) -> None:
@@ -258,66 +299,199 @@ def _absent_snapshot(identity: str, parser_identity: str) -> ArtifactSnapshot:
 
 
 def _source_methods(source_config: Mapping[str, Any]):
-    roots = [Path(item).expanduser().resolve() for item in source_config.get("source_dirs") or ()]
-    common_root_value = source_config.get("source_root") or (
-        roots[0] if len(roots) == 1 else None
-    )
-    if common_root_value is None:
+    source_sets = list(source_config.get("source_sets") or ())
+    if not source_sets:
         raise BinaryPipelineError(
-            "BINARY_SOURCE_COMMON_ROOT_REQUIRED",
-            "multiple source_dirs require an explicit stable source_root",
+            "BINARY_SOURCE_SETS_REQUIRED",
+            "source_overlay.source_sets must contain at least one user-authorized source set",
         )
-    common_root = Path(str(common_root_value)).expanduser().resolve()
-    if not common_root.is_dir():
-        raise BinaryPipelineError("BINARY_SOURCE_ROOT_MISSING", str(common_root))
     methods = []
     manifest = []
     coverage_complete = True
-    for root in roots:
-        if not root.is_dir():
-            raise BinaryPipelineError("BINARY_SOURCE_ROOT_MISSING", str(root))
-        try:
-            root.relative_to(common_root)
-        except ValueError as error:
+    for raw_set in source_sets:
+        source_set = dict(raw_set or {})
+        roots = [
+            Path(item).expanduser().resolve()
+            for item in source_set.get("source_dirs") or ()
+        ]
+        common_root_value = source_set.get("source_root") or (
+            roots[0] if len(roots) == 1 else None
+        )
+        if common_root_value is None:
             raise BinaryPipelineError(
-                "BINARY_SOURCE_ROOT_OUTSIDE_SNAPSHOT", str(root)
-            ) from error
-        for path in sorted(root.rglob("*.java")):
-            sha = _sha256_file(path)
-            logical = path.relative_to(common_root).as_posix()
-            manifest.append({"logical_path": logical, "sha256": sha})
-            source_root = {
-                "root": str(root),
-                "owner_type": str(source_config.get("owner_type") or "business"),
-                "owner_coord": str(source_config.get("owner_coord") or "BUSINESS"),
-                "module": str(source_config.get("module") or "root"),
-            }
-            parsed, diagnostics = analyze_file(
-                str(path), source_root, prefer_tree_sitter=True, return_diagnostics=True
+                "BINARY_SOURCE_COMMON_ROOT_REQUIRED",
+                "each source set with multiple source_dirs requires source_root",
             )
-            if diagnostics:
-                # Source is explanatory. Preserve partial coverage but never mutate binary facts.
-                stable_diagnostics = {
-                    key: diagnostics.get(key)
-                    for key in (
-                        "preferred_parser", "actual_parser", "fallback_reason",
-                        "tree_sitter_available", "language", "error_nodes",
-                    )
+        common_root = Path(str(common_root_value)).expanduser().resolve()
+        if not common_root.is_dir():
+            raise BinaryPipelineError("BINARY_SOURCE_ROOT_MISSING", str(common_root))
+        owner_type = str(source_set.get("owner_type") or "").strip()
+        owner_coord = str(source_set.get("owner_coord") or "").strip()
+        module = str(source_set.get("module") or "root").strip()
+        if owner_type not in {"business", "dependency"} or not owner_coord:
+            raise BinaryPipelineError(
+                "BINARY_SOURCE_OWNER_REQUIRED",
+                "every source set requires owner_type business/dependency and owner_coord",
+            )
+        for root in roots:
+            if not root.is_dir():
+                raise BinaryPipelineError("BINARY_SOURCE_ROOT_MISSING", str(root))
+            try:
+                root.relative_to(common_root)
+            except ValueError as error:
+                raise BinaryPipelineError(
+                    "BINARY_SOURCE_ROOT_OUTSIDE_SNAPSHOT", str(root)
+                ) from error
+            for path in sorted(root.rglob("*.java")):
+                sha = _sha256_file(path)
+                logical = path.relative_to(common_root).as_posix()
+                manifest_item = {
+                    "owner_type": owner_type,
+                    "owner_coord": owner_coord,
+                    "module": module,
+                    "logical_path": logical,
+                    "sha256": sha,
                 }
-                manifest.append({"logical_path": logical, "diagnostics": stable_diagnostics})
-                if (
-                    stable_diagnostics.get("actual_parser") == "skipped"
-                    or int(stable_diagnostics.get("error_nodes") or 0) > 0
-                ):
-                    coverage_complete = False
-            methods.extend(parsed)
+                manifest.append(manifest_item)
+                analyzer_root = {
+                    "root": str(root),
+                    "owner_type": owner_type,
+                    "owner_coord": owner_coord,
+                    "module": module,
+                }
+                parsed, diagnostics = analyze_file(
+                    str(path), analyzer_root,
+                    prefer_tree_sitter=True,
+                    return_diagnostics=True,
+                )
+                if diagnostics:
+                    # Source is explanatory. Preserve partial coverage but never mutate binary facts.
+                    stable_diagnostics = {
+                        key: diagnostics.get(key)
+                        for key in (
+                            "preferred_parser", "actual_parser", "fallback_reason",
+                            "tree_sitter_available", "language", "error_nodes",
+                        )
+                    }
+                    manifest.append({**manifest_item, "diagnostics": stable_diagnostics})
+                    if (
+                        stable_diagnostics.get("actual_parser") == "skipped"
+                        or int(stable_diagnostics.get("error_nodes") or 0) > 0
+                    ):
+                        coverage_complete = False
+                methods.extend(parsed)
     snapshot_identity = _identity("source_snapshot_identity", {"files": manifest})
     return (
         methods,
         snapshot_identity,
-        common_root,
         "complete" if coverage_complete else "partial",
     )
+
+
+def _source_explanations(
+    methods: list[Any] | tuple[Any, ...],
+    source_overlay: Any,
+    *,
+    analysis_context_identity: str,
+) -> dict[str, Any]:
+    mapped_by_symbol = {
+        str((row.get("source_location") or {}).get("source_symbol_id") or ""): row
+        for row in source_overlay.rows
+        if row.get("mapping_status") == "mapped"
+        and (row.get("source_location") or {}).get("source_symbol_id")
+    }
+    declarations = []
+    candidates = []
+    for method in methods:
+        overlay = mapped_by_symbol.get(str(getattr(method, "symbol_id", "") or ""))
+        if not overlay:
+            continue
+        location = dict(overlay.get("source_location") or {})
+        member = dict(overlay.get("binary_member") or {})
+        declared_signature = str(
+            getattr(method, "declared_signature", "") or ""
+        ).strip()
+        if not declared_signature:
+            parameter_types = list(
+                (getattr(method, "param_declared_types", {}) or {}).values()
+            ) or list((getattr(method, "param_types", {}) or {}).values())
+            return_type = str(
+                getattr(method, "return_declared_type", "")
+                or getattr(method, "return_type", "")
+                or ""
+            ).strip()
+            modifiers = " ".join(
+                map(str, getattr(method, "modifiers", ()) or ())
+            ).strip()
+            declared_signature = " ".join(
+                item for item in (
+                    modifiers,
+                    return_type,
+                    f"{getattr(method, 'method_name', '')}({', '.join(map(str, parameter_types))})",
+                )
+                if item
+            )
+        declaration = {
+            "overlay_identity": overlay.get("overlay_identity"),
+            "source_owner_type": location.get("owner_type"),
+            "source_owner_coord": location.get("owner_coord"),
+            "binary_artifact_coord": member.get("artifact_coord"),
+            "binary_class_name": member.get("class_name"),
+            "binary_member_name": member.get("member_name"),
+            "binary_descriptor": member.get("descriptor"),
+            "logical_path": location.get("logical_path"),
+            "line": location.get("line"),
+            "end_line": location.get("end_line"),
+            "declared_signature": declared_signature,
+            "annotations": list(getattr(method, "annotations", ()) or ()),
+            "modifiers": list(getattr(method, "modifiers", ()) or ()),
+            "throws_declared_types": list(
+                getattr(method, "throws_declared_types", ()) or ()
+            ),
+        }
+        declarations.append(declaration)
+        for edge in extract_call_edges_enhanced(method, include_low_confidence=False):
+            candidates.append({
+                "overlay_identity": overlay.get("overlay_identity"),
+                "source_owner_type": location.get("owner_type"),
+                "source_owner_coord": location.get("owner_coord"),
+                "binary_artifact_coord": member.get("artifact_coord"),
+                "caller_binary_class_name": member.get("class_name"),
+                "caller_binary_member_name": member.get("member_name"),
+                "caller_binary_descriptor": member.get("descriptor"),
+                "caller_logical_path": location.get("logical_path"),
+                "source_line": int(getattr(edge, "line", 0) or 0),
+                "callee_key": str(getattr(edge, "callee_key", "") or ""),
+                "callee_simple_key": str(
+                    getattr(edge, "callee_simple_key", "") or ""
+                ),
+                "evidence_type": str(getattr(edge, "evidence_type", "") or ""),
+                "confidence": str(getattr(edge, "confidence", "") or ""),
+                "authority": "source_candidate_only_not_executable_edge",
+            })
+    declarations.sort(key=lambda item: (
+        str(item.get("source_owner_coord") or ""),
+        str(item.get("binary_artifact_coord") or ""),
+        str(item.get("binary_class_name") or ""),
+        str(item.get("binary_member_name") or ""),
+        str(item.get("binary_descriptor") or ""),
+    ))
+    candidates.sort(key=lambda item: (
+        str(item.get("source_owner_coord") or ""),
+        str(item.get("caller_binary_class_name") or ""),
+        str(item.get("caller_binary_member_name") or ""),
+        int(item.get("source_line") or 0),
+        str(item.get("callee_key") or ""),
+    ))
+    return {
+        "schema": "java-upgrade-analyzer.binary-source-explanations.v1",
+        "analysis_context_identity": analysis_context_identity,
+        "authority": "explanatory_source_overlay_only",
+        "declaration_count": len(declarations),
+        "candidate_relationship_count": len(candidates),
+        "declarations": declarations,
+        "candidate_relationships": candidates,
+    }
 
 
 def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[str, Any]:
@@ -325,6 +499,7 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
     phase_timings: list[dict[str, Any]] = []
     if config.get("schema") != "java-upgrade-analyzer.binary-pipeline-input.v1":
         raise BinaryPipelineError("BINARY_PIPELINE_CONFIG_SCHEMA_INVALID", str(config.get("schema")))
+    source_usage = _source_usage_contract(config)
     asm_jar = config.get("asm_jar") or None
     output_root = Path(output_root).resolve()
     cache_root = Path(
@@ -521,8 +696,9 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
             decision_started = time.perf_counter()
             source_overlay = None
             source_methods = ()
+            source_explanations = None
             if config.get("source_overlay"):
-                methods, source_snapshot, source_root, source_coverage = _source_methods(
+                methods, source_snapshot, source_coverage = _source_methods(
                     dict(config["source_overlay"])
                 )
                 source_overlay = build_source_overlay(
@@ -530,10 +706,14 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                     methods,
                     analysis_context_identity=context.identity,
                     source_snapshot_identity=source_snapshot,
-                    source_root=source_root,
                     source_snapshot_coverage_status=source_coverage,
                 )
                 source_methods = tuple(methods)
+                source_explanations = _source_explanations(
+                    source_methods,
+                    source_overlay,
+                    analysis_context_identity=context.identity,
+                )
             decisions = BinaryDecisionEngine(
                 analysis_context_identity=context.identity,
                 runtime_comparison_identity=runtime_comparison.identity,
@@ -752,6 +932,15 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                         separators=(",", ":"),
                     ) + "\n"
                 ).encode("utf-8")
+            if source_explanations is not None:
+                additional["binary_source_explanations.json"] = (
+                    json.dumps(
+                        source_explanations,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ) + "\n"
+                ).encode("utf-8")
             generation_write_started = time.perf_counter()
             manifest = write_binary_generation(
                 output_root,
@@ -779,6 +968,7 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                     "current_fact_build_input_slice": current_input_slice.identity,
                 },
                 source_overlay=source_overlay,
+                source_usage=source_usage,
                 additional_sidecars=additional,
             )
             phase_timings.append({
@@ -856,6 +1046,7 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                 "trace_coverage_status": traces.coverage_status,
                 "authoritative_change_fact_count": len(decisions.authoritative_decisions),
                 "diagnostic_candidate_fact_count": len(decisions.diagnostic_decisions),
+                "source_usage": source_usage,
                 "validation_run_identity": validation["validation_run_identity"],
                 "validation_status": validation["status"],
                 "validation_result_path": validation["validation_result_path"],

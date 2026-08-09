@@ -147,14 +147,32 @@
     ],
     "changed_or_unknown_profile_fields": []
   },
+  "source_usage": {
+    "decision": "use_source",
+    "decision_source": "explicit_config",
+    "purpose_version": "source-overlay-purpose-v1"
+  },
   "source_overlay": {
-    "source_root": "/abs/path/to/current/source-snapshot",
-    "source_dirs": [
-      "/abs/path/to/current/source-snapshot/src/main/java"
-    ],
-    "owner_type": "business",
-    "owner_coord": "com.example:app:2.0.0",
-    "module": "app"
+    "source_sets": [
+      {
+        "source_root": "/abs/path/to/current/source-snapshot",
+        "source_dirs": [
+          "/abs/path/to/current/source-snapshot/src/main/java"
+        ],
+        "owner_type": "business",
+        "owner_coord": "com.example:app:2.0.0",
+        "module": "app"
+      },
+      {
+        "source_root": "/abs/path/to/example-api-source",
+        "source_dirs": [
+          "/abs/path/to/example-api-source/src/main/java"
+        ],
+        "owner_type": "dependency",
+        "owner_coord": "com.example:example-api:2.0.0",
+        "module": "example-api"
+      }
+    ]
   },
   "max_trace_nodes": 1000000,
   "max_paths_per_target": 20

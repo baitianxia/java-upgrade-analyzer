@@ -95,7 +95,7 @@ Step1 以最终制品为依赖事实源。工程依赖树只在容器内元数�
 
 | 文件 | 说明 | 复核重点 |
 |---|---|---|
-| `review.md` | 人工升级范围确认页 | 目标模块、分支/commit、JDK、Spring Boot 和源码覆盖是否正确 |
+| `review.md` | 人工升级范围确认页 | 目标模块、分支/commit、JDK、Spring Boot、源码是用户提交/选择使用还是明确不提供，以及对应覆盖是否正确 |
 | `context.json` | 程序使用的完整上下文 | 深入排障时查看 |
 | `dep_graph.json` | 依赖关系 | 仅用于上下文传播排查 |
 
@@ -139,6 +139,9 @@ Step3 识别 JDK、Jakarta、Spring、配置和 classfile 等背景风险。这�
 | `review.md` | 不可安全投影为 API 的真实变化 | 资源、SPI、安全、topology、候选和证据边界，仍保留依赖坐标 |
 | `business_bytecode_changed_api_refs.csv` | 业务最终制品的逐指令引用证据 | caller class/member、descriptor、offset、target API 和 coord |
 | `business_bytecode_priority_evidence.json` | 依赖排序证据摘要 | 扫描完整性与精确/候选引用数 |
+| `source_overlay.md` | 给人看的源码辅助证据 | 按源码归属依赖包展示二进制制品、方法、源码文件/行号、声明、注解和源码候选关系；同时说明用户选择与二进制权威边界 |
+| `source_overlay.csv` | 同一源码映射的结构化视图 | 按依赖包、制品、方法、源码位置、声明和注解筛选；用户不提供源码时保留表头且不制造映射行 |
+| `source_candidate_relationships.csv` | 源码调用候选视图 | 展示带依赖归属、调用方位置和置信度的候选关系；明确不作为可执行调用边或正式触达结论 |
 | `summary.md` | Step4 人工摘要 | generation、依赖/API 规模、覆盖和后续阅读路径 |
 
 `all_changed_apis.csv` 不是旧格式兼容投影，而是从 validated generation 确定生成的正式人工/API 视图。无法投影为 API 的真实资源或 topology 变化进入 `review.md` 和权威 decision；系统不会制造虚构 API 行。

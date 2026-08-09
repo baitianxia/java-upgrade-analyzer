@@ -1866,9 +1866,22 @@ SCAN_FUNCS = {
     'dep_compat':    (scan_dependency_compat, 's3_dependency_compat.csv'),
     'dep_classfile': (scan_dependency_classfile_versions, 's3_dependency_classfile.csv'),
 }
+SOURCE_REQUIRED_SCANS = {
+    'jdk_removed', 'javax', 'jdk_internal', 'reflection', 'serialization',
+    'jdk_runtime_flags', 'sb_config', 'sb_autoconfig',
+}
 
 
-def write_step3_coverage(output_dir, source_roots, planned_scans, executed_scans, coverage_output=''):
+def write_step3_coverage(
+    output_dir,
+    source_roots,
+    planned_scans,
+    executed_scans,
+    coverage_output='',
+    *,
+    source_usage_decision='use_source',
+    business_source_coverage_status='',
+):
     extension_counts = {}
     read_failures = []
     scanned_files = 0
@@ -1901,6 +1914,12 @@ def write_step3_coverage(output_dir, source_roots, planned_scans, executed_scans
             + (['scan_operation_failures'] if scan_diagnostics else [])
         ),
         'source_roots': list(source_roots or []),
+        'source_usage_decision': source_usage_decision,
+        'source_coverage_status': business_source_coverage_status or (
+            'not_provided'
+            if source_usage_decision == 'skip_source'
+            else ('complete' if source_roots else 'missing')
+        ),
         'planned_scans': planned,
         'executed_scans': executed,
         'not_applicable_scans': [item for item in SCAN_FUNCS if item not in planned],
@@ -1947,6 +1966,10 @@ def main():
                     help='源码目录（兼容单目录调用）')
     ap.add_argument('--source-dirs', nargs='+',
                     help='源码目录列表（Step3 会扫描全部目录）')
+    ap.add_argument('--no-source', action='store_true',
+                    help='用户明确选择不提供源码；只执行最终制品可完成的扫描')
+    ap.add_argument('--no-business-source', action='store_true',
+                    help='用户提供了依赖源码但没有业务源码；跳过业务源码扫描')
     ap.add_argument('--output',
                     help='输出文件路径（单项扫描时使用）')
     ap.add_argument('--output-dir', default='.upgrade-report',
@@ -1976,8 +1999,12 @@ def main():
         if not args.include_test_scope and orchestrated_input.get("include_test_scope"):
             args.include_test_scope = True
     global STEP3_DEPENDENCY_SOURCE_DIRS
-    STEP3_DEPENDENCY_SOURCE_DIRS = normalize_dependency_source_dirs(
-        orchestrated_input.get("dependency_source_dirs") if orchestrated_input else None
+    STEP3_DEPENDENCY_SOURCE_DIRS = (
+        []
+        if args.no_source
+        else normalize_dependency_source_dirs(
+            orchestrated_input.get("dependency_source_dirs") if orchestrated_input else None
+        )
     )
     global STEP3_REPORT_DIR
     STEP3_REPORT_DIR = report_dir
@@ -1992,13 +2019,23 @@ def main():
     if not args.type and not args.all:
         ap.print_help()
         sys.exit(1)
+    if args.no_source and args.no_business_source:
+        ap.error('--no-source and --no-business-source are mutually exclusive')
+    if (args.no_source or args.no_business_source) and args.type in SOURCE_REQUIRED_SCANS:
+        ap.error(f'{args.type} requires business source')
 
     step_timer = PhaseTimer("step3", "total")
-    source_dir = args.source_dirs or args.source_dir
+    business_source_unavailable = args.no_source or args.no_business_source
+    source_dir = None if business_source_unavailable else (args.source_dirs or args.source_dir)
     source_roots = list(iter_source_roots(source_dir))
-    if not source_roots:
+    if not source_roots and not business_source_unavailable:
         ap.error('the following arguments are required: --source-dir')
-    print(f"\nStep 3 扫描：{len(source_roots)} 个源码目录", file=sys.stderr)
+    if args.no_source:
+        print("\nStep 3 扫描：用户选择不提供源码，仅执行最终制品扫描", file=sys.stderr)
+    elif args.no_business_source:
+        print("\nStep 3 扫描：已提供依赖源码但没有业务源码，仅执行最终制品扫描", file=sys.stderr)
+    else:
+        print(f"\nStep 3 扫描：{len(source_roots)} 个源码目录", file=sys.stderr)
     for root in source_roots:
         print(f"  - {root}", file=sys.stderr)
     global DEP_COMPAT_INCLUDE_TEST_SCOPE
@@ -2027,6 +2064,8 @@ def main():
         if not to_run:
             # 没有指定升级类型，运行全部
             to_run = list(SCAN_FUNCS.keys())
+        if business_source_unavailable:
+            to_run = [item for item in to_run if item not in SOURCE_REQUIRED_SCANS]
 
         reset_scan_diagnostics()
         cleanup_step3_outputs(args.output_dir)
@@ -2064,7 +2103,17 @@ def main():
                 elapsed=time.perf_counter() - scan_timer,
                 item=default_fname,
             )
-        write_step3_coverage(args.output_dir, source_roots, to_run, executed_scans, args.coverage_output)
+        write_step3_coverage(
+            args.output_dir,
+            source_roots,
+            to_run,
+            executed_scans,
+            args.coverage_output,
+            source_usage_decision=('skip_source' if args.no_source else 'use_source'),
+            business_source_coverage_status=(
+                'dependency_source_only' if args.no_business_source else ''
+            ),
+        )
         print(f"\nStep 3 完成：共 {total} 处命中", file=sys.stderr)
         emit_progress(
             "step3",
@@ -2080,7 +2129,17 @@ def main():
         emit_progress("step3", "scan", f"开始执行 {args.type}", item=default_fname)
         single_timer = time.perf_counter()
         matches = func(source_dir, output, dep_list_path) or 0
-        write_step3_coverage(args.output_dir, source_roots, [args.type], [args.type], args.coverage_output)
+        write_step3_coverage(
+            args.output_dir,
+            source_roots,
+            [args.type],
+            [args.type],
+            args.coverage_output,
+            source_usage_decision=('skip_source' if args.no_source else 'use_source'),
+            business_source_coverage_status=(
+                'dependency_source_only' if args.no_business_source else ''
+            ),
+        )
         emit_progress(
             "step3",
             "done",

@@ -42,7 +42,7 @@ description: "Java 升级兼容性分析。用户提到 JDK、Spring Boot、Spri
 
 1. **最终制品唯一事实源**：依赖、版本、类、方法、字段、资源和调用边以 base/current 最终制品及显式 RuntimeProfile 为准。本地仓库副本、重新下载的 JAR 或源码模型不能替代制品事实。
 2. **单一 Binary-first 权威**：Step4–Step6 只使用 binary-first 引擎。不存在 legacy、shadow、灰度、兼容模式或 fallback；generation 失败时停止并保留上一份已验证结果。
-3. **源码仅作覆盖层**：source overlay 只补名称、位置和解释，不生成或删除 executable edge，不覆盖 provider/member resolution，不把制品中不存在的对象提升为正式事实。
+3. **源码由用户提供或选择**：用户已提交源码目录、仓库或 overlay 时直接使用，不重复确认；没有提交源码时，进入 source overlay 前必须告知源码能增加位置、声明与注解、可读上下文和候选关系，并在受支持的常量内联场景与字节码共同形成证明，但不会覆盖二进制裁决，再由用户选择补充源码或明确不提供。系统不得根据自动发现的目录默认使用或默认跳过源码。
 4. **依赖包维度贯穿**：每条变化、API、路径和报告必须带 `coord`、base/current 版本、artifact identity 与 lineage。不得用虚构坐标填补无法绑定的事实。
 5. **四维结果**：正式结果分别保留 `reachability_status`、`static_linkage_status`、`impact_conclusion`、`runtime_verification_status`。
 6. **静态触达四态**：`reachable`、`uncertain`、`not_found_in_static_analysis`、`not_analyzed` 四类互斥。`not_found_in_static_analysis` 不等于不受影响；旧 `not_impacted` 不属于新引擎合同。
@@ -67,7 +67,7 @@ python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --describe-step1-contract
 - base/current 分支、tag、commit 或直接最终制品；
 - 两侧需要的 JDK home；
 - `binary_pipeline_config`，用于固定两侧最终制品、完整目标 JDK、有序运行路径、loader/resource policy 和业务入口；
-- 可选的依赖源码目录或 Git 地址。
+- 用户提供的源码目录、仓库或 overlay；若没有源码输入，再收集用户对源码辅助分析的明确选择，并在选择提供时补充源码目录或 Git 地址。
 
 不能从构建环境猜测会改变运行时结论的 loader、entrypoint 或 JDK image。缺失这些外部事实时明确询问，不用旧引擎兜底。
 
@@ -166,7 +166,8 @@ run("python .../run_step.py --step auto")
 ### Phase 4 [CHECKPOINT] Confirm Upgrade Context
 
 - 对应步骤：`step2`
-- 只有 JDK、分支、目标模块或其他会改变分析范围的外部事实无法确定时才确认。
+- 用户已经主动提供源码目录、仓库或 overlay 时直接使用，不再要求二次确认；用户没有提供源码时，必须告知源码的作用与二进制权威边界，并由用户选择补充源码或明确不提供。自动识别到目录不能代替用户选择。
+- 选择提供源码时，再确认无法自动确定的业务源码范围、依赖源码路径和映射；选择不提供时，后续报告明确记录源码解释覆盖缺失。
 - 普通内部证据故障不生成这类 checkpoint。
 
 人工入口：`evidence/context/review.md`。
