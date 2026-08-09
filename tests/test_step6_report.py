@@ -1051,11 +1051,11 @@ class Step6ReportObjectivityTest(unittest.TestCase):
             ["com.acme.Api.high", "com.acme.Api.low"],
         )
 
-    def test_main_report_fully_expands_reachable_and_uncertain_by_dependency(self):
+    def test_main_report_uses_human_conclusions_for_confirmed_and_uncertain_apis(self):
         reachable = [
             {
-                "coord": "com.acme:reachable",
-                "api": f"com.acme.Api.reachable{index}",
+                "coord": "com.acme:confirmed",
+                "api": f"com.acme.Api.confirmed{index}",
                 "api_signature": "()",
                 "symbol_kind": "method",
                 "change_type": "BEHAVIOR_CHANGED",
@@ -1067,7 +1067,7 @@ class Step6ReportObjectivityTest(unittest.TestCase):
         ]
         uncertain = [
             {
-                "coord": "com.beta:uncertain",
+                "coord": "com.beta:review",
                 "api": "com.beta.Api.low",
                 "api_signature": "()",
                 "symbol_kind": "method",
@@ -1077,7 +1077,7 @@ class Step6ReportObjectivityTest(unittest.TestCase):
                 "priority_score": 3,
             },
             {
-                "coord": "com.beta:uncertain",
+                "coord": "com.beta:review",
                 "api": "com.beta.Api.high",
                 "api_signature": "()",
                 "symbol_kind": "method",
@@ -1124,16 +1124,25 @@ class Step6ReportObjectivityTest(unittest.TestCase):
             s6_report.render_api_and_calls({}, api_model=api_model)
         )
 
-        self.assertIn("### 五态语义与用户行动", report)
-        self.assertIn("`not_found_in_static_analysis` 只表示当前静态范围没有找到路径", report)
+        self.assertNotIn("五态语义", report)
+        self.assertNotIn("内部状态", report)
+        self.assertNotIn("reachable", report)
+        self.assertNotIn("uncertain", report)
+        self.assertNotIn("not_found_in_static_analysis", report)
+        self.assertNotIn("not_analyzed", report)
         self.assertIn("完整展示 15/15", report)
+        self.assertIn("不表示运行时故障已经发生", report)
         for index in range(13):
-            self.assertIn(f"com.acme.Api.reachable{index}", report)
+            self.assertIn(f"com.acme.Api.confirmed{index}", report)
         self.assertLess(report.index("com.beta.Api.high"), report.index("com.beta.Api.low"))
-        self.assertLess(report.index("`com.acme:reachable`"), report.index("`com.beta:uncertain`"))
+        self.assertLess(report.index("`com.acme:confirmed`"), report.index("`com.beta:review`"))
         self.assertNotIn("notFoundSentinel", report)
         self.assertNotIn("notImpactedSentinel", report)
-        self.assertIn("| `not_found_in_static_analysis` | 1 | 仅统计，不展开 API", report)
+        self.assertIn(
+            "| 静态分析未发现调用路径 | 1 | "
+            "仅统计，不展开 API；未发现路径不等于确认不受影响。 |",
+            report,
+        )
 
     def test_core_conclusion_translates_partial_coverage_without_raw_status(self):
         text = "\n".join(

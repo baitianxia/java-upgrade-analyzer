@@ -4007,13 +4007,24 @@ def collect_findings(d):
                 pass
             if entry['coord']:
                 impacted_coords.add(entry['coord'])
-            # binary-first separates a confirmed executable call relation from
-            # the impact conclusion.  A reachable static path therefore remains
-            # "可能影响" until runtime verification exists; it must not be
-            # promoted to the legacy confirmed-impact buckets.
-            if (
+            # The established human report uses "已确认影响" to mean that a
+            # changed API has a confirmed current-system call relationship.  It
+            # does not claim that a runtime failure was observed.  Preserve the
+            # explicit human conclusion before consulting the binary engine's
+            # separate runtime-impact dimension.
+            if api_info.get('user_conclusion') == '已确认影响':
+                if sev == 'P0':
+                    findings['p0'].append(entry)
+                elif sev == 'P1':
+                    findings['p1'].append(entry)
+                else:
+                    findings['p2'].append(entry)
+            elif (
                 api_info.get('user_conclusion') == '可能影响'
-                or api_info.get('decision_bucket') == 'probable_impact'
+                or (
+                    not api_info.get('user_conclusion')
+                    and api_info.get('decision_bucket') == 'probable_impact'
+                )
             ):
                 entry['severity'] = sev
                 entry['user_conclusion'] = '可能影响'
@@ -5221,6 +5232,11 @@ def _human_reason(value):
         ),
         'ANALYSIS_INCOMPLETE': '分析未完整完成。',
         'SYSTEM_CODE_REACHED': '调用链已从当前系统入口触达变更 API。',
+        'RUNTIME_VERIFICATION_REQUIRED': (
+            '已确认当前系统存在到该变化 API 的精确静态可执行调用关系；'
+            '这里确认的是调用关系受到 API 变化影响，不表示运行时故障已经发生，'
+            '仍需定向测试验证。'
+        ),
         'RUNTIME_DEPENDENCY_USES_REMOVED_API': (
             '当前最终制品中的运行时依赖仍引用已移除 API；'
             '加载或执行该路径时存在链接错误风险。'
@@ -6823,84 +6839,28 @@ def _api_result_is_incomplete(row):
     )
 
 
-def _api_five_state(row):
+def _api_human_category(row):
     if _api_result_is_incomplete(row):
-        return "not_analyzed"
+        return "未完成分析"
     conclusion = str((row or {}).get("conclusion") or "").strip()
-    if conclusion == "已确认影响" or (
-        conclusion in {"可能影响", UNCERTAIN_CANDIDATE_CONCLUSION}
-        and int((row or {}).get("confirmed_path_count") or 0) > 0
-    ):
-        return "reachable"
+    if conclusion == "已确认影响":
+        return "确认有影响"
     if conclusion == "已确认不受影响":
-        return "not_impacted"
+        return "确认不受影响"
     if conclusion == "未发现调用路径":
-        return "not_found_in_static_analysis"
-    # A completed result that cannot support a positive or negative conclusion
-    # belongs to uncertain. Unknown labels must never fall through to a safe state.
-    return "uncertain"
+        return "未发现调用路径"
+    # Unknown completed labels remain unconfirmed and must never fall through
+    # to a positive or safe conclusion.
+    return "结论未确定"
 
 
-def _five_state_counts(api_model):
+def _api_human_category_counts(api_model):
     counts = defaultdict(int)
     for row in (api_model or {}).get("rows") or []:
-        counts[_api_five_state(row)] += int(row.get("aggregate_count") or 1)
-    return counts
-
-
-def render_five_state_semantics(api_model):
-    counts = _five_state_counts(api_model)
-    rows = [
-        (
-            "reachable",
-            "静态证据已从当前系统触达到该变更 API；确认的是调用关系，不等同于已发生运行时故障。",
-            "否",
-            "优先核对兼容方案，修复后执行相关业务回归。",
-        ),
-        (
-            "not_impacted",
-            "当前制品中有足以支持“不受本次 API 调用变化影响”的相同类字节码证据；结论只覆盖已检查范围。",
-            "仅限已检查范围",
-            "保留证据，并用目标部署制品完成回归验证。",
-        ),
-        (
-            "uncertain",
-            "已有候选关系，或系统已识别出阻止确定结论的静态分析边界。",
-            "否",
-            "按复核优先分数检查证据链，并补充定向测试或必要输入。",
-        ),
-        (
-            "not_analyzed",
-            "输入、制品或分析过程不完整，本轮没有形成有效结论。",
-            "否",
-            "修复对应证据缺口后重跑相关阶段。",
-        ),
-        (
-            "not_found_in_static_analysis",
-            "本轮已执行的静态搜索中没有找到路径；与 uncertain 的区别是当前没有候选路径或已识别的特定阻断证据。",
-            "否",
-            "结合反射、配置、SPI、生成代码、常量内联及运行时装配场景做定向验证。",
-        ),
-    ]
-    lines = [
-        "### 五态语义与用户行动",
-        "",
-        (
-            "五态互斥。`uncertain` 表示已有候选证据或明确的分析能力边界；"
-            "`not_found_in_static_analysis` 只表示当前静态范围没有找到路径，"
-            "不能解释为安全。"
-        ),
-        "",
-        "| 内部状态 | 本轮数量 | 含义 | 可视为安全 | 用户行动 |",
-        "|---|---:|---|---|---|",
-    ]
-    for status, meaning, safe, action in rows:
-        lines.append(
-            f"| `{status}` | {int(counts.get(status) or 0)} | "
-            f"{meaning} | {safe} | {action} |"
+        counts[_api_human_category(row)] += int(
+            row.get("aggregate_count") or 1
         )
-    lines.append("")
-    return lines
+    return counts
 
 
 def _api_result_priority(row):
@@ -8334,7 +8294,7 @@ def _main_completed_api_rows(rows):
     actionable = [
         row
         for row in rows or []
-        if _api_five_state(row) in {"reachable", "uncertain"}
+        if _api_human_category(row) in {"确认有影响", "结论未确定"}
     ]
     return [
         row
@@ -8383,15 +8343,27 @@ def _api_result_explanation(row, findings=None):
         return _incomplete_api_reason(row, findings or {})
     conclusion = str(row.get("conclusion") or "").strip()
     if conclusion == "已确认影响":
+        runtime_boundary = (
+            "这里确认的是调用关系受到 API 变化影响，不表示运行时故障已经发生，"
+            "仍需定向测试验证。"
+        )
         reason = _human_reason(row.get("reason"))
         if reason:
-            return reason
+            if "不表示运行时故障已经发生" in reason:
+                return reason
+            return f"{reason.rstrip('。')}。{runtime_boundary}"
         path_count = int(
             row.get("confirmed_path_count") or row.get("path_count") or 0
         )
         if path_count:
-            return f"{path_count} 条已确认调用关系到达该 API。"
-        return "已有证据确认当前系统调用关系到达该 API。"
+            return (
+                f"{path_count} 条已确认调用关系到达该 API。"
+                f"{runtime_boundary}"
+            )
+        return (
+            "已有证据确认当前系统调用关系到达该 API。"
+            f"{runtime_boundary}"
+        )
     if conclusion == "已确认不受影响":
         return "当前制品中的相同类字节码保留该 API。"
     if conclusion == "未发现调用路径":
@@ -8521,7 +8493,6 @@ def render_api_and_calls(findings, api_model=None):
             api_model["count_note"],
             "",
         ])
-    lines.extend(render_five_state_semantics(api_model))
     if api_model["incomplete"]:
         displayed = api_model["incomplete"][:S6_MAIN_INCOMPLETE_LIMIT]
         displayed_count = sum(
@@ -8564,7 +8535,7 @@ def render_api_and_calls(findings, api_model=None):
             ),
             "",
             (
-                "本节按依赖坐标分组，完整展示全部 `reachable` 和 `uncertain` API。"
+                "本节按依赖坐标分组，完整展示全部已确认调用关系和结论未确定的 API。"
                 "依赖之间按已确认影响、复核优先分数和调用关系强度排序；"
                 "每个依赖内部再按结论与复核优先分数排序。"
             ),
@@ -8572,39 +8543,39 @@ def render_api_and_calls(findings, api_model=None):
         ])
         if not actionable:
             lines.extend([
-                "本轮没有 `reachable` 或 `uncertain` API。",
+                "本轮没有已确认调用关系或结论未确定的 API。",
                 "",
             ])
         for index, (coord, dependency_rows) in enumerate(
             _completed_api_rows_by_dependency({"completed": actionable}),
             start=1,
         ):
-            reachable_count = sum(
+            confirmed_impact_count = sum(
                 int(row.get("aggregate_count") or 1)
                 for row in dependency_rows
-                if _api_five_state(row) == "reachable"
+                if _api_human_category(row) == "确认有影响"
             )
-            uncertain_count = sum(
+            unconfirmed_count = sum(
                 int(row.get("aggregate_count") or 1)
                 for row in dependency_rows
-                if _api_five_state(row) == "uncertain"
+                if _api_human_category(row) == "结论未确定"
             )
             lines.extend([
                 f"#### {index}. `{_full_md_cell(coord or '依赖身份未记录')}`",
                 "",
                 (
-                    f"本依赖完整展示 {reachable_count} 个 `reachable`、"
-                    f"{uncertain_count} 个 `uncertain` API。"
+                    f"本依赖完整展示 {confirmed_impact_count} 个确认有影响、"
+                    f"{unconfirmed_count} 个结论未确定的 API。"
                 ),
                 "",
                 *_api_completed_table(dependency_rows, findings),
                 "",
             ])
 
-        five_state_counts = _five_state_counts(api_model)
-        not_impacted_count = int(five_state_counts.get("not_impacted") or 0)
+        category_counts = _api_human_category_counts(api_model)
+        not_impacted_count = int(category_counts.get("确认不受影响") or 0)
         not_found_count = int(
-            five_state_counts.get("not_found_in_static_analysis") or 0
+            category_counts.get("未发现调用路径") or 0
         )
         lines.extend([
             "### 其他已完成状态统计",
@@ -8612,12 +8583,12 @@ def render_api_and_calls(findings, api_model=None):
             "| 状态 | 数量 | 正文展示方式 |",
             "|---|---:|---|",
             (
-                f"| `not_impacted` | {not_impacted_count} | "
+                f"| 确认不受影响 | {not_impacted_count} | "
                 "仅统计；完整逐项记录见明细文件。 |"
             ),
             (
-                f"| `not_found_in_static_analysis` | {not_found_count} | "
-                "仅统计，不展开 API；该状态不等于安全。 |"
+                f"| 静态分析未发现调用路径 | {not_found_count} | "
+                "仅统计，不展开 API；未发现路径不等于确认不受影响。 |"
             ),
             "",
             (
@@ -8891,8 +8862,8 @@ def _completed_api_rows_by_dependency(api_model):
         grouped[_canonical_identity_coord(row.get("coord"))].append(row)
 
     def row_sort_key(row):
-        state = _api_five_state(row)
-        if state == "reachable":
+        category = _api_human_category(row)
+        if category == "确认有影响":
             return (
                 0,
                 _severity_rank(row.get("severity")),
@@ -8902,7 +8873,7 @@ def _completed_api_rows_by_dependency(api_model):
                 str(row.get("api_signature") or ""),
                 str(row.get("change_type") or ""),
             )
-        if state == "uncertain":
+        if category == "结论未确定":
             return (
                 1,
                 -int(row.get("priority_score") or 0),
@@ -8935,21 +8906,21 @@ def _completed_api_rows_by_dependency(api_model):
             ),
             default=99,
         )
-        uncertain_scores = [
+        unconfirmed_scores = [
             int(row.get("priority_score") or 0)
             for row in ordered_rows
-            if _api_five_state(row) == "uncertain"
+            if _api_human_category(row) == "结论未确定"
         ]
         dependency_groups.append({
             "coord": coord,
             "rows": ordered_rows,
             "best_result_rank": best_result_rank,
             "best_severity_rank": best_severity_rank,
-            "top_priority_score": max(uncertain_scores, default=0),
-            "total_priority_score": sum(uncertain_scores),
-            "uncertain_count": len(uncertain_scores),
-            "reachable_count": sum(
-                _api_five_state(row) == "reachable"
+            "top_priority_score": max(unconfirmed_scores, default=0),
+            "total_priority_score": sum(unconfirmed_scores),
+            "unconfirmed_count": len(unconfirmed_scores),
+            "confirmed_impact_count": sum(
+                _api_human_category(row) == "确认有影响"
                 for row in ordered_rows
             ),
             "relationship_count": sum(
@@ -8963,21 +8934,21 @@ def _completed_api_rows_by_dependency(api_model):
             not bool(group["coord"]),
             str(group["coord"]),
         )
-        if int(group["reachable_count"]):
+        if int(group["confirmed_impact_count"]):
             return (
                 0,
                 int(group["best_severity_rank"]),
                 -int(group["relationship_count"]),
-                -int(group["reachable_count"]),
+                -int(group["confirmed_impact_count"]),
                 -int(group["top_priority_score"]),
                 *stable_tail,
             )
-        if int(group["uncertain_count"]):
+        if int(group["unconfirmed_count"]):
             return (
                 1,
                 -int(group["top_priority_score"]),
                 -int(group["total_priority_score"]),
-                -int(group["uncertain_count"]),
+                -int(group["unconfirmed_count"]),
                 int(group["best_severity_rank"]),
                 -int(group["relationship_count"]),
                 *stable_tail,
@@ -9068,7 +9039,7 @@ def write_full_dependency_analysis_artifact(
             ),
             "",
             (
-                "依赖先按影响结论、严重级别、uncertain 最高优先分和"
+                "依赖先按影响结论、严重级别、未确认影响最高优先分和"
                 "总优先分排序，再比较调用关系数量；“API 分析”中的"
                 "链接指向该依赖的完整 API 结果。"
             ),
@@ -9174,7 +9145,7 @@ def write_full_api_analysis_artifact(
             (
                 f"以下 {api_model['completed_count']} 个已完成分析的 API "
                 "按依赖影响程度展示；依赖之间先比较最强结论、严重级别"
-                "和 uncertain 优先分数，每个依赖内再按结论类型及 API "
+                "和未确认影响优先分数，每个依赖内再按结论类型及 API "
                 "复核优先分数排列。"
             ),
             "",

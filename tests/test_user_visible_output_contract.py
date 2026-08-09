@@ -28,6 +28,8 @@ class UserVisibleOutputContractTest(unittest.TestCase):
         self.assertIn("已完成分析", reading_section)
         self.assertIn("未完成分析", reading_section)
         self.assertIn("确认有影响", reading_section)
+        self.assertNotIn("五态语义", text)
+        self.assertIn("不展示分析引擎内部状态", text)
         self.assertNotIn("建议按", reading_section)
         self.assertNotIn("当前无法确认", reading_section)
         self.assertIn("本次未完成分析", text)

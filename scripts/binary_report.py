@@ -1045,11 +1045,12 @@ def _legacy_result_item(
         paths = [str(item.get("path_text") or "").strip()]
     state = str(item.get("reachability_status") or "not_analyzed")
     if state == "reachable":
-        user_conclusion = "可能影响"
+        user_conclusion = "已确认影响"
         reason_code = "RUNTIME_VERIFICATION_REQUIRED"
         user_reason = (
-            "已确认当前系统存在到该变化 API 的静态可执行调用关系；"
-            "是否在真实运行时触发兼容性问题仍需定向测试验证。"
+            "已确认当前系统存在到该变化 API 的精确静态可执行调用关系；"
+            "这里确认的是调用关系受到 API 变化影响，不表示运行时故障已经发生，"
+            "仍需定向测试验证。"
         )
     elif state == "uncertain":
         user_conclusion = "结论未确定（存在候选证据）" if paths else "结论未确定（静态分析能力边界）"

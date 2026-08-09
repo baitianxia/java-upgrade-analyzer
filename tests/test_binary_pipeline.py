@@ -313,13 +313,23 @@ class BinaryPipelineTest(unittest.TestCase):
                 b"\xef\xbb\xbf"
             )
         )
-        self.assertIn("not_found_in_static_analysis", final_report.read_text())
         self.assertIn("用户选择不提供源码", final_report.read_text())
         rendered_report = final_report.read_text()
         self.assertIn("# Java 依赖升级影响报告", rendered_report)
         self.assertIn("## 一、依赖层面结论", rendered_report)
         self.assertIn("## 二、API 及调用关系", rendered_report)
         self.assertIn("## 三、用户可见文件说明", rendered_report)
+        self.assertIn("确认有影响", rendered_report)
+        self.assertIn("不表示运行时故障已经发生", rendered_report)
+        self.assertNotIn("五态语义", rendered_report)
+        for internal_status in (
+            "reachable",
+            "uncertain",
+            "not_found_in_static_analysis",
+            "not_analyzed",
+        ):
+            self.assertNotIn(internal_status, rendered_report)
+        self.assertNotIn("未确认影响（存在候选关系）", rendered_report)
         self.assertNotIn("Analysis context：", rendered_report)
         self.assertFalse((api_dir / "source_overlay.md").exists())
         self.assertTrue(
