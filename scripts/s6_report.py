@@ -11,7 +11,7 @@ s6_report.py — Step 6：汇总报告
     --output-report   .upgrade-report/deliverables/report.md
 """
 
-import argparse, csv, hashlib, json, os, re, sys
+import argparse, csv, hashlib, json, os, re, sys, unicodedata
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
@@ -9654,55 +9654,46 @@ def build_report_sections_for_test_only():
 _MAIN_REPORT_TOC_ENTRIES = (
     (
         "## 一、依赖层面结论",
-        "dependency-conclusions",
         "一、依赖层面结论",
         0,
     ),
     (
         "### 未完成分析的依赖",
-        "incomplete-dependencies",
         "未完成分析的依赖",
         1,
     ),
     (
         "### 已完成分析的依赖",
-        "completed-dependencies",
         "已完成分析的依赖",
         1,
     ),
     (
         "## 二、API 及调用关系",
-        "api-call-relationships",
         "二、API 及调用关系",
         0,
     ),
     (
         "### 运行时资源变化及激活关系",
-        "runtime-resource-impacts",
         "运行时资源变化及激活关系",
         1,
     ),
     (
         "### 未完成分析的 API",
-        "incomplete-apis",
         "未完成分析的 API",
         1,
     ),
     (
         "### 已确认触达与结论未确定的 API",
-        "confirmed-and-unconfirmed-apis",
         "已确认触达与结论未确定的 API",
         1,
     ),
     (
         "### 其他已完成状态统计",
-        "other-completed-api-states",
         "其他已完成状态统计",
         1,
     ),
     (
         "## 三、用户可见文件说明",
-        "user-visible-files",
         "三、用户可见文件说明",
         0,
     ),
@@ -9710,38 +9701,45 @@ _MAIN_REPORT_TOC_ENTRIES = (
 
 
 def _main_report_heading_entry(line):
-    for prefix, anchor, label, depth in _MAIN_REPORT_TOC_ENTRIES:
+    for prefix, label, depth in _MAIN_REPORT_TOC_ENTRIES:
         if line.startswith(prefix):
-            return anchor, label, depth
+            return prefix, label, depth
     return None
 
 
-def _anchor_main_report_sections(lines):
-    anchored = []
-    for line in lines:
-        entry = _main_report_heading_entry(line)
-        if entry:
-            anchored.append(f'<a id="{entry[0]}"></a>')
-        anchored.append(line)
-    return anchored
+def _markdown_heading_fragment(line):
+    heading = re.sub(r"^#{1,6}\s+", "", str(line or "")).strip()
+    heading = heading.replace("`", "").lower()
+    fragment = []
+    for char in heading:
+        if char.isspace():
+            fragment.append("-")
+            continue
+        if char in {"-", "_"}:
+            fragment.append(char)
+            continue
+        if unicodedata.category(char).startswith(("P", "S")):
+            continue
+        fragment.append(char)
+    return "".join(fragment)
 
 
 def _render_main_report_toc(section_lines):
-    present_anchors = {
-        entry[0]
+    present_targets = {
+        entry[0]: _markdown_heading_fragment(line)
         for line in section_lines
         if (entry := _main_report_heading_entry(line))
     }
     lines = [
-        '<a id="report-toc"></a>',
         "## 报告目录",
         "",
     ]
-    for _prefix, anchor, label, depth in _MAIN_REPORT_TOC_ENTRIES:
-        if anchor not in present_anchors:
+    for prefix, label, depth in _MAIN_REPORT_TOC_ENTRIES:
+        target = present_targets.get(prefix)
+        if not target:
             continue
         indent = "  " if depth else ""
-        lines.append(f"{indent}- [{label}](#{anchor})")
+        lines.append(f"{indent}- [{label}](#{target})")
     lines.append("")
     return lines
 
@@ -9774,9 +9772,9 @@ def generate_report(findings):
     # Place navigation at the top of the report, after metadata and any source
     # or scope notice. Conditional subsections appear only when rendered.
     L += _render_main_report_toc(all_section_lines)
-    L += _anchor_main_report_sections(dependency_lines)
-    L += _anchor_main_report_sections(api_lines)
-    L += _anchor_main_report_sections(user_visible_file_lines)
+    L += dependency_lines
+    L += api_lines
+    L += user_visible_file_lines
 
     return '\n'.join(L)
 

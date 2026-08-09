@@ -25,6 +25,7 @@ class UserVisibleOutputContractTest(unittest.TestCase):
         self.assertIn("依赖层面结论", reading_section)
         self.assertIn("API 及调用关系", reading_section)
         self.assertIn("用户可见文件说明", reading_section)
+        self.assertIn("不在人工报告中插入 HTML 标签", reading_section)
         self.assertIn("已完成分析", reading_section)
         self.assertIn("未完成分析", reading_section)
         self.assertIn("确认有影响", reading_section)

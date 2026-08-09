@@ -760,33 +760,39 @@ class Step6ReportObjectivityTest(unittest.TestCase):
         )
         self.assertNotIn("不替使用者决定", first_screen)
 
-    def test_report_directory_links_to_every_rendered_entry_with_stable_anchors(self):
+    def test_report_directory_uses_native_heading_links_without_html_tags(self):
         report = s6_report.generate_report(self._human_first_findings())
         toc = report[
             report.index("## 报告目录") : report.index("## 一、依赖层面结论")
         ]
 
         expected_links = (
-            "[一、依赖层面结论](#dependency-conclusions)",
-            "[已完成分析的依赖](#completed-dependencies)",
-            "[二、API 及调用关系](#api-call-relationships)",
+            "[一、依赖层面结论](#一依赖层面结论)",
+            "[已完成分析的依赖](#已完成分析的依赖展示-11)",
+            "[二、API 及调用关系](#二api-及调用关系)",
             (
                 "[已确认触达与结论未确定的 API]"
-                "(#confirmed-and-unconfirmed-apis)"
+                "(#已确认触达与结论未确定的-api完整展示-11)"
             ),
-            "[其他已完成状态统计](#other-completed-api-states)",
-            "[三、用户可见文件说明](#user-visible-files)",
+            "[其他已完成状态统计](#其他已完成状态统计)",
+            "[三、用户可见文件说明](#三用户可见文件说明)",
         )
         for link in expected_links:
             self.assertIn(link, toc)
-        self.assertNotIn("未完成分析的依赖](#incomplete-dependencies)", toc)
-        self.assertNotIn("未完成分析的 API](#incomplete-apis)", toc)
+        self.assertNotIn("[未完成分析的依赖]", toc)
+        self.assertNotIn("[未完成分析的 API]", toc)
         self.assertNotIn("运行时资源变化及激活关系", toc)
 
-        targets = re.findall(r"\]\(#([a-z-]+)\)", toc)
+        targets = re.findall(r"\]\(#([^)]+)\)", toc)
         self.assertTrue(targets)
+        heading_targets = {
+            s6_report._markdown_heading_fragment(line)
+            for line in report.splitlines()
+            if re.match(r"^#{1,6}\s+", line)
+        }
         for target in targets:
-            self.assertEqual(report.count(f'<a id="{target}"></a>'), 1)
+            self.assertIn(target, heading_targets)
+        self.assertNotIn("<a ", report)
         self.assertLess(
             report.index("## 报告目录"),
             report.index("## 一、依赖层面结论"),
@@ -832,9 +838,9 @@ class Step6ReportObjectivityTest(unittest.TestCase):
         ]
 
         for link in (
-            "[未完成分析的依赖](#incomplete-dependencies)",
-            "[未完成分析的 API](#incomplete-apis)",
-            "[运行时资源变化及激活关系](#runtime-resource-impacts)",
+            "[未完成分析的依赖](#未完成分析的依赖展示-11)",
+            "[未完成分析的 API](#未完成分析的-api展示-11)",
+            "[运行时资源变化及激活关系](#运行时资源变化及激活关系)",
         ):
             self.assertIn(link, toc)
 
