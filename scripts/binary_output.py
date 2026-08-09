@@ -19,6 +19,7 @@ from binary_source_overlay import SourceOverlayResult
 from binary_trace_engine import BinaryTraceBundle
 from csv_io import open_csv_write
 from path_runtime import make_short_temp_dir, short_temporary_directory
+from signature_utils import jvm_method_parameter_signature
 
 
 class BinaryOutputError(BinaryFirstContractError):
@@ -103,11 +104,63 @@ def _aggregate_by_api(
         results = [item["result"] for item in items]
         primary = max(results, key=lambda item: priority[item["reachability_status"]])
         scopes = [item["decision"]["fact_scope"] for item in items]
+        target_scope = scopes[0]
+        target_owner = str(target_scope.get("class_name") or "").replace("/", ".")
+        target_member = str(target_scope.get("member_name") or "")
+        target_descriptor = str(target_scope.get("descriptor") or "")
+        target_signature = (
+            jvm_method_parameter_signature(target_descriptor)
+            if target_descriptor.startswith("(") else ""
+        )
+        target_label = (
+            target_owner
+            if not target_member or target_member == "<class>"
+            else f"{target_owner}.{target_member}{target_signature}"
+        )
+        path_records = []
+        path_identities = set()
+        for result in results:
+            for path in result.get("paths") or ():
+                if path.get("path_identity") in path_identities:
+                    continue
+                path_identities.add(path.get("path_identity"))
+                nodes = []
+                for edge in path.get("edges") or ():
+                    owner = str(edge.get("caller_class_name") or "").replace("/", ".")
+                    member = str(edge.get("caller_member_name") or "")
+                    descriptor = str(edge.get("caller_descriptor") or "")
+                    signature = (
+                        jvm_method_parameter_signature(descriptor)
+                        if descriptor.startswith("(") else ""
+                    )
+                    label = f"{owner}.{member}{signature}" if owner and member else ""
+                    if label and (not nodes or nodes[-1] != label):
+                        nodes.append(label)
+                if target_label and (not nodes or nodes[-1] != target_label):
+                    nodes.append(target_label)
+                path_records.append({
+                    "path_identity": path.get("path_identity"),
+                    "path_certainty": path.get("path_certainty"),
+                    "path_text": " → ".join(nodes),
+                    "edge_count": len(path.get("edges") or ()),
+                })
+        dependency_artifacts = []
+        dependency_keys = set()
+        for item in items:
+            for artifact in item["decision"].get("dependency_artifacts") or ():
+                key = (
+                    str(artifact.get("side") or ""),
+                    str(artifact.get("artifact_instance_identity") or ""),
+                )
+                if key not in dependency_keys:
+                    dependency_keys.add(key)
+                    dependency_artifacts.append(dict(artifact))
         output.append({
             "reported_api_identity": reported,
             "display_owner": scopes[0].get("class_name"),
             "display_member": scopes[0].get("member_name"),
             "display_descriptor": scopes[0].get("descriptor"),
+            "display_member_kind": scopes[0].get("member_kind") or items[0]["decision"].get("fact_kind"),
             "reachability_status": primary["reachability_status"],
             "is_reachable": any(item["is_reachable"] for item in results),
             "impact_conclusion": (
@@ -124,11 +177,32 @@ def _aggregate_by_api(
             "path_set_complete": all(item["path_set_complete"] for item in results),
             "exact_path_exists": any(item["exact_path_exists"] for item in results),
             "possible_path_exists": any(item["possible_path_exists"] for item in results),
+            "paths": sorted(path_records, key=lambda item: (
+                str(item.get("path_certainty") or ""),
+                str(item.get("path_text") or ""),
+                str(item.get("path_identity") or ""),
+            )),
             "contributing_projection_ids": sorted(item["projection_identity"] for item in results),
             "contributing_projection_assessment_ids": sorted(
                 item["projection_assessment_identity"] for item in results
             ),
             "contributing_change_fact_ids": sorted(item["change_fact_identity"] for item in results),
+            "dependency_artifacts": dependency_artifacts,
+            "dependency_lineages": sorted({
+                str(item.get("logical_dependency_lineage") or "")
+                for item in dependency_artifacts
+                if item.get("logical_dependency_lineage")
+            }),
+            "base_dependency_coords": sorted({
+                str(item.get("coord") or "")
+                for item in dependency_artifacts
+                if item.get("side") == "base" and item.get("coord")
+            }),
+            "current_dependency_coords": sorted({
+                str(item.get("coord") or "")
+                for item in dependency_artifacts
+                if item.get("side") == "current" and item.get("coord")
+            }),
             "target_jvm_identities": [profile.identity],
             "primary_projection_id": primary["projection_identity"],
             "primary_projection_selection_reason": "highest_reachability_then_stable_input_order_v1",
@@ -257,14 +331,10 @@ def write_binary_generation(
     traces: BinaryTraceBundle,
     profile: RuntimeProfile,
     *,
-    engine_mode: str,
     policy_identities: Mapping[str, str],
     source_overlay: SourceOverlayResult | None = None,
     additional_sidecars: Mapping[str, bytes] | None = None,
-    activate: bool = True,
 ) -> dict[str, Any]:
-    if engine_mode not in {"binary_strict", "binary_with_legacy_fallback", "shadow"}:
-        raise BinaryOutputError("BINARY_OUTPUT_ENGINE_MODE_INVALID", engine_mode)
     root = Path(output_root)
     root.mkdir(parents=True, exist_ok=True)
     payloads = build_output_payloads(
@@ -286,7 +356,6 @@ def write_binary_generation(
     sidecar_identities = {name: _sha256(content) for name, content in encoded.items()}
     generation = ResultGeneration(
         decisions.analysis_context_identity,
-        engine_mode,
         decisions.active_snapshots,
         traces.trace_result_set_digest,
         sidecar_identities,
@@ -299,7 +368,7 @@ def write_binary_generation(
         "schema": "java-upgrade-analyzer.binary-result-generation.v1",
         "result_generation_identity": generation.identity,
         "analysis_context_identity": decisions.analysis_context_identity,
-        "engine_mode": engine_mode,
+        "authority": "binary_first",
         "active_snapshot_identities": {
             layer: snapshot.identity for layer, snapshot in decisions.active_snapshots.items()
         },
@@ -353,13 +422,10 @@ def write_binary_generation(
             if temp.exists():
                 import shutil
                 shutil.rmtree(temp)
-    active_descriptor = ""
-    if activate:
-        active_descriptor = activate_binary_generation(root, manifest)
     return {
         **manifest,
         "generation_directory": str(destination),
-        "active_generation_descriptor": active_descriptor,
+        "active_generation_descriptor": "",
     }
 
 
@@ -376,16 +442,15 @@ def activate_binary_generation(
         raise BinaryOutputError(
             "BINARY_GENERATION_ACTIVATION_TARGET_INVALID", str(destination)
         )
-    mode = str(manifest.get("engine_mode") or "")
-    if mode in {"binary_strict", "binary_with_legacy_fallback"}:
-        if (
-            not validation_result
-            or validation_result.get("status") != "passed"
-            or validation_result.get("result_generation_identity") != generation_identity
-        ):
-            raise BinaryOutputError(
-                "BINARY_GENERATION_VALIDATION_REQUIRED", generation_identity
-            )
+    if (
+        manifest.get("authority") != "binary_first"
+        or not validation_result
+        or validation_result.get("status") != "passed"
+        or validation_result.get("result_generation_identity") != generation_identity
+    ):
+        raise BinaryOutputError(
+            "BINARY_GENERATION_VALIDATION_REQUIRED", generation_identity
+        )
     for name, expected in (manifest.get("sidecar_content_identities") or {}).items():
         path = destination / str(name)
         if not path.is_file() or _sha256(path.read_bytes()) != expected:

@@ -1,66 +1,44 @@
 # 跨步骤诊断契约
 
-所有面向用户或下游工具的诊断 JSON 使用
-`java-upgrade-analyzer.diagnostic.v1` 契约。
+用户和下游诊断 JSON 使用 `java-upgrade-analyzer.diagnostic.v1`。
 
-## 命名规则
+## 命名
 
-- JSON 字段名统一使用小写 `snake_case`。
-- `reason_code` / `reason_codes[]` 的值统一使用大写 `UPPER_SNAKE_CASE`。
-- 原因码描述语义，不混入瞬时处理过程，推荐结构为
-  `DOMAIN_SUBJECT_CONDITION`。
-- 诊断来源步骤写入独立的 `origin_step` 字段，不要求用户从原因码猜测步骤。
-- 旧原因码通过 `reason_code_aliases[]` 或覆盖组件中的
-  `reason_code_aliases{}` 暴露；新输出只使用规范原因码。
+- 字段名：`lower_snake_case`；
+- `reason_code`：`UPPER_SNAKE_CASE`，表达稳定语义而非瞬时动作；
+- 来源：独立 `origin_step`；
+- 历史拼写只通过 `reason_code_aliases` 归一化，新输出不发布旧码。
 
-当前重点原因码：
+常用原因码包括：
 
-| 来源步骤 | 规范原因码 | 旧名称 |
+| 阶段 | 原因码 | 含义 |
 |---|---|---|
-| Step1 | `DEPENDENCY_COORDINATES_UNRESOLVED` | `unresolved_dependency_coordinates_after_enrichment` |
-| Step4 | `DEPENDENCY_SOURCE_REF_UNAVAILABLE` | 无 |
-| Step4 | `JAPICMP_EXECUTION_FAILED` | 无 |
-| Step4 | `JAPICMP_TIMEOUT` | 无 |
-| Step5 | `SPRING_RUNTIME_CLASS_AMBIGUOUS` | `SPRING_PACKAGED_CLASS_AMBIGUOUS` |
-| Step5 | `MYBATIS_RUNTIME_ARTIFACT_PARSE_FAILED` | 无 |
-| Step5 | `BYTECODE_CALLER_UNRESOLVED` | 无 |
-| Step6 | `S6_EVIDENCE_IDENTITY_MISMATCH` | 无 |
+| Step1 | `DEPENDENCY_COORDINATES_UNRESOLVED` | 最终制品条目尚未绑定唯一依赖身份 |
+| Step4 | `BINARY_PIPELINE_CONFIG_REQUIRED` | 缺少显式 target runtime 输入 |
+| Step4 | `BINARY_ARTIFACT_PARSE_FAILED` | 制品事实未完整形成 |
+| Step4 | `BINARY_INDEPENDENT_VALIDATION_FAILED` | generation 未通过独立 Oracle |
+| Step4 | `BINARY_GENERATION_FAILED` | binary generation 或原子发布失败 |
+| Step5 | `BINARY_GENERATION_SIDECAR_INTEGRITY_FAILED` | active generation 内容完整性失败 |
+| Step6 | `BINARY_STEP5_GENERATION_MISMATCH` | Step5 范围与 active generation 不一致 |
 
-Step5 汇总中由采集器、调用图或证据接入产生的目录外原因码，`origin_step` 仍写为
-`step5`；传播作用域缺失时只有 `observed_scope` 使用 `unknown`。来源阶段与传播作用域
-是两个独立事实。
+具体代码可以更细，但必须符合 `diagnostic_contract.py` 的规范化规则。
 
-## 输出约定
+## 输出位置
 
-Step1 交互卡、Step4 覆盖文件和 Step5 `summary.json` 都应提供：
+- 工作流阻塞与恢复：`.runtime/state/main_state.json`、`interaction.json`；
+- binary generation 失败：`.runtime/binary_authority/binary_failures/`；
+- coverage：generation 的 `binary_coverage.json` 以及用户报告中的范围说明；
+- 人工变化复核：`evidence/api_changes/review.md`；
+- 最终结论边界：`deliverables/analysis-scope.md`。
 
-- 诊断契约或 schema；
-- 规范 `reason_code`；
-- `origin_step`；
-- 旧码别名；
-- 触发条件、影响范围、建议决策、修复动作和完成标准。
+API CSV 不使用伪造行承载系统错误。诊断候选与正式变化在 generation 和 `review.md` 中分开；`all_changed_apis.csv` 只发布可进入触达分析的正式 API 投影。
 
-Step6 使用同一原因目录中的事实字段生成主报告，不单独维护另一套诊断事实。主报告只展示
-可读标题、观察范围和对结论的限制；原因码、来源阶段和物理证据进入诊断明细，建议决策、
-修复动作和完成标准不进入 Step6 的用户报告。旧版结果在读取时先归一化原因码，再进行聚合，
-避免同一问题因新旧拼写被拆成两条诊断。
+## 用户说明
 
-Step4 的 `all_changed_apis.csv` 只保存真实 API 变化事实，不使用伪造 API 行承载执行
-错误。用户首先阅读 `dependency_analysis_status.md`，其中使用中文直接说明每个依赖
-的 API 对比结果、实现变化检查结果、最终结论、是否完整、能否按无变化处理、形成结论
-前是否还需处理，以及下一步动作。
-`dependency_analysis_status.csv` 与 `dependency_analysis_status.json` 供机器读取。字段名
-必须带明确对象，例如 `api_comparison_status`、`api_comparison_failure_reason`、
-`implementation_check_status`，不得使用无法看出所指对象的 `status`、`failure_message`
-或 `result_interpretation`。`api_comparison_status` 的值为：
+面向用户时先说明：哪个依赖/范围、发生什么、结论为何受限、系统已做什么、需要用户做什么。只有缺少系统无法获取的外部事实、授权或会改变范围的选择才请求用户输入。
 
-- `changes_detected`：对比成功且发现 API 变化；
-- `no_api_change`：对比成功且没有可见 API 变化；
-- `failed`：没有形成 API 数据，禁止解释为零变化；
-- `not_applicable`：不存在可执行的 old/new 二进制对比范围。
+不得要求用户从英文枚举、行数为零或文件缺失推断“没有变化”。coverage 不完整必须明确写成“当前范围不能形成完整结论”，并给出证据路径和重跑完成标准。
 
-用户文档不得要求用户根据英文枚举、API 行是否存在或多个文件之间的缺失关系猜测结论。
-机器字段必须同时提供对应的 `*_text`、明确布尔结论以及 `next_action`。禁止使用
-`needs_fix` 这类无法判断修复对象的模糊字段；证据不完整统一使用
-`requires_action_before_conclusion`，表示必须按 `next_action` 处理并重新分析后才能
-采用结论。
+## 失败关闭
+
+binary-first 没有兼容或降级分支。诊断建议只允许修复输入/环境后重跑受影响阶段；不能建议忽略缺口、批准使用旧引擎或扩大结论。上一份已验证 generation 可继续保留，但不得冒充本次失败输入的新结果。

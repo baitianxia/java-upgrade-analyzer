@@ -1,109 +1,30 @@
 # 质量门禁与测试策略
 
-本文面向维护者，定义本工程修改代码时必须遵守的质量要求。
+本文定义 binary-first 引擎的开发准入。测试服务于准确性、用户体验和性能，不能用“测试通过”掩盖错误模型或不完整验证。
 
-本页内容属于开发与发布治理，不是 Claude Code 执行分析任务时的运行时指令。测试命令、真实项目轮换、fixture 沉淀、复盘与发布门禁不得复制到 `SKILL.md` 或 `RUNBOOK.md`。
+## 不可突破的门槛
 
-修改代码前应先阅读 [工程宪法](constitution.md)。本文中的测试策略和质量门禁都服务于工程宪法，不得用“测试通过”替代对原则性约束的判断。
+1. 最终制品和目标运行时是正式事实；源码只是可选解释层。
+2. 依赖坐标、版本、lineage、物理制品 SHA 和运行路径身份必须贯穿变化事实、触达结果和最终报告。
+3. 四态语义互斥，不把静态未命中写成无影响，不把静态路径写成运行时确认。
+4. coverage 缺口必须随 scope 和 generation 保留；失败关闭，不能转入旧引擎。
+5. 普通复核人必须能从 Markdown/CSV 直接理解“哪个依赖、哪个变化、路径、原因、缺口和下一步”。
+6. `.runtime` 内部制品与 `evidence`/`deliverables` 人读产物严格分开。
+7. 性能优化不得缩小分析范围、降低身份精度或减少证据。
 
-## 基本原则
-
-准确性优先于性能。
-
-性能优化只能减少重复计算、降低内存峰值或改善索引结构，不能降低分析覆盖面或改变结论语义。
-
-任何修复都不能只为了一个单一场景硬编码；修复前必须判断它是否符合整体分析模型。
-
-## 修改准入
-
-修复或优化前先回答：
-
-1. 这个问题属于漏报、误报、性能、可读性还是交互问题；
-2. 影响哪个 Step；
-3. 是否会改变正式输出契约；
-4. 是否可能影响 Step5 五态语义；
-5. 是否需要新增正例和负例；
-6. 是否需要真实项目或压力模型验证。
-7. 同一根因是否在其他 Step、模块、平台分支、缓存或降级路径重复实现；
-8. 上游生成、入口校验、核心处理、下游消费与门禁的规则是否一致；
-9. 哪些同类点已修复，哪些经检查确认不受影响；
-10. 是否应抽取或复用共享规则，避免只在当前触发点打补丁。
-
-缺陷修复的准出条件不是“当前案例通过”，而是根因族已完成横向审计：受影响点统一修复并有正例、负例和边界回归；不受影响点有可复核依据；无法同步处理的点已登记工程债务、风险边界和后续验证。没有完成这项审计时，不得宣称问题已系统性解决。
-
-## 常用质量门
-
-所有 profile 默认只运行可复现的本地回归，不自动启动真实项目矩阵。只有明确需要真实项目证据时，
-才使用 `--include-real` 显式加入；`--skip-real` 保留为兼容写法。
-
-结构化结果把“回归执行成功”和“允许发布”严格分开：
-
-- `local_regression_status` 表示当前 profile 的本地任务是否完整通过；
-- `real_project_scope.mode` 区分未计划、显式跳过和已加入，`selector` 记录真实项目范围；
-- `real_project_status` 区分通过、失败、显式跳过和未评估；
-- `release_decision` 只有在 `release` profile、本地任务、完整 `guard`（或其超集 `all`）、质量信号审计全部通过，且没有 infra skip、阻塞信号或 fixture debt 时才会是 `release_allowed`。其他 profile 或未加入真实项目时为 `not_evaluated`。
-
-CI 分层为：PR 运行 quick，主干 push 增加 Step5，定时/手工 release 物化完整 guard 并运行发布门禁；平台契约在 Linux、macOS、Windows 与 JDK 11/17/21 矩阵上运行。
-
-真实项目 guard v4 将“源码身份”和“构建产物身份”分开：
-
-- `source_build` 固定 Git revision、源码树、构建命令和相对制品路径；构建完成后计算本次 JAR/WAR 的实际 SHA-256，并用该值绑定缓存、provenance、Analyzer 与独立 Oracle。默认不拿历史构建的原始 ZIP SHA 拒绝当前构建，因为 ZIP 时间戳、JDK 和打包工具可能改变字节而不改变受测语义。只有显式声明 `artifact_verification: sha256` 的可复现构建才比较预期 SHA。
-- `published_artifact` 下载不可变发布制品，仍必须同时满足清单中的 SHA-1/SHA-256；任一摘要不一致都阻断。
-- source-build 清单中的 canonical edge 是稳定语义锚点（entry、caller/callee descriptor、opcode），不固定编译器相关 instruction offset；本次制品的全部物理边仍必须由 Analyzer 与独立 Oracle 按实际 SHA 和 offset 完整 reconciliation。
-- `capability_ids` 与 `required_topologies` 构成能力矩阵；`guard_lifecycle` 为 `core`、`capability` 或 `exploratory`。
-
-可按层运行：
-
-```bash
-python3 scripts/real_project_regression.py --case guard-core
-python3 scripts/real_project_regression.py --case guard-capability
-python3 scripts/real_project_regression.py --case guard-exploratory
-```
-
-`guard` 是 `core + capability` 的发布集合；`exploratory` 用于候选项目观察，不计入发布充分条件。物化脚本接受相同 selector，并在输出中记录本次实际 artifact SHA-256。
-
-分析器最低运行要求为 CPython 3.10；PR quick 在 Ubuntu 上验证 3.12.x、3.13.x 和 3.14.x，
-平台矩阵使用 3.12 验证 Linux/macOS/Windows，并固定 `tree-sitter==0.25.2`、
-`tree-sitter-java==0.23.5`。满足最低要求但
-未进入 CI 矩阵的小版本会产生非阻断提示，并在精确依赖版本与 import 检查通过后继续。JDK、Maven、Gradle 属于被分析工程的
-构建工具链，不设全局版本下限；base/current 构建分别优先采用其 revision 中的 Wrapper 和
-对应侧 JDK，Wrapper 缺失时才回落 PATH。
-`scripts/bootstrap_runtime.py` 是唯一依赖安装入口，支持联网安装或通过 `--wheel-dir`
-使用带 `--no-index` 的受控离线缓存。quality gate 的首项会核对 Python 包精确版本与
-import；需要 Java/Maven 的测试 profile 只检查命令可执行，不把 CI 工具版本强加给用户工程。
-运行分析时不得隐式联网修复环境。
-
-快速检查：
+## 测试 profiles
 
 ```bash
 python3 scripts/quality_gate.py --profile quick
-```
-
-Step5 相关修改：
-
-```bash
 python3 scripts/quality_gate.py --profile step5
-```
-
-发布或重要提交前的本地回归：
-
-```bash
 python3 scripts/quality_gate.py --profile release
 ```
 
-需要同时运行真实项目守护矩阵时：
+- `quick`：模型、制品 diff、target runtime reconciliation、裁决、trace 和 generation 输出；
+- `step5`：在 quick 上增加 ASM/fact store/cache/source overlay、端到端 pipeline、查询、调度和用户输出契约；
+- `release`：`python3 -m unittest discover -s tests`，发现并运行全部当前测试。
 
-```bash
-python3 scripts/quality_gate.py --profile release --include-real --real-case guard
-```
-
-完整 unittest：
-
-```bash
-python3 -m unittest discover -s tests -v
-```
-
-准确性基准：
+准确性定向门：
 
 ```bash
 python3 scripts/accuracy_benchmark.py --profile core
@@ -111,473 +32,92 @@ python3 scripts/accuracy_benchmark.py --profile step5
 python3 scripts/accuracy_benchmark.py --profile all
 ```
 
-Smoke：
-
-```bash
-python3 scripts/smoke_regression.py
-python3 scripts/smoke_regression.py --group core
-python3 scripts/smoke_regression.py --group step5
-python3 scripts/smoke_regression.py --group orchestrator
-```
-
-真实项目回归与质量信号审计：
-
-```bash
-python3 scripts/real_project_regression.py --case all
-python3 scripts/quality_signal_audit.py <real-project-result.json> --json-out <quality-signal-audit.json>
-```
-
-## 必须守住的语义
-
-### Step1
-
-- 以真实构建结果或用户提供的构建产物为准；
-- 多模块项目必须明确目标部署模块；
-- 不得用不完整 dependency tree 替代正式产物事实；
-- Maven/Gradle 内部模块补全只能覆盖目标模块运行时闭包，必须排除目标模块自身和无关 sibling；Maven 有效属性、Gradle project path、自定义 `finalName` 以及构建输出优先级都要有正反例；
-- 静态项目模型只能为最终制品中实际存在的内部 JAR 补身份，不能覆盖构建工具报告的不同版本，也不能扩展制品依赖范围；
-- 无法安全解析的坐标必须显式进入交互或 unresolved。
-
-### Step4
-
-- `all_changed_apis.csv` 是 Step5 的正式输入；
-- JApiCmp XML/文本、git diff、removed jar symbol export 都应保留可追溯证据；
-- JDK 标准类、第三方无关类不能误归入目标依赖 API 变化；
-- removed jar 场景必须导出旧版 public/protected 符号。
-- Step4 内部源码 ref 故障不得要求用户修复：应验证 `DEPENDENCY_SOURCE_REF_UNAVAILABLE` 可追溯、最终 JAR 方法字节码兜底会发现同签名实现变化，并且成功兜底后 `behavior_diff=complete`。若兜底失败，应验证 `behavior_diff` 进入 `critical_incomplete`，报告不出现完整或无影响结论；只有不同 commit pair 会改变源码范围时才允许进入确认 checkpoint。
-- Step4 成功后必须生成有实际意义的范围确认，让用户选择 Step5 全量或部分分析；部分分析必须限制最终结论范围。范围卡必须保留依赖坐标，默认展示按业务最终制品直接字节码引用证据排序的 Top 10；删除等变更类型和源码可用性不得参与排序，证据不完整时必须显式降级为按变更 API 数排序。Step5 成功后不生成例行确认，直接生成报告，但必须把五态摘要写成非阻塞 `interaction.json/user_decision_card`。Step4 超时和 Step5 依赖源码缺失在标准模式下自动记录证据缺口后继续，不得伪装成范围选择要求用户修复；严格模式或关键覆盖约束仍必须阻止无边界结论。
-- `--step auto` 必须连续运行到下一个必要确认点或流程完成：Step2 只有在 JDK、业务源码范围或源码映射歧义等会改变分析口径的事实无法可靠确定时暂停；Step3 和 Step5 不得生成例行成功确认。默认 manifest 的流程控制语义必须有端到端测试覆盖。
-- JApiCmp、tree-sitter 等内部能力在自动准备失败后必须进入 `blocked_by_system`，不得生成伪业务 checkpoint 要求用户确认“修复后继续”；同时不得为保持流程表面连续而降低准确性。
-- 应验证 Step4 即使误配 `auto_continue_on_success` 也不会跳过范围确认；Step5 必须写入 `.runtime/cache/step5_selection.json`，Step6 对部分范围或范围快照缺失都不得输出全量/全局无影响措辞。
-
-### Step5
-
-- 不得漏掉 jdeps 能发现的跨 JAR 类依赖；
-- 删除依赖、升级依赖、字段变化、构造器变化、多依赖链路都要覆盖；
-- 反射、MethodHandle、资源、表达式语言不能静默当成未命中；
-- `reachable` / `not_impacted` / `uncertain` / `not_found_in_static_analysis` / `not_analyzed` 语义不能混淆；`not_impacted` 必须有当前制品中的相同类字节码证据；
-- Kotlin/KTS 当前属于 partial capability：相关降级文件不得产生确定的负结论或 `not_impacted`；源码范围必须先与当前最终制品 class 闭集对齐，测试代码只能按标准源集路径识别；
-- `alerts.csv` 必须保留全量原始分析记录和记录中的完整调用关系，不得抽样；
-- 性能优化不能通过减少分析范围实现。
-- 重载匹配必须同时校验全限定类名和参数描述符；最终制品已完整扫描且精确描述符未命中时，不得被无签名别名阻塞为 `not_analyzed`。
-- 不得把具有方法体的接口 `static` / `default` / `private` 方法当成动态代理边界。
-
-### Step6
-
-- `report.md` 必须按“依赖层面结论 → API 及调用关系 → 用户可见文件说明”排列；
-- 依赖层和 API 层必须统一使用“变化总数、已完成分析、未完成分析、确认有影响、确认不受影响、尚未确认影响”六列；总数必须等于已完成与未完成之和；依赖已有确认有影响结果但仍有其他 API 未完成时，必须同时保留确认有影响事实和未完成状态；
-- 部分分析时，六列统计、主报告逐项结果和两份完整明细只能包含 `included_dependency_coords` 及其变化 API；未选择对象属于范围外对象，不得计入“未完成分析”。选择前全集继续保留在原始依赖/API 清单，未纳入对象及原因进入 `analysis-scope.md`；
-- 同一层级的已完成与未完成明细必须使用相同表头和列顺序；依赖与 API 明细共同使用“当前系统调用关系、分析结果、结果说明”，不得分别改用“分析状态、未完成原因、分析结论、结论依据”等不同标题；
-- 已执行分析但未发现当前系统调用关系属于已完成分析；缺少关键输入或分析过程未完成才进入未完成分析，并逐项显示原因；
-- 正文只展示部分明细时必须同时给出展示数、总数、未展示数量和对应全量文件；
-- 本轮范围内全部依赖结果进入 `all-affected-dependencies.md`，本轮范围内全部 API 结果及完整调用关系进入 `all-impact-details.md`，两者不得合并为同一个链接；
-- 主报告必须按依赖坐标分组完整展示本轮全部 `reachable` 和 `uncertain` API，依赖之间及依赖内部都按影响/复核优先证据排序；`not_found_in_static_analysis` 在主报告只展示统计且必须明确不等于安全。完整依赖/API 明细仍按“确认有影响 → 未确认影响 → 确认不受影响”组织，并覆盖本轮范围内全部状态；
-- `all-affected-dependencies.md` 和 `all-impact-details.md` 必须分别生成同数据、同顺序的 `all-affected-dependencies.csv` 和 `all-impact-details.csv`，CSV 使用与 Markdown 相同的用户可读字段；
-- `alerts.csv` 是一行一条的原始分析记录，必须保留全量记录；`report.md` 的文件说明必须解释它与用户可读 API 明细的区别；
-- `s6_findings.json` 保持结构化消费能力。
+Category 只使用当前 binary 能力名；旧引擎 category 不保留调用别名。
 
-## 测试分层
-
-| 层级 | 目的 |
-|---|---|
-| 单元测试 | 验证具体函数和边界行为 |
-| 契约测试 | 验证跨 Step 输入输出语义 |
-| 准确性基准 | 验证高风险分析能力不退化 |
-| Smoke | 验证主流程可跑通 |
-| 压力模型 | 验证大 API、大依赖、大边数下的复杂度 |
-| 真实项目验证 | 验证工程化输入和真实依赖结构 |
-
-## 声明式测试目录与发布健康门
-
-`tests/fixtures/capability_families.json` 是能力不变量与广义回归的注册表，
-`tests/fixtures/test_profiles.json` 只声明 profile 选择哪些能力族、测试角色和附加性质测试。
-`scripts/capability_test_catalog.py` 在运行时通过 unittest loader 自动解析注册引用、去重并
-生成确定性测试闭集；quick 与 Step5 不再在 `quality_gate.py` 中维护第二份手写模块列表。
-
-目录使用测试完整 ID 的 SHA-256 做稳定分片，支持 `--shard-index` / `--shard-count`。
-同一 profile 无论文件枚举顺序如何，所有 shard 必须互斥且并集等于完整测试闭集。任何 enforced
-能力的陈旧或无法加载引用都会在测试执行前失败；不能等到真实项目 closure 阶段才发现。
-
-release profile 额外执行三类阻塞门：
+## 必测能力
 
-- `branch_coverage_core` 使用 Python 运行时 line-arc 跟踪计算 `if` 的 true/false decision
-  branch，而不是把行覆盖冒充分支覆盖。`signature_utils.py` 与
-  `step5_evidence_model.py` 的最低门槛为 75%，纯追踪策略 `step5_trace_policy.py` 为 90%；
-  缺失函数、无可测分支或低于门槛都会失败。
-- `production_mutations` 对生产 AST 应用 owner、签名、坐标、change identity、证据完整性、
-  深度预算、最终制品绑定与归档安全等变异。任一 survived 或 infrastructure failure 都会失败。
-- `test_health` 对声明式 health 闭集重复运行，输出每个测试的结果序列和耗时降序排行；结果波动
-  视为 flaky，单测平均耗时超过 profile 预算视为 slow，二者都阻塞 release。
-
-规范化、重载兼容、路径去重、结论状态单调性、深度边界与失败关闭使用固定随机种子的生成式/
-metamorphic 测试。它们不依赖在线安装 property-testing 包，离线发布环境与 CI 使用同一输入序列。
-
-可单独复核：
+### Artifact facts
 
-```bash
-python3 scripts/capability_test_catalog.py --profile quick --validate-only
-python3 scripts/capability_test_catalog.py --profile health
-python3 scripts/branch_coverage_gate.py --profile branch_core
-python3 -m unittest tests.test_production_mutation.ProductionMutationTest.test_registered_production_mutants_are_all_killed
-```
+- class/member/access/descriptor/constant/code fingerprint；
+- manifest、service provider、module/resource 选择语义；
+- ZIP 时间戳、entry 顺序等 packaging noise 不产生变化事实；
+- traversal、重复 entry、膨胀比、嵌套深度、CRC/解析失败均有界失败；
+- MR-JAR、未知资源和不支持 class major 正确记录覆盖边界。
 
-## 模块与外部工具失败门
+### Target runtime reconciliation
 
-Step5 的事实提取、身份解析、图存储、纯追踪策略、结论收敛与输出渲染使用单向 import
-边界；测试会解析这些模块的 AST 并拒绝循环依赖。核心 cost/confidence/frontier/stop policy
-只依赖内存参数，不读取文件、不运行命令，可由纯 fixture 完整复核。
+- 同名 class 多制品、parent-first/child-first、有序 slot、module/classpath；
+- base-only/current-only/exact lineage 配对；
+- 目标 JDK platform image 身份一致；
+- provider 不唯一或运行闭包不完整时不得猜测。
 
-迁移到 `scripts/tool_execution.py` 的外部工具必须使用 argv 列表，并为失败保留：
-`stage`、完整 `command`、`timeout_seconds`、`stderr`、`returncode`、`reason_code` 与
-`blocking`。超时、命令缺失、权限不足、启动异常、非零退出和要求输出却为空分别使用稳定
-reason code。上层必须把失败投影到 coverage/EvidenceFailure；禁止捕获后返回空字符串，
-也禁止后续 collector ingestion 覆盖已经记录的工具失败。
+### Decision and projection
 
-## 正例和负例
+- authoritative facts、diagnostic candidates、excluded decisions 分离；
+- 可投影 API 与已确认但不可投影的 service/resource 等事实分离；
+- 每条事实绑定依赖、base/current 制品、原因码和证据；
+- source overlay 不得改变权威裁决。
 
-每个能力增强都应尽量成对补测试：
+### Trace
 
-- 正例：应该命中；
-- 负例：相似但不应该命中；
-- 边界例：输入不完整时应该进入 `uncertain` 或 `not_analyzed`，不能误判为无影响。
+- owner/member/descriptor/loader realm 精确匹配；
+- 重载、继承、接口 dispatch 和多态候选边界；
+- `reachable`、`uncertain`、`not_found_in_static_analysis`、`not_analyzed` 互斥且计数闭合；
+- 路径集合的完整性和预算限制明确；
+- `not_found_in_static_analysis` 永不提升为安全结论。
 
-示例：
+### Publication and UX
 
-- commons-lang 被删除，业务直接调用：应 reachable；
-- commons-lang 被删除，运行时依赖调用但无法回业务：应 uncertain；
-- 同名 `StringUtils.EMPTY` 来自 commons-lang3，不应误报 commons-lang；
-- JApiCmp 输出中的 JDK 标准接口不应误归为目标依赖 API。
+- active generation 完整性与 validation attachment 校验；
+- Step4/5 目录原子替换，失败保留上一版本；
+- Step4 首屏以依赖包为入口，提供单依赖 Markdown、完整 review 和 CSV；
+- Step5/Step6 每条 API 和依赖保留坐标，部分范围不能冒充全量；
+- CSV 为 UTF-8 BOM；Markdown/CSV 同一语义；
+- 内部 SQLite/sidecar 不发布到 `evidence` 或 `deliverables`；
+- 用户卡使用“可能影响/仍不确定”，不输出旧五态或运行时确认空壳。
 
-## 性能验证
+### Architecture boundary
 
-性能问题不能只靠真实项目暴露。
+必须有自动测试验证旧 Step4–Step6 文件不存在，manifest 只路由 binary generation/report，调度器不暴露旧引擎、灰度、兼容或降级参数。删除旧实现时同步删除其专属测试；保留的安全、平台、编码和 Oracle 原则应重写到当前引擎测试中。
 
-应主动构造压力模型：
+## 独立 Oracle
 
-- API 数量大；
-- 运行时依赖 JAR 多；
-- reverse edges 多；
-- 多依赖链路深；
-- 反射/MethodHandle 候选多；
-- class/field 变化多。
+`binary_validation_oracle.py` 必须从原始制品、目标 JDK 和不可变 generation sidecar 独立重建关键事实，不调用生产 ASM parser、provider resolver、decision engine 或 tracer。边界由 `tests/fixtures/oracle_boundary.json` 和静态审计测试约束。
 
-每次执行真实项目矩阵时，性能也必须作为质量信号审计。超过 Step4/Step5 配置预算、图规模异常下降、边截断、edge cap 命中，都不能只作为日志观察；其中耗时超预算应输出 `performance_regression`，P1 阻塞 release。性能优化只能降低重复计算和资源消耗，不能通过缩小分析范围换取通过。
+验证至少覆盖：
 
-最终制品 edge oracle 对每个有效 class 独立执行 JDK `javap`，最多并发 8 个进程；结果必须按制品 entry 和物理指令身份确定性汇总。并发不能抽样、跳过 nested JAR、合并物理 occurrence，或丢弃任一 class 的解析失败。
+- generation sidecar SHA 和身份；
+- 独立 class/member/resource 差异；
+- 目标运行时 provider/outcome；
+- 最终制品直接调用边；
+- 正式投影和四态计数闭合。
 
-oracle 使用进程内不可变缓存，key 必须同时包含最终制品 SHA-256、oracle procedure/version 和完整 JDK `javap` version。缓存值采用序列化快照，命中时返回独立副本；不同 SHA、procedure 或 JDK 之间禁止复用。只有已经穷举结束的扫描可以写缓存；超时或中断结果禁止缓存。
+Oracle 失败或证据不足时 generation 不得激活。
 
-Step5 报告运行还会在报告目录的 `.runtime/artifact_fact_cache` 中持久化已经成功解析的字节码事实。该缓存只替代重复的事实提取，不参与候选裁剪、边合并、深度预算或结论判断。缓存身份必须绑定制品 SHA-256、class entry、目标 JDK、解析 procedure/schema 和解析工具版本；内容另带结果摘要并在读取时完整校验。损坏、制品替换、工具升级、schema 变化、读取失败或写入失败都必须回退到原始解析路径，失败或不完整的解析结果不得落盘。写入采用同目录临时文件、`fsync` 和原子替换，保证并发读者不会看到半写入内容。
+## 性能门
 
-每个真实项目 case 必须配置 `max_oracle_seconds`，默认预算为 120 秒。超过预算或收到中断时，oracle 必须终止在途 `javap`、禁止 traceback、标记结果不完整，并同时输出 blocking `oracle_incomplete` 和 `performance_regression`。禁止为了满足预算减少 class、edge 或 failure 范围。
+性能门必须同时记录输入规模、冷/热 cache、总耗时、阶段耗时和可取得的峰值内存。固定性能 fixture 位于 `tests/fixtures/binary_first/performance_gate.json`，其内容身份在 support manifest 中固定。
 
-runner 的 `performance_envelope` 至少保留以下 oracle 指标：
+允许：内容寻址缓存、批量事务、有界并行、索引、避免重复解析。禁止：抽样 API、跳过依赖、缩短路径而不报告、降低描述符/loader 精度、用源码替代制品。
 
-- `oracle_class_count` / `oracle_completed_class_count`；
-- `oracle_parsed_class_count` / `oracle_cached_class_count`；
-- `oracle_parse_failure_count`；
-- `oracle_parse_seconds` / `oracle_elapsed_seconds`；
-- `oracle_worker_count`；
-- `oracle_cache_hits` / `oracle_cache_misses`；
-- `oracle_timed_out` / `oracle_interrupted`。
+## 同输入分支对比
 
-Step4 性能验证优先看：
+引擎替换的 A/B 结论必须先写真值，再运行两分支。每个 case 至少记录：
 
-```text
-.runtime/observability/step4_timing.csv
-```
+- 输入制品 SHA、JDK 和 runtime profile；
+- 预期依赖、变化对象、正式/诊断类别、路径与覆盖边界；
+- 两分支实际人读文件和机器事实；
+- 漏报、误报、依赖归属错误、路径错误和不诚实负结论；
+- wall time、cache 状态和峰值内存（可取得时）。
 
-关键阶段：
-
-- `artifact_resolve`;
-- `dependency.gitdiff`;
-- `dependency.japicmp`;
-- `dependency.removed_jar_export`;
-- `dependency.changed_classes`;
-- `dependencies.process_all`;
-- `write.*`。
-
-Step5 性能验证优先看：
+只比较行数、状态总数或单个成功案例没有说服力。推荐至少包含：精确 removed/descriptor change、确认但不可投影的 resource/service 变化、packaging-only noise、覆盖不完整失败关闭。
 
-```text
-.runtime/observability/step5_timing.csv
-```
+## 提交准出
 
-关键指标：
-
-- `main.indirect_usage_potential_legacy_method_target_pairs`;
-- `main.indirect_usage_owner_presence_scans`;
-- `bytecode_scan.elapsed_sec`;
-- `bytecode_expand.elapsed_sec`;
-- `trace.incoming_edges_scanned`;
-- `trace.declared_signature_index_elapsed_sec`;
-- `trace.direct_class_usage_elapsed_sec`;
-- `trace.direct_field_usage_elapsed_sec`;
-- `trace.direct_source_fact_index_elapsed_sec`;
-- `trace.direct_source_fact_index_scanned_methods`;
-- `trace.direct_source_fact_index_body_reads`;
-- `trace.direct_source_fact_index_body_cache_evictions`;
-- `trace.direct_source_fact_index_class_keys` / `field_keys`;
-- `trace.multi_target_group_count` / `multi_target_target_count` / `multi_target_shared_key_count`;
-- `trace.reverse_transition_cache_builds` / `reverse_transition_cache_hits`;
-- `trace.reverse_transition_edges_materialized` / `reverse_transition_edges_reused`;
-- `report.elapsed_sec`。
-
-多目标复用的定向门禁必须同时比较开启与关闭复用后的五态结论、`path_details` 指纹和完整
-`alerts.csv` 字节，并以 1×/2×/4× 共享前驱图验证转换物化次数近线性增长。命中率提升只
-是性能信号，不能替代上述语义等价与闭集范围校验。
-
-真实项目的亚 50ms 单 API 墙钟指标可能受操作系统调度抖动影响。只有 pinned manifest
-显式声明 `scheduler_jitter_floor` 时，相对阈值才可提升到该绝对 floor；未声明时仍严格使用
-baseline ratio，超过 floor 仍阻塞。该例外只适用于对应微计时指标，不放宽总耗时、扫描速率、
-RSS、外部命令数或范围闭集门，并且必须有 floor 内/外成对边界测试。
-
-## 真实项目验证口径
-
-真实项目验证不能只证明“能跑完”。
-
-项目规模不能替代测试覆盖率。真实项目 case 必须声明生命周期：
-
-- `discovery`：Step4 产生的 API 必须 100% 进入 Step5；
-- `convergence`：保持全量覆盖，同时把 P0/P1 问题沉淀为 fixture；
-- `guard`：只运行已声明的代表性探针，输出不得暗示项目级全量覆盖。
-
-每次运行必须分别通过五类门禁：
-
-- 覆盖门禁：记录 API population、selected、accounted 和 coverage ratio；
-- 证据门禁：区分缺运行时 jar、缺源码映射、测试配置错误和真实外部缺失；
-- 结论门禁：按 reason code 与 symbol kind 分组 `not_analyzed`，不得压成一条模糊汇总；
-- 真值门禁：每个输入 API 必须有且只有一条独立 oracle 记录；缺失、重复、错误、
-  无法验证或 oracle 冲突都阻断，不能用抽样比例宣称准确性通过；
-- 性能门禁：同时约束绝对耗时、每 API 耗时、每千 class 扫描耗时、候选配对数、
-  重复 JAR/class 扫描、javap 调用数和峰值 RSS；探索/守护案例还应使用绑定 Git revision
-  与最终制品 SHA-256 的历史基线设置相对退化阈值。
-
-具备独立物理边 Oracle 的真实项目必须声明故障注入。干净运行通过后，测试编排层从
-分析器侧删除一条由最终制品 Oracle 独立证明的物理边，再执行隔离对账。注入运行必须
-出现 `missing` 并阻断，且注入前后 Oracle 证据文件 SHA-256 必须相同。没有可注入边、
-Oracle 被一同修改、注入后仍通过或只产生无关错误，都属于 `fault_injection_failure`。
-故障注入只属于测试编排层，禁止加入生产 Step5 分支。
-
-每 API 性能记录必须覆盖完整输入闭集，不能只保存最慢 Top N。相对性能基线必须同时
-绑定真实项目 Git revision 和最终制品 SHA-256；绑定过期、指标缺失或逐 API 记录不完整
-必须失败关闭，不能退回仅观察绝对总耗时。
-
-runner 状态必须由质量信号派生。存在 blocking signal 时状态必须为 `failed`；
-只有 ground truth 尚未完成且没有其他阻断时才是 `observed`；独立 audit 的发布决定
-不得与 runner 文本状态冲突。
-
-至少应记录：
-
-- 项目规模；
-- 依赖数量；
-- API 变化数量；
-- Step1~Step6 每步耗时；
-- reachable / not_impacted / uncertain / not_found / not_analyzed 分布；
-- 逐 API oracle 核对结果；
-- 与 jdeps 或人工预期不一致的差异。
-
-误报与漏报必须逐 API 核对。每条记录包含 canonical identity、analyzer conclusion、
-oracle conclusion、verdict、证据模式和证据文件。宽泛 grep 只能用来发现候选，不能
-作为 owner 或重载签名精度的最终真值；当前分析器自己的结论也不能反过来充当 oracle。
-
-对于已编译的真实业务项目，可使用“字节码变更语料”模式：由 JDK `javap` 穷举全部
-生产 class 对指定依赖包的精确 owner/member/JVM descriptor 调用，去重后动态生成
-`all_changed_apis.csv`，再由独立的第二遍字节码扫描逐 API 裁决 Step5 结论。该模式禁止
-抽样，也禁止使用分析器输出生成输入集合。当前 `mall` discovery case 固定在提交
-`0504e86b1f1b6f1b8aa6a734d37a90fb67346be7`，以 `cn/hutool/` 为目标依赖边界；在
-Java 23+ 构建环境中需要显式传入 `-Dmaven.compiler.proc=full`。case 必须使用已完成
-Spring Boot repackage 的 `mall-admin` fat jar，并在远程 Docker goal 之前取得和校验该
-最终制品，不能退回 `compile` 阶段输出。
-
-确定性业务字节码结论只能来自经过 SHA-256 校验的 `current_final_artifact`。禁止使用
-`target/classes`、IDE 输出目录或其他散落 class 作为降级真值，因为这些目录可能包含
-旧 class、未打包模块或与部署参数不一致的产物。缺少最终制品时必须 fail closed，输出
-制品证据缺失；不得通过降低证据等级继续给出 `reachable` 或项目级准确性通过结论。
-
-如果每轮真实项目测试都发现新问题，说明测试矩阵仍不足，应继续补充针对性测试和压力模型。
-
-## 每轮测试必须复盘
-
-真实项目 runner 和质量信号审计结束后，必须执行：
-
-```bash
-python3 scripts/test_round_retrospective.py \
-  <real-project-result.json> \
-  <quality-signal-audit.json> \
-  --reviews <test-round-reviews.json> \
-  --history <test-round-history.json> \
-  --json-out <test-round-retrospective.json> \
-  --markdown-out <test-round-retrospective.md>
-```
-
-每轮复盘必须记录：
-
-- 新增 P0/P1 数量以及与上一轮相比的上升、持平或下降；
-- 每个 finding 的根因族、上一轮未发现或本轮形成的原因、处置状态和待优化动作；
-- 新增拓扑、缺失拓扑、Oracle 完整性、fixture debt 和性能证据；
-- 修复是统一模型/架构修复还是案例补丁；
-- 当前项目应继续发现、转成 guard、轮换还是因质量债务阻塞。
-
-所有 P0/P1 必须额外填写回归测试和修复范围，`resolution_scope=case_patch` 不能通过。P2/P3 也不能因为非阻塞就不解释；客观无法证明的项可标记 `accepted_uncertainty`，但必须写清证据边界和下一步增强能力。外部或第三方复核发现的问题即使没有被当前 audit 捕获，也必须作为 `external_finding` 写入 reviews，不能丢失。
-
-`test-round-reviews.json` 推荐使用对象格式：
-
-```json
-{
-  "findings": [
-    {
-      "finding_id": "finding-...",
-      "root_cause_family": "evidence_identity",
-      "escape_reason": "此前矩阵没有组合覆盖嵌套类身份与重载签名",
-      "resolution_scope": "evidence_model",
-      "regression_test": "tests.test_step5_evidence_model.EvidenceModelTest.test_collector_batch_requires_identity_and_valid_sha",
-      "optimization_action": "统一身份后再进入图遍历",
-      "status": "fixed",
-      "architecture_review": true
-    }
-  ],
-  "next_action": {
-    "decision": "rotate",
-    "project": "新的真实项目或仓库标识",
-    "rationale": "覆盖当前项目未包含的运行时激活拓扑",
-    "target_topologies": ["framework_runtime_activation"]
-  }
-}
-```
-
-根因族必须使用固定分类：`artifact_provenance`、`business_activation_not_proven`、`coverage_scope`、`error_visibility`、`evidence_identity`、`framework_semantics`、`oracle_gap`、`output_contract`、`ownership_classification`、`performance_complexity`、`static_evidence_limit`、`test_asset_invalid`、`workflow_gate`。确属新架构缺口时使用 `new_architecture_gap` 并填写 `root_cause_definition`，避免通过不断换名称规避重复根因检测。
-
-复盘器会校验真实结果与 signal audit 的 payload SHA-256、Git revision/dirty 状态、API population/accounted/verified、逐边 Oracle、性能预算、超时和解析失败。API 与 Oracle 必须按闭集核验：既不能缺少输入 API，也不能出现输入集合之外的 analyzer 输出；同一 identity 的 analyzer 结论重复或冲突、Oracle identity 缺失/重复/额外、provenance 无效都必须阻断。所有计数字段必须真实存在且类型正确，不能把缺失字段解释为零。质量门禁在每个生成任务前清理该任务的旧 JSON/Markdown；即使 runner 或 audit 失败且没有产生输出，复盘器也必须生成带输入错误的 `blocked` 制品。
-
-同一 `root_cause_family` 跨轮重复出现时，必须进行架构复审，不能继续从相邻条件分支追加补丁。复盘门禁失败时不得开始下一轮项目，也不得宣称本轮测试完成。
-
-当本轮没有新增 P0/P1、Oracle 与性能证据完整、fixture debt 为零且没有新增拓扑时，决策应为 `rotate`；下一项目应从尚未覆盖的证据组合和调用拓扑中选择。仍有新增拓扑时先转为 `guard` 或继续收敛，不能立刻把项目丢弃。
-
-`rotate` 必须指定不同于当前 case/path 的下一项目、选择理由和至少一个当前尚未覆盖的目标拓扑；只写“换项目”或继续选择同一项目不能通过。
-
-四类决策的行动引用必须精确绑定事实集合：`guard` 只能指向所选当前项目本轮新增的拓扑；`continue` 必须精确列出该项目全部 P0/P1 finding，不能夹带不存在的 ID；`blocked` 必须精确列出本轮门禁错误；`rotate` 只能指向不同项目和尚未覆盖的拓扑。单一行动无法完整表达多项目轮次时必须阻断并升级行动模型，不能忽略其他项目的拓扑或 finding。
-
-真实项目矩阵必须按“发现池”而不是“固定纪念碑”维护。每次执行真实项目测试时都要遵守：
-
-- 探索期项目用于发现未知问题；
-- 收敛期项目必须把 P0/P1 findings 转成 L0/L1/L2 fixture；
-- 守护期项目只保留少量代表性 probe；
-- 当一个项目的问题都已沉淀且不再发现新信号时，应把主要发现预算轮换到更适合暴露未知问题的新工程。
-
-优先轮换到能覆盖当前能力边界的工程，例如 Spring Boot 2 到 3、Jakarta 迁移、多模块应用、annotation processor、SPI、反射、动态代理、fat jar、shaded jar、nested jar、Kotlin/Groovy 混合 Java、复杂 Maven 依赖管理等。
-
-真实项目测试必须先校验测试资产本身。若项目不是有效 Git checkout、源码规模低于 case 假设，或 `target/generated-sources` 占比异常高，应输出 `project_asset_invalid` 并阻塞 release，不能继续跑 Step4/Step5 后把资产问题误归因成 analyzer 能力缺口。
-
-### 全量 API 与独立事实契约
-
-- 真实项目的 API 人口只能由 Step1 的全部最终制品依赖变化，经 Step4 生成的全部变更 API 决定。框架、owner、严重级别、已知调用形态和拓扑标签都不能缩小人口。
-- discovery/convergence 必须满足 `Step4 population == Step5 input == analyzer accounted == Oracle ledger`。拓扑只描述已观察到的边，不能充当 API 选择器；class 级变化本身也不能伪装成调用拓扑。
-- 坐标更名、一对多拆包和同一逻辑依赖的 provider 迁移必须按最终制品中的运行时 provider set 比较。provider set 合并时主升级制品优先，同名 class 不得被 companion 覆盖。
-- 对高风险 `not_found_in_static_analysis`、`not_impacted` 和 `uncertain`，两个权威必须支持同一明确结论；一条 `uncertain` 记录不能凑数成为负结论的第二权威。
-- 成员级事实至少由 JDK `javap` 物理边和独立原始 constant-pool 解析器交叉验证；class 级事实至少由原始 classfile 常量引用和系统 JDK `jdeps` 交叉验证。任一解析器失败都必须阻断，不得转成空结果。
-- 每轮必须删除一条已被 Oracle 证明的 analyzer 物理边。只有 injected ledger 出现 `missing`、干净 Oracle SHA 不变且干净边对账无错误，故障注入才算通过。
-- 性能门控除 Step5 外，还必须记录 Oracle 总耗时、`javap`/`jdeps` 调用数、扫描 class 数、每 API 耗时、每千 class 耗时、重复 JAR/class 扫描和峰值内存。
-
-## Capability Family Closure
-
-真实项目 finding 的修复单位是能力家族，不是项目或具体输入。能力家族注册表位于
-`tests/fixtures/capability_families.json`，每个家族必须定义一个可证伪的不变量、全部生产路径、
-广义正例、反例、故障注入和需要当前通过的真实项目守护案例。
-
-Step5 和 release 门在测试轮次复盘后执行 `scripts/capability_family_closure.py`。P0/P1 finding
-只有在以下条件全部满足时才能关闭：
-
-- review 精确绑定注册表中的 capability family 和 invariant；
-- `audited_production_paths` 与注册表路径集合完全相同；
-- 正例、反例和 mutation unittest 引用都能加载；
-- 当前轮次中的全部 cross-project guards 均为 `passed`；
-- 重复根因家族具有明确的架构决策；
-- retrospective 中每个 finding 都有对应 review，不能在组件边界消失。
-
-注册表中的 `enforced` 只表示共享实现边界和广义测试已建立，不表示能力已经全局关闭。只有本轮
-closure report 同时通过生产路径、测试和当前真实项目守护核验，才允许表述为 closed。能力审计状态
-见 `docs/developer/capability-family-audit.md`。
-
-不得通过把 `resolution_scope` 改写为 `architecture`、填写说明文字或增加项目专用断言关闭 finding。
-仍有开放的重复能力家族时不得继续轮换真实项目。
-
-## Fixture Debt
-
-每个 P0/P1 真实项目质量信号都必须进入以下状态之一：
-
-- 已沉淀为 L0/L1/L2 回归测试；
-- 已记录为 planned，并写清楚目标 fixture 形态；
-- 已 waived，并写清楚原因和过期时间。
-
-Release 门禁会统计 blocking signal 中尚未沉淀的 `fixture_debt`。不能让真实项目反复发现同一类问题，却只保留一次性运行记录。
-
-Fixture debt 的机器状态只有三种：`fixed`、`planned`、`waived_until`。`fixed` 必须指向已存在的
-L0/L1/L2 回归测试；`planned` 必须填写目标 fixture 形态；`waived_until` 必须同时填写原因和
-ISO 日期。缺失状态、缺失必填字段和已过期 waiver 都会让 `fixture_debt` gate 阻塞。
-
-### `gs-multi-module` pinned guard
-
-`tests/fixtures/real_projects/gs-multi-module.json` 固定了 `spring-guides/gs-multi-module` 的 Git
-revision、源码构建命令和最终 application artifact 的相对路径。runner 在启动 Step5 之前校验 HEAD、
-ZIP/class 完整性并记录本次 artifact SHA；任何源码 revision 或制品结构不一致都会直接返回 `failed`，不会读取 `target/classes`、
-IDE 输出或其他 jar 作为替代真值。允许的本地 checkout 位置是
-`/private/tmp/gs-multi-module/complete`，最终制品是
-`application/target/application-0.0.1-SNAPSHOT.jar`。
-
-守护链必须精确为 `DemoApplication.home -> MyService.message ->
-ServiceProperties.getMessage()`，目标 descriptor 为 `()Ljava/lang/String;`。两个 manifest 语义边必须
-在本次制品的 physical reconciliation 中找到 Analyzer/Oracle 双方均为 `correct` 的对应边，并同时观察到
-`business_to_same_jar_bridge` 和 `same_coord_multimodule`。出现
-`SOURCE_BYTECODE_EDGE_CONFLICT` 时 `conclusion` gate 必须失败。
-
-执行命令：
-
-```bash
-python3 scripts/real_project_regression.py --case gs-multi-module
-```
-
-命令逐项打印 `asset`、`api_coverage`、`topology_coverage`、`edge_truth`、`conclusion`、
-`performance`、`fixture_debt` 七个独立 gate。证据写入 case report 的
-`evidence/quality/v3_gates.json`、`fixture_debt.json` 和 `fixture_debt.csv`。原始
-same-coordinate finding 只有在完整守护契约通过时才保持 `fixed`；任一精确边、拓扑、链或结论
-回归都会重新打开该 debt 并阻塞。
-
-精确边校验读取 reconciliation ledger 的 `analyzer_row` / `oracle_row` 生产结构。ledger 内仍同时校验
-`correct` verdict 和本次制品的 `physical_occurrence`，source-build 清单层只比较稳定语义锚点；调用链按实际节点分隔后精确比较，
-仅对末节点的 `变更 API：` 标记做归一化。Fixture debt 先独立计算 finding lifecycle；
-`fixed` 行的 fixture 必须能由 unittest loader 解析到真实测试，且 `asset`、`api_coverage`、
-`topology_coverage`、`edge_truth`、`conclusion`、`performance`、`fixture_debt` 七个显式门禁状态
-全部通过后才算满足。Finding 再现由显式 lifecycle 结果判定，不从同一组边、拓扑或结论门禁反推。
-
-## 打包前最低要求
-
-## 解析器兼容性规则
-
-- Classfile 快路径只能跳过常量池中不存在目标 owner/member 的 class，或输出已经逐指令验证的调用边；反射和无法完整解析的 `invokedynamic` 必须回退 `javap`。
-- 直接解析缓存与 `javap` 缓存使用不同能力命名空间，禁止把常量池摘要当成完整指令证据。
-- `tableswitch` / `lookupswitch` 按方法 Code 数组绝对偏移对齐；Lambda 和方法引用必须解析 `BootstrapMethods` 中的实现 MethodHandle。
-- 类层级优先读取 classfile 的 `super_class` 和 `interfaces`；解析失败才允许有限并发调用 `javap`。层级覆盖不完整必须 fail closed。
-- 并发 worker、归档读取或字节码解析失败必须保留 artifact、class、异常类型和覆盖影响；不得缓存为正常空结果。
-- Fat Jar 内部模块只能由项目范围中的 reactor 坐标和最终制品条目共同证明，不允许用 groupId/package 前缀猜测。
-- 依赖源码快照使用 commit archive，不注册 Git Worktree；删除报告目录不得改变用户仓库的 `.git/worktrees`。
-
-## 打包前最低要求
-
-打包给使用者验证前至少执行：
-
-```bash
-python3 scripts/quality_gate.py --profile quick
-```
-
-如果改动涉及 Step5、Step4 或输出文件语义，至少再执行相关定向测试或 `step5` profile。
-
-打包文件应排除：
-
-- `.git/`;
-- `.idea/`;
-- `.upgrade-report/`;
-- `__pycache__/`;
-- `.pytest_cache/`;
-- 历史 zip；
-- 临时日志。
+- 所有现存测试实际通过；
+- 公开文档与代码一致；
+- 人读报告已抽查依赖身份和阅读路径；
+- 旧引擎入口/参数/活动文档已清除；
+- 性能数据存在且不进入确定性 generation；
+- A/B 使用相同输入并按预先真值评估；
+- Git diff 只包含本次目标，提交信息说明 engine replacement 和用户输出保持。

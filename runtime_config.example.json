@@ -12,12 +12,8 @@
     "/abs/path/to/dependency-b-multi-module",
     "https://git.example.com/team/dependency-c.git"
   ],
-  "japicmp_jar": "/abs/path/to/japicmp-0.21.2-jar-with-dependencies.jar",
-  "max_depth": 5,
   "include_test_scope": false,
   "tool": "maven",
-  "engine_mode": "binary_strict",
   "binary_pipeline_config": "/abs/path/to/binary-pipeline-input.json",
-  "allow_degraded": false,
   "strict_risk_gate": false
 }

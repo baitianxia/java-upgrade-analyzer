@@ -56,6 +56,7 @@ class BinaryTraceEngine:
         self.inline_overlay = inline_overlay
         self.members = {row["member_identity"]: row for row in store.rows("members")}
         self.edges = {row["direct_edge_identity"]: row for row in store.rows("direct_edges")}
+        self.members = {row["member_identity"]: row for row in store.rows("members")}
         self.providers = {
             (item["initiating_loader_realm_identity"], item["class_name"]): item
             for item in reconciliation.provider_bindings
@@ -396,7 +397,24 @@ class BinaryTraceEngine:
                 gaps.append("trace_node_limit_exceeded")
                 break
             if node in self.entrypoints:
-                path_edges = list(reversed(suffix))
+                path_edges = []
+                for item in reversed(suffix):
+                    edge = self.edges.get(item["direct_edge_identity"]) or {}
+                    caller = self.members.get(item["caller_member_identity"]) or {}
+                    path_edges.append({
+                        **item,
+                        "caller_class_name": str(caller.get("class_name") or ""),
+                        "caller_member_name": str(caller.get("member_name") or ""),
+                        "caller_descriptor": str(caller.get("descriptor") or ""),
+                        "caller_artifact_instance_identity": str(
+                            edge.get("caller_artifact_instance_identity") or ""
+                        ),
+                        "edge_kind": str(edge.get("edge_kind") or ""),
+                        "bytecode_offset": edge.get("bytecode_offset"),
+                        "symbolic_owner": str(edge.get("symbolic_owner") or ""),
+                        "symbolic_name": str(edge.get("symbolic_name") or ""),
+                        "symbolic_descriptor": str(edge.get("symbolic_descriptor") or ""),
+                    })
                 path_identity = _identity("binary_trace_path_identity", {
                     "entrypoint_member_identity": node,
                     "target_nodes": list(target_nodes),

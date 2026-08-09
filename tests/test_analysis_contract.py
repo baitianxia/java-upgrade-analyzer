@@ -722,20 +722,15 @@ class AnalysisContractTest(unittest.TestCase):
             "sides": sides,
         }), encoding="utf-8")
 
-    def test_indirect_usage_partial_is_a_critical_coverage_gap(self):
+    def test_binary_reachability_not_analyzed_is_a_critical_coverage_gap(self):
         with tempfile.TemporaryDirectory() as tmp:
             report = Path(tmp)
             summary = report / "evidence" / "call_chain" / "summary.json"
             summary.parent.mkdir(parents=True)
             summary.write_text(json.dumps({
+                "authority": "binary_first",
                 "total_apis": 1,
                 "not_analyzed": 1,
-                "graph_stats": {
-                    "indirect_usage": {
-                        "status": "partial",
-                        "reason_codes": ["reflection_source_partial"],
-                    }
-                },
             }), encoding="utf-8")
 
             coverage = derive_coverage_report(
@@ -743,33 +738,28 @@ class AnalysisContractTest(unittest.TestCase):
                 project_scope={"status": "complete", "reason_codes": []},
             )
 
-        self.assertIn("indirect_usage_matrix", coverage["critical_incomplete"])
-        indirect = next(item for item in coverage["components"] if item["id"] == "indirect_usage_matrix")
-        self.assertEqual(indirect["reason_codes"], ["REFLECTION_SOURCE_PARTIAL"])
+        self.assertIn("business_reachability", coverage["critical_incomplete"])
+        reachability = next(
+            item for item in coverage["components"]
+            if item["id"] == "business_reachability"
+        )
+        self.assertEqual(reachability["reason_codes"], ["STEP5_NOT_ANALYZED_TARGETS"])
 
-    def test_behavior_diff_insufficient_is_a_critical_coverage_gap(self):
+    def test_binary_decision_partial_is_a_critical_coverage_gap(self):
         with tempfile.TemporaryDirectory() as tmp:
             report = Path(tmp)
-            dependencies = report / "evidence" / "dependencies"
             api_changes = report / "evidence" / "api_changes"
-            runtime_coverage = report / ".runtime" / "coverage"
-            dependencies.mkdir(parents=True)
             api_changes.mkdir(parents=True)
-            runtime_coverage.mkdir(parents=True)
-            (dependencies / "dep_changes.csv").write_text(
-                "coord,old_version,new_version\ncom.acme:api,1,2\n",
-                encoding="utf-8",
-            )
             (api_changes / "all_changed_apis.csv").write_text(
                 "coord,api_name\n",
                 encoding="utf-8",
             )
-            (runtime_coverage / "s4_coverage.json").write_text(
+            (api_changes / "summary.json").write_text(
                 json.dumps({
-                    "binary_api_diff": {"status": "complete", "reason_codes": []},
-                    "behavior_diff": {
-                        "status": "insufficient",
-                        "reason_codes": ["FINAL_JAR_BEHAVIOR_DIFF_UNAVAILABLE"],
+                    "authority": "binary_first",
+                    "decision_coverage_status": "partial",
+                    "coverage": {
+                        "decision_coverage_gaps": ["UNSUPPORTED_CLASS_MAJOR"],
                     },
                 }),
                 encoding="utf-8",
@@ -780,10 +770,13 @@ class AnalysisContractTest(unittest.TestCase):
                 project_scope={"status": "complete", "reason_codes": []},
             )
 
-        self.assertIn("behavior_diff", coverage["critical_incomplete"])
-        behavior = next(item for item in coverage["components"] if item["id"] == "behavior_diff")
-        self.assertEqual(behavior["status"], "insufficient")
-        self.assertEqual(behavior["reason_codes"], ["FINAL_JAR_BEHAVIOR_DIFF_UNAVAILABLE"])
+        self.assertIn("binary_authority_decision", coverage["critical_incomplete"])
+        decision = next(
+            item for item in coverage["components"]
+            if item["id"] == "binary_authority_decision"
+        )
+        self.assertEqual(decision["status"], "partial")
+        self.assertEqual(decision["reason_codes"], ["UNSUPPORTED_CLASS_MAJOR"])
 
 
 if __name__ == "__main__":

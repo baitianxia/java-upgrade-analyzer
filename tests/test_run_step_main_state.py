@@ -21,18 +21,12 @@ import run_step  # noqa: E402
 
 
 class RunStepMainStateTest(unittest.TestCase):
-    def test_binary_engine_modes_are_explicit_and_implemented(self):
-        self.assertEqual(run_step.normalize_binary_engine_mode("shadow"), "shadow")
-        self.assertEqual(
-            run_step.normalize_binary_engine_mode("binary_strict"),
-            "binary_strict",
-        )
-        self.assertEqual(
-            run_step.normalize_binary_engine_mode("binary_with_legacy_fallback"),
-            "binary_with_legacy_fallback",
-        )
+    def test_orchestrator_exposes_no_engine_selection_or_fallback_api(self):
+        self.assertFalse(hasattr(run_step, "normalize_binary_engine_mode"))
+        self.assertFalse(hasattr(run_step, "validate_binary_engine_mode_transition"))
+        self.assertFalse(hasattr(run_step, "ENGINE_DESCRIPTOR_RELATIVE_PATH"))
 
-    def test_binary_strict_failure_preserves_previous_outputs(self):
+    def test_binary_failure_preserves_previous_outputs_and_records_internal_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             report = root / ".upgrade-report"
@@ -48,26 +42,27 @@ class RunStepMainStateTest(unittest.TestCase):
                 side_effect=run_step.StepError("parser failed"),
             ):
                 with self.assertRaisesRegex(
-                    run_step.StepError, "BINARY_STRICT_GENERATION_FAILED"
+                    run_step.StepError, "BINARY_GENERATION_FAILED"
                 ):
                     run_step._run_binary_step4(
-                        requested_mode="binary_strict",
                         run_context={"binary_pipeline_config": str(config)},
                         project_dir=root,
                         report_dir=report,
                         s4_dir=s4_dir,
-                        dep_changes=report / "dep.csv",
-                        context_json=report / "context.json",
                     )
             self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve")
+            failures = list(
+                (report / ".runtime" / "binary_authority" / "binary_failures").glob("*.json")
+            )
+            self.assertEqual(len(failures), 1)
+            self.assertTrue(json.loads(failures[0].read_text())["fail_closed"])
 
-    def test_binary_fallback_restarts_one_complete_legacy_generation(self):
+    def test_step4_runs_only_binary_pipeline_and_binary_report(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             report = root / ".upgrade-report"
             s4_dir = report / "evidence" / "api_changes"
             s4_dir.mkdir(parents=True)
-            (s4_dir / "stale.txt").write_text("stale", encoding="utf-8")
             config = root / "binary.json"
             config.write_text("{}", encoding="utf-8")
             calls = []
@@ -75,78 +70,59 @@ class RunStepMainStateTest(unittest.TestCase):
             def fake_run(script_name, script_args, _cwd, **_kwargs):
                 calls.append((script_name, list(script_args)))
                 if script_name == "binary_pipeline.py":
-                    raise run_step.StepError("binary DB integrity failed")
-                self.assertEqual(script_name, "s4_jar_compare.py")
-                s4_dir.mkdir(parents=True, exist_ok=True)
-                (s4_dir / "all_changed_apis.csv").write_text(
-                    "coord,api_name\n", encoding="utf-8"
-                )
+                    result_path = Path(
+                        script_args[script_args.index("--result-json") + 1]
+                    )
+                    run_step.write_json(result_path, {
+                        "validation_status": "passed",
+                        "result_generation_identity": "generation-1",
+                        "analysis_context_identity": "context-1",
+                        "phase_timings": [{
+                            "phase": "binary_trace",
+                            "elapsed_seconds": 0.125,
+                            "formal_trace_result_count": 1,
+                        }],
+                    })
+                else:
+                    self.assertEqual(script_name, "binary_report.py")
 
             with patch.object(run_step, "run_python", side_effect=fake_run):
                 result = run_step._run_binary_step4(
-                    requested_mode="binary_with_legacy_fallback",
                     run_context={"binary_pipeline_config": str(config)},
                     project_dir=root,
                     report_dir=report,
                     s4_dir=s4_dir,
-                    dep_changes=report / "dep.csv",
-                    context_json=report / "context.json",
                 )
-            self.assertTrue(result["fallback"])
+            self.assertEqual(result["result_generation_identity"], "generation-1")
             self.assertEqual(
                 [item[0] for item in calls],
-                ["binary_pipeline.py", "s4_jar_compare.py"],
+                ["binary_pipeline.py", "binary_report.py"],
             )
-            self.assertFalse((s4_dir / "stale.txt").exists())
-            descriptor = json.loads(
-                (report / run_step.ENGINE_DESCRIPTOR_RELATIVE_PATH).read_text()
+            timing_path = report / ".runtime/observability/step4_timing.csv"
+            self.assertTrue(timing_path.read_bytes().startswith(b"\xef\xbb\xbf"))
+            with timing_path.open(encoding="utf-8-sig", newline="") as handle:
+                timings = list(csv.DictReader(handle))
+            self.assertEqual(timings[0]["phase"], "binary_trace")
+            self.assertEqual(
+                timings[0]["result_generation_identity"], "generation-1"
             )
-            self.assertEqual(descriptor["authoritative_engine"], "legacy_fallback")
-            self.assertEqual(descriptor["fallback_scope"], "whole_generation_only")
-            self.assertFalse(descriptor["binary_support_manifest_satisfied"])
-
-    def test_binary_engine_mode_change_after_step4_requires_restart(self):
-        with self.assertRaisesRegex(
-            run_step.StepError,
-            "BINARY_ENGINE_MODE_CHANGE_REQUIRES_STEP4_RESTART",
-        ):
-            run_step.validate_binary_engine_mode_transition(
-                "legacy",
-                "shadow",
-                "step5",
-            )
-        with self.assertRaisesRegex(
-            run_step.StepError,
-            "BINARY_ENGINE_MODE_CHANGE_REQUIRES_STEP4_RESTART",
-        ):
-            run_step.validate_binary_engine_mode_transition(
-                "",
-                "shadow",
-                "step5",
+            self.assertEqual(
+                timings[-1]["phase"], "step4_human_report_publication"
             )
 
-        self.assertEqual(
-            run_step.validate_binary_engine_mode_transition(
-                "legacy",
-                "shadow",
-                "step4",
-            ),
-            "shadow",
-        )
-
-    def test_binary_engine_mode_intent_targets_step4_and_is_persisted(self):
-        response = {"action": "continue", "engine_mode": "shadow"}
+    def test_binary_pipeline_config_intent_targets_step4_and_is_persisted(self):
+        response = {"action": "continue", "binary_pipeline_config": "binary.json"}
 
         self.assertEqual(
             run_step.infer_non_pending_target_step_from_payload(response),
             "step4",
         )
         updated = run_step.merge_user_response_into_run_context(
-            {"engine_mode": "legacy"},
+            {},
             response,
             Path.cwd(),
         )
-        self.assertEqual(updated["engine_mode"], "shadow")
+        self.assertEqual(updated["binary_pipeline_config"], str(Path.cwd() / "binary.json"))
 
     def test_json_reader_rejects_bom_prefixed_input(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -157,28 +133,6 @@ class RunStepMainStateTest(unittest.TestCase):
             with self.assertRaises(json.JSONDecodeError):
                 run_step.read_json(invalid_path)
 
-    def test_internal_tool_failure_reason_is_recorded_as_system_block(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            report_dir = Path(tmp) / ".upgrade-report"
-            diagnostic = run_step.step4_api_changes_dir(report_dir) / "japicmp_preflight.json"
-            diagnostic.parent.mkdir(parents=True)
-            diagnostic.write_text(
-                json.dumps(
-                    {
-                        "status": "blocked_by_system",
-                        "reason_code": "step4_japicmp_missing_need_resolution",
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            reason_codes = run_step.read_step_system_block_reason_codes(
-                "s4_jar_compare.py", report_dir
-            )
-
-        self.assertEqual(
-            reason_codes, ["STEP4_JAPICMP_MISSING_NEED_RESOLUTION"]
-        )
 
     def test_step1_artifact_preflight_does_not_show_unpinned_local_candidates(self):
         interaction = run_step.build_step1_preflight_interaction(
@@ -473,7 +427,7 @@ class RunStepMainStateTest(unittest.TestCase):
             steps = {
                 "step3": {"gate": "scan", "interaction": None},
                 "step4": {
-                    "gate": "jar_compare",
+                    "gate": "binary_generation",
                     "requires_scope_confirmation": True,
                 },
             }
@@ -630,7 +584,7 @@ class RunStepMainStateTest(unittest.TestCase):
             manifest = {"auto_run_until_checkpoint": True}
             steps = {
                 "step5": {
-                    "gate": "call_chain",
+                    "gate": "binary_report",
                     "auto_continue_on_success": True,
                     "interaction": None,
                 },
@@ -727,7 +681,7 @@ class RunStepMainStateTest(unittest.TestCase):
                     {},
                     {
                         "step5": {
-                            "gate": "call_chain",
+                            "gate": "binary_report",
                             "auto_continue_on_success": True,
                         }
                     },
@@ -758,7 +712,7 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertIn("本卡无需回复", card)
         self.assertNotIn("为什么暂停", card)
 
-    def test_step5_generates_standard_five_state_card_when_manifest_skips_checkpoint(self):
+    def test_step5_generates_standard_four_state_card_when_manifest_skips_checkpoint(self):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp) / "project"
             report_dir = project_dir / ".upgrade-report"
@@ -767,7 +721,6 @@ class RunStepMainStateTest(unittest.TestCase):
             (call_chain_dir / "summary.json").write_text(
                 json.dumps({
                     "reachable": 2,
-                    "not_impacted": 3,
                     "uncertain": 4,
                     "not_analyzed": 5,
                     "not_found_in_static_analysis": 6,
@@ -795,8 +748,9 @@ class RunStepMainStateTest(unittest.TestCase):
         )
         self.assertEqual(informational["status"], "informational")
         card = "\n".join(informational["user_decision_card"])
+        self.assertIn("静态触达四态摘要（四类互斥）", card)
         self.assertIn("reachable（已确认静态触达）=2", card)
-        self.assertIn("not_impacted（已确认不受 API 调用影响）=3", card)
+        self.assertNotIn("not_impacted", card)
         self.assertIn("uncertain（存在候选证据或已知分析边界）=4", card)
         self.assertIn("not_analyzed（输入不足或分析未完成）=5", card)
         self.assertIn("not_found_in_static_analysis（当前静态范围未找到路径）=6", card)
@@ -900,7 +854,7 @@ class RunStepMainStateTest(unittest.TestCase):
                     {},
                     {
                         "step4": {
-                            "gate": "jar_compare",
+                            "gate": "binary_generation",
                             "auto_continue_on_success": True,
                             "requires_scope_confirmation": True,
                         }
@@ -1020,11 +974,6 @@ class RunStepMainStateTest(unittest.TestCase):
             source_repo_hints=[],
             dependency_repo_mappings=[],
             dependency_git_ref_overrides_json="",
-            japicmp_jar="",
-            step4_git_diff_timeout=None,
-            step4_japicmp_timeout=None,
-            step4_fetch_timeout=None,
-            step5_timeout=None,
             base_artifact_path="",
             current_artifact_path="",
             base_source_project_dir="",
@@ -1036,46 +985,10 @@ class RunStepMainStateTest(unittest.TestCase):
             include_test_scope=False,
             max_depth=None,
             tool="maven",
-            allow_degraded=False,
             strict_risk_gate=False,
             allow_unresolved=False,
         )
 
-    def test_jar_compare_gate_failure_carries_structured_coverage_reason_codes(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            report_dir = Path(tmp) / ".upgrade-report"
-            coverage_path = report_dir / ".runtime" / "coverage" / "s4_coverage.json"
-            self._write_text(
-                coverage_path,
-                json.dumps(
-                    {
-                        "binary_api_diff": {
-                            "status": "insufficient",
-                            "reason_codes": [
-                                "japicmp_or_old_jar_failed",
-                                "FINAL_ARTIFACT_JAR_EVIDENCE_MISSING",
-                            ],
-                        },
-                        "behavior_diff": {"status": "complete", "reason_codes": []},
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            with patch.object(
-                run_step,
-                "run_python",
-                side_effect=run_step.StepError("gate.py execution failed"),
-            ), self.assertRaises(run_step.StepError) as raised:
-                run_step.run_gate("jar_compare", report_dir, Path(tmp))
-
-            self.assertEqual(
-                raised.exception.reason_codes,
-                [
-                    "japicmp_or_old_jar_failed",
-                    "FINAL_ARTIFACT_JAR_EVIDENCE_MISSING",
-                ],
-            )
 
     def test_persist_step_error_saves_machine_readable_reason_codes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1095,37 +1008,6 @@ class RunStepMainStateTest(unittest.TestCase):
                 ["FINAL_ARTIFACT_JAR_EVIDENCE_MISSING"],
             )
 
-    def test_step5_artifact_preflight_failure_carries_system_block_reason_code(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            report_dir = Path(tmp) / ".upgrade-report"
-            diagnostic_path = (
-                report_dir
-                / "evidence"
-                / "call_chain"
-                / "artifact_preflight_failure.json"
-            )
-            self._write_text(
-                diagnostic_path,
-                json.dumps(
-                    {
-                        "status": "blocked_by_system",
-                        "reason_code": (
-                            "STEP1_RETAINED_ARTIFACT_EVIDENCE_INVALID"
-                        ),
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            reason_codes = run_step.read_step_system_block_reason_codes(
-                "s5_call_chain_engine_integrated.py",
-                report_dir,
-            )
-
-        self.assertEqual(
-            reason_codes,
-            ["STEP1_RETAINED_ARTIFACT_EVIDENCE_INVALID"],
-        )
 
     def test_auto_step_reads_from_main_state(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1289,7 +1171,7 @@ class RunStepMainStateTest(unittest.TestCase):
                 "\n".join(
                     [
                         "coord,api_name,api_simple,api_signature,symbol_kind,change_type,confirmed,severity,source,analysis_scope",
-                        "sample:base,com.lib.Base.call,call,(),method,REMOVED,true,P1,japicmp,api",
+                        "sample:base,com.lib.Base.call,call,(),method,REMOVED,true,P1,classfile_contract,api",
                     ]
                 )
                 + "\n",
@@ -1319,7 +1201,7 @@ class RunStepMainStateTest(unittest.TestCase):
             )
             self.assertEqual(materialized_path, all_changed_path)
             self.assertEqual(len(selection_summary["matched_rows"]), 1)
-            self.assertEqual(selection_summary["matched_rows"][0]["source"], "japicmp")
+            self.assertEqual(selection_summary["matched_rows"][0]["source"], "classfile_contract")
             scope = json.loads(
                 (report_dir / ".runtime" / "cache" / "step5_selection.json").read_text(encoding="utf-8")
             )
@@ -1334,9 +1216,9 @@ class RunStepMainStateTest(unittest.TestCase):
                 "\n".join(
                     [
                         "coord,api_name,api_simple,api_signature,symbol_kind,change_type,confirmed,severity,source,analysis_scope",
-                        "com.example:demo-lib,com.example.Demo.call,call,(),method,REMOVED,true,P1,japicmp,api",
-                        "org.example:demo-lib,org.example.Demo.call,call,(),method,REMOVED,true,P1,japicmp,api",
-                        "com.example:core-lib,com.example.Core.call,call,(),method,REMOVED,true,P1,japicmp,api",
+                        "com.example:demo-lib,com.example.Demo.call,call,(),method,REMOVED,true,P1,classfile_contract,api",
+                        "org.example:demo-lib,org.example.Demo.call,call,(),method,REMOVED,true,P1,classfile_contract,api",
+                        "com.example:core-lib,com.example.Core.call,call,(),method,REMOVED,true,P1,classfile_contract,api",
                     ]
                 )
                 + "\n",
@@ -1862,8 +1744,10 @@ class RunStepMainStateTest(unittest.TestCase):
                         "analysis_scope": {
                             "mode": "partial",
                             "included_dependency_count": 1,
+                            "analyzed_dependency_count": 0,
                             "available_dependency_count": 3,
-                            "analyzed_api_count": 7,
+                            "included_api_count": 7,
+                            "analyzed_api_count": 2,
                             "total_api_count": 19,
                             "included_dependency_coords": [
                                 "com.example:demo"
@@ -1911,16 +1795,13 @@ class RunStepMainStateTest(unittest.TestCase):
                             }
                             for index in range(7)
                         ],
-                        "p0": [{
+                        "probable_impact": [{
                             "coord": "com.example:demo",
-                            "api": "com.example.Api.confirmed",
+                            "api": "com.example.Api.probable",
                             "api_signature": "()",
                             "symbol_kind": "method",
                             "change_type": "REMOVED",
                         }],
-                        "p1": [],
-                        "p2": [],
-                        "probable_impact": [],
                         "uncertain": [{
                             "coord": "com.example:demo",
                             "api": "com.example.Api.uncertain",
@@ -1928,7 +1809,6 @@ class RunStepMainStateTest(unittest.TestCase):
                             "symbol_kind": "method",
                             "change_type": "REMOVED",
                         }],
-                        "needs_input": [],
                         "not_analyzed": [],
                         "diagnostics": [],
                     },
@@ -1945,7 +1825,7 @@ class RunStepMainStateTest(unittest.TestCase):
             )
 
         self.assertEqual(summary["status"], "completed_with_limits")
-        self.assertEqual(summary["confirmed_count"], 1)
+        self.assertEqual(summary["probable_count"], 1)
         self.assertIn("用户选择了部分变化依赖", summary["limitations"])
         self.assertIn("1 项存在候选证据但结论未确定", summary["limitations"])
         self.assertIn("分析已完成，但存在结论限制", message)
@@ -1955,17 +1835,17 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertEqual(summary["dependency_total_count"], 1)
         self.assertEqual(summary["dependency_completed_count"], 0)
         self.assertEqual(summary["dependency_incomplete_count"], 1)
-        self.assertEqual(summary["dependency_confirmed_count"], 1)
+        self.assertEqual(summary["dependency_probable_count"], 1)
         self.assertEqual(summary["api_total_count"], 7)
         self.assertEqual(summary["api_completed_count"], 2)
         self.assertEqual(summary["api_incomplete_count"], 5)
-        self.assertEqual(summary["api_confirmed_count"], 1)
+        self.assertEqual(summary["api_probable_count"], 1)
         self.assertIn(
-            "依赖：变化 1，已完成分析 0，未完成分析 1，其中确认有影响 1。",
+            "依赖：变化 1，已完成分析 0，未完成分析 1，其中可能影响 1。",
             message,
         )
         self.assertIn(
-            "API：变化 7，已完成分析 2，未完成分析 5，确认有影响 1。",
+            "API：变化 7，已完成分析 2，未完成分析 5，可能影响 1。",
             message,
         )
         self.assertIn(
@@ -1989,12 +1869,12 @@ class RunStepMainStateTest(unittest.TestCase):
                 json.dumps({
                     "coverage": {"overall_status": "complete"},
                     "analysis_scope": {"mode": "full"},
-                    "p0": [], "p1": [], "p2": [], "probable_impact": [],
+                    "probable_impact": [],
                     "uncertain": [
                         {"uncertainty_kind": "candidate_evidence"},
                         {"uncertainty_kind": "analysis_limitation"},
                     ],
-                    "needs_input": [], "not_analyzed": [], "diagnostics": [],
+                    "not_analyzed": [], "diagnostics": [],
                 }, ensure_ascii=False),
                 encoding="utf-8",
             )
@@ -2060,19 +1940,17 @@ class RunStepMainStateTest(unittest.TestCase):
                         "scope_mode": "partial",
                         "included_dependency_count": 1,
                         "available_dependency_count": 3,
-                        "confirmed_count": 2,
                         "probable_count": 1,
                         "uncertain_count": 4,
-                        "needs_input_count": 3,
                         "not_analyzed_count": 0,
                         "dependency_total_count": 3,
                         "dependency_completed_count": 2,
                         "dependency_incomplete_count": 1,
-                        "dependency_confirmed_count": 1,
+                        "dependency_probable_count": 1,
                         "api_total_count": 10,
                         "api_completed_count": 7,
                         "api_incomplete_count": 3,
-                        "api_confirmed_count": 2,
+                        "api_probable_count": 1,
                         "limitations": ["用户选择了部分变化依赖"],
                     },
                 }
@@ -2083,11 +1961,11 @@ class RunStepMainStateTest(unittest.TestCase):
 
         self.assertIn("分析范围：部分依赖（1/3）", text)
         self.assertIn(
-            "依赖：变化 3，已完成分析 2，未完成分析 1，其中确认有影响 1。",
+            "依赖：变化 3，已完成分析 2，未完成分析 1，其中可能影响 1。",
             text,
         )
         self.assertIn(
-            "API：变化 10，已完成分析 7，未完成分析 3，确认有影响 2。",
+            "API：变化 10，已完成分析 7，未完成分析 3，可能影响 1。",
             text,
         )
         self.assertIn("结论限制：用户选择了部分变化依赖", text)
@@ -2117,7 +1995,7 @@ class RunStepMainStateTest(unittest.TestCase):
         )
         self.assertNotIn("evidence/dependencies/dep_changes.csv", text)
 
-    def test_final_completion_counts_named_not_analyzed_subcategories_once(self):
+    def test_final_completion_counts_binary_not_analyzed_items_once(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp) / ".upgrade-report"
             findings_path = report_dir / ".runtime" / "findings" / "s6_findings.json"
@@ -2150,14 +2028,18 @@ class RunStepMainStateTest(unittest.TestCase):
                 json.dumps(
                     {
                         "coverage": {"overall_status": "complete"},
-                        "analysis_scope": {"mode": "full"},
-                        "p0": [],
-                        "p1": [],
-                        "p2": [],
+                        "analysis_scope": {
+                            "mode": "full",
+                            "included_dependency_count": 1,
+                            "analyzed_dependency_count": 0,
+                            "available_dependency_count": 1,
+                            "included_api_count": 3,
+                            "analyzed_api_count": 1,
+                            "total_api_count": 3,
+                        },
                         "probable_impact": [probable],
                         "uncertain": [],
-                        "needs_input": [needs_input],
-                        "not_analyzed": [probable, needs_input, residual],
+                        "not_analyzed": [needs_input, residual],
                         "diagnostics": [],
                     },
                     ensure_ascii=False,
@@ -2184,23 +2066,23 @@ class RunStepMainStateTest(unittest.TestCase):
             )
 
         self.assertEqual(summary["probable_count"], 1)
-        self.assertEqual(summary["needs_input_count"], 1)
-        self.assertEqual(summary["not_analyzed_count"], 1)
+        self.assertNotIn("needs_input_count", summary)
+        self.assertEqual(summary["not_analyzed_count"], 2)
         self.assertEqual(summary["dependency_total_count"], 1)
         self.assertEqual(summary["dependency_completed_count"], 0)
         self.assertEqual(summary["dependency_incomplete_count"], 1)
-        self.assertEqual(summary["dependency_confirmed_count"], 0)
+        self.assertEqual(summary["dependency_probable_count"], 1)
         self.assertEqual(summary["api_total_count"], 3)
         self.assertEqual(summary["api_completed_count"], 1)
         self.assertEqual(summary["api_incomplete_count"], 2)
-        self.assertEqual(summary["api_confirmed_count"], 0)
+        self.assertEqual(summary["api_probable_count"], 1)
         for text in (terminal, landing):
             self.assertIn(
-                "依赖：变化 1，已完成分析 0，未完成分析 1，其中确认有影响 0。",
+                "依赖：变化 1，已完成分析 0，未完成分析 1，其中可能影响 1。",
                 text,
             )
             self.assertIn(
-                "API：变化 3，已完成分析 1，未完成分析 2，确认有影响 0。",
+                "API：变化 3，已完成分析 1，未完成分析 2，可能影响 1。",
                 text,
             )
             self.assertNotIn("建议", text)
@@ -2541,6 +2423,7 @@ class RunStepMainStateTest(unittest.TestCase):
             "selected_targets",
             "\n".join(machine_event["user_decision_card"]),
         )
+        self.assertNotIn("fallback_inputs", machine_event)
 
     def test_human_interaction_output_mode_hides_machine_protocol(self):
         interaction = {
@@ -2657,31 +2540,6 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertNotIn("input_normalization", text)
         self.assertNotIn("action_requirements", text)
 
-    def test_user_decision_card_covers_dependency_source_rerun_without_generic_continue_example(self):
-        interaction = {
-            "step_id": "step5",
-            "question": "需要补充依赖源码目录后重跑 Step5。",
-            "options": [
-                {"id": "rerun_current_step", "label": "补源码后重跑"},
-                {"id": "cancel", "label": "取消"},
-            ],
-            "response_schema": {
-                "type": "object",
-                "properties": {
-                    "action": {"type": "string"},
-                    "dependency_source_dirs": {"type": "array"},
-                },
-            },
-            "action_requirements": {
-                "rerun_current_step": {"at_least_one_of": ["dependency_source_dirs"]}
-            },
-        }
-
-        text = "\n".join(run_step.build_user_decision_card(interaction))
-
-        self.assertIn("依赖源码目录是 /path/to/dependency-repo，补充后重跑", text)
-        self.assertNotIn("“继续”", text)
-        self.assertNotIn("action_requirements", text)
 
     def test_user_decision_card_humanizes_option_descriptions(self):
         interaction = {
@@ -2708,29 +2566,6 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertNotIn("restart_step_id", text)
         self.assertNotIn("not_analyzed", text)
 
-    def test_step5_missing_source_interaction_question_uses_human_field_name(self):
-        interaction = {
-            "step_id": "step5",
-            "reason_code": "step5_dependency_source_mapping_missing",
-            "question": "请补充 dependency_source_dirs 后重跑 Step5。",
-            "response_schema": {
-                "type": "object",
-                "properties": {
-                    "action": {"type": "string"},
-                    "dependency_source_dirs": {"type": "array"},
-                },
-            },
-        }
-
-        annotated = run_step.annotate_dependency_source_dirs_interaction(
-            interaction,
-            {},
-            Path("/tmp/.upgrade-report"),
-        )
-
-        self.assertIn("依赖源码目录", annotated["question"])
-        self.assertNotIn("dependency_source_dirs", annotated["question"])
-        self.assertIn("dependency_source_dirs", annotated["response_schema"]["properties"])
 
     def test_apply_structured_user_response_resolves_name_selected_targets_without_pending(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3028,259 +2863,13 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertEqual(updated_state["step2"]["input"]["base_branch"], "fresh-base")
             self.assertEqual(updated_state["step3"]["input"]["base_branch"], "fresh-base")
 
-    def test_annotate_dependency_source_dirs_interaction_marks_existing_input(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            project_dir = Path(tmp)
-            dep_repo = project_dir / "dep-repo"
-            module_dir = dep_repo / "demo-lib"
-            (module_dir / "src/main/java").mkdir(parents=True)
-            (dep_repo / ".git").mkdir()
-            (module_dir / "pom.xml").write_text(
-                "<project><modelVersion>4.0.0</modelVersion>"
-                "<groupId>com.example</groupId><artifactId>demo-lib</artifactId><version>1.0.0</version>"
-                "</project>",
-                encoding="utf-8",
-            )
-            interaction = {
-                "step_id": "step4",
-                "reason_code": "step4_git_refs_need_confirmation",
-                "question": "请确认 git refs 后重跑 Step4。",
-                "response_schema": {
-                    "type": "object",
-                    "required": ["action"],
-                    "properties": {
-                        "action": {"type": "string"},
-                        "dependency_source_dirs": {"type": "array"},
-                    },
-                },
-            }
 
-            annotated = run_step.annotate_dependency_source_dirs_interaction(
-                interaction,
-                {"dependency_source_dirs": [str(dep_repo.resolve())]},
-                project_dir / ".upgrade-report",
-            )
 
-            self.assertTrue(annotated["dependency_source_dirs_state"]["provided"])
-            self.assertEqual(annotated["question"], "请确认 git refs 后重跑 Step4。")
-            self.assertIn("仅当现有目录不正确", annotated["response_schema"]["properties"]["dependency_source_dirs"]["description"])
 
-    def test_step5_review_does_not_require_removed_target_source_when_analysis_did_not_need_it(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            report_dir = Path(tmp) / ".upgrade-report"
-            dep_repo = Path(tmp) / "dependency-repo"
-            module = dep_repo / "helper"
-            (module / "src/main/java").mkdir(parents=True)
-            (dep_repo / ".git").mkdir()
-            (module / "pom.xml").write_text(
-                "<project><modelVersion>4.0.0</modelVersion>"
-                "<groupId>com.example</groupId><artifactId>helper</artifactId><version>1</version>"
-                "</project>",
-                encoding="utf-8",
-            )
-            self._write_text(
-                self._api_changes_dir(report_dir) / "all_changed_apis.csv",
-                "coord,new_version,change_type,api_name,symbol_kind\n"
-                "org.slf4j:slf4j-api,-,REMOVED,org.slf4j.Logger,class\n",
-                encoding="utf-8",
-            )
-            self._write_text(
-                self._call_chain_dir(report_dir) / "summary.json",
-                json.dumps({
-                    "reachable": 1,
-                    "uncertain": 0,
-                    "not_analyzed": 0,
-                    "reachable_apis": [{
-                        "coord": "org.slf4j:slf4j-api",
-                        "api": "org.slf4j.Logger",
-                        "reason_code": "BUSINESS_ARTIFACT_BYTECODE_USAGE",
-                    }],
-                }),
-                encoding="utf-8",
-            )
-            interaction = {
-                "step_id": "step5",
-                "question": "请确认 Step5 结果。",
-                "response_schema": {
-                    "type": "object",
-                    "properties": {
-                        "action": {"type": "string"},
-                        "dependency_source_dirs": {"type": "array"},
-                    },
-                },
-            }
 
-            annotated = run_step.annotate_dependency_source_dirs_interaction(
-                interaction,
-                {"dependency_source_dirs": [str(dep_repo.resolve())]},
-                report_dir,
-            )
 
-        self.assertNotIn("仍未覆盖这些目标依赖坐标", annotated["question"])
-        self.assertEqual(annotated["question"], "请确认 Step5 结果。")
 
-    def test_validate_pending_interaction_response_rejects_empty_step5_rerun(self):
-        interaction = {
-            "step_id": "step5",
-            "reason_code": "step5_dependency_source_mapping_missing",
-            "response_schema": {
-                "type": "object",
-                "required": ["action"],
-                "properties": {
-                    "action": {"type": "string"},
-                    "dependency_source_dirs": {"type": "array"},
-                    "allow_degraded": {"type": "boolean"},
-                },
-            },
-        }
 
-        with self.assertRaisesRegex(run_step.StepError, "依赖源码目录"):
-            run_step.validate_pending_interaction_response(
-                interaction,
-                {"action": "rerun_current_step"},
-            )
-
-    def test_validate_pending_interaction_response_accepts_step5_rerun_with_dependency_source_dirs(self):
-        interaction = {
-            "step_id": "step5",
-            "reason_code": "step5_dependency_source_mapping_missing",
-            "response_schema": {
-                "type": "object",
-                "required": ["action"],
-                "properties": {
-                    "action": {"type": "string"},
-                    "dependency_source_dirs": {"type": "array"},
-                    "allow_degraded": {"type": "boolean"},
-                },
-            },
-        }
-
-        run_step.validate_pending_interaction_response(
-            interaction,
-            {
-                "action": "rerun_current_step",
-                "dependency_source_dirs": ["/tmp/dep-repo"],
-            },
-        )
-
-    def test_validate_pending_interaction_response_accepts_step5_rerun_with_allow_degraded(self):
-        interaction = {
-            "step_id": "step5",
-            "reason_code": "step5_dependency_source_mapping_missing",
-            "response_schema": {
-                "type": "object",
-                "required": ["action"],
-                "properties": {
-                    "action": {"type": "string"},
-                    "dependency_source_dirs": {"type": "array"},
-                    "allow_degraded": {"type": "boolean"},
-                },
-            },
-        }
-
-        run_step.validate_pending_interaction_response(
-            interaction,
-            {
-                "action": "rerun_current_step",
-                "allow_degraded": True,
-            },
-        )
-
-    def test_validate_pending_interaction_response_accepts_step5_rerun_with_selected_coords(self):
-        interaction = {
-            "step_id": "step5",
-            "reason_code": "step5_dependency_source_mapping_missing",
-            "response_schema": {
-                "type": "object",
-                "required": ["action"],
-                "properties": {
-                    "action": {"type": "string"},
-                    "dependency_source_dirs": {"type": "array"},
-                    "allow_degraded": {"type": "boolean"},
-                    "step5_selected_coords": {"type": "array"},
-                },
-            },
-            "action_requirements": {
-                "rerun_current_step": {
-                    "at_least_one_of": ["dependency_source_dirs", "allow_degraded"],
-                }
-            },
-        }
-
-        run_step.validate_pending_interaction_response(
-            interaction,
-            {
-                "action": "rerun_current_step",
-                "step5_selected_coords": ["com.example:demo-lib"],
-            },
-        )
-
-    def test_validate_pending_interaction_response_requires_japicmp_confirmation(self):
-        interaction = {
-            "step_id": "step4",
-            "reason_code": "step4_japicmp_missing_need_resolution",
-            "response_schema": {
-                "type": "object",
-                "required": ["action"],
-                "properties": {
-                    "action": {"type": "string"},
-                    "japicmp_jar": {"type": "string"},
-                    # Simulate a stale checkpoint produced before the strict
-                    # parser policy. Validation itself must still reject this
-                    # bypass rather than relying on the schema omission.
-                    "allow_degraded": {"type": "boolean"},
-                },
-            },
-        }
-
-        with self.assertRaises(run_step.StepError):
-            run_step.validate_pending_interaction_response(
-                interaction,
-                {"action": "rerun_current_step"},
-            )
-
-        run_step.validate_pending_interaction_response(
-            interaction,
-            {"action": "rerun_current_step", "japicmp_jar": "/tmp/japicmp.jar"},
-        )
-        with self.assertRaises(run_step.StepError):
-            run_step.validate_pending_interaction_response(
-                interaction,
-                {"action": "rerun_current_step", "allow_degraded": True},
-            )
-
-    def test_validate_pending_interaction_response_requires_tree_sitter_install_confirmation(self):
-        interaction = {
-            "step_id": "step5",
-            "reason_code": "step5_tree_sitter_missing_need_resolution",
-            "response_schema": {
-                "type": "object",
-                "required": ["action"],
-                "properties": {
-                    "action": {"type": "string"},
-                    "tree_sitter_installed": {"type": "boolean"},
-                    # A hand-crafted or stale response cannot re-enable the
-                    # removed parser-degradation path.
-                    "allow_degraded": {"type": "boolean"},
-                },
-            },
-        }
-
-        with self.assertRaises(run_step.StepError):
-            run_step.validate_pending_interaction_response(
-                interaction,
-                {"action": "rerun_current_step"},
-            )
-
-        run_step.validate_pending_interaction_response(
-            interaction,
-            {"action": "rerun_current_step", "tree_sitter_installed": True},
-        )
-        with self.assertRaises(run_step.StepError):
-            run_step.validate_pending_interaction_response(
-                interaction,
-                {"action": "rerun_current_step", "allow_degraded": True},
-            )
 
     def test_build_resume_command_examples_uses_intent_patch_payload(self):
         examples = run_step.build_resume_command_examples(
@@ -3711,15 +3300,11 @@ class RunStepMainStateTest(unittest.TestCase):
                 json.dumps(
                     {
                         "reachable": 1,
-                        "not_impacted": 1,
                         "user_conclusion_summary": {
-                            "confirmed_impact": 1,
                             "probable_impact": 2,
-                            "confirmed_no_impact": 1,
                             "inconclusive": 3,
-                            "input_required": 4,
                         },
-                        "quality_gate": {"inconclusive": 3, "needs_input": 4},
+                        "quality_gate": {"inconclusive": 3},
                         "uncertain_apis": [
                             {
                                 "severity": "P1",
@@ -3773,15 +3358,15 @@ class RunStepMainStateTest(unittest.TestCase):
             )
 
         checklist_text = "\n".join(payload.get("checklist_lines") or [])
-        self.assertIn("需人工复核=3", checklist_text)
-        self.assertIn("缺少输入=4", checklist_text)
+        self.assertIn("仍不确定=3", checklist_text)
+        self.assertNotIn("缺少输入=", checklist_text)
         self.assertIn("not_analyzed（输入不足或分析未完成）=1", checklist_text)
         self.assertIn(
             "not_found_in_static_analysis（当前静态范围未找到路径）=1",
             checklist_text,
         )
-        self.assertIn("需人工复核示例", checklist_text)
-        self.assertIn("缺少依赖源码/构建产物示例", checklist_text)
+        self.assertIn("存在候选证据或边界的示例", checklist_text)
+        self.assertIn("未完成分析示例", checklist_text)
         self.assertNotIn("当前无法确认=", checklist_text)
         self.assertNotIn("当前无法确认示例", checklist_text)
 
@@ -3802,11 +3387,6 @@ class RunStepMainStateTest(unittest.TestCase):
                 source_repo_hints=[],
                 dependency_repo_mappings=[],
                 dependency_git_ref_overrides_json="",
-                japicmp_jar="",
-                step4_git_diff_timeout=None,
-                step4_japicmp_timeout=None,
-                step4_fetch_timeout=None,
-                step5_timeout=None,
                 base_artifact_path="",
                 current_artifact_path="",
                 base_source_project_dir="",
@@ -3818,7 +3398,6 @@ class RunStepMainStateTest(unittest.TestCase):
                 include_test_scope=False,
                 max_depth=None,
                 tool="maven",
-                allow_degraded=False,
                 strict_risk_gate=False,
             )
 
@@ -3845,11 +3424,6 @@ class RunStepMainStateTest(unittest.TestCase):
                 source_repo_hints=[],
                 dependency_repo_mappings=[],
                 dependency_git_ref_overrides_json="",
-                japicmp_jar="",
-                step4_git_diff_timeout=None,
-                step4_japicmp_timeout=None,
-                step4_fetch_timeout=None,
-                step5_timeout=None,
                 base_artifact_path="",
                 current_artifact_path="",
                 base_source_project_dir="",
@@ -3861,7 +3435,6 @@ class RunStepMainStateTest(unittest.TestCase):
                 include_test_scope=False,
                 max_depth=None,
                 tool="maven",
-                allow_degraded=False,
                 strict_risk_gate=False,
             )
 
@@ -3905,11 +3478,6 @@ class RunStepMainStateTest(unittest.TestCase):
                 source_repo_hints=[],
                 dependency_repo_mappings=[],
                 dependency_git_ref_overrides_json="",
-                japicmp_jar="",
-                step4_git_diff_timeout=None,
-                step4_japicmp_timeout=None,
-                step4_fetch_timeout=None,
-                step5_timeout=None,
                 base_artifact_path="",
                 current_artifact_path="",
                 base_source_project_dir="",
@@ -3921,7 +3489,6 @@ class RunStepMainStateTest(unittest.TestCase):
                 include_test_scope=False,
                 max_depth=None,
                 tool="maven",
-                allow_degraded=False,
                 strict_risk_gate=False,
             )
 
@@ -4444,12 +4011,21 @@ class RunStepMainStateTest(unittest.TestCase):
                 {},
                 {"dependency_repo_mappings": [str(dep_repo)]},
             )
+            config = project_dir / "binary.json"
+            config.write_text("{}", encoding="utf-8")
+            run_context["binary_pipeline_config"] = str(config)
             manifest_steps = {"step4": {"gate": "binary_diff"}}
-            captured = {}
+            captured = []
 
             def fake_run_python(script_name, script_args, _cwd, **_kwargs):
-                captured["script_name"] = script_name
-                captured["script_args"] = list(script_args)
+                captured.append((script_name, list(script_args)))
+                if script_name == "binary_pipeline.py":
+                    result_path = Path(script_args[script_args.index("--result-json") + 1])
+                    run_step.write_json(result_path, {
+                        "validation_status": "passed",
+                        "result_generation_identity": "generation-1",
+                        "analysis_context_identity": "context-1",
+                    })
 
             with patch.object(run_step, "validate_run_context_for_step"), \
                  patch.object(run_step, "ensure_exists"), \
@@ -4458,20 +4034,12 @@ class RunStepMainStateTest(unittest.TestCase):
                  patch.object(run_step, "build_interaction_payload", return_value={}):
                 run_step.execute_step("step4", args, manifest_steps, run_context)
 
-        self.assertEqual(captured["script_name"], "s4_jar_compare.py")
-        self.assertNotIn("--dependency-repo-mappings", captured["script_args"])
-        self.assertNotIn("--source-branches", captured["script_args"])
-        self.assertNotIn("--allow-degraded", captured["script_args"])
+        self.assertEqual([item[0] for item in captured], ["binary_pipeline.py", "binary_report.py"])
+        pipeline_args = captured[0][1]
+        self.assertNotIn("--dependency-repo-mappings", pipeline_args)
+        self.assertNotIn("--source-branches", pipeline_args)
+        self.assertNotIn("--allow-degraded", pipeline_args)
 
-    def test_build_run_context_accepts_step5_timeout(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            project_dir = Path(tmp)
-            report_dir = project_dir / ".upgrade-report"
-            args = self._make_default_args(project_dir, report_dir)
-
-            run_context = run_step.build_run_context(args, {"step5_timeout": "900"}, {})
-
-        self.assertEqual(run_context["step5_timeout"], 900)
 
     def test_run_python_has_no_default_timeout(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -4523,95 +4091,7 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertIn("[进度][兼容性线索][运行中]", stderr.getvalue())
         self.assertTrue(any(item.get("phase") == "heartbeat" for item in events))
 
-    def test_step5_heartbeat_uses_reliable_completed_progress(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            report_dir = Path(tmp) / ".upgrade-report"
-            progress_snapshot = (
-                run_step.runtime_observability_dir(report_dir)
-                / run_step.STEP5_PROGRESS_FILE
-            )
-            run_step.write_json(
-                progress_snapshot,
-                {
-                    "schema": "java-upgrade-analyzer.step5-progress.v1",
-                    "step_id": "step5",
-                    "phase": "trace",
-                    "status": "running",
-                    "completed": 2606,
-                    "total": 2953,
-                    "elapsed_sec": 1500.0,
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                },
-            )
-            stderr = io.StringIO()
 
-            def slow_run_cmd(*_args, **_kwargs):
-                time.sleep(0.06)
-                return "", "", 0
-
-            with patch.dict(
-                os.environ,
-                {"JUA_HEARTBEAT_INTERVAL_SECONDS": "0.01"},
-            ), patch.object(
-                run_step,
-                "run_cmd",
-                side_effect=slow_run_cmd,
-            ), patch.object(sys, "stderr", stderr):
-                run_step.run_python(
-                    "s5_call_chain_engine_integrated.py",
-                    [],
-                    tmp,
-                    report_dir=report_dir,
-                )
-
-        self.assertIn("[2606/2953]", stderr.getvalue())
-        self.assertIn("[88.2%]", stderr.getvalue())
-        self.assertIn("预计剩余约", stderr.getvalue())
-
-    def test_step5_heartbeat_omits_eta_for_stale_progress(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            report_dir = Path(tmp) / ".upgrade-report"
-            progress_snapshot = (
-                run_step.runtime_observability_dir(report_dir)
-                / run_step.STEP5_PROGRESS_FILE
-            )
-            run_step.write_json(
-                progress_snapshot,
-                {
-                    "schema": "java-upgrade-analyzer.step5-progress.v1",
-                    "step_id": "step5",
-                    "phase": "trace",
-                    "status": "running",
-                    "completed": 2606,
-                    "total": 2953,
-                    "elapsed_sec": 1500.0,
-                    "updated_at": "2000-01-01T00:00:00+00:00",
-                },
-            )
-            stderr = io.StringIO()
-
-            def slow_run_cmd(*_args, **_kwargs):
-                time.sleep(0.04)
-                return "", "", 0
-
-            with patch.dict(
-                os.environ,
-                {"JUA_HEARTBEAT_INTERVAL_SECONDS": "0.01"},
-            ), patch.object(
-                run_step,
-                "run_cmd",
-                side_effect=slow_run_cmd,
-            ), patch.object(sys, "stderr", stderr):
-                run_step.run_python(
-                    "s5_call_chain_engine_integrated.py",
-                    [],
-                    tmp,
-                    report_dir=report_dir,
-                )
-
-        self.assertIn("[2606/2953]", stderr.getvalue())
-        self.assertIn("无新增完成项", stderr.getvalue())
-        self.assertNotIn("预计剩余约", stderr.getvalue())
 
     def test_keyboard_interrupt_cleans_partial_current_step_and_can_resume_safely(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -4910,7 +4390,7 @@ class RunStepMainStateTest(unittest.TestCase):
                         "api_signature": "()",
                         "confirmed": "true",
                         "severity": "P0",
-                        "source": "japicmp",
+                        "source": "classfile_contract",
                     }
                 )
             manifest_steps = {
@@ -5236,44 +4716,8 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertTrue(updated_context["strict_risk_gate"])
         self.assertTrue(updated_state["step5"]["input"]["strict_risk_gate"])
 
-    def test_execute_step5_does_not_pass_business_inputs_via_cli(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            project_dir = Path(tmp)
-            report_dir = project_dir / ".upgrade-report"
-            report_dir.mkdir(parents=True)
-            self._api_changes_dir(report_dir).mkdir(parents=True)
-            args = self._make_default_args(project_dir, report_dir)
-            run_context = {
-                "source_dirs": [str((project_dir / "src/main/java").resolve())],
-                "source_dirs_status": "provided",
-                "dependency_source_mappings": [f"com.example:demo={str((project_dir / 'dep-src').resolve())}"],
-                "max_depth": 5,
-                "allow_degraded": True,
-                "step5_timeout": None,
-            }
-            manifest_steps = {"step5": {"gate": "call_chain"}}
-            captured = {}
 
-            def fake_run_python(script_name, script_args, _cwd, **_kwargs):
-                captured["script_name"] = script_name
-                captured["script_args"] = list(script_args)
-
-            with patch.object(run_step, "validate_run_context_for_step"), \
-                 patch.object(run_step, "ensure_exists"), \
-                 patch.object(run_step, "run_python", side_effect=fake_run_python), \
-                 patch.object(run_step, "run_gate"), \
-                 patch.object(run_step, "build_interaction_payload", return_value={}), \
-                 patch.object(run_step, "build_run_context", return_value=run_context):
-                run_step.execute_step("step5", args, manifest_steps, run_context)
-
-        self.assertEqual(captured["script_name"], "s5_call_chain_engine_integrated.py")
-        self.assertNotIn("--source-dirs", captured["script_args"])
-        self.assertNotIn("--dependency-source-mappings", captured["script_args"])
-        self.assertNotIn("--max-depth", captured["script_args"])
-        self.assertNotIn("--allow-degraded", captured["script_args"])
-        self.assertIsNone(captured.get("timeout"))
-
-    def test_execute_step5_filters_all_changed_apis_by_selected_targets(self):
+    def test_execute_step5_passes_validated_selected_targets_to_binary_report(self):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
             report_dir = project_dir / ".upgrade-report"
@@ -5294,7 +4738,7 @@ class RunStepMainStateTest(unittest.TestCase):
                         "api_signature": "()",
                         "confirmed": "true",
                         "severity": "P0",
-                        "source": "japicmp",
+                        "source": "classfile_contract",
                     },
                     {
                         "coord": "com.example:core-lib",
@@ -5307,7 +4751,7 @@ class RunStepMainStateTest(unittest.TestCase):
                         "api_signature": "()",
                         "confirmed": "true",
                         "severity": "P0",
-                        "source": "japicmp",
+                        "source": "classfile_contract",
                     },
                     {
                         "coord": "com.example:other-lib",
@@ -5320,44 +4764,39 @@ class RunStepMainStateTest(unittest.TestCase):
                         "api_signature": "()",
                         "confirmed": "true",
                         "severity": "P0",
-                        "source": "japicmp",
+                        "source": "classfile_contract",
                     },
                 ]:
                     writer.writerow(row)
             args = self._make_default_args(project_dir, report_dir)
             run_context = {
-                "source_dirs": [str((project_dir / "src/main/java").resolve())],
-                "source_dirs_status": "provided",
-                "dependency_source_mappings": [],
                 "step5_selected_coords": ["com.example:demo-lib"],
                 "step5_selected_names": ["core-lib"],
-                "step5_timeout": None,
             }
-            manifest_steps = {"step5": {"gate": "call_chain"}}
+            manifest_steps = {"step5": {"gate": "binary_report"}}
             captured = {}
 
             def fake_run_python(script_name, script_args, _cwd, **kwargs):
                 captured["script_name"] = script_name
                 captured["script_args"] = list(script_args)
                 captured["timeout"] = kwargs.get("timeout")
-                selected_path = Path(script_args[script_args.index("--all-changed-apis") + 1])
-                captured["selected_path"] = selected_path
-                with open(selected_path, "r", encoding="utf-8", newline="") as f:
-                    captured["selected_rows"] = list(csv.DictReader(f))
 
             with patch.object(run_step, "validate_run_context_for_step"), \
                  patch.object(run_step, "run_python", side_effect=fake_run_python), \
                  patch.object(run_step, "run_gate"), \
                  patch.object(run_step, "build_interaction_payload", return_value={}), \
-                 patch.object(run_step, "build_run_context", return_value=run_context):
+                patch.object(run_step, "build_run_context", return_value=run_context):
                 run_step.execute_step("step5", args, manifest_steps, run_context)
+            timing_path = report_dir / ".runtime/observability/step5_timing.csv"
+            self.assertTrue(timing_path.read_bytes().startswith(b"\xef\xbb\xbf"))
 
-        self.assertEqual(captured["script_name"], "s5_call_chain_engine_integrated.py")
-        self.assertEqual(captured["selected_path"].name, "selected_all_changed_apis.csv")
+        self.assertEqual(captured["script_name"], "binary_report.py")
         self.assertEqual(
-            {row["coord"] for row in captured["selected_rows"]},
-            {"com.example:demo-lib", "com.example:core-lib"},
+            captured["script_args"].count("--selected-coord"),
+            1,
         )
+        self.assertIn("com.example:demo-lib", captured["script_args"])
+        self.assertIn("core-lib", captured["script_args"])
 
     def test_materialize_step5_rejects_partial_scope_without_targets(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -5414,7 +4853,7 @@ class RunStepMainStateTest(unittest.TestCase):
                         "api_signature": "()",
                         "confirmed": "true",
                         "severity": "P0",
-                        "source": "japicmp",
+                        "source": "classfile_contract",
                     }
                 )
             args = self._make_default_args(project_dir, report_dir)
@@ -5424,7 +4863,7 @@ class RunStepMainStateTest(unittest.TestCase):
                 "dependency_source_mappings": [],
                 "step5_selected_coords": ["com.example:not-found"],
             }
-            manifest_steps = {"step5": {"gate": "call_chain"}}
+            manifest_steps = {"step5": {"gate": "binary_report"}}
 
             with patch.object(run_step, "validate_run_context_for_step"), \
                  patch.object(run_step, "run_gate"), \
@@ -5432,46 +4871,6 @@ class RunStepMainStateTest(unittest.TestCase):
                 with self.assertRaises(run_step.StepError):
                     run_step.execute_step("step5", args, manifest_steps, run_context)
 
-    def test_execute_step5_passes_timeout_to_run_python(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            project_dir = Path(tmp)
-            report_dir = project_dir / ".upgrade-report"
-            report_dir.mkdir(parents=True)
-            self._api_changes_dir(report_dir).mkdir(parents=True)
-            args = SimpleNamespace(
-                project_dir=str(project_dir),
-                report_dir=str(report_dir),
-                source_dirs=None,
-                dependency_source_mappings=[],
-                max_depth=None,
-                step5_timeout=None,
-            )
-            run_context = {
-                "source_dirs": [str((project_dir / "src/main/java").resolve())],
-                "source_dirs_status": "provided",
-                "dependency_source_mappings": [],
-                "max_depth": 5,
-                "allow_degraded": True,
-                "step5_timeout": 900,
-            }
-            manifest_steps = {"step5": {"gate": "call_chain"}}
-            captured = {}
-
-            def fake_run_python(script_name, script_args, _cwd, **kwargs):
-                captured["script_name"] = script_name
-                captured["script_args"] = list(script_args)
-                captured["timeout"] = kwargs.get("timeout")
-
-            with patch.object(run_step, "validate_run_context_for_step"), \
-                 patch.object(run_step, "ensure_exists"), \
-                 patch.object(run_step, "run_python", side_effect=fake_run_python), \
-                 patch.object(run_step, "run_gate"), \
-                 patch.object(run_step, "build_interaction_payload", return_value={}), \
-                 patch.object(run_step, "build_run_context", return_value=run_context):
-                run_step.execute_step("step5", args, manifest_steps, run_context)
-
-        self.assertEqual(captured["script_name"], "s5_call_chain_engine_integrated.py")
-        self.assertEqual(captured["timeout"], 900)
 
     def test_build_run_context_expands_path_only_dependency_repo_mappings(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -5684,23 +5083,33 @@ class RunStepMainStateTest(unittest.TestCase):
                 encoding="utf-8",
             )
             self._write_text(run_step.step2_context_path(report_dir), "{}", encoding="utf-8")
+            config = project_dir / "binary.json"
+            config.write_text("{}", encoding="utf-8")
             args = self._make_default_args(project_dir, report_dir)
             captured = []
 
             def fake_run_python(script_name, script_args, *_args, **_kwargs):
                 captured.append((script_name, list(script_args)))
+                if script_name == "binary_pipeline.py":
+                    result_path = Path(script_args[script_args.index("--result-json") + 1])
+                    run_step.write_json(result_path, {
+                        "validation_status": "passed",
+                        "result_generation_identity": "generation-1",
+                        "analysis_context_identity": "context-1",
+                    })
                 return None
 
             with patch.object(run_step, "run_python", side_effect=fake_run_python):
                 run_step.execute_step(
                     "step4",
                     args,
-                    {"step4": {"gate": "jar_compare"}},
+                    {"step4": {"gate": "binary_generation"}},
                     {
                         "base_branch": "main",
                         "current_branch": "feature/upgrade",
                         "source_dirs": [str(source_dir.resolve())],
                         "source_dirs_status": "provided",
+                        "binary_pipeline_config": str(config),
                         "dependency_git_ref_overrides": [
                             {
                                 "coord": "com.example:demo-lib",
@@ -5711,7 +5120,7 @@ class RunStepMainStateTest(unittest.TestCase):
                     },
                 )
 
-        s4_calls = [item for item in captured if item[0] == "s4_jar_compare.py"]
+        s4_calls = [item for item in captured if item[0] == "binary_pipeline.py"]
         self.assertEqual(len(s4_calls), 1)
         _, script_args = s4_calls[0]
         self.assertNotIn("--dependency-git-ref-overrides-json", script_args)
@@ -5773,53 +5182,6 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertTrue(main_state.exists())
             self.assertTrue(interaction.exists())
 
-    def test_cleanup_step_outputs_preserves_reusable_business_bytecode_index(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            report_dir = Path(tmp)
-            step5_dir = self._call_chain_dir(report_dir)
-            artifact_catalog = self._runtime_cache_dir(report_dir) / run_step.STEP5_ARTIFACT_BYTECODE_CATALOG_FILE
-            artifact_index = self._runtime_cache_dir(report_dir) / run_step.STEP5_ARTIFACT_BYTECODE_INDEX_FILE
-            artifact_bytecode_dir = self._runtime_cache_dir(report_dir) / run_step.STEP5_ARTIFACT_BYTECODE_DIRNAME
-            framework_adapters = self._call_chain_dir(report_dir) / "framework_adapters.json"
-            source_alignment = self._call_chain_dir(report_dir) / "source_artifact_alignment.json"
-            diagnostics = (
-                run_step.runtime_observability_dir(report_dir)
-                / run_step.STEP5_DIAGNOSTICS_FILE
-            )
-            progress_snapshot = (
-                run_step.runtime_observability_dir(report_dir)
-                / run_step.STEP5_PROGRESS_FILE
-            )
-            main_state = self._runtime_state_dir(report_dir) / "main_state.json"
-            interaction = self._runtime_state_dir(report_dir) / "interaction.json"
-            step5_dir.mkdir(parents=True)
-            (step5_dir / "summary.json").write_text("{}", encoding="utf-8")
-            artifact_bytecode_dir.mkdir(parents=True)
-            (artifact_bytecode_dir / "current.jar").write_text("jar\n", encoding="utf-8")
-            artifact_catalog.parent.mkdir(parents=True, exist_ok=True)
-            artifact_catalog.write_text("{}", encoding="utf-8")
-            artifact_index.write_text("{}", encoding="utf-8")
-            framework_adapters.write_text("{}", encoding="utf-8")
-            source_alignment.write_text("{}", encoding="utf-8")
-            diagnostics.parent.mkdir(parents=True, exist_ok=True)
-            diagnostics.write_text("{}\n", encoding="utf-8")
-            progress_snapshot.write_text("{}\n", encoding="utf-8")
-            main_state.parent.mkdir(parents=True, exist_ok=True)
-            main_state.write_text("{}", encoding="utf-8")
-            interaction.write_text("{}", encoding="utf-8")
-
-            run_step.cleanup_step_outputs("step5", report_dir)
-
-            self.assertFalse(step5_dir.exists())
-            self.assertFalse(artifact_bytecode_dir.exists())
-            self.assertFalse(artifact_catalog.exists())
-            self.assertTrue(artifact_index.exists())
-            self.assertFalse(framework_adapters.exists())
-            self.assertFalse(source_alignment.exists())
-            self.assertFalse(diagnostics.exists())
-            self.assertFalse(progress_snapshot.exists())
-            self.assertTrue(main_state.exists())
-            self.assertTrue(interaction.exists())
 
     def test_cleanup_step_outputs_step3_removes_bridge_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -5895,7 +5257,7 @@ class RunStepMainStateTest(unittest.TestCase):
             self._call_chain_dir(report_dir).mkdir()
             (self._call_chain_dir(report_dir) / "summary.json").write_text("{}", encoding="utf-8")
             self._write_text(run_step.s6_findings_path(report_dir), "{}", encoding="utf-8")
-            self._write_text(run_step.s6_report_path(report_dir), "# stale\n", encoding="utf-8")
+            self._write_text(run_step.final_report_path(report_dir), "# stale\n", encoding="utf-8")
 
             captured = {}
 
@@ -5908,7 +5270,7 @@ class RunStepMainStateTest(unittest.TestCase):
                 captured["step4_output_exists"] = self._api_changes_dir(report_dir).exists()
                 captured["step5_output_exists"] = self._call_chain_dir(report_dir).exists()
                 captured["step6_findings_exists"] = run_step.s6_findings_path(report_dir).exists()
-                captured["step6_report_exists"] = run_step.s6_report_path(report_dir).exists()
+                captured["step6_report_exists"] = run_step.final_report_path(report_dir).exists()
                 return None
 
             with patch.object(
@@ -5961,75 +5323,6 @@ class RunStepMainStateTest(unittest.TestCase):
             [str(source_dir.resolve())],
         )
 
-    def test_main_marks_step5_as_awaiting_user_when_script_requests_interaction(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            project_dir = Path(tmp) / "project"
-            project_dir.mkdir(parents=True)
-            report_dir = project_dir / ".upgrade-report"
-            report_dir.mkdir(parents=True)
-            state = run_step.new_main_state(report_dir)
-            state["state"]["current_step"] = "step5"
-            state["state"]["completed_step"] = "step4"
-            run_step.save_main_state(report_dir, state)
-            interaction = {
-                "schema": "java-upgrade-analyzer.interaction.v2",
-                "checkpoint": True,
-                "hard_stop": True,
-                "status": "awaiting_user_input",
-                "kind": "review",
-                "step_id": "step5",
-                "title": "step5 缺少依赖源码映射",
-                "question": "请补充 dependency_source_dirs 后重跑 Step5。",
-                "reason_code": "step5_dependency_source_mapping_missing",
-                "options": [{"id": "rerun_current_step"}],
-                "response_schema": {
-                    "type": "object",
-                    "required": ["action"],
-                    "properties": {
-                        "action": {"type": "string", "enum": ["rerun_current_step"]},
-                        "dependency_source_dirs": {"type": "array"},
-                    },
-                },
-            }
-
-            with patch.object(
-                sys,
-                "argv",
-                [
-                    "run_step.py",
-                    "--step",
-                    "step5",
-                    "--project-dir",
-                    str(project_dir),
-                    "--report-dir",
-                    str(report_dir),
-                ],
-            ), patch.object(
-                run_step,
-                "load_manifest",
-                return_value=({}, {"step5": {"gate": "call_chain"}}),
-            ), patch.object(
-                run_step,
-                "execute_step",
-                side_effect=run_step.StepInteractionRequired(interaction),
-            ):
-                exit_code = run_step.main()
-
-            saved = run_step.load_main_state(report_dir)
-            interaction_exists = (self._runtime_state_dir(report_dir) / "interaction.json").exists()
-
-            self.assertEqual(exit_code, run_step.EXIT_AWAITING_USER)
-            self.assertEqual(saved["state"]["status"], "awaiting_user_input")
-            self.assertEqual(saved["state"]["current_step"], "step5")
-            self.assertEqual(saved["state"]["completed_step"], "step4")
-            self.assertEqual(
-                saved["state"]["pending_interaction"]["reason_code"],
-                "STEP5_DEPENDENCY_SOURCE_MAPPING_MISSING",
-            )
-            pending_properties = saved["state"]["pending_interaction"]["response_schema"]["properties"]
-            self.assertNotIn("step5_selected_coords", pending_properties)
-            self.assertNotIn("step5_selected_names", pending_properties)
-            self.assertTrue(interaction_exists)
 
     def test_main_auto_repairs_missing_step4_prereq_by_restarting_step1(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -6158,7 +5451,7 @@ class RunStepMainStateTest(unittest.TestCase):
             ), patch.object(
                 run_step,
                 "load_manifest",
-                return_value=({}, {"step5": {"gate": "call_chain"}}),
+                return_value=({}, {"step5": {"gate": "binary_report"}}),
             ), patch.object(
                 run_step,
                 "execute_step",
@@ -6213,7 +5506,7 @@ class RunStepMainStateTest(unittest.TestCase):
             )
             self._call_chain_dir(report_dir).mkdir(parents=True, exist_ok=True)
             (self._call_chain_dir(report_dir) / "alerts.csv").write_text("x\n", encoding="utf-8")
-            self._write_text(run_step.s6_report_path(report_dir), "# stale\n", encoding="utf-8")
+            self._write_text(run_step.final_report_path(report_dir), "# stale\n", encoding="utf-8")
             captured = {}
 
             def fake_execute_step(step_id, _args, _manifest_steps, run_context, **_kwargs):
@@ -6221,7 +5514,7 @@ class RunStepMainStateTest(unittest.TestCase):
                 captured["run_context"] = dict(run_context)
                 captured["s4_exists_before_step"] = self._api_changes_dir(report_dir).exists()
                 captured["s5_exists_before_step"] = self._call_chain_dir(report_dir).exists()
-                captured["s6_exists_before_step"] = run_step.s6_report_path(report_dir).exists()
+                captured["s6_exists_before_step"] = run_step.final_report_path(report_dir).exists()
                 return None
 
             with patch.object(
@@ -6249,7 +5542,7 @@ class RunStepMainStateTest(unittest.TestCase):
             ), patch.object(
                 run_step,
                 "load_manifest",
-                return_value=({}, {"step4": {"gate": "jar_compare"}}),
+                return_value=({}, {"step4": {"gate": "binary_generation"}}),
             ), patch.object(
                 run_step,
                 "execute_step",

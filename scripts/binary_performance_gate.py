@@ -568,16 +568,17 @@ def main(argv=None) -> int:
             warm_samples=args.warm_samples,
             include_legacy=not args.skip_legacy,
         )
+        evaluation = None
+        if args.gate:
+            gate = json.loads(Path(args.gate).expanduser().resolve().read_text(encoding="utf-8"))
+            evaluation = evaluate_gate(result, gate)
+            result["gate_evaluation"] = evaluation
         output = Path(args.output).expanduser().resolve()
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(
             json.dumps(result, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
-        evaluation = None
-        if args.gate:
-            gate = json.loads(Path(args.gate).expanduser().resolve().read_text(encoding="utf-8"))
-            evaluation = evaluate_gate(result, gate)
         print(json.dumps({
             "status": result["status"],
             "dataset_identity": result["measurement_protocol"]["dataset_identity"],

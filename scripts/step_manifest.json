@@ -1,18 +1,7 @@
 {
-  "version": "1.1",
+  "version": "2.0",
   "auto_run_until_checkpoint": true,
   "runtime_controls": {
-    "engine_mode": {
-      "type": "string",
-      "enum": [
-        "legacy",
-        "shadow",
-        "binary_strict",
-        "binary_with_legacy_fallback"
-      ],
-      "default": "legacy",
-      "description": "固定整代分析引擎。binary_strict 失败关闭；binary_with_legacy_fallback 只允许丢弃失败 binary generation 后整代 legacy 回退，禁止逐边混用。"
-    },
     "strict_risk_gate": {
       "type": "boolean",
       "default": false,
@@ -34,7 +23,6 @@
           "action"
         ],
         "missing_inputs": [],
-        "fallback_inputs": [],
         "input_modes": [],
         "input_normalization": {
           "enabled": true,
@@ -134,7 +122,6 @@
           "action"
         ],
         "missing_inputs": [],
-        "fallback_inputs": [],
         "input_modes": [],
         "input_normalization": {
           "enabled": true,
@@ -270,13 +257,12 @@
       "title": "依赖 API 变化",
       "requires_scope_confirmation": true,
       "scope_confirmation_min_candidates": 2,
-      "script": "s4_jar_compare.py",
-      "gate": "jar_compare",
+      "script": "binary_pipeline.py",
+      "gate": "binary_generation",
       "interaction": {
         "type": "review",
         "status": "awaiting_user_input",
         "missing_inputs": [],
-        "fallback_inputs": [],
         "input_modes": [],
         "input_normalization": {
           "enabled": true,
@@ -286,7 +272,7 @@
             "cancel"
           ]
         },
-        "question": "请选择系统触达分析范围：默认全量分析全部变化依赖，以保持结论覆盖完整；如果你明确需要控制耗时，也可以选择部分依赖，但最终结论只适用于所选范围。",
+    "question": "请选择系统触达结果的分析范围和复核范围：默认发布全部变化依赖，以保持结论覆盖完整；如果你只关心部分依赖，也可以选择部分范围，但最终报告只适用于所选范围。",
         "response_schema": {
           "type": "object",
           "required": [
@@ -323,7 +309,7 @@
           {
             "id": "continue",
             "label": "选择分析范围（默认全量）",
-            "description": "回复“全量分析”即可分析全部依赖；如需部分分析，直接回复要分析的依赖名称或完整坐标。未展示的依赖可从完整依赖选择清单的“依赖包”列获取。"
+            "description": "回复“全量分析”即可发布全部依赖的触达结果；如需部分复核，直接回复依赖名称或完整坐标。未展示的依赖可从完整依赖选择清单的“依赖包”列获取。"
           },
           {
             "id": "cancel",
@@ -348,16 +334,17 @@
         "evidence/context/context.json"
       ],
       "outputs": [
+        ".runtime/binary_authority/active_binary_generation.json",
         "evidence/api_changes/all_changed_apis.csv",
         "evidence/api_changes/changed_dependencies.csv",
         "evidence/api_changes/changed_dependencies.md",
         "evidence/api_changes/business_bytecode_changed_api_refs.csv",
         "evidence/api_changes/business_bytecode_priority_evidence.json",
-        "evidence/api_changes/git_ref_matches.txt",
-        "evidence/api_changes/git_ref_matches.json"
+        "evidence/api_changes/review.md",
+        "evidence/api_changes/s4_per_dependency/"
       ],
       "notes": [
-        "本步骤输出 all_changed_apis.csv，并基于业务最终制品的直接字节码引用证据按依赖坐标生成 Top 10 影响复核顺序；存在至少两个候选依赖时由用户选择 Step5 全量或部分分析范围，0/1 个候选时直接继续。范围选择会影响覆盖率、耗时和最终结论边界。"
+        "binary-first 是唯一分析权威。本步骤仍发布 all_changed_apis.csv 与按依赖包分组的人工复核材料；内部二进制 generation 仅位于 .runtime/binary_authority/。"
       ]
     },
     {
@@ -365,34 +352,33 @@
       "order": 5,
       "title": "系统触达证据",
       "auto_continue_on_success": true,
-      "script": "s5_call_chain_engine_integrated.py",
-      "gate": "call_chain",
+      "script": "binary_report.py",
+      "gate": "binary_report",
       "interaction": null,
       "depends_on": [
         "step4"
       ],
       "inputs": [
+        ".runtime/binary_authority/active_binary_generation.json",
         "evidence/api_changes/changed_dependencies.csv",
         "evidence/api_changes/all_changed_apis.csv"
       ],
       "outputs": [
-        "evidence/call_chain/",
-        ".runtime/indexes/s5_query_index.json",
-        ".runtime/cache/s5_artifact_bytecode/",
-        ".runtime/cache/s5_artifact_bytecode_catalog.json",
-        ".runtime/cache/s5_artifact_bytecode_index.json",
-        "evidence/call_chain/framework_adapters.json",
-        "evidence/call_chain/source_artifact_alignment.json"
+        "evidence/call_chain/summary.json",
+        "evidence/call_chain/summary.md",
+        "evidence/call_chain/alerts.csv",
+        "evidence/call_chain/by_api/",
+        ".runtime/indexes/s5_query_index.json"
       ],
       "notes": [
-        "系统触达分析默认遍历 all_changed_apis.csv；若用户通过 selected_targets 提供 changed_dependencies.md 中的依赖包完整坐标，则只分析对应依赖包。"
+        "系统触达结果直接消费同一个已独立验证的 binary generation；全量/部分范围仍按 changed_dependencies.md 中的依赖包坐标发布。"
       ]
     },
     {
       "id": "step6",
       "order": 6,
       "title": "分析报告",
-      "script": "s6_report.py",
+      "script": "binary_report.py",
       "interaction": null,
       "depends_on": [
         "step5"
@@ -404,7 +390,9 @@
         ".runtime/findings/s6_findings.json",
         "deliverables/report.md",
         "deliverables/all-affected-dependencies.md",
+        "deliverables/all-affected-dependencies.csv",
         "deliverables/all-impact-details.md",
+        "deliverables/all-impact-details.csv",
         "deliverables/analysis-scope.md"
       ]
     }

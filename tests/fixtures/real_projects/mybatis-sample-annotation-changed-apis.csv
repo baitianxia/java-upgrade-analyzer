@@ -1,4 +1,0 @@
-coord,old_version,new_version,change_type,api_name,api_simple,symbol_kind,api_signature,confirmed,severity,source
-org.mybatis:mybatis,3.5.19,-,REMOVED,org.apache.ibatis.binding.MapperProxy.invoke,invoke,method,"(java.lang.Object,java.lang.reflect.Method,java.lang.Object[])",true,P1,independent_reviewed_mybatis_proxy_inventory
-org.mybatis:mybatis,3.5.19,-,REMOVED,org.apache.ibatis.binding.MapperMethod.execute,execute,method,"(org.apache.ibatis.session.SqlSession,java.lang.Object[])",true,P1,independent_reviewed_mybatis_proxy_inventory
-org.mybatis:mybatis,3.5.19,-,REMOVED,org.apache.ibatis.session.SqlSession.selectOne,selectOne,method,"(java.lang.String,java.lang.Object)",true,P1,independent_reviewed_mybatis_proxy_inventory

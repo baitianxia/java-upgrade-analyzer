@@ -214,6 +214,7 @@ class BinaryDecisionEngine:
         target_identity: str = "",
         coverage_gaps: Iterable[str] = (),
         evidence: Mapping[str, Any] | None = None,
+        dependency_artifacts: Iterable[Mapping[str, Any]] = (),
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "reason_code": reason_code,
@@ -222,6 +223,7 @@ class BinaryDecisionEngine:
             "decision_policy_version": "binary-runtime-decision-v1",
             "coverage_gaps": sorted(set(coverage_gaps)),
             "evidence": dict(evidence or {}),
+            "dependency_artifacts": [dict(item) for item in dependency_artifacts],
         }
         if target_identity:
             payload["analysis_target_identity"] = target_identity
@@ -257,6 +259,81 @@ class BinaryDecisionEngine:
         else:
             self.excluded.append(record)
         return record
+
+    def _artifact_reference(
+        self,
+        side: str,
+        artifact_identity: str,
+        *,
+        lineage: str = "",
+    ) -> dict[str, Any] | None:
+        if not artifact_identity or artifact_identity.startswith("ABSENT:"):
+            return None
+        if artifact_identity.startswith("platform-image:"):
+            module_name = artifact_identity.rsplit(":", 1)[-1]
+            return {
+                "side": side,
+                "logical_dependency_lineage": "JDK_PLATFORM",
+                "artifact_instance_identity": artifact_identity,
+                "coord": f"JDK_PLATFORM:{module_name}",
+                "runtime_path_kind": "platform_module",
+                "runtime_classpath_index": -1,
+                "runtime_code_source_origin_identity": artifact_identity,
+            }
+        store = self.base_store if side == "base" else self.current_store
+        rows = store.rows(
+            "artifact_instances",
+            where="artifact_instance_identity=?",
+            parameters=(artifact_identity,),
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        return {
+            "side": side,
+            "logical_dependency_lineage": lineage,
+            "artifact_instance_identity": artifact_identity,
+            "coord": str(row.get("coord") or ""),
+            "runtime_path_kind": str(row.get("runtime_path_kind") or ""),
+            "runtime_classpath_index": row.get("runtime_classpath_index"),
+            "runtime_code_source_origin_identity": str(
+                row.get("runtime_code_source_origin_identity") or ""
+            ),
+        }
+
+    def _dependency_artifacts(
+        self,
+        base_identity: str = "",
+        current_identity: str = "",
+        *,
+        lineage: str = "",
+    ) -> tuple[dict[str, Any], ...]:
+        return tuple(
+            item for item in (
+                self._artifact_reference("base", base_identity, lineage=lineage),
+                self._artifact_reference("current", current_identity, lineage=lineage),
+            )
+            if item is not None
+        )
+
+    def _resource_dependency_artifacts(
+        self,
+        base: Mapping[str, Any] | None,
+        current: Mapping[str, Any] | None,
+    ) -> tuple[dict[str, Any], ...]:
+        output = []
+        seen = set()
+        for side, record in (("base", base), ("current", current)):
+            for selected in (record or {}).get("selected_resources") or ():
+                artifact_identity = str(selected.get("artifact_instance_identity") or "")
+                reference = self._artifact_reference(side, artifact_identity)
+                if reference is None:
+                    continue
+                key = (reference["side"], reference["artifact_instance_identity"])
+                if key not in seen:
+                    seen.add(key)
+                    output.append(reference)
+        return tuple(output)
 
     def _assess(self, decision: Mapping[str, Any]) -> None:
         fact_kind = decision["fact_kind"]
@@ -369,10 +446,16 @@ class BinaryDecisionEngine:
         for artifact_diff in self.artifact_diffs:
             base_artifact = artifact_diff["base_artifact_instance_identity"]
             current_artifact = artifact_diff["current_artifact_instance_identity"]
+            lineage = str(artifact_diff.get("logical_dependency_lineage") or "")
+            dependency_artifacts = self._dependency_artifacts(
+                base_artifact, current_artifact, lineage=lineage
+            )
             comparison_complete = artifact_diff.get("comparison_coverage_status") == "complete"
             for entry in artifact_diff.get("entry_deltas") or ():
                 if entry["entry_scope"].get("entry_kind") != "class":
-                    self._process_resource_delta(entry, comparison_complete)
+                    self._process_resource_delta(
+                        entry, comparison_complete, dependency_artifacts
+                    )
                     continue
                 class_name = self._class_name(entry["entry_scope"]["entry_name"])
                 keys = sorted({
@@ -432,6 +515,7 @@ class BinaryDecisionEngine:
                                 fact_kind=fact_kind,
                                 fact_scope=scope,
                                 evidence={"base_provider": base_provider, "current_provider": current_provider},
+                                dependency_artifacts=dependency_artifacts,
                             )
                             continue
                         gaps = []
@@ -476,10 +560,20 @@ class BinaryDecisionEngine:
                                 "upstream_artifact_observed_delta_identity": entry.get("observed_delta_identity"),
                                 "base_provider_binding_identity": (base_provider or {}).get("provider_binding_identity"),
                                 "current_provider_binding_identity": (current_provider or {}).get("provider_binding_identity"),
+                                "base_member_fingerprint": member_delta.get("base_member_fingerprint"),
+                                "current_member_fingerprint": member_delta.get("current_member_fingerprint"),
+                                "base_contract": member_delta.get("base_contract"),
+                                "current_contract": member_delta.get("current_contract"),
                             },
+                            dependency_artifacts=dependency_artifacts,
                         )
 
-    def _process_resource_delta(self, entry: Mapping[str, Any], comparison_complete: bool) -> None:
+    def _process_resource_delta(
+        self,
+        entry: Mapping[str, Any],
+        comparison_complete: bool,
+        dependency_artifacts: Iterable[Mapping[str, Any]],
+    ) -> None:
         scope = dict(entry["entry_scope"])
         observed = observed_delta_identity(
             delta_source_kind="resource_selection",
@@ -501,6 +595,7 @@ class BinaryDecisionEngine:
                 ),
                 "runtime_authority": "resource_selection_delta",
             },
+            dependency_artifacts=dependency_artifacts,
         )
 
     def _process_resource_outcome_deltas(self) -> None:
@@ -561,6 +656,7 @@ class BinaryDecisionEngine:
                 fact_scope=scope,
                 coverage_gaps=gaps,
                 evidence={"base_selection": base, "current_selection": current},
+                dependency_artifacts=self._resource_dependency_artifacts(base, current),
             )
 
     def _process_runtime_outcome_deltas(self) -> None:
@@ -607,6 +703,10 @@ class BinaryDecisionEngine:
                     target_identity=target,
                     coverage_gaps=gaps,
                     evidence={"base_provider": base, "current_provider": current},
+                    dependency_artifacts=self._dependency_artifacts(
+                        str((base or {}).get("selected_artifact_instance_identity") or ""),
+                        str((current or {}).get("selected_artifact_instance_identity") or ""),
+                    ),
                 )
 
             base_definition = self._base_definitions.get((realm, class_name))
@@ -636,6 +736,10 @@ class BinaryDecisionEngine:
                 target_identity=target,
                 coverage_gaps=gaps if gaps else (() if definite else ("definition_outcome_not_definite",)),
                 evidence={"base_definition": base_definition, "current_definition": current_definition},
+                dependency_artifacts=self._dependency_artifacts(
+                    str((base or {}).get("selected_artifact_instance_identity") or ""),
+                    str((current or {}).get("selected_artifact_instance_identity") or ""),
+                ),
             )
         self._process_resource_outcome_deltas()
 

@@ -82,7 +82,7 @@ Claude Code 会负责：
 | 升级前后来源 | 必需 | 通常是 base/current 分支，也可以是已有 base/current JAR/WAR |
 | 依赖源码路径或 Git 地址 | 可选但推荐 | 依赖包源码仓库本地路径或 HTTPS/SSH Git 地址，用于提升 API 行为变更和跨依赖调用链分析能力 |
 | 特殊 JDK | 可选 | 如果 base/current 需要不同 JDK 构建，请说明 |
-| Binary runtime 快照 | 启用 binary 权威时必需 | 按 `binary_pipeline_config.example.json` 固定两侧完整 JDK、最终制品、有序 classpath、loader/resource policy 和业务入口 |
+| Binary runtime 快照 | 必需 | 按 `binary_pipeline_config.example.json` 固定两侧完整 JDK、最终制品、有序 classpath、loader/resource policy 和业务入口；这是唯一分析引擎的运行时事实输入 |
 
 说明：
 
@@ -107,20 +107,19 @@ Claude Code 会负责：
 - 如果只表达“想分析什么”，但没有提供 base/current 来源或目标模块，Claude Code 会继续追问，不会猜测执行。
 - 如果只是查询某个方法调用链，则需要当前工程已经跑完 Step5 并生成查询索引。
 
-### Binary-first 模式
+### Binary-first 分析引擎
 
-默认执行模式仍是 `legacy`。需要以最终制品 JVM 事实作为正式权威时，在运行配置中同时设置：
+Step4–6 只使用 binary-first 引擎，没有 legacy、shadow、灰度或 fallback 模式。运行配置必须设置：
 
 ```json
 {
-  "engine_mode": "binary_strict",
   "binary_pipeline_config": "/abs/path/to/binary-pipeline-input.json"
 }
 ```
 
-输入模板见 `binary_pipeline_config.example.json`，完整运行配置见 `runtime_config.example.json`。`binary_strict` 在身份、支持边界、独立 Oracle 或 sidecar 完整性失败时停止，并保留上一份完整结果；`binary_with_legacy_fallback` 仅允许整代失败后从 Step4 重建纯 legacy 结果，不会混合 binary/legacy 的事实或边。`shadow` 保持 legacy 权威，同时在独立目录运行完整 binary 对账。
+输入模板见 `binary_pipeline_config.example.json`，完整运行配置见 `runtime_config.example.json`。身份、支持边界、独立 Oracle 或 sidecar 完整性任一失败时，当前 generation 失败关闭并保留上一份已验证结果；系统不会调用旧引擎补算，也不会逐 API、逐事实或逐边降级。
 
-binary 输出使用 `reachability_status`、`static_linkage_status`、`impact_conclusion`、`runtime_verification_status` 四个独立维度。静态分析最多给出 `probable_impact`，不会伪造 `confirmed_impact`、`confirmed_no_impact` 或已经执行的运行验证。详细文件和复核顺序见 `docs/user/outputs.md`。
+binary 输出使用 `reachability_status`、`static_linkage_status`、`impact_conclusion`、`runtime_verification_status` 四个独立维度。静态分析最多给出 `probable_impact`，不会伪造 `confirmed_impact`、`confirmed_no_impact` 或已经执行的运行验证。人工复核先看 `evidence/api_changes/changed_dependencies.md`，再进入 `s4_per_dependency/` 的依赖明细；批量筛选使用 `all_changed_apis.csv`。详细文件和复核顺序见 `docs/user/outputs.md`。
 
 ---
 
@@ -142,7 +141,7 @@ binary 输出使用 `reachability_status`、`static_linkage_status`、`impact_co
 
 正常流程中的确认顺序是：先确认分析对象与实际依赖范围；升级上下文只有在关键事实缺失时才确认；依赖 API 变化完成后确认全量或部分系统触达范围。兼容性线索扫描、证据完整的升级上下文、系统触达分析和最终报告都会自动衔接。
 
-Step4 识别出至少两个可分析依赖后会让你选择 Step5 的分析范围：全量分析覆盖更完整，部分分析可以降低耗时，但最终结论只适用于所选范围。范围卡会展示依赖数、变化 API 数，以及按业务最终制品直接字节码引用证据排序的 Top 10 依赖和理由。删除或签名变化不会获得额外权重，依赖源码是否可用只作为分析条件展示。0 个或 1 个候选不存在实际范围取舍，系统会直接继续。确认范围后，系统会连续执行 Step5 和 Step6，不再要求点击“继续”；Step5 仍会把标准五态摘要写成非阻塞 `user_decision_card`，供 Agent 直接转述。超时、依赖源码缺失等内部证据故障会自动记录覆盖缺口并生成受限结论，不会混入范围选择要求用户修复。
+Step4 识别出至少两个可分析依赖后会让你选择 Step5 的分析范围：全量分析覆盖更完整，部分分析可以降低耗时，但最终结论只适用于所选范围。范围卡会展示依赖数、变化 API 数，以及按业务最终制品直接字节码引用证据排序的 Top 10 依赖和理由。删除或签名变化不会获得额外权重，依赖源码是否可用只作为解释条件展示。0 个或 1 个候选不存在实际范围取舍，系统会直接继续。确认范围后，系统会连续执行 Step5 和 Step6，不再要求点击“继续”；Step5 会把 binary-first 的四态摘要写成非阻塞 `user_decision_card`，供 Agent 直接转述。内部证据故障由系统自动重试或失败关闭，不会混入范围选择要求用户批准降级。
 
 你只需要用自然语言回答即可，例如：
 
@@ -292,16 +291,7 @@ Step6 已经生成了，但我想补充依赖源码后，从 Step5 重新分析�
 | 3 | `.upgrade-report/deliverables/all-impact-details.md` | 查看全部变化 API 和完整调用关系 |
 | 4 | `.upgrade-report/evidence/call_chain/alerts.csv` | 核对一行一条的原始分析记录 |
 
-如果 `alerts.csv` 很大，Skill 会额外生成按状态拆分的阅读视图：
-
-```text
-.upgrade-report/evidence/call_chain/alerts_reachable.csv
-.upgrade-report/evidence/call_chain/alerts_uncertain.csv
-.upgrade-report/evidence/call_chain/alerts_not_found_in_static_analysis.csv
-.upgrade-report/evidence/call_chain/alerts_not_analyzed.csv
-```
-
-这些拆分文件只是方便阅读；完整主文件仍然是：
+完整主文件是：
 
 ```text
 .upgrade-report/evidence/call_chain/alerts.csv
@@ -311,8 +301,7 @@ Step6 已经生成了，但我想补充依赖源码后，从 Step5 重新分析�
 
 | 状态 | 含义 |
 |---|---|
-| `reachable` | 已找到调用链并触达业务代码，属于确认影响 |
-| `not_impacted` | 直接制品证据证明该变更 API 仍由当前运行时依赖以完全相同的类字节码提供；仅证明该 API 未实际消失，不代表被删除 JAR 的资源、SPI 或其他非 API 内容没有影响 |
+| `reachable` | 已找到从声明入口到变化 API 的静态调用路径；表示静态触达，不等于已经通过运行测试确认影响 |
 | `uncertain` | 已有候选证据，或系统已识别出阻止确定结论的具体静态分析边界，需要按优先级复核 |
 | `not_found_in_static_analysis` | 静态分析执行过，但当前范围没有找到引用路径且没有候选路径；不等于确定无影响，也不能视为安全 |
 | `not_analyzed` | 输入缺失或工具能力不足，无法完成有效分析 |
@@ -367,7 +356,7 @@ Step6 已经生成了，但我想补充依赖源码后，从 Step5 重新分析�
 
 可以，但准确性会下降。
 
-没有依赖源码时，Skill 仍会尽量通过业务源码、业务字节码、运行时依赖 JAR 字节码和框架适配器追踪影响。但依赖内部行为变化、跨依赖源码调用链、部分反射/配置关系可能只能给出 `uncertain` 或 `not_analyzed`。
+可以。正式变化和调用图来自 base/current 最终制品、运行时依赖与目标 JDK 字节码，不依赖源码才能成立。缺少依赖源码只会减少名称、声明位置和行为解释等 source overlay 信息；无法由当前 binary support manifest 建模的动态机制仍会进入 `uncertain`、`not_analyzed` 或失败关闭，而不会要求用户批准旧逻辑降级。
 
 ### Step4 / Step5 很慢怎么办？
 
@@ -377,16 +366,7 @@ Step4 慢时，让 Claude Code 先查看：
 .upgrade-report/.runtime/observability/step4_timing.csv
 ```
 
-重点关注：
-
-- `artifact_resolve`
-- `dependency.gitdiff`
-- `dependency.japicmp`
-- `dependency.removed_jar_export`
-- `dependency.changed_classes`
-- `write.*`
-
-这些指标可以判断耗时主要来自 JAR 定位/解压、源码 diff、JApiCmp、删除依赖符号导出、类 hash 或输出汇总。
+重点关注 artifact inventory、ASM fact extraction、runtime reconciliation、decision/projection、batch trace、Oracle validation 和 publication 阶段。结合 archive/class/edge 数、缓存命中率与峰值 RSS，可以区分制品解析、运行时裁决、图遍历、独立验证或报告发布的瓶颈。
 
 Step5 慢时，让 Claude Code 查看：
 
@@ -394,40 +374,14 @@ Step5 慢时，让 Claude Code 查看：
 .upgrade-report/.runtime/observability/step5_timing.csv
 ```
 
-其中 `memory.*_process_tree_peak_rss_mb` 是 Python、`javap`、`jdeps` 等全部后代进程的
-瞬时 RSS 总和峰值；`memory.*_external_process_count_<tool>` 和
-`memory.*_external_process_peak_concurrency`、`memory.*_temporary_file_peak_bytes` 和
-`memory.*_external_process_wall_sec` 用于区分进程启动、临时文件与 Python 建图压力。需要限制内存时，
-可设置 `JUA_STEP5_PROCESS_TREE_SOFT_RSS_MB`（告警）或
-`JUA_STEP5_PROCESS_TREE_HARD_RSS_MB`（在阶段边界失败关闭），单位均为 MiB。
+不要只看总耗时猜瓶颈。运行时闭包很大、class/edge 很多或独立 Oracle 扫描量很大时，Step4 的整代构建会明显变慢；Step5 只是发布同一 generation 的选择范围和查询视图，不会重新扫描制品。
 
-重点关注：
+### Binary-first 需要哪些分析工具？
 
-- `business_bytecode`
-- `framework_adapter_merge`
-- `business_graph`
-- `trace`
-- `bytecode_expand`
-- `main.indirect_usage_*`
+生产事实解析使用版本和 SHA 固定的 ASM helper；独立 Oracle 使用目标 JDK 中的 `java`、`javac`、`javap`、`jmods` 和 `lib/modules` 做交叉验证。缺失完整目标 JDK、helper 完整性不符或 Oracle 无法完成时，generation 失败关闭，不会安装或调用 JApiCmp 旧引擎补算。
 
-不要只看总耗时猜瓶颈。运行时依赖 JAR 很多、变更 API 很多、依赖间调用链很深时，Step5 会明显变慢。
-
-### 没安装 japicmp 会怎样？
-
-Step4 需要 JApiCmp 做 JAR API 对比。
-
-如果缺失，Skill 会先自动尝试安装 JApiCmp。自动安装失败时，本次执行会记录为系统环境阻塞，不会生成一项让用户决定如何处理的业务确认；安装完成前也不会继续生成不完整的 API 结论。
-
-不安装 JApiCmp 的后果是：二进制 API 对比证据不完整，可能漏掉删除方法、签名变化、字段变化、源码重编译不兼容等风险。
-
-### tree-sitter 缺失会中断吗？
-
-默认会按系统环境错误阻断，不会生成用户确认，也不会静默降级。
-
-最低运行要求为 CPython 3.10；当前 CI 已验证 3.12.x、3.13.x 和 3.14.x。使用其他满足最低要求的小版本时，预检会明确提示“尚未进入 CI 验证矩阵”，并在固定依赖版本及模块导入检查通过后继续，不会把“未经验证”误报成“不兼容”。在 Skill 根目录显式执行 `python3 scripts/bootstrap_runtime.py` 安装固定版本的 `tree-sitter` 与 `tree-sitter-java`。离线环境可增加 `--wheel-dir /abs/path/to/wheels`，安装过程会禁止访问包索引。分析运行时不会联网安装；Python 低于最低版本、依赖缺失、版本不符或加载失败时会在分析前明确停止，安装完成前不会使用增强正则继续分析。
-
-不安装 tree-sitter 的后果是：Java AST 主链路不可用，源码调用链、重载签名、lambda、构造器、方法引用、局部变量类型传播等识别能力会下降。
+tree-sitter 只服务可选 source overlay 的源码解释，不是 executable edge 或二进制变化的权威来源。覆盖层不可用会留下明确解释缺口；它不能改变二进制 fact、依赖身份或静态触达路径。
 
 ### Kotlin 与 KTS 的结论边界是什么？
 
-当前 Kotlin/KTS 是 partial capability：工具会收集 `.kt`、`.kts` 并用增强正则提供候选线索，但不会把它宣称为 Kotlin 编译器级语义。只要与目标 API 相关的 Kotlin/KTS 文件进入当前最终制品闭集，静态未命中和 `not_impacted` 捷径都会失败关闭为 `PARTIAL_LANGUAGE_ANALYSIS`。生产与测试代码依据 `src/<sourceSet>/...` 分类，生产类名包含 `Test` 不会被误判为测试代码。
+Kotlin/KTS 是否可分析由 binary support manifest、最终 classfile 和 RuntimeProfile 决定。源码覆盖层不会把增强正则结果提升为正式调用边；未知 inline 或未注册语言语义进入 `uncertain`、`not_analyzed` 或 generation failure，不能把静态未命中解释为安全。

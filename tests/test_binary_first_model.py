@@ -296,14 +296,14 @@ class BindingDecisionAndSnapshotTest(unittest.TestCase):
             for layer in ActiveSnapshot.VALID_LAYERS
         }
         generation = ResultGeneration(
-            "context-1", "shadow", snapshots, "trace-set-1",
+            "context-1", snapshots, "trace-set-1",
             {"binary_facts": "content-sha-1"}, {"diff": "policy-1"},
         )
         self.assertTrue(generation.identity)
 
         with self.assertRaises(BinaryFirstContractError) as error:
             ResultGeneration(
-                "context-1", "shadow", {"decision": snapshots["decision"]},
+                "context-1", {"decision": snapshots["decision"]},
                 "trace-set-1", {}, {},
             )
         self.assertEqual(error.exception.reason_code, "RESULT_GENERATION_SNAPSHOT_SET_INVALID")

@@ -1,14 +1,17 @@
+import json
 import shutil
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR / "scripts"))
 
 import binary_asm_helper  # noqa: E402
+import binary_performance_gate  # noqa: E402
 from binary_performance_gate import evaluate_gate, run_benchmark  # noqa: E402
 
 
@@ -71,6 +74,19 @@ class BinaryPerformanceGateTest(unittest.TestCase):
         # The small unit fixture intentionally skips the legacy comparator;
         # evaluation must fail rather than interpreting missing relative data as pass.
         self.assertEqual(evaluate_gate(result, gate)["status"], "failed")
+
+        with tempfile.TemporaryDirectory() as output_tmp:
+            output = Path(output_tmp) / "result.json"
+            gate_path = Path(output_tmp) / "gate.json"
+            gate_path.write_text(json.dumps(gate), encoding="utf-8")
+            with patch.object(binary_performance_gate, "run_benchmark", return_value=result):
+                returncode = binary_performance_gate.main([
+                    "--output", str(output),
+                    "--gate", str(gate_path),
+                ])
+            persisted = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(returncode, 1)
+        self.assertEqual(persisted["gate_evaluation"]["status"], "failed")
 
 
 if __name__ == "__main__":

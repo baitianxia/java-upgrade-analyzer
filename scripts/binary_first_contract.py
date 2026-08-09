@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Versioned contracts for the binary-first migration.
+"""Versioned contracts for the binary-first analysis engine.
 
 This module deliberately contains no graph-building or change-detection logic.
-It freezes the identities and truth-table boundaries that shadow components can
-use without accidentally changing the legacy authoritative result set.
+It freezes identities and truth-table boundaries for the single authoritative
+binary-first pipeline.
 """
 
 from __future__ import annotations
@@ -13,14 +13,6 @@ import json
 import re
 from collections.abc import Mapping
 
-
-ENGINE_MODES = (
-    "legacy",
-    "shadow",
-    "binary_strict",
-    "binary_with_legacy_fallback",
-)
-IMPLEMENTED_ENGINE_MODES = frozenset(ENGINE_MODES)
 
 PHASE_ORDER = (
     "step4a_artifact_local_diff",
@@ -51,26 +43,6 @@ class BinaryFirstContractError(ValueError):
     def __init__(self, reason_code, message):
         super().__init__(message)
         self.reason_code = str(reason_code or "BINARY_FIRST_CONTRACT_VIOLATION")
-
-
-def normalize_engine_mode(value, *, default="legacy"):
-    mode = str(value or default).strip().lower()
-    if mode not in ENGINE_MODES:
-        raise BinaryFirstContractError(
-            "BINARY_ENGINE_MODE_INVALID",
-            f"engine_mode must be one of {', '.join(ENGINE_MODES)}; got {mode or '<empty>'}",
-        )
-    return mode
-
-
-def require_implemented_engine_mode(value):
-    mode = normalize_engine_mode(value)
-    if mode not in IMPLEMENTED_ENGINE_MODES:
-        raise BinaryFirstContractError(
-            "BINARY_ENGINE_MODE_NOT_IMPLEMENTED",
-            f"engine_mode={mode} is not implemented",
-        )
-    return mode
 
 
 def _canonical_value(value):
@@ -481,11 +453,9 @@ def validate_phase_manifest(records):
 
 __all__ = [
     "BinaryFirstContractError",
-    "ENGINE_MODES",
     "FORMAL_IMPACT_CONCLUSIONS",
     "FORMAL_REACHABILITY_STATUSES",
     "FORMAL_RUNTIME_VERIFICATION_STATUSES",
-    "IMPLEMENTED_ENGINE_MODES",
     "PHASE_ORDER",
     "analysis_context_identity",
     "artifact_content_identity",
@@ -494,10 +464,8 @@ __all__ = [
     "derive_formal_result_state",
     "derive_path_set_complete",
     "disposition_obligation_identity",
-    "normalize_engine_mode",
     "observed_delta_identity",
     "projection_obligation_key",
-    "require_implemented_engine_mode",
     "validate_formal_result_state",
     "validate_phase_manifest",
     "validate_projection_assessment",

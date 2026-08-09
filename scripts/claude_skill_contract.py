@@ -26,6 +26,16 @@ PHASE_HEADING_RE = re.compile(
 )
 PHASE_STEP_RE = re.compile(r"^- 对应步骤：`(?P<step>step[1-6])`", re.MULTILINE)
 
+# Public-contract metamorphic variants change only a supported custom Manifest
+# attribute on both sides.  The attribute values alter artifact bytes while
+# leaving the declared removed-method truth unchanged.
+TRANSFORM_IDS = (
+    "manifest_attribute_alpha",
+    "manifest_attribute_beta",
+    "manifest_attribute_gamma",
+    "manifest_attribute_delta",
+)
+
 
 @dataclass(frozen=True)
 class SkillContractReport:
@@ -156,36 +166,56 @@ def _write_library_jar(
         f"version={version}\n"
     ).encode("utf-8")
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        manifest = "Manifest-Version: 1.0\n"
+        if artifact_variant:
+            manifest += f"X-Contract-Variant: {artifact_variant}\n"
+        archive.writestr("META-INF/MANIFEST.MF", manifest + "\n")
         for class_file in sorted(classes.rglob("*.class")):
             archive.write(class_file, class_file.relative_to(classes).as_posix())
         archive.writestr(
             "META-INF/maven/contract/demo-lib/pom.properties", properties
         )
-        if artifact_variant:
-            archive.writestr("META-INF/contract-variant", artifact_variant)
 
 
 def _write_fat_jar(
     path: Path, app_classes: Path, library: Path, artifact_variant: str = ""
 ):
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr(
-            "META-INF/MANIFEST.MF",
-            "Manifest-Version: 1.0\nMain-Class: contract.App\n",
-        )
+        manifest = "Manifest-Version: 1.0\nMain-Class: contract.App\n"
+        if artifact_variant:
+            manifest += f"X-Contract-Variant: {artifact_variant}\n"
+        archive.writestr("META-INF/MANIFEST.MF", manifest + "\n")
         for class_file in sorted(app_classes.rglob("*.class")):
             archive.write(
                 class_file,
                 "BOOT-INF/classes/" + class_file.relative_to(app_classes).as_posix(),
             )
         archive.write(library, f"BOOT-INF/lib/{library.name}")
-        if artifact_variant:
-            archive.writestr("META-INF/contract-variant", artifact_variant)
+
+
+def _write_classes_jar(path: Path, classes: Path):
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for class_file in sorted(classes.rglob("*.class")):
+            archive.write(class_file, class_file.relative_to(classes).as_posix())
+
+
+def _current_jdk_home(cwd: Path) -> Path:
+    stdout, stderr, returncode = run_cmd(
+        ["java", "-XshowSettings:properties", "-version"],
+        cwd=str(cwd),
+        timeout=30,
+    )
+    if returncode != 0:
+        raise RuntimeError(f"java_home_probe_failed:{stderr or stdout}")
+    match = re.search(r"(?m)^\s*java\.home\s*=\s*(.+?)\s*$", f"{stdout}\n{stderr}")
+    if not match:
+        raise RuntimeError("java_home_probe_missing")
+    return Path(match.group(1)).resolve()
 
 
 def _materialize_complete_fixture(
     fixture: Path, artifact_variant: str = ""
-) -> tuple[Path, Path, Path]:
+) -> tuple[Path, Path, Path, Path]:
     build = fixture / "contract-build"
     old_source = build / "old-src" / "contract" / "Target.java"
     new_source = build / "new-src" / "contract" / "Target.java"
@@ -211,7 +241,101 @@ def _materialize_complete_fixture(
     current_artifact = build / "app-current.jar"
     _write_fat_jar(base_artifact, app_classes, old_library, artifact_variant)
     _write_fat_jar(current_artifact, app_classes, new_library, artifact_variant)
-    return base_artifact, current_artifact, app_source.parents[2]
+    business_jar = build / "business-classes.jar"
+    _write_classes_jar(business_jar, app_classes)
+    jdk_home = _current_jdk_home(fixture)
+    loader_topology = {
+        "coverage_status": "complete",
+        "entrypoint_realms": ["application-loader"],
+        "realms": [
+            {
+                "identity": "platform-loader",
+                "kind": "platform",
+                "delegation": "parent_first",
+                "module_mode": "named-platform",
+            },
+            {
+                "identity": "application-loader",
+                "kind": "application",
+                "parent": "platform-loader",
+                "delegation": "parent_first",
+                "module_mode": "unnamed",
+            },
+        ],
+    }
+    entrypoints = {
+        "coverage_status": "complete",
+        "methods": [{
+            "initiating_loader_realm_identity": "application-loader",
+            "class_name": "contract/App",
+            "member_name": "run",
+            "descriptor": "(Lcontract/Target;)Ljava/lang/String;",
+        }],
+    }
+
+    def side(outer: Path, library: Path, version: str):
+        return {
+            "jdk_home": str(jdk_home),
+            "artifacts": [
+                {
+                    "path": str(business_jar),
+                    "outer_artifact_path": str(outer),
+                    "container_entry": "BOOT-INF/classes/",
+                    "logical_location": "app/business-classes",
+                    "loader_realm": "application-loader",
+                    "path_kind": "business_classes",
+                    "slot": 0,
+                    "coord": "contract:fixture:1",
+                    "lineage": "contract:fixture",
+                    "runtime_code_source_origin_identity": "fixture-application",
+                },
+                {
+                    "path": str(library),
+                    "outer_artifact_path": str(outer),
+                    "container_entry": f"BOOT-INF/lib/{library.name}",
+                    "logical_location": "lib/demo-lib.jar",
+                    "loader_realm": "application-loader",
+                    "path_kind": "nested_runtime",
+                    "slot": 1,
+                    "coord": f"contract:demo-lib:{version}",
+                    "lineage": "contract:demo-lib",
+                    "runtime_code_source_origin_identity": "fixture-demo-lib",
+                },
+            ],
+            "runtime_profile": {
+                "container_and_launcher_kind": "spring-boot-fat-jar",
+                "loader_topology": loader_topology,
+                "runtime_security_and_package_sealing_policy_identity": "standard-unsealed-unsigned-v1",
+                "active_profile_identities": [],
+                "external_config_snapshot_identities": [],
+                "agent_transformer_plugin_profile_identities": [],
+                "business_entrypoint_profile": entrypoints,
+                "runtime_class_closure_coverage_status": "complete",
+                "resource_selection_coverage_status": "complete",
+            },
+        }
+
+    config_path = build / "binary-pipeline.json"
+    config_path.write_text(json.dumps({
+        "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+        "base": side(base_artifact, old_library, "1.0"),
+        "current": side(current_artifact, new_library, "2.0"),
+        "runtime_comparison": {
+            "comparison_intent": "same_deployment_profile",
+            "profile_correspondence_policy_version": "v1",
+            "controlled_profile_fields": ["loader_topology"],
+            "declared_upgrade_payload_scope": ["artifact-bytes"],
+            "changed_or_unknown_profile_fields": [],
+        },
+        "source_overlay": {
+            "source_root": str(fixture),
+            "source_dirs": [str(app_source.parents[2])],
+            "owner_type": "business",
+            "owner_coord": "contract:fixture:1",
+            "module": ".",
+        },
+    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return base_artifact, current_artifact, app_source.parents[2], config_path
 
 
 def _initialize_fixture_remote(fixture: Path, remote: Path) -> str:
@@ -295,9 +419,9 @@ def run_skill_contract(
         "<version>1</version></project>\n",
         encoding="utf-8",
     )
-    base_artifact = current_artifact = source_root = None
+    base_artifact = current_artifact = source_root = binary_config = None
     if complete_workflow:
-        base_artifact, current_artifact, source_root = _materialize_complete_fixture(
+        base_artifact, current_artifact, source_root, binary_config = _materialize_complete_fixture(
             fixture, artifact_variant
         )
         _initialize_fixture_remote(
@@ -327,7 +451,7 @@ def run_skill_contract(
             "--current-branch", "current-artifact",
             "--source-dirs", str(source_root),
             "--target-module", ".",
-            "--allow-degraded",
+            "--binary-pipeline-config", str(binary_config),
         ])
     first = _run(command, fixture)
     state = report_dir / ".runtime" / "state" / "main_state.json"
@@ -394,17 +518,15 @@ def run_skill_contract(
                 "jdk_base": fixture_jdk,
                 "jdk_current": fixture_jdk,
                 "source_dirs": [str(source_root)],
-                "allow_degraded": True,
                 "accept_suggested_mappings": True,
-                "tree_sitter_installed": True,
             }
             for field in required_fields:
                 if field in response_properties and field in known_fixture_values:
                     response[field] = known_fixture_values[field]
             if step_id == "step2" and "source_dirs" in response_properties:
                 response["source_dirs"] = [str(source_root)]
-            if step_id == "step5" and "allow_degraded" in response_properties:
-                response["allow_degraded"] = True
+            if step_id == "step4":
+                response["scope_mode"] = "full"
             resume_command = [
                 sys.executable, str(skill_root / "scripts" / "run_step.py"),
                 "--step", "auto",

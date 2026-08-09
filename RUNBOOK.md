@@ -1,699 +1,147 @@
 # Java Upgrade Analyzer Runbook
 
-本文件承载**执行细节**。使用者先看 `README.md`（快速开始 + 自查清单），`SKILL.md` 主要保留协议与状态机规则。
+本文件给维护者提供执行和排障命令。普通使用者先看 `README.md`；正式流程始终由 `scripts/run_step.py` 调度。
 
-## 使用方式
+## 运行前提
 
-- 先阅读 `README.md`，按“自我排查”把输入/环境补齐
-- 优先使用 `scripts/run_step.py` 执行单步，减少手动拼命令
-- 只在需要具体命令时查阅本文件
-- 每次只执行一个 Step，执行后立刻做门控与主状态保存
-- 若 `run_step.py` 返回退出码 `4` 或进入待交互状态，优先读取 `.upgrade-report/.runtime/state/main_state.json` 与 `.upgrade-report/.runtime/state/interaction.json`，再由 Claude Code 向用户发问
-- 若要在首次调用 `step1` 前让 Claude Code 先完成首轮抽参，可先执行 `python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --describe-step1-contract` 读取静态前置协议
-- 所有 CSV 产物统一采用 UTF-8 BOM，可直接用 Excel 打开；脚本读取时兼容历史无 BOM 的 UTF-8 CSV
+- CPython 3.10 或更高版本；
+- base/current 两侧可复核的最终制品；
+- 与两侧运行环境一致的完整目标 JDK；
+- 一份显式 `binary_pipeline_config`，固定制品 SHA、运行路径顺序、loader/resource policy 和业务入口；
+- 可写的 `.upgrade-report/`。
 
-### 技能目录约定
+所有 CSV 使用 UTF-8 BOM，适合 Excel 直接打开。JSON 和 Markdown 使用 UTF-8。
 
-- Claude Code 使用 `${CLAUDE_SKILL_DIR}` 指向当前 Skill 的安装目录
-- 正式流程默认通过 `run_step.py` 调度；单脚本命令主要用于开发调试或门控排查
-- 以下命令默认使用 `python3`（适配 macOS/Linux）；若当前环境以 `python` 作为解释器入口，可等价替换
+Step4–Step6 只有 binary-first 引擎。没有旧引擎选择、灰度、兼容或 fallback 参数；失败时停止并保留上一份已经独立验证且完整发布的 generation。
 
-### 推荐入口
+## 推荐入口
+
+首次查看 Step1 输入协议：
 
 ```bash
-export PYTHONUTF8=1
-python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step <step1|step2|step3|step4|step5|step6> \
-  --project-dir . \
-  --report-dir .upgrade-report
+python3 scripts/run_step.py --describe-step1-contract
 ```
 
-### 项目无关的准确性双线对账
-
-真实项目的分析结果与独立 Oracle 分别产出后，用统一数据入口逐 API 对账。接入新项目无需修改脚本或登记项目名；三个输入集合必须使用相同的 API 身份字段，Oracle 每条记录必须绑定本次最终制品 SHA-256，并提供可校验的独立证据来源。
+初始化并自动运行到必要确认点：
 
 ```bash
-python3 "${CLAUDE_SKILL_DIR}/scripts/dual_line_accuracy.py" \
-  --api-universe /abs/path/to/independent_api_universe.csv \
-  --analyzer-summary /abs/path/to/summary.json \
-  --oracle-ledger /abs/path/to/independent_oracle.csv \
-  --artifact-sha256 <final-artifact-sha256> \
-  --ledger-out /abs/path/to/exhaustive_api_oracle.csv \
-  --json-out /abs/path/to/dual_line_accuracy.json
+python3 scripts/run_step.py --step auto \
+  --project-dir /abs/path/to/project \
+  --report-dir /abs/path/to/project/.upgrade-report \
+  --seed-json /abs/path/to/runtime-input.json
 ```
 
-API universe 必须来自独立 API diff、人工审核契约或其他外部事实源，不能直接复制分析器结果充当分母；空集合按失败处理。退出码 `0` 表示所有 API 身份与结论均验证一致，`1` 表示发现漏报、误报、冲突或未验证项，`2` 表示输入或证据协议无效。对账器不负责生成 Oracle；Oracle 应来自项目测试、运行时观测、JDK `javap`/`jdeps` 或其他不复用分析器实现的方法。
+`runtime-input.json` 示例见 `runtime_config.example.json`。后续业务参数以
+`.upgrade-report/.runtime/state/main_state.json` 为唯一主状态，不要在每一步重新拼接一套参数。
 
-框架代理、反射或回调无法由静态字节码 Oracle 证明为 `reachable` 时，可用 `runtime_coverage_oracle.py` 执行项目自己的测试并读取 JaCoCo 原始覆盖。测试命令通过 JSON 字符串数组传入，不登记项目名；解析器要求测试实际执行且通过、覆盖 class ID 匹配，并要求被解析的 class JAR 是最终制品本身或其中 SHA-256 完全一致的嵌套 JAR。未覆盖只能输出 `uncertain`。
+恢复运行：
 
 ```bash
-python3 "${CLAUDE_SKILL_DIR}/scripts/runtime_coverage_oracle.py" \
-  --api-universe /abs/path/to/independent_api_universe.csv \
-  --artifact /abs/path/to/final-application.jar \
-  --classfiles /abs/path/to/extracted-provider.jar \
-  --jacoco-exec /abs/path/to/jacoco.exec \
-  --jacoco-classpath /abs/path/to/org.jacoco.core.jar \
-  --jacoco-classpath /abs/path/to/asm.jar \
-  --jacoco-classpath /abs/path/to/asm-commons.jar \
-  --jacoco-classpath /abs/path/to/asm-tree.jar \
-  --command-json /abs/path/to/test-command.json \
-  --run-cwd /abs/path/to/project \
-  --command-log-out /abs/path/to/runtime-test.log \
-  --test-result-glob '/abs/path/to/target/surefire-reports/TEST-*.xml' \
-  --evidence-out /abs/path/to/runtime-oracle-evidence.json \
-  --oracle-out /abs/path/to/runtime-oracle.csv
+python3 scripts/run_step.py --step auto \
+  --project-dir /abs/path/to/project \
+  --report-dir /abs/path/to/project/.upgrade-report
 ```
 
-若项目没有自行配置 JaCoCo，再额外传 `--jacoco-agent /abs/path/to/org.jacoco.agent-runtime.jar`；项目已有 agent 时不要重复注入。
-
-若需要在首次执行前预置首轮输入，使用 `--seed-json` 建立主状态，不要手写 `.upgrade-report/.runtime/state/main_state.json`。
-
-推荐模板：
-
-```json
-{
-  "base_branch": "main",
-  "current_branch": "feature/upgrade-test",
-  "source_dirs": ["src/main/java"],
-  "dependency_source_dirs": ["/abs/path/to/dependency-repo", "https://git.example.com/team/dependency-repo.git"],
-  "max_depth": 5,
-  "tool": "maven"
-}
-```
+恢复用户确认：
 
 ```bash
-export PYTHONUTF8=1
-python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
-  --project-dir . \
-  --report-dir .upgrade-report \
-  --seed-json /abs/path/to/seed.json
+python3 scripts/run_step.py --step auto \
+  --project-dir /abs/path/to/project \
+  --report-dir /abs/path/to/project/.upgrade-report \
+  --response-file /abs/path/to/user-response.json
 ```
 
-按主状态自动续跑：
+退出码 `4` 表示等待用户输入。必须读取 `main_state.json` 和 `interaction.json`，按
+`CHECKPOINT_RULES.md` 向用户展示决策卡，不能代替用户选择。
+
+## Binary pipeline 输入
+
+配置 schema 为 `java-upgrade-analyzer.binary-pipeline-input.v1`。base/current 每个运行时制品至少包含：
+
+- `path`：实际 JAR/ZIP；
+- `coord`：带版本依赖坐标；
+- `lineage`：跨版本稳定依赖身份，通常为 `groupId:artifactId[:classifier]`；
+- `logical_location`、`loader_realm`、`path_kind`、`slot`：有序运行路径身份；
+- 完整 `runtime_profile`：目标 JDK、loader topology、入口和覆盖状态。
+
+源码解释层是配置中的可选 `source_overlay`。它只增加人类可理解的源码位置和语义，不能改变运行时提供者、变化事实、可执行边或正式裁决。源码解析不完整会形成覆盖缺口，不会切换到另一套引擎。
+
+可直接调试 generation：
 
 ```bash
-export PYTHONUTF8=1
-python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
-  --project-dir . \
-  --report-dir .upgrade-report
+python3 scripts/binary_pipeline.py \
+  --config /abs/path/to/binary-pipeline-input.json \
+  --output-root /abs/path/to/.upgrade-report/.runtime/binary_authority \
+  --result-json /abs/path/to/.upgrade-report/.runtime/state/binary_pipeline_result.json
 ```
 
-- `Step5` 若单独直接执行且未显式传 `--report-dir`，会先尝试从 `--all-changed-apis` 的 `evidence/api_changes/all_changed_apis.csv` 推导报告目录；若仍缺失，再从 `--output-dir` 的父目录推导。
+## Step4–Step6 数据流
 
-### tree-sitter 安装
+1. Step4 读取最终制品并构建二进制事实，按 target runtime 重建有效 class/resource provider，冻结变化裁决与投影，再执行独立 Oracle 验证。
+2. 只有验证通过的 generation 才原子激活；Step4 从该 generation 发布依赖和 API 人工复核材料。
+3. Step5 从同一 generation 发布四态系统触达证据，可按 Step4 已确认的依赖坐标限制范围。
+4. Step6 校验 Step5 与 active generation 身份一致后发布最终报告。
 
-- 分析器最低要求为 CPython 3.10；PR quick 在 Ubuntu 上验证 3.12.x/3.13.x/3.14.x，平台矩阵使用 3.12 验证 Linux/macOS/Windows。其他满足最低要求的小版本会记录未进入 CI 矩阵的提示，并在固定依赖版本和 import 检查通过后继续。JDK、Maven、Gradle 版本以 base/current 工程为准，不设全局最低版本；优先使用各 revision 的 `mvnw` / `gradlew` 和对应侧 JDK。
-- Windows 下所有步骤共用统一的短路径运行时：Git 命令自动带 `core.longpaths=true`；Step1/Step2 的 detached worktree 使用短名称，失败后定向清理本次注册并切换备用根目录；Step3–Step5 的源码快照、JAR/class 解压、`javap`/`jdeps`/JaCoCo 和排序缓存使用短临时根；Step4/Step5 的坐标、版本和 API 派生文件名会做定长截断并附稳定哈希。系统不会修改用户全局 Git 配置，一般无需人工干预。`JUA_SHORT_TEMP_ROOT` 可选指定一个可写的短目录（例如 `C:\jua-tmp`）；旧的 `JUA_STEP1_WORKTREE_ROOT` 仍兼容，但不再建议使用。只有所有候选目录都不可写，或下游旧版构建插件本身不支持长路径时才会阻塞。
-- 安装版本以根目录 `requirements-runtime.txt` 为唯一清单；Step5 运行时不会联网安装或修改 Python 环境。
-- 在仓库根目录使用 CPython 3.10 或更高版本执行显式 bootstrap：
+四态互斥：`reachable`、`uncertain`、`not_found_in_static_analysis`、`not_analyzed`。
+`not_found_in_static_analysis` 只表示当前静态范围未发现路径，不表示安全或不受影响。没有运行时验证时只输出 `probable_impact` 或 `inconclusive`，不输出“确认有影响/确认无影响”。
+
+## 人工复核路径
+
+先看：
+
+1. `evidence/api_changes/changed_dependencies.md`：哪些依赖引起变化、优先顺序和明细入口；
+2. `evidence/api_changes/s4_per_dependency/*/summary.md`：单个依赖的变化 API；
+3. `evidence/api_changes/review.md`：包含不可投影事实、诊断候选和证据缺口的完整复核；
+4. `evidence/call_chain/summary.md` 与 `alerts.csv`：每个依赖/API 的四态和路径；
+5. `deliverables/report.md`：最终结论和范围；完整明细位于同目录的 dependency/API Markdown 与 CSV。
+
+内部文件分开存放：
+
+- `.runtime/binary_authority/`：不可变 generation、SQLite、验证附件和失败记录；
+- `.runtime/state/`：工作流主状态；
+- `.runtime/indexes/`：查询索引；
+- `.runtime/observability/`：进度和耗时，不是结论证据。
+
+不要要求人工从内部 JSON/SQLite 反推结论。
+
+## 原子发布与失败处理
+
+- 新 generation 写入独立目录，内容身份不包含耗时、绝对临时路径或时间戳；
+- 独立验证失败时不激活；
+- generation 激活后若 Step4 人工报告发布失败，调度层恢复上一 active pointer；
+- Step4/5 报告目录使用 stage + replace 发布，不能留下半套文件；
+- 失败证据写入 `.runtime/binary_authority/binary_failures/`；不要删除上一份有效输出；
+- 输入、目标 JDK、loader policy 或 coverage 缺失会失败关闭，不调用其他引擎补算。
+
+## 性能与进度
+
+- 长阶段通过统一进度事件和 heartbeat 告知用户仍在运行；
+- `.runtime/observability/step4_timing.csv` 记录事实解析、reconciliation、裁决、trace、generation 写入、独立验证和人读报告发布耗时；
+- `.runtime/observability/step5_timing.csv` 记录范围过滤、索引和报告发布耗时；
+- `.runtime/binary_authority/binary_observability/` 保存 cache 命中和 pipeline 原始计时；这些数据不进入 generation 内容身份。
+
+性能优化只能减少重复解析、I/O、内存和确定无关的工作，不能缩小声明范围、降低身份精度或把未完成结果改成负结论。
+
+## 重跑
+
+单步安全重跑：
 
 ```bash
-python3 scripts/bootstrap_runtime.py
+python3 scripts/run_step.py --step step4 \
+  --project-dir /abs/path/to/project \
+  --report-dir /abs/path/to/project/.upgrade-report
 ```
 
-- 离线环境先准备受控 wheel 目录，再禁止索引访问安装：
+Step4 重跑会生成或复用内容绑定的 generation；Step5/6 只消费 active generation。范围改变时从 Step4 的范围确认恢复，让调度器清理 Step5 及之后的用户输出；不要手工混合两次 generation 的文件。
+
+## 开发验证
 
 ```bash
-python3 scripts/bootstrap_runtime.py --wheel-dir /abs/path/to/wheels
+python3 -m py_compile scripts/*.py tests/*.py
+python3 scripts/quality_gate.py --profile quick
+python3 scripts/quality_gate.py --profile step5
+python3 scripts/quality_gate.py --profile release
+python3 scripts/accuracy_benchmark.py --profile all
 ```
 
-- 安装后运行门禁；它会实际执行外部命令、核对解析器 import/精确版本，并确认 Java 工具与当前项目的 Maven 或 Gradle 使用同一 JDK：
-
-```bash
-python3 scripts/quality_gate.py --profile quick --skip-real
-```
-
-- 环境不满足契约时，分析在开始前给出明确失败；Step5 缺少解析器时仍进入 checkpoint，且不会用正则静默生成结论。
-
-## main_state.json（推荐）
-
-复杂参数建议通过 `--seed-json` 收敛到 `.upgrade-report/.runtime/state/main_state.json`，避免每步重复拼接命令。
-可先参考 `main_state.json` 的字段结构，再把首轮确认后的输入整理为 `seed json` 交给 `run_step.py` 初始化。
-建议在任务开始时一次性让用户补齐该文件，后续不再按 Step 反复追问参数。
-
-示例：
-
-```json
-{
-  "base_branch": "main",
-  "current_branch": "feature/upgrade-test",
-  "source_dirs": [
-    "src/main/java",
-    "module-a/src/main/java"
-  ],
-  "dependency_source_dirs": [
-    "D:/repo/dependency-a",
-    "D:/repo/dependency-b-multi-module"
-  ],
-  "max_depth": 5,
-  "include_test_scope": false,
-  "tool": "maven"
-}
-```
-
-说明：
-
-- `dependency_source_dirs` 是推荐主入口；可填写源码工程目录、仓库根目录或 HTTPS/SSH Git 地址。Git 地址会先克隆到 `.upgrade-report/.runtime/cache/dependency_source_git/` 并在后续运行中复用。调度层只针对 Step1 已确认的变化 GAV，对构建清单执行一次有界模块定位；源码只补充版本差异证据，不会再次发现依赖或新增同 GAV 条目。
-- Git 地址克隆复用宿主环境已有的 SSH key 或 Git credential helper，并设置 `GIT_TERMINAL_PROMPT=0`；克隆失败会保留既有正式产物并要求修正地址或权限，不会降级成一个空源码目录。
-- 路径支持相对路径（相对 `project-dir`）和绝对路径。
-- `dependency_source_dirs` 一旦提供，Step4 会通过 `git ls-remote` 查询源码仓库的实时远程分支，再按依赖 `old_version/new_version` 做严格边界匹配；old/new 两侧优先选择 remote 和版本前缀家族一致的 ref pair，同名候选只有 commit 相同才会自动合并。选定 ref 后会定向 fetch 并固定 commit，再执行源码 diff；不会以本地远端跟踪分支冒充远端最新状态。
-- 唯一匹配会自动继续；确认卡中的方案会把 `old_ref/new_ref` 与 `expected_old_commit/expected_new_commit` 一起写回。执行前再次校验远端 ref：commit 不一致或 ref 消失时标记 `remote_ref_moved`，重新确认后才继续。`refs/heads/*` 在多个 remote 上指向不同 commit 时仍视为歧义，不能按排序取第一个。
-- `dependency_source_dirs` 是唯一推荐用户入口；系统会自动推断后续所需映射。
-- `main_state.json` 是唯一主状态和业务参数来源；步骤执行时不应再由 CLI 覆盖已确认的业务参数。
-- 上述约束同样适用于正式恢复/重建路径；即使是重建 `step2` 上下文，也只能传壳层参数，不能把 `base_branch/current_branch/source_dirs` 之类的业务参数重新塞回单步脚本 CLI。
-- 因此，Step2 若提示缺少 `base_branch/current_branch` 或提示两侧分支相同，修复方向应是检查 `main_state.json` 或回到最近 checkpoint 恢复，而不是补 CLI 业务参数。
-- 首轮初始化输入应通过 `--seed-json` 写入主状态，后续步骤统一从主状态读取。
-
-### 一次性收集模板（可直接发给用户）
-
-```text
-请一次性提供以下信息（可直接粘贴为 JSON）：
-{
-  "project_dir": "项目根目录",
-  "base_branch": "基准分支，如 main",
-  "current_branch": "当前分支",
-  "source_dirs": ["src/main/java"],
-  "dependency_source_dirs": ["依赖源码工程目录、仓库根目录或 Git 地址（可选）"],
-  "max_depth": 5,
-  "include_test_scope": false,
-  "tool": "maven"
-}
-```
-
-## 执行前预检
-
-开始任何 Step 之前，先确认：
-
-1. 已明确项目根目录、基准分支、当前分支
-2. Shell 环境已初始化 `export PYTHONUTF8=1`
-3. Claude Code 已提供 `${CLAUDE_SKILL_DIR}` 技能目录变量
-4. 上一步产物存在且非空
-5. `.upgrade-report/` 目录可写
-
-若预检未通过，不执行脚本，先补齐缺失信息。
-
-## 推荐的主状态结构
-
-若脚本暂未产出结构化状态，至少保证 `.upgrade-report/.runtime/state/main_state.json` 能表达：
-
-```json
-{
-  "completed_step_id": "step2",
-  "current_step": "step3",
-  "completed_steps": ["step1", "step2"],
-  "blocked": false,
-  "blocking_reason": null,
-  "next_step_id": "step3",
-  "status": "ready",
-  "pending_interaction": null
-}
-```
-
-`ready` 表示上一 Step 已完成、下一 Step 尚待执行。只有 `current_step=done` 且 `completed_step=step6` 时，`status` 才能是 `completed` 或 `completed_with_limits`；不能仅凭某个中间 Step 成功就判断整个分析完成。
-
-两个完成状态都可以直接交付并收尾，不属于 checkpoint：`completed` 展示完成摘要和交付物路径；`completed_with_limits` 还必须展示完整限制清单与结论适用范围。只有用户明确要求扩大范围、补充证据或重跑时才恢复流程，不得为例行复核生成 `interaction.json`。
-
-新对话恢复时：
-
-1. 先读取 `main_state.json`
-2. 若 `status` 是 `awaiting_user_input` / `awaiting_input`，或上一条 `run_step.py` 命令退出码为 `4`，再读取 `interaction.json`
-2. 再检查 `current_step` 所需输入文件是否存在
-3. 文件缺失时，以实际文件状态为准，不盲信主状态中的旧产物摘要
-
-例外：若用户只是要求查询某个方法的调用链，且 `.upgrade-report/.runtime/indexes/s5_query_index.json` 已存在，可以直接执行只读查询脚本返回调用链。这不属于 checkpoint 恢复，也不能顺带继续下一步或改写主状态。
-
-待交互恢复命令示例：
-
-```bash
-python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
-  --project-dir . \
-  --report-dir .upgrade-report \
-  --response-json '{"intent_patch":{"action":"continue","set":{}}}'
-```
-
-补充说明：
-
-- `run_step.py` 退出码 `4` 表示当前命令已进入待用户交互状态，不是普通失败
-- 退出码 `4` 时不要直接重试上一条命令，应先读取 `interaction.json` 并等待用户答复
-- 对当前 checkpoint 的答复直接使用其 `response_schema`；Step4 范围确认使用顶层 `action` / `selected_targets`。只有当前不存在 `pending_interaction`、用户提出新的正式业务意图时才使用 `intent_patch`
-- 若当前不存在 `pending_interaction`，但用户提出了新的正式业务意图，也可以继续使用 `intent_patch`
-- 这类输入不会伪装成 checkpoint 恢复；调度器会先把它桥接为主状态更新，再从推断出的目标步骤或 `restart_step_id` 重跑
-- 非 checkpoint 场景下，`intent_patch` 必须在 `set` / `clear` 中提供至少一个正式业务字段，或显式使用 `action=restart_from_step`
-- `blocked_by_system` 下可直接重新运行 `--step auto`，也可提交不带业务字段的 `action=rerun_current_step`；两种方式都只重建当前步骤及后续结果
-- 回退步骤的标准字段位置是 `intent_patch.restart_step_id`，例如 `{"intent_patch":{"action":"restart_from_step","restart_step_id":"step2","set":{}}}`
-
-### Step4 后按单依赖包进入 Step5
-
-当 Step4 已生成 `evidence/api_changes/changed_dependencies.md` / `changed_dependencies.csv` 后，可通过依赖包完整坐标只让某个或某几个依赖进入 Step5。
-
-Step4 成功且存在至少两个候选依赖时生成范围选择 checkpoint，由用户决定 Step5 全量或部分分析。0 个候选时没有系统触达目标，1 个候选时全量和选择该候选等价，系统直接继续。用户只需回复“全量分析”或“只分析 <依赖名称/完整坐标>”；调度器在内部转换范围字段，不向用户暴露 `selected_targets` / `selection_key`。范围卡同时展示依赖数、变化 API 数，以及按影响证据排序的 Top 10 依赖和理由。排序依次比较业务最终制品精确直接引用的变更 API 数、签名不完整候选引用数、引用指令数和变更 API 总数，最后按完整依赖坐标稳定排序；删除、签名变化等变更类型不额外加权，源码是否可用只作为分析条件展示。Top 10 只用于已经决定缩小范围时降低选择成本，不表示系统建议缩小范围，也不表示其余依赖安全。完整依赖选择清单保存在 `changed_dependencies.md`。内部源码/ref/超时故障不得成为该 checkpoint 的用户修复项。
-
-让用户从 `changed_dependencies.md` 的“依赖包”列复制完整坐标，例如：
-
-```text
-com.example:legacy-lib
-```
-
-恢复输入示例：
-
-```bash
-python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
-  --project-dir . \
-  --report-dir .upgrade-report \
-  --response-json '{"intent_patch":{"action":"continue","set":{"scope_mode":"partial","selected_targets":["com.example:legacy-lib"]}}}'
-```
-
-说明：
-
-- 用户无需填写或理解 `selected_targets`；只需自然语言回复要分析的依赖名称或完整坐标，调度器负责生成内部字段
-- 用户回复“全量分析”时，调度器生成 `scope_mode=full`；用户点名依赖时生成 `scope_mode=partial` 和非空 `selected_targets`
-- `notes` 只用于备注，不参与分析范围控制；只在 `notes` 中记录部分选择会被拒绝，不会回退为全量分析
-- `changed_dependencies.csv` 中的 `selection_key` 仅供程序兼容解析和自动化使用，不作为人工选择入口
-- 这些选择字段必须先归一化写入 `main_state.json`
-- 正式流程中不要把选中依赖直接透传给 `s5_call_chain*.py`
-- Step5 只消费 Step4 API 目标的选中子集；Step3 candidate 保留为独立风险线索，不再生成合并后的 Step5 目标文件
-- Step5 的 `summary.json -> graph_stats.indirect_usage` 会输出按 API、symbol kind 和调用机制拆分的覆盖矩阵；目标相关能力为 `partial/insufficient` 时，该 API 不得输出 `not_found_in_static_analysis`，对应总视图会派生到 `.upgrade-report/.runtime/coverage/coverage.json` 的 `indirect_usage_matrix`
-- Step5 的 `.upgrade-report/framework_adapters.json` 当前基线包含 `java_spi`、`spring_basic`、`mybatis`、`dynamic_proxy_basic` 和 `declarative_http_client_basic`
-- `dynamic_proxy_basic` 只为能够从注册点绑定到具体 handler 的回调输出证据，但仅注册不会把 handler 提升为业务入口；`declarative_http_client_basic` 生成的是业务向远端发起调用的出站证据；两者都不直接进入 `framework_entry_symbols`
-- 若当前不在 Step4 范围 checkpoint，用户之后主动改变范围，可通过结构化新意图指定，例如：
-
-```bash
-python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
-  --project-dir . \
-  --report-dir .upgrade-report \
-  --response-json '{"intent_patch":{"action":"continue","set":{"scope_mode":"partial","selected_targets":["com.example:legacy-lib"]}}}'
-```
-
-- 调度器会先把 `selected_targets` 归一化为正式 `step5_selected_coords` / `step5_selected_names`，再自动桥接为从 `step5` 重跑，而不是直接卡死在“当前没有 pending interaction”
-- 只有已进入 Step4 API 目标集的依赖才能通过 `step5_selected_coords` / `step5_selected_names` 被选中
-- `selected_targets` 的正式解析范围始终是完整候选集，可以从 `changed_dependencies.md` 复制完整坐标提交
-- 调度器会把本次全量/部分选择写入 `.runtime/cache/step5_selection.json`；Step6 使用该快照声明分析范围，部分分析不得生成全局无影响结论
-
-若用户答复较长，优先使用：
-
-```bash
-python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
-  --project-dir . \
-  --report-dir .upgrade-report \
-  --response-file .upgrade-report/user_response.json
-```
-
-## 输出目录
-
-常用产物如下：
-
-```text
-.upgrade-report/
-  README.md
-  deliverables/
-    report.md
-    all-affected-dependencies.md
-    all-impact-details.md
-    analysis-scope.md
-  evidence/
-    dependencies/
-      dep_changes.csv
-      dep_alerts.csv
-      dep_summary.txt
-      deps_current_resolved.csv
-      build_provenance.json
-      dependency_jars.json
-      s1_artifacts/
-      s1_dependency_jars/
-    context/
-      review.md
-      context.json
-      dep_graph.json
-      source_mapping_summary.json
-    static_scan/
-      s3_jdk_removed_api.csv
-      s3_jdk_javax_refs.csv
-      s3_jdk_internal_api.csv
-      s3_jdk_reflection.csv
-      s3_jdk_serialization.txt
-      s3_jdk_runtime_flags.csv
-      s3_springboot_config.csv
-      s3_springboot_autoconfig.txt
-      s3_dependency_compat.csv
-      s3_dependency_classfile.csv
-    api_changes/
-      changed_dependencies.md
-      changed_dependencies.csv
-      all_changed_apis.csv
-      all_changed_apis_part_001.csv
-      s4_per_dependency/
-        <coord>/
-          removed_jar_symbols.csv
-          resolved_targets.csv
-          summary.json
-    call_chain/
-      alerts.csv
-      summary.json
-      by_api/
-      by_module/
-  .runtime/
-    observability/progress.jsonl
-    state/
-      main_state.json
-      interaction.json
-    coverage/
-      coverage.json
-      s3_coverage.json
-      s4_coverage.json
-    indexes/
-    findings/
-      s6_findings.json
-    cache/
-```
-
-补充说明：
-
-- 当某个依赖在 Step1 中被识别为 `移除` 时，Step4 会额外尝试从旧版 jar 导出 `public/protected class/method/constructor` 符号集
-- 这些符号会写入 `evidence/api_changes/s4_per_dependency/<coord>/removed_jar_symbols.csv`
-- Step5 会把单条 API 结果再汇总回 `evidence/api_changes/s4_per_dependency/<coord>/summary.json`
-- Step6 先汇总全部变化依赖的完成状态和影响结论，再展示变化 API 与对应调用关系；主报告未展开的内容分别进入完整依赖明细和完整 API 调用关系明细
-
-## Step 1：获取真实依赖结果
-
-### 输入
-
-- 用户提供项目根目录，以及 Step1 的其中一种输入
-- 方式 A：基准分支、当前分支
-- 方式 B：`base_artifact_path/current_artifact_path`，直接读取两侧编译产物；系统升级分析默认按“同一仓库、不同分支”处理
-- 如需模块级分析，首轮就提供 `primary_module/modules`
-- 若两种方式都未给全，`run_step.py` 会先进入 Step1 前置输入契约交互，而不是直接执行实际分析
-
-### 建议命令
-
-```bash
-# 在项目根目录执行（bash / zsh）
-export PYTHONUTF8=1
-
-python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step step1 \
-  --project-dir . \
-  --report-dir .upgrade-report \
-  --base-branch <基准分支> \
-  --current-branch <当前分支>
-```
-
-如果只分析 `module-a`：
-
-```bash
-python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step step1 \
-  --project-dir . \
-  --report-dir .upgrade-report \
-  --base-branch <基准分支> \
-  --current-branch <当前分支> \
-  --primary-module module-a \
-  --modules module-a
-```
-
-说明：
-- Maven 场景下，Step1 会真实执行目标模块的 `package`
-- Gradle 场景下，Step1 优先调用项目 Wrapper，执行目标 project 的 `build -x test`；Groovy DSL、Kotlin DSL、`projectDir` 与 `project(...)` 模块依赖均纳入模块/源码范围推导。坐标补全优先使用 `runtimeClasspath` resolved artifacts 的组件坐标与物理文件清单；`project :internal` 按精确 Gradle project path 读取实际 group、artifact、version。不支持 artifact inventory 的 Gradle 版本或插件才回退到原有组件依赖树。Gradle build、inventory 或回退命令出现明确文件锁冲突时，只重试同一命令最多 3 次（间隔 1 秒、3 秒）；不得因锁冲突切换命令、删除 `.lock/.lck` 或执行全局 `gradle --stop`
-- Maven/Gradle 构建、Wrapper 下载和运行时依赖坐标补全默认不设置总执行时限；首次填充本地依赖缓存时不会再因超过固定 30 分钟而被 Step1 中止。仓库连接或读取失败仍由 Maven/Gradle 自身的网络超时与退出码显式报告
-- 两种构建工具都可以跳过自动构建，直接读取用户提供的编译产物
-- `boot jar/war` 直接读取最终产物
-- `thin jar` / 无嵌套依赖场景当前不支持，会直接报错
-- 若 Step1 先进入待交互，Claude Code 必须把 `interaction.json` 整理成用户可读的决策卡片：缺什么输入、可用哪种输入方式、可以直接怎么回复；协议字段只用于内部恢复命令构造
-- 若某一侧编译包里的嵌套 jar 缺少 `pom.properties`，对同一系统升级场景优先补 `base_branch/current_branch`，让 Step1 在同一源码仓库自动切分支生成 Maven `dependency:list` 或 Gradle `runtimeClasspath` 报告补全坐标；但这不是 direct artifact 模式的执行前硬前置
-- Maven `dependency:list` 未列出 reactor 依赖，或 Gradle inventory 只暴露 project component 时，Step1 会建立目标模块运行时闭包内的内部模块目录。Maven 模型会解析 reactor 继承及 `${revision}`、`${project.version}` 等属性；Gradle 模型按精确 project path 读取有效坐标。目录排除目标模块自身和闭包外 sibling，并丢弃缺失 group/artifact/version、`unspecified` 或仍含未解析占位符的项
-- 内部模块目录只合并构建工具输出中缺失的身份；若同一坐标已有不同版本，以实际执行的构建模型为准，不用静态源码覆盖。内部模块的唯一主归档可提供精确物理文件名，从而识别自定义 `finalName`；没有唯一物理归档时仍须满足现有安全匹配条件
-- Maven/Gradle artifact inventory 与 fat JAR 条目物理文件名的精确匹配是最高优先级坐标补全证据；它可以纠正 filename-only 解析得到的误导性 artifact/version。构建工具只提供唯一 group、artifact、version 而没有 classifier 时，Step1 再以完整 version 为锚拆分标准物理文件名；例如 `jffi-1.2.23.jar` 与 `jffi-1.2.23-native.jar` 分别固化为 `com.github.jnr:jffi` 与 `com.github.jnr:jffi:native`。版本本身含连字符时不把版本尾部误判为 classifier。只有两个以上不同最终坐标都能解释同一物理条目时才视为真实歧义
-- `base_source_project_dir/current_source_project_dir` 可以指向同一个仓库，但不能单独定义 base/current 身份；必须同时确认各侧 branch/tag/commit，确认后固定为 commit 再进入独立 detached worktree
-- 直接产物模式先解析最终 JAR，仅当某一侧仍有依赖坐标缺失时才解析该侧源码并运行对应构建工具补全；自动构建模式则在构建前解析两侧 ref。解析时先查询实时远程 refs，候选按 commit 去重，唯一 commit 自动采用，多个不同 commit 则在构建前暂停确认；选定后仅定向 fetch 所需 ref，不执行 `git pull`，也不修改用户当前分支。
-- 对 Step1 构建来源，首次全量远端清单选出的 commit 是后续执行的固定快照，并与 repo、remote、canonical ref、artifact 一起写入状态绑定。二次定向查询为空、查询到不同 commit、SSH 握手失败、断连、超时、DNS 或临时服务故障都按错误类型受控重试；空结果或不同 commit 只是后续观测，不能让已固定快照失效。本地已有固定 SHA 对象时直接验证复用，否则按该 SHA 精确 fetch；固定 SHA 最终无法物化时以 `STEP1_REMOTE_EXPECTED_COMMIT_UNMATERIALIZABLE` 系统错误停止，不生成“重新选 ref”的用户 checkpoint。只有用户明确确认 `base/current_allow_local_source=true` 后才允许相应侧使用本地分支兜底；本地仓库有未提交修改时还需确认 `base/current_allow_dirty_local_source=true`。Step4 的依赖源码属于辅助证据：远端查询、fetch、ref 移动、未匹配等内部故障在受控重试后记录为 `DEPENDENCY_SOURCE_REF_UNAVAILABLE`，并自动改用最终 JAR 方法字节码指纹识别同签名实现变化；不会要求用户修复，也不会静默使用本地 ref。若字节码兜底也失败，行为覆盖成为关键缺口并限制最终结论。只有两个以上不同 commit pair 会改变源码对比范围时才暂停确认。
-- Step5 分析业务源码前会核对 Step1 记录的 current commit：现有业务源码工作区 HEAD 一致且干净时直接复用；否则从本地 Git 对象创建临时 detached worktree，并把业务源码目录映射到该 commit 后只读扫描。该过程不重新 clone、不运行构建且不下载 Maven/Gradle 依赖，Step5 结束或异常后统一清理；若本地已不存在该 commit，则失败关闭而不使用错误版本源码。
-- 同时提供 branch/ref 与 source directory 时，以确认后的 branch/ref 为准；只有 source directory 时不得直接使用当前 checkout 执行坐标补全
-- 若本次分析还要继续进入 Step2+，直接产物模式下请显式提供 `base_branch/current_branch`；系统不会自动拿工作区探测到的分支冒充这两个产物的来源
-- 若这两个分支是在 Step1 review checkpoint 才补充，恢复 `continue` 后调度器会先把确认值写入 `step2.input`，再进入 Step2
-- 任一步 checkpoint 恢复时，若主状态里该 step 已有更新后的 `input`，恢复逻辑会优先使用它，而不是继续沿用旧 `output`
-- 若用户选择 `restart_from_step` 回跳更早步骤，调度器会优先复用当前 checkpoint 已确认的新上下文，再补目标步骤原有缺失字段
-- 若直接产物中的嵌套 jar 缺少 `pom.properties`，可同时提供 `base_branch/current_branch`，让 Step1 额外生成 Maven `dependency:list` 或 Gradle `runtimeClasspath` 报告安全补全坐标
-- `base_jdk_home/current_jdk_home` 为可选项；未提供时各侧默认回落主机 `JAVA_HOME`
-- 若仍有依赖坐标无法安全补齐，Step1 会进入待交互；可按 `artifact:version[:classifier] -> groupId:artifactId` 补 `manual_coord_overrides`，或显式选择 `confirm_unresolved`。这条补丁路径同时适用于直接产物模式和自动切分支构建模式
-- 选择 `confirm_unresolved` 后，未补齐项会保留在 `evidence/dependencies/dep_changes.csv` 并标记 `resolution_status=unresolved`；后续步骤会跳过这些行
-
-若已提前拿到两侧产物，可直接这样执行：
-
-```bash
-python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step step1 \
-  --project-dir . \
-  --report-dir .upgrade-report \
-  --base-artifact-path /abs/path/to/base-app.jar \
-  --current-artifact-path /abs/path/to/current-app.jar
-```
-
-若 Step1 返回待交互状态，给用户看的第一层只保留决策信息：
-
-- 当前缺哪些输入
-- 可以用哪种输入方式补齐
-- 哪些信息是可选补充
-- 用户可以直接怎么回复
-
-`response_schema`、`input_normalization`、`action_requirements`、`selection_resolution` 仅用于 Claude Code 把用户原话整理成恢复命令，不作为用户主信息展示。
-
-### 门控
-
-```bash
-python3 "${CLAUDE_SKILL_DIR}/scripts/gate.py" --step step1_scope --report-dir .upgrade-report
-```
-
-## Step 2：从依赖树推断上下文
-
-- 依赖是否存在及实际版本以 Step1 留存的最终制品为准；该结果已经包含 Maven BOM / `<exclusions>` 或 Gradle dependency constraints / resolution strategy 的最终效果。
-- `s2_dep_graph.json` 不再读取单个依赖的原始 POM 猜测传递父子边。没有构建工具最终解析树证据时，`edges` 保持为空并标记 `relationship_status=not_inferred_without_resolved_tree`，避免把已排除依赖画成幽灵关系。
-
-```bash
-export PYTHONUTF8=1
-
-python3 "${CLAUDE_SKILL_DIR}/scripts/s2_context_from_deps.py" \
-  --dep-changes .upgrade-report/evidence/dependencies/dep_changes.csv \
-  --base <基准分支> \
-  --current <当前分支> \
-  --work-dir . \
-  --output .upgrade-report/evidence/context/context.json \
-  --output-dep-graph .upgrade-report/evidence/context/dep_graph.json
-```
-
-若脚本提示上下文字段无法推断，要求用户补齐 `evidence/context/context.json`，再进入下一步。
-
-### 门控
-
-```bash
-python3 "${CLAUDE_SKILL_DIR}/scripts/gate.py" --step context --report-dir .upgrade-report
-```
-
-## Step 3：静态扫描
-
-### 规则
-
-- JDK 升级时运行 JDK 相关扫描
-- Spring Boot 大版本升级时运行 Spring Boot 相关扫描
-- 无论何种升级，默认补跑依赖 jar 兼容性扫描
-- 正式流程会向 `stderr` 输出 `[进度][兼容性线索][准备/扫描/完成]` 等用户可读进度；长时间无新输出时每 30 秒发出一次运行心跳，有可靠分母时显示粗略预计剩余时间；原始任务、阶段、数量、已用时间和预计剩余时间同时写入 `.runtime/observability/progress.jsonl`
-- 用户按 `Ctrl-C` 时，编排器会终止当前子进程、清理当前步骤的候选输出，保留已完成步骤及当前输入，并以退出码 130 结束；再次运行 `run_step.py --step auto` 即可安全重试当前任务。
-
-### 参考命令
-
-```bash
-export PYTHONUTF8=1
-$ctx = Get-Content .upgrade-report/evidence/context/context.json | ConvertFrom-Json
-
-if ($ctx.jdk_upgraded) {
-  python3 "${CLAUDE_SKILL_DIR}/scripts/s3_scan.py" --type jdk_removed --source-dir . --output .upgrade-report/s3_jdk_removed_api.csv
-  python3 "${CLAUDE_SKILL_DIR}/scripts/s3_scan.py" --type javax --source-dir . --output .upgrade-report/s3_jdk_javax_refs.csv
-  python3 "${CLAUDE_SKILL_DIR}/scripts/s3_scan.py" --type jdk_internal --source-dir . --output .upgrade-report/s3_jdk_internal_api.csv
-  python3 "${CLAUDE_SKILL_DIR}/scripts/s3_scan.py" --type reflection --source-dir . --output .upgrade-report/s3_jdk_reflection.csv
-  python3 "${CLAUDE_SKILL_DIR}/scripts/s3_scan.py" --type serialization --source-dir . --output .upgrade-report/s3_jdk_serialization.txt
-}
-
-if ($ctx.springboot_major_upgrade) {
-  python3 "${CLAUDE_SKILL_DIR}/scripts/s3_scan.py" --type sb_config --source-dir . --output .upgrade-report/s3_springboot_config.csv
-  python3 "${CLAUDE_SKILL_DIR}/scripts/s3_scan.py" --type sb_autoconfig --source-dir . --output .upgrade-report/s3_springboot_autoconfig.txt
-}
-
-python3 "${CLAUDE_SKILL_DIR}/scripts/s3_scan.py" --type dep_compat \
-  --source-dir . \
-  --dep-changes .upgrade-report/evidence/dependencies/dep_changes.csv \
-  --output .upgrade-report/s3_dependency_compat.csv
-```
-
-若需把 `test` 依赖纳入扫描，可为 `dep_compat` 追加 `--include-test-scope`。
-
-### 门控
-
-```bash
-python3 "${CLAUDE_SKILL_DIR}/scripts/gate.py" --step scan --report-dir .upgrade-report
-```
-
-## Step 4：jar 包变更对比
-
-```bash
-export PYTHONUTF8=1
-python3 "${CLAUDE_SKILL_DIR}/scripts/s4_jar_compare.py" \
-  --dep-changes .upgrade-report/evidence/dependencies/dep_changes.csv \
-  --context .upgrade-report/evidence/context/context.json \
-  --output-dir .upgrade-report/evidence/api_changes \
-  --workers 4 \
-  --source-branches <基准分支> <当前分支>
-```
-
-若依赖包有本地源码路径，可追加：
-
-```bash
-  --dependency-repo-mappings "groupId:artifactId[:classifier]=D:\repo\dependency-a"
-```
-
-更推荐写入 `main_state.json` 的 `dependency_source_dirs`，减少命令行复杂度。
-提供后，Step4 会从远端实时查询结果中尝试将 `old_version/new_version` 匹配为对应依赖源码分支，例如 `origin/release-1.2.3`、`origin/hotfix-1.2.3`、`origin/support/1.2.3-DEV`；其中会先去掉末尾 `-SNAPSHOT`，按“严格边界命中”筛选候选。比如版本 `3.0.2` 会命中 `origin/auth-sdk3.0.2`，不会命中 `origin/auth-sdk3.0.2.1`。若 old/new 两侧同时存在多个候选，还会优先选择 remote 一致、版本前缀家族一致的 ref pair；同分候选指向同一 commit pair 时固定该 pair，指向两个以上不同 commit pair 且会改变 diff 范围时才进入人工确认。远端查询、fetch、ref 移动或未匹配等内部故障不会中断 JAR 分析；系统会自动执行最终 JAR 方法字节码兜底，只有源码与字节码两条行为证据都失败时才把覆盖率标记为关键缺口。
-
-Step4 需要 JApiCmp 执行 jar 二进制 API 对比。正式流程会先自动尝试安装：
-
-```bash
-mvn dependency:get \
-  -Dartifact=com.github.siom79.japicmp:japicmp:0.21.2:jar:jar-with-dependencies
-```
-
-如果自动安装失败，Step4 会记录 `japicmp_preflight.json` 并以
-`blocked_by_system` 停止，不生成用户确认项。环境恢复后可以重跑 Step4；
-也可以事先在主状态中提供 `japicmp_jar` 绝对路径。
-
-JApiCmp 是 Java 依赖升级分析的必需工具，不允许降级继续。缺少 JApiCmp 会漏掉删除方法、签名变化、字段变化、源码重编译不兼容等风险。
-
-若处于离线/内网环境，建议额外准备：
-
-- 预先下载好 `japicmp-*-jar-with-dependencies.jar`
-- 在 `.upgrade-report/.runtime/state/main_state.json` 中填写 `japicmp_jar`
-- 若无法使用 JApiCmp，停止 Step4；不得仅凭源码 diff / 其他证据生成后续升级结论
-
-人工抽查点：
-
-- 变更 API 数量为 0 的依赖
-- `最终制品 JAR 证据缺失`
-- `JApiCmp 未安装`
-- 其他执行失败项
-- Step1 按 `base_lib_entry/current_lib_entry` 一次性提取变化依赖 JAR，写入 `evidence/dependencies/s1_dependency_jars/` 和 `dependency_jars.json`，并在 Step1 门控校验条目与 SHA-256。正式 Step4 只直读这份清单，不重新打开 fat JAR、不递归检查内嵌归档，也不读取本地 Maven 仓库或下载同坐标 JAR
-- Step4 默认 `step4_workers=4` 进行依赖级并行；如果本机 CPU/磁盘压力过高，可在主状态或命令行设为 1/2
-- 正式流程默认不设置 Step4 超时；仅在主状态中显式写入 `step4_git_diff_timeout` / `step4_japicmp_timeout` / `step4_fetch_timeout` / `step4_tool_install_timeout` 时才启用对应限制。`step4_fetch_timeout` 只控制远端 Git 查询/抓取，JApiCmp 自动安装使用独立的 `step4_tool_install_timeout`
-- 正式流程会向 `stderr` 输出 `[进度][依赖 API 变化][处理依赖/源码辅助对比/制品 API 对比/完成]` 等用户可读进度，并展示当前对象、数量和耗时
-
-## Step 5：调用链影响分析
-
-```bash
-export PYTHONUTF8=1
-python3 "${CLAUDE_SKILL_DIR}/scripts/s5_call_chain.py" \
-  --all-changed-apis .upgrade-report/evidence/api_changes/all_changed_apis.csv \
-  --jdk-scan-dir .upgrade-report \
-  --source-dirs src/main/java \
-  --output-dir .upgrade-report/evidence/call_chain \
-  --max-depth 5
-```
-
-若通过 `run_step.py` 执行，建议将 `source_dirs` / `dependency_source_dirs` / `max_depth` 写入 `main_state.json`，命令保持最小参数集。
-- 若只想分析部分变更 jar，通过新的正式意图传入 `selected_targets`；调度器会先把它归一化为正式的 `step5_selected_coords` / `step5_selected_names`，再基于 Step4 API 生成过滤后的输入文件执行 Step5。
-- 人工输入的 `selected_targets` 使用依赖包完整坐标，调度器必须严格匹配唯一目标；`selection_key` 仅供结构化自动化输入兼容解析。只有用户仅给出依赖名称时，才允许按 `artifactId` 名称筛选命中的全部候选。
-正式流程默认不设置 Step5 外层超时；仅在主状态中显式写入 `step5_timeout` 时才启用限制。
-
-规则：
-
-- `max_depth` 默认值为 `5`，表示最大累计追踪代价，不是固定跳数
-- 全高置信度边时通常可追踪约 5 跳；混合高/中置信度边时可达跳数会相应减少
-- 只要回溯到系统代码即可记为 `reachable`，不要求必须到达最外层 HTTP 入口
-- `summary.json` 中的 `analysis_status` / `reason_code` 用于解释 reachable / not_impacted / uncertain / not_found_in_static_analysis / not_analyzed 的成因；`by_api/*.json` 中的 `evidence_paths` 是逐边证据
-- 若 `all_changed_apis.csv` 为空，直接跳过并说明“Step4 未提取到可追踪的变更 API”
-- 若指定 `selected_targets`，优先按依赖包完整坐标精确匹配；结构化自动化输入仍可使用 `selection_key`。解析后归一化为程序内部的 `step5_selected_coords` / `step5_selected_names`
-- `selected_targets` 基于完整候选集匹配，不依赖终端是否展示该候选
-- 显式重跑 Step1 或 Step5 前，调度层会先清空该步骤全部正式输出，避免旧的制品、catalog、framework adapter 或对齐文件污染新一轮结果
-- 若直接指定 `step5_selected_coords`，按 `coord` 精确匹配；若指定 `step5_selected_names`，按 `coord` 的 `artifactId` 精确匹配
-- 若筛选条件未在 Step4 API 目标中命中，Step5 会直接报错，避免静默分析错范围
-- 正式流程会向 `stderr` 输出 `[进度][系统触达证据][发现源码/构建调用图/跨依赖检查/追踪系统触达/生成结果/完成]` 等用户可读进度
-- Step5 会生成内部查询索引 `.upgrade-report/.runtime/indexes/s5_query_index.json`。当用户询问某个方法、依赖坐标/ArtifactId 或 Java 包前缀的调用链时，Claude Code 可使用 `scripts/s5_query_call_chain.py` 的 `--method`、`--coord` 或 `--package` 即时查询；默认只把调用链返回给用户，不额外落查询结果文件。
-- 该查询是只读旁路能力：Step5 完成后任意时刻都可使用；它不会改写主流程状态。
-- 当 `reason_code` 为 `DIRECT_CLASS_USAGE`、`DIRECT_FIELD_USAGE`、`DIRECT_STATIC_IMPORT_USAGE` 时，表示 Step5 已直接在业务源码中找到类型/字段引用证据，而不是传统方法调用链
-- `DIRECT_CLASS_USAGE` 仅接受声明类型、import（含 wildcard import）精确命中或 FQCN 直写等正式类型证据；若 simple name 已被 import 解析到其他 FQCN，不会再升级为直接类型命中
-- 当 `reason_code` 为 `PACKAGED_DEPENDENCY_BYTECODE_USAGE` 时，表示 Step5 已在运行时依赖 jar 的字节码里稳定命中目标符号；若该依赖仍有可用源码映射，Step5 会先继续尝试回溯到业务代码，只有源码追踪未能确认业务入口时才保守收敛为 `uncertain`
-- 对依赖源码或资源配置中的明确运行时主动入口，Step5 会把 `@Scheduled`、`@PostConstruct`、Spring Runner/Lifecycle、Quartz `Job.execute`、Spring XML `task:scheduled`、`init-method`、`MethodInvokingJobDetailFactoryBean` 等入口视为框架/容器可触发的链路起点；这类链路即使没有业务源码调用方，也可以证明运行时影响。
-- Step5 运行时会在进度日志输出 `business_graph_ready`、`source_graph_ready`、`business_bytecode_collected`、`indirect_usage_collected`、`evidence_merged`、`trace_complete` 六个内存观测点。对应的当前/峰值 RSS、方法数和反向边规模保存在 `.upgrade-report/.runtime/observability/step5_timing.csv` 的 `memory` 段，可用于定位内存峰值阶段；这些指标不参与影响结论。
-- JPA `@PrePersist`、`@PostPersist`、`@PreUpdate`、`@PostUpdate`、`@PreRemove`、`@PostRemove`、`@PostLoad` 会记录为实体生命周期回调；若静态证据不能证明生命周期实际触发，入口保持 conditional。`@Async` 本身不触发方法，只改变已有调用的执行线程，因此不会单独制造入口。
-
-若 `uncertain` 或 `not_analyzed` 偏多，建议优先按这个顺序排查：
-
-- 查看 `.upgrade-report/evidence/call_chain/summary.json` 中的 `uncertain_apis` 与 `not_analyzed_apis`
-- 若出现 `DEPENDENCY_SOURCE_MAPPING_MISSING`，优先补齐 `dependency_source_dirs` 后重跑 Step5
-- 若出现 `PACKAGED_DEPENDENCY_BYTECODE_USAGE`，优先打开命中的无源码依赖条目；如需继续证明是否回到系统源码，再补 `dependency_source_dirs`
-- 若出现 `GRAPH_TRUNCATED`，提高 `--max-methods / --max-reverse-edges / --max-incoming-per-key`
-- 若出现 `INTERFACE_OR_ABSTRACT_API` 或 `RESOURCE_OR_REFLECTION`，不要把结果解释为“未影响”
-- 再打开 `.upgrade-report/evidence/call_chain/by_api/*.json`，核对 `reason_code` 与 `evidence_paths`
-
-通过 `run_step.py` 恢复时，推荐直接使用：
-
-```bash
-python3 "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
-  --project-dir . \
-  --report-dir .upgrade-report \
-  --response-json '{"intent_patch":{"action":"rerun_current_step","set":{"dependency_source_dirs":["D:/repo/dependency-a"]},"notes":"补依赖源码目录后复跑 Step5"}}'
-```
-
-### 门控
-
-```bash
-python3 "${CLAUDE_SKILL_DIR}/scripts/gate.py" --step call_chain --report-dir .upgrade-report
-```
-
-## Step 6：汇总报告
-
-```bash
-export PYTHONUTF8=1
-python3 "${CLAUDE_SKILL_DIR}/scripts/s6_report.py" \
-  --report-dir .upgrade-report \
-  --output-findings .upgrade-report/.runtime/findings/s6_findings.json \
-  --output-report .upgrade-report/deliverables/report.md
-```
-
-说明：
-
-- `deliverables/report.md` 固定按“依赖层面结论 → API 及调用关系 → 用户可见文件说明”组织，不在依赖结论前重复报告范围或工程背景
-- 依赖和 API 都先展示“变化总数、已完成分析、未完成分析”；确认有影响数量是已完成分析结果的子集，不与完成状态并列成互斥分类
-- 已完成分析的结果合并在同一张表中，通过“分析结论”区分确认有影响、确认不受影响和未确认影响
-- 只有真正没有完成分析的依赖或 API 才进入“未完成分析”，并在主报告中直接记录具体原因；已完成分析但未发现当前系统调用关系的结果仍属于已完成分析
-- 主报告按依赖坐标分组，完整展示全部“已确认影响”和“结论未确定”API；“已确认不受影响”和“静态分析未找到路径”只展示统计数量。只有本次未完成分析的 API 可以采用限量展示，但必须同时标明展示数、总数、未展示数，并链接 `deliverables/all-impact-details.md`
-- `deliverables/all-affected-dependencies.md` 保存全部变化依赖；`deliverables/all-impact-details.md` 保存全部变化 API 和完整调用关系；两者不得使用同一个链接替代
-- 主报告必须为五态结论提供对应的用户行动说明，但不得把静态未命中表述为安全，也不得越过证据生成发布判断、修改判断、具体实现方案或验证完成结论
-- `alerts.csv` 是原始分析记录，不替代完整 API 与调用关系明细，也不作为普通读者理解主报告的前置条件
-- 内部步骤编号、原因码、状态枚举、`api_id`/`path_status` 筛选说明和 `.runtime/` 文件目录不得进入主阅读路径；它们保留在结构化 findings、证据台账或深度排障文档中
-- “用户可见文件说明”必须解释每个主阅读文件包含什么、覆盖全量还是节选，以及对应主报告的哪一部分
-
-## 每步完成后的固定动作
-
-### 保存主状态摘要
-
-若通过 `run_step.py` 执行，本动作会自动完成。手动执行时可使用：
-
-```bash
-export PYTHONUTF8=1
-python3 "${CLAUDE_SKILL_DIR}/scripts/context_compress.py" save \
-  --report-dir .upgrade-report \
-  --completed-step-id <step1|step2|step3|step4|step5|step6> \
-  --output .upgrade-report/context_summary.json
-```
-
-### 查看错误摘要
-
-```bash
-export PYTHONUTF8=1
-python3 "${CLAUDE_SKILL_DIR}/scripts/error_handler.py" summary --report-dir .upgrade-report
-```
-
-### 首次运行环境诊断
-
-```bash
-python3 "${CLAUDE_SKILL_DIR}/scripts/error_handler.py" summary --report-dir .upgrade-report
-```
-
-## 稳定执行建议
-
-- 优先依赖文件状态，不依赖对话记忆
-- 任一步失败后，不要直接尝试下一步
-- 每一步结束都简要记录：输入是否齐全、输出是否生成、门控是否通过
-- 优先让 `run_step.py` 负责门控与主状态更新，而不是在对话里手动记流程
-- `scripts/step_manifest.json` 是机器可读流程定义，新增步骤时先更新它
+release profile 使用 unittest discovery，新增测试不会因未登记而漏跑。对重要引擎改动还必须执行同一真值输入的 `main`/当前分支对比，逐项核对依赖身份、变化对象、路径、漏报、误报、覆盖边界、耗时和内存；只比较总数不构成有效证据。

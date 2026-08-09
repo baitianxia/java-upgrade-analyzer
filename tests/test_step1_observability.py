@@ -16,7 +16,6 @@ if str(SCRIPTS) not in sys.path:
 import compat
 import run_step
 import s1_dep_diff
-import s4_jar_compare
 import step1_observability
 
 
@@ -307,66 +306,6 @@ class Step1ObservabilityTest(unittest.TestCase):
 
         self.assertIn(observability / "step4_timing.csv", step4_paths)
         self.assertIn(observability / "step5_timing.csv", step5_paths)
-        self.assertIn(observability / "step5_diagnostics.jsonl", step5_paths)
-        self.assertIn(observability / "step5_progress.json", step5_paths)
-
-    def test_step4_timing_records_resources_and_external_processes(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            timing = s4_jar_compare.Step4TimingRecorder(tmp)
-            timing.record(
-                "dependency.japicmp",
-                status="success",
-                elapsed=0.25,
-                external_process_count=1,
-            )
-            timing.flush()
-
-            with Path(timing.path).open(encoding="utf-8", newline="") as handle:
-                rows = list(csv.DictReader(handle))
-
-        self.assertEqual(rows[0]["external_process_count"], "1")
-        self.assertGreater(float(rows[0]["peak_rss_mb"]), 0.0)
-
-    def test_step4_timing_exposes_and_updates_running_operation_immediately(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            timing = s4_jar_compare.Step4TimingRecorder(tmp)
-            timing.record(
-                "dependency.japicmp",
-                coord="com.example:demo",
-                old_version="1.0",
-                new_version="2.0",
-                status="running",
-                message="正在执行 JApiCmp 二进制 API 对比",
-                details={"dependency_index": 2, "dependency_total": 7},
-            )
-
-            with Path(timing.path).open(encoding="utf-8-sig", newline="") as handle:
-                running_rows = list(csv.DictReader(handle))
-
-            self.assertEqual(len(running_rows), 1)
-            self.assertEqual(running_rows[0]["status"], "running")
-            self.assertEqual(running_rows[0]["coord"], "com.example:demo")
-            self.assertIn("JApiCmp", running_rows[0]["message"])
-            self.assertEqual(running_rows[0]["ended_at"], "")
-
-            timing.record(
-                "dependency.japicmp",
-                coord="com.example:demo",
-                old_version="1.0",
-                new_version="2.0",
-                status="success",
-                elapsed=0.25,
-                external_process_count=1,
-            )
-            with Path(timing.path).open(encoding="utf-8-sig", newline="") as handle:
-                completed_rows = list(csv.DictReader(handle))
-
-        self.assertEqual(len(completed_rows), 2)
-        self.assertEqual(completed_rows[0]["status"], "running")
-        self.assertIn("JApiCmp", completed_rows[0]["message"])
-        self.assertTrue(completed_rows[0]["started_at"])
-        self.assertEqual(completed_rows[1]["status"], "success")
-        self.assertTrue(completed_rows[1]["ended_at"])
 
 
 if __name__ == "__main__":

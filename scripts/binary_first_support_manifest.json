@@ -1,17 +1,7 @@
 {
   "schema": "java-upgrade-analyzer.binary-first-support-manifest.v1",
   "status": "binary_authority_v1_supported_scope",
-  "authority": "fixed_per_generation_engine_mode",
-  "engine_modes": {
-    "implemented": [
-      "legacy",
-      "shadow",
-      "binary_strict",
-      "binary_with_legacy_fallback"
-    ],
-    "reserved_fail_closed": [],
-    "fallback_contract": "binary failure discards the attempted generation; only binary_with_legacy_fallback may start one complete legacy_fallback generation; per-fact/per-edge mixing is forbidden"
-  },
+  "authority": "binary_first_only_fail_closed",
   "artifact_diff_support_manifest": {
     "authority": "artifact_local_observation_then_runtime_selection_decision",
     "parser_contract": {

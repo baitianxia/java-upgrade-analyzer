@@ -1,24 +1,19 @@
 {
   "schema_version": 1,
   "oracle_files": [
-    "scripts/dual_line_accuracy.py",
-    "scripts/exhaustive_api_oracle.py",
-    "scripts/final_artifact_edge_oracle.py",
-    "scripts/runtime_coverage_oracle.py",
-    "scripts/third_party_jdeps_oracle.py",
-    "scripts/third_party_jdk_oracle.py"
+    "scripts/binary_validation_oracle.py",
+    "scripts/final_artifact_edge_oracle.py"
   ],
   "forbidden_modules": [
-    "business_bytecode_graph",
-    "confidence_weighted_tracer",
-    "framework_adapters",
-    "indirect_usage_analyzer",
-    "s4_jar_compare",
-    "s5_call_chain_engine_integrated",
-    "step5_evidence_ingestion"
+    "binary_artifact_diff",
+    "binary_asm_helper",
+    "binary_decision_engine",
+    "binary_fact_store",
+    "binary_output",
+    "binary_runtime_reconciler",
+    "binary_trace_engine"
   ],
   "allowed_schema_modules": [
-    "step5_evidence_model",
-    "signature_utils"
+    "binary_first_contract"
   ]
 }

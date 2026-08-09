@@ -12,8 +12,6 @@ from path_runtime import bounded_path_component
 from pipeline_constants import (
     PER_DEPENDENCY_CANDIDATE_HITS_FILE as _PER_DEPENDENCY_CANDIDATE_HITS_FILE,
     PER_DEPENDENCY_DIRNAME as _PER_DEPENDENCY_DIRNAME,
-    PER_DEPENDENCY_REMOVED_JAR_SYMBOLS_FILE as _PER_DEPENDENCY_REMOVED_JAR_SYMBOLS_FILE,
-    PER_DEPENDENCY_RESOLVED_TARGETS_FILE as _PER_DEPENDENCY_RESOLVED_TARGETS_FILE,
     PER_DEPENDENCY_SUMMARY_FILE as _PER_DEPENDENCY_SUMMARY_FILE,
     STEP3_RISK_CANDIDATES_FILE as _STEP3_RISK_CANDIDATES_FILE,
 )
@@ -36,17 +34,16 @@ ALL_CHANGED_APIS_FIELDS = [
                      # 明确告诉 Step 5 当前变更符号的类型，避免靠命名猜测
     "api_signature", # 参数签名，如 (String) 或 (ClassLoader[])
                      # 仅 method/constructor 使用；空字符串表示无参数或签名未知
-    "confirmed",     # "true"  = JApiCmp 二进制确认，结论可靠
-                     # "false" = changelog 推断，需人工验证
+    "confirmed",     # binary-first 正式投影固定为 "true"
     "severity",      # P0 / P1 / P2
-    "source",        # japicmp / gitdiff / changelog
-    "binary_compatible", # true / false / unknown（JApiCmp XML）
-    "source_compatible", # true / false / unknown（JApiCmp XML）
+    "source",        # classfile_contract
+    "binary_compatible", # true / false / unknown
+    "source_compatible", # true / false / unknown
     "compatibility_flags", # 以 | 分隔的结构化兼容性原因
     "reason_code",    # 稳定机器原因码
     "data_contract_evidence", # DTO/数据对象识别依据；仅 DATA_FIELD_* 使用
     "evidence_path", # 产生该结论的证据文件
-    "old_value",     # 字段/常量旧值（如 JApiCmp XML 可提供）
+    "old_value",     # 字段/常量旧值（由 classfile 证据提供）
     "new_value",     # 字段/常量新值
     "field_descriptor", # JVM 字段描述符；仅 field 使用
     "old_field_has_constant_value", # true/false；仅完整 classfile 证据时写入
@@ -88,21 +85,12 @@ DEFAULT_SEVERITY = {
 }
 
 # source 枚举
-SOURCES = [
-    "japicmp",
-    "gitdiff",
-    "jar_bytecode",
-    "changelog",
-    "old_jar",
-    "classfile_contract",
-]
+SOURCES = ["classfile_contract"]
 
 SYMBOL_KINDS = {"method", "field", "class", "constructor"}
 
 PER_DEPENDENCY_DIRNAME = _PER_DEPENDENCY_DIRNAME
 PER_DEPENDENCY_SUMMARY_FILE = _PER_DEPENDENCY_SUMMARY_FILE
-PER_DEPENDENCY_RESOLVED_TARGETS_FILE = _PER_DEPENDENCY_RESOLVED_TARGETS_FILE
-PER_DEPENDENCY_REMOVED_JAR_SYMBOLS_FILE = _PER_DEPENDENCY_REMOVED_JAR_SYMBOLS_FILE
 PER_DEPENDENCY_CANDIDATE_HITS_FILE = _PER_DEPENDENCY_CANDIDATE_HITS_FILE
 STEP3_RISK_CANDIDATES_FILE = _STEP3_RISK_CANDIDATES_FILE
 CHANGED_DEPENDENCIES_CSV = "changed_dependencies.csv"

@@ -8,6 +8,7 @@ from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
+import time
 from typing import Any, Mapping
 
 from binary_artifact_diff import ArtifactSnapshot, compare_artifact_snapshots, snapshot_archive
@@ -72,14 +73,14 @@ def _load_json(path: str | Path) -> dict[str, Any]:
     return value
 
 
-def _require_binary_authority_gates(engine_mode: str, support: Mapping[str, Any]) -> None:
-    if engine_mode not in {"binary_strict", "binary_with_legacy_fallback"}:
-        return
-    if engine_mode not in set((support.get("engine_modes") or {}).get("implemented") or ()):
-        raise BinaryPipelineError("BINARY_ENGINE_MODE_NOT_SUPPORTED", engine_mode)
+def _require_binary_authority_gates(support: Mapping[str, Any]) -> None:
+    if support.get("authority") != "binary_first_only_fail_closed":
+        raise BinaryPipelineError(
+            "BINARY_AUTHORITY_MANIFEST_INVALID", str(support.get("authority") or "")
+        )
     oracle = support.get("oracle_support_manifest") or {}
     if not oracle.get("production_binary_authority_switch_allowed"):
-        raise BinaryPipelineError("BINARY_ORACLE_AUTHORITY_GATE_BLOCKED", engine_mode)
+        raise BinaryPipelineError("BINARY_ORACLE_AUTHORITY_GATE_BLOCKED", "binary_first")
     performance_contract = support.get("performance_gate") or {}
     try:
         performance = _load_json(PERFORMANCE_GATE_PATH)
@@ -319,7 +320,9 @@ def _source_methods(source_config: Mapping[str, Any]):
     )
 
 
-def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path, engine_mode: str) -> dict[str, Any]:
+def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[str, Any]:
+    pipeline_started = time.perf_counter()
+    phase_timings: list[dict[str, Any]] = []
     if config.get("schema") != "java-upgrade-analyzer.binary-pipeline-input.v1":
         raise BinaryPipelineError("BINARY_PIPELINE_CONFIG_SCHEMA_INVALID", str(config.get("schema")))
     asm_jar = config.get("asm_jar") or None
@@ -353,7 +356,7 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path, engine_m
     )
     capability = RuntimeCapabilityPolicy(**dict(config.get("runtime_capability_policy") or {}))
     support = json.loads(SUPPORT_MANIFEST_PATH.read_text(encoding="utf-8"))
-    _require_binary_authority_gates(engine_mode, support)
+    _require_binary_authority_gates(support)
     scope_fields = {
         "analysis_observability_scope": str(config.get("analysis_observability_scope") or "binary-static-v1"),
         "artifact_diff_support_manifest_identity": _identity(
@@ -382,12 +385,18 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path, engine_m
     scope_fields["field_coverage"] = {key: "known" for key in AnalysisScope.REQUIRED_FIELDS}
     analysis_scope = AnalysisScope(scope_fields)
     context = AnalysisContext(runtime_comparison, analysis_scope)
+    phase_timings.append({
+        "phase": "input_and_runtime_profile",
+        "elapsed_seconds": round(time.perf_counter() - pipeline_started, 6),
+        "artifact_count": len(base_artifacts) + len(current_artifacts),
+    })
 
     with short_temporary_directory(prefix="binary-pipeline") as temp_text:
         temp = Path(temp_text)
         base_store = BinaryFactStore(temp / "base.sqlite")
         current_store = BinaryFactStore(temp / "current.sqlite")
         try:
+            artifact_phase_started = time.perf_counter()
             cache_metrics = {
                 "artifact_snapshot_hits": 0,
                 "artifact_snapshot_misses": 0,
@@ -474,14 +483,25 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path, engine_m
                     current_instance.identity if current_instance else "",
                 )
                 pairings.append(pairing)
-                diffs.append(compare_artifact_snapshots(
+                artifact_diff = compare_artifact_snapshots(
                     base_snapshot,
                     current_snapshot,
                     comparison_or_runtime_scope={
                         "runtime_comparison_identity": runtime_comparison.identity,
                         "cross_version_artifact_pairing_identity": pairing.identity,
                     },
-                ))
+                )
+                artifact_diff["logical_dependency_lineage"] = lineage
+                diffs.append(artifact_diff)
+            phase_timings.append({
+                "phase": "artifact_fact_build_and_local_diff",
+                "elapsed_seconds": round(
+                    time.perf_counter() - artifact_phase_started, 6
+                ),
+                "artifact_count": len(base_artifacts) + len(current_artifacts),
+                "pairing_count": len(pairings),
+            })
+            reconciliation_started = time.perf_counter()
             base_runtime = RuntimeReconciler(
                 base_store, base_profile, base_platform,
                 analysis_context_identity=context.identity,
@@ -492,6 +512,13 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path, engine_m
                 analysis_context_identity=context.identity,
                 capability_policy=capability,
             ).reconcile()
+            phase_timings.append({
+                "phase": "target_independent_runtime_reconciliation",
+                "elapsed_seconds": round(
+                    time.perf_counter() - reconciliation_started, 6
+                ),
+            })
+            decision_started = time.perf_counter()
             source_overlay = None
             source_methods = ()
             if config.get("source_overlay"):
@@ -527,12 +554,27 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path, engine_m
                     current_runtime,
                     analysis_context_identity=context.identity,
                 )
+            phase_timings.append({
+                "phase": "decision_and_projection_freeze",
+                "elapsed_seconds": round(time.perf_counter() - decision_started, 6),
+                "authoritative_change_fact_count": len(
+                    decisions.authoritative_decisions
+                ),
+                "diagnostic_candidate_fact_count": len(decisions.diagnostic_decisions),
+            })
+            trace_started = time.perf_counter()
             traces = BinaryTraceEngine(
                 current_store, current_profile, current_runtime, decisions,
                 inline_overlay=inline_overlay,
                 max_visited_nodes=int(config.get("max_trace_nodes") or 1_000_000),
                 max_paths_per_target=int(config.get("max_paths_per_target") or 20),
             ).build()
+            phase_timings.append({
+                "phase": "binary_trace",
+                "elapsed_seconds": round(time.perf_counter() - trace_started, 6),
+                "formal_trace_result_count": len(traces.formal_results),
+                "candidate_trace_result_count": len(traces.candidate_results),
+            })
             base_store.connection.commit()
             current_store.connection.commit()
             parser_identities = sorted({
@@ -710,12 +752,12 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path, engine_m
                         separators=(",", ":"),
                     ) + "\n"
                 ).encode("utf-8")
+            generation_write_started = time.perf_counter()
             manifest = write_binary_generation(
                 output_root,
                 decisions,
                 traces,
                 current_profile,
-                engine_mode=engine_mode,
                 policy_identities={
                     "support_manifest": _sha256_file(SUPPORT_MANIFEST_PATH),
                     "runtime_capability": capability.identity,
@@ -738,17 +780,33 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path, engine_m
                 },
                 source_overlay=source_overlay,
                 additional_sidecars=additional,
-                activate=False,
             )
+            phase_timings.append({
+                "phase": "immutable_generation_write",
+                "elapsed_seconds": round(
+                    time.perf_counter() - generation_write_started, 6
+                ),
+            })
+            validation_started = time.perf_counter()
             validation = validate_generation(config, manifest["generation_directory"])
+            phase_timings.append({
+                "phase": "independent_validation",
+                "elapsed_seconds": round(time.perf_counter() - validation_started, 6),
+                "issue_count": len(validation.get("issues") or ()),
+            })
             if validation["status"] != "passed":
                 raise BinaryPipelineError(
                     "BINARY_INDEPENDENT_VALIDATION_FAILED",
                     json.dumps(validation["issues"][:20], ensure_ascii=False),
                 )
+            activation_started = time.perf_counter()
             manifest["active_generation_descriptor"] = activate_binary_generation(
                 output_root, manifest, validation_result=validation
             )
+            phase_timings.append({
+                "phase": "validated_generation_activation",
+                "elapsed_seconds": round(time.perf_counter() - activation_started, 6),
+            })
             observability = output_root / "binary_observability"
             observability.mkdir(parents=True, exist_ok=True)
             cache_metrics_path = observability / "latest_cache_metrics.json"
@@ -758,6 +816,25 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path, engine_m
                         "schema": "java-upgrade-analyzer.binary-cache-metrics.v1",
                         "result_generation_identity": manifest["result_generation_identity"],
                         **cache_metrics,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ) + "\n",
+                encoding="utf-8",
+            )
+            total_elapsed_seconds = round(time.perf_counter() - pipeline_started, 6)
+            phase_timings_path = observability / "latest_phase_timings.json"
+            phase_timings_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "java-upgrade-analyzer.binary-phase-timings.v1",
+                        "result_generation_identity": manifest[
+                            "result_generation_identity"
+                        ],
+                        "total_elapsed_seconds": total_elapsed_seconds,
+                        "phases": phase_timings,
+                        "non_authoritative_observability": True,
                     },
                     ensure_ascii=False,
                     sort_keys=True,
@@ -784,6 +861,9 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path, engine_m
                 "validation_result_path": validation["validation_result_path"],
                 "cache_metrics": cache_metrics,
                 "cache_metrics_path": str(cache_metrics_path),
+                "phase_timings": phase_timings,
+                "phase_timings_path": str(phase_timings_path),
+                "total_elapsed_seconds": total_elapsed_seconds,
             }
         finally:
             base_store.close()
@@ -794,16 +874,9 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Run the binary-first analysis generation")
     parser.add_argument("--config", required=True)
     parser.add_argument("--output-root", required=True)
-    parser.add_argument(
-        "--engine-mode",
-        choices=("shadow", "binary_strict", "binary_with_legacy_fallback"),
-        default="binary_strict",
-    )
     parser.add_argument("--result-json", default="")
     args = parser.parse_args(argv)
-    result = run_pipeline(
-        _load_json(args.config), output_root=args.output_root, engine_mode=args.engine_mode
-    )
+    result = run_pipeline(_load_json(args.config), output_root=args.output_root)
     encoded = json.dumps(result, ensure_ascii=False, indent=2) + "\n"
     if args.result_json:
         Path(args.result_json).parent.mkdir(parents=True, exist_ok=True)

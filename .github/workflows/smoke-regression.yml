@@ -99,5 +99,5 @@ jobs:
 
       - name: Run Step5 Quality Gate
         run: >-
-          python scripts/quality_gate.py --profile step5 --skip-real
+          python scripts/quality_gate.py --profile step5
           --json-out /tmp/jua-step5-quality-gate.json

@@ -17,7 +17,6 @@ from diagnostic_contract import (
     diagnostic_contract_metadata,
     normalize_component_reason_codes,
 )
-from pipeline_constants import STEP5_ARTIFACT_BYTECODE_CATALOG_FILE
 
 
 COVERAGE_STATUSES = ("complete", "partial", "insufficient", "not_applicable")
@@ -1117,98 +1116,60 @@ def derive_coverage_report(report_dir, project_scope=None):
 
     api_changes_dir = report / "evidence" / "api_changes"
     api_path = api_changes_dir / "all_changed_apis.csv"
-    dependency_status_csv = api_changes_dir / "dependency_analysis_status.csv"
-    dependency_status_json = api_changes_dir / "dependency_analysis_status.json"
-    dependency_status_md = api_changes_dir / "dependency_analysis_status.md"
+    step4_summary_path = api_changes_dir / "summary.json"
     api_rows = _csv_rows(api_path)
-    step4_coverage_path = report / ".runtime" / "coverage" / "s4_coverage.json"
-    step4_coverage = {}
-    if step4_coverage_path.is_file():
+    if step4_summary_path.is_file():
         try:
-            step4_coverage = json.loads(step4_coverage_path.read_text(encoding='utf-8'))
+            step4_summary = json.loads(step4_summary_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            step4_coverage = {}
-    binary_component = dict(step4_coverage.get('binary_api_diff') or {})
-    if api_path.is_file():
-        binary_status = binary_component.get('status') or "partial"
-        binary_reasons = list(binary_component.get('reason_codes') or (
-            [] if binary_status == 'complete' else ['step4_coverage_missing']
-        ))
+            step4_summary = {}
+    else:
+        step4_summary = {}
+    if api_path.is_file() and step4_summary.get("authority") == "binary_first":
+        binary_status = (
+            "complete"
+            if step4_summary.get("decision_coverage_status") == "complete"
+            else "partial"
+        )
+        binary_reasons = list(
+            (step4_summary.get("coverage") or {}).get("decision_coverage_gaps") or ()
+        )
+    elif api_path.is_file():
+        binary_status, binary_reasons = "insufficient", ["binary_step4_summary_invalid"]
     else:
         binary_status, binary_reasons = "not_applicable", ["step4_not_executed"]
     components.append({
-        "id": "binary_api_diff", "status": binary_status, "reason_codes": binary_reasons,
+        "id": "binary_authority_decision", "status": binary_status,
+        "reason_codes": binary_reasons,
         "evidence": [
             value
             for path, value in (
                 (api_path, "evidence/api_changes/all_changed_apis.csv"),
-                (
-                    dependency_status_csv,
-                    "evidence/api_changes/dependency_analysis_status.csv",
-                ),
-                (
-                    dependency_status_json,
-                    "evidence/api_changes/dependency_analysis_status.json",
-                ),
-                (
-                    dependency_status_md,
-                    "evidence/api_changes/dependency_analysis_status.md",
-                ),
+                (step4_summary_path, "evidence/api_changes/summary.json"),
+                (api_changes_dir / "changed_dependencies.md",
+                 "evidence/api_changes/changed_dependencies.md"),
+                (api_changes_dir / "review.md", "evidence/api_changes/review.md"),
             )
             if path.is_file()
         ],
-        "metrics": {"changed_apis": len(api_rows), **(binary_component.get('metrics') or {})},
-    })
-
-    behavior_files = sorted(api_changes_dir.glob("*_gitdiff_api_changes.txt"))
-    behavior_bytecode_files = sorted(api_changes_dir.glob("*_bytecode_behavior.json"))
-    behavior_component = dict(step4_coverage.get('behavior_diff') or {})
-    if behavior_component:
-        behavior_status = behavior_component.get('status') or 'insufficient'
-        behavior_reasons = list(behavior_component.get('reason_codes') or [])
-    elif not dep_path.is_file():
-        behavior_status, behavior_reasons = "not_applicable", ["step1_not_executed"]
-    elif not dep_rows:
-        behavior_status, behavior_reasons = "not_applicable", ["no_dependency_changes"]
-    elif behavior_files:
-        behavior_status, behavior_reasons = "complete", []
-    else:
-        behavior_status, behavior_reasons = "partial", ["dependency_source_diff_not_available"]
-    components.append({
-        "id": "behavior_diff", "status": behavior_status, "reason_codes": behavior_reasons,
-        "evidence": [
-            str(path.relative_to(report))
-            for path in [*behavior_files, *behavior_bytecode_files]
-        ],
-        "metrics": behavior_component.get('metrics') or {},
+        "metrics": {
+            "changed_apis": len(api_rows),
+            "dependency_count": int(step4_summary.get("dependency_count") or 0),
+            "authoritative_change_facts": int(
+                step4_summary.get("authoritative_change_fact_count") or 0
+            ),
+        },
     })
 
     call_chain_dir = report / "evidence" / "call_chain"
     step5_summary = call_chain_dir / "summary.json"
-    graph_stats = {}
     if step5_summary.is_file():
         try:
             step5_payload = json.loads(step5_summary.read_text(encoding="utf-8"))
-            graph_stats = (
-                step5_payload.get('graph_stats')
-                or (step5_payload.get('meta') or {}).get('graph_stats')
-                or {}
-            )
         except (OSError, json.JSONDecodeError):
-            step5_payload, graph_stats = {}, {}
+            step5_payload = {}
     else:
         step5_payload = {}
-    bytecode = dict(graph_stats.get("business_bytecode") or {})
-    components.append({
-        "id": "business_bytecode_graph",
-        "status": bytecode.get("status") or ("partial" if step5_summary.is_file() else "not_applicable"),
-        "reason_codes": (
-            [] if bytecode.get("status") == "complete"
-            else (["compiled_business_classes_not_available"] if step5_summary.is_file() else ["step5_not_executed"])
-        ),
-        "evidence": ["evidence/call_chain/summary.json"] if step5_summary.is_file() else [],
-        "metrics": bytecode,
-    })
 
     if step5_summary.is_file():
         total = int(step5_payload.get('total_apis') or 0)
@@ -1241,92 +1202,14 @@ def derive_coverage_report(report_dir, project_scope=None):
         },
     })
 
-    alignment_path = call_chain_dir / 'source_artifact_alignment.json'
-    if alignment_path.is_file():
-        try:
-            alignment = json.loads(alignment_path.read_text(encoding='utf-8'))
-        except (OSError, json.JSONDecodeError):
-            alignment = {'status': 'unverified', 'reason_codes': ['source_alignment_invalid']}
-        alignment_state = alignment.get('status')
-        alignment_status = 'complete' if alignment_state == 'aligned' else 'partial'
-        alignment_reasons = list(alignment.get('reason_codes') or [])
-    else:
-        alignment, alignment_status, alignment_reasons = {}, 'not_applicable', ['step5_not_executed']
-    components.append({
-        'id': 'source_artifact_alignment',
-        'status': alignment_status,
-        'reason_codes': alignment_reasons,
-        'evidence': ['evidence/call_chain/source_artifact_alignment.json'] if alignment_path.is_file() else [],
-        'metrics': alignment,
-    })
-
-    artifact_bytecode = dict(graph_stats.get("artifact_bytecode") or {})
-    artifact_status = artifact_bytecode.get("status") or (
-        "partial" if step5_summary.is_file() else "not_applicable"
-    )
-    components.append({
-        "id": "artifact_bytecode_dependencies",
-        "status": artifact_status,
-        "reason_codes": list(artifact_bytecode.get("reason_codes") or (
-            [] if artifact_status == "complete"
-            else (["s5_artifact_bytecode_catalog_missing"] if step5_summary.is_file() else ["step5_not_executed"])
-        )),
-        "evidence": [
-            item for item in (
-                f".runtime/cache/{STEP5_ARTIFACT_BYTECODE_CATALOG_FILE}",
-                "evidence/call_chain/summary.json",
-            )
-            if (report / item).is_file()
-        ],
-        "metrics": artifact_bytecode,
-    })
-
-    indirect_usage = dict(graph_stats.get("indirect_usage") or {})
-    indirect_status = indirect_usage.get("status") or (
-        "partial" if step5_summary.is_file() else "not_applicable"
-    )
-    components.append({
-        "id": "indirect_usage_matrix",
-        "status": indirect_status,
-        "reason_codes": list(indirect_usage.get("reason_codes") or (
-            [] if indirect_status in {"complete", "not_applicable"}
-            else (["indirect_usage_coverage_missing"] if step5_summary.is_file() else ["step5_not_executed"])
-        )),
-        "evidence": ["evidence/call_chain/summary.json"] if step5_summary.is_file() else [],
-        "metrics": {
-            "analyzers": indirect_usage.get("analyzers") or {},
-            "matrix": indirect_usage.get("matrix") or {},
-            "source_methods_scanned": int(indirect_usage.get("source_methods_scanned") or 0),
-            "resource_files_scanned": int(indirect_usage.get("resource_files_scanned") or 0),
-            "merged_edges": int(indirect_usage.get("merged_edges") or 0),
-        },
-    })
-
-    adapter_path = call_chain_dir / "framework_adapters.json"
-    if adapter_path.is_file():
-        try:
-            adapters = json.loads(adapter_path.read_text(encoding="utf-8")).get("adapters") or []
-        except (OSError, json.JSONDecodeError):
-            adapters = []
-        for adapter in adapters:
-            components.append({
-                "id": f"framework_adapter:{adapter.get('adapter')}",
-                "status": adapter.get("status") or "insufficient",
-                "reason_codes": ["adapter_execution_errors"] if adapter.get("errors") else [],
-                "evidence": ["evidence/call_chain/framework_adapters.json"],
-                "metrics": adapter.get("metrics") or {},
-            })
-
     components = [
         normalize_component_reason_codes(component)
         for component in components
     ]
     overall = aggregate_coverage_status(item["status"] for item in components)
     critical_ids = {
-        'project_scope', 'dependency_diff', 'build_provenance', 'binary_api_diff',
-        'behavior_diff',
-        'artifact_bytecode_dependencies', 'source_artifact_alignment',
-        'indirect_usage_matrix',
+        'project_scope', 'dependency_diff', 'build_provenance',
+        'binary_authority_decision', 'business_reachability',
     }
     critical_incomplete = [
         item['id'] for item in components
@@ -1345,9 +1228,8 @@ def derive_coverage_report(report_dir, project_scope=None):
 
 def write_coverage_report(report_dir, project_scope=None):
     payload = derive_coverage_report(report_dir, project_scope=project_scope)
-    # Direct/legacy script invocations do not carry the confirmed project scope.
-    # Keep their coverage visible but advisory; orchestrated runs pass the scope
-    # and receive enforceable standard-mode gates.
+    # Direct component invocations do not carry the confirmed project scope.
+    # Keep their coverage visible but advisory; orchestrated runs pass the scope.
     payload['enforcement'] = (
         'required' if project_scope and project_scope.get('status') in {'complete', 'partial'}
         else 'advisory'

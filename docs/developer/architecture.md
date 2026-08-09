@@ -1,1143 +1,293 @@
-# Architecture
+# 系统架构
 
-## 文档定位
+## 1. 总体边界
 
-本文档用于描述 `java-upgrade-analyzer` 的当前实现。本文档回答三个核心问题：
+`java-upgrade-analyzer` 是一个以最终制品为事实源、按状态机执行的 Java 升级影响分析器。
 
-1. 这套分析链路如何组织与运行
-2. 它依赖哪些技术与内部契约
-3. 它如何在当前静态分析边界内保证结果的准确性、可追溯性和可恢复性
+系统分为三层：
 
-本文于 2026-07-29 以 `main@e72c769` 为代码复核基线。五态裁决以
-`scripts/step5_evidence_model.py` 为准，发布裁决以 `scripts/quality_gate.py`
-为准；后续 HEAD 若发生变化，应以对应代码和当前提交上的测试结果更新本文，
-不能把本页的复核日期当成新鲜验证证据。
+1. Step1–Step3：固定分析对象、依赖闭包与升级背景；
+2. Step4–Step6：单一 binary-first 引擎生成变化事实、静态触达结果和最终报告；
+3. 调度与交互：保存主状态、门控、原子发布、恢复、进度和用户确认。
 
-本文档面向维护者、新工程师和其他需要理解或复现当前逻辑的模型。本文档描述的是当前实现，不承担运行期交互规则，也不替代：
+Step4–Step6 不存在旧引擎选择、shadow、灰度、兼容模式或 fallback。详细引擎合同见 [Binary-first / Source-overlay 最终设计](binary-first-source-overlay-design.md)。
 
-- `SKILL.md`
-- `RUNBOOK.md`
-- `docs/developer/quality.md`
-- `docs/archive/DESIGN_PRINCIPLES.md`
+## 2. 架构目标
 
-## 系统目标
+系统持续同时满足：
 
-`java-upgrade-analyzer` 是一个供 Claude Code 使用的升级兼容性分析 Skill。系统将升级问题拆成三层事实，并以正式流程串联：
+- 准确性：最终制品与运行时事实决定结论，失败关闭，证据可追溯；
+- 用户体验：只询问会实质改变结果的外部事实/范围，所有正式结果有 Markdown/CSV 人工入口；
+- 性能：制品一次采集、批量建图/遍历、内容寻址缓存，并记录耗时和内存。
 
-1. 升级前后究竟变了什么
-2. 这些变化是否触达当前业务系统
-3. 哪些结果可以证明，哪些结果只能保守表达
+准确性是底线；源码覆盖、性能优化和人工展示均不能改变权威事实集合。
 
-因此，当前实现的正式链路由六个步骤组成：
+## 3. 状态机与调度器
 
-- Step1：识别依赖变化范围
-- Step2：收敛升级上下文
-- Step3：扫描背景兼容性风险
-- Step4：构建 API 变化证据池
-- Step5：证明变化是否触达业务系统
-- Step6：汇总最终 findings 和报告
-
-## 阅读地图
-
-本文档按以下顺序组织：
-
-1. 先说明系统为什么采用 `jar + 源码` 的双证据模式
-2. 再说明正式运行模型、主状态模型和调度职责
-3. 然后逐步解释 Step1 到 Step6 的职责与契约
-4. 最后集中说明 Step5 的实现机制、准确性保障、验证方式和已知边界
-
-## 设计摘要
-
-当前实现的关键判断如下：
-
-- 升级变化识别依赖 `jar` 与产物层证据
-- 影响证明依赖业务源码与依赖源码构成的静态图
-- 正式流程只有一个调度入口：`scripts/run_step.py`
-- 正式流程只有一个业务参数与状态真相源：`.upgrade-report/.runtime/state/main_state.json`
-- `interaction.json` 只负责展示待交互信息或非阻塞阶段结果，不参与求值
-- Step5 的目标是高精度影响证明，不是最大召回
-- 证据不足时系统进入保守状态，不将“未覆盖”误写成“未影响”
-
-## 为什么必须是 `jar + 源码`
-
-### 三种分析模式的能力边界
-
-当前实现采用 `jar + 源码` 的组合模式。三种模式的能力边界如下：
-
-| 模式 | 擅长回答的问题 | 主要短板 |
-| --- | --- | --- |
-| `只用 jar` | 哪些依赖 API 变了 | 很难证明业务是否实际触达这些 API |
-| `只用源码` | 业务代码调用了哪些依赖符号 | 很难准确界定升级前后究竟发生了哪些正式变化 |
-| `jar + 源码` | 依赖里变了什么，以及这些变化是否真正影响业务 | 仍受静态分析边界限制，但能力最完整 |
-
-### `jar` 在当前实现中的角色
-
-`jar` 相关能力主要落在 Step1 和 Step4，也会在 Step5 中提供类型补充信息。
-
-当前 `jar` 承担四类职责：
-
-- 作为 Step1 的正式输入之一，支持直接产物模式
-- 作为 Step4 的二进制变化证据源，识别删除、签名变化、访问级别变化和类层次变化
-- 作为 Step5 的类型补丁层，为依赖源码图补齐类层次和方法返回类型元数据
-- 作为 Step6 最终交付的可追溯事实来源之一
-
-### 源码在当前实现中的角色
-
-源码能力主要落在 Step5。当前实现依赖源码完成以下工作：
-
-- 构建 AST
-- 提取方法定义和调用点
-- 推断局部变量、receiver 和调用签名
-- 构建 `reverse_edges`
-- 对变更 API 执行反向可达性证明
-
-### 只用 `jar` 为什么不足以形成当前效果
-
-仅依赖 `jar` 可以识别“变了什么”，但难以稳定形成源码级调用链证据。原因在于：
-
-- 字节码提供的是编译结果，不是源码中的调用上下文
-- 局部变量、receiver、实参表达式和链式调用语义会明显弱化
-- lambda、方法引用、泛型传播和部分多态信息在编译后退化
-- 仅靠 `jar` 更容易得到结构层候选，较难得到可解释的业务调用证据
-
-当前实现据此形成明确分工：
-
-- Step4 负责证明变化存在
-- Step5 负责证明变化触达业务
-
-## 顶层架构
-
-### 总体分层
-
-当前实现可分为六层：
-
-1. 调度与状态层
-2. 步骤执行层
-3. 契约与门控层
-4. 分析引擎层
-5. 报告交付层
-6. 验证与回归层
+统一入口是 `scripts/run_step.py`，步骤定义在 `scripts/step_manifest.json`。
 
 ```text
-                 +-----------------------------+
-                 |       run_step.py           |
-                 | 调度 / 主状态 / 恢复 / 门控 |
-                 +-------------+---------------+
-                               |
-        +----------------------+----------------------+
-        |                      |                      |
-        v                      v                      v
- +-------------+       +--------------+      +---------------+
- | Step1~Step3 |       |    Step4     |      |     Step5     |
- | 发现与上下文 |       | 变化证据池构建 |      | 调用链影响证明  |
- +-------------+       +--------------+      +---------------+
-        |                      |                      |
-        +----------------------+-----------+----------+
-                                           |
-                                           v
-                                 +-------------------+
-                                 |      Step6        |
-                                 | findings / report |
-                                 +-------------------+
-                                           |
-                                           v
-                                 +-------------------+
-                                 | gate / smoke / CI |
-                                 +-------------------+
+step1 → step2 → step3 → step4 → step5 → step6 → done
 ```
 
-### 主要文件职责
-
-#### 调度与状态层
-
-- `scripts/run_step.py`
-  - 唯一正式入口
-  - 负责步骤解析、主状态维护、结构化恢复、统一落盘和重跑协调
-
-#### 步骤执行层
-
-- `scripts/s1_dep_diff.py`
-- `scripts/s2_context_from_deps.py`
-- `scripts/s3_scan.py`
-- `scripts/s4_jar_compare.py`
-- `scripts/s5_call_chain_engine_integrated.py`
-- `scripts/s6_report.py`
-
-这些脚本只负责本步骤事实生成与产物落盘，不承担跨步骤状态机职责。
-
-#### 共享能力层
-
-- `scripts/analysis_contract.py`
-  - 共享项目模型：解析 Maven reactor / Gradle project graph、有效模块坐标和目标模块运行时闭包
-- `scripts/enhanced_source_analyzer.py`
-  - 事实提取：AST、正则补充、调用边提取和类型推测
-- `scripts/signature_utils.py`
-  - 身份解析：签名规范化、descriptor 对齐和 canonical API identity
-- `scripts/step5_graph.py`
-  - 图存储：Step5 内存图的稳定数据契约
-- `scripts/step5_trace_policy.py`
-  - 追踪策略：cost、confidence、Pareto frontier 和停止条件；不依赖工程内其他模块
-- `scripts/confidence_weighted_tracer.py`
-  - 图查询编排：反向回溯、签名过滤、多态扩展和候选收集；为兼容旧调用方重导出纯策略接口
-- `scripts/step5_evidence_model.py`
-  - 结论收敛：覆盖、失败与五态 envelope 的唯一规则
-- `scripts/enhanced_output_formatter.py`
-  - 输出渲染：把已收敛结果写为稳定 JSON/CSV，不反向参与结论求值
-- `scripts/tool_execution.py`
-  - 外部工具边界：统一 stage、argv、timeout、stderr、reason code 与 blocking 属性
-- `scripts/auto_discover_bridge_sources.py`
-  - 依赖源码桥接发现
-- `scripts/progress_logging.py`
-  - 进度事件落盘与汇总
-- `scripts/error_handler.py`
-  - 统一错误承载
-- `scripts/compat.py`
-  - 运行兼容与命令封装
-
-Step5 的依赖方向固定为“事实/身份/图契约/纯策略 → 图查询 → 结论 → 渲染”，
-`s5_call_chain_engine_integrated.py` 只在最外层编排这些能力。自动化架构测试解析模块 import
-图并拒绝回边或循环；`step5_graph.py` 与 `step5_trace_policy.py` 不导入上层实现。
-
-Step5 的两条 `javap` 路径已迁移到 `tool_execution.py`。命令启动失败、超时、命令缺失、
-权限不足、非零退出和空输出都产生结构化失败；字节码扫描失败进入 analyzer ledger，JAR 元数据
-失败进入 `step5_evidence_failures` 与 parser fallback。collector ingestion 在替换同一 collector
-快照时会保留这些非 collector 失败，任何失败都不能被转换成正常空结果。
-
-#### 契约与辅助层
-
-- `scripts/step_manifest.json`
-  - 固定步骤顺序和交互配置
-- `scripts/pipeline_constants.py`
-  - 共享常量
-- `scripts/s4_contract.py`
-  - 固定 `all_changed_apis.csv` 字段契约
-- `CHECKPOINT_RULES.md`
-  - 固定待交互最小规则
-
-## 正式运行模型
-
-### 唯一入口
-
-当前正式流程只有一个入口：`scripts/run_step.py`。
-
-任何正式执行都通过该入口完成以下动作：
-
-- 解析 CLI 与当前执行意图
-- 读取与更新主状态
-- 应用结构化用户答复
-- 解析当前步骤输入
-- 执行前置交互或正式步骤
-- 统一持久化成功、待交互和失败状态
-
-### 唯一主状态
-
-`.upgrade-report/.runtime/state/main_state.json` 是正式流程的唯一主状态文件，也是唯一业务参数真相源。
-
-它承载：
-
-- `state.*`
-- 每一步的 `input`
-- 每一步的 `derived`
-- 每一步的 `output`
-- 当前待交互元数据
-- 已归一化且已确认的业务参数
-
-一旦某个业务参数被写入 `main_state.json`，后续步骤必须只从这里读取，不再从 CLI、展示文件或历史产物重新决定真值。
-
-### 主状态字段语义
-
-当前 `state.*` 字段至少包含以下正式语义：
-
-- `current_step`
-  - 当前应执行或应恢复的步骤
-- `completed_step`
-  - 最近一个已完成并已写回主状态的步骤
-- `status`
-  - 当前运行态，如 `idle`、`ready`、`completed`、`completed_with_limits`、`awaiting_user_input`、`blocked_by_system`
-  - `ready` 表示上一 Step 已完成、`current_step` 指向下一待执行 Step
-  - `completed` / `completed_with_limits` 只表示整个流程终态；此时必须同时满足 `current_step=done`、`completed_step=step6`
-- `blocking_reason`
-  - 当前阻塞原因
-- `pending_interaction`
-  - 当前待恢复的 checkpoint 描述
-- `last_user_response`
-  - 最近一次已归一化并写回主状态的结构化用户答复
-
-这些字段由调度层维护。步骤脚本不直接实现状态机迁移。
-读取历史状态时，调度层会将“`current_step` 尚未结束但 `status=completed*`”的旧状态归一化为 `ready`，避免把局部步骤成功误认为全流程完成。
-
-### 展示文件与证据文件
-
-当前实现严格区分三类文件：
-
-- `main_state.json`
-  - 运行真相
-- `interaction.json`
-  - 当前待交互展示，或最近一份需要标准化转述的非阻塞阶段结果
-- 各类 CSV、JSON、报告和摘要
-  - 证据文件和汇总产物
-
-当前正式流程明确禁止：
-
-- 把 `interaction.json` 当作状态文件
-- 把报告或摘要文件当作求值输入
-- 让历史产物反向篡改主状态
-- 显式重跑某一步时漏清该步骤正式输出，导致旧轮次证据混入本轮结果
-
-### 正式执行与调试执行
-
-当前实现支持两种运行形态：
-
-1. 正式编排形态
-   - 入口为 `run_step.py`
-   - 真相源为 `main_state.json`
-2. 单脚本调试形态
-   - 入口为各步骤脚本 CLI
-   - 仅服务局部调试，不改写正式主状态模型
-
-这两种形态共享大部分实现，但正式语义只由正式编排形态定义。
-
-## 调度器职责
-
-### `run_step.py` 的职责分组
-
-当前 `run_step.py` 的职责分为四组：
-
-#### 输入与上下文准备
-
-- `build_step_input_context()`
-- `build_run_context()`
-- `store_step_input()`
-
-#### 恢复与重跑管理
-
-- `clear_steps_from()`
-- `reset_step_state_for_restart()`
-- `prepare_main_state_for_step_execution()`
-
-#### 结构化恢复协议
-
-- `resolve_user_response()`
-- `build_canonical_user_response()`
-- `normalize_intent_patch()`
-- `apply_structured_user_response_if_present()`
-- `handle_step2_resume_followups()`
-
-#### 执行结果持久化
-
-- `persist_step_interaction()`
-- `persist_completed_step()`
-- `persist_interaction_required_error()`
-- `persist_step_error()`
-
-### 正式主路径
-
-当前正式主路径稳定为：
-
-1. 解析 CLI
-2. 读取主状态
-3. 应用结构化用户答复
-4. 处理仍未消费的 pending interaction
-5. 执行恢复后补充逻辑
-6. 构建当前步骤 `run_context`
-7. 执行前置交互或正式步骤
-8. 统一持久化结果
-
-### 主状态写回与下游播种
-
-步骤之间的正式参数传递通过主状态写回与下游播种完成，不通过临时 CLI 透传。
-
-关键函数包括：
-
-- `store_step_output()`
-  - 将当前步骤产出写回 `<step>.output`
-- `seed_next_step_input()`
-  - 将当前步骤对下游有效的正式输入播种到下一步 `input`
-- `persist_completed_step()`
-  - 在步骤完成后统一写回主状态并清理失效的待交互信息；Step5 的非阻塞阶段结果可保留到 Step6 完成
-- `persist_step_interaction()`
-  - 在步骤进入 checkpoint 时统一写回主状态并落盘 `interaction.json`
-
-## 步骤级设计
-
-### Step1：依赖范围发现
-
-Step1 负责识别依赖变化范围，并建立后续分析所需的最小可信输入。
-
-当前实现的关键点：
-
-- 支持 `artifact_inputs` 与 `checkout_build` 两种入口
-- 输入不足时优先进入前置交互，而不是直接失败
-- base/current 可共享同一个源码仓库路径；revision 才是两侧身份，解析后持久化 requested ref、resolved ref 与 immutable commit
-- `artifact_inputs` 先解析最终 JAR，只有坐标缺失的一侧才按需解析 ref 并运行 Maven 补全；`checkout_build` 在构建前解析两侧 ref
-- 坐标补全先采用 Maven `dependency:list` 或 Gradle `runtimeClasspath` artifact inventory；随后用 `analysis_contract.py` 建立目标模块运行时闭包内的内部模块目录，补齐构建输出遗漏的 reactor/project component 身份
-- Maven 内部模块坐标支持 reactor 父子继承以及 `${revision}`、`${project.version}` 等有效属性；Gradle 内部模块按精确 project path 读取有效 group、artifact、version
-- 内部模块目录排除目标模块自身、闭包外 sibling、`unspecified` 和未解析占位符；同坐标版本冲突时构建工具输出优先，静态源码模型不能覆盖已解析结果
-- 内部模块存在唯一主归档时，其物理文件名可匹配自定义 `finalName`；无论是否完成补全，只有最终 fat JAR / boot JAR / WAR 中实际存在的条目才能进入依赖事实
-- ref 解析通过实时 `ls-remote` 获取候选并定向 fetch 所选 ref；不会执行 pull 或改变当前 checkout。候选按 commit 去重，唯一 commit 自动采用，歧义在 Maven 前形成硬 checkpoint；交互选择同时绑定 expected commit，执行前再次校验 ref 未移动
-- 坐标补全同时拿到 source directory 与 ref 时始终优先 ref；source-only 输入必须确认 HEAD 对应的 commit，不能直接分析可变工作区
-- 所有分支构建和坐标补全使用 detached worktree，不改变用户仓库当前 HEAD 与未提交内容
-- 首轮确认的模块范围必须尽早写入主状态
-- 依赖坐标无法安全补齐时不伪装成功
-- Maven 输出通过编排层实时转发，避免长时间构建期间完全无反馈
-- `.runtime/observability/step1_progress.jsonl` 记录可增量读取的阶段事件；`ref_resolution` 事件保存 requested ref、resolved ref、commit、解析方式与候选数量
-- `.runtime/observability/step1_timing.csv`、`step4_timing.csv`、`step5_timing.csv` 统一记录各阶段耗时与状态
-- 进度与耗时属于诊断证据；正式依赖差异仍只在 base/current 两侧均成功后生成
-
-### Step2：升级上下文收敛
-
-Step2 负责把后续步骤真正依赖的上下文收敛回主状态，并产出 `evidence/context/context.json`。
-
-当前实现的关键点：
-
-- 确认 `base_branch/current_branch`
-- 接受 `source_repo_hints`
-- 处理依赖源码目录入口
-- 固化确认后的映射
-- 恢复时优先使用最新确认输入
-
-### Step3：背景风险扫描
-
-Step3 负责扫描升级背景中的兼容性风险信号，不负责最终影响判定。
-
-当前实现主要扫描：
-
-- JDK API 变化
-- `javax.*` / Jakarta 相关变化
-- 内部 API、反射和 Spring Boot 配置风险
-
-Step3 的职责是暴露风险面，Step5 才负责证明这些变化是否触达业务系统。
-
-### Step4：变化证据池构建
-
-Step4 的职责是构建 Step5 可稳定消费的变化证据池。
-
-当前实现的核心工作：
-
-- 生成 JApiCmp 二进制兼容变化
-- 生成依赖源码 `git diff` 变化
-- 直接比较 old/current 最终 JAR 的实例字段，识别 DTO/数据对象字段新增、删除和类型变化
-- 对 `removed jar` 场景导出旧版 jar 的 public/protected 符号集合
-- 自动识别依赖源码目录与仓库映射
-- 聚合生成 `all_changed_apis.csv`
-- 扫描当前业务最终制品的直接字节码引用，生成仅供范围取舍使用的依赖影响排序证据
-- 按单个 `coord` 落盘 `s4_per_dependency/<coord>/` 目录，作为 Step4/Step5 的桥接视图
-
-#### Step4 的正式语义
-
-Step4 是变化识别层，不负责调用链分析。它定义“变更 API 池”，并把后续 Step5 所需的结构化证据统一到一个契约文件中。
-
-当前关键语义如下：
-
-- Step1 从最终制品提取变化依赖 JAR，并用 `dependency_jars.json` 固化 `side + coord + lib_entry + SHA-256 + retained_path`；Step1 门控逐项验证，正式 Step4 只直读该清单
-- JAR 坐标优先来自内嵌 Maven 元数据，无法确定时可用构建工具运行时输出和目标闭包内的项目模块目录补齐对应制品条目；项目模块目录只是与最终制品条目绑定的身份候选，Step4 的依赖源码仓库不是坐标事实源
-- `dependency_source_dirs` 是推荐入口，同时接受本地目录和 Git 地址；Git 地址先物化到 `.runtime/cache/dependency_source_git/`。模块定位仅针对 Step1 已有变化 GAV，对构建清单做一次有深度和数量上限的扫描；源码不得新增依赖行
-- `dependency_repo_mappings` 是内部派生结果
-- `s4_contract.py` 固定 `all_changed_apis.csv` 字段契约
-- `changed_dependencies.csv/.md` 保留依赖坐标维度并按影响证据排序：先比较精确直接引用的变更 API 数，再比较签名不完整候选引用数、引用指令数和变更 API 总数；删除、签名变化等变更类型不额外加权，源码可用性只表示分析条件
-- `business_bytecode_changed_api_refs.csv` 保存排序所用的物理调用位置；`business_bytecode_priority_evidence.json` 保存扫描完整性。该扫描复用 Step5 字节码缓存，只是 Step4 的选择辅助信号，不替代跨依赖、框架或运行时路径分析，也不能把“未直接引用”解释为安全
-- `removed jar` 不走旁路逻辑；正式语义是把旧版 jar 的 `class / method / constructor` 符号集导出为 Step5 目标池
-- Step4 在报告根目录下为每个依赖写出 `s4_per_dependency/<coord>/removed_jar_symbols.csv`、`resolved_targets.csv`、`summary.json`
-- 同一 JAR 条目内重复但内容一致的 `pom.properties` / `pom.xml` 只归一化为一个 GAV，不生成重复依赖；只有元数据声明彼此冲突时才记录异常。源码不能覆盖这项制品判断
-- 依赖源码仓库的 git ref 只从远端分支 `remotes` 中匹配，不直接沿用主项目分支名
-- 版本匹配会先去掉末尾 `-SNAPSHOT`，再按“严格边界命中”筛选候选；像 `3.0.2` 不会命中 `3.0.2.1`
-- `DEV/dev` 分支在同等条件下低于非 `DEV/dev` 分支
-- old/new 两侧同时存在多个候选时，先要求候选各自命中规范化版本，再优先选择能够复现 `old_version -> new_version` 非核心 token 差分、且 remote 一致、版本前缀家族一致的 ref pair；只有剩余两个以上不同 commit pair、且选择会改变 diff 范围时才进入人工确认
-- 远端查询失败、fetch 失败、ref 移动、未匹配、远端不可用或未授权本地兜底属于内部源码证据故障；受控重试后统一转为 `DEPENDENCY_SOURCE_REF_UNAVAILABLE`，不生成用户 checkpoint，不猜测 ref，也不静默使用本地对象。系统改用升级前后最终 JAR：先以 class SHA-256 缩小到共享变化类，再批量运行 `javap -c -s -p`，按方法 JVM descriptor 对齐并比较去除常量池槽位噪声后的指令指纹，生成 `jar_bytecode` / `FINAL_JAR_METHOD_BODY_CHANGED` 证据
-- 源码 git diff 或最终 JAR 方法字节码兜底只要有一项完整，该依赖的 `behavior_diff` 即可计为 complete；两者均不可用时，`behavior_diff` 必须成为 `critical_incomplete`，标准报告只能给受限结论，严格模式必须阻塞
-- `behavior_diff.metrics.planned_dependencies` 以具备 base/current 版本的适用依赖为分母，不再因没有源码映射而把依赖从分母删除
-
-#### binary-first 执行与整代边界
-
-统一入口固定 `engine_mode`：`legacy`、`shadow`、`binary_strict`、`binary_with_legacy_fallback`，四种模式均已实现。默认仍为 `legacy`；启用 binary 必须显式提供 `binary_pipeline_config`，固定 base/current 最终制品与 RuntimeProfile。Step4 之后不得原地改变模式，修改时必须从 Step4 重跑。
-
-- `binary_strict`：Step4A artifact-local diff → Step5A target-independent reconciliation → Step4B decision/projection freeze → Step5B batch trace → Step6 report 使用同一 immutable generation。独立 Oracle、sidecar SHA、support manifest 和 performance gate 任一失败都拒绝激活，并保留上一份完整输出。
-- `binary_with_legacy_fallback`：先执行与 strict 相同的 binary generation；只有整代失败时才丢弃该代，并从 Step4 重新生成一套纯 legacy 结果。descriptor 固定为 `authoritative_engine=legacy_fallback`，不能宣称满足 binary support manifest，禁止逐 API、逐事实或逐边回落。
-- `shadow`：legacy 仍是正式权威；如提供 binary config，另在 `.runtime/binary_shadow/` 运行完整 binary pipeline。shadow 成败都不改变 legacy 目标、Step5/Step6 统计或正式 generation。
-- `legacy`：继续使用旧 source-first 路径，供显式兼容和回滚；它与 binary SQLite、decision、projection 和 trace snapshot 不混用。
-
-binary 权威能力边界由 `scripts/binary_first_support_manifest.json` 失败关闭。当前受支持范围是父优先、显式有序 classpath、完整目标 JDK image、无未建模 runtime transformer 的 JVM direct/type/class-init/dynamic/linkage/dispatch 事实；资源、安全、未知语言 inline 或未注册语义不伪造成 API，占用 candidate、confirmed-unprojectable、coverage gap 或 generation failure 通道。
-
-#### Step4 到 Step5 的正式契约
-
-`all_changed_apis.csv` 是 Step4 的核心输出，也是 Step5 的正式输入。字段顺序和字段语义由 `s4_contract.py` 唯一定义。
-
-当前最关键的字段包括：
-
-- `coord`
-  - 变更 API 所属依赖坐标
-- `change_type`
-  - `REMOVED` / `SIGNATURE_CHANGED` / `BEHAVIOR_CHANGED` / `ACCESS_REDUCED`
-- `api_name`
-  - Step5 主目标键来源
-- `api_simple`
-  - Step5 回退匹配来源
-- `symbol_kind`
-  - `method` / `field` / `class` / `constructor`
-- `api_signature`
-  - 方法和构造器的精确签名来源
-- `confirmed`
-  - 区分二进制确认结论与推断结论
-- `severity`
-  - Step6 汇总风险等级的基础字段
-- `source`
-  - 变更来源，如 `japicmp` / `gitdiff` / `changelog`
-- `old_value` / `new_value`
-  - `DATA_FIELD_*` 行中的字段旧类型和新类型
-- `data_contract_evidence`
-  - DTO/数据对象识别依据，例如命名/包结构、JavaBean/record 访问器或 `Serializable` 状态
-
-`DATA_FIELD_ADDED`、`DATA_FIELD_REMOVED`、`DATA_FIELD_TYPE_CHANGED` 来自最终 JAR 的 classfile 成员表，包含 private 实例字段，排除 static、synthetic 和内部类 `this$` 字段。它们描述的是 DTO/数据对象结构变化，不等于数据库字段已经不匹配。
-
-#### Step4 的 per-dependency 中间产物
-
-Step4 现在会在报告根目录下为每个依赖额外生成 `s4_per_dependency/<coord>/` 目录，用于承接“单个依赖包为集合”的正式语义。
-
-当前最小闭环中，这个目录包含三类文件：
-
-- `removed_jar_symbols.csv`
-  - 仅在 `change_type=removed` 时有实际内容
-  - 保存旧版 jar 导出的 `class / method / constructor` 符号集合
-- `resolved_targets.csv`
-  - 保存该依赖最终归一化后的 Step5 输入视图
-  - 已按 `coord + api_name + api_signature + symbol_kind + change_type` 去重
-- `summary.json`
-  - 保存该依赖当前阶段的最小摘要
-  - Step4 先写入目标池规模、source 分布和 removed jar 导出元数据
-  - Step5 再补写该依赖是否触达系统源码的结果
-
-#### `jar` 元数据在 Step4 与 Step5 之间的桥接作用
-
-Step4 不仅产出变化 API 池，也为 Step5 提供依赖坐标、版本和桥接线索。Step5 会据此定位依赖 `jar`，进一步抽取 `jar_metadata`，作为依赖源码图的类型补丁层。
-
-这条桥接链路的目标不是让 `jar` 直接生成调用图，而是让 `jar` 补齐：
-
-- 依赖类的 `extends / implements`
-- 依赖类的方法签名与返回类型
-- `coord -> jar -> class` 的归属关系
-
-### Step5：调用链影响证明
-
-Step5 负责证明 Step4 发现的 API 变化是否已经触达当前业务系统。
-
-这里的“触达当前业务系统”不是狭义的 Controller 或普通业务方法。正式语义是触达任何有证据证明会影响系统运行的入口，包括业务制品代码、定时任务、消息/事件监听、生命周期入口、Runner/Lifecycle、SPI 与已激活的框架回调。只有条件声明、但当前制品尚未证明会激活的框架入口仍保留为 `uncertain` 或 `not_analyzed`。
-
-当前正式输入：
-
-- `all_changed_apis.csv`
-- 业务源码目录 `source_dirs`
-- 自动推断或用户补齐的依赖源码映射
-- 用户在 Step4 范围 checkpoint 中选择的目标 API 子集；选择全量时使用全部 Step4 API
-
-调度层在执行 Step5 前写入 `.runtime/cache/step5_selection.json`，记录全量/部分模式、纳入和排除的依赖以及 API 数量。范围恢复协议内部使用 `scope_mode=full|partial`：部分模式必须同时包含非空目标依赖，全量模式不得携带筛选条件；`notes` 不参与范围控制。协议不一致时必须停止，不能静默扩大为全量分析。Step6 必须读取该快照声明结论范围；快照缺失时不得默认解释为全量分析。
-
-当 `Step5` 作为独立 CLI 运行且未显式传 `--report-dir` 时，当前实现会优先从 `all_changed_apis.csv` 所在的 `evidence/api_changes/` 目录推导报告目录；若该输入也未提供，则再回退到 `output_dir` 的父目录。
-
-当前正式输出：
-
-- `evidence/call_chain/alerts.csv`
-- `evidence/call_chain/summary.json`
-- `evidence/call_chain/by_api/*.json`
-- `evidence/call_chain/by_module/*_impacts.json`
-- `evidence/api_changes/s4_per_dependency/<coord>/candidate_hits.csv`
-- `reachable`
-- `not_impacted`
-- `uncertain`
-- `not_analyzed`
-- `not_found_in_static_analysis`
-- `evidence/api_changes/s4_per_dependency/<coord>/summary.json` 中的单依赖结果视图
-
-五态属于正式语义，不是展示标签。`not_impacted` 仅在当前制品中的其他运行时依赖以完全相同的类字节码保留目标 API 时成立；它不等于宽泛的“没有风险”。
-
-Step5 成功后，即使流程按默认策略直接进入 Step6，也会先把五态摘要写为
-`interaction.json` 中的非阻塞 `user_decision_card`。该卡不进入
-`main_state.pending_interaction`、不要求用户回复，只作为 Agent 的标准化展示来源。
-
-#### Step5 的 per-dependency 汇总
-
-Step5 在保留原有 `summary.json`、`by_api/*.json`、`by_module/*.json` 的同时，现在会把 API 级 `TraceResult` 再按 `coord` 汇总回 `s4_per_dependency/<coord>/summary.json`。
-
-同时，Step5 现在会把 Step4 的正式 API 目标与 Step3 的 `s3_risk_candidates.csv` 做并集桥接：
-
-- Step4 负责提供“已确认 API 变化事实”
-- Step3 负责提供 `class_usage / resource / reflection / SPI` 等候选信号
-- 若通过定向分析意图指定了 `step5_selected_coords` / `step5_selected_names`，筛选会同时作用于这两类输入，而不是只过滤 Step4
-
-#### Step5 的直接证据增强
-
-对于传统方法反向图不擅长的符号，Step5 现在先尝试直接业务证据：
-
-- `class_usage` / `symbol_kind=class`
-  - 直接检查业务方法中的声明类型、导入类型与 FQCN body 引用
-  - simple name 形式的 `new` / `instanceof` / `Type.class` 仅在当前 import（含 wildcard import）精确解析到目标 FQCN 时才可升级为 `DIRECT_CLASS_USAGE`
-  - 若命中，则输出 `DIRECT_CLASS_USAGE`
-- `symbol_kind=field`
-  - 直接检查 `static import` 与限定名字段访问
-  - 若命中，则输出 `DIRECT_STATIC_IMPORT_USAGE` 或 `DIRECT_FIELD_USAGE`
-- `change_type=DATA_FIELD_*`
-  - 不把 DTO 字段变化伪装成普通字段读写；先按全限定类型名查找方法参数、返回值、局部变量和最终制品 class 引用
-  - 再复用标准反向图，证明 DTO/数据对象是否进入业务制品或已激活运行入口
-  - current 最终制品字节码是正式证据，源码类型解析是辅助证据；不使用简单类名跨包匹配
-  - 结论只表示“数据契约变化进入系统运行路径”，不判断数据库 DDL、迁移脚本或真实表结构是否同步
-
-只有在这些直接证据也未命中时，`class_usage` 才继续回落到 `CLASS_USAGE_ONLY`，`field` 才继续回落到 `CALL_GRAPH_LIMITATION_SYMBOL_KIND`。
-
-当前最小输出字段包括：
-
-- `reaches_system_source`
-  - 该依赖是否已有任一目标 API 被证明触达业务源码
-- `blocked_at`
-  - 若未触达系统源码，当前证据链主要止步层级
-- `blocked_reason`
-  - 当前代表性阻塞原因，来自代表性 API 的 `reason_code`
-- `evidence_level`
-  - 当前单依赖结论的最小证据强度摘要
-
-#### Step5 的设计原则
-
-当前 Step5 显式遵循以下原则：
-
-- 精度优先于召回
-- 业务直达优先
-- 跨依赖回溯必须有证据门槛
-- 图不完整时优先保守
-- 证据字段属于正式契约
-- 调试与正式严格隔离
-
-#### Step5 的内部架构
-
-Step5 按“目标键生成 -> 源码图构建 -> 过滤与门控 -> 反向回溯 -> 候选收敛”的顺序组织。
+主状态：
 
 ```text
-all_changed_apis.csv
-        |
-        v
-+------------------------------+
-| build_api_target_key_groups |
-| 目标键生成 / 分层退化        |
-+------------------------------+
-        |
-        v
-+------------------------------+        +---------------------------+
-| build_enhanced_source_graph  |<-------| source_dirs / dep sources |
-| 方法索引 / reverse_edges     |        | source roots              |
-| type_metadata                |        +---------------------------+
-+------------------------------+
-        |
-        +----------------------+
-        |                      |
-        v                      v
-+----------------------+  +-------------------------------+
-| overload safety      |  | bridge / graph completeness   |
-| 精确签名保护          |  | 缺映射 / 图不完整保守处理      |
-+----------------------+  +-------------------------------+
-        |                      |
-        +----------+-----------+
-                   |
-                   v
-+--------------------------------------------+
-| trace_api_with_confidence_weighting         |
-| 反向 BFS / cost / confidence / polymorphic |
-+--------------------------------------------+
-                   |
-                   v
-+--------------------------------------------+
-| TraceResult                                |
-| analysis_status / reason_code / paths      |
-+--------------------------------------------+
+.upgrade-report/.runtime/state/main_state.json
 ```
 
-#### Step5 的关键数据结构
+辅助恢复状态：
 
-以下数据结构构成 Step5 的正式实现骨架：
+- `last_step_summary.json`：轻量机器摘要；
+- `resume_context.md`：可直接向用户说明的恢复摘要；
+- `interaction.json`：待交互决策卡或 Step5 非阻塞信息卡。
 
-##### `MethodDef`
+状态语义：
 
-`MethodDef` 是 AST 层向建图层传递的方法级结构化表示。核心字段包括：
+- `ready`：上一阶段完成，`current_step` 指向下一阶段；
+- `awaiting_*`：必须等待真实用户答复；
+- `running`：当前有实际任务执行；
+- `completed`：Step6 完成且无记录限制；
+- `completed_with_limits`：Step6 完成但范围或证据存在明确限制；
+- `failed`：当前阶段失败关闭，之前正式产物保留。
 
-- 标识字段：`symbol_id`、`qualified_key`、`simple_key`
-- 类型字段：`class_fqcn`、`class_name`、`package_name`、`is_interface`
-- 源码定位字段：`file`、`line`、`end_line`
-- 归属字段：`owner_type`、`owner_coord`、`module`、`source_root`、`is_test`
-- 签名字段：`return_type`、`param_types`、`param_declared_types`
-- 推断辅助字段：`imports`、`field_types`、`local_var_types`
-- 运行辅助字段：`local_method_return_types`、`known_method_return_types`、`known_method_return_types_by_signature`
-- AST 提取字段：`ast_local_var_sites`、`ast_call_sites`
+重跑某一步会清理该步及后续本轮产物，但保留之前步骤。binary generation 与人类报告另有原子发布保护，失败时恢复 active pointer 和发布前用户文件。
 
-后续建图层只消费 `MethodDef`，不直接操作原始 AST 节点。
+## 4. 目录架构
 
-##### `CallEdge`
+```text
+.upgrade-report/
+  README.md
+  deliverables/
+  evidence/
+    dependencies/
+    context/
+    static_scan/
+    api_changes/
+    call_chain/
+  .runtime/
+    state/
+    observability/
+    cache/
+    indexes/
+    findings/
+    binary_authority/
+```
 
-`CallEdge` 是调用边的正式表示。核心字段包括：
+| 分区 | 职责 |
+|---|---|
+| `deliverables/` | 最终用户报告；依赖、API/路径、范围及 CSV |
+| `evidence/` | 人工复核证据；按分析阶段分目录 |
+| `.runtime/state/` | 状态机与恢复 |
+| `.runtime/observability/` | 进度、耗时、内存与失败观测 |
+| `.runtime/cache/` | 可验证、可失效重建的缓存 |
+| `.runtime/indexes/` | 查询索引 |
+| `.runtime/findings/` | 最终结构化程序结果 |
+| `.runtime/binary_authority/` | immutable binary generations、SQLite、validation、failures 与 active pointer |
 
-- `caller_symbol_id`
-- `caller_qualified_key`
-- `callee_key`
-- `callee_simple_key`
-- `confidence`
-- `file`
-- `line`
-- `content`
-- `owner_type`
-- `owner_coord`
-- `module`
-- `is_test`
-- `callee_param_types`
+内部原始数据不复制到 evidence 冒充人工文件；人工报告也不放进 runtime。
 
-`CallEdge` 同时保留精确匹配键、回退匹配键、追踪裁剪信息和证据定位信息。
+## 5. Step1：最终制品与依赖闭包
 
-##### `SourceGraph`
+Step1 支持两类输入：
 
-`SourceGraph` 是围绕 Step5 回溯需求构建的最小图模型。核心字段包括：
+- 分支/tag/commit：固定远程 SHA，在隔离 worktree 中构建；
+- 直接制品：用户提供 base/current JAR/WAR。
 
-- `methods_by_id`
-- `methods_by_qualified`
-- `methods_by_simple`
-- `reverse_edges`
-- `lookup_keys_by_symbol`
-- `type_metadata`
+核心职责：
 
-其中：
+1. 确认唯一可部署模块；
+2. 产生或验证两侧最终制品；
+3. 从 fat JAR/WAR 读取实际运行时依赖；
+4. 建立 container entry、Maven coord、logical lineage 和 physical SHA；
+5. 一次性留存后续需要的依赖 JAR 与业务内容；
+6. 记录 build provenance。
 
-- `reverse_edges` 是正式回溯主索引
-- `type_metadata` 是继承、多态和签名兼容分析的正式依赖
+制品内 Maven 元数据优先；构建工具 resolved artifact 清单或项目模型只能补齐实际存在的条目，不能扩展闭包或覆盖已确定坐标。Thin JAR 不能证明完整运行时闭包，正式分析失败关闭。
 
-##### `TraceResult`
+人工输出位于 `evidence/dependencies/`。
 
-`TraceResult` 是 Step5 的正式输出载体。核心字段包括：
+## 6. Step2：升级上下文
 
-- API 信息：`api_name`、`api_simple`、`api_signature`、`symbol_kind`、`change_type`、`coord`、`source`
-- 正式结论：`analysis_status`、`is_reachable`、`reason_code`、`reachable_note`
-- 路径证据：`call_paths`、`evidence_paths`、`hops`
-- 追踪状态：`direct_callers`、`business_reach_depth`、`dependency_chain_coords`、`confidence_score`
-- 人工复核：`verification_commands`
+Step2 读取 Step1 已固定事实，生成：
 
-五态、`reason_code` 和路径证据字段共同构成正式结论。
+- `evidence/context/context.json`；
+- `evidence/context/dep_graph.json`；
+- `evidence/context/review.md`。
 
-#### AST 构建与类型推测
+项目源码结构用于补充目标 JDK、Spring、模块和解释上下文。只有会改变范围或结论且系统无法可靠确定的外部事实才进入用户确认。
 
-当前 Java 主路径优先使用 `tree-sitter` 构建 AST，核心入口为 `TreeSitterAnalyzer.analyze()`。
+## 7. Step3：背景兼容线索
 
-实现分工如下：
+Step3 扫描：
 
-- `tree-sitter`
-  - 负责主结构定位
-- 增强正则
-  - 补充包名、imports、字段、嵌套类和类型推断辅助信息
+- JDK removed/internal API；
+- `javax`/`jakarta` 迁移；
+- Spring Boot 配置与自动装配；
+- runtime flag、serialization、reflection；
+- current 最终制品依赖兼容和 classfile 版本。
 
-Kotlin 当前是明确的 partial capability，而不是与 Java 等价的完整语义前端：
+输出位于 `evidence/static_scan/`。Step3 是背景风险层，不得制造 Step4 正式 API projection，不覆盖 binary decision。
 
-- `.kt` 与 `.kts` 都会进入源码闭集并记录 `unsupported_language_kotlin`；
-- 正则结果可以提供正向候选线索，但相关文件存在时，静态未命中不能收敛为完整负结论；
-- 即使当前其他依赖以相同 class 字节码保留目标 API，相关 Kotlin/KTS 源码仍会以
-  `PARTIAL_LANGUAGE_ANALYSIS` 失败关闭，不输出确定的 `not_impacted`；
-- 源码先按当前最终业务制品中的 class 集合过滤，未打包的 Kotlin 源码不会扩大正式分析闭集；
-- 生产/测试分类只依据 `src/<sourceSet>/...`，其中 `main`/`*Main` 为生产源集，
-  `test`/`*Test`/`testFixtures` 为测试源集，不再依据类名是否包含 `Test`。
+## 8. Step4：Binary generation 与 API 变化视图
 
-只有接入 Kotlin PSI/compiler frontend 并补齐对应 Oracle 后，才可把这项能力升级为完整语义分析。
+生产入口：
 
-当前类型推测直接决定 `callee_key`、调用签名和调用边质量。系统显式推测以下类型：
+- `scripts/binary_pipeline.py`：构建、验证、激活 immutable generation；
+- `scripts/binary_report.py --phase step4`：发布人工 Step4 视图；
+- `scripts/gate.py step4`：验证 generation 与人工视图守恒。
 
-- 方法返回类型
-- 参数类型
-- 局部变量类型
-- receiver 类型
-- 方法调用表达式返回类型
-- lambda 参数类型
+必需输入 `binary_pipeline_config` 固定：
 
-当前主要顺序如下：
+- base/current artifacts；
+- coord、lineage、container entry 和 runtime path；
+- 完整目标 JDK；
+- loader realms、ordered classpath 和 resource policy；
+- entrypoints；
+- 可选 source overlay。
 
-1. 解析方法声明中的 `return_type`、`param_types` 和 `param_declared_types`
-2. 收集字段类型、imports 和包级类型信息
-3. 收集局部变量声明，对 `var` / `val` 等推断型声明按初始化表达式反推类型
-4. 在调用点推断 `receiver_type`
-5. 对实参表达式推断参数类型
-6. 根据 `receiver_type + method_name + invocation_signature` 推断调用返回类型
+内部单向 phase：
 
-这套机制不是完整编译器语义，也不做全局数据流求解。当前实现采用局部高置信度推断和有限返回类型传播，以获得更高的建图精度。
+```text
+Step4A artifact-local diff
+  → Step5A runtime-effective reconciliation
+  → Step4B decision/projection freeze
+  → Step5B batch trace
+  → Step6 snapshot
+```
 
-#### `callee_key` 形成链路
+### 8.1 Binary components
 
-`callee_key` 的形成依赖完整的调用点解释链：
+- `binary_first_model.py`：schema 和 immutable identity；
+- `binary_artifact_diff.py`：archive/classfile/IR/resource facts；
+- `binary_runtime_resolver.py`：provider、definition、member/resource resolution；
+- `binary_decision_engine.py`：authoritative/candidate/excluded；
+- `binary_trace_engine.py`：entrypoint 到目标的 batch trace；
+- `binary_output.py`：SQLite、sidecar、formal/candidate/coverage/summary；
+- `binary_validation_oracle.py`：独立 Oracle；
+- `binary_first_contract.py`：支持边界和守恒；
+- `binary_report.py`：Step4–Step6 人工/程序发布视图。
 
-1. 从 AST 或正则提取调用点
-2. 提取 `receiver_expr`、`method_name`、`arg_exprs`
-3. 推断 `receiver_type`
-4. 推断实参类型
-5. 参数类型完整时构建 `invocation_signature`
-6. 生成 `callee_key`
-7. 同时生成 `callee_simple_key`
+### 8.2 人工输出
 
-当前关键规则如下：
+`evidence/api_changes/` 中：
 
-- `receiver_type` 可确认时，`callee_key` 使用 `receiver_type.method_name`
-- `receiver_type` 无法确认时，退回 `method:{method_name}`
-- 参数类型完整时才追加签名
-- 参数类型不完整时不强行生成不可靠的带签名键
-- 方法引用场景单独处理，不把空参数列表误判为零参数重载
+- `changed_dependencies.md/.csv`；
+- `s4_per_dependency/<coord>/summary.md`；
+- `all_changed_apis.csv`；
+- `business_bytecode_changed_api_refs.csv`；
+- `business_bytecode_priority_evidence.json`；
+- `summary.md/.json`；
+- `review.md`。
 
-#### 调用边提取
+`all_changed_apis.csv` 是 validated generation 的稳定用户视图，不是兼容投影。confirmed-unprojectable resource/security/topology facts 进入 `review.md` 和权威 decision，不创建占位 API。
 
-调用边提取入口为 `extract_ast_call_edges()`。当前重点处理：
+## 9. Step4 范围交互
 
-- 普通方法调用
-- 构造器调用
-- 方法引用
+只有至少两个含正式 API projection 的依赖时才产生范围选择：
 
-对每个调用点，系统依次完成：
+- 全量：分析所有目标依赖；
+- 部分：用户按完整坐标或依赖名选择。
 
-1. 解析 `receiver_expr`、`method_name`、`arg_exprs`
-2. 推断 `receiver_type`
-3. 推断参数类型
-4. 生成 `callee_key` 和 `callee_simple_key`
-5. 在签名足够完整时拼接调用签名
+范围卡按依赖展示 Top 10，并提供 `changed_dependencies.md` 完整列表。排序使用业务最终制品精确直接引用、候选引用、指令数和 API 数；不因为删除/签名变化人为加权。
 
-#### 源码图构建
+选择结果先写入主状态。Step5 验证坐标/名称确实命中 Step4 `all_changed_apis.csv`；协议冲突或空匹配停止，不能静默扩大为全量。
 
-源码图由 `build_enhanced_source_graph()` 统一构建。建图过程分两段：
+## 10. Step5：同 generation 触达发布
 
-1. 先建立类型信息
-   - 收集 `class_info`
-   - 解析 `extends` / `implements`
-   - 建立接口实现关系
-2. 再写入方法和边索引
-   - 归档 `MethodDef`
-   - 建立方法级查找表
-   - 把调用边写入 `reverse_edges`
+Step5 不重新扫描制品，而是从 active validated generation 发布用户选择范围：
 
-#### `jar` 元数据如何辅助源码图构建
+- `evidence/call_chain/summary.md/.json`；
+- `evidence/call_chain/alerts.csv`；
+- `evidence/call_chain/by_api/*.json`；
+- `.runtime/indexes/s5_query_index.json`。
 
-Step5 并不使用 `jar` 直接构建调用图，而是使用 `jar_metadata` 补齐依赖源码图缺失的类型信息。
+### 10.1 正式四维
 
-当前链路如下：
+| 维度 | 值 |
+|---|---|
+| reachability | reachable / uncertain / not_found_in_static_analysis / not_analyzed |
+| static linkage | compatible_or_not_applicable / incompatible_if_executed / undetermined |
+| impact conclusion | probable_impact / inconclusive |
+| runtime verification | required_not_executed / undetermined |
 
-1. 根据 `dependency_source_mappings` 建立 `source_roots`
-2. 依据 Step1 的 `build_provenance.json` 与依赖 `lib_entry`，从 current 最终制品提取目标 `jar`；无法提取时记录证据缺失，不使用本地 Maven 仓库替代
-3. 通过 `javap -s -p` 解析类层和方法层元数据
-4. 生成 `jar_metadata`
-5. 将 `jar_metadata` 合并进 `class_info`、`type_metadata` 和全局方法返回类型索引
+静态分析不输出 runtime-confirmed impact/no-impact。Step5 生成非阻塞四态信息卡后自动进入 Step6。
 
-`jar_metadata` 当前主要补齐：
+### 10.2 路径数据
 
-- 依赖类的 `extends / implements`
-- 依赖类的方法签名与返回类型
-- `coord -> jar -> class` 的归属关系
+每条路径同时保存结构化 edge 和可读文本：
 
-其直接收益包括：
+- caller class/member/Java signature/artifact；
+- edge kind 和 bytecode offset；
+- resolved target；
+- exact/possible certainty；
+- 最终 API 所属 coord 和 base/current 版本。
 
-- 提升 `resolve_type_name()` 的稳定性
-- 为多态目标扩展提供更完整的 `type_metadata`
-- 为返回类型推断提供依赖方法签名索引
+查询工具读取内部索引，支持完整方法、coord、artifactId 和包前缀；查询未命中不解释为安全。
 
-因此，当前系统的调用图仍是源码图，但其类型语义由源码信息和 `jar` 元数据共同支撑。
+## 11. Step6：最终报告
 
-#### `reverse_edges` 与目标键
+Step6 只读取同 generation 的 Step5 范围，发布：
 
-当前回溯依赖 `reverse_edges` 执行反向查询。
+- `deliverables/report.md`；
+- `deliverables/all-affected-dependencies.md/.csv`；
+- `deliverables/all-impact-details.md/.csv`；
+- `deliverables/analysis-scope.md`；
+- `.runtime/findings/s6_findings.json`。
 
-`reverse_edges` 的 key 设计遵循以下规则：
+报告顺序固定为依赖层 → API/调用关系 → 文件说明。Markdown/CSV 从同一排序数据生成，并保留 coord、base/current 版本、四维状态和关键路径。
 
-- 同时索引 `callee_key` 和 `callee_simple_key`
-- 若 key 带签名，则补一份无签名基键
-- 对方法引用场景，若源码中只有唯一声明签名，则额外补该唯一签名键
+完成摘要使用“可能影响/仍不确定”，不保留旧 severity bucket、`not_impacted` 或 confirmed impact/no-impact 空字段。
 
-目标键生成入口为 `build_api_target_key_groups()`。当前正式顺序如下：
+## 12. 失败关闭和原子发布
 
-1. `exact_signature`
-2. `exact_name`
-3. `fallback_simple`
-4. `polymorphic`
+一个 binary generation 只有在以下检查都通过后才能激活：
 
-系统先生成分层键组，再命中 `reverse_edges`。`tier_index`、`provenance` 和 `provenance_family` 都属于正式求值的一部分。
+- artifact/runtime identity；
+- support manifest；
+- fact/decision/projection/API 守恒；
+- trace/dependency binding；
+- sidecar SHA；
+- SQLite integrity；
+- 独立 Oracle；
+- performance gate。
 
-#### overload 安全过滤
+失败记录在 `.runtime/binary_authority/binary_failures/`。active pointer 不切换，已有用户输出不覆盖，不创建旧引擎 generation。
 
-系统在命中无签名键后先应用 overload 安全过滤，再决定是否进入正式回溯。
+人类发布也使用 staging + atomic replace。Step4/5/6 发布失败时恢复本轮前 active pointer 和用户文件，避免内部权威与人工报告撕裂。
 
-核心规则如下：
+## 13. Source overlay
 
-- 方法或构造器缺少 `api_signature` 时，直接进入 `not_analyzed`
-- 存在精确签名命中时，只保留精确签名组
-- 只有兼容签名且兼容结果唯一时，允许退化到 `compatible_signature`
-- 只有无签名键或存在兄弟重载但无法唯一确认时，进入 `OVERLOAD_AMBIGUOUS_TARGET`
+Source overlay 是可选解释层：
 
-overload 安全过滤发生在 BFS 之前，而不是回溯之后补救。
+- 绑定已经由 artifact identity 确定的类和成员；
+- 提供源码位置、声明、注释和解释；
+- 不参与 class provider、member resolution、dispatch 或 executable edge 裁决；
+- 缺失或解析不完整时形成明确 coverage gap；
+- 不要求用户批准二进制降级，因为不存在降级路径。
 
-#### bridge-check 与图完整性判定
+## 14. 观测与性能
 
-Step5 在正式回溯前执行 `bridge-check`，判断是否必须跨依赖边界继续分析。
+统一进度位于 `.runtime/observability/progress.jsonl`。各阶段 timing 保存 phase、对象、状态、耗时、规模和可用时的进度分母。
 
-判定依据包括：
+Binary 性能策略：
 
-- 业务源码图是否已经直接命中目标 API
-- `dependency_source_mappings` 是否可用
-- `business_graph_precheck_incomplete()` 是否认为业务图不完整
-- `critical_parser_fallback_reasons()` 是否暴露关键解析降级
+- 每个 archive/classfile 每 generation 采集一次；
+- 内容寻址缓存绑定 artifact SHA、RuntimeProfile、parser 和 policy；
+- 批量建图、SCC 和多目标遍历；
+- 缓存完整性失败重建；
+- 记录端到端耗时、phase 耗时、峰值 RSS、archive/class/edge 数和缓存命中。
 
-当前正式语义如下：
+任何性能优化必须同时通过独立 Oracle 和性能门。
 
-- 业务图已直接命中时，不要求额外 bridge source
-- 需要跨依赖继续回溯时，先尝试依赖源码映射；若缺映射，则继续尝试当前 packaged runtime jar 的字节码稳定符号匹配
-- 只有依赖源码与无源码字节码两条正式路径都不可用时，才进入待交互或 `not_analyzed`
-- 图明显不完整时，不将“未命中”解释为“未影响”
+## 15. 测试分层
 
-#### 多目标反向复用
+- 单元：schema、descriptor、identity、pairing、decision、projection、trace、report；
+- 守恒：fact/decision/projection/API、dependency binding、generation identity；
+- 故障：parse、JDK、entrypoint、Oracle、sidecar、SQLite、publication；
+- 端到端：Step4→Step5→Step6、全量/部分范围、查询和恢复；
+- 人工输出：Markdown/CSV 同源、依赖维度、Java 签名、关键路径、UTF-8 BOM；
+- 性能：固定数据集冷/热执行、峰值内存和缓存；
+- A/B：main 与当前分支消费同一 base/current 制品，先写独立真值，再比较漏报、误报、身份和路径。
 
-`trace_all_apis_with_confidence_weighting()` 会先按依赖坐标与目标 owner 对 API 分组，
-为组内目标 key 执行一次多源反向传播。传播结果只用于预热不可变的前驱转换缓存和统计共享
-子图；每个 API 仍独立执行 overload 过滤、cost/confidence 预算、关键节点停止规则与五态收敛。
-
-共享转换缓存保存的是与目标 API 无关的事实：确定性排序后的入边、边成本、调用者声明、
-关键节点以及精确签名分组。它不缓存最终候选或结论，因此不能让一个 API 的深度、置信度、
-多态或失败关闭状态泄漏到另一个 API。若同一 key 的原始入边数量发生变化，缓存立即失效并
-重新物化。
-
-这条路径把共同前驱子图的排序、签名索引和节点事实提取从逐 API 重复工作收敛为按 key
-一次物化，同时保持 `path_details` 和 `alerts.csv` 的确定性字节输出不变。核心观测指标为
-`multi_target_*`、`reverse_transition_cache_*`、`reverse_transition_edges_materialized` 和
-`reverse_transition_edges_reused`。
-
-#### 回溯与候选收敛
-
-正式回溯入口为 `trace_api_with_confidence_weighting()`。当前采用“从变更 API 反向寻找调用者”的求值模型，而不是从业务入口正向枚举下游调用。
-
-正式顺序为：
-
-1. 校验最小追踪条件
-2. 构建目标键组
-3. 选择可命中的目标组
-4. 应用 overload 安全过滤
-5. 以 BFS 方式扩展回溯前沿
-6. 用 `cost`、`confidence` 和关键节点控制搜索边界
-7. 基于 `type_metadata` 处理多态扩展
-8. 将候选收敛成正式五态结果
-
-当前评分与停止条件固定为：
-
-- `calculate_depth_cost()`
-  - `high -> 1`
-  - `medium -> 2`
-  - `low -> 5`
-- `calculate_confidence_decay()`
-  - `high -> ×0.95`
-  - `medium -> ×0.8`
-  - `low -> ×0.5`
-- `should_stop_tracing()`
-  - `current_cost >= max_cost`
-  - `confidence_score < 0.3`
-  - 命中 `system_code_touched`
-  - 命中 `framework_boundary`
-
-系统不会在命中第一条路径后立即返回，而是先收集候选，再通过 `select_confirmable_reachable_candidate()` 和 `select_best_candidate()` 做收敛与稳定排序。
-
-#### Step5 的正式结果语义
-
-Step5 最终收敛到以下五态：
-
-- `reachable`
-- `not_impacted`
-- `uncertain`
-- `not_analyzed`
-- `not_found_in_static_analysis`
-
-结果不仅包含状态，还必须输出：
-
-- `reason_code`
-- `call_paths`
-- `evidence_paths`
-
-当前高频决策如下：
-
-| 场景 | 当前处理 | 结果语义 |
-| --- | --- | --- |
-| 缺少 `symbol_kind` | 不进入正式回溯 | `not_analyzed` |
-| 方法或构造器缺少 `api_signature` | 不进入正式回溯 | `not_analyzed` |
-| 目标键无法生成 | 直接终止 | `not_analyzed` |
-| 只有无签名命中且重载无法唯一确认 | overload 安全阻断 | `not_analyzed` |
-| 需要跨依赖回溯但缺 `dependency_source_mappings`，但 packaged runtime jar 可扫描 | 走无源码依赖字节码路径 | `uncertain` / `not_found_in_static_analysis` |
-| 需要跨依赖回溯且源码映射、无码字节码路径都不可用 | 默认阻塞或待交互 | `not_analyzed` / 阻塞 |
-| 图明显不完整 | 不把未命中解释为无影响 | 保守语义 |
-| 命中业务代码 | 停止继续扩展 | `reachable` |
-| removed API 的旧类与当前其他运行时依赖中的同名类字节码完全一致 | 记录制品保留证据，不再把该 API 当作已消失符号 | `not_impacted` |
-| 命中框架边界且无法再静态证明 | 收敛为不确定候选 | `uncertain` |
-| 没有任何静态路径 | 不伪装成影响 | `not_found_in_static_analysis` |
-
-### Step6：最终交付
-
-Step6 负责把 Step1 到 Step5 的结构化产物收敛成最终交付结果。
-
-核心产物包括：
-
-- `.runtime/findings/s6_findings.json`
-- `deliverables/report.md`
-- `deliverables/all-affected-dependencies.md`
-- `deliverables/all-affected-dependencies.csv`
-- `deliverables/all-impact-details.md`
-- `deliverables/all-impact-details.csv`
-
-`report.md` 固定按“依赖层面结论 → API 及调用关系 → 用户可见文件说明”组织。依赖层和 API 层统一使用“变化总数、已完成分析、未完成分析、确认有影响、确认不受影响、尚未确认影响”六列统计，并给出五态语义和行动边界。统计母集是 Step5 本轮分析范围：全量模式使用全部变化对象，部分模式只使用 `included_dependency_coords` 及其变化 API；未选择对象不得进入“未完成分析”。部分模式下 `available_dependency_count` / `total_api_count` 只用于范围说明，结果统计分别使用 `included_dependency_count` / `analyzed_api_count`。变化总数等于已完成与未完成之和。API 层后三类结果划分已完成分析；依赖层只要已有 API 确认有影响就保留确认有影响计数，因此仍有其他已选 API 未完成的依赖会同时计入“确认有影响”和“未完成分析”。依赖明细固定使用“依赖、版本变化、API 分析（已完成/总数）、当前系统调用关系、分析结果、结果说明”，API 明细固定使用“依赖、API、新版本中的变化、当前系统调用关系、分析结果、结果说明”；已完成与未完成只改变单元格内容，不改变表头和列顺序。主报告按依赖坐标分组完整展开全部 `reachable` 和 `uncertain` API：先按依赖的已确认触达、最高/累计复核优先分数和调用关系强度排序，再在依赖内部按结论与复核优先分数排序；`not_found_in_static_analysis` 只给统计并明确不等于安全。完整 Markdown 和 CSV 继续覆盖本轮范围内全部状态，正文未展开的明细可从 `all-impact-details.*` 查阅。正文没有展开的依赖进入 `all-affected-dependencies.md`；两份 Markdown 分别生成同数据、同顺序的 CSV。两类完整明细相互独立，且都只覆盖本轮分析范围。选择前的全量依赖/API 仍保留在 Step1/Step4 原始清单，未纳入对象和原因记录在 `analysis-scope.md`。
-
-`alerts.csv` 是 Step5 的原始分析记录，一条原始记录一行；它保留分析状态、调用起点、完整调用关系和证据文件。`all-impact-details.md` 与 `all-impact-details.csv` 将这些原始记录按变化 API 归并成用户可读的全量明细，因此它们与原始记录的用途不同，都需要在 `report.md` 的“用户可见文件说明”中解释。
-
-Step6 的职责是读取和重组前序结构化产物，回填 `reason_code` 与 `evidence_paths`，并按用户可理解的视角组织 findings。已经执行分析但未找到当前系统调用关系的 API 属于“已完成分析”；只有缺少关键输入或分析过程未完成的 API 才进入“未完成分析”，并随项记录原因。
-
-#### Step5 到 Step6 的结果消费链
-
-当前 Step6 主要消费以下产物：
-
-- `evidence/call_chain/summary.json`
-  - 五态统计、`user_conclusion_summary`、`quality_gate`
-- `evidence/call_chain/by_api/*.json`
-  - 单条 API 的 `reason_code`、`call_paths`、`evidence_paths`
-- `evidence/call_chain/alerts.csv`
-  - 原始分析记录和完整调用关系，用于生成用户可读的全量 API 明细
-- `evidence/api_changes/all_changed_apis.csv`
-  - Step4 输入变更集，用于反向核对 Step6 汇总项
-
-Step6 不是新的分析层，而是对 Step4 和 Step5 的正式证据做收敛、分组和可读化表达。
-
-## 门控、恢复与重跑
-
-### 门控层
-
-`gate.py` 统一负责完整性判断，主要覆盖：
-
-- `step1_scope`
-- `context`
-- `scan`
-- `jar_compare`
-- `call_chain`
-
-门控层的职责是判断是否足够继续，不负责改写主状态。
-
-### 恢复协议
-
-当前恢复协议的正式入口在 `run_step.py`。核心顺序为：
-
-1. 读取 pending interaction
-2. 接收 `--response-json` 或 `--response-file`
-3. 构建规范化答复
-4. 校验 `response_schema`
-5. 将 `intent_patch` 合并入主状态
-6. 再由调度器决定 `continue`、`rerun_current_step` 或 `restart_from_step`
-
-当前恢复是受结构化协议约束的状态机操作，而不是裸动作跳转。
-
-### checkpoint 恢复、自愈与重跑边界
-
-当前调度层区分三类恢复路径：
-
-- `continue`
-  - 在当前 checkpoint 上继续执行
-- `rerun_current_step`
-  - 保留当前步输入，清理当前步及下游状态与产物后重跑
-- `restart_from_step`
-  - 回跳到指定上游步骤，并重新建立后续状态
-
-系统同时支持完整性自愈：
-
-- `detect_integrity_repair_step()`
-  - 检查目标步骤依赖的关键产物是否缺失
-- 若关键产物缺失
-  - 自动回退到最早缺口步骤并重建
-
-## 准确性保障模型
-
-当前实现对准确性的要求是：在正式边界内给出可信结论。当前主要控制以下风险：
-
-- 多源状态不一致
-- 证据缺失被误解释为无影响
-- 签名和调用图的模糊匹配导致串链
-- 同输入重复运行时结果漂移
-- 调试逻辑渗透进正式语义
-
-当前主要依赖以下机制：
-
-- 单一真相源
-  - 正式流程只从 `main_state.json` 读取业务上下文
-- 契约优先
-  - 步骤顺序、CSV 字段和恢复答复都由显式契约约束
-- 保守求值
-  - 证据不足时进入保守状态，不用乐观假设填平结论
-- 精度优先匹配
-  - 先精确键，后退化键，并辅以 overload 安全过滤
-- 图质量前置检查
-  - 图不完整时不把“没找到”直接写成“没影响”
-- 证据可回溯
-  - 最终结论必须能回溯到 Step4 与 Step5 证据字段
-- 调试隔离
-  - `JUA_STEP5_DEBUG`、`--debug-analysis` 等开关只服务观察，不改变正式结论语义
-
-## 验证与正式语义
-
-### 回归验证面
-
-当前回归验证按正式架构拆成三个验证面：
-
-- `core`
-  - 验证 Step1 到 Step4 的基础分析链路
-- `step5`
-  - 验证调用链、bridge source、五态语义和门控行为
-- `orchestrator`
-  - 验证 `run_step.py` 的主状态机、checkpoint 恢复、结构化答复和状态落盘
-
-### gate 与 smoke 的正式语义
-
-`gate.py` 和 `smoke_regression.py` 共同约束正式行为。
-
-`gate.py` 当前负责：
-
-- 判断每一步必要产物是否齐备
-- 阻止“证据缺失但流程继续”这类错误前进
-- 在严格模式下，对 `uncertain`、`not_analyzed`、`not_found_in_static_analysis` 保持阻断语义
-
-`smoke_regression.py` 当前负责：
-
-- 固定 `summary.json`、`main_state.json`、`interaction.json` 等核心产物口径
-- 固定 Step5 的 `reason_code`、五态语义和旧字段迁移行为
-- 固定 orchestrator 的 checkpoint 恢复、自愈和重跑边界
-
-因此，当前正式行为不仅由实现定义，也由 gate 和 smoke 共同约束。
-
-## 已知边界
-
-以下边界属于当前实现明确承认的能力边界，不是偶发错误：
-
-- `api_signature` 的原始文本不保证完全统一
-- 签名归一化会带来一定精度损失
-- `reachable` 表示已触达业务代码，不保证一定展示到最外层入口
-- 动态行为、反射和运行时代理会削弱静态图完整性
-- 源码图缺失、桥接信息缺失和参数类型缺失都会限制 Step5 的稳定结论能力
-
-排查 Step5 miss 场景时，按以下顺序检查：
-
-1. `api_name` 与 `symbol_kind` 是否正确
-2. `api_signature` 是否只是文本风格差异
-3. `reverse_edges` 中是否存在该目标的带签名键或无签名键
-4. 是否被 overload 安全过滤拦截
-5. 是否属于多态扩展或跨依赖桥接场景
-
-## 维护要求
-
-当以下内容发生变化时，本文档必须同步更新：
-
-- 主状态模型
-- 恢复协议
-- Step1 到 Step6 的职责边界
-- Step4 / Step5 的正式输入输出契约
-- Step5 的 AST 构建、建图、`jar_metadata` 补图或回溯口径
-- Step6 的交付语义
-
-## 代码评审检查项
-
-每次改动以下区域时，必须逐项检查：
-
-- 是否引入了第二业务参数源
-- 是否引入了第二主状态源
-- 是否让 `interaction.json` 或报告产物重新参与求值
-- 是否让 CLI 重新成为步骤之间透传业务参数的主路径
-- 是否破坏了结构化恢复协议
-- 是否破坏了 Step5 的五态语义
-- 是否破坏了 Step5 的精度优先、overload 保护或 bridge-check 规则
-- 是否修改程序行为但未同步更新本文档和相关测试
+全量测试结果只能证明实际执行的当前提交和环境，不得沿用旧运行结果。

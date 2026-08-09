@@ -787,7 +787,6 @@ def validate_snapshot_supersession(snapshots: Iterable[ActiveSnapshot]) -> bool:
 @dataclass(frozen=True)
 class ResultGeneration:
     analysis_context_identity: str
-    engine_mode: str
     snapshots: Mapping[str, ActiveSnapshot]
     trace_result_set_digest: str
     sidecar_content_identities: Mapping[str, str]
@@ -815,7 +814,7 @@ class ResultGeneration:
                 )
         payload = {
             "analysis_context_identity": self.analysis_context_identity,
-            "engine_mode": self.engine_mode,
+            "authority": "binary_first",
             "snapshot_identities": {
                 layer: snapshot.identity for layer, snapshot in sorted(self.snapshots.items())
             },

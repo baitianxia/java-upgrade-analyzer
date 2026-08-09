@@ -18,9 +18,19 @@ from binary_output import (  # noqa: E402
     write_binary_generation,
 )
 from binary_trace_engine import BinaryTraceBundle  # noqa: E402
+from signature_utils import jvm_method_parameter_signature  # noqa: E402
 
 
 class BinaryOutputTest(unittest.TestCase):
+    def test_jvm_descriptor_is_presented_as_java_parameter_signature(self):
+        self.assertEqual(jvm_method_parameter_signature("()I"), "()")
+        self.assertEqual(
+            jvm_method_parameter_signature("(Ljava/lang/String;[I[[Lcom/acme/Dto;)V"),
+            "(java.lang.String,int[],com.acme.Dto[][])",
+        )
+        with self.assertRaisesRegex(ValueError, "invalid_method_descriptor"):
+            jvm_method_parameter_signature("(I")
+
     def profile(self):
         required = RuntimeProfile.REQUIRED_FIELDS
         return RuntimeProfile({
@@ -137,7 +147,6 @@ class BinaryOutputTest(unittest.TestCase):
                 decisions,
                 traces,
                 profile,
-                engine_mode="shadow",
                 policy_identities={"projection_registry": "registry-1"},
             )
             second = write_binary_generation(
@@ -145,9 +154,13 @@ class BinaryOutputTest(unittest.TestCase):
                 decisions,
                 traces,
                 profile,
-                engine_mode="shadow",
                 policy_identities={"projection_registry": "registry-1"},
             )
+            activate_binary_generation(tmp, first, validation_result={
+                "status": "passed",
+                "result_generation_identity": first["result_generation_identity"],
+                "validation_run_identity": "validation-1",
+            })
             generation = Path(first["generation_directory"])
             manifest = json.loads((generation / "result_generation.json").read_text())
             active = json.loads((Path(tmp) / "active_binary_generation.json").read_text())
@@ -179,8 +192,13 @@ class BinaryOutputTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             first = write_binary_generation(
                 tmp, decisions, traces, profile,
-                engine_mode="shadow", policy_identities={"registry": "v1"},
+                policy_identities={"registry": "v1"},
             )
+            activate_binary_generation(tmp, first, validation_result={
+                "status": "passed",
+                "result_generation_identity": first["result_generation_identity"],
+                "validation_run_identity": "validation-1",
+            })
             active_before = (Path(tmp) / "active_binary_generation.json").read_bytes()
             generation = Path(first["generation_directory"])
             (generation / "binary_summary.json").write_text("tampered", encoding="utf-8")
@@ -188,21 +206,20 @@ class BinaryOutputTest(unittest.TestCase):
             with self.assertRaises(BinaryOutputError) as error:
                 write_binary_generation(
                     tmp, decisions, traces, profile,
-                    engine_mode="shadow", policy_identities={"registry": "v1"},
+                    policy_identities={"registry": "v1"},
                 )
 
             active_after = (Path(tmp) / "active_binary_generation.json").read_bytes()
         self.assertEqual(error.exception.reason_code, "BINARY_GENERATION_IDENTITY_COLLISION")
         self.assertEqual(active_before, active_after)
 
-    def test_strict_generation_cannot_activate_without_independent_validation(self):
+    def test_generation_cannot_activate_without_independent_validation(self):
         profile = self.profile()
         decisions, traces = self.bundles()
         with tempfile.TemporaryDirectory() as tmp:
             manifest = write_binary_generation(
                 tmp, decisions, traces, profile,
-                engine_mode="binary_strict", policy_identities={"registry": "v1"},
-                activate=False,
+                policy_identities={"registry": "v1"},
             )
             with self.assertRaises(BinaryOutputError) as error:
                 activate_binary_generation(tmp, manifest)

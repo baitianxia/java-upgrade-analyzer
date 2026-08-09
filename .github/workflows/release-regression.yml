@@ -72,23 +72,14 @@ jobs:
           jdeps -version
           mvn -version
 
-      - name: Materialize SHA-pinned guard matrix
-        run: >-
-          python scripts/materialize_real_project_asset.py
-          --selector guard --declared-locations
-
       - name: Run Release Quality Gate
         run: >-
-          python scripts/quality_gate.py --profile release --include-real --real-case guard
-          --continue-on-failure
-          --report-root /tmp/jua-release-regression
-          --json-out /tmp/jua-release-quality-gate.json
+          python scripts/quality_gate.py --profile release
+          --json-out "${{ runner.temp }}/jua-release-quality-gate.json"
 
       - name: Upload Quality Evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: jua-release-quality-evidence
-          path: |
-            /tmp/jua-release-quality-gate.json
-            /tmp/jua-release-regression
+          path: ${{ runner.temp }}/jua-release-quality-gate.json

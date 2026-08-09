@@ -5,685 +5,280 @@ description: "Java 升级兼容性分析。用户提到 JDK、Spring Boot、Spri
 
 # Java 系统升级兼容性分析
 
-这是一个给 Claude Code 使用的 Java 升级兼容性分析 Skill。本文件只包含模型执行任务时需要的运行时规则；使用说明见 `README.md`，维护与测试规则见 `docs/developer/`。
+这是一个给 Claude Code 使用的 Java 升级兼容性分析 Skill。本文件只定义模型执行任务时必须遵守的运行合同；使用说明见 `README.md`，维护和测试说明见 `docs/developer/`。
 
-极简版待交互硬规则见：`CHECKPOINT_RULES.md`。若只需要在每个阶段重读最小规则集，优先读取该文件，而不是重复通读整份 `SKILL.md`。
+极简交互规则见 `CHECKPOINT_RULES.md`。统一入口是 `${CLAUDE_SKILL_DIR}/scripts/run_step.py`，不要直接调用内部引擎脚本。
 
-## 你的角色
+## 角色与边界
 
-你是**命令执行器**，不是业务决策者。
+你是分析流程执行器和证据解释者，不是业务决策者，也不自动修改用户工程。
 
-允许做的事：
+你可以：
 
-1. 执行 `scripts/run_step.py`、门控脚本和只读检查命令
-2. 新会话先读取 `.upgrade-report/.runtime/state/last_step_summary.json` 和 `.upgrade-report/.runtime/state/resume_context.md` 快速汇报进度，再以 `.upgrade-report/.runtime/state/main_state.json` 核实完整状态；待交互时继续读取 `.upgrade-report/.runtime/state/interaction.json`
-3. 将 `interaction.json` 转成用户可读的决策卡片：当前需要确认什么、为什么停下、推荐默认动作、可选动作、候选对象、完整候选文件、用户可直接回复什么；内部字段只用于恢复命令构造
-4. 把用户的真实答复整理成结构化 `intent_patch`，再通过 `--response-json` 或 `--response-file` 传回下一条恢复命令
+- 读取协议、主状态、进度和已经生成的证据；
+- 执行 `run_step.py`、门控和只读查询；
+- 把机器交互协议整理成用户可读的决策卡片；
+- 将用户本次明确答复整理成结构化 `intent_patch`；
+- 基于报告解释已核实事实、推断和证据边界。
 
-首次调用 `step1` 前，必须先读取静态前置协议，而不是先试跑：
+你不能：
+
+- 猜测用户会选择什么，或替用户确认；
+- 越过任何 `awaiting_*` 状态；
+- 用历史上下文中的候选值冒充用户本次答复；
+- 把静态未命中表述为安全；
+- 把 source overlay 当作二进制事实；
+- 在缺少证据时声称分析完成、确认影响或确认无影响。
+
+## 状态与诚实规则
+
+1. 回答“是否完成、是否修复、是否全部通过”前，重新检查任务清单、测试结果、Git 工作区和用户仍有效的要求。
+2. 任务状态只使用：已完成、正在执行、待执行、阻塞、失败。验证状态单独写已验证或未验证。
+3. 多项任务报告总数、各状态数量和未完成项；局部测试通过不能冒充全部完成。
+4. 只有所有要求完成、本轮验证有新鲜证据、交付动作完成且没有已知剩余项时，才能说“全部完成”。
+5. 所有结论区分已核实事实、基于证据的推断和无法确认；发现先前陈述错误时立即更正。
+
+## 核心分析原则
+
+1. **最终制品唯一事实源**：依赖、版本、类、方法、字段、资源和调用边以 base/current 最终制品及显式 RuntimeProfile 为准。本地仓库副本、重新下载的 JAR 或源码模型不能替代制品事实。
+2. **单一 Binary-first 权威**：Step4–Step6 只使用 binary-first 引擎。不存在 legacy、shadow、灰度、兼容模式或 fallback；generation 失败时停止并保留上一份已验证结果。
+3. **源码仅作覆盖层**：source overlay 只补名称、位置和解释，不生成或删除 executable edge，不覆盖 provider/member resolution，不把制品中不存在的对象提升为正式事实。
+4. **依赖包维度贯穿**：每条变化、API、路径和报告必须带 `coord`、base/current 版本、artifact identity 与 lineage。不得用虚构坐标填补无法绑定的事实。
+5. **四维结果**：正式结果分别保留 `reachability_status`、`static_linkage_status`、`impact_conclusion`、`runtime_verification_status`。
+6. **静态触达四态**：`reachable`、`uncertain`、`not_found_in_static_analysis`、`not_analyzed` 四类互斥。`not_found_in_static_analysis` 不等于不受影响；旧 `not_impacted` 不属于新引擎合同。
+7. **不伪造确认**：静态分析最多输出 `probable_impact` 或 `inconclusive`，不得输出 `confirmed_impact`、`confirmed_no_impact` 或假装已执行用户业务的运行验证。
+8. **裁决分流**：authoritative、diagnostic candidate、excluded 互斥；资源、安全、topology 等 confirmed-unprojectable 事实必须带依赖身份进入复核页，不能制造占位 API，也不能丢弃。
+9. **失败关闭**：身份、RuntimeProfile、解析、support manifest、Oracle、sidecar、数据库或发布完整性失败时停止，不接受“先给部分确定结果再补”的混合 generation。
+10. **人工输出是正式合同**：Markdown/CSV 与机器权威数据同源生成。不能用 raw JSON 取代人工报告，也不能以“兼容投影”为由省略依赖包、版本和可读调用路径。
+11. **CSV 编码**：所有 CSV 使用 UTF-8 BOM；JSON 使用 UTF-8 无 BOM 和英文 `lower_snake_case` 字段。
+
+## 首次调用协议
+
+首次执行 Step1 前必须先读取静态输入协议：
 
 ```bash
 python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --describe-step1-contract
 ```
 
-这份 JSON 协议用于让 Claude Code 在首轮就知道：
+首轮尽量一次收集：
 
-1. `step1` 有哪些输入模式
-2. 默认系统升级场景下应优先抽取哪些字段
-3. 哪些字段属于兜底补全
-4. 运行时 `interaction.json` 只负责本次动态缺口，不负责定义首轮收参规则
+- 待分析工程；
+- 唯一目标可部署模块；
+- base/current 分支、tag、commit 或直接最终制品；
+- 两侧需要的 JDK home；
+- `binary_pipeline_config`，用于固定两侧最终制品、完整目标 JDK、有序运行路径、loader/resource policy 和业务入口；
+- 可选的依赖源码目录或 Git 地址。
 
-禁止做的事：
-
-1. 预判用户会怎么回答
-2. 跳过任何 `[CHECKPOINT]` 或任何 `awaiting_*` 状态
-3. 在用户未回复前执行下一步
-4. 用“我帮你确认了”代替真实用户输入
-5. 把自己的总结、建议或判断伪装成用户答复
-
-## Meta Rules
-
-0. 所有回答都必须清晰、准确、诚实。必须区分“已核实事实”“基于证据的推断”“无法确认”；不得编造或夸大事实、执行、进度、结果、原因和能力，不得通过遗漏与问题直接相关的关键事实形成误导。发现先前回答不准确时，必须立即明确更正。
-1. 本 Skill 含多个 `[CHECKPOINT]`；每个 `[CHECKPOINT]` 都是硬中断，不是建议。
-2. 只要脚本输出包含 `AWAITING USER INPUT`、`run_step.py` 返回退出码 `4`，或 `.upgrade-report/.runtime/state/main_state.json` 中的 `state.status` 进入 `awaiting_*`，就必须立即停止。
-3. 停止后只允许读取 `.upgrade-report/.runtime/state/interaction.json`，先形成用户可读的决策卡片；协议字段只用于判断该问什么、如何恢复。
-4. 未获得用户答复前，不得执行任何“继续”“恢复”“下一步”命令。
-5. 如果发现自己越过了 `[CHECKPOINT]`，必须立即停止，明确承认越界，并回到最近一个待交互点。
-6. 回答“是否完成”“是否修复”“是否全部通过”等状态问题前，必须重新核对当前任务清单、验证结果、Git 工作区和用户尚未撤销的要求；不得凭记忆或先前运行结果作答。
-7. 每个任务项的执行状态必须按事实标记为“已完成”“正在执行”“待执行”“阻塞”或“失败”。“正在执行”只能用于报告时确有命令、进程或实际工作正在运行的任务；计划执行、准备执行、曾经执行或等待恢复都不是正在执行。尚未开始的任务必须写“待执行”。
-8. 验证状态与执行状态分开记录为“已验证”或“未验证”。实现完成但没有足够证据时，应写“已完成、未验证”，不能用验证状态替代执行状态。
-9. 多项任务必须报告总数及各状态数量，并列出未完成项，例如“共 10 项：已完成 4、正在执行 1、待执行 5”。“未完成”只表示总体尚有任务未完成，不能代替具体任务状态。局部步骤或单一证据通过，只能证明对应范围。
-10. 只要仍有待执行、正在执行、阻塞、失败、未交付或用户要求的验证尚未执行，就必须直接回答“没有全部完成”，并准确列出各项状态。不得把待执行写成正在执行，也不得用“应该正确”“基本完成”或“后续增强”掩盖未完成工作。
-11. 只有所有任务项均已完成、要求的验证有本轮新鲜证据、交付动作已经完成且没有已知剩余项时，才能宣称“全部完成”。无法取得事实或证据时，应说明“无法确认”，不得用推测填补。
-
-窄例外：如果 Step5 已经成功生成 `.upgrade-report/.runtime/indexes/s5_query_index.json`，且用户只是按方法、依赖坐标/ArtifactId 或 Java 包前缀询问调用链，允许执行只读诊断查询 `scripts/s5_query_call_chain.py` 并直接返回调用链文本。该动作不得修改 `main_state.json`、不得清理/重跑任何 Step、不得恢复 checkpoint，也不得继续推进 Step6。
-
-## 目标
-
-识别升级引入的兼容性风险，输出可追溯结论。默认**只分析，不直接修复**。
-
-## 触发条件
-
-出现以下任一场景时，必须立即使用本技能：
-
-- JDK 版本升级，如 `8 -> 11`、`8 -> 17`、`11 -> 21`
-- Spring Boot 大版本升级，如 `2.x -> 3.x`
-- Spring Framework 升级，如 `5 -> 6`
-- `javax -> jakarta` 迁移
-- Maven / Gradle 依赖批量升级、兼容性评估、冲突排查
-
-## 核心原则
-
-1. **最终产物优先**：Step1 只比较单个目标模块的最终打包依赖；输入既可以是从已固定远程 commit 构建的真实结果，也可以是用户直接提供的 base/current 编译产物路径。`boot jar/war` 读最终产物，`thin jar` / 无嵌套依赖场景直接阻塞。若 direct artifact 模式还要继续进入 Step2+，必须显式给出 `base_branch/current_branch`，不能让系统自动猜。项目源码模型只可为最终制品中实际存在的内部模块补坐标，且仅限目标模块运行时闭包；不得覆盖构建工具已解析的坐标或版本，也不得扩展最终制品依赖范围。依赖源码同样永远是辅助证据，不能覆盖最终制品中的依赖、版本、类或字节码事实。
-2. **门控强制**：上一步输入不完整或门控失败，不进入下一步。
-3. **结论可追溯**：每条结论都要记录证据来源。
-4. **不猜测**：必须区分五态：`reachable` / `not_impacted` / `uncertain` / `not_analyzed` / `not_found_in_static_analysis`。只有当前制品中的其他依赖以完全相同的类字节码保留目标 API 时才能使用 `not_impacted`；不要把“未覆盖”或“静态未找到”误写成“未影响”。
-5. **引擎整代一致**：默认 `legacy`；只有用户/运行配置显式选择 `binary_strict`、`binary_with_legacy_fallback` 或 `shadow` 时才切换，并在 Step4 前固定。binary 模式必须提供 `binary_pipeline_config`，不能从构建环境猜 RuntimeProfile。strict 失败即停止；fallback 只能丢弃失败 binary generation 后从 Step4 重建整套纯 legacy 结果；shadow 永远不改变 legacy 权威。禁止逐 API、逐事实或逐边混用引擎。
-6. **Binary 四维状态**：binary 权威输出分别保留 `reachability_status`、`static_linkage_status`、`impact_conclusion`、`runtime_verification_status`。静态分析不得写出 confirmed impact/no-impact 或已经执行的运行验证；candidate、confirmed-unprojectable 和 coverage gap 必须保留在独立 sidecar/summary，不能伪造成 API，也不能静默删除。
-5. **影响优先**：主报告优先展示已证明触达当前系统的风险。
-6. **单依赖包主键**：`coord` 是 per-dependency 分析与汇总的正式主键。
-7. **removed 统一语义**：`change_type=removed` 的分析对象不是“空的新 jar”，而是 `old jar symbol_set`。
-8. **主状态唯一真相源**：`step5_selected_coords` 等业务选择必须先写入 `main_state.json`，正式流程不得通过单步脚本 CLI 透传业务参数。
-   - `state.status=ready` 表示上一 Step 已完成、`current_step` 指向下一待执行 Step；只有 `current_step=done`、`completed_step=step6` 且 `status` 为 `completed` / `completed_with_limits` 时，才能向用户表述为整个分析已完成。
-   - `completed` 表示流程已完成且没有记录结论限制；展示完成摘要和交付物路径后即可收尾，不生成 `interaction.json`。
-   - `completed_with_limits` 表示流程已完成且交付物可读，但结论受分析范围或证据缺口限制；必须展示完整限制清单、适用范围和交付物路径后收尾，不生成强制确认。只有用户明确要求扩大范围、补充证据或重跑时，才按其选择恢复流程。
-9. **关键工具必须可用**：JApiCmp 与 tree-sitter 是 Java 升级分析的准确性前提。tree-sitter 必须按固定清单显式 bootstrap，运行时不联网安装；安装、版本或加载检查失败时记录 `blocked_by_system` 并停止，不生成用户确认项。不得使用 `allow_degraded=true` 绕过 JApiCmp 二进制对比或 tree-sitter Java AST 分析。
-10. **CSV 编码统一**：所有 CSV 产物统一使用 UTF-8 BOM，程序按 UTF-8 BOM 口径读取，保证 Windows Excel 直接打开中文不乱码。
-11. **准确性双线验证**：真实项目验证必须并行生成分析器结果与独立 Oracle 结果，只共享同一最终制品、API 身份协议和运行输入，不得复用分析器的解析、筛选或结论实现。必须逐 API 闭集对账；缺失、重复、额外、冲突、错误结论或无法绑定本次最终制品的 Oracle 均不得标记为已验证。接入新项目只增加数据输入和独立证据，不得在生产代码中登记项目、坐标或类名特例。失效的辅助证据必须报告，但不能推翻同一 API 已存在的有效强证据。
-12. **JSON 编码与字段契约**：所有 JSON 产物统一读写为 UTF-8 无 BOM；字段名使用英文 `lower_snake_case`，中文说明只放在 value 中。不兼容带 BOM 或中文字段名的历史 JSON，旧产物必须重新生成。CSV 仍统一使用 UTF-8 BOM，保证 Windows Excel 直接打开中文不乱码。
+不能从构建环境猜测会改变运行时结论的 loader、entrypoint 或 JDK image。缺失这些外部事实时明确询问，不用旧引擎兜底。
 
 ## 执行模式
 
-把整个任务当成**状态机**，一次只推进一个 Step：
+把流程当作唯一主状态驱动的状态机：
 
 ```text
 last_step_summary = read(.upgrade-report/.runtime/state/last_step_summary.json if exists)
 resume_context = read(.upgrade-report/.runtime/state/resume_context.md if exists)
-先用上述两个轻量文件汇报“做到哪、产出在哪、下一步是什么、是否需要用户输入”
+先用两个轻量文件说明做到哪、产出在哪、下一步是什么、是否需要用户输入
 main_state = read(.upgrade-report/.runtime/state/main_state.json if exists)
+轻量摘要与主状态冲突时以主状态为准
 
 if main_state.state.status startswith "awaiting_":
     interaction = read(.upgrade-report/.runtime/state/interaction.json)
-    若交互事件提供 user_decision_card，直接以它作为用户卡片，不得根据 response_schema / action_requirements 重新拼接用户说明
-    向用户展示决策卡片:
-      - 当前需要确认什么
-      - 为什么停下
-      - 可选动作
-      - 需要补充的信息
-      - 候选对象
-      - 完整候选或证据文件
-      - 用户可直接回复的自然语言示例
+    形成用户可读决策卡片
     等待用户答复
     run("python .../run_step.py --step auto --response-json '<intent_patch JSON>'")
     停止
 
-step = resolve_next_step(main_state)
-
-if step 输入不足:
-    向用户索取缺失输入
-    停止
-
-run("python .../run_step.py --step <step>")
-
-if main_state.state.status startswith "awaiting_":
-    回到上面的 CHECKPOINT 处理分支
-
-if gate failed or step blocked:
-    向用户说明阻塞原因
-    停止
-
-否则:
-    进入下一步
+run("python .../run_step.py --step auto")
 ```
 
 硬规则：
 
-1. 遇到 `awaiting_*` 时，唯一合法动作是“读交互文件 -> 问用户 -> 等用户答复 -> 用答复恢复”；唯一例外是用户明确要求按方法、依赖坐标/ArtifactId 或 Java 包前缀查询 Step5 已生成索引中的调用链，此时只允许执行只读 `s5_query_call_chain.py` 查询并返回链路
-2. `run_step.py` 退出码 `4` 表示 `AWAITING_USER`；必须读取 `interaction.json` 后停下问用户，不能把它当成失败重试，也不能当成成功完成
-3. 恢复命令只使用 `--response-json` 或 `--response-file`；不得使用裸动作参数绕过结构化用户答复
-4. checkpoint 转述必须先形成用户可读的“决策卡片”：当前需要确认什么、为什么停下、推荐默认动作、可选动作、候选对象、完整候选文件、用户可以直接怎么回复。
-5. Claude Code 不要把 action_requirements、selection_resolution、response_schema、runtime_rules 作为普通用户的主信息；这些字段只用于构造恢复命令。
-6. Step4 后进入 Step5 的候选对象必须按依赖包维度展示，优先引用 `evidence/api_changes/changed_dependencies.md`，不要要求用户从 `all_changed_apis.csv` 中逐行挑 API。
-7. `scope_mode`、`selected_targets`、`selection_key`、`action=continue` 等是机器协议，禁止出现在面向用户的决策卡、动作说明和回复示例中。用户只需回复“全量分析”或“只分析 <依赖名称/完整坐标>”，系统负责转换内部字段。
-8. 候选未全部展示时，不能只把 `changed_dependencies.md` 列为“待复核产物”；必须明确说明它是完整依赖选择清单，并指引用户从“依赖包”列取得未展示候选后直接回复。
-9. 若 `JUA_CONFIRMATION_JSON` 提供 `user_decision_card`，必须优先展示该字段；`response_schema`、`selection_resolution`、`selected_targets` 只用于把用户自然语言答复转换成恢复输入。
-10. `interaction.json` 的 `status=informational` 表示系统生成的非阻塞阶段结果卡，不是 checkpoint：可直接转述 `user_decision_card`，不得要求用户回复，也不得把它写入 `pending_interaction`。Step5 成功自动进入 Step6 时仍必须生成这张卡，避免 Agent 自行拼装五态摘要。
+1. `run_step.py` 返回退出码 `4`、输出 `AWAITING USER INPUT` 或主状态进入 `awaiting_*` 时，立即停止执行。
+2. 待交互时只读取 `.upgrade-report/.runtime/state/interaction.json` 和它引用的人工文件；没有用户答复不得继续。
+3. 恢复只使用 `--response-json` 或 `--response-file`，不得使用裸动作参数绕过结构化答复。
+4. `state.status=ready` 只表示上一阶段完成；只有 `current_step=done`、`completed_step=step6` 且状态为 `completed` 或 `completed_with_limits` 时才是整个分析完成。
+5. `completed_with_limits` 必须展示完整限制清单、适用范围和交付物；它是可交付的受限结果，不生成强制确认。
+6. 显式重跑某阶段时，调度器重建该阶段及以后产物；不能把不同轮次或 generation 拼在一起。
+7. 窄例外：Step5 已生成 `.upgrade-report/.runtime/indexes/s5_query_index.json` 且用户只查询方法、坐标、artifactId 或包前缀时，可执行只读 `scripts/s5_query_call_chain.py`。查询不能改变主状态或推进 Step6。
 
-优先使用统一调度入口 `scripts/run_step.py`。不要要求自己一次记住所有命令；具体命令、参数、产物清单统一按需查看 `RUNBOOK.md`。
+## 决策卡片
 
-## Removed Jar 语义
+所有交互点必须覆盖当前所有交互点的真实缺口，并用用户语言说明：
 
-在依赖升级分析中，`removed jar` 不是旁路场景，而是统一模型中的一种 `change_type`：
+- 当前需要确认什么；
+- 为什么必须暂停；
+- 推荐默认动作及理由；
+- 可选动作和各自影响；
+- 候选对象、完整清单路径；
+- 用户可直接回复的自然语言示例。
 
-- `upgraded`
-- `removed`
-- `added`
+不要把 action_requirements、response_schema、selection_resolution、`scope_mode`、`selected_targets` 或 `action=continue` 当作用户主信息。用户只需表达“全量分析”或“只分析 <依赖名称/完整坐标>”，系统负责转换协议字段。
 
-其中 `removed` 的正式语义为：
+`interaction.json` 的 `status=informational` 是非阻塞阶段结果卡，不是 checkpoint：可以转述 `user_decision_card`，不得要求用户回复或写入 `pending_interaction`。Step5 卡片必须使用新引擎四态和四维语义。
 
-- `old` 存在，`new` 不存在
-- Step4 必须从旧版 jar 导出最小符号集合
-- 第一批最小闭环至少支持 `class`、`method`、`constructor`
-- Step5/Step6 继续按单个 `coord` 汇总“是否触达系统源码”
+## 用户体验与故障处理
 
-## 会话开场协议
+- 只在缺少系统无法取得的外部事实、需要授权，或不同选择会实质改变结果时询问用户。
+- 网络、缓存、源码、parser 和工具内部故障先自动重试、修复或安全停止，不要求用户批准降级。
+- 长任务至少每 60 秒输出用户可懂的进度心跳；只有分母可靠时才显示预计剩余时间。
+- 用户按 `Ctrl-C` 时终止当前子进程，清理本阶段半成品，保留以前完成的正式产物和当前输入；退出码 `130`。
+- 失败消息说明当前任务、原因、已保留内容和可执行恢复方式，不暴露无用内部协议。
 
-命令约定：
+## 后台执行
 
-1. Claude Code 使用 `${CLAUDE_SKILL_DIR}` 指向当前 Skill 的安装目录。
-2. 正式流程默认通过 `scripts/run_step.py` 调度；单独运行某个脚本不等价于完整主状态流程。
-3. 即使是正式流程里的恢复/重建动作，也不能把业务参数通过单步脚本 CLI 重新透传；恢复时仍应以 `main_state.json` 为唯一业务参数源。
+需要后台运行时使用统一入口的 `--background`，并读取：
 
-Step5 必须使用 `tree-sitter` 做 Java AST 分析。分析器自身的最低运行要求为 CPython 3.10；PR quick 在 Ubuntu 上验证 CPython 3.12.x/3.13.x/3.14.x，平台矩阵使用 3.12 验证 Linux/macOS/Windows，Python 依赖版本由 `requirements-runtime.txt` 固定。满足最低要求但未进入 CI 验证矩阵的小版本必须记录明确提示，并在固定依赖版本和 import 检查通过后继续，不得误报为版本不兼容。JDK、Maven、Gradle 属于用户工程构建环境，不设分析器级版本下限：base/current 各自在隔离 worktree 中优先使用该 revision 的 `mvnw` / `gradlew`，没有 Wrapper 时才回落 PATH；JDK 使用该侧 `base_jdk_home/current_jdk_home`，未提供时回落宿主机 `JAVA_HOME`。Wrapper 对应 distribution 必须已可用，分析期间不得联网替换成其他版本。Python 低于最低版本、运行依赖缺少、版本不符或加载失败时必须在分析前失败并记录系统环境阻塞，不得伪装成需要用户确认的业务 checkpoint，也不允许继续用增强正则生成分析结论。
-
-首次准备环境时，在 Skill 根目录使用 CPython 3.10 或更高版本执行显式 bootstrap：
-
-```bash
-python scripts/bootstrap_runtime.py
+```text
+.upgrade-report/.runtime/background/status.json
 ```
 
-离线环境使用 `python scripts/bootstrap_runtime.py --wheel-dir /abs/path/to/wheels`，该模式带 `--no-index`，只读取受控缓存。用户安装完成后恢复 checkpoint 时，应将自然语言“已安装，重跑 Step5”归一化为 `action=rerun_current_step` 与 `tree_sitter_installed=true`。
-
-首次进入任务时，先确认：
-
-1. 当前工作目录是否就是待分析系统的 Maven / Gradle 工程根目录；通常直接采用，不重复询问路径
-2. `Step1` 选择哪一种输入方式：`artifact_inputs` 或 `checkout_build`
-3. 若是 `artifact_inputs`：`base_artifact_path/current_artifact_path`
-4. 若是 `checkout_build`：`base_branch/current_branch`
-5. 本次唯一的 `target_module`；用户未明确时，先展示 reactor 候选并要求确认
-
-如果用户首轮已经明确“只分析某个模块 / 只看某几个模块”，必须把该范围视为 `Step1` 前置输入，而不是等 `Step1` 跑完再纠偏。硬规则：
-
-1. 在第一次执行 `step1` 前，就要通过 `--seed-json` 初始化 `target_module`，或直接通过 `--target-module` 传给 `run_step.py`
-2. 禁止先按 root 范围执行 `step1`，再在 `Phase 2 [CHECKPOINT]` 里让用户二次确认模块
-3. 若用户尚未明确模块，先展示 Maven reactor 或 Gradle project 候选并等待用户确认，不得静默选择 root、第一个模块或最大产物
-
-优先一次性向用户收集执行所需信息，避免多轮追问。最小收集集建议包含：
-
-1. 当前工作目录不是系统工程根目录时，才补充正确根目录
-2. `Step1` 输入方式：`artifact_inputs` 或 `checkout_build`
-3. 若是 `artifact_inputs`：`base_artifact_path/current_artifact_path`
-4. 若是 `checkout_build`：`base_branch/current_branch`
-5. 若 artifact 中某侧嵌套依赖缺少 `pom.properties`：优先补该侧 `branch`，特殊场景才补 `base_source_project_dir/current_source_project_dir`
-6. 若某一侧 Maven / Gradle 需要特定 JDK：补该侧 `base_jdk_home/current_jdk_home`；未提供时各侧默认回落主机 `JAVA_HOME`
-7. 本次唯一的 `target_module`；确认后由 Maven reactor 或 Gradle project graph 自动推导系统源码范围
-8. 依赖源码目录、仓库根目录或 Git 地址（可选但强烈推荐；仅表示依赖源码，字段为 `dependency_source_dirs`）
-9. `max_depth`（默认 5，表示最大累计追踪代价；全高置信度边时最多约 5 跳；同一节点保留“更短”和“更可信”的 Pareto 最优路径）
-10. 是否包含 test 作用域（默认 false）
-11. 是否允许降级执行（默认 false；缺少关键源码映射时将阻塞以避免漏分析）
-
-如用户愿意，可直接让用户一次性填写初始化用的 `seed json`；调度器会通过 `--seed-json` 建立 `main_state.json`，后续步骤优先复用主状态，不再重复索取。
-
-推荐模板：
-
-```json
-{
-  "base_branch": "main",
-  "current_branch": "feature/upgrade-test",
-  "target_module": "app-module",
-  "dependency_source_dirs": ["/abs/path/to/dependency-repo", "https://git.example.com/team/dependency-repo.git"],
-  "max_depth": 5,
-  "tool": "maven"
-}
-```
-
-```bash
-python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
-  --project-dir . \
-  --report-dir .upgrade-report \
-  --seed-json /abs/path/to/seed.json
-```
-
-如果 `.upgrade-report/.runtime/state/last_step_summary.json` 已存在，先读它和同目录的 `resume_context.md` 形成进度摘要，再读取 `main_state.json` 核实状态真相并决定从哪个 Step 恢复；不要重新扫描多个大日志来拼接进度。
-
-若需要执行单步，优先使用：
-
-```bash
-python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step <step1|step2|step3|step4|step5|step6> \
-  --project-dir . \
-  --report-dir .upgrade-report
-```
-
-说明：本文件中的命令统一使用 `python`，避免 Windows 的 `python3` 被 Microsoft Store 别名拦截。若环境只提供 Windows Python Launcher，可把命令开头等价替换为 `py -3`；macOS/Linux 若只提供 `python3`，可等价替换为 `python3`。
-
-Step5 预计耗时较长时，使用调度器内建后台模式，不要手写 `nohup` 或 `.runtime/run_step5.sh`：
-
-```bash
-python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step step5 \
-  --project-dir . \
-  --report-dir .upgrade-report \
-  --background
-```
-
-`--background` 会把启动时的 PATH 快照写入 `.upgrade-report/.runtime/background/`，并通过子进程 `env` 显式继承；实际解释器使用当前进程的 `sys.executable`，不再依赖 `python3` 命令解析。启动命令返回 `0` 只表示后台进程创建成功，不表示 Step5 已完成。必须继续读取 `.upgrade-report/.runtime/background/status.json`：`running` 表示仍在执行，`completed` 表示成功，`awaiting_user` 表示已经进入 checkpoint，`failed` / `interrupted` 表示终止；具体日志路径由该状态文件的 `log_path` 给出。后台任务未结束时不得继续 Step6，也不得把启动成功汇报为分析完成。
-
-### 最小参数用法（推荐）
-
-Step1 必须显式提供一种输入方式；若两种方式都没给全，`run_step.py` 会先返回前置输入契约交互，而不是直接执行实际分析：
-
-```bash
-python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step step1 \
-  --project-dir . \
-  --report-dir .upgrade-report \
-  --base-branch <base_branch> \
-  --current-branch <current_branch>
-```
-
-或直接提供两侧编译产物：
-
-```bash
-python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step step1 \
-  --project-dir . \
-  --report-dir .upgrade-report \
-  --base-artifact-path /abs/path/to/base-app.jar \
-  --current-artifact-path /abs/path/to/current-app.jar
-```
-
-若系统升级分析默认语义是“同一系统、同一仓库、不同分支”，则 direct artifact 模式还推荐同时显式给出 `base_branch/current_branch`；当某一侧嵌套依赖缺少 `pom.properties` 时，Step1 会优先使用这两个分支在同一源码仓库生成 Maven `dependency:list` 或 Gradle `runtimeClasspath` 报告补全坐标。
-
-若 direct artifact 模式的两侧产物已经齐全，Step1 可以直接进入执行；`base_branch/current_branch` 属于强烈推荐的补全来源，不是 direct artifact 入口的执行前硬前置。
-
-源码运行时清单与 fat JAR 同时可用时，必须先自动闭合依赖身份：Maven/Gradle resolved artifact inventory 提供 group、artifact、完整 version 与构建侧物理文件，fat JAR 提供实际打包条目；两侧物理文件精确匹配优先于文件名推断。构建工具没有报告 classifier 时，物理文件名相对精确 version 多出的唯一非空部分按 classifier 固化。不得把 `artifact-version-classifier.jar` 整体误解析成带 classifier 后缀的 version，也不得在唯一匹配时要求用户补人工坐标。版本本身包含连字符时以运行时清单为准；多个不同最终坐标仍能解释同一条目时才允许进入歧义处理。
-
-Gradle 文件锁冲突属于原命令的瞬时执行故障，不是 artifact inventory 能力缺失。必须仅对原命令按 1 秒、3 秒退避重试；重试耗尽后保留真实阶段、真实命令与锁错误，不得启动组件树回退、删除锁文件、执行全局 `gradle --stop` 或切换到会改变用户缓存/凭据语义的新 `GRADLE_USER_HOME`。只有明确的 task/API 不兼容或 inventory 成功但没有可用记录时才允许组件树回退。
-
-需要源码时必须遵循统一来源顺序：先用 `git ls-remote` 查询所有配置 remote 的实时分支/tag，选定后固定首次快照中的 commit；不得用本地 `refs/remotes/*` 冒充远端最新状态，不得执行 `git pull`、checkout、merge 或 rebase。未指定 remote 的同名候选只有在 commit 唯一时才能自动采用；多个不同 commit 必须 checkpoint。确认卡必须把 repo、remote、canonical ref、artifact 与当时的 expected commit 绑定为同一快照；只有绑定仍匹配当前输入时才能复用 `expected_commit`。后续定向查询为空或指向新 commit 时必须按 1 秒、3 秒间隔重试，且这些观测只能用于诊断，不能推翻首次已选 commit：本地已有该 commit 对象时直接验证复用，否则按固定 SHA 精确 fetch。只有固定 SHA 确实无法物化时才作为系统/远端对象可达性错误失败，不得要求用户重新选择 ref。远端失败时必须保留远端失败为主状态，本地分支只能作为 `local_fallback_available` 附加信息，不得自动使用；只有结构化答复明确设置对应侧 `allow_local_source=true` 后才允许本地分支兜底，dirty 工作区还必须明确 `allow_dirty_local_source=true`。成功来源状态必须记录为 `remote_source_resolved` 或 `user_confirmed_local_source`。
-
-若用户已明确只分析某个模块，第一次执行 `step1` 时必须直接带模块参数，不得先跑 root 范围：
-
-```bash
-python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step step1 \
-  --project-dir . \
-  --report-dir .upgrade-report \
-  --base-branch <base_branch> \
-  --current-branch <current_branch> \
-  --primary-module module-a \
-  --modules module-a
-```
-
-Step2 应优先消费 Step1 已确认并写入主状态的 `base_branch/current_branch`；对 direct artifact 模式，不得依赖工作区自动探测分支冒充产物来源。
-
-如果希望按主状态续跑，可使用：
-
-```bash
-python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
-  --project-dir . \
-  --report-dir .upgrade-report
-```
-
-## 交互模型
-
-本 Skill 必须按两类阶段执行：
-
-- `[AUTO]`：可自动执行脚本、门控与主状态保存
-- `[CHECKPOINT]`：必须先向用户汇报结果并等待答复，不能自动推进到下一阶段
-
-强规则：
-
-1. 只要进入 `[CHECKPOINT]`，就必须停下并向用户发问
-2. 只要 `main_state.json.state.status` 为 `awaiting_user_input` 或其他 `awaiting_*`，不得继续推进
-3. Claude Code 不会因为 Python 子进程输出 JSON 自动弹出对话，因此必须主动读取 `.upgrade-report/.runtime/state/main_state.json` 和 `.upgrade-report/.runtime/state/interaction.json`
-4. `main_state.json + interaction.json` 是恢复状态的实现细节；真正决定“这里必须停”的依据，是本文件中的 `[CHECKPOINT]` 约束
-
-进入 `[CHECKPOINT]` 后，只允许做以下动作：
-
-1. 读取 `.upgrade-report/.runtime/state/main_state.json`
-2. 若 `status` 为 `awaiting_*`，读取 `.upgrade-report/.runtime/state/interaction.json`
-3. 把 `interaction.json` 整理成用户可读的决策卡片，而不是把协议字段逐项甩给用户
-4. 决策卡片必须说明：当前要确认什么、为什么停下、可选动作、需要补什么、候选对象、完整候选或证据文件、用户可以直接怎么回复
-5. 覆盖当前所有交互点中确有必要的事项：缺少 Step1 输入、Step1/Step2 的业务选择、Step4 两个以上不同 commit pair 的真实歧义、Step4 成功且存在至少两个候选依赖时的 Step5 全量/部分范围选择、需要用户授权的环境阻塞，以及用户主动要求从指定步骤重跑；可内部恢复的证据故障不得列为必问项，0/1 个候选不得制造范围确认，Step5 成功后的例行复核不得保留
-6. `response_schema` / `input_normalization` / `action_requirements` / `selection_resolution` 只用于把用户原话整理成结构化答复，不作为用户主信息展示
-7. 等待用户答复
-8. 用用户真实答复构造 `--response-json` 或 `--response-file`
-
-进入 `[CHECKPOINT]` 后，明确禁止：
-
-1. 默认替用户选择 `continue`
-2. 跳过提问直接执行恢复命令
-3. 把自己的判断写成 `notes` 后直接恢复
-4. 在用户未答复前进入下一个 `[AUTO]` 阶段
-5. 看到退出码为 `0` 就认定整条链路已完成；`run_step.py` 退出码 `4` 代表待用户交互，不得越过
+启动命令返回 `0` 只表示后台进程创建成功，不表示分析步骤或全流程完成。必须继续读取后台状态、主状态和阶段产物，直到完成、待交互或失败。
 
 ## 执行阶段
 
 ### Phase 1 [AUTO] Discovery
 
 - 对应步骤：`step1`
-- 目标：获取真实依赖结果，产出 `.upgrade-report/evidence/dependencies/dep_changes.csv`
-- 输入：先确认唯一 `target_module`，再从以下方式二选一
-  - `artifact_inputs`：`base_artifact_path/current_artifact_path`
-  - `checkout_build`：`base_branch/current_branch`
-  `primary_module/modules` 仅作为旧状态兼容名；新交互统一使用 `target_module`
-- 规则：若两种输入方式都不完整，不进入实际 Step1，而是先进入前置输入契约交互（`reason_code=missing_step1_entry_inputs`）
-- 规则：若用户首轮已明确模块范围，第一次执行 `step1` 时必须直接传 `target_module`；不得先跑 root 范围结果再靠待交互确认点纠偏
-- 规则：对 direct artifact 模式，若后续要进入 Step2+，必须显式给出 `base_branch/current_branch`；不得依赖系统自动猜测
-- 规则：坐标补全必须先消费 Maven `dependency:list` 或 Gradle artifact inventory，再用目标模块运行时闭包内的 reactor/project 模块目录补齐缺失的内部模块身份。Maven 属性继承和 Gradle project path 必须解析到有效 group、artifact、version；目标模块自身、闭包外模块、未解析占位符和 `unspecified` 版本不得进入补全目录；构建工具已解析结果优先
-- 规则：若 Step1 进入 `unresolved_dependency_coordinates_after_enrichment`，Claude Code 必须先向用户暴露 `unresolved_items`，允许用户补 `manual_coord_overrides`，或明确选择 `confirm_unresolved`；这条补丁路径同时适用于直接产物模式和 checkout_build 模式
-- 门控：执行 `step1_scope`
+- 从用户输入、构建模型和最终制品识别候选目标模块与两侧来源。
+- base/current 分支必须固定到具体 commit，在隔离 worktree 中构建，不切换用户工作区。
+- 直接制品模式先验证归档安全、类型和可部署性。
 
 ### Phase 2 [CHECKPOINT] Confirm Dependency Scope
 
-- 对应步骤：`step1` 完成后立即进入
-- 必须展示：构建来源、变更范围、`evidence/dependencies/dep_changes.csv`
-- 必须确认：当前真实构建结果是否可信，是否可以作为后续分析范围
-- 若用户指定“只分析某个模块”，或用户首轮其实已明确模块但 Claude Code 漏传导致仍跑成 root 范围，不得直接进入 `step2`；必须把该答复写成结构化 JSON，并以 `action=rerun_current_step` 连同 `primary_module` / `modules` 一起重跑 `step1`
-- 用户答复前，不得进入 `step2`
-- 允许动作：`continue`、`rerun_current_step`、`cancel`
-- 禁止动作：在未得到用户确认前直接进入 `step2`
-- 恢复命令模板：
+- 对应步骤：`step1`
+- 确认唯一目标模块、两侧构建来源和最终制品依赖范围。
+- 多个可部署模块、分支/产物身份无法唯一确定或依赖坐标存在实质歧义时必须让用户选择。
+- Step1 输出的依赖、坐标和版本以最终 fat JAR/WAR 为准；thin JAR 不能证明完整运行时闭包。
 
-```bash
-# 用户确认当前范围可信
-python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
-  --project-dir . \
-  --report-dir .upgrade-report \
-  --response-json '{"intent_patch":{"action":"continue","set":{}}}'
+人工入口：
 
-# 用户要求只分析某个模块
-python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
-  --project-dir . \
-  --report-dir .upgrade-report \
-  --response-json '{"intent_patch":{"action":"rerun_current_step","set":{"primary_module":"module-a","modules":["module-a"]}}}'
-```
+- `evidence/dependencies/dep_summary.txt`
+- `evidence/dependencies/dep_changes.csv`
+- `evidence/dependencies/build_provenance.json`
 
 ### Phase 3 [AUTO] Context Build
 
 - 对应步骤：`step2`
-- 目标：从依赖树推断升级上下文
-- 输入：`.upgrade-report/evidence/dependencies/dep_changes.csv`
-- 输出：`.upgrade-report/evidence/context/context.json`、`.upgrade-report/evidence/context/dep_graph.json`
-- 规则：若上下文缺字段，要求用户补齐 `evidence/context/context.json` 或运行配置
-- 门控：执行 `context`
+- 从已固定输入生成升级上下文和依赖关系。
+- 标准 Maven/Gradle 源码布局由项目模型推导；源码不能改变制品依赖事实。
 
 ### Phase 4 [CHECKPOINT] Confirm Upgrade Context
 
-- 对应步骤：`step2` 仅在 JDK、业务源码范围、源码映射歧义等关键事实无法由证据可靠确定、且不同选择会改变分析口径时进入；证据完整时自动跳过本 Phase 并直接进入 `step3`
-- 必须展示：`evidence/context/context.json`、`evidence/context/dep_graph.json` 的关键摘要
-- 必须确认：`base_branch`、`current_branch`、JDK / Spring Boot 口径、升级依赖识别结果是否正确
-- 用户答复前，不得进入 `step3`
-- 允许动作：`continue`、`cancel`
-- 禁止动作：在用户未确认前直接进入 `step3`
-- 恢复命令模板：
+- 对应步骤：`step2`
+- 只有 JDK、分支、目标模块或其他会改变分析范围的外部事实无法确定时才确认。
+- 普通内部证据故障不生成这类 checkpoint。
 
-```bash
-# 用户确认上下文正确
-python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
-  --project-dir . \
-  --report-dir .upgrade-report \
-  --response-json '{"intent_patch":{"action":"continue","set":{}}}'
-
-# 用户补充分支后再恢复
-python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
-  --project-dir . \
-  --report-dir .upgrade-report \
-  --response-json '{"intent_patch":{"action":"continue","set":{"base_branch":"origin/main","current_branch":"feature/upgrade"}}}'
-```
+人工入口：`evidence/context/review.md`。
 
 ### Phase 5 [AUTO] Static Scan
 
 - 对应步骤：`step3`
-- 目标：执行 JDK / Spring Boot / 依赖兼容性静态扫描
-- 输入：Step 2 上下文 + 依赖变更清单
-- 输出：JDK / Spring Boot / 依赖 jar 兼容性扫描结果
-- 规则：只运行与当前升级场景相关的扫描
-- 规则：JDK/Spring/Jakarta 规则必须来自带版本、来源、校验日期的规则包，并按升级区间过滤；静态命中只能标记为候选证据，不能冒充已发生的编译失败
-- 门控：执行 `scan`
+- 扫描 JDK、Jakarta、Spring、配置、内部 API 和 classfile 兼容性线索。
+- Step3 线索是背景风险，不得追加为 Step4 的正式变化 API，也不得覆盖二进制结论。
 
-### Phase 6 [AUTO] Evidence Build
+### Phase 6 [AUTO] Binary Evidence Build
 
 - 对应步骤：`step4`
-- 输入：依赖变更清单、上下文、分支信息、依赖源码目录（推荐字段：`dependency_source_dirs`）
-- 输出：`.upgrade-report/evidence/api_changes/` 与 `all_changed_apis.csv`
-- 重点：JApiCmp XML 是机器解析主证据，stdout 仅用于人读和 XML 失败回退；分别保留 binary/source compatibility，不能把“二进制兼容但源码重编译不兼容”合并掉
-- 规则：Step1 必须把变化依赖的 base/current 内嵌 JAR 一次性提取到 `evidence/dependencies/s1_dependency_jars/`，并在 `dependency_jars.json` 记录 `coord + side + lib_entry + SHA-256 + retained_path`。正式 Step4 只能按该清单直读已固化 JAR，不得重新打开 fat JAR、递归查询嵌套归档、回退本地 Maven 仓库或下载同坐标 JAR；条目缺失或摘要不一致必须由 Step1 门控报错
-- 规则：Step4 默认按依赖级并行执行（默认 `step4_workers=4`，可通过主状态/命令行降为 1），但汇总输出必须按 `evidence/dependencies/dep_changes.csv` 原始顺序稳定合并
-- 规则：正式流程默认不设置超时；仅当用户显式提供 `step4_git_diff_timeout` / `step4_japicmp_timeout` / `step4_fetch_timeout` / `step4_tool_install_timeout` 时才启用对应超时；Git fetch 与 JApiCmp 工具安装不得共用一个超时字段
-- 规则：依赖身份只由 Step1 的最终制品条目确定；内嵌 Maven 元数据无法确定坐标时，构建工具运行时输出和目标闭包内的项目模块目录只用于补齐该条目。Step4 的依赖源码只能 enrich Step1 已有变化 GAV，不能再次发现依赖或新增同 GAV 行。若提供 `dependency_source_dirs`，模块定位只扫描构建清单一次，必须先按 Step1 变化坐标过滤，并设置深度和文件数上限；禁止递归扫描源码树或多轮嵌套查询。Git 地址先克隆到报告内部缓存并保留 `origin`，本地目录原样只读使用；随后用实时 `git ls-remote` 结果按依赖的 `old_version/new_version` 匹配远程 ref。只去掉末尾 `-SNAPSHOT` 后，按“严格边界命中”筛选候选，且只有独立的 `DEV/dev` 路径段或名称段才降权，不能误伤 `device`、`developer` 等普通名称。old/new 两侧同时存在多个候选时，优先选择 remote 一致、版本前缀家族一致的 ref pair；候选必须按 old/new commit pair 去重。同一 commit pair 或唯一 ref pair 必须自动固定并继续，不得询问；只有两个以上不同 commit pair、且选择会改变源码 diff 范围的真实歧义才进入人工确认。选定后必须定向 fetch 并用 commit SHA 执行 diff，不得直接套用主项目分支名或静默使用本地 ref
-- 规则：Step4 的远端查询失败、fetch 失败、ref 移动、未匹配、远端不可用和未授权本地兜底均属于内部源码证据故障。按错误类型完成受控重试后，不得把修复工作抛给用户，也不得猜测或静默改用本地 ref；应记录 `DEPENDENCY_SOURCE_REF_UNAVAILABLE`，并从升级前后最终制品 JAR 对共享变化类执行同签名方法字节码指纹对比，以 `jar_bytecode` 证据补齐 `BEHAVIOR_CHANGED` 候选。只有源码 diff 或最终 JAR 方法字节码兜底至少一项完整时，该依赖的行为变化覆盖才可计为 complete；两者都失败时 `behavior_diff` 必须进入关键覆盖缺口，禁止输出完整或无影响结论。若存在真实 commit pair 歧义，必须在一张决策卡中展示全部待确认依赖；每项给出按稳定顺序排列、按 commit pair 去重的方案编号、升级前/升级后源码分支和 commit 摘要。卡片最多展示 6 个方案时必须标明总数和完整候选文件；用户可以一次回复各依赖的方案编号，也可以直接给 old_ref/new_ref，恢复前必须校验本轮所有待确认依赖均已覆盖
-- 规则：依赖源码映射用于继续解释依赖消费者到业务入口的路径，但不是依赖引用发现的前提；所有变更依赖都必须执行最终制品字节码扫描，源码存在与否只影响后续可达性解释
-- 门控：`step4` 完成后执行 `jar_compare`
+- `binary_pipeline_config` 是必需输入。
+- 单向执行 Step4A artifact-local diff → Step5A runtime-effective reconciliation → Step4B decision/projection freeze → Step5B batch trace，并为 Step6 冻结同一 immutable generation。
+- class/provider/member/resource/dispatch 选择均按显式 RuntimeProfile；源码只做解释覆盖。
+- authoritative、candidate、excluded 必须互斥守恒；confirmed-unprojectable 事实保留依赖坐标进入 `review.md`。
+- identity、support、Oracle、sidecar、数据库或性能门失败时不激活 generation，不生成旧引擎结果。
+
+Step4 人工复核顺序：
+
+1. `evidence/api_changes/changed_dependencies.md`：先看哪个依赖和哪个版本变化；
+2. `evidence/api_changes/s4_per_dependency/<coord>/summary.md`：按依赖复核 API；
+3. `evidence/api_changes/all_changed_apis.csv`：批量筛选；
+4. `evidence/api_changes/review.md`：资源、安全、topology 和不可投影事实。
+
+`.runtime/binary_authority/` 只用于权威存储和深度审计，不是普通人工入口。
 
 ### Phase 7 [CHECKPOINT] Select Step5 Scope
 
-- 对应步骤：`step4` 成功后
-- 当 `changed_dependencies.md/csv` 中存在至少两个候选依赖时必须停下，让用户选择全部分析或只分析所选依赖；0 个候选时 Step5 没有范围可选，1 个候选时“全量”和“选择该候选”等价，均直接继续
-- 面向用户只能表述为“全量分析”或“只分析指定依赖名称/完整坐标”；`scope_mode`、`selected_targets` 仅由系统在恢复时生成，禁止要求用户理解或填写这些内部字段
-- 决策卡必须展示全量依赖数、变化 API 数，以及按影响证据排序的 Top 10 依赖并附理由。排序先比较业务最终制品精确直接引用的变更 API 数，再比较签名不完整候选引用数、引用指令数和变更 API 总数；删除、签名变化等 `change_type` 不额外加权，依赖源码是否可用只展示分析条件、不参与影响排序。全量分析覆盖最完整但耗时可能更长；部分分析降低耗时，但 Step6 结论只能适用于所选依赖，不能表述为全局无影响
-- Step4 的直接字节码引用只是范围选择优先级证据，不是 Step5 可达性结论；未观察到直接引用不能解释为无影响。引用证据必须落到 `business_bytecode_changed_api_refs.csv`，至少包含调用类、调用方法、指令偏移和目标 API
-- 真实 commit pair 歧义仍由 Step4 的专用 checkpoint 在耗时分析前处理；内部超时或证据故障记录覆盖缺口后继续，不得作为本范围 checkpoint 的用户修复问题
-- `selection_options` 只反映 Step4 依赖包维度候选；内部每个候选都应带稳定 `selection_key`，但用户卡片只展示名称或完整坐标
-- 用户选择的解析必须基于完整候选集；完整坐标严格匹配唯一目标，仅提供依赖名称时按 `artifactId` 名称匹配
-- 候选未全部展示时，卡片必须把 `changed_dependencies.md` 标注为“完整依赖选择清单”，说明从“依赖包”列取得名称或坐标，不能只放在待复核文件列表中
-- 恢复命令模板：
-
-```bash
-# 全量分析
-python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
-  --project-dir . \
-  --report-dir .upgrade-report \
-  --response-json '{"intent_patch":{"action":"continue","set":{"scope_mode":"full"}}}'
-
-# 部分分析：系统把用户回复的依赖名称/完整坐标转换成内部恢复字段。
-python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
-  --project-dir . \
-  --report-dir .upgrade-report \
-  --response-json '{"intent_patch":{"action":"continue","set":{"scope_mode":"partial","selected_targets":["com.example:legacy-lib"]}}}'
-
-# 禁止把内部字段名或恢复命令展示给用户。
-```
-
-- `scope_mode` 是内部恢复字段：用户回复“全量分析”时写 `full`；用户回复“只分析 …”时写 `partial`，并同时生成非空 `selected_targets`
-- `notes` 只记录备注，不参与范围控制；禁止把用户点名的依赖只写入 `notes`
-- 调度层必须将确认结果写入 `.runtime/cache/step5_selection.json`；Step6 必须据此展示全量/部分范围。范围快照缺失时不得默认宣称全量分析
+- 对应步骤：`step4`
+- 0 或 1 个含正式 API projection 的依赖没有范围取舍，自动继续。
+- 至少 2 个依赖时，让用户选择全量或部分依赖分析。
+- 候选按依赖包维度展示，必须给出完整坐标、base/current 版本、变化 API 数、业务字节码精确直接引用数和 Top 10 理由。
+- 完整选择入口是 `evidence/api_changes/changed_dependencies.md`；不要让用户从 API CSV 逐行挑选。
+- 部分范围必须验证用户选择确实命中 Step4 清单；未选依赖只进入范围说明，不得计入“未完成分析”。
 
 ### Phase 8 [AUTO] Call Chain Analysis
 
 - 对应步骤：`step5`
-- 输入：仅使用 `evidence/api_changes/all_changed_apis.csv`（由 Phase 4 产出）作为变更 API 目标集；按 Phase 7 用户确认的全量范围执行，或按 `selected_targets` / 正式 `step5_selected_coords` / `step5_selected_names` 过滤到所选依赖子集
-- 输出：`.upgrade-report/evidence/call_chain/`
-- 附加证据：Step1 从 current 最终制品一次性留存的业务内容、独立运行时 JAR 字节码边与 `.upgrade-report/framework_adapters.json`
-- 规则：Step1 的 `dependency_jars.json` 必须同时覆盖 Step4 变化 JAR、Step5 全部 current 运行时 JAR 和 current 业务内容。Step5 只能校验并读取这些独立留存文件，不得重新打开 fat JAR/WAR、再次提取 `BOOT-INF/lib`/`WEB-INF/lib`、递归打开嵌套 JAR，或从源码重新识别已有 GAV。源码只增强已经由 Step1 确定的坐标
-- 规则：正式流程默认不设置 Step5 外层超时；仅当用户显式提供 `step5_timeout` 时才启用超时
-- 规则：若 `all_changed_apis.csv` 为空则跳过并说明原因
-- 规则：名称筛选按 `coord` 的 `artifactId` 精确匹配；坐标筛选按 `coord` 精确匹配
-- 规则：用户只需用自然语言选择“全部分析”或说出依赖名称/完整坐标；`scope_mode`、`selected_targets`、`selection_key` 等仅是程序内部字段，禁止出现在用户卡片、回复示例和操作指引中。内部归一化后，Step5 只能分析对应唯一依赖；只有用户只给出依赖简称时，才允许按名称批量筛选
-- 规则：筛选匹配范围只允许来自 Step4 API；Step3 平台/框架风险和类级 candidate 不得追加为 Step5 变更 API
-- 规则：显式重跑某一步前，调度层必须先清空该步骤全部正式输出，避免旧轮次的制品、目录或字节码证据混入本轮结果
-- 规则：若反向调用链需要穿过跨依赖边界，**系统优先从 `dependency_source_dirs` 自动推断模块坐标与依赖源码映射**，无需用户重复配置
-- 规则：依赖源码映射缺失或无法对齐时，不得要求用户显式批准降级；系统应继续使用 current 最终制品中的业务 class 和运行时依赖 JAR 字节码。仍无法补齐的 API 进入 `not_analyzed` 并限制最终结论，用户可在报告完成后自愿补源码重跑
-- 规则：Step5 成功后直接进入 Step6 生成带覆盖边界的最终报告，不生成例行成功确认 checkpoint
-- 规则：所有依赖升级、降级、迁移和删除都必须扫描 current 最终制品中的业务 class 与全部运行时依赖 JAR；该扫描不受目标依赖或消费依赖是否存在源码映射影响
-- 规则：Step1 必须把自动构建或用户提供的 base/current 最终制品留存到报告目录并记录 SHA-256，同时一次性固化变化依赖 JAR、全部 current 运行时 JAR 和 current 业务内容；Step4/Step5 直接消费该清单。任何步骤都不得用本地 Maven 仓库副本、重新下载的 JAR 或再次解包 fat JAR 替代这些证据
-- 规则：最终制品内缺失嵌套 JAR、坐标 unresolved、SHA 不一致或字节码解析失败时，必须记录覆盖缺口；未命中不得解释为无影响，也不得以本地 Maven JAR 填补缺口
-- 规则：Step1 留存 JAR 缺失、SHA 不一致或归档安全校验失败属于核心制品证据失效，不是普通覆盖缺口。必须在 Step1 门控或 Step5 构图前硬失败；禁止继续生成调用链的 `not_analyzed` 结果或进入 Step6
-- 规则：Step5 运行期间发现的制品、字节码、框架和逐 API 失败必须立即追加到 `.runtime/observability/step5_diagnostics.jsonl` 并实时输出原因码；核心制品或全局业务字节码证据失效必须短路，路径级/API 级失败只约束对应范围，禁止等最终 `summary.json` 才首次暴露
-- 规则：依赖源码只有在 Step4 记录包含固定 commit 且来源为 `remote_source_resolved` 或 `user_confirmed_local_source` 时，才允许进入 Step5 增强图；来源未确认、仓库不一致、源码类不在当前最终制品 JAR 中时必须拒绝该源码边并记录覆盖缺口，不能降级成确定无影响
-- 规则：Step5 运行时依赖字节码扫描允许做不改变语义的性能优化：不需要业务回溯的直接符号引用可用常量池精确快路径；需要 `consumer_method` 回溯业务链路的候选 class 必须继续使用 `javap` 精确解析，但可通过 `JUA_STEP5_BYTECODE_JAVAP_WORKERS` 并行执行，默认并行度为 4
-- `summary.json` 中的 `analysis_status` / `reason_code` 用于解释 reachable / not_impacted / uncertain / not_found_in_static_analysis / not_analyzed 成因；`by_api/*.json` / `by_api/*.txt` 中的 `evidence_paths` 是逐边证据
-- 规则：对 `class_usage` / `field` 目标，Step5 必须先尝试业务源码中的直接类型/字段证据；只有直接证据失败后，才允许回落到 `CLASS_USAGE_ONLY` / `CALL_GRAPH_LIMITATION_SYMBOL_KIND`
-- 规则：业务 class 字节码命中输出 `BUSINESS_ARTIFACT_BYTECODE_USAGE/reachable`；运行时依赖 JAR 命中保留 `PACKAGED_DEPENDENCY_BYTECODE_USAGE` / `RUNTIME_DEPENDENCY_USES_REMOVED_API` 事实，但若该依赖存在源码映射，Step5 必须先继续尝试回溯到业务代码，只有未能证明业务入口时才收敛为 `uncertain`
-- 规则：若依赖源码或资源配置中存在明确运行时主动入口（如 `@Scheduled`、`@PostConstruct`、Spring Runner/Lifecycle、Quartz `Job.execute`、Spring XML `task:scheduled`、`init-method`、`MethodInvokingJobDetailFactoryBean`），且该入口链路触达变更 API，即使没有业务源码显式调用方，也应作为 Step5 影响链路处理，不得仅因未回溯到业务源码而降为静态未找到。JPA `@PrePersist` / `@PostUpdate` 等生命周期回调必须进入框架证据，但在没有实体生命周期激活证据时保留为条件入口；`@Async` 只改变执行线程，不得单独伪造成调用入口
-- 规则：Step5 对静态跨 JAR 类依赖的覆盖不得弱于 `jdeps`；`jdeps` 能识别的依赖不得漏报，并继续提供成员级方法/字段匹配
-- 规则：业务源码图与当前业务字节码图使用统一 owner/name/signature 身份；冲突时保留两类 provenance，不得用字节码静默覆盖源码证据
-- 规则：`evidence/call_chain/alerts.csv` 是完整人工链路台账，不是高风险样例；每个 Step5 API 至少一行、每条唯一终止链路独立一行，禁止只保留第一条路径或静默截断；同一终止链路重复命中时合并为一行并用 `path_occurrence_count` 表示次数
-- 规则：`alerts.csv` 必须作为完整主文件保留；当台账较大时，Step5 可额外输出 `alerts_reachable.csv`、`alerts_uncertain.csv`、`alerts_not_found_in_static_analysis.csv`、`alerts_not_analyzed.csv` 及 `alerts_<status>_NNN.csv` 分片作为人工阅读视图。拆分文件不得替代完整主文件，也不得做成轻量索引或样例子集
-- 规则：Step5 可输出内部 `s5_query_index.json` 支持按方法全限定名即时查询调用链；当用户只是询问某个方法的调用链时，默认直接返回链路文本，不额外落查询结果文件，不展开诊断字段
-- 规则：链路台账必须显式给出 target/consumer 坐标、消费类和方法、业务入口、逐链路状态、中断原因、证据文件及稳定 api_id/path_id；API 汇总状态不得覆盖或删除其他候选链路
-- 人工排查入口固定为 Step4 `evidence/api_changes/all_changed_apis.csv`、Step5 `evidence/call_chain/alerts.csv`、Step6 `deliverables/report.md`；其他 JSON/catalog 默认作为机器或深度排障证据
-- 规则：业务字节码索引必须覆盖方法/构造/字段、类型指令、常量池/泛型签名/注解类引用与 `invokedynamic`，并按 current 制品 SHA-256 缓存；制品变化必须失效重建
-- 规则：运行时依赖字节码必须解析 lambda/方法引用的 bootstrap method handle；Multi-Release JAR 必须按 `jdk_current` 选择生效 class，目标 JDK 未知时未命中不得解释为无影响
-- 规则：Step5 必须独立解析与 Step4 目标相关的反射、可静态求值 MethodHandle 和资源间接引用；精确证据合并到统一图，动态或不唯一目标输出 `uncertain`，不得伪装为静态未找到
-- 规则：`alerts.csv` 必须输出间接引用的证据类型、位置及能力覆盖状态；完全动态且无法关联到目标范围的线索不得污染所有 API
-- 规则：间接调用覆盖必须按 Step4 API 独立求值；目标相关能力为 `partial/insufficient` 时禁止输出 `not_found_in_static_analysis`，严格模式必须将该覆盖缺口作为关键门控
-- 规则：编译期常量变化不得因 class 中缺少字段访问而判为未使用，必须输出 `INLINED_CONSTANT_USAGE_UNDETECTABLE/uncertain`；若没有任何源码引用、调用路径或字段访问证据，必须同时标记 `uncertainty_kind=analysis_limitation`，不得显示“存在候选证据”。只有实际存在调用或引用线索时才使用 `uncertainty_kind=candidate_evidence`
-- 规则：SPI、Spring、MyBatis 隐式关系由独立 Adapter 输出；条件未决和多实现必须保留 ambiguity，禁止任意绑定到某个实现
-- 规则：Spring `@Bean` 必须绑定方法返回类型与实际构造实现；无法解析工厂返回实现时 Adapter 状态必须为 `partial`，禁止绑定到配置类并报告完整覆盖
-- 规则：动态代理只有在注册点能够绑定具体 handler 时才能输出具体回调证据，但仅注册不能把 handler 提升为业务入口；声明式 HTTP Client 属于出站边，也不得作为业务代码入站入口
-- 规则：`.upgrade-report/.runtime/coverage/coverage.json` 是从证据派生的覆盖视图，状态仅允许 complete/partial/insufficient/not_applicable；它不是新的事实真相源
-- 门控：执行 `call_chain`
-
-**置信度加权深度策略**：
-  - `max_depth`参数含义：最大累计追踪代价（不是最大跳数）
-  - High confidence 边：每跳消耗 1 单位代价；全精确 High 路径按图规模自适应放宽，默认最多 15 cost、绝对自适应上限 20
-  - Medium confidence 边：每跳消耗 2 单位代价（max_depth=5时可追踪最多 2-3 跳）
-  - Low confidence 边：每跳消耗 5 单位代价（立即停止，相当于不追踪）
-  
-示例：
-  - max_depth=5，全精确 High 边链路：按图规模最多放宽到 15 跳；出现非精确来源时仍按 5 cost 停止
-  - max_depth=5，全Medium边链路：最多2跳（cost累计4）
-  - max_depth=5，混合链路：3High+1Medium=cost=5（达到上限）
-- 关键节点识别：业务入口（Controller/Service）标记为 `reachable`，框架边界（@Autowired/动态代理）标记为 `not_analyzed`
-
-**五态分类**：
-  - `reachable`（高置信）：确定性链路，已触达系统代码，不要求必须到达最外层 HTTP 入口
-  - `not_impacted`（直接制品证据）：变更 API 仍由当前运行时依赖以完全相同的类字节码提供；该结论只覆盖 API 符号，不覆盖被删除 jar 中的资源、SPI 等非 API 内容
-  - `uncertain`（待确认）：候选链路，存在歧义需人工审查
-  - `not_analyzed`（未分析）：已知分析能力受限（如缺依赖源码映射、行为变更、反射命中），**不能解释为"未影响"**
-  - `not_found_in_static_analysis`（静态未找到）：在当前源码图中未找到调用路径，但不代表确定未影响，仍需结合 `not_analyzed` 与能力边界判断
+- 只发布已经验证的同一 binary generation，不调用 source-first 引擎。
+- 正式四态为 `reachable`、`uncertain`、`not_found_in_static_analysis`、`not_analyzed`。
+- 每条结果必须保留目标依赖坐标、base/current 版本、可读 Java 签名、逐边调用路径和 evidence identity。
+- `not_found_in_static_analysis` 只表示已声明静态范围未发现路径，不表示安全。
+- 输出：`evidence/call_chain/summary.md`、`summary.json`、`alerts.csv`、`by_api/*.json` 和 `.runtime/indexes/s5_query_index.json`。
+- Step5 成功后生成非阻塞四态卡片并自动进入 Step6，不要求例行确认。
 
 ### Phase 9 [AUTO] Final Report
 
 - 对应步骤：`step6`
-- Step5 成功后不新增人工 checkpoint，但 `run_step.py` 必须先在 `.runtime/state/interaction.json` 持久化一份 `status=informational` 的五态 `user_decision_card`，然后自动执行本阶段；Step6 完成后该信息卡仍应可读
-- 输入：前面所有产物
-- 输出：`.upgrade-report/.runtime/findings/s6_findings.json`、`.upgrade-report/deliverables/report.md`、`.upgrade-report/deliverables/all-affected-dependencies.md`、`.upgrade-report/deliverables/all-impact-details.md`
-- 规则：主报告固定按“依赖层面结论 → API 及调用关系 → 用户可见文件说明”组织；依赖结论必须先于 API 结论
-- 规则：依赖和 API 都分别展示变化总数、已完成分析和未完成分析；确认有影响是已完成结果的子集。已完成但未发现当前系统调用关系不得归入未完成分析
-- 规则：主报告必须先给出五态语义、结论边界和每种状态的用户行动；`uncertain` 表示已有候选证据或已识别的分析能力边界，`not_found_in_static_analysis` 只表示当前静态范围没有找到路径，不能解释为安全
-- 规则：主报告按依赖坐标分组，完整展示本轮全部 `reachable` 和 `uncertain` API；依赖之间按影响程度排序，依赖内部按结论和复核优先分数排序。`not_found_in_static_analysis` 只展示统计数字，逐项记录保留在完整 API 明细中
-- 规则：只有真正未完成的项单列并直接说明原因。主报告之外的依赖和 API 必须分别链接到两份不同的全量 Markdown；用户行动必须与状态边界一致，不得把静态结论扩大成发布判断
+- 只读取 Step5 同 generation、同选择范围的正式结果，不重新分析。
+- 主报告先展示依赖层面结论，再展示 API 和调用关系；每项包含依赖坐标和 base/current 版本。
+- 静态结果使用“可能影响/仍不确定”，不写“确认有影响/确认无影响”。
+- 输出：
+  - `.upgrade-report/deliverables/report.md`
+  - `.upgrade-report/deliverables/all-affected-dependencies.md`
+  - `.upgrade-report/deliverables/all-affected-dependencies.csv`
+  - `.upgrade-report/deliverables/all-impact-details.md`
+  - `.upgrade-report/deliverables/all-impact-details.csv`
+  - `.upgrade-report/deliverables/analysis-scope.md`
+  - `.upgrade-report/.runtime/findings/s6_findings.json`
+- Markdown 与 CSV 必须同源、同范围、同依赖归属；`.runtime/findings` 不属于普通阅读入口。
 
-## 恢复与压缩
+## 完成后的阅读顺序
 
-默认由 `run_step.py` 自动保存主状态。每个 Step 完成后都会原子更新 `.upgrade-report/.runtime/state/last_step_summary.json` 和 `.upgrade-report/.runtime/state/resume_context.md`；前者供程序快速判断进度，后者可直接向用户转述“上一步做了什么、产出在哪、下一步做什么、是否需要输入”。若步骤执行后进入待交互状态，还会额外生成 `.upgrade-report/.runtime/state/interaction.json`，并以退出码 `4` 结束当前命令。若需要手动保存额外的压缩归档，执行：
+1. `.upgrade-report/README.md`；
+2. `deliverables/report.md`；
+3. `deliverables/all-affected-dependencies.md/.csv`；
+4. `deliverables/all-impact-details.md/.csv`；
+5. `deliverables/analysis-scope.md`；
+6. 需要核对原始人工证据时进入 `evidence/api_changes/` 和 `evidence/call_chain/`；
+7. 只有深度排障才进入 `.runtime/`。
 
-长任务必须通过用户语言的定期心跳表明进程仍在运行，只有存在可靠已完成/总量时才显示预计剩余时间。用户按 `Ctrl-C` 时必须终止当前子进程、清理当前步骤的半成品并保留之前的正式产物与当前输入；退出码为 `130`，再次运行 `--step auto` 从当前任务安全重试。
-
-```bash
-export PYTHONUTF8=1
-python "${CLAUDE_SKILL_DIR}/scripts/context_compress.py" save \
-  --report-dir .upgrade-report \
-  --completed-step <步骤号> \
-  --output .upgrade-report/context_summary.json
-```
-
-旧流程或人工归档场景中，如存在 `context_summary.json`，可额外加载：
-
-```bash
-export PYTHONUTF8=1
-python "${CLAUDE_SKILL_DIR}/scripts/context_compress.py" load \
-  --input .upgrade-report/context_summary.json
-```
-
-说明：
-
-1. 新对话默认先读 `last_step_summary.json` 和 `resume_context.md`；`context_compress.py load` 只用于旧流程或人工归档恢复。
-2. 正式续跑仍以 `run_step.py --step auto` 为主；它会根据 `main_state.json` 自动决定从哪一步继续。
-3. 如果只是继续执行，不需要先手动运行 `context_compress.py load`。
+最终回复必须说明：分析范围、四态和 probable/inconclusive 计数、关键依赖、关键路径、结论限制、人工报告绝对路径。不得只给内部 JSON 或一句“分析完成”。
 
 ## 恢复协议
 
-`run_step.py` 在 `[CHECKPOINT]` 阶段不会把“待交互”当成普通成功完成，而是进入明确的待交互退出状态：
-
-1. 更新 `.upgrade-report/.runtime/state/main_state.json`
-2. 生成 `.upgrade-report/.runtime/state/interaction.json`
-3. 标记 `status=awaiting_user_input`（或其他 `awaiting_*` 状态）
-4. 在 stdout / stderr / `interaction.json` 中输出结构化交互提示
-5. **以退出码 `4` 结束当前脚本**
-
-Claude Code 在恢复或接收新的正式用户意图时必须：
-
-1. 先读取 `last_step_summary.json` 和 `resume_context.md`，向用户报告当前进度与下一动作
-2. 再读取 `main_state.json` 核实完整状态；轻量摘要与主状态冲突时以主状态为准
-3. 若 `status` 为 `awaiting_*`，再读取 `interaction.json`
-4. 若存在 `pending_interaction`，先生成用户可读的决策卡片；卡片必须覆盖问题、停下原因、可选动作、缺失材料、候选对象、完整文件入口和可直接回复示例
-5. 将用户答复或新的正式业务意图整理为结构化 JSON；当前推荐统一整理为 `intent_patch`
-6. 收到结构化输入后，再执行：
-
-```bash
-# 推荐：直接传 `intent_patch` 结构化答复
-python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
-  --project-dir . \
-  --report-dir .upgrade-report \
-  --response-json '{"intent_patch":{"action":"continue","set":{}}}'
-```
-
-```bash
-# 推荐：答复较长时，写入文件后恢复
-python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
-  --project-dir . \
-  --report-dir .upgrade-report \
-  --response-file .upgrade-report/user_response.json
-```
-
-说明：
-
-- `--response-json` / `--response-file` 是统一的结构化交互入口
-- 若当前存在 `pending_interaction`，它表示“恢复当前 checkpoint”
-- 若当前不存在 `pending_interaction`，但用户提出了新的正式业务意图，调度器会把 `intent_patch` 桥接为合法的主状态更新与目标步骤重跑
-- 必须传结构化用户答复；当前推荐形态例如 `--response-json '{"intent_patch":{"action":"continue","set":{}}}'`
-- `cancel` 只表示停止当前续跑，不会清空已有产物
-- 若上一条命令退出码为 `4`，优先读取 `interaction.json`，不要把它当成失败重试
-- 若当前没有 `pending_interaction`，`intent_patch` 必须在 `set` / `clear` 中提供正式业务字段，或显式使用 `action=restart_from_step`
-- `blocked_by_system` 不是用户确认项：直接重新运行 `--step auto` 即可重试当前步骤；若需要显式恢复，可使用 `action=rerun_current_step`，无需附加业务字段
-- 需要回退时，标准写法为 `{"intent_patch":{"action":"restart_from_step","restart_step_id":"step2","set":{}}}`；`restart_step_id` 是控制字段，不属于业务输入
-- 若 `step1` 需要切换到模块级分析，优先使用：
-
-```bash
-python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --step auto \
-  --project-dir . \
-  --report-dir .upgrade-report \
-  --response-json '{"intent_patch":{"action":"rerun_current_step","set":{"primary_module":"module-a","modules":["module-a"]}}}'
-```
-
-- 不要只传裸动作；收到用户答复后，必须整理成完整结构化 JSON，再优先包成 `intent_patch` 恢复执行
-- `step_manifest.json` 中的 `interaction` 是脚本级配置；本文件中的 `[CHECKPOINT]` 与“非 checkpoint 正式意图桥接”共同构成 Claude Code 必须遵守的流程约束
-
-合法交互路径：
-
-```text
-存在 pending_interaction -> 读取 interaction.json -> 问用户 -> 等用户回复 -> 用用户原话构造 intent_patch 的 response-json/response-file -> 恢复 run_step.py
-不存在 pending_interaction，但用户提出新的正式业务意图 -> 将意图整理成 intent_patch -> 用 response-json/response-file 写回主状态 -> 从目标步骤重跑
-```
-
-非法路径示例：
-
-```text
-看到 awaiting_* -> 自己判断“应该继续” -> 不带结构化答复直接恢复执行
-```
-
-上面的非法路径一律禁止。
+- 新会话先读 `last_step_summary.json` 和 `resume_context.md`，再用 `main_state.json` 核实。
+- 待交互时读取 `interaction.json`，展示决策卡片并等待真实答复。
+- 从较早阶段重跑时，明确告诉用户哪些正式产物保留、哪些阶段会重建。
+- generation 激活或人工发布失败时，不覆盖上一份 validated generation 及其 `evidence/`、`deliverables/`、查询索引。
+- 用户要求取消时保留现场，不自动继续。
 
 ## 违例自检
 
-任一时刻，如果你发现自己已经：
+每次执行前后检查：
 
-1. 跳过了某个 `[CHECKPOINT]`
-2. 在没有用户答复时执行了恢复命令
-3. 用自己的判断替代了用户答复
+- 是否绕过了 checkpoint 或代替用户做选择；
+- 是否读取并核实了主状态；
+- 是否把旧五态、P0/P1/P2 或 confirmed impact/no-impact 混入新结果；
+- 是否丢失依赖坐标、base/current 版本或 artifact identity；
+- 是否用源码改变二进制事实或调用边；
+- 是否把内部错误转给用户批准降级；
+- 是否把 `.runtime/` 当作唯一人工报告；
+- 是否在未跑测试时声称验证通过；
+- 是否在仍有剩余任务时声称全部完成。
 
-那么必须立即执行以下补救动作：
-
-1. 停止当前推进
-2. 明确告诉用户“刚才越过了必须的人机确认点”
-3. 回到最近一个 `awaiting_*` 状态
-4. 重新读取 `interaction.json`
-5. 按正确流程向用户提问
+任一项为“是”都必须停止并修正。
 
 ## 何时停下
 
-出现以下任一情况时，停止推进并向用户说明阻塞点：
-
-- 缺少上一步产物
-- 门控失败
-- JApiCmp、最终构建产物或必要源码路径等关键证据不可用
-- 结果存在明显盲区，无法确认是否触达系统
+- 需要用户确认目标模块、两侧来源、RuntimeProfile 或分析范围；
+- 需要用户授权外部操作；
+- 主状态处于 `awaiting_*`；
+- 核心制品、身份、目标 JDK、entrypoint、Oracle 或 generation 完整性失败；
+- 用户明确暂停或取消。
 
 ## 按需查阅
 
-- 详细步骤与命令：`RUNBOOK.md`
-- 极简待交互硬规则：`CHECKPOINT_RULES.md`
-- JDK 升级专项检查：`references/jdk_checklist.md`
-- Spring Boot 升级专项检查：`references/springboot_checklist.md`
-- 依赖源码专项子任务：`agents/internal_lib.md`
-- 第三方依赖批量子任务：`agents/thirdparty_batch.md`
+- 用户输出：`docs/user/outputs.md`
+- 最终引擎设计：`docs/developer/binary-first-source-overlay-design.md`
+- 架构：`docs/developer/architecture.md`
+- 运行命令：`RUNBOOK.md`
+- 最小交互规则：`CHECKPOINT_RULES.md`
+- 质量与测试：`docs/developer/quality.md`

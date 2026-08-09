@@ -10,7 +10,6 @@ if str(SCRIPTS) not in sys.path:
 
 from diagnostic_contract import (  # noqa: E402
     DEPENDENCY_COORDINATES_UNRESOLVED,
-    SPRING_RUNTIME_CLASS_AMBIGUOUS,
     canonical_reason_code,
     diagnostic_contract_metadata,
     normalize_component_reason_codes,
@@ -40,10 +39,6 @@ class DiagnosticContractTest(unittest.TestCase):
                 "unresolved_dependency_coordinates_after_enrichment"
             ),
         )
-        self.assertEqual(
-            SPRING_RUNTIME_CLASS_AMBIGUOUS,
-            canonical_reason_code("SPRING_PACKAGED_CLASS_AMBIGUOUS"),
-        )
 
     def test_interaction_payload_exposes_contract_and_legacy_alias(self):
         payload = normalize_diagnostic_payload(
@@ -63,14 +58,14 @@ class DiagnosticContractTest(unittest.TestCase):
         component = normalize_component_reason_codes({
             "reason_codes": [
                 "dependency_coordinates_unresolved",
-                "SPRING_PACKAGED_CLASS_AMBIGUOUS",
+                "BINARY_INDEPENDENT_VALIDATION_FAILED",
             ],
         })
 
         self.assertEqual(
             [
+                "BINARY_INDEPENDENT_VALIDATION_FAILED",
                 DEPENDENCY_COORDINATES_UNRESOLVED,
-                SPRING_RUNTIME_CLASS_AMBIGUOUS,
             ],
             component["reason_codes"],
         )
@@ -87,8 +82,8 @@ class DiagnosticContractTest(unittest.TestCase):
         for code in (
             DEPENDENCY_COORDINATES_UNRESOLVED,
             "DEPENDENCY_SOURCE_REF_UNAVAILABLE",
-            SPRING_RUNTIME_CLASS_AMBIGUOUS,
-            "MYBATIS_RUNTIME_ARTIFACT_PARSE_FAILED",
+            "BINARY_INDEPENDENT_VALIDATION_FAILED",
+            "BINARY_ARTIFACT_PARSE_FAILED",
         ):
             self.assertIsNotNone(pattern.fullmatch(code))
 

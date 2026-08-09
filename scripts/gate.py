@@ -18,12 +18,10 @@ from pipeline_constants import (
 )
 from analysis_contract import sha256_file
 from artifact_safety import require_safe_archive
-from binary_compat_output import (
-    ENGINE_DESCRIPTOR_RELATIVE_PATH,
-    load_validated_generation,
-)
+from binary_report import load_validated_generation
 from binary_first_contract import BinaryFirstContractError
 from csv_io import open_csv_read
+from s4_contract import ALL_CHANGED_APIS_FIELDS
 GATES = list(GATE_SEQUENCE)
 
 def python_cmds():
@@ -42,17 +40,6 @@ def fail(msg, instructions=None):
     sys.exit(1)
 
 def ok(msg): print(f"✅ {msg}", file=sys.stderr)
-
-
-def _engine_descriptor(report_dir):
-    path = Path(report_dir) / ENGINE_DESCRIPTOR_RELATIVE_PATH
-    if not path.is_file():
-        return {}
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        fail(f"engine generation 描述无效：{path}: {exc}")
-    return payload if isinstance(payload, dict) else {}
 
 
 def evidence_dependencies_dir(report_dir):
@@ -344,189 +331,120 @@ def gate_scan(d):
               for pc in python_cmds()])
     ok("scan 门控通过")
 
-def gate_jar_compare(d, strict_risk_gate=False):
+def gate_binary_generation(d, strict_risk_gate=False):
     jar_dir = evidence_api_changes_dir(d)
-    csv_path = jar_dir / "all_changed_apis.csv"
-    descriptor = _engine_descriptor(d)
-    if descriptor.get("authoritative_engine") == "binary":
-        try:
-            loaded = load_validated_generation(d)
-        except BinaryFirstContractError as exc:
-            fail(f"binary generation 完整性门禁失败：{exc.reason_code}: {exc}")
-        if not csv_path.is_file():
-            fail("binary Step4 兼容投影 all_changed_apis.csv 缺失")
-        decisions = loaded["decisions"]
-        authoritative = len(decisions.get("authoritative_change_facts") or ())
-        diagnostic = len(decisions.get("diagnostic_candidate_facts") or ())
-        excluded = len(decisions.get("excluded_decisions") or ())
-        if strict_risk_gate and loaded["summary"].get("decision_coverage_status") != "complete":
-            fail("严格门禁要求 binary decision coverage=complete")
-        ok(
-            "jar_compare binary 门控通过："
-            f"正式变化={authoritative} 诊断候选={diagnostic} 排除={excluded}，独立 Oracle 已通过"
-        )
-        return
-    ref_txt_path = jar_dir / "git_ref_matches.txt"
-    ref_json_path = jar_dir / "git_ref_matches.json"
-    pending_ref_path = jar_dir / "git_ref_pending.json"
-    timeouts_path = jar_dir / "timeouts.json"
-    if not csv_path.exists():
-        fail("evidence/api_changes/all_changed_apis.csv 不存在，请先执行 Step 4（jar 对比）")
-    for path in (ref_txt_path, ref_json_path):
-        if not path.exists():
-            fail(f"{os.path.basename(path)} 不存在，请重新执行 Step 4，确认源码 diff ref 匹配结果已生成")
-    if pending_ref_path.exists():
-        with open(pending_ref_path, encoding="utf-8", errors="replace") as f:
-            pending_payload = json.load(f)
-        pending_items = list(pending_payload.get("items") or [])
-        if pending_items:
-            fail(
-                f"以下依赖的 git refs 仍待人工确认：{len(pending_items)} 个",
-                [
-                    "查看 evidence/api_changes/git_ref_pending.json 与 git_ref_matches.*，确认 old_ref/new_ref 后重跑 Step4",
-                    "通过 --response-json 传入 dependency_git_ref_overrides，再继续流程",
-                ],
-            )
-    if timeouts_path.exists():
-        with open(timeouts_path, encoding="utf-8", errors="replace") as f:
-            timeout_payload = json.load(f)
-        timeout_items = list(timeout_payload.get("items") or [])
-        if timeout_items:
-            if strict_risk_gate:
-                fail(
-                    f"严格模式下 Step4 不允许存在超时证据缺失：{len(timeout_items)} 项",
-                    ["查看 evidence/api_changes/timeouts.json，修复后重跑 Step4"],
-                )
-            print(
-                f"\n⚠️ Step4 存在 {len(timeout_items)} 个超时项；标准模式继续生成受限结论，"
-                "不会把证据缺口解释为无影响。",
-                file=sys.stderr,
-            )
-    with open(csv_path, encoding="utf-8", errors="replace") as f:
-        rows = sum(1 for l in f if l.strip() and not l.startswith('#')) - 1
-    print(f"  all_changed_apis.csv：{rows} 个变更 API", file=sys.stderr)
+    api_path = jar_dir / "all_changed_apis.csv"
+    dependency_path = jar_dir / "changed_dependencies.csv"
+    summary_path = jar_dir / "summary.json"
+    required_user_files = (
+        api_path,
+        dependency_path,
+        jar_dir / "changed_dependencies.md",
+        summary_path,
+        jar_dir / "summary.md",
+        jar_dir / "review.md",
+        jar_dir / "business_bytecode_changed_api_refs.csv",
+        jar_dir / "business_bytecode_priority_evidence.json",
+    )
+    try:
+        loaded = load_validated_generation(d)
+    except BinaryFirstContractError as exc:
+        fail(f"binary generation 完整性门禁失败：{exc.reason_code}: {exc}")
+    missing = [str(path.relative_to(Path(d))) for path in required_user_files if not path.is_file()]
+    if missing:
+        fail(f"Step4 面向用户的复核文件缺失：{missing}")
+    try:
+        published = json.loads(summary_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        fail(f"Step4 summary.json 无效：{exc}")
+    if (
+        published.get("schema") != "java-upgrade-analyzer.binary-step4-summary.v1"
+        or published.get("authority") != "binary_first"
+        or published.get("result_generation_identity")
+        != loaded["manifest"].get("result_generation_identity")
+    ):
+        fail("Step4 发布结果与 active binary generation 不一致")
+    api_rows = read_csv_dicts(api_path, ALL_CHANGED_APIS_FIELDS)
+    dependency_rows = read_csv_dicts(
+        dependency_path, ("coord", "changed_api_count", "detail")
+    )
+    if any(not row.get("coord") or row.get("coord") == "UNBOUND_RUNTIME_ARTIFACT" for row in api_rows):
+        fail("Step4 发布的变化 API 缺少可复核的依赖包身份")
+    api_coords = {row["coord"] for row in api_rows}
+    dependency_coords = {row["coord"] for row in dependency_rows}
+    if api_coords != dependency_coords:
+        fail("Step4 API 明细与依赖包汇总的坐标集合不一致")
+    if len(api_rows) != int(published.get("published_api_change_count") or 0):
+        fail("Step4 all_changed_apis.csv 行数与 generation 发布摘要不一致")
+    authoritative = int(published.get("authoritative_change_fact_count") or 0)
+    diagnostic = int(published.get("diagnostic_candidate_fact_count") or 0)
+    excluded = int(published.get("excluded_decision_count") or 0)
+    if strict_risk_gate and loaded["summary"].get("decision_coverage_status") != "complete":
+        fail("严格门禁要求 binary decision coverage=complete")
+    ok(
+        "binary_generation 门控通过："
+        f"正式变化={authoritative} 诊断候选={diagnostic} 排除={excluded}，独立 Oracle 已通过"
+    )
 
-    if rows == 0:
-        print("\n⚠️  Step 4 未识别到变更 API。Step5 将基于空输入生成跳过说明，而不是直接得出“无风险”结论。", file=sys.stderr)
-
-    jar_missing = []
-    if jar_dir.is_dir():
-        for f in os.listdir(jar_dir):
-            if f.endswith('_binary.txt'):
-                try:
-                    content = open(jar_dir / f, encoding="utf-8", errors="replace").read(200)
-                    if '最终制品' in content and ('证据缺失' in content or '未找到' in content):
-                        jar_missing.append(f)
-                except (OSError, UnicodeError) as exc:
-                    jar_missing.append(f"{f}:unreadable:{type(exc).__name__}")
-    if jar_missing:
-        fail(
-            f"以下依赖缺少最终制品 JAR 证据，Step4 证据池不完整：{jar_missing[:5]}",
-            ["修复 Step1 最终制品或制品内依赖条目证据后，重新执行 Step4"]
-        )
-    ok(f"jar_compare 门控通过：{rows} 个变更 API")
-
-def gate_call_chain(d, strict_risk_gate=False):
+def gate_binary_report(d, strict_risk_gate=False):
     summary_path = evidence_call_chain_dir(d) / "summary.json"
     if not summary_path.exists():
         fail("evidence/call_chain/summary.json 不存在，请先执行 Step 5")
-    descriptor = _engine_descriptor(d)
-    if descriptor.get("authoritative_engine") == "binary":
-        try:
-            loaded = load_validated_generation(d)
-        except BinaryFirstContractError as exc:
-            fail(f"binary generation 完整性门禁失败：{exc.reason_code}: {exc}")
+    try:
+        loaded = load_validated_generation(d)
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
-        if summary.get("result_generation_identity") != loaded["manifest"].get(
-            "result_generation_identity"
-        ):
-            fail("Step5 binary 兼容视图与 active generation 不一致")
-        if strict_risk_gate and loaded["summary"].get("trace_coverage_status") != "complete":
-            fail("严格门禁要求 binary trace coverage=complete")
-        ok(
-            "call_chain binary 门控通过："
-            f"reachable={summary.get('reachable', 0)} "
-            f"uncertain={summary.get('uncertain', 0)} "
-            f"not_found={summary.get('not_found_in_static_analysis', 0)} "
-            f"not_analyzed={summary.get('not_analyzed', 0)}"
-        )
-        return
-    with open(summary_path, encoding="utf-8", errors="replace") as f:
-        summary = json.load(f)
-    coverage_file = coverage_path(d)
-    coverage = {}
-    if coverage_file.is_file():
-        try:
-            coverage = json.loads(coverage_file.read_text(encoding='utf-8'))
-        except json.JSONDecodeError:
-            fail('.runtime/coverage/coverage.json 无效，无法判断分析完整性')
-    critical_incomplete = list(coverage.get('critical_incomplete') or [])
-    components = {item.get('id'): item for item in coverage.get('components') or []}
-    if critical_incomplete and coverage.get('enforcement') == 'required':
-        # Standard mode may continue to produce a diagnostic report, but the
-        # report must not turn this into a safe/zero-impact conclusion. Strict
-        # mode below remains a hard gate.
-        print(
-            f"\n⚠️ 关键覆盖维度未完整，标准模式仅允许生成受限结论：{critical_incomplete}",
-            file=sys.stderr,
-        )
-        summary['safe_conclusion_allowed'] = False
-    if strict_risk_gate and critical_incomplete:
+    except BinaryFirstContractError as exc:
+        fail(f"binary generation 完整性门禁失败：{exc.reason_code}: {exc}")
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        fail(f"Step5 summary.json 无效：{exc}")
+    if (
+        summary.get("schema") != "java-upgrade-analyzer.binary-step5-summary.v1"
+        or summary.get("authority") != "binary_first"
+        or summary.get("result_generation_identity")
+        != loaded["manifest"].get("result_generation_identity")
+    ):
+        fail("Step5 发布结果与 active binary generation 不一致")
+    user_files = (
+        evidence_call_chain_dir(d) / "summary.md",
+        evidence_call_chain_dir(d) / "alerts.csv",
+        evidence_call_chain_dir(d) / "by_api",
+    )
+    missing = [str(path.relative_to(Path(d))) for path in user_files if not path.exists()]
+    if missing:
+        fail(f"Step5 面向用户的复核文件缺失：{missing}")
+    alert_rows = read_csv_dicts(
+        evidence_call_chain_dir(d) / "alerts.csv",
+        ("coord", "changed_symbol", "api_signature", "path_status", "path_text"),
+    )
+    if len(alert_rows) != int(summary.get("total_apis") or 0):
+        fail("Step5 alerts.csv 行数与 summary.json 不一致")
+    if any(not row.get("coord") for row in alert_rows):
+        fail("Step5 触达结果丢失依赖包维度")
+    query_index_path = Path(d) / RUNTIME_DIRNAME / "indexes" / "s5_query_index.json"
+    try:
+        query_index = json.loads(query_index_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        fail(f"Step5 调用链查询索引无效：{exc}")
+    if (
+        query_index.get("schema") != "java-upgrade-analyzer.s5-query-index.v1"
+        or query_index.get("result_generation_identity")
+        != loaded["manifest"].get("result_generation_identity")
+    ):
+        fail("Step5 调用链查询索引与 active binary generation 不一致")
+    uncertain = int(summary.get("uncertain") or 0)
+    not_analyzed = int(summary.get("not_analyzed") or 0)
+    if strict_risk_gate and loaded["summary"].get("trace_coverage_status") != "complete":
+        fail("严格门禁要求 binary trace coverage=complete")
+    if strict_risk_gate and (uncertain or not_analyzed):
         fail(
-            f"严格模式要求关键覆盖维度全部 complete：{critical_incomplete}",
-            ['根据 .runtime/coverage/coverage.json 补齐 partial/insufficient 维度后重跑'],
-        )
-    if summary.get('status') == 'skipped':
-        if strict_risk_gate:
-            fail("调用链分析被跳过，严格模式下禁止继续", ["补齐 Step4/Step5 所需输入后重新执行分析"])
-        print(f"\n⚠️  调用链分析被跳过：{summary.get('skip_reason', 'unknown')}", file=sys.stderr)
-        for note in summary.get('notes', [])[:3]:
-            print(f"  - {note}", file=sys.stderr)
-        ok("call_chain 门控通过：调用链分析未执行（不会得出“无风险”结论）")
-        return
-    uncertain = summary.get('uncertain', 0)
-    not_analyzed = summary.get('not_analyzed', 0)
-    not_found = summary.get('not_found_in_static_analysis', summary.get('not_reachable', 0))
-    user_conclusion_summary = dict(summary.get('user_conclusion_summary') or {})
-    quality_gate = dict(summary.get('quality_gate') or {})
-    needs_input = int(quality_gate.get('needs_input', user_conclusion_summary.get('input_required', 0)) or 0)
-    inconclusive = int(quality_gate.get('inconclusive', user_conclusion_summary.get('inconclusive', 0)) or 0)
-    probable_impact = int(quality_gate.get('probable_impact', user_conclusion_summary.get('probable_impact', 0)) or 0)
-    confirmed_impact = int(quality_gate.get('confirmed_impact', user_conclusion_summary.get('confirmed_impact', 0)) or 0)
-    confirmed_no_impact = int(summary.get('not_impacted', user_conclusion_summary.get('confirmed_no_impact', 0)) or 0)
-    high_risk_inconclusive = int(quality_gate.get('high_risk_inconclusive', 0) or 0)
-    if uncertain > 0:
-        print(f"\n⚠️  {uncertain} 个风险点需要人工复核：", file=sys.stderr)
-        for item in summary.get('uncertain_apis', [])[:5]:
-            print(f"  - {item.get('api','')[:60]}: {item.get('reason','')[:60]}", file=sys.stderr)
-    if not_analyzed > 0:
-        print(f"\n⚠️  {not_analyzed} 个风险点本次未完成分析：", file=sys.stderr)
-        for item in summary.get('not_analyzed_apis', [])[:5]:
-            print(f"  - {item.get('api','')[:60]}: {item.get('reason','')[:60]}", file=sys.stderr)
-    if not_found > 0:
-        print(f"\n⚠️  {not_found} 个风险点未发现调用路径：", file=sys.stderr)
-        for item in summary.get('not_found_apis', [])[:5]:
-            print(f"  - {item.get('api','')[:60]}: {item.get('reason','')[:60]}", file=sys.stderr)
-    if needs_input > 0:
-        print(
-            f"\n⚠️  Step5 仍有 {needs_input} 个风险点缺少依赖源码证据；"
-            "系统已使用最终制品字节码继续并限制相关结论。"
-            "如需提高覆盖率，可在报告生成后补充源码并重跑 Step5。",
-            file=sys.stderr,
-        )
-    if strict_risk_gate and (uncertain > 0 or not_analyzed > 0 or not_found > 0):
-        fail(
-            f"严格模式下调用链仍存在未完成项：需人工复核={uncertain}, 本次未完成分析={not_analyzed}, 未发现调用路径={not_found}",
-            ["补齐依赖源码目录、排查未发现调用路径的项，或关闭严格模式后重试"]
-        )
-    if strict_risk_gate and high_risk_inconclusive > 0:
-        fail(
-            f"严格模式下仍有 {high_risk_inconclusive} 个高风险项需要人工复核",
-            ["优先人工复核 P0/P1 项，必要时补输入后重跑 Step5"],
+            f"严格门禁不允许未完成结果：uncertain={uncertain}, not_analyzed={not_analyzed}"
         )
     ok(
-        f"call_chain 门控通过：已确认影响={confirmed_impact} 可能影响={probable_impact} "
-        f"已确认不受影响={confirmed_no_impact} 需人工复核={inconclusive} 未发现调用路径={not_found}"
+        "binary_report 门控通过："
+        f"reachable={summary.get('reachable', 0)} "
+        f"uncertain={uncertain} "
+        f"not_found={summary.get('not_found_in_static_analysis', 0)} "
+        f"not_analyzed={not_analyzed}"
     )
 
 def main():
@@ -536,8 +454,8 @@ def main():
     ap.add_argument('--strict-risk-gate', action='store_true')
     args = ap.parse_args()
     gates = {'step1_scope': gate_step1_scope, 'context': gate_context, 'scan': gate_scan,
-             'jar_compare': lambda d: gate_jar_compare(d, strict_risk_gate=args.strict_risk_gate),
-             'call_chain': lambda d: gate_call_chain(d, strict_risk_gate=args.strict_risk_gate)}
+             'binary_generation': lambda d: gate_binary_generation(d, strict_risk_gate=args.strict_risk_gate),
+             'binary_report': lambda d: gate_binary_report(d, strict_risk_gate=args.strict_risk_gate)}
     gates[args.step](args.report_dir)
     print(f"\n门控 [{args.step}] 通过，可以进入下一步。", file=sys.stderr)
 

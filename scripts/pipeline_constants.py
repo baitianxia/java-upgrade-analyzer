@@ -18,8 +18,8 @@ GATE_SEQUENCE = [
     "step1_scope",
     "context",
     "scan",
-    "jar_compare",
-    "call_chain",
+    "binary_generation",
+    "binary_report",
 ]
 
 STEP1_ARTIFACTS_DIRNAME = "s1_artifacts"
@@ -27,16 +27,9 @@ STEP1_DEPENDENCY_JARS_DIRNAME = "s1_dependency_jars"
 STEP1_DEPENDENCY_JARS_MANIFEST_FILE = "dependency_jars.json"
 PER_DEPENDENCY_DIRNAME = "s4_per_dependency"
 PER_DEPENDENCY_SUMMARY_FILE = "summary.json"
-PER_DEPENDENCY_RESOLVED_TARGETS_FILE = "resolved_targets.csv"
-PER_DEPENDENCY_REMOVED_JAR_SYMBOLS_FILE = "removed_jar_symbols.csv"
 PER_DEPENDENCY_CANDIDATE_HITS_FILE = "candidate_hits.csv"
 STEP3_RISK_CANDIDATES_FILE = "s3_risk_candidates.csv"
-STEP5_ARTIFACT_BYTECODE_DIRNAME = "s5_artifact_bytecode"
-STEP5_ARTIFACT_BYTECODE_CATALOG_FILE = "s5_artifact_bytecode_catalog.json"
-STEP5_ARTIFACT_BYTECODE_INDEX_FILE = "s5_artifact_bytecode_index.json"
 STEP5_QUERY_INDEX_FILE = "s5_query_index.json"
-STEP5_DIAGNOSTICS_FILE = "step5_diagnostics.jsonl"
-STEP5_PROGRESS_FILE = "step5_progress.json"
 
 # ``analysis_status=uncertain`` describes the conclusion, not whether the
 # analyzer actually found a candidate usage.  Keep that evidence distinction

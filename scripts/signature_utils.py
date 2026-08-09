@@ -3,6 +3,64 @@
 """Shared helpers for method signature parsing and normalization."""
 
 
+_JVM_PRIMITIVE_TYPES = {
+    'B': 'byte',
+    'C': 'char',
+    'D': 'double',
+    'F': 'float',
+    'I': 'int',
+    'J': 'long',
+    'S': 'short',
+    'Z': 'boolean',
+    'V': 'void',
+}
+
+
+def _jvm_descriptor_type(descriptor, offset):
+    dimensions = 0
+    while offset < len(descriptor) and descriptor[offset] == '[':
+        dimensions += 1
+        offset += 1
+    if offset >= len(descriptor):
+        raise ValueError('invalid_jvm_descriptor')
+    marker = descriptor[offset]
+    if marker in _JVM_PRIMITIVE_TYPES:
+        type_name = _JVM_PRIMITIVE_TYPES[marker]
+        if marker == 'V' and dimensions:
+            raise ValueError('invalid_jvm_descriptor')
+        offset += 1
+    elif marker == 'L':
+        terminator = descriptor.find(';', offset)
+        if terminator < 0:
+            raise ValueError('invalid_jvm_descriptor')
+        type_name = descriptor[offset + 1:terminator].replace('/', '.').replace('$', '.')
+        offset = terminator + 1
+    else:
+        raise ValueError('invalid_jvm_descriptor')
+    return type_name + '[]' * dimensions, offset
+
+
+def jvm_method_parameter_signature(descriptor):
+    """Convert an exact JVM method descriptor to the product's Java parameter form."""
+    value = str(descriptor or '').strip()
+    if not value.startswith('(') or ')' not in value:
+        raise ValueError('invalid_method_descriptor')
+    parameter_end = value.index(')')
+    offset = 1
+    parameters = []
+    while offset < parameter_end:
+        parameter, offset = _jvm_descriptor_type(value, offset)
+        if parameter == 'void' or offset > parameter_end:
+            raise ValueError('invalid_method_descriptor')
+        parameters.append(parameter)
+    if offset != parameter_end:
+        raise ValueError('invalid_method_descriptor')
+    return_type, return_end = _jvm_descriptor_type(value, parameter_end + 1)
+    if return_end != len(value) or return_type.endswith('[]') and return_type.startswith('void'):
+        raise ValueError('invalid_method_descriptor')
+    return '(' + ','.join(parameters) + ')'
+
+
 def split_signature_params(signature):
     signature = (signature or '').strip()
     if not (signature.startswith('(') and signature.endswith(')')):

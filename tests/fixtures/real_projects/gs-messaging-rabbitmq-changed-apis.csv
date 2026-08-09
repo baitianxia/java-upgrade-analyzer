@@ -1,4 +1,0 @@
-coord,old_version,new_version,change_type,api_name,api_simple,symbol_kind,api_signature,confirmed,severity,source
-jdk:java.base,17,-,REMOVED,java.lang.System.out,out,field,,true,P1,pinned_callback_javap_denominator
-jdk:java.base,17,-,REMOVED,java.io.PrintStream.println,println,method,(String),true,P1,pinned_callback_javap_denominator
-jdk:java.base,17,-,REMOVED,java.util.concurrent.CountDownLatch.countDown,countDown,method,(),true,P1,pinned_callback_javap_denominator

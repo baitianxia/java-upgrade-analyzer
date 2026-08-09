@@ -1,3 +1,4 @@
+import csv
 import json
 import re
 import shutil
@@ -14,15 +15,15 @@ sys.path.insert(0, str(ROOT_DIR / "scripts"))
 
 import binary_asm_helper  # noqa: E402
 from binary_pipeline import run_pipeline  # noqa: E402
-from binary_compat_output import (  # noqa: E402
-    BinaryCompatibilityOutputError,
+from binary_report import (  # noqa: E402
+    BinaryReportError,
     load_validated_generation,
-    materialize_step4,
-    materialize_step5,
-    materialize_step6,
-    write_engine_descriptor,
+    publish_step4,
+    publish_step5,
+    publish_step6,
 )
 from binary_validation_oracle import validate_generation  # noqa: E402
+from s5_query_call_chain import query_scope_call_chain_result  # noqa: E402
 
 
 def jdk_home():
@@ -85,7 +86,7 @@ class BinaryPipelineTest(unittest.TestCase):
                 )
         return jar
 
-    def _side(self, jar):
+    def _side(self, jar, version="1"):
         return {
             "jdk_home": str(self.home),
             "artifacts": [{
@@ -94,7 +95,7 @@ class BinaryPipelineTest(unittest.TestCase):
                 "loader_realm": "application-loader",
                 "path_kind": "classpath",
                 "slot": 0,
-                "coord": "com.acme:api:1",
+                "coord": f"com.acme:api:{version}",
                 "lineage": "com.acme:api",
                 "runtime_code_source_origin_identity": "deployment-api",
             }],
@@ -145,8 +146,8 @@ class BinaryPipelineTest(unittest.TestCase):
         config = {
             "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
             "asm_jar": str(self.asm_jar),
-            "base": self._side(base),
-            "current": self._side(current),
+            "base": self._side(base, "1"),
+            "current": self._side(current, "2"),
             "runtime_comparison": {
                 "controlled_profile_fields": ["loader_topology"],
                 "declared_upgrade_payload_scope": ["artifact-bytes"],
@@ -154,8 +155,8 @@ class BinaryPipelineTest(unittest.TestCase):
         }
         report = self.root / "report"
         output = report / ".runtime" / "binary_authority"
-        first = run_pipeline(config, output_root=output, engine_mode="binary_strict")
-        second = run_pipeline(config, output_root=output, engine_mode="binary_strict")
+        first = run_pipeline(config, output_root=output)
+        second = run_pipeline(config, output_root=output)
 
         self.assertEqual(
             first["result_generation_identity"], second["result_generation_identity"]
@@ -164,6 +165,17 @@ class BinaryPipelineTest(unittest.TestCase):
         self.assertEqual(second["cache_metrics"]["classfile_parser_invocations"], 0)
         self.assertEqual(second["cache_metrics"]["artifact_snapshot_misses"], 0)
         self.assertEqual(first["authoritative_change_fact_count"], 2)
+        self.assertGreater(first["total_elapsed_seconds"], 0)
+        self.assertTrue(first["phase_timings"])
+        self.assertTrue(all(
+            item["elapsed_seconds"] >= 0 for item in first["phase_timings"]
+        ))
+        timings = json.loads(Path(first["phase_timings_path"]).read_text())
+        self.assertTrue(timings["non_authoritative_observability"])
+        self.assertEqual(
+            timings["result_generation_identity"],
+            first["result_generation_identity"],
+        )
         generation = Path(first["generation_directory"])
         summary = json.loads((generation / "binary_summary.json").read_text())
         self.assertEqual(summary["formal_projection_count"], 1)
@@ -173,46 +185,70 @@ class BinaryPipelineTest(unittest.TestCase):
         self.assertEqual(
             active["result_generation_identity"], first["result_generation_identity"]
         )
-        write_engine_descriptor(report, {
-            "requested_engine_mode": "binary_strict",
-            "authoritative_engine": "binary",
-            "result_generation_identity": first["result_generation_identity"],
-            "analysis_context_identity": first["analysis_context_identity"],
-            "validation_run_identity": first["validation_run_identity"],
-        })
         api_dir = report / "evidence" / "api_changes"
         call_dir = report / "evidence" / "call_chain"
         findings = report / ".runtime" / "findings" / "s6_findings.json"
         final_report = report / "deliverables" / "report.md"
-        step4_result = materialize_step4(report, api_dir)
-        materialize_step5(report, call_dir)
-        materialize_step6(report, findings, final_report)
-        self.assertTrue((api_dir / "binary_decisions.json").is_file())
-        self.assertEqual(step4_result["row_count"], 1)
+        step4_result = publish_step4(report, api_dir)
+        publish_step5(report, call_dir)
+        publish_step6(report, findings, final_report)
+        self.assertFalse((api_dir / "binary_decisions.json").exists())
+        self.assertEqual(step4_result["change_fact_count"], 1)
         step4_summary = json.loads(
-            (api_dir / "binary_step4_summary.json").read_text()
+            (api_dir / "summary.json").read_text()
         )
         self.assertEqual(step4_summary["authoritative_change_fact_count"], 2)
-        self.assertEqual(step4_summary["targetable_api_change_count"], 1)
+        self.assertEqual(step4_summary["published_api_change_count"], 1)
         self.assertEqual(step4_summary["confirmed_unprojectable_fact_count"], 1)
         self.assertTrue(
             (api_dir / "all_changed_apis.csv").read_bytes().startswith(b"\xef\xbb\xbf")
         )
         api_csv = (api_dir / "all_changed_apis.csv").read_text()
         self.assertNotIn("META-INF/services/demo.Service", api_csv)
-        compatibility_summary = json.loads((call_dir / "summary.json").read_text())
-        self.assertEqual(compatibility_summary["reachable"], 1)
-        self.assertEqual(compatibility_summary["quality_gate"]["confirmed_impact"], 0)
-        self.assertEqual(compatibility_summary["quality_gate"]["confirmed_no_impact"], 0)
+        with (api_dir / "all_changed_apis.csv").open(encoding="utf-8-sig", newline="") as handle:
+            api_rows = list(csv.DictReader(handle))
+        self.assertEqual(api_rows[0]["coord"], "com.acme:api")
+        self.assertEqual(api_rows[0]["old_version"], "1")
+        self.assertEqual(api_rows[0]["new_version"], "2")
+        self.assertEqual(api_rows[0]["api_signature"], "()")
+        dependency_review = (api_dir / "changed_dependencies.md").read_text()
+        self.assertIn("com.acme:api", dependency_review)
+        self.assertIn("[review.md](review.md)", dependency_review)
+        per_dependency_review = next((api_dir / "s4_per_dependency").glob("*/summary.md"))
+        self.assertIn(
+            "[查看完整裁决](../../review.md)",
+            per_dependency_review.read_text(),
+        )
+        self.assertIn("com.acme:api", (api_dir / "review.md").read_text())
+        self.assertFalse(any(api_dir.glob("*.sqlite")))
+        published_summary = json.loads((call_dir / "summary.json").read_text())
+        self.assertEqual(published_summary["reachable"], 1)
+        self.assertNotIn("confirmed_impact", published_summary["quality_gate"])
+        self.assertNotIn("confirmed_no_impact", published_summary["quality_gate"])
+        self.assertNotIn("not_impacted", published_summary)
         self.assertTrue(
             (call_dir / "alerts.csv").read_bytes().startswith(b"\xef\xbb\xbf")
         )
+        with (call_dir / "alerts.csv").open(encoding="utf-8-sig", newline="") as handle:
+            alert_rows = list(csv.DictReader(handle))
+        self.assertEqual(alert_rows[0]["coord"], "com.acme:api")
+        self.assertEqual(alert_rows[0]["api_signature"], "()")
+        self.assertTrue(alert_rows[0]["path_text"].endswith("demo.Api.value()"))
+        query = query_scope_call_chain_result(report, "com.acme:api", "coord")
+        self.assertEqual(query["matched_coords"], ["com.acme:api"])
+        self.assertTrue(query["chains"], query)
         self.assertTrue(
             (generation / "binary_formal_results.csv").read_bytes().startswith(
                 b"\xef\xbb\xbf"
             )
         )
         self.assertIn("not_found_in_static_analysis", final_report.read_text())
+        self.assertTrue((final_report.parent / "all-affected-dependencies.md").is_file())
+        self.assertTrue((final_report.parent / "all-affected-dependencies.csv").is_file())
+        self.assertTrue((final_report.parent / "all-impact-details.md").is_file())
+        self.assertTrue((final_report.parent / "all-impact-details.csv").is_file())
+        self.assertTrue((final_report.parent / "analysis-scope.md").is_file())
+        self.assertIn("关键路径", (final_report.parent / "all-impact-details.md").read_text())
         self.assertEqual(
             load_validated_generation(report)["manifest"]["result_generation_identity"],
             first["result_generation_identity"],
@@ -230,7 +266,7 @@ class BinaryPipelineTest(unittest.TestCase):
             item["reason_code"] == "ORACLE_GENERATION_SIDECAR_TAMPERED"
             for item in tampered["issues"]
         ))
-        with self.assertRaises(BinaryCompatibilityOutputError):
+        with self.assertRaises(BinaryReportError):
             load_validated_generation(report)
 
     def test_manifest_semantics_match_independent_validation(self):
@@ -257,7 +293,6 @@ class BinaryPipelineTest(unittest.TestCase):
         result = run_pipeline(
             config,
             output_root=self.root / "report" / ".runtime" / "binary_authority",
-            engine_mode="binary_strict",
         )
 
         self.assertEqual(result["validation_status"], "passed")
@@ -348,9 +383,7 @@ class BinaryPipelineTest(unittest.TestCase):
                 "owner_coord": "business",
             },
         }
-        result = run_pipeline(
-            config, output_root=self.root / "inline-output", engine_mode="binary_strict"
-        )
+        result = run_pipeline(config, output_root=self.root / "inline-output")
         generation = Path(result["generation_directory"])
         inline = json.loads((generation / "binary_inline_overlay.json").read_text())
         self.assertEqual(inline["proven_count"], 1, inline)
@@ -392,7 +425,6 @@ class BinaryPipelineTest(unittest.TestCase):
         result = run_pipeline(
             config,
             output_root=self.root / "retained-output",
-            engine_mode="binary_strict",
         )
         inline = json.loads(
             (Path(result["generation_directory"]) / "binary_inline_overlay.json").read_text()
@@ -464,7 +496,6 @@ class BinaryPipelineTest(unittest.TestCase):
         result = run_pipeline(
             config,
             output_root=self.root / "dispatch-output",
-            engine_mode="binary_strict",
         )
         self.assertEqual(result["validation_status"], "passed")
         validation = json.loads(Path(result["validation_result_path"]).read_text())

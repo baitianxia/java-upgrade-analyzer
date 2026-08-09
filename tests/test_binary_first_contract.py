@@ -25,10 +25,8 @@ class BinaryFirstContractTest(unittest.TestCase):
         )
 
         self.assertEqual(tuple(support["phase_contract"]), contract.PHASE_ORDER)
-        self.assertEqual(
-            set(support["engine_modes"]["implemented"]),
-            set(contract.IMPLEMENTED_ENGINE_MODES),
-        )
+        self.assertEqual(support["authority"], "binary_first_only_fail_closed")
+        self.assertNotIn("engine_modes", support)
         self.assertTrue(
             support["runtime_loader_support_manifest"][
                 "authoritative_runtime_effective_decisions_allowed"
@@ -94,16 +92,10 @@ class BinaryFirstContractTest(unittest.TestCase):
             contract.disposition_obligation_identity(observed, second_context),
         )
 
-    def test_engine_modes_enable_strict_and_whole_generation_fallback(self):
-        self.assertEqual(contract.require_implemented_engine_mode("shadow"), "shadow")
-        self.assertEqual(
-            contract.require_implemented_engine_mode("binary_strict"),
-            "binary_strict",
-        )
-        self.assertEqual(
-            contract.require_implemented_engine_mode("binary_with_legacy_fallback"),
-            "binary_with_legacy_fallback",
-        )
+    def test_contract_exposes_no_engine_selection_or_fallback_api(self):
+        self.assertFalse(hasattr(contract, "ENGINE_MODES"))
+        self.assertFalse(hasattr(contract, "IMPLEMENTED_ENGINE_MODES"))
+        self.assertFalse(hasattr(contract, "require_implemented_engine_mode"))
 
     def test_reachable_truth_table_preserves_static_reachability(self):
         result = contract.derive_formal_result_state("reachable")

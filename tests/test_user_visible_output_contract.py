@@ -27,7 +27,8 @@ class UserVisibleOutputContractTest(unittest.TestCase):
         self.assertIn("用户可见文件说明", reading_section)
         self.assertIn("已完成分析", reading_section)
         self.assertIn("未完成分析", reading_section)
-        self.assertIn("确认有影响", reading_section)
+        self.assertIn("可能影响", reading_section)
+        self.assertNotIn("确认有影响", reading_section)
         self.assertNotIn("建议按", reading_section)
         self.assertNotIn("当前无法确认", reading_section)
         self.assertIn("本次未完成分析", text)
@@ -73,8 +74,8 @@ class UserVisibleOutputContractTest(unittest.TestCase):
         self.assertNotIn("$SKILL", skill)
         for maintenance_entry in (
             "scripts/accuracy_benchmark.py",
-            "scripts/quality_signal_audit.py",
-            "scripts/test_round_retrospective.py",
+            "binary_validation_oracle.py",
+            "tests/fixtures/oracle_boundary.json",
             "scripts/quality_gate.py --profile release",
         ):
             self.assertNotIn(maintenance_entry, skill)

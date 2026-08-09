@@ -15,7 +15,6 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import compat  # noqa: E402
-import error_handler  # noqa: E402
 import s1_dep_diff  # noqa: E402
 import s4_contract  # noqa: E402
 import path_runtime  # noqa: E402
@@ -180,22 +179,6 @@ class PlatformContractTest(unittest.TestCase):
                     f"{path.relative_to(ROOT)}:{node.lineno} imports "
                     f"{sorted(guarded_modules)} without an ImportError fallback",
                 )
-
-    def test_diagnostic_commands_match_the_host_shell(self):
-        expected_java_locator = (
-            "where java" if os.name == "nt" else "command -v java"
-        )
-        expected_settings_reader = (
-            'Get-Content "$HOME\\.m2\\settings.xml"'
-            if os.name == "nt"
-            else "cat ~/.m2/settings.xml"
-        )
-
-        self.assertEqual(error_handler.JAVA_LOCATION_COMMAND, expected_java_locator)
-        self.assertEqual(
-            error_handler.MAVEN_SETTINGS_COMMAND,
-            expected_settings_reader,
-        )
 
     def test_git_resolution_prefers_working_user_install_over_broken_system_git(self):
         executable_name = "git.exe" if compat.IS_WINDOWS else "git"
@@ -853,10 +836,17 @@ time.sleep(60)
         self.assertIn("platform-contract-step-${STEP_OUTCOME}-${STEP_NAME}-${MATRIX_OS}-jdk${MATRIX_JAVA}-${GITHUB_SHA}", text)
         self.assertIn("platform-contract-gate-${GATE_STATUS}-${GATE_NAME}-${MATRIX_OS}-jdk${MATRIX_JAVA}-${GITHUB_SHA}", text)
         self.assertIn("platform-contract-benchmark-${BENCHMARK_STATUS}-${BENCHMARK_NAME}-${MATRIX_OS}-jdk${MATRIX_JAVA}-${GITHUB_SHA}", text)
-        self.assertIn("platform-contract-smoke-${SMOKE_STATUS}-${SMOKE_CHECKPOINT}-${MATRIX_OS}-jdk${MATRIX_JAVA}-${GITHUB_SHA}", text)
         self.assertIn("steps.quality_gate.outcome == 'failure'", text)
-        self.assertIn("steps.diag_jdeps_floor.outcome", text)
+        for diagnostic in (
+            "steps.diag_artifact_facts.outcome",
+            "steps.diag_runtime_bytecode.outcome",
+            "steps.diag_runtime_reconciliation.outcome",
+            "steps.diag_decision_projection.outcome",
+        ):
+            self.assertIn(diagnostic, text)
         self.assertIn("gate|quality-gate-report|missing", text)
+        self.assertNotIn("jua-platform-contract", text)
+        self.assertNotIn("platform-contract-smoke-", text)
         self.assertNotIn("continue-on-error", text)
 
     def test_run_cmd_preserves_unicode_space_and_metacharacter_arguments(self):

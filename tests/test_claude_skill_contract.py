@@ -9,11 +9,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from claude_skill_contract import (  # noqa: E402
+    TRANSFORM_IDS,
     audit_public_contract,
     run_skill_contract,
     run_skill_contract_metamorphic_matrix,
 )
-from metamorphic_regression import TRANSFORM_IDS  # noqa: E402
 
 
 class ClaudeSkillContractTest(unittest.TestCase):
