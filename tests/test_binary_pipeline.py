@@ -219,7 +219,10 @@ class BinaryPipelineTest(unittest.TestCase):
             "[查看完整裁决](../../review.md)",
             per_dependency_review.read_text(),
         )
-        self.assertIn("com.acme:api", (api_dir / "review.md").read_text())
+        complete_review = (api_dir / "review.md").read_text()
+        self.assertIn("## com.acme:api\n", complete_review)
+        self.assertNotIn("## com.acme:api:1、com.acme:api:2", complete_review)
+        self.assertIn("META-INF/services/demo.Service", complete_review)
         self.assertFalse(any(api_dir.glob("*.sqlite")))
         published_summary = json.loads((call_dir / "summary.json").read_text())
         self.assertEqual(published_summary["reachable"], 1)

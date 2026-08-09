@@ -213,7 +213,16 @@ def _dependency_view(record: Mapping[str, Any]) -> dict[str, str]:
         str(item.get("coord") or item.get("runtime_code_source_origin_identity") or "")
         for item in artifacts
     } - {""})
-    dependency = "、".join(lineages or fallback) or "未绑定制品（需查看裁决证据）"
+    normalized_coord, _base_version, _current_version = _artifact_coord_parts(record)
+    normalized_fallback = (
+        [normalized_coord]
+        if normalized_coord and normalized_coord != "UNBOUND_RUNTIME_ARTIFACT"
+        else fallback
+    )
+    dependency = (
+        "、".join(lineages or normalized_fallback)
+        or "未绑定制品（需查看裁决证据）"
+    )
     return {
         "dependency": dependency,
         "dependency_lineage": "|".join(lineages),
