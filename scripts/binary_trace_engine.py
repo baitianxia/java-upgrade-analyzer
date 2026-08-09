@@ -9,6 +9,10 @@ import json
 from typing import Any, Mapping
 
 from binary_decision_engine import BinaryDecisionBundle
+from binary_entrypoint_discovery import (
+    BinaryEntrypointDiscoveryResult,
+    discover_binary_entrypoints,
+)
 from binary_fact_store import BinaryFactStore
 from binary_first_contract import canonical_identity, derive_formal_result_state
 from binary_first_model import RuntimeProfile
@@ -34,6 +38,8 @@ class BinaryTraceBundle:
     identity: str
     graph_stats: Mapping[str, Any] | None = None
     resource_activation_results: tuple[dict[str, Any], ...] = ()
+    entrypoint_discovery_identity: str = ""
+    entrypoint_records: tuple[dict[str, Any], ...] = ()
 
 
 class BinaryTraceEngine:
@@ -44,6 +50,7 @@ class BinaryTraceEngine:
         reconciliation: RuntimeReconciliationResult,
         decisions: BinaryDecisionBundle,
         *,
+        entrypoint_discovery: BinaryEntrypointDiscoveryResult | None = None,
         inline_overlay: Any | None = None,
         max_visited_nodes: int = 1_000_000,
         max_paths_per_target: int = 20,
@@ -57,7 +64,6 @@ class BinaryTraceEngine:
         self.inline_overlay = inline_overlay
         self.members = {row["member_identity"]: row for row in store.rows("members")}
         self.edges = {row["direct_edge_identity"]: row for row in store.rows("direct_edges")}
-        self.members = {row["member_identity"]: row for row in store.rows("members")}
         self.providers = {
             (item["initiating_loader_realm_identity"], item["class_name"]): item
             for item in reconciliation.provider_bindings
@@ -82,7 +88,18 @@ class BinaryTraceEngine:
         }
         self.reverse: dict[str, list[dict[str, Any]]] = defaultdict(list)
         self._build_reverse_graph()
-        self.entrypoints, self.entrypoint_gaps = self._entrypoints()
+        self.entrypoint_discovery = entrypoint_discovery or discover_binary_entrypoints(
+            store, runtime_profile, reconciliation
+        )
+        (
+            self.exact_entrypoints,
+            self.possible_entrypoints,
+            self.entrypoint_gaps,
+        ) = self._entrypoints()
+        self.entrypoints = self.exact_entrypoints | self.possible_entrypoints
+        self.entrypoint_records_by_member: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for item in self.entrypoint_discovery.records:
+            self.entrypoint_records_by_member[item["member_identity"]].append(item)
         self._trace_cache: dict[
             tuple[str, ...], tuple[list[dict[str, Any]], list[str]]
         ] = {}
@@ -286,7 +303,7 @@ class BinaryTraceEngine:
                     exact[caller].add(target)
                 else:
                     possible_edge_count += 1
-        self.exact_reachable_nodes = self._reachable(self.entrypoints, exact)
+        self.exact_reachable_nodes = self._reachable(self.exact_entrypoints, exact)
         self.possible_reachable_nodes = self._reachable(self.entrypoints, all_edges)
         exact_scc_count, exact_largest = self._scc_count(nodes, exact)
         possible_scc_count, possible_largest = self._scc_count(nodes, all_edges)
@@ -296,6 +313,9 @@ class BinaryTraceEngine:
             "effective_edge_count": effective_edge_count,
             "possible_edge_count": possible_edge_count,
             "entrypoint_count": len(self.entrypoints),
+            "exact_entrypoint_count": len(self.exact_entrypoints),
+            "possible_entrypoint_count": len(self.possible_entrypoints),
+            "entrypoint_discovery_identity": self.entrypoint_discovery.identity,
             "exact_reachable_node_count": len(self.exact_reachable_nodes),
             "possible_reachable_node_count": len(self.possible_reachable_nodes),
             "exact_scc_count": exact_scc_count,
@@ -317,41 +337,12 @@ class BinaryTraceEngine:
             "member_kind": kind,
         })
 
-    def _entrypoints(self) -> tuple[set[str], tuple[str, ...]]:
-        profile = self.profile.payload.get("business_entrypoint_profile") or {}
-        methods = profile.get("methods") or () if isinstance(profile, Mapping) else ()
-        gaps = []
-        entrypoints = set()
-        for item in methods:
-            if not isinstance(item, Mapping):
-                gaps.append("entrypoint_record_invalid")
-                continue
-            realm = str(item.get("initiating_loader_realm_identity") or "")
-            owner = str(item.get("class_name") or "").replace(".", "/")
-            provider = self.providers.get((realm, owner))
-            if not provider or provider.get("class_provider_status") != "resolved":
-                gaps.append(f"entrypoint_provider_unresolved:{realm}:{owner}")
-                continue
-            variant = provider["selected_class_variant_identity"]
-            rows = self.store.rows(
-                "members",
-                where=(
-                    "class_variant_identity=? AND member_kind='method' "
-                    "AND member_name=? AND descriptor=?"
-                ),
-                parameters=(variant, item.get("member_name"), item.get("descriptor")),
-            )
-            if len(rows) != 1:
-                gaps.append(
-                    f"entrypoint_member_unresolved:{realm}:{owner}:{item.get('member_name')}:{item.get('descriptor')}"
-                )
-            else:
-                entrypoints.add(rows[0]["member_identity"])
-        if not methods:
-            gaps.append("entrypoint_method_set_missing")
-        if isinstance(profile, Mapping) and profile.get("coverage_status") != "complete":
-            gaps.append("entrypoint_coverage_incomplete")
-        return entrypoints, tuple(sorted(set(gaps)))
+    def _entrypoints(self) -> tuple[set[str], set[str], tuple[str, ...]]:
+        return (
+            set(self.entrypoint_discovery.exact_member_identities),
+            set(self.entrypoint_discovery.possible_member_identities),
+            tuple(self.entrypoint_discovery.coverage_gaps),
+        )
 
     def _target_nodes(self, decision: Mapping[str, Any]) -> tuple[str, ...]:
         scope = decision.get("fact_scope") or {}
@@ -405,6 +396,16 @@ class BinaryTraceEngine:
                 gaps.append("trace_node_limit_exceeded")
                 break
             if node in self.entrypoints:
+                root_certainty = (
+                    "possible" if node in self.possible_entrypoints else "exact"
+                )
+                root_records = [
+                    item for item in self.entrypoint_records_by_member.get(node, ())
+                    if item.get("path_certainty") == root_certainty
+                ]
+                certainty = (
+                    "possible" if "possible" in {certainty, root_certainty} else "exact"
+                )
                 path_edges = []
                 for item in reversed(suffix):
                     edge = self.edges.get(item["direct_edge_identity"]) or {}
@@ -425,6 +426,10 @@ class BinaryTraceEngine:
                     })
                 path_identity = _identity("binary_trace_path_identity", {
                     "entrypoint_member_identity": node,
+                    "entrypoint_record_identities": [
+                        item["entrypoint_record_identity"]
+                        for item in root_records
+                    ],
                     "target_nodes": list(target_nodes),
                     "edge_identities": [item["direct_edge_identity"] for item in path_edges],
                     "path_certainty": certainty,
@@ -432,6 +437,10 @@ class BinaryTraceEngine:
                 paths.append({
                     "path_identity": path_identity,
                     "entrypoint_member_identity": node,
+                    "entrypoint_records": [
+                        dict(item)
+                        for item in root_records
+                    ],
                     "target_nodes": list(target_nodes),
                     "path_certainty": certainty,
                     "edges": path_edges,
@@ -698,6 +707,7 @@ class BinaryTraceEngine:
         resource_results = self._service_activation_results()
         all_results = [*formal, *candidate]
         digest = _identity("binary_trace_result_set_digest", {
+            "entrypoint_discovery_identity": self.entrypoint_discovery.identity,
             "formal_result_identities": [item["trace_result_identity"] for item in formal],
             "candidate_result_identities": [item["trace_result_identity"] for item in candidate],
             "resource_activation_result_identities": [
@@ -728,6 +738,8 @@ class BinaryTraceEngine:
             identity=identity,
             graph_stats=self.graph_stats,
             resource_activation_results=tuple(resource_results),
+            entrypoint_discovery_identity=self.entrypoint_discovery.identity,
+            entrypoint_records=tuple(self.entrypoint_discovery.records),
         )
 
 

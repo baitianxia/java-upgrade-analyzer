@@ -1,9 +1,11 @@
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.lang.reflect.Constructor;
+import java.lang.reflect.AnnotatedElement;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
+import java.lang.annotation.Annotation;
 import java.net.URL;
 import java.net.URLClassLoader;
 import java.nio.charset.StandardCharsets;
@@ -62,7 +64,14 @@ public final class RuntimeOutcomeOracle {
             for (Class<?> iface : type.getInterfaces()) interfaces.add(internal(iface));
             Collections.sort(interfaces);
             out.append(',').append(json("interfaces")).append(':').append(jsonArray(interfaces));
+            out.append(',').append(json("class_annotations")).append(':').append(
+                jsonArray(annotationDescriptors(type))
+            );
+            out.append(',').append(json("class_annotation_imports")).append(':').append(
+                jsonArray(annotationImports(type))
+            );
             List<String> memberRows = new ArrayList<>();
+            List<String> memberAnnotationRows = new ArrayList<>();
             for (Field field : fields) {
                 memberRows.add("field|" + field.getName() + "|" + descriptor(field.getType())
                     + "|" + field.getModifiers());
@@ -70,13 +79,22 @@ public final class RuntimeOutcomeOracle {
             for (Method method : methods) {
                 memberRows.add("method|" + method.getName() + "|" + methodDescriptor(method)
                     + "|" + method.getModifiers());
+                for (String annotation : annotationDescriptors(method)) {
+                    memberAnnotationRows.add(
+                        method.getName() + "|" + methodDescriptor(method) + "|" + annotation
+                    );
+                }
             }
             for (Constructor<?> constructor : constructors) {
                 memberRows.add("method|<init>|" + constructorDescriptor(constructor)
                     + "|" + constructor.getModifiers());
             }
             Collections.sort(memberRows);
+            Collections.sort(memberAnnotationRows);
             out.append(',').append(json("members")).append(':').append(jsonArray(memberRows));
+            out.append(',').append(json("member_annotations")).append(':').append(
+                jsonArray(memberAnnotationRows)
+            );
         } catch (Throwable error) {
             out.append(',').append(json("status")).append(':').append(json("definition_failed"));
             out.append(',').append(json("failure_kind")).append(':').append(json(error.getClass().getName()));
@@ -102,6 +120,42 @@ public final class RuntimeOutcomeOracle {
     }
 
     private static String internal(Class<?> type) { return type.getName().replace('.', '/'); }
+
+    private static List<String> annotationDescriptors(AnnotatedElement element) {
+        List<String> result = new ArrayList<>();
+        try {
+            for (Annotation annotation : element.getDeclaredAnnotations()) {
+                result.add("L" + internal(annotation.annotationType()) + ";");
+            }
+        } catch (RuntimeException | LinkageError error) {
+            result.add("<unresolved:" + error.getClass().getName() + ">");
+        }
+        Collections.sort(result);
+        return result;
+    }
+
+    private static List<String> annotationImports(AnnotatedElement element) {
+        List<String> result = new ArrayList<>();
+        try {
+            for (Annotation annotation : element.getDeclaredAnnotations()) {
+                if (!annotation.annotationType().getName().equals(
+                    "org.springframework.context.annotation.Import"
+                )) continue;
+                try {
+                    Object value = annotation.annotationType().getDeclaredMethod("value").invoke(annotation);
+                    if (value instanceof Class<?>[]) {
+                        for (Class<?> imported : (Class<?>[]) value) result.add(internal(imported));
+                    }
+                } catch (ReflectiveOperationException | RuntimeException error) {
+                    result.add("<unresolved:" + error.getClass().getName() + ">");
+                }
+            }
+        } catch (RuntimeException | LinkageError error) {
+            result.add("<unresolved:" + error.getClass().getName() + ">");
+        }
+        Collections.sort(result);
+        return result;
+    }
 
     private static String methodDescriptor(Method method) {
         StringBuilder value = new StringBuilder("(");

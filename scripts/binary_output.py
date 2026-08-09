@@ -22,6 +22,31 @@ from path_runtime import make_short_temp_dir, short_temporary_directory
 from signature_utils import jvm_method_parameter_signature
 
 
+ENTRY_KIND_LABELS = {
+    "declared_runtime_entry": "用户声明的运行入口",
+    "java_main": "Java 主程序入口",
+    "spring_scheduled": "Spring 定时任务",
+    "spring_event_listener": "Spring 事件监听",
+    "spring_message_listener": "消息监听",
+    "lifecycle_callback": "组件初始化回调",
+    "jpa_lifecycle_callback": "JPA 生命周期回调",
+    "spring_web_endpoint": "HTTP 接口入口",
+    "spring_bean_initialization": "Spring Bean 初始化",
+    "spring_application_runner": "Spring ApplicationRunner 启动回调",
+    "spring_command_line_runner": "Spring CommandLineRunner 启动回调",
+    "spring_application_listener": "Spring ApplicationListener 事件回调",
+    "spring_environment_post_processor": "Spring 环境后处理回调",
+    "spring_application_context_initializer": "Spring 上下文初始化回调",
+    "spring_lifecycle_callback": "Spring 生命周期回调",
+    "spring_web_interceptor": "Spring Web 拦截器回调",
+    "spring_conversion_callback": "Spring 类型转换回调",
+    "servlet_endpoint": "Servlet 请求入口",
+    "servlet_filter": "Servlet 过滤器入口",
+    "servlet_lifecycle_callback": "Servlet 生命周期回调",
+    "quartz_job": "Quartz 定时任务",
+}
+
+
 class BinaryOutputError(BinaryFirstContractError):
     pass
 
@@ -138,11 +163,31 @@ def _aggregate_by_api(
                         nodes.append(label)
                 if target_label and (not nodes or nodes[-1] != target_label):
                     nodes.append(target_label)
+                entrypoint_records = list(path.get("entrypoint_records") or ())
+                entry_kinds = sorted({
+                    str(item.get("entry_kind") or "")
+                    for item in entrypoint_records
+                    if item.get("entry_kind")
+                })
                 path_records.append({
                     "path_identity": path.get("path_identity"),
                     "path_certainty": path.get("path_certainty"),
                     "path_text": " → ".join(nodes),
                     "edge_count": len(path.get("edges") or ()),
+                    "entry_kinds": entry_kinds,
+                    "entry_kind_labels": [
+                        ENTRY_KIND_LABELS.get(item, item) for item in entry_kinds
+                    ],
+                    "entrypoint_dependency_coords": sorted({
+                        str(item.get("dependency_coord") or "")
+                        for item in entrypoint_records
+                        if item.get("dependency_coord")
+                    }),
+                    "entrypoint_activation_reasons": sorted({
+                        str(item.get("activation_reason") or "")
+                        for item in entrypoint_records
+                        if item.get("activation_reason")
+                    }),
                 })
         dependency_artifacts = []
         dependency_keys = set()
@@ -242,6 +287,17 @@ def build_output_payloads(
         )
     ]
     by_api = _aggregate_by_api(decisions, traces, profile)
+    exact_entrypoints = {
+        str(item.get("member_identity") or "")
+        for item in traces.entrypoint_records
+        if item.get("path_certainty") == "exact" and item.get("member_identity")
+    }
+    possible_entrypoints = {
+        str(item.get("member_identity") or "")
+        for item in traces.entrypoint_records
+        if item.get("path_certainty") == "possible"
+        and item.get("member_identity") not in exact_entrypoints
+    }
     summary = {
         "schema": "java-upgrade-analyzer.binary-summary.v1",
         "analysis_context_identity": decisions.analysis_context_identity,
@@ -268,6 +324,9 @@ def build_output_payloads(
             for item in traces.resource_activation_results
         ),
         "resource_activation_result_count": len(traces.resource_activation_results),
+        "exact_entrypoint_count": len(exact_entrypoints),
+        "possible_entrypoint_count": len(possible_entrypoints),
+        "entrypoint_discovery_identity": traces.entrypoint_discovery_identity,
         "formal_path_set_complete": all(item["path_set_complete"] for item in by_api),
         "decision_coverage_status": decisions.coverage_status,
         "trace_coverage_status": traces.coverage_status,
@@ -302,6 +361,13 @@ def build_output_payloads(
             "schema": "java-upgrade-analyzer.binary-candidate-results.v1",
             "results": list(traces.candidate_results),
         },
+        "binary_entrypoints.json": {
+            "schema": "java-upgrade-analyzer.binary-entrypoint-discovery.v1",
+            "entrypoint_discovery_identity": traces.entrypoint_discovery_identity,
+            "exact_entrypoint_count": len(exact_entrypoints),
+            "possible_entrypoint_count": len(possible_entrypoints),
+            "records": list(traces.entrypoint_records),
+        },
         "binary_coverage.json": {
             "schema": "java-upgrade-analyzer.binary-coverage.v1",
             "decision_coverage_status": decisions.coverage_status,
@@ -309,6 +375,7 @@ def build_output_payloads(
             "trace_coverage_status": traces.coverage_status,
             "trace_coverage_gaps": list(traces.coverage_gaps),
             "batch_graph_stats": dict(traces.graph_stats or {}),
+            "entrypoint_discovery_identity": traces.entrypoint_discovery_identity,
             "source_overlay": asdict(source_overlay) if source_overlay else {
                 "coverage_status": "not_provided",
             },

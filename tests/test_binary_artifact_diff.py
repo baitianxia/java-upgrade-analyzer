@@ -130,6 +130,41 @@ class BinaryArtifactDiffTest(unittest.TestCase):
         self.assertEqual(result["resource_diff_status"], "runtime_topology_changed")
         self.assertEqual(result["comparison_coverage_status"], "complete")
 
+    def test_spring_factories_preserves_each_auto_configuration_class(self):
+        artifact = self.jar("spring-factories.jar", [(
+            "META-INF/spring.factories",
+            (
+                b"org.springframework.boot.autoconfigure.EnableAutoConfiguration=\\\n"
+                b"  vendor.FirstConfig,\\\n"
+                b"  vendor.SecondConfig\n"
+            ),
+        )])
+
+        snapshot = diff.snapshot_archive(
+            artifact,
+            artifact_instance_identity="artifact-1",
+            expected_sha256=diff._sha256_file(artifact),
+            asm_jar=self.asm_jar,
+        )
+
+        resource = next(
+            item for item in snapshot.entries
+            if item.name == "META-INF/spring.factories"
+        )
+        self.assertEqual(
+            resource.resource_semantic_facts,
+            (
+                (
+                    "property_entry:org.springframework.boot.autoconfigure.EnableAutoConfiguration",
+                    "vendor.FirstConfig",
+                ),
+                (
+                    "property_entry:org.springframework.boot.autoconfigure.EnableAutoConfiguration",
+                    "vendor.SecondConfig",
+                ),
+            ),
+        )
+
     def test_unknown_changed_resource_makes_only_that_comparison_scope_partial(self):
         base = self.jar("base.jar", [("config/custom.bin", b"old")])
         current = self.jar("current.jar", [("config/custom.bin", b"new")])

@@ -30,6 +30,103 @@ SUPPORT_MANIFEST = Path(__file__).with_name("binary_first_support_manifest.json"
 POLICY_VERSION = "binary-independent-validation-v1"
 
 
+_ORACLE_METHOD_ENTRY_KINDS = {
+    "Lorg/springframework/scheduling/annotation/Scheduled;": "spring_scheduled",
+    "Lorg/springframework/scheduling/annotation/Schedules;": "spring_scheduled",
+    "Lorg/springframework/context/event/EventListener;": "spring_event_listener",
+    "Lorg/springframework/kafka/annotation/KafkaListener;": "spring_message_listener",
+    "Lorg/springframework/amqp/rabbit/annotation/RabbitListener;": "spring_message_listener",
+    "Lorg/springframework/amqp/rabbit/annotation/RabbitHandler;": "spring_message_listener",
+    "Lorg/springframework/jms/annotation/JmsListener;": "spring_message_listener",
+    "Lorg/apache/rocketmq/spring/annotation/RocketMQMessageListener;": "spring_message_listener",
+    "Ljavax/annotation/PostConstruct;": "lifecycle_callback",
+    "Ljakarta/annotation/PostConstruct;": "lifecycle_callback",
+    "Ljavax/persistence/PrePersist;": "jpa_lifecycle_callback",
+    "Ljavax/persistence/PostPersist;": "jpa_lifecycle_callback",
+    "Ljavax/persistence/PreUpdate;": "jpa_lifecycle_callback",
+    "Ljavax/persistence/PostUpdate;": "jpa_lifecycle_callback",
+    "Ljavax/persistence/PreRemove;": "jpa_lifecycle_callback",
+    "Ljavax/persistence/PostRemove;": "jpa_lifecycle_callback",
+    "Ljavax/persistence/PostLoad;": "jpa_lifecycle_callback",
+    "Ljakarta/persistence/PrePersist;": "jpa_lifecycle_callback",
+    "Ljakarta/persistence/PostPersist;": "jpa_lifecycle_callback",
+    "Ljakarta/persistence/PreUpdate;": "jpa_lifecycle_callback",
+    "Ljakarta/persistence/PostUpdate;": "jpa_lifecycle_callback",
+    "Ljakarta/persistence/PreRemove;": "jpa_lifecycle_callback",
+    "Ljakarta/persistence/PostRemove;": "jpa_lifecycle_callback",
+    "Ljakarta/persistence/PostLoad;": "jpa_lifecycle_callback",
+    "Lorg/springframework/web/bind/annotation/RequestMapping;": "spring_web_endpoint",
+    "Lorg/springframework/web/bind/annotation/GetMapping;": "spring_web_endpoint",
+    "Lorg/springframework/web/bind/annotation/PostMapping;": "spring_web_endpoint",
+    "Lorg/springframework/web/bind/annotation/PutMapping;": "spring_web_endpoint",
+    "Lorg/springframework/web/bind/annotation/DeleteMapping;": "spring_web_endpoint",
+    "Lorg/springframework/web/bind/annotation/PatchMapping;": "spring_web_endpoint",
+    "Lorg/springframework/context/annotation/Bean;": "spring_bean_initialization",
+}
+
+_ORACLE_INTERFACE_CALLBACKS = {
+    "org/springframework/boot/ApplicationRunner": {"run": "spring_application_runner"},
+    "org/springframework/boot/CommandLineRunner": {"run": "spring_command_line_runner"},
+    "org/springframework/context/ApplicationListener": {
+        "onApplicationEvent": "spring_application_listener"
+    },
+    "org/springframework/context/Lifecycle": {
+        "start": "spring_lifecycle_callback", "stop": "spring_lifecycle_callback",
+    },
+    "org/springframework/context/SmartLifecycle": {
+        "start": "spring_lifecycle_callback", "stop": "spring_lifecycle_callback",
+    },
+    "org/springframework/beans/factory/InitializingBean": {
+        "afterPropertiesSet": "spring_lifecycle_callback",
+    },
+    "org/springframework/web/servlet/HandlerInterceptor": {
+        "preHandle": "spring_web_interceptor",
+        "postHandle": "spring_web_interceptor",
+        "afterCompletion": "spring_web_interceptor",
+    },
+    "org/springframework/core/convert/converter/Converter": {
+        "convert": "spring_conversion_callback",
+    },
+    "org/springframework/format/Formatter": {
+        "parse": "spring_conversion_callback", "print": "spring_conversion_callback",
+    },
+    "javax/servlet/Servlet": {"service": "servlet_endpoint"},
+    "jakarta/servlet/Servlet": {"service": "servlet_endpoint"},
+    "javax/servlet/Filter": {"doFilter": "servlet_filter"},
+    "jakarta/servlet/Filter": {"doFilter": "servlet_filter"},
+    "javax/servlet/ServletContextListener": {
+        "contextInitialized": "servlet_lifecycle_callback",
+        "contextDestroyed": "servlet_lifecycle_callback",
+    },
+    "jakarta/servlet/ServletContextListener": {
+        "contextInitialized": "servlet_lifecycle_callback",
+        "contextDestroyed": "servlet_lifecycle_callback",
+    },
+    "org/quartz/Job": {"execute": "quartz_job"},
+}
+
+_ORACLE_CLASS_TRIGGER_KINDS = {
+    "Lorg/apache/rocketmq/spring/annotation/RocketMQMessageListener;": (
+        "spring_message_listener", {"onMessage"},
+    ),
+    "Lorg/springframework/amqp/rabbit/annotation/RabbitListener;": (
+        "spring_message_listener", {"handleMessage", "onMessage"},
+    ),
+}
+
+_ORACLE_SPRING_FACTORIES_CALLBACKS = {
+    "org.springframework.context.ApplicationListener": (
+        "onApplicationEvent", "spring_application_listener",
+    ),
+    "org.springframework.boot.env.EnvironmentPostProcessor": (
+        "postProcessEnvironment", "spring_environment_post_processor",
+    ),
+    "org.springframework.context.ApplicationContextInitializer": (
+        "initialize", "spring_application_context_initializer",
+    ),
+}
+
+
 class BinaryValidationError(BinaryFirstContractError):
     pass
 
@@ -186,6 +283,36 @@ def _independent_resource_facts(name: str, content: bytes) -> list[list[str]]:
             for key, separator, value in [line.partition(":")]
             if separator
         ]
+    if name == "META-INF/spring.factories":
+        text = content.decode("iso-8859-1").replace("\r\n", "\n").replace("\r", "\n")
+        logical = []
+        pending = ""
+        for physical in text.split("\n"):
+            combined = pending + (physical.lstrip() if pending else physical)
+            trailing = len(combined) - len(combined.rstrip("\\"))
+            if trailing % 2:
+                pending = combined[:-1]
+            else:
+                logical.append(combined)
+                pending = ""
+        if pending:
+            logical.append(pending)
+        facts = []
+        for raw in logical:
+            stripped = raw.strip()
+            if not stripped or stripped.startswith(("#", "!")):
+                continue
+            separator = next(
+                (index for index, item in enumerate(stripped) if item in "=:"),
+                -1,
+            )
+            if separator < 0:
+                continue
+            key = stripped[:separator].strip()
+            for entry in stripped[separator + 1:].split(","):
+                if entry.strip():
+                    facts.append([f"property_entry:{key}", entry.strip()])
+        return facts
     if not (
         name.startswith("META-INF/services/")
         or (name.startswith("META-INF/spring/") and name.endswith(".imports"))
@@ -570,6 +697,342 @@ def _is_subtype(
         for candidate in [row.get("super_name"), *(row.get("interfaces") or ())]
         if candidate
     )
+
+
+def _oracle_annotation_closure(
+    observations: Mapping[str, Mapping[str, Any]], descriptors: Iterable[str],
+) -> set[str]:
+    result = {str(value) for value in descriptors if str(value)}
+    pending = list(result)
+    while pending:
+        descriptor = pending.pop()
+        if not descriptor.startswith("L") or not descriptor.endswith(";"):
+            continue
+        annotation_type = descriptor[1:-1]
+        for nested in (observations.get(annotation_type) or {}).get(
+            "class_annotations"
+        ) or ():
+            if nested not in result:
+                result.add(str(nested))
+                pending.append(str(nested))
+    return result
+
+
+def _oracle_member_annotations(
+    observation: Mapping[str, Any],
+) -> dict[tuple[str, str], set[str]]:
+    result: dict[tuple[str, str], set[str]] = defaultdict(set)
+    for row in observation.get("member_annotations") or ():
+        name, descriptor, annotation = str(row).split("|", 2)
+        result[(name, descriptor)].add(annotation)
+    return result
+
+
+def _oracle_selected_auto_configurations(
+    resource_truth: Iterable[Mapping[str, Any]],
+) -> tuple[set[str], dict[str, set[tuple[str, str]]]]:
+    result = set()
+    callbacks: dict[str, set[tuple[str, str]]] = defaultdict(set)
+    boot_imports = (
+        "META-INF/spring/"
+        "org.springframework.boot.autoconfigure.AutoConfiguration.imports"
+    )
+    factory_keys = {
+        "org.springframework.boot.autoconfigure.EnableAutoConfiguration",
+        "org.springframework.boot.autoconfigure.AutoConfiguration",
+    }
+    for selection in resource_truth:
+        name = str(selection.get("name") or "")
+        for selected in selection.get("selected") or ():
+            for key, value in selected.get("semantic_facts") or ():
+                if name == boot_imports and key == "ordered_entry":
+                    result.add(str(value).replace(".", "/"))
+                elif str(key).startswith("property_entry:") and str(key).split(
+                    ":", 1
+                )[1] in factory_keys:
+                    result.add(str(value).replace(".", "/"))
+                elif str(key).startswith("property_entry:"):
+                    registration = str(key).split(":", 1)[1]
+                    callback = _ORACLE_SPRING_FACTORIES_CALLBACKS.get(registration)
+                    if callback:
+                        callbacks[str(value).replace(".", "/")].add(callback)
+    return result, dict(callbacks)
+
+
+def _validate_entrypoint_discovery(
+    generation: Path,
+    current_side: Mapping[str, Any],
+    current_artifacts: list[dict[str, Any]],
+    observations: Mapping[str, Mapping[str, Any]],
+    resource_truth: Iterable[Mapping[str, Any]],
+    direct_edge_truth: Iterable[Iterable[Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Independently reconstruct automatic callback roots using target-JVM reflection."""
+
+    issues = []
+    sidecar = _load_json(generation / "binary_entrypoints.json")
+    profile = (current_side.get("runtime_profile") or {}).get(
+        "business_entrypoint_profile"
+    ) or {}
+    topology = (current_side.get("runtime_profile") or {}).get("loader_topology") or {}
+    non_platform_realms = sorted({
+        str(item.get("identity") or "")
+        for item in topology.get("realms") or ()
+        if item.get("kind") != "platform" and item.get("identity")
+    })
+    realms = tuple(topology.get("entrypoint_realms") or non_platform_realms)
+    path_kinds_by_path = {
+        Path(str(item["path"])).resolve(): str(item.get("path_kind") or "").lower()
+        for item in current_artifacts
+    }
+    business_path_kinds = {
+        "application", "application_classes", "business", "business_classes",
+    }
+
+    def artifact_path(observation: Mapping[str, Any]) -> Path | None:
+        return _file_url_path(str(observation.get("provider_url") or ""))
+
+    def business_owned(observation: Mapping[str, Any]) -> bool:
+        path = artifact_path(observation)
+        return path is not None and path_kinds_by_path.get(path) in business_path_kinds
+
+    exact_main_classes = {
+        str(profile.get("main_class") or "").strip().replace(".", "/")
+    } - {""}
+    launcher_kind = str(
+        (current_side.get("runtime_profile") or {}).get(
+            "container_and_launcher_kind"
+        ) or ""
+    ).lower()
+    if launcher_kind in {
+        "java-jar", "executable-jar", "spring-boot", "spring_boot",
+        "spring-boot-launcher",
+    }:
+        for artifact in current_artifacts:
+            artifact_path_value = Path(str(artifact["path"])).resolve()
+            if path_kinds_by_path.get(artifact_path_value) not in business_path_kinds:
+                continue
+            with zipfile.ZipFile(artifact_path_value) as archive:
+                manifests = [
+                    info for info in archive.infolist()
+                    if not info.is_dir()
+                    and info.filename.upper() == "META-INF/MANIFEST.MF"
+                ]
+                for manifest in manifests:
+                    for key, value in _independent_resource_facts(
+                        manifest.filename, archive.read(manifest)
+                    ):
+                        if str(key).lower() in {"main-class", "start-class"}:
+                            exact_main_classes.add(
+                                str(value).strip().replace(".", "/")
+                            )
+
+    registered_auto_configurations, spring_factories_callbacks = (
+        _oracle_selected_auto_configurations(resource_truth)
+    )
+    explicitly_activated_frameworks = {
+        str(value or "").strip().lower()
+        for value in profile.get("activated_frameworks") or ()
+    }
+    launcher = str(
+        (current_side.get("runtime_profile") or {}).get(
+            "container_and_launcher_kind"
+        ) or ""
+    ).lower()
+    declared_method_keys = {
+        (
+            str(item.get("class_name") or "").replace("/", "."),
+            str(item.get("member_name") or ""),
+            str(item.get("descriptor") or ""),
+        )
+        for item in profile.get("methods") or ()
+        if isinstance(item, Mapping)
+    }
+    spring_boot_active = (
+        "spring_boot" in explicitly_activated_frameworks
+        or launcher in {"spring-boot", "spring_boot", "spring-boot-launcher"}
+        or any(
+            str(edge[3]).replace("/", ".")
+            == "org.springframework.boot.SpringApplication"
+            and str(edge[4]) == "run"
+            and business_owned(observations.get(str(edge[0]).replace(".", "/")) or {})
+            and (
+                (str(edge[0]), str(edge[1]), str(edge[2]))
+                in declared_method_keys
+                or (
+                    str(edge[0]).replace(".", "/") in exact_main_classes
+                    and str(edge[1]) == "main"
+                    and str(edge[2]) == "([Ljava/lang/String;)V"
+                )
+            )
+            for edge in direct_edge_truth
+        )
+    )
+    resource_activated = (
+        set(registered_auto_configurations) | set(spring_factories_callbacks)
+        if spring_boot_active else set()
+    )
+    activated = set(resource_activated)
+    activated.update(
+        str(value).replace(".", "/")
+        for value in profile.get("activated_classes") or ()
+        if str(value).strip()
+    )
+    imported_activated = set()
+    changed = True
+    while changed:
+        changed = False
+        for class_name, observation in observations.items():
+            if class_name not in activated and not business_owned(observation):
+                continue
+            annotations = _oracle_annotation_closure(
+                observations, observation.get("class_annotations") or ()
+            )
+            annotated_types = [class_name]
+            annotated_types.extend(
+                descriptor[1:-1]
+                for descriptor in annotations
+                if descriptor.startswith("L") and descriptor.endswith(";")
+            )
+            for annotated_type in annotated_types:
+                for imported in (observations.get(annotated_type) or {}).get(
+                    "class_annotation_imports"
+                ) or ():
+                    if str(imported).startswith("<unresolved:"):
+                        issues.append(_validation_issue(
+                            "entrypoint_discovery",
+                            "ORACLE_ENTRYPOINT_IMPORT_UNRESOLVED",
+                            class_name=class_name, detail=imported,
+                        ))
+                    elif imported not in activated:
+                        activated.add(str(imported))
+                        imported_activated.add(str(imported))
+                        changed = True
+
+    declared = {
+        (
+            str(item.get("class_name") or "").replace(".", "/"),
+            str(item.get("member_name") or ""),
+            str(item.get("descriptor") or ""),
+        )
+        for item in profile.get("methods") or ()
+        if isinstance(item, Mapping)
+    }
+    expected = set()
+    for realm in realms:
+        for class_name, observation in observations.items():
+            if observation.get("status") != "definition_ready":
+                continue
+            owned = business_owned(observation)
+            active = owned or class_name in activated
+            class_annotations = _oracle_annotation_closure(
+                observations, observation.get("class_annotations") or ()
+            )
+            conditional_class = any(
+                value.startswith(
+                    "Lorg/springframework/boot/autoconfigure/condition/Conditional"
+                ) or value == "Lorg/springframework/context/annotation/Conditional;"
+                for value in class_annotations
+            )
+            annotation_by_member = _oracle_member_annotations(observation)
+            for kind, member_name, descriptor, flags in _declared_members(observation):
+                if kind != "method":
+                    continue
+                member_key = (class_name, member_name, descriptor)
+                if member_key in declared:
+                    expected.add((
+                        realm, class_name, member_name, descriptor,
+                        "declared_runtime_entry", "exact",
+                        "runtime_profile_declaration",
+                    ))
+                    continue
+                annotations = _oracle_annotation_closure(
+                    observations,
+                    annotation_by_member.get((member_name, descriptor), ()),
+                )
+                candidate_kinds = {
+                    _ORACLE_METHOD_ENTRY_KINDS[value]
+                    for value in annotations
+                    if value in _ORACLE_METHOD_ENTRY_KINDS
+                }
+                for annotation, (entry_kind, names) in _ORACLE_CLASS_TRIGGER_KINDS.items():
+                    if annotation in class_annotations and member_name in names:
+                        candidate_kinds.add(entry_kind)
+                for interface, callbacks in _ORACLE_INTERFACE_CALLBACKS.items():
+                    if _is_subtype(observations, class_name, interface):
+                        entry_kind = callbacks.get(member_name)
+                        if entry_kind:
+                            candidate_kinds.add(entry_kind)
+                for callback_name, entry_kind in spring_factories_callbacks.get(
+                    class_name, ()
+                ):
+                    if member_name == callback_name:
+                        candidate_kinds.add(entry_kind)
+                if (
+                    member_name == "main"
+                    and descriptor == "([Ljava/lang/String;)V"
+                    and flags & 0x0001 and flags & 0x0008 and owned
+                ):
+                    candidate_kinds.add("java_main")
+                for entry_kind in candidate_kinds:
+                    conditional = conditional_class or any(
+                        value.startswith(
+                            "Lorg/springframework/boot/autoconfigure/condition/Conditional"
+                        ) or value == "Lorg/springframework/context/annotation/Conditional;"
+                        for value in annotations
+                    )
+                    if conditional:
+                        certainty = "possible"
+                        reason = "framework_condition_not_evaluated"
+                    elif entry_kind == "jpa_lifecycle_callback":
+                        certainty = "possible"
+                        reason = "entity_lifecycle_activation_unproven"
+                    elif entry_kind == "java_main" and class_name not in exact_main_classes:
+                        certainty = "possible"
+                        reason = "business_main_activation_unproven"
+                    elif active:
+                        certainty = "exact"
+                        if owned:
+                            reason = "business_final_artifact_runtime_trigger"
+                        elif class_name in resource_activated:
+                            reason = (
+                                "spring_factories_runtime_registration"
+                                if class_name in spring_factories_callbacks
+                                else "spring_boot_auto_configuration_import"
+                            )
+                        elif class_name in imported_activated:
+                            reason = "spring_import_from_active_configuration"
+                        else:
+                            reason = "runtime_profile_activation_declaration"
+                    else:
+                        certainty = "possible"
+                        reason = "dependency_framework_activation_unproven"
+                    expected.add((
+                        realm, class_name, member_name, descriptor,
+                        entry_kind, certainty, reason,
+                    ))
+
+    actual = {
+        (
+            str(item.get("initiating_loader_realm_identity") or ""),
+            str(item.get("class_name") or ""),
+            str(item.get("member_name") or ""),
+            str(item.get("descriptor") or ""),
+            str(item.get("entry_kind") or ""),
+            str(item.get("path_certainty") or ""),
+            str(item.get("activation_reason") or ""),
+        )
+        for item in sidecar.get("records") or ()
+    }
+    if actual != expected:
+        issues.append(_validation_issue(
+            "entrypoint_discovery", "ORACLE_ENTRYPOINT_SET_MISMATCH",
+            missing=sorted(expected - actual), extra=sorted(actual - expected),
+        ))
+    return issues, {
+        "entrypoints": [list(item) for item in sorted(expected)],
+        "entrypoint_count": len(expected),
+    }
 
 
 def _oracle_runtime_contexts(
@@ -1263,6 +1726,16 @@ def validate_generation(
     )
     issues.extend(cross_issues)
     truth_parts["cross_version_semantics"] = cross_truth
+    entrypoint_issues, entrypoint_truth = _validate_entrypoint_discovery(
+        generation,
+        current_side,
+        current_artifacts,
+        observations_by_side.get("current") or {},
+        (truth_parts.get("current") or {}).get("resource_selections") or (),
+        (truth_parts.get("current") or {}).get("direct_edges") or (),
+    )
+    issues.extend(entrypoint_issues)
+    truth_parts["entrypoint_discovery"] = entrypoint_truth
 
     truth_set_identity = _identity("binary_oracle_truth_set_identity", truth_parts)
     support = _load_json(SUPPORT_MANIFEST)

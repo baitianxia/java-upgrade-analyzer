@@ -558,7 +558,10 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
             "class_definition_support_manifest_identity", support["class_definition_support_manifest"]
         ),
         "runtime_fact_semantic_capability_identity": _identity(
-            "runtime_fact_semantic_capability_identity", {"resource_policy": support["artifact_diff_support_manifest"]["resource_policy"]}
+            "runtime_fact_semantic_capability_identity", {
+                "resource_policy": support["artifact_diff_support_manifest"]["resource_policy"],
+                "entrypoint_discovery": support["entrypoint_discovery_support_manifest"],
+            }
         ),
         "runtime_fact_dynamic_capability_identity": _identity(
             "runtime_fact_dynamic_capability_identity", {"asm": support["artifact_diff_support_manifest"]["parser_contract"]}
@@ -786,6 +789,14 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                 "elapsed_seconds": round(time.perf_counter() - trace_started, 6),
                 "formal_trace_result_count": len(traces.formal_results),
                 "candidate_trace_result_count": len(traces.candidate_results),
+                "exact_entrypoint_count": sum(
+                    item.get("path_certainty") == "exact"
+                    for item in traces.entrypoint_records
+                ),
+                "possible_entrypoint_count": sum(
+                    item.get("path_certainty") == "possible"
+                    for item in traces.entrypoint_records
+                ),
             })
             base_store.connection.commit()
             current_store.connection.commit()
@@ -872,6 +883,7 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                         "input_identities": [
                             decisions.identity,
                             current_runtime.identity,
+                            traces.entrypoint_discovery_identity,
                         ],
                         "output_identity": traces.identity,
                     },
@@ -982,6 +994,10 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                 policy_identities={
                     "support_manifest": _sha256_file(SUPPORT_MANIFEST_PATH),
                     "runtime_capability": capability.identity,
+                    "entrypoint_discovery": _identity(
+                        "entrypoint_discovery_support_manifest_identity",
+                        support["entrypoint_discovery_support_manifest"],
+                    ),
                     "analysis_scope": analysis_scope.identity,
                     "runtime_comparison": runtime_comparison.identity,
                     "projection_registry": _identity(

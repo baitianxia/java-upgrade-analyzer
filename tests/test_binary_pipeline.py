@@ -176,6 +176,257 @@ class BinaryPipelineTest(unittest.TestCase):
             },
         }
 
+    def _automatic_scheduled_entry_fixture(self, *, include_activation_resource=True):
+        def compile_core(label, value):
+            source = self.root / label / "src" / "api" / "Api.java"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                f"package api; public class Api {{ public int value() {{ return {value}; }} }}",
+                encoding="utf-8",
+            )
+            classes = self.root / label / "classes"
+            classes.mkdir()
+            completed = subprocess.run(
+                ["javac", "-g", "-d", str(classes), str(source)],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            jar = self.root / label / "core.jar"
+            with zipfile.ZipFile(jar, "w") as archive:
+                archive.write(classes / "api" / "Api.class", "api/Api.class")
+            return jar
+
+        base_core = compile_core("scheduled-core-base", 1)
+        current_core = compile_core("scheduled-core-current", 2)
+        scheduler_root = self.root / "scheduler-entry"
+        scheduler_sources = scheduler_root / "src"
+        source_files = {
+            "org/springframework/scheduling/annotation/Scheduled.java": """
+                package org.springframework.scheduling.annotation;
+                import java.lang.annotation.*;
+                @Retention(RetentionPolicy.RUNTIME) @Target(ElementType.METHOD)
+                public @interface Scheduled { long fixedDelay() default 0; }
+            """,
+            "org/springframework/boot/autoconfigure/AutoConfiguration.java": """
+                package org.springframework.boot.autoconfigure;
+                import java.lang.annotation.*;
+                @Retention(RetentionPolicy.RUNTIME) @Target(ElementType.TYPE)
+                public @interface AutoConfiguration {}
+            """,
+            "org/springframework/boot/SpringApplication.java": """
+                package org.springframework.boot;
+                public final class SpringApplication {
+                    private SpringApplication() {}
+                    public static Object run(Class<?> type, String[] args) {
+                        return null;
+                    }
+                }
+            """,
+            "vendor/ScheduledConfig.java": """
+                package vendor;
+                import api.Api;
+                import org.springframework.boot.autoconfigure.AutoConfiguration;
+                import org.springframework.scheduling.annotation.Scheduled;
+                @AutoConfiguration
+                public class ScheduledConfig {
+                    @Scheduled(fixedDelay = 1000)
+                    public int tick() { return new Api().value(); }
+                }
+            """,
+        }
+        scheduler_paths = []
+        for relative, content in source_files.items():
+            source = scheduler_sources / relative
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text(content, encoding="utf-8")
+            scheduler_paths.append(source)
+        scheduler_classes = scheduler_root / "classes"
+        scheduler_classes.mkdir()
+        completed = subprocess.run(
+            [
+                "javac", "-g", "-cp", str(base_core), "-d", str(scheduler_classes),
+                *map(str, scheduler_paths),
+            ],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        scheduler_jar = scheduler_root / "scheduler.jar"
+        with zipfile.ZipFile(scheduler_jar, "w") as archive:
+            for class_file in sorted(scheduler_classes.rglob("*.class")):
+                archive.write(
+                    class_file,
+                    class_file.relative_to(scheduler_classes).as_posix(),
+                )
+            if include_activation_resource:
+                archive.writestr(
+                    "META-INF/spring/"
+                    "org.springframework.boot.autoconfigure.AutoConfiguration.imports",
+                    "vendor.ScheduledConfig\n",
+                )
+        app_source = self.root / "scheduled-app" / "src" / "biz" / "Application.java"
+        app_source.parent.mkdir(parents=True)
+        app_source.write_text(
+            "package biz; import org.springframework.boot.SpringApplication; "
+            "public class Application { public static void main(String[] args) { "
+            "SpringApplication.run(Application.class, args); } }",
+            encoding="utf-8",
+        )
+        app_classes = self.root / "scheduled-app" / "classes"
+        app_classes.mkdir()
+        completed = subprocess.run(
+            [
+                "javac", "-g", "-cp", str(scheduler_jar),
+                "-d", str(app_classes), str(app_source),
+            ],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        app_jar = self.root / "scheduled-app" / "app.jar"
+        with zipfile.ZipFile(app_jar, "w") as archive:
+            archive.write(
+                app_classes / "biz" / "Application.class",
+                "biz/Application.class",
+            )
+        return base_core, current_core, scheduler_jar, app_jar
+
+    def _automatic_entry_side(self, core, scheduler, app, version):
+        side = self._side(core, version)
+        side["artifacts"] = [
+            {
+                "path": str(app), "logical_location": "app/business.jar",
+                "loader_realm": "application-loader", "path_kind": "business_classes",
+                "slot": 0, "coord": "business", "lineage": "business",
+                "runtime_code_source_origin_identity": "deployment-business",
+            },
+            {
+                "path": str(scheduler), "logical_location": "lib/scheduler.jar",
+                "loader_realm": "application-loader", "path_kind": "classpath",
+                "slot": 1, "coord": "com.acme:scheduler:1.0",
+                "lineage": "com.acme:scheduler",
+                "runtime_code_source_origin_identity": "deployment-scheduler",
+            },
+            {
+                "path": str(core), "logical_location": "lib/core.jar",
+                "loader_realm": "application-loader", "path_kind": "classpath",
+                "slot": 2, "coord": f"com.acme:core:{version}",
+                "lineage": "com.acme:core",
+                "runtime_code_source_origin_identity": "deployment-core",
+            },
+        ]
+        side["runtime_profile"]["business_entrypoint_profile"] = {
+            "discovery_mode": "binary_auto",
+            "coverage_status": "complete",
+            "main_class": "biz.Application",
+            "methods": [],
+        }
+        return side
+
+    def test_dependency_scheduled_auto_configuration_is_reachable_without_manual_entrypoint(self):
+        base_core, current_core, scheduler, app = self._automatic_scheduled_entry_fixture()
+        config = {
+            "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+            "source_usage": {
+                "decision": "skip_source",
+                "decision_source": "explicit_config",
+            },
+            "asm_jar": str(self.asm_jar),
+            "base": self._automatic_entry_side(base_core, scheduler, app, "1.0"),
+            "current": self._automatic_entry_side(current_core, scheduler, app, "2.0"),
+            "runtime_comparison": {
+                "controlled_profile_fields": ["loader_topology"],
+                "declared_upgrade_payload_scope": ["artifact-bytes"],
+            },
+        }
+
+        result = run_pipeline(config, output_root=self.root / "scheduled-report")
+        generation = Path(result["generation_directory"])
+        formal = json.loads((generation / "binary_formal_results.json").read_text())
+        self.assertTrue(formal["by_api"], formal)
+        matching_targets = [
+            item for item in formal["by_api"]
+            if item["display_owner"] == "api/Api"
+            and str(item["display_member"]).startswith("value")
+        ]
+        self.assertEqual(
+            len(matching_targets), 1,
+            [
+                (item.get("display_owner"), item.get("display_member"))
+                for item in formal["by_api"]
+            ],
+        )
+        target = matching_targets[0]
+        entrypoint_path = generation / "binary_entrypoints.json"
+        entrypoints = json.loads(entrypoint_path.read_text())
+
+        self.assertEqual(target["reachability_status"], "reachable")
+        self.assertEqual(target["paths"][0]["entry_kinds"], ["spring_scheduled"])
+        self.assertEqual(
+            target["paths"][0]["entry_kind_labels"], ["Spring 定时任务"]
+        )
+        self.assertEqual(
+            target["paths"][0]["entrypoint_dependency_coords"],
+            ["com.acme:scheduler:1.0"],
+        )
+        scheduled = next(
+            item for item in entrypoints["records"]
+            if item["entry_kind"] == "spring_scheduled"
+        )
+        self.assertEqual(scheduled["class_name"], "vendor/ScheduledConfig")
+        self.assertEqual(scheduled["member_name"], "tick")
+        self.assertEqual(scheduled["path_certainty"], "exact")
+        self.assertEqual(
+            scheduled["activation_reason"],
+            "spring_boot_auto_configuration_import",
+        )
+        entrypoint_path.write_text(
+            json.dumps({**entrypoints, "records": []}), encoding="utf-8"
+        )
+        independent_validation = validate_generation(config, generation)
+        self.assertTrue(any(
+            item["reason_code"] == "ORACLE_ENTRYPOINT_SET_MISMATCH"
+            for item in independent_validation["issues"]
+        ), independent_validation["issues"])
+
+    def test_dependency_scheduled_method_without_activation_proof_is_not_exact(self):
+        base_core, current_core, scheduler, app = self._automatic_scheduled_entry_fixture(
+            include_activation_resource=False
+        )
+        config = {
+            "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+            "source_usage": {
+                "decision": "skip_source",
+                "decision_source": "explicit_config",
+            },
+            "asm_jar": str(self.asm_jar),
+            "base": self._automatic_entry_side(base_core, scheduler, app, "1.0"),
+            "current": self._automatic_entry_side(current_core, scheduler, app, "2.0"),
+            "runtime_comparison": {
+                "controlled_profile_fields": ["loader_topology"],
+                "declared_upgrade_payload_scope": ["artifact-bytes"],
+            },
+        }
+
+        result = run_pipeline(config, output_root=self.root / "unactivated-report")
+        generation = Path(result["generation_directory"])
+        formal = json.loads((generation / "binary_formal_results.json").read_text())
+        target = next(
+            item for item in formal["by_api"]
+            if item["display_owner"] == "api/Api"
+            and str(item["display_member"]).startswith("value")
+        )
+        entrypoints = json.loads((generation / "binary_entrypoints.json").read_text())
+        scheduled = next(
+            item for item in entrypoints["records"]
+            if item["entry_kind"] == "spring_scheduled"
+        )
+
+        self.assertEqual(target["reachability_status"], "uncertain")
+        self.assertEqual(scheduled["path_certainty"], "possible")
+        self.assertEqual(
+            scheduled["activation_reason"],
+            "dependency_framework_activation_unproven",
+        )
+
     def test_end_to_end_generation_is_content_bound_and_immutable(self):
         base = self._jar("base", 1, service_provider="demo.OldProvider")
         current = self._jar("current", 2, service_provider="demo.NewProvider")

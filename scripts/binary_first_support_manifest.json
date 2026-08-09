@@ -126,6 +126,7 @@
         "parent_first"
       ],
       "runtime_path_kinds": [
+        "business_classes",
         "classpath"
       ],
       "multi_release": "manifest Multi-Release true plus exact target JDK major",
@@ -160,6 +161,37 @@
     "platform_image_identity": "content-bound release/modules/java launcher identity",
     "unsupported_behavior": "definition status unsupported/failed and affected decisions cannot become complete authoritative negatives"
   },
+  "entrypoint_discovery_support_manifest": {
+    "status": "implemented_binary_entrypoint_discovery_v1",
+    "policy_version": "binary-entrypoint-discovery-v1",
+    "automatic_discovery": [
+      "Java main methods in business final artifacts",
+      "Spring scheduled, event, messaging, web, bean and lifecycle annotations including runtime meta-annotations",
+      "JPA lifecycle callbacks",
+      "Spring runner, application-listener and lifecycle interfaces including inherited interfaces",
+      "Quartz Job callbacks",
+      "dependency callbacks activated by selected Spring Boot AutoConfiguration.imports or spring.factories",
+      "transitive Spring @Import activation",
+      "explicit runtime-profile entrypoint declarations"
+    ],
+    "certainty_policy": {
+      "exact": "business final-artifact callback or dependency callback with selected activation proof and no unresolved condition",
+      "possible": "callback declaration exists but dependency activation or framework condition is not independently proved"
+    },
+    "human_evidence": [
+      "entrypoint kind",
+      "entrypoint owning dependency coordinate",
+      "activation reason",
+      "exact or possible path certainty"
+    ],
+    "known_exclusions": [
+      "Spring XML scheduled and Quartz MethodInvokingJobDetailFactoryBean registration",
+      "component-scan package and external condition evaluation",
+      "runtime registration performed only through reflection or custom framework code",
+      "dynamic proxy, declarative client, MyBatis mapper and AOP semantic dispatch edges"
+    ],
+    "unsupported_behavior": "retain a possible path or explicit coverage limitation; never promote an unproved dependency callback to exact"
+  },
   "oracle_support_manifest": {
     "status": "implemented_independent_validation_v1",
     "production_binary_authority_switch_allowed": true,
@@ -173,6 +205,7 @@
       "actual target-JVM provider and non-initializing definition observations",
       "member resolution and closed-world dispatch",
       "ordered resource selection",
+      "target-JVM reflection reconstruction of automatic framework entrypoints",
       "generation sidecar integrity and tamper detection"
     ],
     "supported_closed_scope": [

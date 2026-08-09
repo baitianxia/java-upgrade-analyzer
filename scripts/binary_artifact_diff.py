@@ -102,6 +102,76 @@ def _normalized_resource_digest(name: str, category: str, content: bytes) -> str
     return _sha256_bytes(text.encode("utf-8", errors="surrogateescape"))
 
 
+def _java_properties_entries(content: bytes) -> tuple[tuple[str, str], ...]:
+    """Return logical key/value entries using the Java Properties line rules."""
+
+    text = content.decode("iso-8859-1").replace("\r\n", "\n").replace("\r", "\n")
+    logical_lines = []
+    pending = ""
+    for physical in text.split("\n"):
+        line = physical.lstrip(" \t\f") if pending else physical
+        combined = pending + line
+        trailing = len(combined) - len(combined.rstrip("\\"))
+        if trailing % 2:
+            pending = combined[:-1]
+            continue
+        logical_lines.append(combined)
+        pending = ""
+    if pending:
+        logical_lines.append(pending)
+
+    def unescape(value: str) -> str:
+        output = []
+        index = 0
+        escapes = {"t": "\t", "n": "\n", "r": "\r", "f": "\f"}
+        while index < len(value):
+            if value[index] != "\\" or index + 1 >= len(value):
+                output.append(value[index])
+                index += 1
+                continue
+            index += 1
+            marker = value[index]
+            if marker == "u" and index + 4 < len(value):
+                digits = value[index + 1:index + 5]
+                try:
+                    output.append(chr(int(digits, 16)))
+                    index += 5
+                    continue
+                except ValueError:
+                    pass
+            output.append(escapes.get(marker, marker))
+            index += 1
+        return "".join(output)
+
+    result = []
+    for raw in logical_lines:
+        stripped = raw.lstrip(" \t\f")
+        if not stripped or stripped.startswith(("#", "!")):
+            continue
+        escaped = False
+        split_at = len(stripped)
+        for index, character in enumerate(stripped):
+            if escaped:
+                escaped = False
+                continue
+            if character == "\\":
+                escaped = True
+                continue
+            if character in "=: \t\f":
+                split_at = index
+                break
+        key = unescape(stripped[:split_at])
+        cursor = split_at
+        while cursor < len(stripped) and stripped[cursor] in " \t\f":
+            cursor += 1
+        if cursor < len(stripped) and stripped[cursor] in "=:":
+            cursor += 1
+        while cursor < len(stripped) and stripped[cursor] in " \t\f":
+            cursor += 1
+        result.append((key, unescape(stripped[cursor:])))
+    return tuple(result)
+
+
 def _resource_semantic_facts(name: str, category: str, content: bytes) -> tuple[tuple[str, str], ...]:
     if category not in {"runtime_topology", "distribution_metadata"}:
         return ()
@@ -120,6 +190,13 @@ def _resource_semantic_facts(name: str, category: str, content: bytes) -> tuple[
             key, value = line.split(":", 1)
             facts.append((key.strip().lower(), value.strip()))
         return tuple(facts)
+    if name == "META-INF/spring.factories":
+        return tuple(
+            (f"property_entry:{key}", entry)
+            for key, value in _java_properties_entries(content)
+            for entry in (item.strip() for item in value.split(","))
+            if entry
+        )
     if name.startswith("META-INF/services/") or name.startswith("META-INF/spring/"):
         facts = []
         for line in text.splitlines():

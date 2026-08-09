@@ -6,7 +6,12 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR / "scripts"))
 
-from binary_report import _product_change_row, _product_change_type  # noqa: E402
+from binary_report import (  # noqa: E402
+    _legacy_alert_rows,
+    _legacy_result_item,
+    _product_change_row,
+    _product_change_type,
+)
 from s6_report import _change_summary, _human_change_type  # noqa: E402
 
 
@@ -80,6 +85,35 @@ class BinaryReportLabelsTest(unittest.TestCase):
             "解析目标：demo.ParentA → demo.ParentB",
             _change_summary(row),
         )
+
+    def test_human_call_chain_names_framework_entry_and_owning_dependency(self):
+        item = _legacy_result_item({
+            "api": "api.Api.value",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "reachability_status": "reachable",
+            "static_linkage_status": "compatible",
+            "impact_conclusion": "probable_impact",
+            "paths": [{
+                "path_text": "vendor.ScheduledConfig.tick() → api.Api.value()",
+                "path_certainty": "exact",
+                "entry_kinds": ["spring_scheduled"],
+                "entry_kind_labels": ["Spring 定时任务"],
+                "entrypoint_dependency_coords": ["com.acme:scheduler:1.0"],
+                "entrypoint_activation_reasons": [
+                    "spring_boot_auto_configuration_import"
+                ],
+            }],
+        }, {
+            "coord": "com.acme:core",
+            "change_type": "IMPLEMENTATION_CHANGED",
+        })
+
+        row = _legacy_alert_rows([item])[0]
+
+        self.assertEqual(row["entry_kind"], "Spring 定时任务")
+        self.assertEqual(row["consumer_coord"], "com.acme:scheduler:1.0")
+        self.assertIn("入口类型：Spring 定时任务", row["chain_summary"])
 
 
 if __name__ == "__main__":

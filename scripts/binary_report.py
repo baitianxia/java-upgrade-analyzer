@@ -1114,6 +1114,13 @@ def _legacy_result_item(
     old_version = str(change.get("old_version") or "")
     new_version = str(change.get("new_version") or "")
     business_entry = paths[0].split(" → ", 1)[0] if paths else ""
+    primary_path = next(
+        (
+            candidate for candidate in item.get("paths") or []
+            if candidate.get("path_text") == (paths[0] if paths else "")
+        ),
+        {},
+    )
     return {
         **dict(item),
         "api_identity": "|".join((
@@ -1148,6 +1155,18 @@ def _legacy_result_item(
                 "path_certainty": str(
                     next((candidate.get("path_certainty") for candidate in item.get("paths") or [] if candidate.get("path_text") == path), "")
                 ),
+                "entry_kinds": list(
+                    next((candidate.get("entry_kinds") or [] for candidate in item.get("paths") or [] if candidate.get("path_text") == path), [])
+                ),
+                "entry_kind_labels": list(
+                    next((candidate.get("entry_kind_labels") or [] for candidate in item.get("paths") or [] if candidate.get("path_text") == path), [])
+                ),
+                "entrypoint_dependency_coords": list(
+                    next((candidate.get("entrypoint_dependency_coords") or [] for candidate in item.get("paths") or [] if candidate.get("path_text") == path), [])
+                ),
+                "entrypoint_activation_reasons": list(
+                    next((candidate.get("entrypoint_activation_reasons") or [] for candidate in item.get("paths") or [] if candidate.get("path_text") == path), [])
+                ),
             }
             for path in paths
         ],
@@ -1164,6 +1183,10 @@ def _legacy_result_item(
         ),
         "key_evidence": paths[0] if paths else "",
         "business_entry": business_entry,
+        "entry_kind": " / ".join(primary_path.get("entry_kind_labels") or ()),
+        "entrypoint_dependency": " / ".join(
+            primary_path.get("entrypoint_dependency_coords") or ()
+        ),
         "change_summary": str(change.get("change_summary") or ""),
         "old_value": str(change.get("old_value") or ""),
         "new_value": str(change.get("new_value") or ""),
@@ -1176,6 +1199,22 @@ def _legacy_alert_rows(items: list[dict[str, Any]]) -> list[dict[str, str]]:
     for item in items:
         paths = list(item.get("call_paths") or []) or [""]
         for index, path in enumerate(paths, start=1):
+            path_detail = next(
+                (
+                    candidate for candidate in item.get("path_details") or ()
+                    if str(candidate.get("path_text") or "") == str(path)
+                ),
+                {},
+            )
+            entry_kind = " / ".join(
+                str(value) for value in path_detail.get("entry_kind_labels") or ()
+                if str(value)
+            )
+            entrypoint_dependency = " / ".join(
+                str(value)
+                for value in path_detail.get("entrypoint_dependency_coords") or ()
+                if str(value)
+            )
             nodes = [part.strip() for part in str(path).split(" → ") if part.strip()]
             entry = nodes[0] if nodes else str(item.get("business_entry") or "")
             target = nodes[-1] if nodes else f"{item.get('api') or ''}{item.get('api_signature') or ''}"
@@ -1192,7 +1231,8 @@ def _legacy_alert_rows(items: list[dict[str, Any]]) -> list[dict[str, str]]:
                 "change_summary": str(item.get("change_summary") or ""),
                 "review_reason": str(item.get("review_reason") or item.get("user_reason") or ""),
                 "chain_summary": (
-                    f"入口：{entry}；终点：{target}；{max(len(nodes) - 1, 0)} 次调用（{len(nodes)} 个节点）"
+                    f"入口类型：{entry_kind or '业务字节码入口'}；入口：{entry}；"
+                    f"终点：{target}；{max(len(nodes) - 1, 0)} 次调用（{len(nodes)} 个节点）"
                     if path else f"未形成完整链路；目标 API：{target}"
                 ),
                 "review_focus": str(item.get("recommended_action") or ""),
@@ -1213,10 +1253,10 @@ def _legacy_alert_rows(items: list[dict[str, Any]]) -> list[dict[str, str]]:
                 "path_status": status,
                 "uncertainty_kind": str(item.get("uncertainty_kind") or ""),
                 "business_reachable": "true" if status == "reachable" else "unknown",
-                "entry_kind": "business_bytecode" if entry else "",
+                "entry_kind": entry_kind or ("业务字节码入口" if entry else ""),
                 "reach_kind": "binary_executable_path" if path else "",
                 "business_entry": entry,
-                "consumer_coord": "业务制品" if entry else "",
+                "consumer_coord": entrypoint_dependency or ("业务制品" if entry else ""),
                 "consumer_class": consumer_class,
                 "consumer_method": consumer_method,
                 "consumer_signature": entry_signature,
