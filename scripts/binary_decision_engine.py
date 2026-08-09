@@ -49,6 +49,7 @@ DEFAULT_RULES = {
     "class": ProjectionRule("class", "type"),
     "provider_topology": ProjectionRule("provider_topology", "type"),
     "class_definition": ProjectionRule("class_definition", "type"),
+    "member_resolution": ProjectionRule("member_resolution", "method"),
 }
 
 
@@ -106,6 +107,45 @@ class BinaryDecisionEngine:
         self._current_resources = self._resource_records_by_key(
             current_reconciliation.resource_selections
         )
+
+    @staticmethod
+    def _semantic_member_edges(
+        store: BinaryFactStore,
+        reconciliation: RuntimeReconciliationResult,
+    ) -> dict[tuple[Any, ...], tuple[dict[str, Any], dict[str, Any], dict[str, Any]]]:
+        members = {item["member_identity"]: item for item in store.rows("members")}
+        artifacts = {
+            item["artifact_instance_identity"]: item
+            for item in store.rows("artifact_instances")
+        }
+        resolutions = {
+            item["direct_edge_identity"]: item
+            for item in reconciliation.member_resolutions
+        }
+        output = {}
+        for edge in store.rows("direct_edges"):
+            if edge.get("edge_kind") != "method":
+                continue
+            resolution = resolutions.get(edge["direct_edge_identity"])
+            caller = members.get(edge["caller_member_identity"])
+            artifact = artifacts.get(edge["caller_artifact_instance_identity"])
+            if not resolution or not caller or not artifact:
+                continue
+            key = (
+                str(artifact.get("runtime_code_source_origin_identity") or ""),
+                str(artifact.get("runtime_path_kind") or ""),
+                str(caller.get("class_name") or ""),
+                str(caller.get("member_name") or ""),
+                str(caller.get("descriptor") or ""),
+                int(edge.get("instruction_index") or 0),
+                int(edge.get("bytecode_offset") or 0),
+                int(edge.get("opcode") or 0),
+                str(edge.get("symbolic_owner") or ""),
+                str(edge.get("symbolic_name") or ""),
+                str(edge.get("symbolic_descriptor") or ""),
+            )
+            output[key] = (edge, resolution, artifact)
+        return output
 
     @staticmethod
     def _records_by_key(records):
@@ -749,8 +789,98 @@ class BinaryDecisionEngine:
             )
         self._process_resource_outcome_deltas()
 
+    def _process_member_resolution_deltas(self) -> None:
+        base_edges = self._semantic_member_edges(self.base_store, self.base_runtime)
+        current_edges = self._semantic_member_edges(
+            self.current_store, self.current_runtime
+        )
+        for key in sorted(set(base_edges).intersection(current_edges)):
+            base_edge, base_resolution, _base_caller_artifact = base_edges[key]
+            current_edge, current_resolution, _current_caller_artifact = current_edges[key]
+            if (
+                base_resolution.get("member_resolution_status") != "resolved"
+                or current_resolution.get("member_resolution_status") != "resolved"
+            ):
+                continue
+            base_owner = str(base_resolution.get("resolved_owner") or "")
+            current_owner = str(current_resolution.get("resolved_owner") or "")
+            base_realm = str(
+                base_resolution.get("resolved_defining_loader_realm_identity") or ""
+            )
+            current_realm = str(
+                current_resolution.get("resolved_defining_loader_realm_identity") or ""
+            )
+            if (base_owner, base_realm) == (current_owner, current_realm):
+                continue
+            realm = str(
+                current_resolution.get("initiating_loader_realm_identity")
+                or base_resolution.get("initiating_loader_realm_identity")
+                or ""
+            )
+            owner = str(current_edge.get("symbolic_owner") or "")
+            scope = {
+                "initiating_loader_realm_identity": realm,
+                "class_name": owner,
+                "member_kind": "method",
+                "member_name": str(current_edge.get("symbolic_name") or ""),
+                "descriptor": str(current_edge.get("symbolic_descriptor") or ""),
+                "member_change_kind": "resolution_changed",
+                "mechanism": "member_resolution",
+            }
+            observed = observed_delta_identity(
+                delta_source_kind="member_resolution",
+                comparison_or_runtime_scope={
+                    "runtime_comparison_identity": self.runtime_comparison_identity,
+                    "initiating_loader_realm_identity": realm,
+                },
+                fact_or_mechanism_scope={
+                    **scope,
+                    "caller_origin": key[0],
+                    "caller_class": key[2],
+                    "caller_member": key[3],
+                    "caller_descriptor": key[4],
+                    "instruction_index": key[5],
+                },
+                base_fingerprint=_identity("member_resolution_outcome", {
+                    "status": "resolved", "owner": base_owner, "realm": base_realm,
+                }),
+                current_fingerprint=_identity("member_resolution_outcome", {
+                    "status": "resolved", "owner": current_owner, "realm": current_realm,
+                }),
+            )
+            base_provider = self._base_providers.get((realm, owner))
+            current_provider = self._current_providers.get((realm, owner))
+            target = self._member_target(realm, owner, scope)
+            self._decision(
+                observed_identity=observed,
+                channel="authoritative",
+                reason_code="RUNTIME_MEMBER_RESOLUTION_CHANGED",
+                fact_kind="member_resolution",
+                fact_scope=scope,
+                target_identity=target,
+                evidence={
+                    "semantic_caller_edge": {
+                        "runtime_code_source_origin_identity": key[0],
+                        "caller_class": key[2],
+                        "caller_member": key[3],
+                        "caller_descriptor": key[4],
+                        "instruction_index": key[5],
+                        "bytecode_offset": key[6],
+                    },
+                    "base_direct_edge_identity": base_edge["direct_edge_identity"],
+                    "current_direct_edge_identity": current_edge["direct_edge_identity"],
+                    "base_resolution": base_resolution,
+                    "current_resolution": current_resolution,
+                },
+                dependency_artifacts=self._dependency_artifacts(
+                    str((base_provider or {}).get("selected_artifact_instance_identity") or ""),
+                    str((current_provider or {}).get("selected_artifact_instance_identity") or ""),
+                ),
+            )
+
     def build(self) -> BinaryDecisionBundle:
         self._process_artifact_diffs()
+        self._process_member_resolution_deltas()
         self._process_runtime_outcome_deltas()
         decision_objects = []
         for record in (*self.authoritative, *self.diagnostic, *self.excluded):

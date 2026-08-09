@@ -145,6 +145,14 @@ class BinarySourceOverlayTest(unittest.TestCase):
         ambiguous = next(item for item in result.rows if item["mapping_status"] == "ambiguous")
         self.assertEqual(ambiguous["conflict"]["candidate_symbol_ids"], ["one", "two"])
 
+    def test_unqualified_java_lang_char_sequence_uses_platform_descriptor(self):
+        method = self.method(params={"value": "CharSequence"})
+
+        self.assertEqual(
+            source_method_descriptor(method),
+            "(Ljava/lang/CharSequence;)Ljava/lang/String;",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

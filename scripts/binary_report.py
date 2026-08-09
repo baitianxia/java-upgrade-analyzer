@@ -417,7 +417,7 @@ _PRODUCT_CHANGE_TYPES = {
     "descriptor_changed": "SIGNATURE_CHANGED",
     "access_changed": "ACCESS_REDUCED",
     "constant_value_changed": "CONSTANT_VALUE_CHANGED",
-    "added": "BEHAVIOR_CHANGED",
+    "added": "METHOD_ADDED",
     "implementation_changed": "BEHAVIOR_CHANGED",
     "contract_changed": "BEHAVIOR_CHANGED",
 }
@@ -442,6 +442,9 @@ def _product_change_type(decision: Mapping[str, Any]) -> str:
     base_contract = evidence.get("base_contract")
     current_contract = evidence.get("current_contract")
 
+    if fact_kind == "member_resolution":
+        return "MEMBER_RESOLUTION_CHANGED"
+
     if fact_kind == "provider_topology":
         base_status = str((evidence.get("base_provider") or {}).get("class_provider_status") or "missing")
         current_status = str((evidence.get("current_provider") or {}).get("class_provider_status") or "missing")
@@ -450,6 +453,8 @@ def _product_change_type(decision: Mapping[str, Any]) -> str:
         if base_status == "missing" and current_status == "resolved":
             return "CLASS_ADDED"
         return "BEHAVIOR_CHANGED"
+    if change_kind == "added" and fact_kind == "class":
+        return "CLASS_ADDED"
     if change_kind == "added" and fact_kind == "field":
         return "DATA_FIELD_ADDED"
     if change_kind == "removed" and fact_kind == "field":
@@ -467,7 +472,9 @@ def _product_change_type(decision: Mapping[str, Any]) -> str:
             and base_contract.get("constant") != current_contract.get("constant")
         ):
             return "CONSTANT_VALUE_CHANGED"
-        return "SIGNATURE_CHANGED"
+        if base_contract.get("descriptor") != current_contract.get("descriptor"):
+            return "SIGNATURE_CHANGED"
+        return "CONTRACT_CHANGED"
     return _PRODUCT_CHANGE_TYPES.get(change_kind, "BEHAVIOR_CHANGED")
 
 
@@ -505,6 +512,36 @@ def _artifact_coord_parts(record: Mapping[str, Any]) -> tuple[str, str, str]:
     return coord, version(base_coords), version(current_coords)
 
 
+def _resource_activation_item(result: Mapping[str, Any]) -> dict[str, Any]:
+    coord, old_version, new_version = _artifact_coord_parts(result)
+    callers = []
+    for caller in result.get("activation_callers") or ():
+        if caller.get("path_certainty") not in {"exact", "possible"}:
+            continue
+        owner = str(caller.get("caller_class_name") or "").replace("/", ".")
+        name = str(caller.get("caller_member_name") or "")
+        descriptor = str(caller.get("caller_descriptor") or "")
+        signature = (
+            jvm_method_parameter_signature(descriptor)
+            if descriptor.startswith("(") else "()"
+        )
+        callers.append({
+            **dict(caller),
+            "display_caller": f"{owner}.{name}{signature}",
+        })
+    return {
+        **dict(result),
+        "coord": coord,
+        "old_version": old_version,
+        "new_version": new_version,
+        "activation_callers": callers,
+        "business_entries": sorted({
+            item["display_caller"] for item in callers
+            if item.get("display_caller")
+        }),
+    }
+
+
 def _product_change_row(
     decision: Mapping[str, Any],
     assessment: Mapping[str, Any],
@@ -529,6 +566,20 @@ def _product_change_row(
         if member_kind in {"method", "constructor"} and descriptor.startswith("(")
         else ""
     )
+    if str(decision.get("fact_kind") or "") == "member_resolution":
+        base_resolution = evidence.get("base_resolution") or {}
+        current_resolution = evidence.get("current_resolution") or {}
+        old_value = str(base_resolution.get("resolved_owner") or base_resolution.get("member_resolution_status") or "")
+        new_value = str(current_resolution.get("resolved_owner") or current_resolution.get("member_resolution_status") or "")
+    else:
+        old_value = json.dumps(
+            evidence.get("base_contract") or evidence.get("base_member_fingerprint") or "",
+            ensure_ascii=False, sort_keys=True,
+        )
+        new_value = json.dumps(
+            evidence.get("current_contract") or evidence.get("current_member_fingerprint") or "",
+            ensure_ascii=False, sort_keys=True,
+        )
     return {
         "conclusion": "二进制运行时有效变化",
         "change_summary": f"{change_label}：{api_name}{descriptor}",
@@ -553,14 +604,8 @@ def _product_change_row(
         "reason_code": str(decision.get("reason_code") or ""),
         "data_contract_evidence": "",
         "evidence_path": evidence_path,
-        "old_value": json.dumps(
-            evidence.get("base_contract") or evidence.get("base_member_fingerprint") or "",
-            ensure_ascii=False, sort_keys=True,
-        ),
-        "new_value": json.dumps(
-            evidence.get("current_contract") or evidence.get("current_member_fingerprint") or "",
-            ensure_ascii=False, sort_keys=True,
-        ),
+        "old_value": old_value,
+        "new_value": new_value,
         "field_descriptor": descriptor if member_kind == "field" else "",
         "old_field_has_constant_value": "",
         "constant_field_evidence_json": "",
@@ -1120,6 +1165,8 @@ def _legacy_result_item(
         "key_evidence": paths[0] if paths else "",
         "business_entry": business_entry,
         "change_summary": str(change.get("change_summary") or ""),
+        "old_value": str(change.get("old_value") or ""),
+        "new_value": str(change.get("new_value") or ""),
         "review_reason": str(change.get("review_reason") or user_reason),
     }
 
@@ -1244,6 +1291,10 @@ def publish_step5(
     source_usage = _source_usage_view(loaded)
     by_api = list(loaded["formal"].get("by_api") or ())
     raw_items = [_result_item(item) for item in by_api]
+    all_resource_items = [
+        _resource_activation_item(item)
+        for item in loaded["formal"].get("resource_activation_results") or ()
+    ]
     _change_rows, change_lookup = _change_rows_by_result(report_dir)
     projection_assessments = {
         str(item.get("decision_identity") or ""): item
@@ -1319,6 +1370,10 @@ def publish_step5(
         })
     else:
         included_dependency_coords = list(all_dependency_coords)
+    resource_items = [
+        item for item in all_resource_items
+        if item["coord"] in included_dependency_coords
+    ]
     excluded_dependency_coords = sorted(
         set(all_dependency_coords) - set(included_dependency_coords)
     )
@@ -1359,6 +1414,7 @@ def publish_step5(
         "uncertain_apis": by_state["uncertain"],
         "not_found_apis": by_state["not_found_in_static_analysis"],
         "not_analyzed_apis": by_state["not_analyzed"],
+        "resource_activation_results": resource_items,
         "meta": {
             "generated_at": datetime.now().isoformat(timespec="seconds"),
             "total_apis": len(items),
@@ -1444,6 +1500,18 @@ def publish_step5(
             })
             counts["total"] += 1
             counts[str(item["analysis_status"])] += 1
+        for item in resource_items:
+            counts = dependency_counts.setdefault(item["coord"], {
+                "total": 0,
+                "reachable": 0,
+                "uncertain": 0,
+                "not_found_in_static_analysis": 0,
+                "not_analyzed": 0,
+            })
+            counts.setdefault("resource_activation_reachable", 0)
+            counts["resource_activation_reachable"] += int(
+                item.get("activation_status") == "reachable"
+            )
         lines = [
             "# 系统触达证据", "",
             "本报告按引起变化的依赖包汇总。完整筛选表见 `alerts.csv`，逐 API 证据见 `by_api/`。", "",
@@ -1456,13 +1524,39 @@ def publish_step5(
             f"- 源码映射：{source_usage['mapped_count']} 个，覆盖状态 `{source_usage['coverage_status']}`", "",
             source_usage["effect"], "",
             "`not_found_in_static_analysis` 不是已确认无影响；静态可执行路径也不等于已完成运行时验证。", "",
-            "## 按依赖汇总", "",
-            "| 依赖包 | API 数 | 已发现路径 | 不确定 | 未发现路径 | 未分析 |",
-            "|---|---:|---:|---:|---:|---:|",
+            "## 运行时资源激活", "",
         ]
+        if resource_items:
+            lines.extend((
+                "| 依赖包 | 资源 | 激活状态 | 当前系统入口 |",
+                "|---|---|---|---|",
+            ))
+            for item in resource_items:
+                entries = "<br>".join(
+                    f"`{entry}`" for entry in item.get("business_entries") or ()
+                ) or "-"
+                status_label = {
+                    "reachable": "已确认当前系统激活",
+                    "uncertain": "存在候选激活关系",
+                    "not_found_in_static_analysis": "未发现静态激活关系",
+                    "not_analyzed": "未完成激活分析",
+                }.get(str(item.get("activation_status") or ""), "未知")
+                lines.append(
+                    f"| `{item['coord']}` | `{item['resource_name']}` | "
+                    f"{status_label} | {entries} |"
+                )
+        else:
+            lines.append("本轮没有可展示的运行时资源变化激活结果。")
+        lines.extend([
+            "",
+            "## 按依赖汇总", "",
+            "| 依赖包 | API 数 | 已发现路径 | 资源激活 | 不确定 | 未发现路径 | 未分析 |",
+            "|---|---:|---:|---:|---:|---:|---:|",
+        ])
         for coord, counts in sorted(dependency_counts.items()):
             lines.append(
                 f"| `{coord}` | {counts['total']} | {counts['reachable']} | "
+                f"{counts.get('resource_activation_reachable', 0)} | "
                 f"{counts['uncertain']} | {counts['not_found_in_static_analysis']} | "
                 f"{counts['not_analyzed']} |"
             )
@@ -1548,6 +1642,10 @@ def publish_step6(
         loaded["manifest"]["analysis_context_identity"]
     )
     findings["source_usage"] = _source_usage_view(loaded)
+    findings["resource_impacts"] = [
+        _resource_activation_item(item)
+        for item in loaded["formal"].get("resource_activation_results") or ()
+    ]
     findings["binary_dimensions"] = {
         "reachability_status": {
             state: sum(

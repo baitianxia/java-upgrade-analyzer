@@ -33,6 +33,7 @@ class BinaryTraceBundle:
     coverage_gaps: tuple[str, ...]
     identity: str
     graph_stats: Mapping[str, Any] | None = None
+    resource_activation_results: tuple[dict[str, Any], ...] = ()
 
 
 class BinaryTraceEngine:
@@ -354,6 +355,13 @@ class BinaryTraceEngine:
 
     def _target_nodes(self, decision: Mapping[str, Any]) -> tuple[str, ...]:
         scope = decision.get("fact_scope") or {}
+        if decision.get("fact_kind") == "member_resolution":
+            current_resolution = (decision.get("evidence") or {}).get(
+                "current_resolution"
+            ) or {}
+            resolved = str(current_resolution.get("resolved_member_identity") or "")
+            if resolved:
+                return (resolved,)
         realm = str(scope.get("initiating_loader_realm_identity") or "")
         owner = str(scope.get("class_name") or "").replace(".", "/")
         kind = str(scope.get("member_kind") or "class")
@@ -555,6 +563,111 @@ class BinaryTraceEngine:
         )
         return payload
 
+    def _service_activation_results(self) -> list[dict[str, Any]]:
+        results = []
+        edges_by_caller: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for edge in self.edges.values():
+            edges_by_caller[edge["caller_member_identity"]].append(edge)
+        for rows in edges_by_caller.values():
+            rows.sort(key=lambda item: (
+                int(item.get("instruction_index") or 0),
+                str(item.get("edge_kind") or ""),
+            ))
+
+        for decision in self.decisions.authoritative_decisions:
+            if decision.get("fact_kind") != "resource":
+                continue
+            scope = decision.get("fact_scope") or {}
+            resource_name = str(scope.get("resource_name") or "")
+            prefix = "META-INF/services/"
+            if not resource_name.startswith(prefix):
+                continue
+            service_owner = resource_name[len(prefix):].replace(".", "/")
+            candidates = []
+            for caller_identity, rows in edges_by_caller.items():
+                literals = [
+                    edge for edge in rows
+                    if edge.get("edge_kind") == "type"
+                    and edge.get("symbolic_owner") == service_owner
+                    and (_loads(edge.get("edge_json") or "{}").get("type_use_kind") == "class_literal")
+                ]
+                loads = [
+                    edge for edge in rows
+                    if edge.get("edge_kind") == "method"
+                    and edge.get("symbolic_owner") == "java/util/ServiceLoader"
+                    and edge.get("symbolic_name") == "load"
+                    and str(edge.get("symbolic_descriptor") or "").startswith("(Ljava/lang/Class;")
+                ]
+                for literal in literals:
+                    load = next((
+                        edge for edge in loads
+                        if 0 <= int(edge.get("instruction_index") or 0)
+                        - int(literal.get("instruction_index") or 0) <= 2
+                    ), None)
+                    if load is None:
+                        continue
+                    if caller_identity in self.exact_reachable_nodes:
+                        certainty = "exact"
+                    elif caller_identity in self.possible_reachable_nodes:
+                        certainty = "possible"
+                    else:
+                        certainty = "not_reached"
+                    caller = self.members.get(caller_identity) or {}
+                    paths, path_gaps = self._trace((caller_identity,))
+                    candidates.append({
+                        "caller_member_identity": caller_identity,
+                        "caller_class_name": str(caller.get("class_name") or ""),
+                        "caller_member_name": str(caller.get("member_name") or ""),
+                        "caller_descriptor": str(caller.get("descriptor") or ""),
+                        "path_certainty": certainty,
+                        "class_literal_edge_identity": literal["direct_edge_identity"],
+                        "service_loader_edge_identity": load["direct_edge_identity"],
+                        "paths": paths,
+                        "trace_coverage_gaps": path_gaps,
+                    })
+            exact = [item for item in candidates if item["path_certainty"] == "exact"]
+            possible = [item for item in candidates if item["path_certainty"] == "possible"]
+            gaps = sorted(set(
+                self.entrypoint_gaps
+                + self.runtime.coverage_gaps
+                + tuple(
+                    gap for item in candidates
+                    for gap in item.get("trace_coverage_gaps") or ()
+                )
+            ))
+            if exact:
+                status = "reachable"
+            elif possible:
+                status = "uncertain"
+            elif gaps:
+                status = "not_analyzed"
+            else:
+                status = "not_found_in_static_analysis"
+            payload = {
+                "decision_identity": decision["decision_identity"],
+                "change_fact_identity": decision.get("change_fact_identity", ""),
+                "resource_name": resource_name,
+                "resource_mechanism": str(scope.get("resource_mechanism") or ""),
+                "service_type": service_owner,
+                "activation_status": status,
+                "path_set_complete": not gaps,
+                "activation_callers": candidates,
+                "trace_coverage_gaps": gaps,
+                "dependency_artifacts": list(decision.get("dependency_artifacts") or ()),
+                "reason_code": (
+                    "SERVICE_RESOURCE_CHANGE_REACHABLE"
+                    if status == "reachable"
+                    else "SERVICE_RESOURCE_ACTIVATION_" + status.upper()
+                ),
+            }
+            payload["resource_activation_result_identity"] = _identity(
+                "binary_resource_activation_result_identity", payload
+            )
+            results.append(payload)
+        return sorted(results, key=lambda item: (
+            item["resource_name"], item["decision_identity"]
+        ))
+
     def build(self) -> BinaryTraceBundle:
         formal = []
         for projection in self.decisions.formal_projections:
@@ -582,10 +695,14 @@ class BinaryTraceEngine:
                     assessment_identity="",
                     diagnostic=True,
                 ))
+        resource_results = self._service_activation_results()
         all_results = [*formal, *candidate]
         digest = _identity("binary_trace_result_set_digest", {
             "formal_result_identities": [item["trace_result_identity"] for item in formal],
             "candidate_result_identities": [item["trace_result_identity"] for item in candidate],
+            "resource_activation_result_identities": [
+                item["resource_activation_result_identity"] for item in resource_results
+            ],
         })
         gaps = tuple(sorted(set(
             self.entrypoint_gaps
@@ -610,6 +727,7 @@ class BinaryTraceEngine:
             coverage_gaps=gaps,
             identity=identity,
             graph_stats=self.graph_stats,
+            resource_activation_results=tuple(resource_results),
         )
 
 

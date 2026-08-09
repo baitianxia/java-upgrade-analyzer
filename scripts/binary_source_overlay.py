@@ -75,7 +75,7 @@ def _source_type_descriptor(raw: str, method: Any, *, allow_void: bool = False) 
         elif value in imports:
             value = str(imports[value])
         elif value in {
-            "String", "Object", "Class", "Throwable", "Exception", "RuntimeException",
+            "String", "CharSequence", "Object", "Class", "Throwable", "Exception", "RuntimeException",
             "Boolean", "Byte", "Character", "Short", "Integer", "Long", "Float", "Double",
             "Void", "Iterable", "Record", "Enum",
         }:

@@ -1650,6 +1650,8 @@ def _human_change_type(change_type, symbol_kind=''):
         'METHOD_CHANGED': '修改方法',
         'FIELD_CHANGED': '修改字段',
         'BEHAVIOR_CHANGED': '行为变化',
+        'CONTRACT_CHANGED': 'API 契约变化',
+        'MEMBER_RESOLUTION_CHANGED': '方法解析目标变化',
         'CONSTANT_VALUE_CHANGED': '常量值变化',
         'DATA_FIELD_ADDED': 'DTO 字段新增',
         'DATA_FIELD_REMOVED': 'DTO 字段删除',
@@ -1683,6 +1685,11 @@ def _change_summary(item, severity=''):
         pieces.append(f"字段类型：{item.get('new_value')}")
     elif str(item.get('change_type') or '').upper() == 'DATA_FIELD_REMOVED' and item.get('old_value'):
         pieces.append(f"原字段类型：{item.get('old_value')}")
+    elif str(item.get('change_type') or '').upper() == 'MEMBER_RESOLUTION_CHANGED':
+        old_value = str(item.get('old_value') or '').replace('/', '.')
+        new_value = str(item.get('new_value') or '').replace('/', '.')
+        if old_value or new_value:
+            pieces.append(f"解析目标：{old_value or '-'} → {new_value or '-'}")
     elif str(item.get('change_type') or '').upper() == 'DATA_FIELD_TYPE_CHANGED':
         old_value = str(item.get('old_value') or '').strip() or '未知'
         new_value = str(item.get('new_value') or '').strip() or '未知'
@@ -3988,6 +3995,8 @@ def collect_findings(d):
                 'api_signature': api_info.get('api_signature', ''),
                 'symbol_kind':   api_info.get('symbol_kind', ''),
                 'change_type':   api_info.get('change_type', ''),
+                'old_value':     api_info.get('old_value', ''),
+                'new_value':     api_info.get('new_value', ''),
                 'call_paths':    api_info.get('call_paths', []),
                 'reason_code': canonical_reason_code(
                     api_info.get('reason_code') or 'UNKNOWN'
@@ -7518,6 +7527,11 @@ def build_human_dependency_analysis(findings, api_model=None):
             api_by_coord[coord].append(row)
         else:
             unassigned_api_rows.append(row)
+    resource_by_coord = defaultdict(list)
+    for item in findings.get("resource_impacts") or []:
+        coord = _canonical_identity_coord(item.get("coord"))
+        if coord:
+            resource_by_coord[coord].append(dict(item))
 
     raw_dependency_inventory = list(
         findings.get("dependency_changes") or []
@@ -7584,6 +7598,17 @@ def build_human_dependency_analysis(findings, api_model=None):
             }
             if not target.get(field) and len(values) == 1:
                 target[field] = next(iter(values))
+    for coord, rows in resource_by_coord.items():
+        if raw_dependency_inventory and coord not in dependencies:
+            continue
+        target = dependencies.setdefault(coord, {"coord": coord})
+        for field in ("old_version", "new_version"):
+            values = {
+                str(row.get(field) or "").strip()
+                for row in rows if str(row.get(field) or "").strip()
+            }
+            if not target.get(field) and len(values) == 1:
+                target[field] = next(iter(values))
 
     # When exactly one changed dependency is known, changed APIs without a
     # recorded dependency identity can still be assigned to that sole
@@ -7607,6 +7632,7 @@ def build_human_dependency_analysis(findings, api_model=None):
     result_rows = []
     for coord, dependency in dependencies.items():
         api_rows = api_by_coord.get(coord, [])
+        resource_rows = resource_by_coord.get(coord, [])
         api_total = sum(int(row.get("aggregate_count") or 1) for row in api_rows)
         api_completed = sum(
             int(row.get("aggregate_count") or 1)
@@ -7618,6 +7644,10 @@ def build_human_dependency_analysis(findings, api_model=None):
         api_population_unconfirmed = bool(
             api_model.get("population_unconfirmed")
         )
+        resource_incomplete = any(
+            item.get("activation_status") in {"uncertain", "not_analyzed"}
+            for item in resource_rows
+        )
         dependency_record_conflict = (
             coord in conflicting_dependency_identities
         )
@@ -7627,6 +7657,7 @@ def build_human_dependency_analysis(findings, api_model=None):
             or unassigned_api_count > 0
             or api_population_unconfirmed
             or dependency_record_conflict
+            or resource_incomplete
         )
         confirmed_api_count = sum(
             int(row.get("aggregate_count") or 1)
@@ -7639,6 +7670,15 @@ def build_human_dependency_analysis(findings, api_model=None):
             for row in api_rows
             if not _api_result_is_incomplete(row)
             and row.get("conclusion") == "已确认影响"
+        )
+        confirmed_resource_rows = [
+            item for item in resource_rows
+            if item.get("activation_status") == "reachable"
+        ]
+        confirmed_resource_count = len(confirmed_resource_rows)
+        confirmed_resource_relationships = sum(
+            max(len(item.get("activation_callers") or ()), 1)
+            for item in confirmed_resource_rows
         )
         call_relationships = sum(
             _api_call_relationship_count(row)
@@ -7662,10 +7702,10 @@ def build_human_dependency_analysis(findings, api_model=None):
         if incomplete:
             conclusion = (
                 "部分结果确认有影响；分析未完成"
-                if confirmed_api_count
+                if confirmed_api_count or confirmed_resource_count
                 else "未完成分析"
             )
-        elif confirmed_api_count:
+        elif confirmed_api_count or confirmed_resource_count:
             conclusion = "确认有影响"
         elif api_rows and all(
             row.get("conclusion") == "已确认不受影响"
@@ -7683,6 +7723,14 @@ def build_human_dependency_analysis(findings, api_model=None):
             if excluded or api_incomplete > 0
             else ""
         )
+        if resource_incomplete:
+            resource_reason = (
+                "运行时资源变化的当前系统激活关系存在候选或未完成证据。"
+            )
+            incomplete_reason = (
+                f"{incomplete_reason.rstrip('。')}；{resource_reason}"
+                if incomplete_reason else resource_reason
+            )
         if unassigned_api_count:
             unassigned_reason = (
                 f"{unassigned_api_count} 个变化 API 的依赖归属没有记录，"
@@ -7715,6 +7763,15 @@ def build_human_dependency_analysis(findings, api_model=None):
                 else conflict_reason
             )
         api_change_text = _dependency_api_change_text(api_rows)
+        if resource_rows:
+            resource_text = (
+                f"运行时资源变化 {len(resource_rows)} 个，"
+                f"已确认当前系统激活 {confirmed_resource_count} 个"
+            )
+            api_change_text = (
+                f"{api_change_text}；{resource_text}"
+                if api_change_text else resource_text
+            )
         if unassigned_api_count:
             api_change_text += (
                 f"；另有 {unassigned_api_count} 个变化 API "
@@ -7737,13 +7794,25 @@ def build_human_dependency_analysis(findings, api_model=None):
                 else dependency.get("change_type", "")
             ),
             "api_rows": api_rows,
+            "resource_rows": resource_rows,
+            "resource_total": len(resource_rows),
+            "resource_completed": sum(
+                item.get("activation_status") not in {"uncertain", "not_analyzed"}
+                for item in resource_rows
+            ),
+            "confirmed_resource_count": confirmed_resource_count,
+            "confirmed_resource_relationship_count": confirmed_resource_relationships,
             "api_total": api_total,
             "api_completed": api_completed,
             "api_incomplete": api_incomplete,
             "analysis_complete": not incomplete,
             "confirmed_api_count": confirmed_api_count,
-            "confirmed_relationship_count": confirmed_relationships,
-            "call_relationship_count": call_relationships,
+            "confirmed_relationship_count": (
+                confirmed_relationships + confirmed_resource_relationships
+            ),
+            "call_relationship_count": (
+                call_relationships + confirmed_resource_relationships
+            ),
             "call_relationship_api_count": call_relationship_api_count,
             "top_uncertain_priority_score": max(
                 uncertain_priority_scores, default=0
@@ -7753,7 +7822,14 @@ def build_human_dependency_analysis(findings, api_model=None):
             ),
             "unassigned_api_count": unassigned_api_count,
             "analysis_conclusion": conclusion,
-            "conclusion_basis": _dependency_basis(api_rows),
+            "conclusion_basis": (
+                (
+                    f"{confirmed_resource_count}/{len(resource_rows)} 个运行时资源变化"
+                    f"已由当前系统的 ServiceLoader 激活关系确认，"
+                    f"共 {confirmed_resource_relationships} 条激活关系。"
+                )
+                if confirmed_resource_count else _dependency_basis(api_rows)
+            ),
             "incomplete_reason": incomplete_reason,
             "api_change_text": api_change_text,
             "aggregate_count": 1,
@@ -7932,7 +8008,10 @@ def build_human_dependency_analysis(findings, api_model=None):
     confirmed_any_count = sum(
         int(row.get("aggregate_count") or 1)
         for row in result_rows
-        if int(row.get("confirmed_api_count") or 0) > 0
+        if (
+            int(row.get("confirmed_api_count") or 0) > 0
+            or int(row.get("confirmed_resource_count") or 0) > 0
+        )
     )
     confirmed_incomplete_count = sum(
         int(row.get("aggregate_count") or 1)
@@ -7989,9 +8068,14 @@ def _dependency_result_explanation(row):
 
 
 def _dependency_detail_table(rows, include_link=False):
+    has_resource = any(int(row.get("resource_total") or 0) for row in rows)
     headers = (
         "| 依赖 | 版本变化 | API 分析（已完成/总数） | "
-        "当前系统调用关系 | 分析结果 | 结果说明 |"
+        + (
+            "当前系统调用/激活关系 | 分析结果 | 结果说明 |"
+            if has_resource
+            else "当前系统调用关系 | 分析结果 | 结果说明 |"
+        )
     )
     divider = "|---|---|---:|---|---|---|"
     lines = [headers, divider]
@@ -8006,6 +8090,12 @@ def _dependency_detail_table(rows, include_link=False):
             f"{api_completed}/{api_total}<br>"
             f"{_md_cell(row.get('api_change_text'), 140)}"
         )
+        resource_total = int(row.get("resource_total") or 0)
+        if resource_total:
+            api_analysis += (
+                f"<br>运行时资源 "
+                f"{int(row.get('resource_completed') or 0)}/{resource_total}"
+            )
         if include_link:
             links = []
             if api_completed:
@@ -8048,6 +8138,13 @@ def _dependency_current_calls_cell(row):
         or row.get("confirmed_relationship_count")
         or 0
     )
+    resource_count = int(row.get("confirmed_resource_count") or 0)
+    if resource_count:
+        api_text = f"{api_count} 个变化 API；" if api_count else ""
+        return (
+            f"{api_text}{resource_count} 个运行时资源<br>"
+            f"{relationships} 条调用/激活关系"
+        )
     if api_count and not relationships:
         return f"{api_count} 个变化 API<br>调用关系数量未记录"
     if not relationships:
@@ -8201,11 +8298,21 @@ def render_dependency_conclusions(findings, dependency_model=None):
         findings
     )
     confirmed_any = dependency_model["confirmed_any_count"]
+    confirmed_resource_any = any(
+        int(row.get("confirmed_resource_count") or 0) > 0
+        for row in dependency_model.get("rows") or ()
+    )
     if confirmed_any:
-        headline = (
-            f"{confirmed_any} 个变化依赖已确认存在当前系统调用关系；"
-            "这些调用目标在新版本中发生了变化。"
-        )
+        if confirmed_resource_any:
+            headline = (
+                f"{confirmed_any} 个变化依赖已确认存在当前系统调用或资源激活关系；"
+                "这些调用目标或运行时资源在新版本中发生了变化。"
+            )
+        else:
+            headline = (
+                f"{confirmed_any} 个变化依赖已确认存在当前系统调用关系；"
+                "这些调用目标在新版本中发生了变化。"
+            )
     else:
         headline = "本轮没有变化依赖形成“确认对当前系统有影响”的结论。"
     lines = [
@@ -8488,6 +8595,35 @@ def render_api_and_calls(findings, api_model=None):
         ),
         "",
     ]
+    resource_impacts = list(findings.get("resource_impacts") or [])
+    if resource_impacts:
+        lines.extend([
+            "### 运行时资源变化及激活关系",
+            "",
+            "资源变化不是 API，单独列示，不计入变化 API 数。",
+            "",
+            "| 依赖 | 版本变化 | 运行时资源 | 激活结论 | 当前系统入口 |",
+            "|---|---|---|---|---|",
+        ])
+        for item in resource_impacts:
+            version = _version_transition(item) or "版本变化未记录"
+            status = {
+                "reachable": "已确认当前系统激活",
+                "uncertain": "存在候选激活关系",
+                "not_found_in_static_analysis": "未发现静态激活关系",
+                "not_analyzed": "未完成激活分析",
+            }.get(str(item.get("activation_status") or ""), "未知")
+            entries = "<br>".join(
+                f"`{_md_cell(entry, 240)}`"
+                for entry in item.get("business_entries") or ()
+            ) or "-"
+            lines.append(
+                f"| `{_md_cell(item.get('coord'), 180)}` | "
+                f"{_md_cell(version, 120)} | "
+                f"`{_md_cell(item.get('resource_name'), 260)}` | "
+                f"{status} | {entries} |"
+            )
+        lines.append("")
     if api_model.get("count_note"):
         lines.extend([
             api_model["count_note"],

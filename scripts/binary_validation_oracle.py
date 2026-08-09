@@ -990,6 +990,169 @@ def _validate_pairings(
     return issues, {"pairings": expected}
 
 
+def _validate_cross_version_semantics(
+    generation: Path,
+    config: Mapping[str, Any],
+    truth_parts: Mapping[str, Any],
+    observations_by_side: Mapping[str, Mapping[str, Mapping[str, Any]]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    issues = []
+    base_edges = {tuple(item) for item in truth_parts["base"]["direct_edges"]}
+    current_edges = {tuple(item) for item in truth_parts["current"]["direct_edges"]}
+    expected_resolution_changes = set()
+    for edge in sorted(base_edges.intersection(current_edges)):
+        (
+            caller_owner, caller_name, caller_descriptor,
+            target_owner, target_name, target_descriptor,
+            opcode, bytecode_offset,
+        ) = edge
+        if not str(opcode).startswith("invoke"):
+            continue
+        base_target = _resolve_member(
+            observations_by_side["base"], str(target_owner).replace(".", "/"),
+            "method", target_name, target_descriptor,
+        )
+        current_target = _resolve_member(
+            observations_by_side["current"], str(target_owner).replace(".", "/"),
+            "method", target_name, target_descriptor,
+        )
+        if not base_target or not current_target or base_target[0] == current_target[0]:
+            continue
+        expected_resolution_changes.add((
+            str(caller_owner), str(caller_name), str(caller_descriptor),
+            int(bytecode_offset), str(target_owner), str(target_name),
+            str(target_descriptor), base_target[0].replace("/", "."),
+            current_target[0].replace("/", "."),
+        ))
+
+    decisions = _load_json(generation / "binary_decisions.json")
+    actual_resolution_changes = set()
+    for decision in decisions.get("authoritative_change_facts") or ():
+        if decision.get("reason_code") != "RUNTIME_MEMBER_RESOLUTION_CHANGED":
+            continue
+        scope = decision.get("fact_scope") or {}
+        evidence = decision.get("evidence") or {}
+        caller = evidence.get("semantic_caller_edge") or {}
+        actual_resolution_changes.add((
+            str(caller.get("caller_class") or "").replace("/", "."),
+            str(caller.get("caller_member") or ""),
+            str(caller.get("caller_descriptor") or ""),
+            int(caller.get("bytecode_offset") or 0),
+            str(scope.get("class_name") or "").replace("/", "."),
+            str(scope.get("member_name") or ""),
+            str(scope.get("descriptor") or ""),
+            str((evidence.get("base_resolution") or {}).get("resolved_owner") or "").replace("/", "."),
+            str((evidence.get("current_resolution") or {}).get("resolved_owner") or "").replace("/", "."),
+        ))
+    for missing in sorted(expected_resolution_changes - actual_resolution_changes):
+        issues.append(_validation_issue(
+            "cross_version_member_resolution",
+            "ORACLE_MEMBER_RESOLUTION_CHANGE_MISSING",
+            change=missing,
+        ))
+    for extra in sorted(actual_resolution_changes - expected_resolution_changes):
+        issues.append(_validation_issue(
+            "cross_version_member_resolution",
+            "ORACLE_MEMBER_RESOLUTION_CHANGE_EXTRA",
+            change=extra,
+        ))
+
+    current_graph = defaultdict(set)
+    for edge in current_edges:
+        caller = (str(edge[0]), str(edge[1]), str(edge[2]))
+        if not str(edge[6]).startswith("("):
+            continue
+        target = _resolve_member(
+            observations_by_side["current"], str(edge[3]).replace(".", "/"),
+            "method", edge[4], edge[5],
+        )
+        if target:
+            current_graph[caller].add((
+                target[0].replace("/", "."), str(target[1][1]), str(target[1][2])
+            ))
+    entrypoints = {
+        (
+            str(item.get("class_name") or "").replace("/", "."),
+            str(item.get("member_name") or ""),
+            str(item.get("descriptor") or ""),
+        )
+        for item in (
+            ((config.get("current") or {}).get("runtime_profile") or {})
+            .get("business_entrypoint_profile", {}).get("methods") or ()
+        )
+    }
+    reached = set(entrypoints)
+    pending = list(entrypoints)
+    while pending:
+        caller = pending.pop()
+        for target in current_graph.get(caller, ()):
+            if target not in reached:
+                reached.add(target)
+                pending.append(target)
+
+    base_resources = {
+        (item["realm"], item["name"], item["mechanism"]): item["selected"]
+        for item in truth_parts["base"]["resource_selections"]
+    }
+    current_resources = {
+        (item["realm"], item["name"], item["mechanism"]): item["selected"]
+        for item in truth_parts["current"]["resource_selections"]
+    }
+    current_type_edges = {
+        tuple(item) for item in truth_parts["current"]["type_edges"]
+    }
+    expected_resource_status = {}
+    for key in sorted(set(base_resources).intersection(current_resources)):
+        realm, name, _mechanism = key
+        if not name.startswith("META-INF/services/"):
+            continue
+        if base_resources[key] == current_resources[key]:
+            continue
+        service = name.removeprefix("META-INF/services/")
+        load_callers = {
+            (str(edge[0]), str(edge[1]), str(edge[2])): int(edge[7])
+            for edge in current_edges
+            if str(edge[3]) == "java.util.ServiceLoader"
+            and str(edge[4]) == "load"
+            and str(edge[5]).startswith("(Ljava/lang/Class;")
+        }
+        activated = False
+        for literal in current_type_edges:
+            caller = (
+                str(literal[0]).replace("/", "."),
+                str(literal[1]), str(literal[2]),
+            )
+            literal_owner = str(literal[4]).replace("/", ".")
+            if (
+                literal_owner == service
+                and literal[5] == "class_literal"
+                and caller in load_callers
+                and 0 <= load_callers[caller] - int(literal[3]) <= 4
+                and caller in reached
+            ):
+                activated = True
+                break
+        expected_resource_status[name] = (
+            "reachable" if activated else "not_found_in_static_analysis"
+        )
+    formal = _load_json(generation / "binary_formal_results.json")
+    actual_resource_status = {
+        str(item.get("resource_name") or ""): str(item.get("activation_status") or "")
+        for item in formal.get("resource_activation_results") or ()
+    }
+    if actual_resource_status != expected_resource_status:
+        issues.append(_validation_issue(
+            "resource_activation",
+            "ORACLE_RESOURCE_ACTIVATION_MISMATCH",
+            expected=expected_resource_status,
+            actual=actual_resource_status,
+        ))
+    return issues, {
+        "member_resolution_changes": sorted(expected_resolution_changes),
+        "resource_activation_status": dict(sorted(expected_resource_status.items())),
+    }
+
+
 def validate_generation(
     config: Mapping[str, Any], generation_directory: str | Path,
 ) -> dict[str, Any]:
@@ -1035,6 +1198,7 @@ def validate_generation(
     truth_parts.update(pairing_truth)
 
     helper_identities = {}
+    observations_by_side = {}
     for side_name, side, artifacts, inventories, db_name, jdk_home in (
         ("base", base_side, base_artifacts, base_inventories, "base_binary_facts.sqlite", base_jdk),
         ("current", current_side, current_artifacts, current_inventories, "current_binary_facts.sqlite", current_jdk),
@@ -1060,6 +1224,7 @@ def validate_generation(
                 jdk_home, artifacts, independent_classes
             )
             helper_identities[side_name] = helper_identity
+            observations_by_side[side_name] = observations
             topology = (side.get("runtime_profile") or {}).get("loader_topology") or {}
             realms = {
                 str(item.get("identity")) for item in topology.get("realms") or ()
@@ -1092,6 +1257,12 @@ def validate_generation(
             }
         finally:
             connection.close()
+
+    cross_issues, cross_truth = _validate_cross_version_semantics(
+        generation, config, truth_parts, observations_by_side
+    )
+    issues.extend(cross_issues)
+    truth_parts["cross_version_semantics"] = cross_truth
 
     truth_set_identity = _identity("binary_oracle_truth_set_identity", truth_parts)
     support = _load_json(SUPPORT_MANIFEST)

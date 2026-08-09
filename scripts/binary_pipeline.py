@@ -8,8 +8,14 @@ from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
+import sys
 import time
 from typing import Any, Mapping
+
+try:
+    import resource
+except ImportError:  # pragma: no cover - Windows does not provide resource.
+    resource = None
 
 from binary_artifact_diff import ArtifactSnapshot, compare_artifact_snapshots, snapshot_archive
 from binary_decision_engine import BinaryDecisionEngine, DEFAULT_RULES
@@ -70,6 +76,14 @@ def _sha256_file(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _peak_rss_bytes() -> int:
+    """Return this analyzer process' peak resident set size."""
+    if resource is None:
+        return 0
+    value = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss or 0)
+    return value if sys.platform == "darwin" else value * 1024
 
 
 def _load_json(path: str | Path) -> dict[str, Any]:
@@ -1032,6 +1046,7 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                 encoding="utf-8",
             )
             total_elapsed_seconds = round(time.perf_counter() - pipeline_started, 6)
+            peak_rss_bytes = _peak_rss_bytes()
             phase_timings_path = observability / "latest_phase_timings.json"
             phase_timings_path.write_text(
                 json.dumps(
@@ -1041,6 +1056,8 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                             "result_generation_identity"
                         ],
                         "total_elapsed_seconds": total_elapsed_seconds,
+                        "peak_rss_bytes": peak_rss_bytes,
+                        "peak_rss_scope": "current_process",
                         "phases": phase_timings,
                         "non_authoritative_observability": True,
                     },
@@ -1073,6 +1090,8 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                 "phase_timings": phase_timings,
                 "phase_timings_path": str(phase_timings_path),
                 "total_elapsed_seconds": total_elapsed_seconds,
+                "peak_rss_bytes": peak_rss_bytes,
+                "peak_rss_scope": "current_process",
             }
         finally:
             base_store.close()

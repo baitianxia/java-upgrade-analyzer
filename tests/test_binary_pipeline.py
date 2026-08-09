@@ -212,6 +212,9 @@ class BinaryPipelineTest(unittest.TestCase):
         ))
         timings = json.loads(Path(first["phase_timings_path"]).read_text())
         self.assertTrue(timings["non_authoritative_observability"])
+        self.assertGreater(timings["peak_rss_bytes"], 0)
+        self.assertEqual(timings["peak_rss_scope"], "current_process")
+        self.assertEqual(second["peak_rss_bytes"], timings["peak_rss_bytes"])
         self.assertEqual(
             timings["result_generation_identity"],
             first["result_generation_identity"],
@@ -379,6 +382,207 @@ class BinaryPipelineTest(unittest.TestCase):
         ))
         with self.assertRaises(BinaryReportError):
             load_validated_generation(report)
+
+    def test_inherited_resolution_and_service_activation_are_human_visible(self):
+        def compile_dependency(side, parent, provider, value):
+            source_root = self.root / side / "dependency-src"
+            sources = {
+                "demo/hierarchy/ParentA.java": (
+                    "package demo.hierarchy; public class ParentA { "
+                    "public int value(){ return 1; } }"
+                ),
+                "demo/hierarchy/ParentB.java": (
+                    "package demo.hierarchy; public class ParentB { "
+                    f"public int value(){{ return {value}; }} }}"
+                ),
+                "demo/hierarchy/Child.java": (
+                    "package demo.hierarchy; public class Child extends "
+                    f"{parent} {{ }}"
+                ),
+                "demo/spi/Service.java": (
+                    "package demo.spi; public interface Service { String run(); }"
+                ),
+                f"demo/spi/{provider}.java": (
+                    "package demo.spi; public class "
+                    f"{provider} implements Service {{ public String run(){{ "
+                    f"return \"{provider}\"; }} }}"
+                ),
+            }
+            source_paths = []
+            for relative, content in sources.items():
+                path = source_root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+                source_paths.append(path)
+            classes = self.root / side / "dependency-classes"
+            classes.mkdir(parents=True)
+            completed = subprocess.run(
+                ["javac", "-g", "-d", str(classes), *map(str, source_paths)],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            jar = self.root / side / "dependency.jar"
+            with zipfile.ZipFile(jar, "w") as archive:
+                for path in sorted(classes.rglob("*.class")):
+                    archive.write(path, path.relative_to(classes).as_posix())
+                archive.writestr(
+                    "META-INF/services/demo.spi.Service",
+                    f"demo.spi.{provider}\n",
+                )
+            return jar
+
+        base_dependency = compile_dependency("semantic-base", "ParentA", "OldProvider", 2)
+        current_dependency = compile_dependency("semantic-current", "ParentB", "NewProvider", 2)
+        business_source = self.root / "semantic-business-src" / "biz" / "Main.java"
+        business_source.parent.mkdir(parents=True)
+        business_source.write_text(
+            "package biz; import java.util.ServiceLoader; "
+            "public class Main { public String entry(){ return "
+            "new demo.hierarchy.Child().value() + \":\" + "
+            "ServiceLoader.load(demo.spi.Service.class).findFirst()"
+            ".orElseThrow().run(); } }",
+            encoding="utf-8",
+        )
+        business_classes = self.root / "semantic-business-classes"
+        business_classes.mkdir()
+        completed = subprocess.run(
+            [
+                "javac", "-g", "-cp", str(base_dependency),
+                "-d", str(business_classes), str(business_source),
+            ],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        business_jar = self.root / "semantic-business.jar"
+        with zipfile.ZipFile(business_jar, "w") as archive:
+            archive.write(business_classes / "biz" / "Main.class", "biz/Main.class")
+
+        def side(dependency, version):
+            return {
+                "jdk_home": str(self.home),
+                "artifacts": [{
+                    "path": str(business_jar),
+                    "logical_location": "app/business.jar",
+                    "loader_realm": "application-loader",
+                    "path_kind": "business_classes",
+                    "slot": 0,
+                    "coord": "com.acme:application:1",
+                    "lineage": "com.acme:application",
+                    "runtime_code_source_origin_identity": "semantic:application",
+                }, {
+                    "path": str(dependency),
+                    "logical_location": "lib/semantic.jar",
+                    "loader_realm": "application-loader",
+                    "path_kind": "classpath",
+                    "slot": 1,
+                    "coord": f"com.acme:semantic:{version}",
+                    "lineage": "com.acme:semantic",
+                    "runtime_code_source_origin_identity": "semantic:dependency",
+                }],
+                "runtime_profile": {
+                    "container_and_launcher_kind": "java-classpath",
+                    "loader_topology": {
+                        "coverage_status": "complete",
+                        "entrypoint_realms": ["application-loader"],
+                        "realms": [{
+                            "identity": "platform-loader", "kind": "platform",
+                            "delegation": "parent_first", "module_mode": "named-platform",
+                        }, {
+                            "identity": "application-loader", "kind": "application",
+                            "parent": "platform-loader", "delegation": "parent_first",
+                            "module_mode": "unnamed",
+                        }],
+                    },
+                    "runtime_security_and_package_sealing_policy_identity": "standard-unsealed-unsigned-v1",
+                    "active_profile_identities": ["default"],
+                    "external_config_snapshot_identities": [],
+                    "agent_transformer_plugin_profile_identities": [],
+                    "business_entrypoint_profile": {
+                        "coverage_status": "complete",
+                        "methods": [{
+                            "initiating_loader_realm_identity": "application-loader",
+                            "class_name": "biz/Main", "member_name": "entry",
+                            "descriptor": "()Ljava/lang/String;",
+                        }],
+                    },
+                    "runtime_class_closure_coverage_status": "complete",
+                    "resource_selection_coverage_status": "complete",
+                },
+            }
+
+        config = {
+            "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+            "source_usage": {
+                "decision": "skip_source", "decision_source": "explicit_config",
+            },
+            "asm_jar": str(self.asm_jar),
+            "base": side(base_dependency, "1"),
+            "current": side(current_dependency, "2"),
+            "runtime_comparison": {
+                "controlled_profile_fields": ["loader_topology"],
+                "declared_upgrade_payload_scope": ["artifact-bytes"],
+            },
+        }
+        report = self.root / "semantic-report"
+        result = run_pipeline(
+            config,
+            output_root=report / ".runtime" / "binary_authority",
+        )
+        generation = Path(result["generation_directory"])
+        decisions = json.loads((generation / "binary_decisions.json").read_text())
+        resolution = [
+            item for item in decisions["authoritative_change_facts"]
+            if item.get("reason_code") == "RUNTIME_MEMBER_RESOLUTION_CHANGED"
+        ]
+        self.assertEqual(len(resolution), 1)
+        self.assertEqual(
+            resolution[0]["evidence"]["base_resolution"]["resolved_owner"],
+            "demo/hierarchy/ParentA",
+        )
+        self.assertEqual(
+            resolution[0]["evidence"]["current_resolution"]["resolved_owner"],
+            "demo/hierarchy/ParentB",
+        )
+        formal = json.loads((generation / "binary_formal_results.json").read_text())
+        resolution_result = next(
+            item for item in formal["results"]
+            if item.get("change_fact_identity") == resolution[0]["change_fact_identity"]
+        )
+        self.assertEqual(resolution_result["reachability_status"], "reachable")
+        resource_result = formal["resource_activation_results"]
+        self.assertEqual(len(resource_result), 1)
+        self.assertEqual(resource_result[0]["activation_status"], "reachable")
+
+        publish_step4(report, report / "evidence" / "api_changes")
+        publish_step5(report, report / "evidence" / "call_chain")
+        publish_step6(
+            report,
+            report / ".runtime" / "findings" / "s6_findings.json",
+            report / "deliverables" / "report.md",
+        )
+        with (report / "evidence" / "api_changes" / "all_changed_apis.csv").open(
+            encoding="utf-8-sig", newline=""
+        ) as handle:
+            rows = list(csv.DictReader(handle))
+        resolution_row = next(
+            item for item in rows
+            if item["change_type"] == "MEMBER_RESOLUTION_CHANGED"
+        )
+        self.assertEqual(resolution_row["old_value"], "demo/hierarchy/ParentA")
+        self.assertEqual(resolution_row["new_value"], "demo/hierarchy/ParentB")
+        report_text = (report / "deliverables" / "report.md").read_text()
+        self.assertIn("demo.hierarchy.ParentA → demo.hierarchy.ParentB", report_text)
+        self.assertIn("META-INF/services/demo.spi.Service", report_text)
+        self.assertIn("已确认当前系统激活", report_text)
+        dependencies_text = (
+            report / "deliverables" / "all-affected-dependencies.md"
+        ).read_text()
+        semantic_row = next(
+            line for line in dependencies_text.splitlines()
+            if "`com.acme:semantic`" in line
+        )
+        self.assertIn("确认有影响", semantic_row)
+        self.assertIn("运行时资源", semantic_row)
 
     def test_manifest_semantics_match_independent_validation(self):
         manifest = (

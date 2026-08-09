@@ -263,6 +263,11 @@ def build_output_payloads(
         "not_analyzed_total": sum(item["reachability_status"] == "not_analyzed" for item in by_api),
         "probable_impact_total": sum(item["impact_conclusion"] == "probable_impact" for item in by_api),
         "runtime_verified_total": 0,
+        "resource_activation_reachable_total": sum(
+            item.get("activation_status") == "reachable"
+            for item in traces.resource_activation_results
+        ),
+        "resource_activation_result_count": len(traces.resource_activation_results),
         "formal_path_set_complete": all(item["path_set_complete"] for item in by_api),
         "decision_coverage_status": decisions.coverage_status,
         "trace_coverage_status": traces.coverage_status,
@@ -291,6 +296,7 @@ def build_output_payloads(
             "schema": "java-upgrade-analyzer.binary-formal-results.v1",
             "results": list(traces.formal_results),
             "by_api": by_api,
+            "resource_activation_results": list(traces.resource_activation_results),
         },
         "binary_candidate_results.json": {
             "schema": "java-upgrade-analyzer.binary-candidate-results.v1",
