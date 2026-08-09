@@ -15,7 +15,7 @@ import binary_artifact_diff  # noqa: E402
 from binary_fact_store import BinaryFactStore  # noqa: E402
 from binary_first_model import ArtifactInstance  # noqa: E402
 from binary_source_overlay import build_source_overlay, source_method_descriptor  # noqa: E402
-from enhanced_source_analyzer import MethodDef  # noqa: E402
+from enhanced_source_analyzer import MethodDef, analyze_file  # noqa: E402
 
 
 class BinarySourceOverlayTest(unittest.TestCase):
@@ -148,6 +148,31 @@ class BinarySourceOverlayTest(unittest.TestCase):
     def test_unqualified_java_lang_char_sequence_uses_platform_descriptor(self):
         method = self.method(params={"value": "CharSequence"})
 
+        self.assertEqual(
+            source_method_descriptor(method),
+            "(Ljava/lang/CharSequence;)Ljava/lang/String;",
+        )
+
+    def test_real_source_parser_preserves_unqualified_java_lang_descriptor(self):
+        self.source.write_text(
+            "package demo; public class Sample { "
+            "public String value(CharSequence value) { return value.toString(); } }",
+            encoding="utf-8",
+        )
+        methods = analyze_file(
+            str(self.source),
+            {
+                "root": str(self.root / "src"),
+                "owner_type": "dependency",
+                "owner_coord": "com.acme:sample:2",
+                "module": "sample",
+            },
+            prefer_tree_sitter=True,
+        )
+        method = next(item for item in methods if item.method_name == "value")
+
+        self.assertEqual(method.param_declared_types["value"], "CharSequence")
+        self.assertEqual(method.param_types["value"], "java.lang.CharSequence")
         self.assertEqual(
             source_method_descriptor(method),
             "(Ljava/lang/CharSequence;)Ljava/lang/String;",

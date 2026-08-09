@@ -1127,8 +1127,10 @@ class EnhancedRegexAnalyzer:
 
         # java.lang包（只包含真正的java.lang类）
         java_lang_types = {
-            'String', 'Object', 'Class', 'Integer', 'Long', 'Double',
-            'Exception', 'RuntimeException', 'Throwable', 'Void', 'Boolean'
+            'String', 'CharSequence', 'Object', 'Class', 'Throwable',
+            'Exception', 'RuntimeException', 'Boolean', 'Byte', 'Character',
+            'Short', 'Integer', 'Long', 'Float', 'Double', 'Void', 'Iterable',
+            'Record', 'Enum'
         }
         if simple_name in java_lang_types:
             return f"java.lang.{simple_name}"
@@ -2751,7 +2753,11 @@ def resolve_type_fqn(type_expr, method_def):
         return f"{method_def.class_fqcn}.{inner_suffix}"
 
     # Common Java classes (reduce false positives)
-    java_lang_classes = ["String", "Integer", "Long", "Double", "Float", "Boolean", "Object", "Class", "Exception", "RuntimeException"]
+    java_lang_classes = [
+        "String", "CharSequence", "Object", "Class", "Throwable", "Exception",
+        "RuntimeException", "Boolean", "Byte", "Character", "Short", "Integer",
+        "Long", "Float", "Double", "Void", "Iterable", "Record", "Enum",
+    ]
     java_util_classes = ["List", "ArrayList", "Map", "HashMap", "Set", "HashSet", "Optional", "Stream", "Collector"]
 
     if type_expr in java_lang_classes:

@@ -94,13 +94,17 @@ def source_method_descriptor(method: Any) -> str:
     declared = getattr(method, "param_declared_types", {}) or {}
     ordered_types = []
     for name, value in parameters.items():
-        ordered_types.append(value or declared.get(name) or "")
+        # Prefer the declaration text.  The semantic analyzer's resolved type is
+        # useful for call-graph inference, but an unresolved simple name may
+        # already have been guessed as a same-package class.  JVM descriptors
+        # must instead apply Java's declaration/import/java.lang rules here.
+        ordered_types.append(declared.get(name) or value or "")
     class_simple = str(getattr(method, "class_name", "") or "").split(".")[-1]
     method_name = str(getattr(method, "method_name", "") or "")
     constructor = method_name in {"<init>", class_simple}
     return_type = "void" if constructor else (
-        getattr(method, "return_type", "")
-        or getattr(method, "return_declared_type", "")
+        getattr(method, "return_declared_type", "")
+        or getattr(method, "return_type", "")
     )
     params = [_source_type_descriptor(item, method) for item in ordered_types]
     result = _source_type_descriptor(return_type, method, allow_void=True)
