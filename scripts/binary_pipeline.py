@@ -677,15 +677,33 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                 "pairing_count": len(pairings),
             })
             reconciliation_started = time.perf_counter()
+            # Reconcile both runtime views over the same symbolic class
+            # universe. A type referenced only by one version (for example a
+            # newly introduced JDK parameter type) still exists in the other
+            # runtime and must not be reported as a provider change merely
+            # because it was absent from that side's local discovery seeds.
+            common_runtime_classes = {
+                row["class_name"]
+                for store in (base_store, current_store)
+                for row in store.rows("classes")
+            }
+            common_runtime_classes.update({
+                row["symbolic_owner"]
+                for store in (base_store, current_store)
+                for row in store.rows("direct_edges")
+                if row["symbolic_owner"]
+            })
             base_runtime = RuntimeReconciler(
                 base_store, base_profile, base_platform,
                 analysis_context_identity=context.identity,
                 capability_policy=capability,
+                additional_initial_classes=common_runtime_classes,
             ).reconcile()
             current_runtime = RuntimeReconciler(
                 current_store, current_profile, current_platform,
                 analysis_context_identity=context.identity,
                 capability_policy=capability,
+                additional_initial_classes=common_runtime_classes,
             ).reconcile()
             phase_timings.append({
                 "phase": "target_independent_runtime_reconciliation",

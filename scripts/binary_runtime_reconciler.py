@@ -108,12 +108,16 @@ class RuntimeReconciler:
         *,
         analysis_context_identity: str,
         capability_policy: RuntimeCapabilityPolicy | None = None,
+        additional_initial_classes: Iterable[str] = (),
     ):
         self.store = store
         self.profile = runtime_profile
         self.platform = platform
         self.context_identity = str(analysis_context_identity or "")
         self.capability = capability_policy or RuntimeCapabilityPolicy()
+        self.additional_initial_classes = tuple(sorted({
+            str(name) for name in additional_initial_classes if str(name)
+        }))
         if not self.context_identity:
             raise RuntimeReconciliationError(
                 "RUNTIME_RECONCILIATION_CONTEXT_MISSING", "analysis context is required"
@@ -519,6 +523,7 @@ class RuntimeReconciler:
             row["symbolic_owner"] for row in self.edges
             if row["caller_artifact_instance_identity"] in self.artifacts and row["symbolic_owner"]
         )
+        initial_classes.update(self.additional_initial_classes)
         contexts = set()
         pending = [(realm, name) for realm in self.entrypoint_realms for name in initial_classes]
         while pending:
@@ -1044,8 +1049,10 @@ class RuntimeReconciler:
             }
             if provider["class_provider_status"] != "resolved":
                 status = "ambiguous" if provider["class_provider_status"] == "ambiguous" else "no_class_definition"
+                linkage_status = status
             elif not definition or definition["class_definition_status"] != "definition_ready":
                 status = "class_definition_failed"
+                linkage_status = status
             else:
                 member, member_provider = self._resolve_symbolic_member(
                     caller_realm,
@@ -1056,12 +1063,7 @@ class RuntimeReconciler:
                 )
                 if member is None:
                     status = "no_such_member"
-                elif not self._opcode_compatible(edge, member):
-                    status = "incompatible_class_change"
-                elif not self._member_accessible(
-                    str((caller or {}).get("class_name") or ""), caller_realm, member, member_provider
-                ):
-                    status = "illegal_access"
+                    linkage_status = status
                 else:
                     status = "resolved"
                     payload["resolved_member_identity"] = member["member_identity"]
@@ -1069,6 +1071,17 @@ class RuntimeReconciler:
                     payload["resolved_defining_loader_realm_identity"] = member_provider[
                         "selected_defining_loader_realm_identity"
                     ]
+                    if not self._opcode_compatible(edge, member):
+                        linkage_status = "incompatible_class_change"
+                    elif not self._member_accessible(
+                        str((caller or {}).get("class_name") or ""),
+                        caller_realm,
+                        member,
+                        member_provider,
+                    ):
+                        linkage_status = "illegal_access"
+                    else:
+                        linkage_status = "resolved"
             resolution = MemberResolution({"member_resolution_status": status, **payload})
             member_record = {
                 **payload,
@@ -1079,6 +1092,7 @@ class RuntimeReconciler:
 
             executable_dispatch = edge["edge_kind"] == "method" and kind == "method"
             dispatch_fixed_by_final_declaration = False
+            dispatch_fixed_by_closed_world_single_target = False
             if not executable_dispatch or status != "resolved":
                 dispatch_status = "not_applicable" if not executable_dispatch else "unresolved"
                 targets = ()
@@ -1131,7 +1145,8 @@ class RuntimeReconciler:
                             )
                             coverage = "complete" if hierarchy_complete else "partial"
                         elif hierarchy_complete:
-                            dispatch_status = "possible"
+                            dispatch_status = "exact" if len(targets) == 1 else "possible"
+                            dispatch_fixed_by_closed_world_single_target = len(targets) == 1
                             coverage = "complete"
                         else:
                             dispatch_status = "partial_possible_set"
@@ -1147,6 +1162,9 @@ class RuntimeReconciler:
                     "dispatch_fixed_by_final_declaration": (
                         dispatch_fixed_by_final_declaration
                     ),
+                    "dispatch_fixed_by_closed_world_single_target": (
+                        dispatch_fixed_by_closed_world_single_target
+                    ),
                 },
             )
             dispatch_records.append({
@@ -1157,19 +1175,22 @@ class RuntimeReconciler:
                 "dispatch_resolution_identity": dispatch.identity,
                 "member_resolution_identity": resolution.identity,
             })
-            if edge["edge_kind"] not in {"method", "field"}:
-                linkage = {
-                    "direct_edge_identity": edge["direct_edge_identity"],
-                    "initiating_loader_realm_identity": caller_realm,
-                    "linkage_kind": edge["edge_kind"],
-                    "linkage_status": status,
-                    "coverage_status": "complete" if status == "resolved" else "partial",
-                    "member_resolution_identity": resolution.identity,
-                }
-                linkage["linkage_resolution_identity"] = _identity(
-                    "linkage_resolution_identity", linkage
-                )
-                linkage_records.append(linkage)
+            linkage = {
+                "direct_edge_identity": edge["direct_edge_identity"],
+                "initiating_loader_realm_identity": caller_realm,
+                "linkage_kind": kind,
+                "linkage_status": linkage_status,
+                "coverage_status": (
+                    "partial"
+                    if linkage_status in {"ambiguous", "unresolved", "unsupported"}
+                    else "complete"
+                ),
+                "member_resolution_identity": resolution.identity,
+            }
+            linkage["linkage_resolution_identity"] = _identity(
+                "linkage_resolution_identity", linkage
+            )
+            linkage_records.append(linkage)
         return (
             member_records,
             dispatch_records,

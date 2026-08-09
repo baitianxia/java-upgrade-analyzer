@@ -71,3 +71,83 @@ def guidance_for_reason_code(reason_code, *, origin_step=""):
         "repair_actions": repair_actions,
         "verification_steps": verification_steps,
     }
+
+
+def build_catalog_guidance(
+    reason_codes,
+    *,
+    origin_step="",
+    observed_scope="step",
+    source_components=None,
+):
+    """Build report-ready guidance without coupling it to an engine collector."""
+    rows = []
+    for reason_code in sorted({
+        canonical_reason_code(value)
+        for value in (reason_codes or ())
+        if str(value or "").strip()
+    }):
+        definition = guidance_for_reason_code(
+            reason_code,
+            origin_step=origin_step,
+        )
+        rows.append({
+            **definition,
+            "blocking": True,
+            "observed_scope": observed_scope,
+            "scope_explanation": "该诊断限制对应步骤或覆盖范围，不代表所有 API 都受到影响。",
+            "affected_api_count": 0,
+            "affected_api_count_semantics": "not_available_at_step_scope",
+            "primary_reason_api_count": 0,
+            "potentially_affected_api_count": 0,
+            "affected_status_counts": {},
+            "observed_failure_count": 1,
+            "failure_record_count": 1,
+            "failure_occurrence_count": 0,
+            "collectors": [],
+            "affected_classes": [],
+            "affected_artifacts": [],
+            "affected_artifact_entries": [],
+            "evidence_file": "",
+            "evidence_files": [],
+            "candidate_evidence": [],
+            "sample_apis": [],
+            "failure_detail_summaries": [],
+            "source_components": list(source_components or ()),
+        })
+    return rows
+
+
+def build_diagnostic_guidance_from_summary(summary):
+    """Project binary summary reason codes into the established report model."""
+    payload = dict(summary or {})
+    items = [
+        *list(payload.get("uncertain_apis") or ()),
+        *list(payload.get("not_analyzed_apis") or ()),
+    ]
+    grouped = {}
+    for item in items:
+        reason_code = canonical_reason_code(
+            (item or {}).get("reason_code") or "UNKNOWN"
+        )
+        row = grouped.setdefault(reason_code, {
+            **guidance_for_reason_code(
+                reason_code,
+                origin_step=payload.get("origin_step") or "step5",
+            ),
+            "blocking": True,
+            "observed_scope": "api",
+            "affected_api_count": 0,
+            "affected_status_counts": {},
+            "sample_apis": [],
+            "evidence_files": [],
+        })
+        row["affected_api_count"] += 1
+        status = str((item or {}).get("analysis_status") or "unknown")
+        row["affected_status_counts"][status] = (
+            row["affected_status_counts"].get(status, 0) + 1
+        )
+        api = str((item or {}).get("api") or "").strip()
+        if api and api not in row["sample_apis"]:
+            row["sample_apis"].append(api)
+    return sorted(grouped.values(), key=lambda item: item["reason_code"])

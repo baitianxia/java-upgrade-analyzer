@@ -450,7 +450,13 @@ class BinaryDecisionEngine:
             dependency_artifacts = self._dependency_artifacts(
                 base_artifact, current_artifact, lineage=lineage
             )
-            comparison_complete = artifact_diff.get("comparison_coverage_status") == "complete"
+            comparison_complete = (
+                artifact_diff.get(
+                    "class_comparison_coverage_status",
+                    artifact_diff.get("comparison_coverage_status"),
+                )
+                == "complete"
+            )
             for entry in artifact_diff.get("entry_deltas") or ():
                 if entry["entry_scope"].get("entry_kind") != "class":
                     self._process_resource_delta(

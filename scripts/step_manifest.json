@@ -349,7 +349,8 @@
         "evidence/api_changes/business_bytecode_changed_api_refs.csv",
         "evidence/api_changes/business_bytecode_priority_evidence.json",
         "evidence/api_changes/review.md",
-        "evidence/api_changes/s4_per_dependency/"
+        "evidence/api_changes/s4_per_dependency/",
+        "evidence/source_analysis/"
       ],
       "notes": [
         "binary-first 是唯一分析权威。本步骤仍发布 all_changed_apis.csv 与按依赖包分组的人工复核材料；内部二进制 generation 仅位于 .runtime/binary_authority/。"

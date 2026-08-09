@@ -414,11 +414,17 @@ def gate_binary_report(d, strict_risk_gate=False):
         fail(f"Step5 面向用户的复核文件缺失：{missing}")
     alert_rows = read_csv_dicts(
         evidence_call_chain_dir(d) / "alerts.csv",
-        ("coord", "changed_symbol", "api_signature", "path_status", "path_text"),
+        (
+            "api_identity", "target_coord", "changed_symbol",
+            "api_signature", "path_status", "path_text",
+        ),
     )
-    if len(alert_rows) != int(summary.get("total_apis") or 0):
-        fail("Step5 alerts.csv 行数与 summary.json 不一致")
-    if any(not row.get("coord") for row in alert_rows):
+    published_api_identities = {
+        row["api_identity"] for row in alert_rows if row.get("api_identity")
+    }
+    if len(published_api_identities) != int(summary.get("total_apis") or 0):
+        fail("Step5 alerts.csv 的唯一 API 数与 summary.json 不一致")
+    if any(not row.get("target_coord") for row in alert_rows):
         fail("Step5 触达结果丢失依赖包维度")
     query_index_path = Path(d) / RUNTIME_DIRNAME / "indexes" / "s5_query_index.json"
     try:

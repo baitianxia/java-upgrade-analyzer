@@ -8,12 +8,11 @@ SCRIPTS = ROOT / "scripts"
 
 
 class BinaryOnlyArchitectureTest(unittest.TestCase):
-    def test_removed_step4_to_step6_engines_are_physically_absent(self):
+    def test_removed_analysis_engines_are_physically_absent(self):
         removed = (
             "s4_jar_compare.py",
             "s5_call_chain.py",
             "s5_call_chain_engine_integrated.py",
-            "s6_report.py",
             "binary_compat_output.py",
             "confidence_weighted_tracer.py",
             "enhanced_output_formatter.py",
@@ -22,6 +21,7 @@ class BinaryOnlyArchitectureTest(unittest.TestCase):
             [name for name in removed if (SCRIPTS / name).exists()],
             [],
         )
+        self.assertTrue((SCRIPTS / "s6_report.py").is_file())
 
     def test_orchestrator_has_no_gray_release_or_legacy_engine_switch(self):
         source = (SCRIPTS / "run_step.py").read_text(encoding="utf-8")
@@ -53,12 +53,14 @@ class BinaryOnlyArchitectureTest(unittest.TestCase):
         self.assertIn("changed_dependencies.md", source)
         self.assertIn("review.md", source)
 
-    def test_formal_reports_do_not_restore_removed_five_state_projection(self):
+    def test_human_projection_preserves_binary_authority_boundaries(self):
         source = (SCRIPTS / "binary_report.py").read_text(encoding="utf-8")
-        self.assertNotIn("not_impacted", source)
+        self.assertIn("import s6_report", source)
+        self.assertIn("s6_report.generate_report", source)
+        self.assertIn("reachability_status", source)
+        self.assertIn("runtime_verification_status", source)
         self.assertNotIn("confirmed_impact", source)
         self.assertNotIn("confirmed_no_impact", source)
-        self.assertNotIn("formal_state_contract", source)
 
 
 if __name__ == "__main__":

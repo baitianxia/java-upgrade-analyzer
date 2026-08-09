@@ -140,6 +140,7 @@ class BinaryArtifactDiffTest(unittest.TestCase):
         self.assertEqual(current_snapshot.comparison_coverage_status, "partial")
         self.assertEqual(result["resource_diff_status"], "unknown")
         self.assertEqual(result["comparison_coverage_status"], "partial")
+        self.assertEqual(result["class_comparison_coverage_status"], "complete")
         self.assertIn("unknown_resource:config/custom.bin#0", result["coverage_gaps"])
 
     def test_unsupported_class_major_is_explicit_incomplete_class_scope(self):

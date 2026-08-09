@@ -109,6 +109,21 @@ class BinaryFactStoreTest(unittest.TestCase):
         self.assertIn("field", {item["edge_kind"] for item in edges})
         self.assertIn("method", {item["edge_kind"] for item in edges})
 
+    def test_unknown_resource_does_not_taint_successful_class_fact_coverage(self):
+        artifact = self.make_jar("class-and-unknown-resource.jar")
+        with zipfile.ZipFile(artifact, "a") as archive:
+            archive.writestr("config/custom.bin", b"opaque")
+        instance = self.instance(artifact, 0)
+        snapshot = self.snapshot(artifact, instance)
+
+        self.assertEqual(snapshot.comparison_coverage_status, "partial")
+        self.assertEqual(snapshot.class_fact_coverage_status, "complete")
+        with BinaryFactStore() as store:
+            store.add_artifact_snapshot(instance, snapshot)
+            row = store.rows("artifact_instances")[0]
+
+        self.assertEqual(row["coverage_status"], "complete")
+
     def test_same_coordinate_different_physical_instances_are_not_conflicts(self):
         first_artifact = self.make_jar("first.jar")
         second_artifact = self.make_jar("second.jar")

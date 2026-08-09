@@ -17,6 +17,7 @@ import binary_asm_helper  # noqa: E402
 from binary_pipeline import BinaryPipelineError, run_pipeline  # noqa: E402
 from binary_report import (  # noqa: E402
     BinaryReportError,
+    LEGACY_ALERT_FIELDS,
     load_validated_generation,
     publish_step4,
     publish_step5,
@@ -244,9 +245,11 @@ class BinaryPipelineTest(unittest.TestCase):
         self.assertEqual(step4_summary["confirmed_unprojectable_fact_count"], 1)
         self.assertIn(
             "用户明确选择不提供源码",
-            (api_dir / "source_overlay.md").read_text(encoding="utf-8"),
+            (report / "evidence" / "source_analysis" / "review.md").read_text(
+                encoding="utf-8"
+            ),
         )
-        with (api_dir / "source_overlay.csv").open(
+        with (report / "evidence" / "source_analysis" / "method_mappings.csv").open(
             encoding="utf-8-sig", newline=""
         ) as handle:
             self.assertEqual(list(csv.DictReader(handle)), [])
@@ -276,16 +279,30 @@ class BinaryPipelineTest(unittest.TestCase):
         self.assertIn("META-INF/services/demo.Service", complete_review)
         self.assertFalse(any(api_dir.glob("*.sqlite")))
         published_summary = json.loads((call_dir / "summary.json").read_text())
+        self.assertEqual(
+            published_summary["schema"],
+            "java-upgrade-analyzer.binary-step5-summary.v1",
+        )
+        step5_review = (call_dir / "summary.md").read_text(encoding="utf-8")
+        self.assertIn("# 系统触达证据", step5_review)
+        self.assertIn("com.acme:api", step5_review)
+        self.assertIn("不是已确认无影响", step5_review)
         self.assertEqual(published_summary["reachable"], 1)
         self.assertNotIn("confirmed_impact", published_summary["quality_gate"])
         self.assertNotIn("confirmed_no_impact", published_summary["quality_gate"])
-        self.assertNotIn("not_impacted", published_summary)
+        # The established Step5 report contract retains the explicit
+        # not-impacted bucket even though binary-first never fabricates a
+        # confirmed-no-impact result.  The bucket must therefore remain empty.
+        self.assertEqual(published_summary["not_impacted"], 0)
+        self.assertEqual(published_summary["not_impacted_apis"], [])
         self.assertTrue(
             (call_dir / "alerts.csv").read_bytes().startswith(b"\xef\xbb\xbf")
         )
         with (call_dir / "alerts.csv").open(encoding="utf-8-sig", newline="") as handle:
-            alert_rows = list(csv.DictReader(handle))
-        self.assertEqual(alert_rows[0]["coord"], "com.acme:api")
+            reader = csv.DictReader(handle)
+            alert_rows = list(reader)
+            self.assertEqual(tuple(reader.fieldnames or ()), LEGACY_ALERT_FIELDS)
+        self.assertEqual(alert_rows[0]["target_coord"], "com.acme:api")
         self.assertEqual(alert_rows[0]["api_signature"], "()")
         self.assertTrue(alert_rows[0]["path_text"].endswith("demo.Api.value()"))
         query = query_scope_call_chain_result(report, "com.acme:api", "coord")
@@ -298,12 +315,41 @@ class BinaryPipelineTest(unittest.TestCase):
         )
         self.assertIn("not_found_in_static_analysis", final_report.read_text())
         self.assertIn("用户选择不提供源码", final_report.read_text())
+        rendered_report = final_report.read_text()
+        self.assertIn("# Java 依赖升级影响报告", rendered_report)
+        self.assertIn("## 一、依赖层面结论", rendered_report)
+        self.assertIn("## 二、API 及调用关系", rendered_report)
+        self.assertIn("## 三、用户可见文件说明", rendered_report)
+        self.assertNotIn("Analysis context：", rendered_report)
+        self.assertFalse((api_dir / "source_overlay.md").exists())
+        self.assertTrue(
+            (report / "evidence" / "source_analysis" / "review.md").is_file()
+        )
         self.assertTrue((final_report.parent / "all-affected-dependencies.md").is_file())
         self.assertTrue((final_report.parent / "all-affected-dependencies.csv").is_file())
         self.assertTrue((final_report.parent / "all-impact-details.md").is_file())
         self.assertTrue((final_report.parent / "all-impact-details.csv").is_file())
         self.assertTrue((final_report.parent / "analysis-scope.md").is_file())
-        self.assertIn("关键路径", (final_report.parent / "all-impact-details.md").read_text())
+        with (final_report.parent / "all-affected-dependencies.csv").open(
+            encoding="utf-8-sig", newline=""
+        ) as handle:
+            self.assertEqual(
+                csv.DictReader(handle).fieldnames,
+                ["依赖", "版本变化", "API 分析（已完成/总数）", "当前系统调用关系", "分析结果", "结果说明"],
+            )
+        with (final_report.parent / "all-impact-details.csv").open(
+            encoding="utf-8-sig", newline=""
+        ) as handle:
+            self.assertEqual(
+                csv.DictReader(handle).fieldnames,
+                ["依赖", "API", "新版本中的变化", "当前系统调用关系", "分析结果", "结果说明"],
+            )
+        scope_report = (final_report.parent / "analysis-scope.md").read_text()
+        self.assertIn("## 源码辅助分析", scope_report)
+        self.assertIn("用户选择不提供源码", scope_report)
+        impact_detail = (final_report.parent / "all-impact-details.md").read_text()
+        self.assertIn("当前系统调用关系", impact_detail)
+        self.assertIn("demo.Api.value()", impact_detail)
         self.assertEqual(
             load_validated_generation(report)["manifest"]["result_generation_identity"],
             first["result_generation_identity"],
@@ -356,6 +402,67 @@ class BinaryPipelineTest(unittest.TestCase):
 
         self.assertEqual(result["validation_status"], "passed")
 
+    def test_one_sided_platform_reference_is_not_a_provider_change(self):
+        def signature_jar(side, parameter_type):
+            source = self.root / side / "src" / "demo" / "Api.java"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                "package demo; public class Api { "
+                "public int value(){ return 1; } "
+                f"public int signature({parameter_type} value){{ return value.length(); }} "
+                "}",
+                encoding="utf-8",
+            )
+            classes = self.root / side / "classes"
+            classes.mkdir()
+            completed = subprocess.run(
+                ["javac", "-g", "-d", str(classes), str(source)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            jar = self.root / side / "api.jar"
+            with zipfile.ZipFile(jar, "w") as archive:
+                archive.write(classes / "demo" / "Api.class", "demo/Api.class")
+            return jar
+
+        base = signature_jar("platform-ref-base", "String")
+        current = signature_jar("platform-ref-current", "CharSequence")
+        config = {
+            "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+            "source_usage": {
+                "decision": "skip_source",
+                "decision_source": "explicit_config",
+            },
+            "asm_jar": str(self.asm_jar),
+            "base": self._side(base, "1"),
+            "current": self._side(current, "2"),
+            "runtime_comparison": {
+                "controlled_profile_fields": ["loader_topology"],
+                "declared_upgrade_payload_scope": ["artifact-bytes"],
+            },
+        }
+
+        result = run_pipeline(
+            config,
+            output_root=self.root / "platform-reference-output",
+        )
+        decisions = json.loads(
+            (Path(result["generation_directory"]) / "binary_decisions.json").read_text()
+        )
+        all_decisions = [
+            *decisions["authoritative_change_facts"],
+            *decisions["diagnostic_candidate_facts"],
+        ]
+
+        self.assertFalse(any(
+            item.get("fact_kind") == "provider_topology"
+            and (item.get("fact_scope") or {}).get("class_name")
+            == "java/lang/CharSequence"
+            for item in all_decisions
+        ))
+
     def test_dependency_source_set_is_published_with_dependency_dimension(self):
         base = self._jar("source-base", 1)
         current = self._jar("source-current", 2, uses_system_out=True)
@@ -392,7 +499,8 @@ class BinaryPipelineTest(unittest.TestCase):
         self.assertEqual(result["source_usage"]["decision"], "use_source")
         api_dir = report / "evidence" / "api_changes"
         publish_step4(report, api_dir)
-        with (api_dir / "source_overlay.csv").open(
+        source_dir = report / "evidence" / "source_analysis"
+        with (source_dir / "method_mappings.csv").open(
             encoding="utf-8-sig", newline=""
         ) as handle:
             rows = list(csv.DictReader(handle))
@@ -402,7 +510,7 @@ class BinaryPipelineTest(unittest.TestCase):
         self.assertEqual(mapped["二进制制品"], "com.acme:api:2")
         self.assertEqual(mapped["源码位置"], "demo/Api.java:1")
         self.assertTrue(mapped["源码声明"])
-        with (api_dir / "source_candidate_relationships.csv").open(
+        with (source_dir / "candidate_relationships.csv").open(
             encoding="utf-8-sig", newline=""
         ) as handle:
             candidate_rows = list(csv.DictReader(handle))
@@ -524,12 +632,13 @@ class BinaryPipelineTest(unittest.TestCase):
         self.assertEqual(field_results[0]["reachability_status"], "reachable")
         source_report_dir = inline_report / "evidence" / "api_changes"
         publish_step4(inline_report, source_report_dir)
-        source_report = (source_report_dir / "source_overlay.md").read_text(
+        source_analysis_dir = inline_report / "evidence" / "source_analysis"
+        source_report = (source_analysis_dir / "review.md").read_text(
             encoding="utf-8"
         )
         self.assertIn("`business`", source_report)
         self.assertIn("biz.Main.entry()", source_report)
-        with (source_report_dir / "source_overlay.csv").open(
+        with (source_analysis_dir / "method_mappings.csv").open(
             encoding="utf-8-sig", newline=""
         ) as handle:
             source_rows = list(csv.DictReader(handle))

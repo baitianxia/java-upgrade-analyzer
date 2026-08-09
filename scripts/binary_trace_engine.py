@@ -511,6 +511,7 @@ class BinaryTraceEngine:
         if (
             change_kind in {"removed", "descriptor_changed", "access_changed"}
             or resolution_statuses.intersection(incompatible_statuses)
+            or linkage_statuses.intersection(incompatible_statuses)
         ):
             static_linkage_status = "incompatible_if_executed"
         elif (

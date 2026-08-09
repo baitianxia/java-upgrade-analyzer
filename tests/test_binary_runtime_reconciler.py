@@ -80,6 +80,7 @@ class BinaryRuntimeReconcilerTest(unittest.TestCase):
             source_paths.append(path)
         classes = self.root / "classes"
         classes.mkdir()
+        self.classes = classes
         completed = subprocess.run(
             ["javac", "-g", "-d", str(classes), *map(str, source_paths)],
             capture_output=True,
@@ -214,7 +215,8 @@ class BinaryRuntimeReconcilerTest(unittest.TestCase):
         ))
         interface_dispatch = [
             item for item in result.dispatch_resolutions
-            if item["dispatch_status"] == "possible"
+            if item["dispatch_status"] == "exact"
+            and item["implementation_target_identities"]
         ]
         self.assertTrue(interface_dispatch)
         self.assertTrue(any(item["implementation_target_identities"] for item in interface_dispatch))
@@ -277,6 +279,89 @@ class BinaryRuntimeReconcilerTest(unittest.TestCase):
             and item["class_name"] == "java/lang/String"
         )
         self.assertTrue(provider["selected_artifact_instance_identity"].startswith("platform-image:"))
+
+    def test_member_resolution_remains_resolved_when_access_linkage_fails(self):
+        current_source = self.root / "current-src" / "demo" / "FinalApi.java"
+        current_source.parent.mkdir(parents=True)
+        current_source.write_text(
+            "package demo; public final class FinalApi { private String value(){ return \"new\"; } }",
+            encoding="utf-8",
+        )
+        current_classes = self.root / "current-classes"
+        current_classes.mkdir()
+        completed = subprocess.run(
+            ["javac", "-g", "-d", str(current_classes), str(current_source)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        current_jar = self.root / "current-app.jar"
+        with zipfile.ZipFile(current_jar, "w") as archive:
+            for class_file in sorted(self.classes.rglob("*.class")):
+                relative = class_file.relative_to(self.classes).as_posix()
+                replacement = current_classes / relative
+                archive.write(replacement if replacement.is_file() else class_file, relative)
+        current_sha = binary_artifact_diff._sha256_file(current_jar)
+        profile_payload = dict(self.profile.payload)
+        profile_payload["ordered_runtime_path_entry_descriptors"] = [{
+            "logical_location": "lib/app.jar",
+            "content_sha256": current_sha,
+            "path_kind": "classpath",
+            "slot": 0,
+            "loader_realm": "application-loader",
+        }]
+        current_profile = RuntimeProfile(profile_payload)
+        current_instance = ArtifactInstance(
+            outer_artifact_sha256=current_sha,
+            container_entry="<artifact>",
+            content_sha256=current_sha,
+            runtime_profile_identity=current_profile.identity,
+            path_owner_loader_realm_identity="application-loader",
+            runtime_path_kind="classpath",
+            runtime_classpath_index=0,
+            container_loader_policy_version="flat-parent-first-v1",
+            runtime_code_source_origin_identity="deployment-app-jar",
+            coord="com.acme:app:2",
+        )
+        snapshot = binary_artifact_diff.snapshot_archive(
+            current_jar,
+            artifact_instance_identity=current_instance.identity,
+            expected_sha256=current_sha,
+            asm_jar=self.asm_jar,
+        )
+        with BinaryFactStore() as store:
+            store.add_artifact_snapshot(current_instance, snapshot)
+            edge_id = next(
+                row["direct_edge_identity"]
+                for row in store.rows("direct_edges")
+                if row["symbolic_owner"] == "demo/FinalApi"
+                and row["symbolic_name"] == "value"
+            )
+            result = RuntimeReconciler(
+                store,
+                current_profile,
+                self.platform,
+                analysis_context_identity="analysis-context-access-reduced",
+            ).reconcile()
+
+        member = next(
+            item for item in result.member_resolutions
+            if item["direct_edge_identity"] == edge_id
+        )
+        linkage = next(
+            item for item in result.linkage_resolutions
+            if item["direct_edge_identity"] == edge_id
+        )
+        dispatch = next(
+            item for item in result.dispatch_resolutions
+            if item["direct_edge_identity"] == edge_id
+        )
+        self.assertEqual(member["member_resolution_status"], "resolved")
+        self.assertTrue(member["resolved_member_identity"])
+        self.assertEqual(linkage["linkage_status"], "illegal_access")
+        self.assertEqual(dispatch["dispatch_status"], "exact")
+        self.assertEqual(len(dispatch["implementation_target_identities"]), 1)
 
 
 if __name__ == "__main__":

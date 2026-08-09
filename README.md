@@ -104,7 +104,7 @@ Claude Code 会负责：
 - 分支名只用于定位和展示，确认卡选择会同时绑定 repo、remote、canonical ref、artifact 与当时的 commit SHA。Step1 首次选定的 SHA 是固定快照；后续查询为空或 ref 已移动只触发受控重试和按原 SHA 物化，不会改用新 SHA，也不会要求用户重新确认。Step4 的依赖源码 ref 移动或不可用时不要求用户修复，而是从升级前后最终 JAR 比较同签名方法的规范化字节码，继续识别实现变化。
 - 远端 `ls-remote`/`fetch` 对超时、连接重置、临时 DNS/HTTP 5xx 等瞬时错误最多尝试 3 次，重试间隔为 1 秒、3 秒；已选定 SHA 后，定向查询中的 ref 空结果或新 commit 观测也会重试，但不会替换该 SHA。认证失败等确定性错误不重试。Step4 自动重试耗尽后会记录 `DEPENDENCY_SOURCE_REF_UNAVAILABLE`，不会生成要求用户处理网络、权限或 ref 的确认卡，也不会静默使用本地对象；只有运行前已经明确提供 `allow_local_source=true` 时才允许采用本地兜底。若最终 JAR 方法字节码兜底也无法完成，行为变化覆盖会成为关键缺口，报告不得输出“完整”或“不受影响”结论。
 - 选择提供源码时，源码用于增加文件/行号、声明与注解、可读上下文和候选关系，并在受支持的常量内联场景与字节码共同形成证明；选择不提供时仍完成二进制分析，并在报告中明确标注源码解释覆盖缺失。无论如何，依赖范围、版本、JAR 内容和精确字节码调用边始终以 base/current 最终制品为准。
-- 源码映射不会混成无归属的路径列表：`evidence/api_changes/source_overlay.md` 和 `.csv` 同时展示源码归属依赖、实际二进制制品、方法、文件/行号、声明与注解；`source_candidate_relationships.csv` 另列源码候选调用关系并明确它不是可执行边。人工复核时可以直接判断是哪一个依赖提供的源码解释。
+- 源码映射不会混进 API 变化目录或变成无归属的路径列表：`evidence/source_analysis/review.md` 和 `method_mappings.csv` 同时展示源码归属依赖、实际二进制制品、方法、文件/行号、声明与注解；`candidate_relationships.csv` 另列源码候选调用关系并明确它不是可执行边。人工复核时可以直接判断是哪一个依赖提供的源码解释。
 - 只提供源码目录不能证明它对应哪一侧制品；这种输入会先要求确认 revision，确认前不会执行 Maven 或 Gradle。
 - 如果存在多个可部署模块且无法唯一判断，Claude Code 必须让你选择目标模块。
 - 如果只表达“想分析什么”，但没有提供 base/current 来源或目标模块，Claude Code 会继续追问，不会猜测执行。

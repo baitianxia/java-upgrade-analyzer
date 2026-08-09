@@ -174,6 +174,22 @@ class ArtifactSnapshot:
     parser_identity: str
     comparison_coverage_status: str
 
+    @property
+    def class_fact_coverage_status(self) -> str:
+        """Coverage of class facts, independent of resource semantics.
+
+        An unregistered resource type makes that resource's semantic comparison
+        incomplete, but it does not make successfully parsed classfiles
+        incomplete.  Keeping those scopes separate prevents one ordinary
+        resource from suppressing every method and field change in the JAR.
+        """
+        incomplete = bool(
+            self.safety_reason_codes
+            or self.parse_failure_count
+            or self.unknown_attribute_scopes
+        )
+        return "partial" if incomplete else "complete"
+
     def class_records_by_entry(self) -> dict[str, dict[str, Any]]:
         return {
             str(item.get("class_entry") or ""): item
@@ -612,6 +628,11 @@ def compare_artifact_snapshots(
         "class_diff_status": class_status,
         "resource_diff_status": resource_status,
         "comparison_coverage_status": comparison_coverage,
+        "class_comparison_coverage_status": (
+            "partial"
+            if any(not gap.startswith("unknown_resource:") for gap in coverage_gaps)
+            else "complete"
+        ),
         "coverage_gaps": sorted(coverage_gaps),
         "entry_deltas": entry_deltas,
         "entry_delta_count": len(entry_deltas),

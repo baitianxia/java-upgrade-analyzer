@@ -8,19 +8,24 @@ inputs to the binary graph and preserve the four independent result axes.
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 import csv
+from datetime import datetime
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import tempfile
 from typing import Any, Mapping
 
 from binary_first_contract import BinaryFirstContractError
+from analysis_contract import write_coverage_report
 from csv_io import open_csv_write
 from path_runtime import make_short_temp_dir
 from s4_contract import ALL_CHANGED_APIS_FIELDS, DEFAULT_SEVERITY, make_per_dependency_dirname
+import s6_report
 from signature_utils import jvm_method_parameter_signature
 BINARY_OUTPUT_RELATIVE_PATH = Path(".runtime/binary_authority")
 
@@ -418,6 +423,54 @@ _PRODUCT_CHANGE_TYPES = {
 }
 
 
+def _visibility_rank(access: Any) -> int:
+    value = int(access or 0)
+    if value & 0x0001:  # public
+        return 3
+    if value & 0x0004:  # protected
+        return 2
+    if value & 0x0002:  # private
+        return 0
+    return 1
+
+
+def _product_change_type(decision: Mapping[str, Any]) -> str:
+    scope = decision.get("fact_scope") or {}
+    evidence = decision.get("evidence") or {}
+    fact_kind = str(decision.get("fact_kind") or "")
+    change_kind = str(scope.get("member_change_kind") or "implementation_changed")
+    base_contract = evidence.get("base_contract")
+    current_contract = evidence.get("current_contract")
+
+    if fact_kind == "provider_topology":
+        base_status = str((evidence.get("base_provider") or {}).get("class_provider_status") or "missing")
+        current_status = str((evidence.get("current_provider") or {}).get("class_provider_status") or "missing")
+        if base_status == "resolved" and current_status == "missing":
+            return "CLASS_REMOVED"
+        if base_status == "missing" and current_status == "resolved":
+            return "CLASS_ADDED"
+        return "BEHAVIOR_CHANGED"
+    if change_kind == "added" and fact_kind == "field":
+        return "DATA_FIELD_ADDED"
+    if change_kind == "removed" and fact_kind == "field":
+        return "DATA_FIELD_REMOVED"
+    if change_kind == "contract_changed" and isinstance(base_contract, Mapping) and isinstance(current_contract, Mapping):
+        if _visibility_rank(current_contract.get("access")) < _visibility_rank(base_contract.get("access")):
+            return "ACCESS_REDUCED"
+        if (
+            fact_kind == "field"
+            and base_contract.get("descriptor") != current_contract.get("descriptor")
+        ):
+            return "DATA_FIELD_TYPE_CHANGED"
+        if (
+            fact_kind == "field"
+            and base_contract.get("constant") != current_contract.get("constant")
+        ):
+            return "CONSTANT_VALUE_CHANGED"
+        return "SIGNATURE_CHANGED"
+    return _PRODUCT_CHANGE_TYPES.get(change_kind, "BEHAVIOR_CHANGED")
+
+
 def _artifact_coord_parts(record: Mapping[str, Any]) -> tuple[str, str, str]:
     artifacts = list(record.get("dependency_artifacts") or ())
     lineages = [
@@ -467,7 +520,7 @@ def _product_change_row(
     if member_kind not in {"method", "field", "class", "constructor"}:
         member_kind = "class"
     change_kind = str(scope.get("member_change_kind") or "implementation_changed")
-    change_type = _PRODUCT_CHANGE_TYPES.get(change_kind, "BEHAVIOR_CHANGED")
+    change_type = _product_change_type(decision)
     coord, old_version, new_version = _artifact_coord_parts(decision)
     incompatible = change_type in {"REMOVED", "SIGNATURE_CHANGED", "ACCESS_REDUCED"}
     change_label = _CHANGE_LABELS.get(change_kind, change_kind)
@@ -846,8 +899,9 @@ def publish_step4(report_dir: str | Path, output_dir: str | Path) -> dict[str, A
         ]
         summary_lines.extend((
             source_usage["effect"], "",
-            "源码逐方法证据：`source_overlay.md` / `source_overlay.csv`；"
-            "源码候选关系：`source_candidate_relationships.csv`。", "",
+            "源码辅助证据：`../source_analysis/review.md`；"
+            "结构化映射：`../source_analysis/method_mappings.csv`；"
+            "候选关系：`../source_analysis/candidate_relationships.csv`。", "",
         ))
         _atomic_text(stage / "summary.md", "\n".join(summary_lines))
 
@@ -876,6 +930,22 @@ def publish_step4(report_dir: str | Path, output_dir: str | Path) -> dict[str, A
                 ))
         _atomic_text(stage / "review.md", "\n".join(review_lines))
     _stage_directory(output, write)
+    source_output = loaded["report_dir"] / "evidence" / "source_analysis"
+
+    def publish_source(stage: Path) -> None:
+        shutil.copyfile(output / "source_overlay.md", stage / "review.md")
+        shutil.copyfile(output / "source_overlay.csv", stage / "method_mappings.csv")
+        shutil.copyfile(
+            output / "source_candidate_relationships.csv",
+            stage / "candidate_relationships.csv",
+        )
+
+    _stage_directory(source_output, publish_source)
+    for obsolete_source_file in (
+        "source_overlay.md", "source_overlay.csv",
+        "source_candidate_relationships.csv",
+    ):
+        (output / obsolete_source_file).unlink()
     return {"phase": "step4", "change_fact_count": len(rows), "output_dir": str(output)}
 
 
@@ -920,6 +990,248 @@ def _result_item(api: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+LEGACY_ALERT_FIELDS = (
+    "conclusion", "change_summary", "review_reason", "chain_summary",
+    "review_focus", "chain_entry", "chain_target", "chain_hop_count",
+    "chain_detail", "api_identity", "path_id", "target_coord",
+    "changed_symbol", "api_signature", "symbol_kind", "compile_impact",
+    "runtime_link_impact", "change_type", "severity", "path_status",
+    "uncertainty_kind", "business_reachable", "entry_kind", "reach_kind",
+    "business_entry", "consumer_coord", "consumer_class", "consumer_method",
+    "consumer_signature", "path_text", "path_occurrence_count",
+    "evidence_files", "detail_file",
+)
+
+
+def _read_csv_rows(path: Path) -> list[dict[str, str]]:
+    if not path.is_file():
+        return []
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        return [dict(row) for row in csv.DictReader(handle)]
+
+
+def _change_row_key(row: Mapping[str, Any]) -> tuple[str, str, str, str]:
+    return (
+        str(row.get("coord") or "").strip(),
+        str(row.get("api_name") or row.get("api") or "").strip(),
+        str(row.get("api_signature") or "").strip(),
+        str(row.get("symbol_kind") or "").strip(),
+    )
+
+
+def _change_rows_by_result(
+    report_dir: str | Path,
+) -> tuple[list[dict[str, str]], dict[tuple[str, str, str, str], dict[str, str]]]:
+    rows = _read_csv_rows(
+        Path(report_dir).resolve() / "evidence" / "api_changes" / "all_changed_apis.csv"
+    )
+    lookup: dict[tuple[str, str, str, str], dict[str, str]] = {}
+    for row in rows:
+        lookup.setdefault(_change_row_key(row), row)
+    return rows, lookup
+
+
+def _legacy_result_item(
+    item: Mapping[str, Any],
+    change_row: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    change = dict(change_row or {})
+    paths = [
+        str(path.get("path_text") or "").strip()
+        for path in item.get("paths") or []
+        if str(path.get("path_text") or "").strip()
+    ]
+    if not paths and str(item.get("path_text") or "").strip():
+        paths = [str(item.get("path_text") or "").strip()]
+    state = str(item.get("reachability_status") or "not_analyzed")
+    if state == "reachable":
+        user_conclusion = "可能影响"
+        reason_code = "RUNTIME_VERIFICATION_REQUIRED"
+        user_reason = (
+            "已确认当前系统存在到该变化 API 的静态可执行调用关系；"
+            "是否在真实运行时触发兼容性问题仍需定向测试验证。"
+        )
+    elif state == "uncertain":
+        user_conclusion = "结论未确定（存在候选证据）" if paths else "结论未确定（静态分析能力边界）"
+        reason_code = "BINARY_REACHABILITY_UNCERTAIN"
+        user_reason = "存在候选证据或静态分析边界，当前不能确认实际影响。"
+    elif state == "not_found_in_static_analysis":
+        user_conclusion = "未发现调用路径"
+        reason_code = "NOT_FOUND_IN_STATIC_ANALYSIS"
+        user_reason = "当前完整静态范围内未发现调用路径；该结论不能解释为安全。"
+    else:
+        user_conclusion = "本次未完成分析"
+        reason_code = "BINARY_TRACE_NOT_ANALYZED"
+        user_reason = "二进制触达分析未形成可采用结果，不能解释为未受影响。"
+    api = str(item.get("api") or "")
+    api_signature = str(item.get("api_signature") or "")
+    old_version = str(change.get("old_version") or "")
+    new_version = str(change.get("new_version") or "")
+    business_entry = paths[0].split(" → ", 1)[0] if paths else ""
+    return {
+        **dict(item),
+        "api_identity": "|".join((
+            str(item.get("coord") or ""), api, api_signature,
+            str(item.get("symbol_kind") or ""), str(change.get("change_type") or ""),
+        )),
+        "old_version": old_version,
+        "new_version": new_version,
+        "api_name": api,
+        "api_simple": api.rsplit(".", 1)[-1],
+        "change_type": str(change.get("change_type") or ""),
+        "symbol_kind": str(change.get("symbol_kind") or item.get("symbol_kind") or ""),
+        "severity": str(change.get("severity") or "P1"),
+        "confirmed": str(change.get("confirmed") or "true"),
+        "source": str(change.get("source") or "binary_first"),
+        "analysis_status": state,
+        "uncertainty_kind": (
+            "candidate_evidence" if state == "uncertain" and paths
+            else "analysis_limitation" if state == "uncertain" else ""
+        ),
+        "reason_code": reason_code,
+        "reason": user_reason,
+        "reachable_note": user_reason,
+        "direct_callers": len(paths),
+        "business_reach_depth": max(len(paths[0].split(" → ")) - 1, 0) if paths else 0,
+        "dependency_chain_coords": [],
+        "call_paths": paths,
+        "path_details": [
+            {
+                "path_status": state,
+                "path_text": path,
+                "path_certainty": str(
+                    next((candidate.get("path_certainty") for candidate in item.get("paths") or [] if candidate.get("path_text") == path), "")
+                ),
+            }
+            for path in paths
+        ],
+        "evidence_paths": [],
+        "verification": ["执行相关单元测试、集成测试或运行时回归验证。"] if state == "reachable" else [],
+        "priority_score": 0,
+        "priority_factors": {},
+        "user_conclusion": user_conclusion,
+        "decision_bucket": "probable_impact" if state == "reachable" else state,
+        "user_reason": user_reason,
+        "recommended_action": (
+            "根据已定位调用关系执行定向回归验证。" if state == "reachable"
+            else "复核证据边界并补充缺失输入或测试。"
+        ),
+        "key_evidence": paths[0] if paths else "",
+        "business_entry": business_entry,
+        "change_summary": str(change.get("change_summary") or ""),
+        "review_reason": str(change.get("review_reason") or user_reason),
+    }
+
+
+def _legacy_alert_rows(items: list[dict[str, Any]]) -> list[dict[str, str]]:
+    rows = []
+    for item in items:
+        paths = list(item.get("call_paths") or []) or [""]
+        for index, path in enumerate(paths, start=1):
+            nodes = [part.strip() for part in str(path).split(" → ") if part.strip()]
+            entry = nodes[0] if nodes else str(item.get("business_entry") or "")
+            target = nodes[-1] if nodes else f"{item.get('api') or ''}{item.get('api_signature') or ''}"
+            identity = str(item.get("api_identity") or "")
+            digest = hashlib.sha1(f"{identity}|{path}|{index}".encode("utf-8")).hexdigest()[:12]
+            status = str(item.get("analysis_status") or "not_analyzed")
+            entry_prefix, separator, entry_signature = entry.partition("(")
+            entry_signature = f"({entry_signature}" if separator else ""
+            consumer_class, dot, consumer_method = entry_prefix.rpartition(".")
+            if not dot:
+                consumer_class, consumer_method = entry_prefix, ""
+            rows.append({
+                "conclusion": str(item.get("user_conclusion") or ""),
+                "change_summary": str(item.get("change_summary") or ""),
+                "review_reason": str(item.get("review_reason") or item.get("user_reason") or ""),
+                "chain_summary": (
+                    f"入口：{entry}；终点：{target}；{max(len(nodes) - 1, 0)} 次调用（{len(nodes)} 个节点）"
+                    if path else f"未形成完整链路；目标 API：{target}"
+                ),
+                "review_focus": str(item.get("recommended_action") or ""),
+                "chain_entry": entry,
+                "chain_target": target,
+                "chain_hop_count": str(max(len(nodes) - 1, 0)),
+                "chain_detail": " -> ".join(f"{position}. {node}" for position, node in enumerate(nodes, start=1)),
+                "api_identity": identity,
+                "path_id": f"PATH-{digest}",
+                "target_coord": str(item.get("coord") or ""),
+                "changed_symbol": str(item.get("api") or ""),
+                "api_signature": str(item.get("api_signature") or ""),
+                "symbol_kind": str(item.get("symbol_kind") or ""),
+                "compile_impact": str(item.get("static_linkage_status") or ""),
+                "runtime_link_impact": str(item.get("impact_conclusion") or ""),
+                "change_type": str(item.get("change_type") or ""),
+                "severity": str(item.get("severity") or "P1"),
+                "path_status": status,
+                "uncertainty_kind": str(item.get("uncertainty_kind") or ""),
+                "business_reachable": "true" if status == "reachable" else "unknown",
+                "entry_kind": "business_bytecode" if entry else "",
+                "reach_kind": "binary_executable_path" if path else "",
+                "business_entry": entry,
+                "consumer_coord": "业务制品" if entry else "",
+                "consumer_class": consumer_class,
+                "consumer_method": consumer_method,
+                "consumer_signature": entry_signature,
+                "path_text": str(path),
+                "path_occurrence_count": "1",
+                "evidence_files": ".runtime/binary_authority/active_binary_generation.json",
+                "detail_file": "",
+            })
+    return rows
+
+
+def _safe_detail_filename(item: Mapping[str, Any]) -> str:
+    identity = str(item.get("api_identity") or item.get("reported_api_identity") or "api")
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", identity).strip("_")[:96] or "api"
+    return f"{slug}_{hashlib.sha1(identity.encode('utf-8')).hexdigest()[:12]}.json"
+
+
+def _legacy_coverage(loaded: Mapping[str, Any]) -> dict[str, Any]:
+    def reason_codes(values: Any) -> list[str]:
+        result = []
+        for value in values or ():
+            if isinstance(value, Mapping):
+                code = str(value.get("reason_code") or value.get("code") or "").strip()
+            else:
+                code = str(value or "").strip()
+            if code and code not in result:
+                result.append(code)
+        return result
+
+    summary = dict(loaded.get("summary") or {})
+    binary = dict(loaded.get("coverage") or {})
+    decision_status = str(summary.get("decision_coverage_status") or "unknown")
+    trace_status = str(summary.get("trace_coverage_status") or "unknown")
+    components = [
+        {
+            "id": "binary_api_diff",
+            "status": "complete" if decision_status == "complete" else "partial",
+            "reason_codes": reason_codes(
+                summary.get("decision_coverage_gaps")
+                or binary.get("decision_coverage_gaps")
+            ),
+            "evidence": [".runtime/binary_authority/active_binary_generation.json"],
+        },
+        {
+            "id": "business_reachability",
+            "status": "complete" if trace_status == "complete" else "partial",
+            "reason_codes": reason_codes(
+                summary.get("trace_coverage_gaps")
+                or binary.get("trace_coverage_gaps")
+            ),
+            "evidence": ["evidence/call_chain/alerts.csv"],
+        },
+    ]
+    critical = [item["id"] for item in components if item["status"] != "complete"]
+    return {
+        "schema": "java-upgrade-analyzer.coverage.v1",
+        "overall_status": "complete" if not critical else "partial",
+        "critical_incomplete": critical,
+        "components": components,
+        "binary": binary,
+    }
+
+
 def publish_step5(
     report_dir: str | Path,
     output_dir: str | Path,
@@ -930,7 +1242,54 @@ def publish_step5(
     loaded = load_validated_generation(report_dir)
     source_usage = _source_usage_view(loaded)
     by_api = list(loaded["formal"].get("by_api") or ())
-    items = [_result_item(item) for item in by_api]
+    raw_items = [_result_item(item) for item in by_api]
+    _change_rows, change_lookup = _change_rows_by_result(report_dir)
+    projection_assessments = {
+        str(item.get("decision_identity") or ""): item
+        for item in loaded["projections"].get("authoritative_projection_assessments") or ()
+    }
+    changes_by_fact_identity = {}
+    for decision in loaded["decisions"].get("authoritative_change_facts") or ():
+        fact_identity = str(decision.get("change_fact_identity") or "")
+        assessment = projection_assessments.get(
+            str(decision.get("decision_identity") or ""), {}
+        )
+        if fact_identity and assessment.get("analysis_projection_status") == "targetable":
+            changes_by_fact_identity[fact_identity] = _product_change_row(
+                decision,
+                assessment,
+                evidence_path=".runtime/binary_authority/active_binary_generation.json",
+            )
+
+    def change_for(item: Mapping[str, Any]) -> dict[str, str]:
+        for fact_identity in item.get("contributing_change_fact_ids") or ():
+            exact_fact = changes_by_fact_identity.get(str(fact_identity or ""))
+            if exact_fact is not None:
+                return exact_fact
+        exact = change_lookup.get(_change_row_key(item))
+        if exact is not None:
+            return exact
+        coord = str(item.get("coord") or "")
+        api = str(item.get("api") or "")
+        kind = str(item.get("symbol_kind") or "")
+        same_kind = next(
+            (
+                row for key, row in change_lookup.items()
+                if key[0] == coord and key[1] == api and key[3] == kind
+            ),
+            {},
+        )
+        if same_kind:
+            return same_kind
+        return next(
+            (row for key, row in change_lookup.items() if key[0] == coord and key[1] == api),
+            {},
+        )
+
+    all_items = [
+        _legacy_result_item(item, change_for(item)) for item in raw_items
+    ]
+    items = list(all_items)
     selected_coord_set = {str(item).strip() for item in selected_coords if str(item).strip()}
     selected_name_set = {str(item).strip() for item in selected_names if str(item).strip()}
     if selected_coord_set or selected_name_set:
@@ -940,34 +1299,79 @@ def publish_step5(
             or item["coord"].split(":")[-1] in selected_name_set
         ]
     by_state = {
-        state: [item for item in items if item["reachability_status"] == state]
+        state: [item for item in items if item["analysis_status"] == state]
         for state in ("reachable", "uncertain", "not_found_in_static_analysis", "not_analyzed")
     }
     binary_summary = loaded["summary"]
+    dependency_rows = _read_csv_rows(
+        Path(report_dir).resolve() / "evidence" / "dependencies" / "dep_changes.csv"
+    )
+    all_dependency_coords = sorted({
+        str(row.get("coord") or row.get("comparison_key") or "").strip()
+        for row in dependency_rows
+        if str(row.get("coord") or row.get("comparison_key") or "").strip()
+    } | {item["coord"] for item in all_items})
+    if selected_coord_set or selected_name_set:
+        included_dependency_coords = sorted({
+            coord for coord in all_dependency_coords
+            if coord in selected_coord_set or coord.split(":")[-1] in selected_name_set
+        })
+    else:
+        included_dependency_coords = list(all_dependency_coords)
+    excluded_dependency_coords = sorted(
+        set(all_dependency_coords) - set(included_dependency_coords)
+    )
+    scope = {
+        "mode": "partial" if selected_coord_set or selected_name_set else "full",
+        "validation_status": "passed",
+        "selected_coords": sorted(selected_coord_set),
+        "selected_names": sorted(selected_name_set),
+        "included_dependency_coords": included_dependency_coords,
+        "excluded_dependency_coords": excluded_dependency_coords,
+        "available_dependency_count": len(all_dependency_coords),
+        "included_dependency_count": len(included_dependency_coords),
+        "total_api_count": len(all_items),
+        "analyzed_api_count": len(items),
+        "included_api_count": len(items),
+        "included_reported_api_identities": sorted(
+            str(item.get("reported_api_identity") or "") for item in items
+        ),
+        "excluded_api_count": len(all_items) - len(items),
+    }
     summary = {
         "schema": "java-upgrade-analyzer.binary-step5-summary.v1",
-        "status": "complete" if binary_summary.get("trace_coverage_status") == "complete" else "completed_with_limits",
+        "status": "done",
+        "skip_reason": "",
+        "origin_step": "step5",
         "authority": "binary_first",
         "result_generation_identity": loaded["manifest"]["result_generation_identity"],
         "analysis_context_identity": loaded["manifest"]["analysis_context_identity"],
         "total_apis": len(items),
         "reachable": len(by_state["reachable"]),
+        "not_impacted": 0,
         "uncertain": len(by_state["uncertain"]),
         "not_found_in_static_analysis": len(by_state["not_found_in_static_analysis"]),
         "not_analyzed": len(by_state["not_analyzed"]),
-        "analysis_scope": {
-            "mode": "partial" if selected_coord_set or selected_name_set else "full",
-            "selected_coords": sorted(selected_coord_set),
-            "selected_names": sorted(selected_name_set),
-            "included_reported_api_identities": sorted(
-                str(item.get("reported_api_identity") or "") for item in items
-            ),
-            "excluded_api_count": len(by_api) - len(items),
-        },
+        "analysis_scope": scope,
         "reachable_apis": by_state["reachable"],
+        "not_impacted_apis": [],
         "uncertain_apis": by_state["uncertain"],
         "not_found_apis": by_state["not_found_in_static_analysis"],
         "not_analyzed_apis": by_state["not_analyzed"],
+        "meta": {
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "total_apis": len(items),
+            "reachable": len(by_state["reachable"]),
+            "not_impacted": 0,
+            "uncertain": len(by_state["uncertain"]),
+            "not_analyzed": len(by_state["not_analyzed"]),
+            "not_found_in_static_analysis": len(by_state["not_found_in_static_analysis"]),
+            "tool": "binary_pipeline.py + binary_report.py",
+            "graph_stats": {
+                "truncated": binary_summary.get("trace_coverage_status") != "complete",
+                "truncation_reasons": list(binary_summary.get("trace_coverage_gaps") or ()),
+            },
+        },
         "formal_dimensions": {
             "reachability_status": ["reachable", "uncertain", "not_found_in_static_analysis", "not_analyzed"],
             "impact_conclusion": ["probable_impact", "inconclusive"],
@@ -988,6 +1392,7 @@ def publish_step5(
             ),
             "inconclusive": len(by_state["uncertain"]) + len(by_state["not_analyzed"]),
         },
+        "diagnostic_guidance": [],
         "candidate_diagnostics": {
             "fact_count": int(binary_summary.get("diagnostic_candidate_fact_count") or 0),
             "trace_result_count": int(binary_summary.get("candidate_trace_result_count") or 0),
@@ -999,42 +1404,57 @@ def publish_step5(
     output = Path(output_dir).resolve()
     def write(stage: Path) -> None:
         _atomic_json(stage / "summary.json", summary)
+        alert_rows = _legacy_alert_rows(items)
         with open_csv_write(stage / "alerts.csv") as handle:
-            fields = (
-                "coord", "base_dependency", "current_dependency", "api", "api_signature",
-                "target_coord", "changed_symbol", "path_status",
-                "reachability_status", "impact_conclusion", "static_linkage_status",
-                "runtime_verification_status", "path_set_complete",
-                "exact_path_exists", "possible_path_exists", "path_certainty", "path_text",
-                "reported_api_identity",
-            )
-            writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+            writer = csv.DictWriter(handle, fieldnames=LEGACY_ALERT_FIELDS, extrasaction="ignore")
             writer.writeheader()
-            writer.writerows(items)
+            writer.writerows(alert_rows)
+        for status in (
+            "reachable", "uncertain", "not_found_in_static_analysis", "not_analyzed"
+        ):
+            status_rows = [row for row in alert_rows if row["path_status"] == status]
+            if not status_rows:
+                continue
+            with open_csv_write(stage / f"alerts_{status}.csv") as handle:
+                writer = csv.DictWriter(handle, fieldnames=LEGACY_ALERT_FIELDS, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(status_rows)
         by_api_dir = stage / "by_api"
         by_api_dir.mkdir()
-        for index, item in enumerate(items):
-            _atomic_json(by_api_dir / f"{index:06d}.json", item)
-        dependency_counts: dict[str, dict[str, int]] = {}
+        for item in items:
+            _atomic_json(by_api_dir / _safe_detail_filename(item), item)
+        dependency_counts = {
+            coord: {
+                "total": 0,
+                "reachable": 0,
+                "uncertain": 0,
+                "not_found_in_static_analysis": 0,
+                "not_analyzed": 0,
+            }
+            for coord in included_dependency_coords
+        }
         for item in items:
             counts = dependency_counts.setdefault(item["coord"], {
-                "total": 0, "reachable": 0, "uncertain": 0,
-                "not_found_in_static_analysis": 0, "not_analyzed": 0,
+                "total": 0,
+                "reachable": 0,
+                "uncertain": 0,
+                "not_found_in_static_analysis": 0,
+                "not_analyzed": 0,
             })
             counts["total"] += 1
-            counts[str(item["reachability_status"])] += 1
+            counts[str(item["analysis_status"])] += 1
         lines = [
             "# 系统触达证据", "",
             "本报告按引起变化的依赖包汇总。完整筛选表见 `alerts.csv`，逐 API 证据见 `by_api/`。", "",
             f"- 变化 API：{summary['total_apis']}",
-            f"- 已发现路径：{summary['reachable']}",
+            f"- 已发现静态可执行路径：{summary['reachable']}",
             f"- 结论不确定：{summary['uncertain']}",
             f"- 静态范围内未发现路径：{summary['not_found_in_static_analysis']}",
             f"- 未完成分析：{summary['not_analyzed']}", "",
             f"- 源码选择：{source_usage['label']}",
             f"- 源码映射：{source_usage['mapped_count']} 个，覆盖状态 `{source_usage['coverage_status']}`", "",
             source_usage["effect"], "",
-            "`not_found_in_static_analysis` 不是已确认无影响。", "",
+            "`not_found_in_static_analysis` 不是已确认无影响；静态可执行路径也不等于已完成运行时验证。", "",
             "## 按依赖汇总", "",
             "| 依赖包 | API 数 | 已发现路径 | 不确定 | 未发现路径 | 未分析 |",
             "|---|---:|---:|---:|---:|---:|",
@@ -1047,6 +1467,28 @@ def publish_step5(
             )
         _atomic_text(stage / "summary.md", "\n".join(lines) + "\n")
     _stage_directory(output, write)
+    scope_path = Path(report_dir).resolve() / ".runtime" / "cache" / "step5_selection.json"
+    _atomic_json(scope_path, scope)
+    _atomic_json(
+        Path(report_dir).resolve() / ".runtime" / "coverage" / "s4_coverage.json",
+        _legacy_coverage(loaded),
+    )
+    binary_review = Path(report_dir).resolve() / "evidence" / "binary_analysis"
+    binary_review.mkdir(parents=True, exist_ok=True)
+    _atomic_text(
+        binary_review / "system-reachability.md",
+        "\n".join((
+            "# 二进制系统触达执行摘要", "",
+            "该文件记录新引擎执行信息；面向人工复核的正式结果仍从 `deliverables/report.md` 开始阅读。", "",
+            f"- 变化 API：{summary['total_apis']}",
+            f"- 已发现静态可执行路径：{summary['reachable']}",
+            f"- 结论不确定：{summary['uncertain']}",
+            f"- 未发现静态路径：{summary['not_found_in_static_analysis']}",
+            f"- 未完成分析：{summary['not_analyzed']}",
+            f"- 源码选择：{source_usage['label']}", "",
+            source_usage["effect"], "",
+        )),
+    )
     query_index = {
         "schema": "java-upgrade-analyzer.s5-query-index.v1",
         "authority": "binary_first",
@@ -1074,6 +1516,7 @@ def publish_step5(
         Path(report_dir).resolve() / ".runtime" / "indexes" / "s5_query_index.json",
         query_index,
     )
+    write_coverage_report(Path(report_dir).resolve())
     return {"phase": "step5", "api_count": len(items), "output_dir": str(output)}
 
 
@@ -1082,11 +1525,10 @@ def publish_step6(
     output_findings: str | Path,
     output_report: str | Path,
 ) -> dict[str, Any]:
-    loaded = load_validated_generation(report_dir)
-    source_usage = _source_usage_view(loaded)
-    by_api = list(loaded["formal"].get("by_api") or ())
-    rows = [_result_item(item) for item in by_api]
-    step5_summary_path = Path(report_dir).resolve() / "evidence" / "call_chain" / "summary.json"
+    """Render binary-first facts through the established human report contract."""
+    report_root = Path(report_dir).resolve()
+    loaded = load_validated_generation(report_root)
+    step5_summary_path = report_root / "evidence" / "call_chain" / "summary.json"
     step5_summary = _load_json(step5_summary_path)
     if step5_summary.get("result_generation_identity") != loaded["manifest"].get(
         "result_generation_identity"
@@ -1094,232 +1536,79 @@ def publish_step6(
         raise BinaryReportError(
             "BINARY_STEP5_GENERATION_MISMATCH", str(step5_summary_path)
         )
-    included_identities = set(
-        (step5_summary.get("analysis_scope") or {}).get("included_reported_api_identities") or ()
+
+    findings = s6_report.collect_findings(report_root)
+    findings["schema"] = "java-upgrade-analyzer.binary-findings.v2"
+    findings["authority"] = "binary_first"
+    findings["result_generation_identity"] = (
+        loaded["manifest"]["result_generation_identity"]
     )
-    all_dependency_coords = sorted({_result_item(item)["coord"] for item in by_api})
-    if (step5_summary.get("analysis_scope") or {}).get("mode") == "partial":
-        rows = [item for item in rows if item.get("reported_api_identity") in included_identities]
-    state = lambda value: [item for item in rows if item["reachability_status"] == value]
-    included_dependency_coords = sorted({item["coord"] for item in rows})
-    incomplete_dependency_coords = {
-        item["coord"] for item in rows
-        if item["reachability_status"] == "not_analyzed"
-    }
-    coverage_complete = (
-        loaded["summary"].get("decision_coverage_status") == "complete"
-        and loaded["summary"].get("trace_coverage_status") == "complete"
+    findings["analysis_context_identity"] = (
+        loaded["manifest"]["analysis_context_identity"]
     )
-    findings = {
-        "schema": "java-upgrade-analyzer.binary-findings.v1",
-        "authority": "binary_first",
-        "result_generation_identity": loaded["manifest"]["result_generation_identity"],
-        "analysis_context_identity": loaded["manifest"]["analysis_context_identity"],
-        "probable_impact": [item for item in rows if item["impact_conclusion"] == "probable_impact"],
-        "uncertain": state("uncertain"),
-        "not_analyzed": state("not_analyzed"),
-        "not_found": state("not_found_in_static_analysis"),
-        "diagnostics": list(loaded["candidate"].get("results") or ()),
-        "coverage": {
-            "overall_status": "complete" if coverage_complete else "partial",
-            "binary": loaded["coverage"],
-        },
-        "source_usage": source_usage,
-        "analysis_scope": {
-            "mode": (step5_summary.get("analysis_scope") or {}).get("mode") or "full",
-            "validation_status": "passed",
-            "selected_coords": list(
-                (step5_summary.get("analysis_scope") or {}).get("selected_coords") or ()
-            ),
-            "selected_names": list(
-                (step5_summary.get("analysis_scope") or {}).get("selected_names") or ()
-            ),
-            "included_dependency_coords": included_dependency_coords,
-            "included_dependency_count": len(included_dependency_coords),
-            "analyzed_dependency_count": len(
-                set(included_dependency_coords) - incomplete_dependency_coords
-            ),
-            "available_dependency_count": len(all_dependency_coords),
-            "total_api_count": len(by_api),
-            "included_api_count": len(rows),
-            "analyzed_api_count": sum(
-                item["reachability_status"] != "not_analyzed" for item in rows
-            ),
-        },
-        "artifacts": {
-            "binary_generation": str(loaded["generation"]),
-            "binary_formal_results": str(loaded["generation"] / "binary_formal_results.json"),
-            "binary_candidate_results": str(loaded["generation"] / "binary_candidate_results.json"),
-        },
-    }
-    findings_path = Path(output_findings).resolve()
-    report_path = Path(output_report).resolve()
-    _atomic_json(findings_path, findings)
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    by_dependency: dict[str, list[dict[str, Any]]] = {}
-    for item in rows:
-        by_dependency.setdefault(item["coord"], []).append(item)
-    lines = [
-        "# Java 升级二进制优先分析报告", "",
-        f"- Generation：`{loaded['manifest']['result_generation_identity']}`",
-        f"- Analysis context：`{loaded['manifest']['analysis_context_identity']}`",
-        f"- 独立验证：`{loaded['validation']['status']}`",
-        f"- 裁决覆盖：`{loaded['summary'].get('decision_coverage_status')}`",
-        f"- 触达覆盖：`{loaded['summary'].get('trace_coverage_status')}`",
-        f"- 源码选择：{source_usage['label']}",
-        f"- 源码映射：{source_usage['mapped_count']} 个，覆盖状态 `{source_usage['coverage_status']}`", "",
-        source_usage["effect"], "",
-        "## 正式四维结果", "",
-        f"- reachable：{len(state('reachable'))}",
-        f"- uncertain：{len(state('uncertain'))}",
-        f"- not_found_in_static_analysis：{len(state('not_found_in_static_analysis'))}",
-        f"- not_analyzed：{len(state('not_analyzed'))}",
-        f"- probable_impact：{len(findings['probable_impact'])}",
-        "- runtime verification：系统未执行，正式结果仅为 required_not_executed/undetermined", "",
-        "`not_found_in_static_analysis` 只表示在当前完整静态范围内未发现路径，不表示已确认无影响。", "",
-        "## 诊断候选", "",
-        f"候选事实与正式变化互斥；本代候选触达结果 {len(findings['diagnostics'])} 项。", "",
-        "## 按依赖查看影响", "",
-    ]
-    for coord in sorted(by_dependency):
-        lines.extend((f"### {coord}", ""))
-        for item in by_dependency[coord]:
-            lines.append(
-                f"- `{item['api']}{item['api_signature']}`：{item['reachability_status']} / "
-                f"{item['static_linkage_status']} / {item['impact_conclusion']} / "
-                f"{item['runtime_verification_status']}"
+    findings["source_usage"] = _source_usage_view(loaded)
+    findings["binary_dimensions"] = {
+        "reachability_status": {
+            state: sum(
+                item.get("reachability_status") == state
+                for item in (loaded["formal"].get("by_api") or ())
             )
-            if item["path_text"]:
-                lines.append(f"  - 关键路径：`{item['path_text']}`")
-        lines.append("")
-    _atomic_text(report_path, "\n".join(lines) + "\n")
+            for state in (
+                "reachable", "uncertain",
+                "not_found_in_static_analysis", "not_analyzed",
+            )
+        },
+        "impact_conclusion": {
+            "probable_impact": sum(
+                item.get("impact_conclusion") == "probable_impact"
+                for item in (loaded["formal"].get("by_api") or ())
+            ),
+            "inconclusive": sum(
+                item.get("impact_conclusion") != "probable_impact"
+                for item in (loaded["formal"].get("by_api") or ())
+            ),
+        },
+        "runtime_verification_status": "not_executed",
+    }
+    findings.setdefault("artifacts", {})
+    findings["artifacts"].update({
+        "binary_generation": str(loaded["generation"]),
+        "binary_formal_results": str(
+            loaded["generation"] / "binary_formal_results.json"
+        ),
+        "binary_candidate_results": str(
+            loaded["generation"] / "binary_candidate_results.json"
+        ),
+        "binary_change_review_md": "evidence/api_changes/review.md",
+        "source_analysis_review_md": "evidence/source_analysis/review.md",
+    })
 
-    dependency_lines = [
-        "# 全部受影响依赖", "",
-        "以下依赖至少包含一项运行时有效、可投影的变化。", "",
-        "| 依赖包 | 变化 API | 已发现路径 | 不确定 | 未发现路径 | 未分析 |",
-        "|---|---:|---:|---:|---:|---:|",
-    ]
-    for coord, items in sorted(by_dependency.items()):
-        count = lambda status: sum(item["reachability_status"] == status for item in items)
-        dependency_lines.append(
-            f"| `{coord}` | {len(items)} | {count('reachable')} | {count('uncertain')} | "
-            f"{count('not_found_in_static_analysis')} | {count('not_analyzed')} |"
-        )
-    if not by_dependency:
-        dependency_lines.append("| - | 0 | 0 | 0 | 0 | 0 |")
-    _atomic_text(
-        report_path.parent / "all-affected-dependencies.md",
-        "\n".join(dependency_lines) + "\n",
+    report_path = Path(output_report).resolve()
+    findings_path = Path(output_findings).resolve()
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    s6_report.cleanup_legacy_s6_detail_artifacts(report_root)
+    findings["artifacts"].update(
+        s6_report.write_changed_api_split_artifacts(report_root)
     )
-    dependency_csv_fields = (
-        "coord", "base_dependencies", "current_dependencies", "changed_api_count",
-        "reachable", "uncertain", "not_found_in_static_analysis", "not_analyzed",
-        "probable_impact", "analysis_complete",
+    findings["artifacts"]["analysis_scope_md"] = (
+        s6_report.write_analysis_scope_artifact(report_root, findings)
     )
-    with open_csv_write(report_path.parent / "all-affected-dependencies.csv") as handle:
-        writer = csv.DictWriter(handle, fieldnames=dependency_csv_fields)
-        writer.writeheader()
-        for coord, items in sorted(by_dependency.items()):
-            writer.writerow({
-                "coord": coord,
-                "base_dependencies": "|".join(sorted({
-                    item["base_dependency"] for item in items
-                    if item["base_dependency"] != "-"
-                })) or "-",
-                "current_dependencies": "|".join(sorted({
-                    item["current_dependency"] for item in items
-                    if item["current_dependency"] != "-"
-                })) or "-",
-                "changed_api_count": len(items),
-                "reachable": sum(item["reachability_status"] == "reachable" for item in items),
-                "uncertain": sum(item["reachability_status"] == "uncertain" for item in items),
-                "not_found_in_static_analysis": sum(
-                    item["reachability_status"] == "not_found_in_static_analysis"
-                    for item in items
-                ),
-                "not_analyzed": sum(
-                    item["reachability_status"] == "not_analyzed" for item in items
-                ),
-                "probable_impact": sum(
-                    item["impact_conclusion"] == "probable_impact" for item in items
-                ),
-                "analysis_complete": str(all(
-                    item["reachability_status"] != "not_analyzed" for item in items
-                )).lower(),
-            })
-
-    detail_lines = ["# 全部影响明细", ""]
-    for coord in sorted(by_dependency):
-        detail_lines.extend((f"## {coord}", ""))
-        for item in by_dependency[coord]:
-            detail_lines.extend((
-                f"### {item['api']}{item['api_signature']}", "",
-                f"- 升级前制品：`{item['base_dependency']}`",
-                f"- 升级后制品：`{item['current_dependency']}`",
-                f"- 触达状态：`{item['reachability_status']}`",
-                f"- 静态链接：`{item['static_linkage_status']}`",
-                f"- 影响结论：`{item['impact_conclusion']}`",
-                f"- 运行时验证：`{item['runtime_verification_status']}`",
-                f"- 路径集合完整：`{str(item['path_set_complete']).lower()}`",
-                (
-                    f"- 关键路径：`{item['path_text']}`"
-                    if item["path_text"] else "- 关键路径：当前静态范围内没有可展示路径"
-                ),
-                "",
-            ))
-            if item["paths"]:
-                detail_lines.extend(("| 路径确定性 | 调用路径 |", "|---|---|"))
-                detail_lines.extend(
-                    f"| {path.get('path_certainty') or '-'} | "
-                    f"`{path.get('path_text') or '-'}` |"
-                    for path in item["paths"]
-                )
-                detail_lines.append("")
-    _atomic_text(
-        report_path.parent / "all-impact-details.md",
-        "\n".join(detail_lines) + "\n",
+    diagnostic_detail = s6_report.write_diagnostic_detail_artifact(
+        report_root, findings
     )
-    impact_csv_fields = (
-        "coord", "base_dependency", "current_dependency", "api", "api_signature",
-        "symbol_kind", "reachability_status", "static_linkage_status",
-        "impact_conclusion", "runtime_verification_status", "path_set_complete",
-        "path_certainty", "key_path", "all_paths", "reported_api_identity",
+    if diagnostic_detail:
+        findings["artifacts"]["diagnostic_detail_md"] = diagnostic_detail
+    primary_artifacts, _api_model, _dependency_model = (
+        s6_report.write_primary_report_artifacts(report_root, findings)
     )
-    with open_csv_write(report_path.parent / "all-impact-details.csv") as handle:
-        writer = csv.DictWriter(
-            handle, fieldnames=impact_csv_fields, extrasaction="ignore"
-        )
-        writer.writeheader()
-        for item in rows:
-            writer.writerow({
-                **item,
-                "key_path": item["path_text"],
-                "all_paths": "\n".join(
-                    f"[{path.get('path_certainty') or '-'}] {path.get('path_text') or '-'}"
-                    for path in item["paths"]
-                ),
-            })
-    scope_lines = [
-        "# 分析范围与结论边界", "",
-        f"- Analysis context：`{loaded['manifest']['analysis_context_identity']}`",
-        f"- Result generation：`{loaded['manifest']['result_generation_identity']}`",
-        f"- 独立验证：`{loaded['validation']['status']}`",
-        f"- 裁决覆盖：`{loaded['summary'].get('decision_coverage_status')}`",
-        f"- 触达覆盖：`{loaded['summary'].get('trace_coverage_status')}`",
-        f"- 源码选择：{source_usage['label']}",
-        f"- 源码选择来源：`{source_usage['decision_source']}`",
-        f"- 源码覆盖：`{source_usage['coverage_status']}`",
-        f"- 已映射方法：{source_usage['mapped_count']}", "",
-        source_usage["effect"], "",
-        "本报告仅基于已验证的二进制变化事实与静态可执行边，给出静态触达与可能影响结论；运行时行为不在本次分析边界内。", "",
-    ]
-    _atomic_text(
-        report_path.parent / "analysis-scope.md",
-        "\n".join(scope_lines),
-    )
-    return {"phase": "step6", "api_count": len(rows), "report": str(report_path)}
-
+    findings["artifacts"].update(primary_artifacts)
+    _atomic_json(findings_path, findings)
+    _atomic_text(report_path, s6_report.generate_report(findings))
+    return {
+        "phase": "step6",
+        "api_count": int(findings.get("call_chain_target_count") or 0),
+        "report": str(report_path),
+    }
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Publish validated binary generation reports")

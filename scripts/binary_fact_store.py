@@ -240,7 +240,7 @@ class BinaryFactStore:
                         instance.runtime_code_source_origin_identity,
                         snapshot.inventory_digest,
                         snapshot.parser_identity,
-                        snapshot.comparison_coverage_status,
+                        snapshot.class_fact_coverage_status,
                     ),
                 )
                 for entry in snapshot.entries:
