@@ -3580,6 +3580,10 @@ def _validate_closed_world_results(
         set(coverage.get("trace_coverage_gaps") or ())
         - set(semantic_payload.get("coverage_gaps") or ())
         - decision_gap_union
+        - {
+            "trace_path_enumeration_limit_exceeded",
+            "trace_node_limit_exceeded",
+        }
     )
     formal_payload = _load_json(generation / "binary_formal_results.json")
     formal_results = list(formal_payload.get("results") or ())

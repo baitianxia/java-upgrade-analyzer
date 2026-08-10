@@ -354,6 +354,185 @@ public class demo.ArrayCasts {
             },
         }
 
+    def test_trace_preserves_independent_entrypoint_paths_for_one_changed_api(self):
+        def target(label, value):
+            return self._compile_sources_jar(label, {
+                "lib/Api.java": (
+                    "package lib; public class Api { public int changed() { "
+                    f"return {value}; }} }}"
+                ),
+            })
+
+        base_target = target("multi-path-base", 1)
+        current_target = target("multi-path-current", 2)
+        business = self._compile_sources_jar("multi-path-business", {
+            "biz/Shared.java": (
+                "package biz; public class Shared { public int call() { "
+                "return new lib.Api().changed(); } }"
+            ),
+            "biz/First.java": (
+                "package biz; public class First { public int run() { "
+                "return new Shared().call(); } }"
+            ),
+            "biz/Second.java": (
+                "package biz; public class Second { public int run() { "
+                "return new Shared().call(); } }"
+            ),
+        }, classpath=(current_target,))
+
+        def side(target_jar, version):
+            result = self._side(target_jar, version)
+            result["artifacts"] = [{
+                "path": str(business),
+                "logical_location": "app/business.jar",
+                "loader_realm": "application-loader",
+                "path_kind": "business_classes",
+                "slot": 0,
+                "coord": "com.acme:application:1",
+                "lineage": "com.acme:application",
+                "runtime_code_source_origin_identity": "multi-path-business",
+            }, {
+                "path": str(target_jar),
+                "logical_location": "lib/target.jar",
+                "loader_realm": "application-loader",
+                "path_kind": "classpath",
+                "slot": 1,
+                "coord": f"com.acme:target:{version}",
+                "lineage": "com.acme:target",
+                "runtime_code_source_origin_identity": "multi-path-target",
+            }]
+            result["runtime_profile"]["business_entrypoint_profile"] = {
+                "coverage_status": "complete",
+                "methods": [{
+                    "initiating_loader_realm_identity": "application-loader",
+                    "class_name": class_name,
+                    "member_name": "run",
+                    "descriptor": "()I",
+                } for class_name in ("biz/First", "biz/Second")],
+            }
+            return result
+
+        config = {
+            "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+            "source_usage": {
+                "decision": "skip_source", "decision_source": "explicit_config",
+            },
+            "asm_jar": str(self.asm_jar),
+            "base": side(base_target, "1"),
+            "current": side(current_target, "2"),
+            "runtime_comparison": {
+                "controlled_profile_fields": ["loader_topology"],
+                "declared_upgrade_payload_scope": ["artifact-bytes"],
+            },
+        }
+        result = run_pipeline(config, output_root=self.root / "multi-path-report")
+        generation = Path(result["generation_directory"])
+        formal = json.loads(
+            (generation / "binary_formal_results.json").read_text(encoding="utf-8")
+        )["by_api"]
+        changed = next(
+            item for item in formal
+            if item["display_owner"] == "lib/Api"
+            and item["display_member"] == "changed"
+        )
+        self.assertTrue(changed["path_set_complete"])
+        self.assertEqual(len(changed["paths"]), 2)
+        self.assertEqual(
+            {
+                path["path_text"].split(" → ", 1)[0]
+                for path in changed["paths"]
+            },
+            {"biz.First.run()", "biz.Second.run()"},
+        )
+
+    def test_path_budget_does_not_hide_exact_or_downgrade_unrelated_result(self):
+        def target(label, changed_value, unused_value):
+            return self._compile_sources_jar(label, {
+                "lib/Api.java": (
+                    "package lib; public class Api { "
+                    f"public int changed() {{ return {changed_value}; }} "
+                    f"public int unused() {{ return {unused_value}; }} }}"
+                ),
+            })
+
+        base_target = target("path-budget-base", 1, 10)
+        current_target = target("path-budget-current", 2, 20)
+        method_names = [f"run{index:02d}" for index in range(21)]
+        business = self._compile_sources_jar("path-budget-business", {
+            "biz/Entrypoints.java": (
+                "package biz; public class Entrypoints { "
+                + " ".join(
+                    f"public int {name}() {{ return new lib.Api().changed(); }}"
+                    for name in method_names
+                )
+                + " }"
+            ),
+        }, classpath=(current_target,))
+
+        def side(target_jar, version):
+            result = self._side(target_jar, version)
+            result["artifacts"] = [{
+                "path": str(business),
+                "logical_location": "app/business.jar",
+                "loader_realm": "application-loader",
+                "path_kind": "business_classes",
+                "slot": 0,
+                "coord": "com.acme:application:1",
+                "lineage": "com.acme:application",
+                "runtime_code_source_origin_identity": "path-budget-business",
+            }, {
+                "path": str(target_jar),
+                "logical_location": "lib/target.jar",
+                "loader_realm": "application-loader",
+                "path_kind": "classpath",
+                "slot": 1,
+                "coord": f"com.acme:target:{version}",
+                "lineage": "com.acme:target",
+                "runtime_code_source_origin_identity": "path-budget-target",
+            }]
+            result["runtime_profile"]["business_entrypoint_profile"] = {
+                "coverage_status": "complete",
+                "methods": [{
+                    "initiating_loader_realm_identity": "application-loader",
+                    "class_name": "biz/Entrypoints",
+                    "member_name": name,
+                    "descriptor": "()I",
+                } for name in method_names],
+            }
+            return result
+
+        result = run_pipeline({
+            "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+            "source_usage": {
+                "decision": "skip_source", "decision_source": "explicit_config",
+            },
+            "asm_jar": str(self.asm_jar),
+            "base": side(base_target, "1"),
+            "current": side(current_target, "2"),
+            "runtime_comparison": {
+                "controlled_profile_fields": ["loader_topology"],
+                "declared_upgrade_payload_scope": ["artifact-bytes"],
+            },
+        }, output_root=self.root / "path-budget-report")
+        generation = Path(result["generation_directory"])
+        formal = json.loads(
+            (generation / "binary_formal_results.json").read_text(encoding="utf-8")
+        )["by_api"]
+        changed = next(
+            item for item in formal if item["display_member"] == "changed"
+        )
+        unused = next(
+            item for item in formal if item["display_member"] == "unused"
+        )
+        self.assertEqual(changed["reachability_status"], "reachable")
+        self.assertTrue(changed["exact_path_exists"])
+        self.assertFalse(changed["path_set_complete"])
+        self.assertEqual(len(changed["paths"]), 20)
+        self.assertEqual(
+            unused["reachability_status"], "not_found_in_static_analysis"
+        )
+        self.assertTrue(unused["path_set_complete"])
+
     def _automatic_scheduled_entry_fixture(self, *, include_activation_resource=True):
         def compile_core(label, value):
             source = self.root / label / "src" / "api" / "Api.java"

@@ -309,8 +309,8 @@ class BinaryTraceEngine:
 
     def _prepare_batch_graph(self):
         exact = defaultdict(set)
+        possible = defaultdict(set)
         all_edges = defaultdict(set)
-        forward_rows = defaultdict(list)
         nodes = set(self.entrypoints)
         effective_edge_count = 0
         possible_edge_count = 0
@@ -324,45 +324,33 @@ class BinaryTraceEngine:
                 if incoming["certainty"] == "exact":
                     exact[caller].add(target)
                 else:
+                    possible[caller].add(target)
                     possible_edge_count += 1
-                forward_rows[caller].append({
-                    **incoming,
-                    "target_member_identity": target,
-                })
-        for caller in forward_rows:
-            forward_rows[caller].sort(key=lambda item: (
-                item["target_member_identity"],
-                item["certainty"],
-                item["direct_edge_identity"],
-            ))
-        self.path_state_predecessor = {}
-        self.path_state_root = {}
-        queue = deque()
-        for root in sorted(self.exact_entrypoints):
-            state = (root, False)
-            self.path_state_predecessor[state] = None
-            self.path_state_root[state] = (root, False)
-            queue.append(state)
-        for root in sorted(self.possible_entrypoints):
-            state = (root, True)
-            self.path_state_predecessor[state] = None
-            self.path_state_root[state] = (root, True)
-            queue.append(state)
-        while queue:
-            state = queue.popleft()
-            node, contains_possible = state
-            for transition in forward_rows.get(node, ()):
-                next_state = (
-                    transition["target_member_identity"],
-                    contains_possible or transition["certainty"] == "possible",
-                )
-                if next_state in self.path_state_predecessor:
-                    continue
-                self.path_state_predecessor[next_state] = (state, transition)
-                self.path_state_root[next_state] = self.path_state_root[state]
-                queue.append(next_state)
         self.exact_reachable_nodes = self._reachable(self.exact_entrypoints, exact)
         self.possible_reachable_nodes = self._reachable(self.entrypoints, all_edges)
+        certainty_states = {
+            (root, False) for root in self.exact_entrypoints
+        }
+        certainty_states.update(
+            (root, True) for root in self.possible_entrypoints
+        )
+        certainty_queue = deque(sorted(certainty_states))
+        while certainty_queue:
+            node, contains_possible = certainty_queue.popleft()
+            for target in exact.get(node, ()):
+                state = (target, contains_possible)
+                if state not in certainty_states:
+                    certainty_states.add(state)
+                    certainty_queue.append(state)
+            for target in possible.get(node, ()):
+                state = (target, True)
+                if state not in certainty_states:
+                    certainty_states.add(state)
+                    certainty_queue.append(state)
+        self.possible_path_nodes = {
+            node for node, contains_possible in certainty_states
+            if contains_possible
+        }
         exact_scc_count, exact_largest = self._scc_count(nodes, exact)
         possible_scc_count, possible_largest = self._scc_count(nodes, all_edges)
         self.graph_stats = {
@@ -384,7 +372,7 @@ class BinaryTraceEngine:
             "exact_largest_scc_size": exact_largest,
             "possible_scc_count": possible_scc_count,
             "possible_largest_scc_size": possible_largest,
-            "path_enumeration": "shared_two-certainty-shortest-path-forest-v2",
+            "path_enumeration": "shared-reachability-bounded-complete-consumer-bfs-v3",
         }
         self.batch_graph_identity = _identity(
             "binary_batch_trace_graph_identity", self.graph_stats
@@ -449,32 +437,16 @@ class BinaryTraceEngine:
             result = (paths, gaps)
             self._trace_cache[target_nodes] = result
             return result
-        states = [
-            (target, contains_possible)
-            for target in target_nodes
-            for contains_possible in (False, True)
-            if (target, contains_possible) in self.path_state_predecessor
-        ]
-        if len(states) > self.max_paths_per_target:
-            states = states[:self.max_paths_per_target]
-            gaps.append("trace_path_enumeration_limit_exceeded")
-        for state in states:
-            root, root_possible = self.path_state_root[state]
-            transitions = []
-            cursor = state
-            while self.path_state_predecessor[cursor] is not None:
-                predecessor, transition = self.path_state_predecessor[cursor]
-                transitions.append(transition)
-                cursor = predecessor
-            transitions.reverse()
-            root_certainty = "possible" if root_possible else "exact"
+        def materialize_path(node, suffix, recorded_certainty):
+            root_certainty = (
+                "possible" if node in self.possible_entrypoints else "exact"
+            )
             root_records = [
-                item for item in self.entrypoint_records_by_member.get(root, ())
+                item for item in self.entrypoint_records_by_member.get(node, ())
                 if item.get("path_certainty") == root_certainty
             ]
-            recorded_certainty = "possible" if state[1] else "exact"
             path_edges = []
-            for item in transitions:
+            for item in reversed(suffix):
                 edge = (
                     self.edges.get(item["direct_edge_identity"])
                     or self.semantic_edges.get(item["direct_edge_identity"])
@@ -482,8 +454,7 @@ class BinaryTraceEngine:
                 )
                 caller = self.members.get(item["caller_member_identity"]) or {}
                 path_edges.append({
-                    **{key: value for key, value in item.items()
-                       if key != "target_member_identity"},
+                    **item,
                     "caller_class_name": str(caller.get("class_name") or ""),
                     "caller_member_name": str(caller.get("member_name") or ""),
                     "caller_descriptor": str(caller.get("descriptor") or ""),
@@ -498,14 +469,16 @@ class BinaryTraceEngine:
                     "bytecode_offset": edge.get("bytecode_offset"),
                     "symbolic_owner": str(edge.get("symbolic_owner") or ""),
                     "symbolic_name": str(edge.get("symbolic_name") or ""),
-                    "symbolic_descriptor": str(edge.get("symbolic_descriptor") or ""),
+                    "symbolic_descriptor": str(
+                        edge.get("symbolic_descriptor") or ""
+                    ),
                     "semantic_evidence": dict(edge.get("evidence") or {}),
                     "target_dependency_coord": str(
                         edge.get("target_dependency_coord") or ""
                     ),
                 })
             path_identity = _identity("binary_trace_path_identity", {
-                "entrypoint_member_identity": root,
+                "entrypoint_member_identity": node,
                 "entrypoint_record_identities": [
                     item["entrypoint_record_identity"] for item in root_records
                 ],
@@ -515,14 +488,85 @@ class BinaryTraceEngine:
                 ],
                 "path_certainty": recorded_certainty,
             })
-            paths.append({
+            return {
                 "path_identity": path_identity,
-                "entrypoint_member_identity": root,
+                "entrypoint_member_identity": node,
                 "entrypoint_records": [dict(item) for item in root_records],
                 "target_nodes": list(target_nodes),
                 "path_certainty": recorded_certainty,
                 "edges": path_edges,
-            })
+            }
+
+        def enumerate_paths(*, exact_only, limit):
+            if limit <= 0:
+                return [], False
+            queue = deque((target, [], "exact") for target in target_nodes)
+            queued_states = {
+                target if exact_only else (target, "exact")
+                for target in target_nodes
+            }
+            found = []
+            visited_states = 0
+            while queue and len(found) < limit:
+                node, suffix, certainty = queue.popleft()
+                visited_states += 1
+                if visited_states > self.max_visited_nodes:
+                    gaps.append("trace_node_limit_exceeded")
+                    break
+                if node in self.entrypoints:
+                    root_certainty = (
+                        "possible"
+                        if node in self.possible_entrypoints
+                        else "exact"
+                    )
+                    recorded_certainty = (
+                        "possible"
+                        if "possible" in {certainty, root_certainty}
+                        else "exact"
+                    )
+                    if (
+                        (exact_only and recorded_certainty == "exact")
+                        or (not exact_only and recorded_certainty == "possible")
+                    ):
+                        found.append(materialize_path(
+                            node, suffix, recorded_certainty
+                        ))
+                for incoming in self.reverse.get(node, ()):
+                    if exact_only and incoming["certainty"] != "exact":
+                        continue
+                    caller = incoming["caller_member_identity"]
+                    next_certainty = (
+                        "possible"
+                        if "possible" in {certainty, incoming["certainty"]}
+                        else "exact"
+                    )
+                    state = caller if exact_only else (caller, next_certainty)
+                    if state in queued_states:
+                        continue
+                    queued_states.add(state)
+                    queue.append((
+                        caller, suffix + [incoming], next_certainty,
+                    ))
+            return found, bool(queue)
+
+        if any(node in self.exact_reachable_nodes for node in target_nodes):
+            exact_paths, exact_incomplete = enumerate_paths(
+                exact_only=True, limit=self.max_paths_per_target,
+            )
+            paths.extend(exact_paths)
+            if exact_incomplete:
+                gaps.append("trace_path_enumeration_limit_exceeded")
+        remaining = self.max_paths_per_target - len(paths)
+        if (
+            remaining > 0
+            and any(node in self.possible_path_nodes for node in target_nodes)
+        ):
+            possible_paths, possible_incomplete = enumerate_paths(
+                exact_only=False, limit=remaining,
+            )
+            paths.extend(possible_paths)
+            if possible_incomplete:
+                gaps.append("trace_path_enumeration_limit_exceeded")
         paths.sort(key=lambda item: (
             item["path_certainty"],
             item["entrypoint_member_identity"],
