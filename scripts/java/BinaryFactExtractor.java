@@ -457,6 +457,14 @@ public final class BinaryFactExtractor {
     }
 
     private static Object constant(Object value) {
+        if (value instanceof Float number && !Float.isFinite(number)) return linked(
+            "kind", "non_finite_float", "value", floatingValue(number),
+            "raw_bits", String.format(Locale.ROOT, "%08x", Float.floatToRawIntBits(number))
+        );
+        if (value instanceof Double number && !Double.isFinite(number)) return linked(
+            "kind", "non_finite_double", "value", floatingValue(number),
+            "raw_bits", String.format(Locale.ROOT, "%016x", Double.doubleToRawLongBits(number))
+        );
         if (value == null || value instanceof String || value instanceof Number || value instanceof Boolean) return value;
         if (value instanceof Type type) return linked("kind", "type", "descriptor", type.getDescriptor());
         if (value instanceof Handle handle) return linked(
@@ -470,6 +478,12 @@ public final class BinaryFactExtractor {
                 "bootstrap", constant(dynamic.getBootstrapMethod()), "arguments", args);
         }
         return linked("kind", value.getClass().getName(), "value", String.valueOf(value));
+    }
+
+    private static String floatingValue(Number number) {
+        double value = number.doubleValue();
+        if (Double.isNaN(value)) return "nan";
+        return value > 0 ? "positive_infinity" : "negative_infinity";
     }
 
     private static List<Object> constants(Object[] values) { List<Object> result = new ArrayList<>(); for (Object value : values) result.add(constant(value)); return result; }

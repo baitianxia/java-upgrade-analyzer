@@ -52,6 +52,7 @@ class BinaryTraceEngine:
         *,
         entrypoint_discovery: BinaryEntrypointDiscoveryResult | None = None,
         inline_overlay: Any | None = None,
+        semantic_overlay: Any | None = None,
         max_visited_nodes: int = 1_000_000,
         max_paths_per_target: int = 20,
     ):
@@ -62,8 +63,13 @@ class BinaryTraceEngine:
         self.max_visited_nodes = max_visited_nodes
         self.max_paths_per_target = max_paths_per_target
         self.inline_overlay = inline_overlay
+        self.semantic_overlay = semantic_overlay
         self.members = {row["member_identity"]: row for row in store.rows("members")}
         self.edges = {row["direct_edge_identity"]: row for row in store.rows("direct_edges")}
+        self.semantic_edges = {
+            row["semantic_edge_identity"]: row
+            for row in getattr(semantic_overlay, "rows", ())
+        }
         self.providers = {
             (item["initiating_loader_realm_identity"], item["class_name"]): item
             for item in reconciliation.provider_bindings
@@ -218,6 +224,21 @@ class BinaryTraceEngine:
                 "dispatch_resolution_identity": "",
                 "inline_overlay_identity": record["inline_overlay_identity"],
             })
+        for record in self.semantic_edges.values():
+            caller = str(record.get("caller_member_identity") or "")
+            target = str(record.get("target_member_identity") or "")
+            if not caller or not target:
+                continue
+            self.reverse[target].append({
+                "caller_member_identity": caller,
+                "direct_edge_identity": record["semantic_edge_identity"],
+                "certainty": (
+                    "exact" if record.get("path_certainty") == "exact" else "possible"
+                ),
+                "member_resolution_identity": "",
+                "dispatch_resolution_identity": "",
+                "semantic_edge_identity": record["semantic_edge_identity"],
+            })
         for target in self.reverse:
             self.reverse[target].sort(
                 key=lambda item: (
@@ -289,6 +310,7 @@ class BinaryTraceEngine:
     def _prepare_batch_graph(self):
         exact = defaultdict(set)
         all_edges = defaultdict(set)
+        forward_rows = defaultdict(list)
         nodes = set(self.entrypoints)
         effective_edge_count = 0
         possible_edge_count = 0
@@ -303,6 +325,42 @@ class BinaryTraceEngine:
                     exact[caller].add(target)
                 else:
                     possible_edge_count += 1
+                forward_rows[caller].append({
+                    **incoming,
+                    "target_member_identity": target,
+                })
+        for caller in forward_rows:
+            forward_rows[caller].sort(key=lambda item: (
+                item["target_member_identity"],
+                item["certainty"],
+                item["direct_edge_identity"],
+            ))
+        self.path_state_predecessor = {}
+        self.path_state_root = {}
+        queue = deque()
+        for root in sorted(self.exact_entrypoints):
+            state = (root, False)
+            self.path_state_predecessor[state] = None
+            self.path_state_root[state] = (root, False)
+            queue.append(state)
+        for root in sorted(self.possible_entrypoints):
+            state = (root, True)
+            self.path_state_predecessor[state] = None
+            self.path_state_root[state] = (root, True)
+            queue.append(state)
+        while queue:
+            state = queue.popleft()
+            node, contains_possible = state
+            for transition in forward_rows.get(node, ()):
+                next_state = (
+                    transition["target_member_identity"],
+                    contains_possible or transition["certainty"] == "possible",
+                )
+                if next_state in self.path_state_predecessor:
+                    continue
+                self.path_state_predecessor[next_state] = (state, transition)
+                self.path_state_root[next_state] = self.path_state_root[state]
+                queue.append(next_state)
         self.exact_reachable_nodes = self._reachable(self.exact_entrypoints, exact)
         self.possible_reachable_nodes = self._reachable(self.entrypoints, all_edges)
         exact_scc_count, exact_largest = self._scc_count(nodes, exact)
@@ -312,6 +370,10 @@ class BinaryTraceEngine:
             "node_count": len(nodes),
             "effective_edge_count": effective_edge_count,
             "possible_edge_count": possible_edge_count,
+            "runtime_semantic_edge_count": len(self.semantic_edges),
+            "runtime_semantic_overlay_identity": str(
+                getattr(self.semantic_overlay, "identity", "") or ""
+            ),
             "entrypoint_count": len(self.entrypoints),
             "exact_entrypoint_count": len(self.exact_entrypoints),
             "possible_entrypoint_count": len(self.possible_entrypoints),
@@ -322,7 +384,7 @@ class BinaryTraceEngine:
             "exact_largest_scc_size": exact_largest,
             "possible_scc_count": possible_scc_count,
             "possible_largest_scc_size": possible_largest,
-            "path_enumeration": "per-unique-target-set-cached-canonical-bfs",
+            "path_enumeration": "shared_two-certainty-shortest-path-forest-v2",
         }
         self.batch_graph_identity = _identity(
             "binary_batch_trace_graph_identity", self.graph_stats
@@ -387,80 +449,80 @@ class BinaryTraceEngine:
             result = (paths, gaps)
             self._trace_cache[target_nodes] = result
             return result
-        queue = deque((target, [], "exact", frozenset({target})) for target in target_nodes)
-        visited_states = 0
-        while queue and len(paths) < self.max_paths_per_target:
-            node, suffix, certainty, seen = queue.popleft()
-            visited_states += 1
-            if visited_states > self.max_visited_nodes:
-                gaps.append("trace_node_limit_exceeded")
-                break
-            if node in self.entrypoints:
-                root_certainty = (
-                    "possible" if node in self.possible_entrypoints else "exact"
-                )
-                root_records = [
-                    item for item in self.entrypoint_records_by_member.get(node, ())
-                    if item.get("path_certainty") == root_certainty
-                ]
-                certainty = (
-                    "possible" if "possible" in {certainty, root_certainty} else "exact"
-                )
-                path_edges = []
-                for item in reversed(suffix):
-                    edge = self.edges.get(item["direct_edge_identity"]) or {}
-                    caller = self.members.get(item["caller_member_identity"]) or {}
-                    path_edges.append({
-                        **item,
-                        "caller_class_name": str(caller.get("class_name") or ""),
-                        "caller_member_name": str(caller.get("member_name") or ""),
-                        "caller_descriptor": str(caller.get("descriptor") or ""),
-                        "caller_artifact_instance_identity": str(
-                            edge.get("caller_artifact_instance_identity") or ""
-                        ),
-                        "edge_kind": str(edge.get("edge_kind") or ""),
-                        "bytecode_offset": edge.get("bytecode_offset"),
-                        "symbolic_owner": str(edge.get("symbolic_owner") or ""),
-                        "symbolic_name": str(edge.get("symbolic_name") or ""),
-                        "symbolic_descriptor": str(edge.get("symbolic_descriptor") or ""),
-                    })
-                path_identity = _identity("binary_trace_path_identity", {
-                    "entrypoint_member_identity": node,
-                    "entrypoint_record_identities": [
-                        item["entrypoint_record_identity"]
-                        for item in root_records
-                    ],
-                    "target_nodes": list(target_nodes),
-                    "edge_identities": [item["direct_edge_identity"] for item in path_edges],
-                    "path_certainty": certainty,
-                })
-                paths.append({
-                    "path_identity": path_identity,
-                    "entrypoint_member_identity": node,
-                    "entrypoint_records": [
-                        dict(item)
-                        for item in root_records
-                    ],
-                    "target_nodes": list(target_nodes),
-                    "path_certainty": certainty,
-                    "edges": path_edges,
-                })
-                continue
-            for incoming in self.reverse.get(node, ()):
-                caller = incoming["caller_member_identity"]
-                if caller in seen:
-                    continue
-                next_certainty = (
-                    "possible" if "possible" in {certainty, incoming["certainty"]} else "exact"
-                )
-                queue.append((
-                    caller,
-                    suffix + [incoming],
-                    next_certainty,
-                    seen | {caller},
-                ))
-        if queue and len(paths) >= self.max_paths_per_target:
+        states = [
+            (target, contains_possible)
+            for target in target_nodes
+            for contains_possible in (False, True)
+            if (target, contains_possible) in self.path_state_predecessor
+        ]
+        if len(states) > self.max_paths_per_target:
+            states = states[:self.max_paths_per_target]
             gaps.append("trace_path_enumeration_limit_exceeded")
+        for state in states:
+            root, root_possible = self.path_state_root[state]
+            transitions = []
+            cursor = state
+            while self.path_state_predecessor[cursor] is not None:
+                predecessor, transition = self.path_state_predecessor[cursor]
+                transitions.append(transition)
+                cursor = predecessor
+            transitions.reverse()
+            root_certainty = "possible" if root_possible else "exact"
+            root_records = [
+                item for item in self.entrypoint_records_by_member.get(root, ())
+                if item.get("path_certainty") == root_certainty
+            ]
+            recorded_certainty = "possible" if state[1] else "exact"
+            path_edges = []
+            for item in transitions:
+                edge = (
+                    self.edges.get(item["direct_edge_identity"])
+                    or self.semantic_edges.get(item["direct_edge_identity"])
+                    or {}
+                )
+                caller = self.members.get(item["caller_member_identity"]) or {}
+                path_edges.append({
+                    **{key: value for key, value in item.items()
+                       if key != "target_member_identity"},
+                    "caller_class_name": str(caller.get("class_name") or ""),
+                    "caller_member_name": str(caller.get("member_name") or ""),
+                    "caller_descriptor": str(caller.get("descriptor") or ""),
+                    "caller_artifact_instance_identity": str(
+                        edge.get("caller_artifact_instance_identity") or ""
+                    ),
+                    "edge_kind": str(
+                        edge.get("edge_kind")
+                        or edge.get("semantic_edge_kind")
+                        or ""
+                    ),
+                    "bytecode_offset": edge.get("bytecode_offset"),
+                    "symbolic_owner": str(edge.get("symbolic_owner") or ""),
+                    "symbolic_name": str(edge.get("symbolic_name") or ""),
+                    "symbolic_descriptor": str(edge.get("symbolic_descriptor") or ""),
+                    "semantic_evidence": dict(edge.get("evidence") or {}),
+                    "target_dependency_coord": str(
+                        edge.get("target_dependency_coord") or ""
+                    ),
+                })
+            path_identity = _identity("binary_trace_path_identity", {
+                "entrypoint_member_identity": root,
+                "entrypoint_record_identities": [
+                    item["entrypoint_record_identity"] for item in root_records
+                ],
+                "target_nodes": list(target_nodes),
+                "edge_identities": [
+                    item["direct_edge_identity"] for item in path_edges
+                ],
+                "path_certainty": recorded_certainty,
+            })
+            paths.append({
+                "path_identity": path_identity,
+                "entrypoint_member_identity": root,
+                "entrypoint_records": [dict(item) for item in root_records],
+                "target_nodes": list(target_nodes),
+                "path_certainty": recorded_certainty,
+                "edges": path_edges,
+            })
         paths.sort(key=lambda item: (
             item["path_certainty"],
             item["entrypoint_member_identity"],
@@ -708,6 +770,9 @@ class BinaryTraceEngine:
         all_results = [*formal, *candidate]
         digest = _identity("binary_trace_result_set_digest", {
             "entrypoint_discovery_identity": self.entrypoint_discovery.identity,
+            "runtime_semantic_overlay_identity": str(
+                getattr(self.semantic_overlay, "identity", "") or ""
+            ),
             "formal_result_identities": [item["trace_result_identity"] for item in formal],
             "candidate_result_identities": [item["trace_result_identity"] for item in candidate],
             "resource_activation_result_identities": [
@@ -717,6 +782,7 @@ class BinaryTraceEngine:
         gaps = tuple(sorted(set(
             self.entrypoint_gaps
             + self.runtime.coverage_gaps
+            + tuple(getattr(self.semantic_overlay, "coverage_gaps", ()))
             + tuple(gap for item in all_results for gap in item["trace_coverage_gaps"])
         )))
         coverage = "complete" if not gaps else "partial"

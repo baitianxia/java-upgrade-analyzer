@@ -49,8 +49,17 @@ class BinaryRuntimeReconcilerTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         sources = {
+            "module-info.java": "module demo.module { exports demo; }",
             "demo/Api.java": "package demo; public interface Api { String value(); }",
-            "demo/Impl.java": "package demo; public class Impl implements Api { public String value(){ return \"ok\"; } }",
+            "demo/Impl.java": (
+                "package demo; public class Impl implements Api { "
+                "public String value(){ return \"ok\"; } "
+                "public Missing optional() { return null; } }"
+            ),
+            "demo/OptionalEnum.java": (
+                "package demo; public enum OptionalEnum { A; "
+                "public Missing optional() { return null; } } class Missing {}"
+            ),
             "demo/FinalApi.java": "package demo; public final class FinalApi { public String value(){ return \"ok\"; } }",
             "demo/Init.java": """
                 package demo;
@@ -65,6 +74,8 @@ class BinaryRuntimeReconcilerTest(unittest.TestCase):
                   public String call(Api api) { return api.value().trim(); }
                   public String finalCall(FinalApi api) { return api.value(); }
                   public Runnable dynamic(Api api) { return api::value; }
+                  public Object[] cloneArray(Object[] values) { return values.clone(); }
+                  public OptionalEnum[] cloneOptional(OptionalEnum[] values) { return values.clone(); }
                   public Init create() { return new Init(); }
                   public int staticCall() { return Init.value(); }
                   public int staticField() { return Init.VALUE; }
@@ -91,6 +102,8 @@ class BinaryRuntimeReconcilerTest(unittest.TestCase):
         self.jar = self.root / "app.jar"
         with zipfile.ZipFile(self.jar, "w") as archive:
             for class_file in sorted(classes.rglob("*.class")):
+                if class_file.relative_to(classes).as_posix() == "demo/Missing.class":
+                    continue
                 archive.write(class_file, class_file.relative_to(classes).as_posix())
         self.jar_sha = binary_artifact_diff._sha256_file(self.jar)
         required = RuntimeProfile.REQUIRED_FIELDS
@@ -187,6 +200,12 @@ class BinaryRuntimeReconcilerTest(unittest.TestCase):
                 if item["symbolic_owner"] == "demo/FinalApi"
                 and item["symbolic_name"] == "value"
             )
+            impl_value_member = next(
+                item["member_identity"]
+                for item in store.rows("members")
+                if item["class_name"] == "demo/Impl"
+                and item["member_name"] == "value"
+            )
 
         providers = {
             (item["initiating_loader_realm_identity"], item["class_name"]): item
@@ -202,16 +221,50 @@ class BinaryRuntimeReconcilerTest(unittest.TestCase):
                 "selected_artifact_instance_identity"
             ].startswith("platform-image:")
         )
+        self.assertNotIn(("application-loader", "module-info"), providers)
         caller_definition = next(
             item for item in result.class_definitions
             if item["initiating_loader_realm_identity"] == "application-loader"
             and item["class_name"] == "demo/Caller"
         )
         self.assertEqual(caller_definition["class_definition_status"], "definition_ready")
+        optional_definition = next(
+            item for item in result.class_definitions
+            if item["initiating_loader_realm_identity"] == "application-loader"
+            and item["class_name"] == "demo/OptionalEnum"
+        )
+        self.assertEqual(
+            optional_definition["evidence"]["target_jvm_verification"][
+                "failure_phase"
+            ],
+            "member_linkage",
+        )
+        impl_definition = next(
+            item for item in result.class_definitions
+            if item["initiating_loader_realm_identity"] == "application-loader"
+            and item["class_name"] == "demo/Impl"
+        )
+        self.assertNotEqual(
+            impl_definition["class_definition_status"], "definition_ready"
+        )
+        self.assertEqual(impl_definition["class_load_status"], "ready")
         self.assertTrue(result.member_resolutions)
         self.assertTrue(all(
             item["member_resolution_status"] == "resolved"
             for item in result.member_resolutions
+        ))
+        array_clones = [
+            item for item in result.member_resolutions
+            if item["symbolic_owner"].startswith("[L")
+            and item["symbolic_name"] == "clone"
+        ]
+        self.assertTrue({
+            "[Ljava/lang/Object;", "[Ldemo/OptionalEnum;",
+        }.issubset({item["symbolic_owner"] for item in array_clones}))
+        self.assertTrue(all(
+            item["resolved_owner"] == "java/lang/Object"
+            and item["jvm_array_member_semantics"] == "public_clone"
+            for item in array_clones
         ))
         interface_dispatch = [
             item for item in result.dispatch_resolutions
@@ -219,7 +272,10 @@ class BinaryRuntimeReconcilerTest(unittest.TestCase):
             and item["implementation_target_identities"]
         ]
         self.assertTrue(interface_dispatch)
-        self.assertTrue(any(item["implementation_target_identities"] for item in interface_dispatch))
+        self.assertTrue(any(
+            impl_value_member in item["implementation_target_identities"]
+            for item in interface_dispatch
+        ))
         final_dispatch = next(
             item for item in result.dispatch_resolutions
             if item["direct_edge_identity"] == final_call_edge_id

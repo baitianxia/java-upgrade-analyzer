@@ -22,7 +22,7 @@ python3 scripts/quality_gate.py --profile release
 
 - `quick`：模型、制品 diff、target runtime reconciliation、裁决、trace 和 generation 输出；
 - `step5`：在 quick 上增加 ASM/fact store/cache/source overlay、端到端 pipeline、查询、调度和用户输出契约；
-- `release`：`python3 -m unittest discover -s tests`，发现并运行全部当前测试。
+- `release`：先以 `python3 -m unittest discover -s tests` 发现并运行全部当前测试，再运行能力/拓扑迁移审计、分支/变异/重复健康门、目录内全部 pinned 真实项目 manifest，以及 400 JAR/10 万 class 性能与范围守恒门；任一阶段失败即阻断。
 
 准确性定向门：
 

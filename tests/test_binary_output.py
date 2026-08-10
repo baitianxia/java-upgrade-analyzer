@@ -186,6 +186,24 @@ class BinaryOutputTest(unittest.TestCase):
         for name, expected in manifest["sidecar_content_identities"].items():
             self.assertEqual(actual_sidecar_identities[name], expected)
 
+    def test_large_path_sidecar_is_streamed_and_content_bound(self):
+        profile = self.profile()
+        decisions, traces = self.bundles()
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "facts.sqlite"
+            source.write_bytes((b"binary-fact-block" * 65536) + b"tail")
+            manifest = write_binary_generation(
+                Path(tmp) / "output", decisions, traces, profile,
+                policy_identities={"registry": "v1"},
+                additional_sidecars={"facts.sqlite": source},
+            )
+            copied = Path(manifest["generation_directory"]) / "facts.sqlite"
+            expected = hashlib.sha256(source.read_bytes()).hexdigest()
+            copied_digest = hashlib.sha256(copied.read_bytes()).hexdigest()
+
+        self.assertEqual(manifest["sidecar_content_identities"]["facts.sqlite"], expected)
+        self.assertEqual(copied_digest, expected)
+
     def test_existing_generation_tampering_fails_without_moving_active_pointer(self):
         profile = self.profile()
         decisions, traces = self.bundles()

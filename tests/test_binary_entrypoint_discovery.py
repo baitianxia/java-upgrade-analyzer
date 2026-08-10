@@ -29,9 +29,32 @@ class FakeStore:
 class FakeReconciliation:
     def __init__(self, providers, resources=()):
         self.provider_bindings = tuple(providers)
+        self.definition_statuses = {}
+        self.class_load_statuses = {}
         self.resource_selections = tuple(resources)
         self.coverage_status = "complete"
         self.coverage_gaps = ()
+
+    @property
+    def class_definitions(self):
+        records = []
+        for item in self.provider_bindings:
+            key = (
+                item["initiating_loader_realm_identity"], item["class_name"]
+            )
+            definition_status = self.definition_statuses.get(
+                key, "definition_ready"
+            )
+            records.append({
+                "initiating_loader_realm_identity": key[0],
+                "class_name": key[1],
+                "class_definition_status": definition_status,
+                "class_load_status": self.class_load_statuses.get(
+                    key,
+                    "ready" if definition_status == "definition_ready" else "failed",
+                ),
+            })
+        return tuple(records)
 
 
 class FakeProfile:
@@ -148,6 +171,43 @@ class BinaryEntrypointDiscoveryTest(unittest.TestCase):
             "spring_boot_auto_configuration_import",
         )
 
+    def test_scheduled_entry_survives_unrelated_member_linkage_failure(self):
+        store, runtime, member = self.fixture(
+            class_annotations=[annotation(
+                "Lorg/springframework/boot/autoconfigure/AutoConfiguration;"
+            )],
+            method_annotations=[annotation(
+                "Lorg/springframework/scheduling/annotation/Scheduled;"
+            )],
+            resources=[{
+                "initiating_loader_realm_identity": "application-loader",
+                "resource_name": (
+                    "META-INF/spring/"
+                    "org.springframework.boot.autoconfigure.AutoConfiguration.imports"
+                ),
+                "resource_selection_status": "resolved",
+                "coverage_status": "complete",
+                "selected_resources": [{
+                    "resource_semantic_facts": [[
+                        "ordered_entry", "vendor.ScheduledConfig"
+                    ]],
+                }],
+            }],
+        )
+        key = ("application-loader", "vendor/ScheduledConfig")
+        runtime.definition_statuses[key] = "dependency_linkage_failed"
+        runtime.class_load_statuses[key] = "ready"
+
+        result = discover_binary_entrypoints(store, FakeProfile({
+            "discovery_mode": "binary_auto",
+            "coverage_status": "complete",
+            "methods": [],
+            "activated_frameworks": ["spring_boot"],
+        }), runtime)
+
+        self.assertEqual(result.exact_member_identities, (member,))
+        self.assertEqual(result.records[0]["entry_kind"], "spring_scheduled")
+
     def test_boot_registration_without_business_boot_activation_is_only_possible(self):
         store, runtime, member = self.fixture(
             method_annotations=[annotation(
@@ -177,6 +237,23 @@ class BinaryEntrypointDiscoveryTest(unittest.TestCase):
             result.records[0]["activation_reason"],
             "dependency_framework_activation_unproven",
         )
+
+    def test_provider_presence_does_not_activate_a_class_that_failed_definition(self):
+        store, runtime, _member = self.fixture(
+            path_kind="business_classes",
+            method_annotations=[annotation(
+                "Lorg/springframework/scheduling/annotation/Scheduled;"
+            )],
+        )
+        runtime.definition_statuses[(
+            "application-loader", "vendor/ScheduledConfig"
+        )] = "dependency_linkage_failed"
+
+        result = discover_binary_entrypoints(store, FakeProfile(), runtime)
+
+        self.assertEqual(result.records, ())
+        self.assertEqual(result.exact_member_identities, ())
+        self.assertEqual(result.possible_member_identities, ())
 
     def test_dependency_spring_factories_listener_is_exact_when_boot_is_active(self):
         store, runtime, member = self.fixture(
@@ -227,6 +304,62 @@ class BinaryEntrypointDiscoveryTest(unittest.TestCase):
             "dependency_framework_activation_unproven",
         )
 
+    def test_spring_xml_scheduled_method_is_exact_only_for_selected_resource(self):
+        resource = {
+            "initiating_loader_realm_identity": "application-loader",
+            "resource_name": "config/scheduler.xml",
+            "resource_selection_status": "resolved",
+            "coverage_status": "complete",
+            "selected_resources": [{
+                "resource_semantic_facts": [[
+                    "spring_scheduled_method",
+                    "job|vendor.ScheduledConfig|tick",
+                ]],
+            }],
+        }
+        store, runtime, member = self.fixture(resources=[resource])
+
+        possible = discover_binary_entrypoints(store, FakeProfile(), runtime)
+        exact = discover_binary_entrypoints(store, FakeProfile({
+            "discovery_mode": "binary_auto",
+            "coverage_status": "complete",
+            "methods": [],
+            "activated_resource_names": ["classpath:config/scheduler.xml"],
+        }), runtime)
+
+        self.assertEqual(possible.possible_member_identities, (member,))
+        self.assertEqual(
+            possible.records[0]["activation_reason"],
+            "spring_xml_activation_unproven",
+        )
+        self.assertEqual(exact.exact_member_identities, (member,))
+        self.assertEqual(exact.records[0]["entry_kind"], "spring_xml_scheduled")
+        self.assertEqual(
+            exact.records[0]["activation_reason"],
+            "spring_import_resource_activation",
+        )
+
+    def test_spring_xml_parse_gap_prevents_complete_entrypoint_coverage(self):
+        store, runtime, _member = self.fixture(resources=[{
+            "initiating_loader_realm_identity": "application-loader",
+            "resource_name": "config/scheduler.xml",
+            "resource_selection_status": "resolved",
+            "coverage_status": "complete",
+            "selected_resources": [{
+                "resource_semantic_facts": [[
+                    "xml_parse_gap", "doctype_or_entity_rejected",
+                ]],
+            }],
+        }])
+
+        result = discover_binary_entrypoints(store, FakeProfile(), runtime)
+
+        self.assertEqual(result.coverage_status, "partial")
+        self.assertIn(
+            "xml_entrypoint_parse_gap:config/scheduler.xml:doctype_or_entity_rejected",
+            result.coverage_gaps,
+        )
+
     def test_conditional_dependency_auto_configuration_is_not_promoted_to_exact(self):
         store, runtime, member = self.fixture(
             class_annotations=[
@@ -262,6 +395,65 @@ class BinaryEntrypointDiscoveryTest(unittest.TestCase):
             result.records[0]["activation_reason"],
             "framework_condition_not_evaluated",
         )
+
+    def test_conditional_on_property_uses_prefix_value_and_complete_configuration(self):
+        condition = annotation(
+            "Lorg/springframework/boot/autoconfigure/condition/ConditionalOnProperty;",
+            values=(
+                ["prefix", "feature"],
+                ["name", "array", ["enabled"]],
+                ["havingValue", "on"],
+                ["matchIfMissing", False],
+            ),
+        )
+        store, runtime, member = self.fixture(
+            class_annotations=[
+                annotation(
+                    "Lorg/springframework/boot/autoconfigure/AutoConfiguration;"
+                ),
+                condition,
+            ],
+            method_annotations=[annotation(
+                "Lorg/springframework/scheduling/annotation/Scheduled;"
+            )],
+            resources=[{
+                "initiating_loader_realm_identity": "application-loader",
+                "resource_name": (
+                    "META-INF/spring/"
+                    "org.springframework.boot.autoconfigure.AutoConfiguration.imports"
+                ),
+                "resource_selection_status": "resolved",
+                "coverage_status": "complete",
+                "selected_resources": [{
+                    "resource_semantic_facts": [[
+                        "ordered_entry", "vendor.ScheduledConfig"
+                    ]],
+                }],
+            }],
+        )
+        active = FakeProfile({
+            "discovery_mode": "binary_auto", "coverage_status": "complete",
+            "methods": [], "activated_frameworks": ["spring_boot"],
+        })
+        active.payload.update({
+            "resolved_configuration_properties": {"feature.enabled": "on"},
+            "runtime_configuration_coverage_status": "complete",
+        })
+        inactive = FakeProfile({
+            "discovery_mode": "binary_auto", "coverage_status": "complete",
+            "methods": [], "activated_frameworks": ["spring_boot"],
+        })
+        inactive.payload.update({
+            "resolved_configuration_properties": {},
+            "runtime_configuration_coverage_status": "complete",
+        })
+
+        active_result = discover_binary_entrypoints(store, active, runtime)
+        inactive_result = discover_binary_entrypoints(store, inactive, runtime)
+
+        self.assertEqual(active_result.exact_member_identities, (member,))
+        self.assertEqual(inactive_result.exact_member_identities, ())
+        self.assertEqual(inactive_result.possible_member_identities, ())
 
     def test_runtime_annotation_entrypoint_matrix_is_discovered_from_bytecode(self):
         cases = {
@@ -302,6 +494,23 @@ class BinaryEntrypointDiscoveryTest(unittest.TestCase):
         self.assertEqual(
             result.records[0]["activation_reason"],
             "entity_lifecycle_activation_unproven",
+        )
+
+    def test_business_entity_lifecycle_is_exact_when_boot_entity_scan_is_proved(self):
+        store, runtime, member = self.fixture(
+            path_kind="business_classes",
+            class_annotations=[annotation("Ljakarta/persistence/Entity;")],
+            method_annotations=[annotation("Ljakarta/persistence/PostLoad;")],
+        )
+        profile = FakeProfile()
+        profile.payload["container_and_launcher_kind"] = "spring-boot-executable-jar"
+
+        result = discover_binary_entrypoints(store, profile, runtime)
+
+        self.assertEqual(result.exact_member_identities, (member,))
+        self.assertEqual(
+            result.records[0]["activation_reason"],
+            "jpa_entity_registration_proved",
         )
 
     def test_business_main_requires_launcher_or_profile_activation_for_exact_root(self):

@@ -1,5 +1,7 @@
 import csv
+import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -15,6 +17,7 @@ sys.path.insert(0, str(ROOT_DIR / "scripts"))
 
 import binary_asm_helper  # noqa: E402
 from binary_pipeline import BinaryPipelineError, run_pipeline  # noqa: E402
+from binary_runtime_materializer import materialize_binary_pipeline_config  # noqa: E402
 from binary_report import (  # noqa: E402
     BinaryReportError,
     LEGACY_ALERT_FIELDS,
@@ -23,7 +26,15 @@ from binary_report import (  # noqa: E402
     publish_step5,
     publish_step6,
 )
-from binary_validation_oracle import validate_generation  # noqa: E402
+from binary_validation_oracle import (  # noqa: E402
+    _declared_members,
+    _oracle_runtime_contexts,
+    _oracle_provider_location,
+    _parse_javap_structural,
+    _provider_resource_path,
+    _resolve_member,
+    validate_generation,
+)
 from s5_query_call_chain import query_scope_call_chain_result  # noqa: E402
 
 
@@ -55,6 +66,149 @@ class BinaryPipelineTest(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_structural_oracle_preserves_array_type_instruction_targets(self):
+        parsed = _parse_javap_structural(
+            """
+public class demo.ArrayCasts {
+  java.lang.String[] cast(java.lang.Object);
+    descriptor: (Ljava/lang/Object;)[Ljava/lang/String;
+    Code:
+       0: aload_1
+       1: checkcast     #7                  // class \"[Ljava/lang/String;\"
+       4: areturn
+  java.lang.Class literal();
+    descriptor: ()Ljava/lang/Class;
+    Code:
+       0: ldc           #9                  // class \"[I\"
+       2: areturn
+}
+"""
+        )
+        self.assertIn(
+            (
+                "demo/ArrayCasts", "cast", "(Ljava/lang/Object;)[Ljava/lang/String;",
+                1, "[Ljava/lang/String;", "checkcast",
+            ),
+            parsed["type_edges"],
+        )
+        self.assertIn(
+            (
+                "demo/ArrayCasts", "method", "cast",
+                "(Ljava/lang/Object;)[Ljava/lang/String;", 0,
+            ),
+            parsed["declared_members"],
+        )
+        self.assertIn(
+            (
+                "demo/ArrayCasts", "literal", "()Ljava/lang/Class;",
+                0, "[I", "class_literal",
+            ),
+            parsed["type_edges"],
+        )
+
+    def test_runtime_oracle_resolves_object_array_component_and_skips_primitives(self):
+        contexts = _oracle_runtime_contexts(
+            {
+                "java/lang/String": {
+                    "status": "definition_ready",
+                    "provider_url": "jrt:/java.base/java/lang/String.class",
+                    "super_name": "",
+                    "interfaces": [],
+                },
+            },
+            ["[I", "[B", "[Ljava/lang/String;", "[[Ljava/lang/String;"],
+            ["application-loader"],
+            "platform-loader",
+        )
+        self.assertEqual(
+            contexts,
+            (("application-loader", "java/lang/String"),),
+        )
+
+    def test_runtime_oracle_keeps_provider_selection_separate_from_definition(self):
+        self.assertEqual(
+            _provider_resource_path(
+                "jar:file:/tmp/runtime.jar!/optional/Type.class"
+            ),
+            Path("/tmp/runtime.jar").resolve(),
+        )
+        self.assertIsNone(
+            _provider_resource_path(
+                "jrt:/java.base/java/lang/String.class"
+            )
+        )
+
+    def test_runtime_oracle_applies_object_fallback_for_interface_methods(self):
+        observations = {
+            "demo/Api": {
+                "status": "definition_ready", "modifiers": 0x0601,
+                "members": [], "super_name": "", "interfaces": [],
+            },
+            "java/lang/Object": {
+                "status": "definition_ready", "modifiers": 0x0001,
+                "members": [
+                    "method|getClass|()Ljava/lang/Class;|273",
+                    "method|clone|()Ljava/lang/Object;|260",
+                ],
+                "super_name": "", "interfaces": [],
+            },
+        }
+        resolved = _resolve_member(
+            observations, "demo/Api", "method", "getClass",
+            "()Ljava/lang/Class;",
+        )
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved[0], "java/lang/Object")
+        self.assertIsNone(_resolve_member(
+            observations, "demo/Api", "method", "clone",
+            "()Ljava/lang/Object;",
+        ))
+
+    def test_runtime_oracle_uses_javap_member_when_optional_member_linkage_failed(self):
+        observations = {
+            "demo/OptionalApi": {
+                "status": "definition_failed",
+                "failure_phase": "member_linkage",
+                "modifiers": 0x0401,
+                "super_name": "java/lang/Object",
+                "interfaces": [],
+                "members": [],
+                "javap_declared_members": ["method|available|()V|1"],
+            }
+        }
+        resolved = _resolve_member(
+            observations, "demo/OptionalApi", "method", "available", "()V"
+        )
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved[0], "demo/OptionalApi")
+
+    def test_runtime_oracle_deduplicates_reflection_and_javap_member_views(self):
+        observation = {
+            "members": ["method|run|([Ljava/lang/String;)V|129"],
+            "javap_declared_members": ["method|run|([Ljava/lang/String;)V|1"],
+        }
+        self.assertEqual(
+            _declared_members(observation),
+            [("method", "run", "([Ljava/lang/String;)V", 129)],
+        )
+
+    def test_runtime_oracle_uses_code_source_for_non_base_jdk_modules(self):
+        self.assertEqual(
+            _oracle_provider_location({
+                "provider_resource_url": "",
+                "provider_url": "jrt:/jdk.jdi",
+                "status": "definition_ready",
+            }),
+            "jrt:/jdk.jdi",
+        )
+        self.assertEqual(
+            _oracle_provider_location({
+                "provider_resource_url": "jrt:/java.base/java/lang/String.class",
+                "provider_url": "",
+            }),
+            "jrt:/java.base/java/lang/String.class",
+        )
 
     def test_source_usage_requires_an_explicit_user_decision(self):
         with self.assertRaises(BinaryPipelineError) as raised:
@@ -120,6 +274,30 @@ class BinaryPipelineTest(unittest.TestCase):
                 archive.writestr(
                     "META-INF/services/demo.Service", f"{service_provider}\n"
                 )
+        return jar
+
+    def _compile_sources_jar(self, label, sources, *, classpath=()):
+        source_root = self.root / label / "src"
+        paths = []
+        for relative, content in sources.items():
+            path = source_root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+            paths.append(path)
+        classes = self.root / label / "classes"
+        classes.mkdir(parents=True)
+        command = ["javac", "-g"]
+        if classpath:
+            command.extend(["-cp", os.pathsep.join(map(str, classpath))])
+        command.extend(["-d", str(classes), *map(str, paths)])
+        completed = subprocess.run(
+            command, capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        jar = self.root / label / f"{label}.jar"
+        with zipfile.ZipFile(jar, "w") as archive:
+            for class_file in sorted(classes.rglob("*.class")):
+                archive.write(class_file, class_file.relative_to(classes).as_posix())
         return jar
 
     def _side(self, jar, version="1"):
@@ -427,6 +605,1302 @@ class BinaryPipelineTest(unittest.TestCase):
             "dependency_framework_activation_unproven",
         )
 
+    def test_spring_xml_scheduled_entry_is_rebuilt_by_independent_oracle(self):
+        base_core, current_core, scheduler, app = self._automatic_scheduled_entry_fixture(
+            include_activation_resource=False
+        )
+        with zipfile.ZipFile(scheduler, "a") as archive:
+            archive.writestr(
+                "config/scheduler.xml",
+                "<beans xmlns:task='urn:test'>"
+                "<bean id='job' class='vendor.ScheduledConfig' init-method='tick'/>"
+                "<task:scheduled-tasks>"
+                "<task:scheduled target='job.tick'/>"
+                "</task:scheduled-tasks></beans>",
+            )
+        base_side = self._automatic_entry_side(base_core, scheduler, app, "1.0")
+        current_side = self._automatic_entry_side(current_core, scheduler, app, "2.0")
+        for side in (base_side, current_side):
+            side["runtime_profile"]["business_entrypoint_profile"][
+                "activated_resource_names"
+            ] = ["classpath:config/scheduler.xml"]
+        config = {
+            "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+            "source_usage": {
+                "decision": "skip_source",
+                "decision_source": "explicit_config",
+            },
+            "asm_jar": str(self.asm_jar),
+            "base": base_side,
+            "current": current_side,
+            "runtime_comparison": {
+                "controlled_profile_fields": ["loader_topology"],
+                "declared_upgrade_payload_scope": ["artifact-bytes"],
+            },
+        }
+
+        result = run_pipeline(config, output_root=self.root / "scheduled-xml-report")
+        generation = Path(result["generation_directory"])
+        entries = json.loads(
+            (generation / "binary_entrypoints.json").read_text(encoding="utf-8")
+        )["records"]
+        xml_entry = next(
+            item for item in entries if item["entry_kind"] == "spring_xml_scheduled"
+        )
+        init_entry = next(
+            item for item in entries
+            if item["entry_kind"] == "spring_xml_init_method"
+        )
+        validation = validate_generation(config, generation)
+
+        self.assertEqual(xml_entry["path_certainty"], "exact")
+        self.assertEqual(xml_entry["dependency_coord"], "com.acme:scheduler:1.0")
+        self.assertEqual(init_entry["path_certainty"], "exact")
+        self.assertEqual(init_entry["member_name"], "tick")
+        self.assertEqual(validation["status"], "passed", validation["issues"])
+
+    def test_persistence_unit_registration_proves_dependency_jpa_callback(self):
+        def entity_jar(label, value):
+            jar = self._compile_sources_jar(label, {
+                "jakarta/persistence/Entity.java": (
+                    "package jakarta.persistence; import java.lang.annotation.*; "
+                    "@Retention(RetentionPolicy.RUNTIME) @Target(ElementType.TYPE) "
+                    "public @interface Entity {}"
+                ),
+                "jakarta/persistence/PostLoad.java": (
+                    "package jakarta.persistence; import java.lang.annotation.*; "
+                    "@Retention(RetentionPolicy.RUNTIME) @Target(ElementType.METHOD) "
+                    "public @interface PostLoad {}"
+                ),
+                "lib/EntityRecord.java": (
+                    "package lib; @jakarta.persistence.Entity public class EntityRecord { "
+                    "@jakarta.persistence.PostLoad public void afterLoad() { "
+                    f"System.out.print({value}); }} }}"
+                ),
+            })
+            with zipfile.ZipFile(jar, "a") as archive:
+                archive.writestr(
+                    "META-INF/persistence.xml",
+                    "<?xml version=\"1.0\"?><persistence><persistence-unit name=\"app\">"
+                    "<class>lib.EntityRecord</class></persistence-unit></persistence>",
+                )
+            return jar
+
+        base = entity_jar("jpa-persistence-base", 1)
+        current = entity_jar("jpa-persistence-current", 2)
+        config = {
+            "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+            "source_usage": {
+                "decision": "skip_source", "decision_source": "explicit_config",
+            },
+            "asm_jar": str(self.asm_jar),
+            "base": self._side(base, "1"),
+            "current": self._side(current, "2"),
+            "runtime_comparison": {
+                "controlled_profile_fields": ["loader_topology"],
+                "declared_upgrade_payload_scope": ["artifact-bytes"],
+            },
+        }
+        result = run_pipeline(config, output_root=self.root / "jpa-persistence-report")
+        generation = Path(result["generation_directory"])
+        entries = json.loads(
+            (generation / "binary_entrypoints.json").read_text(encoding="utf-8")
+        )["records"]
+        formal = json.loads(
+            (generation / "binary_formal_results.json").read_text(encoding="utf-8")
+        )["by_api"]
+        callback_entry = next(
+            item for item in entries
+            if item["class_name"] == "lib/EntityRecord"
+            and item["member_name"] == "afterLoad"
+        )
+        callback = next(
+            item for item in formal
+            if item["display_owner"] == "lib/EntityRecord"
+            and str(item["display_member"]).startswith("afterLoad")
+        )
+
+        self.assertEqual(callback_entry["path_certainty"], "exact")
+        self.assertEqual(
+            callback_entry["activation_reason"], "jpa_entity_registration_proved"
+        )
+        self.assertEqual(callback["reachability_status"], "reachable")
+
+    def test_exact_reflection_literals_create_typed_runtime_semantic_path(self):
+        def target_jar(label, value):
+            source = self.root / label / "src" / "lib" / "Target.java"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                "package lib; public class Target { public Target() {} "
+                f"public int changed() {{ return {value}; }} }}",
+                encoding="utf-8",
+            )
+            classes = self.root / label / "classes"
+            classes.mkdir()
+            completed = subprocess.run(
+                ["javac", "-g", "-d", str(classes), str(source)],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            jar = self.root / label / "target.jar"
+            with zipfile.ZipFile(jar, "w") as archive:
+                archive.write(classes / "lib" / "Target.class", "lib/Target.class")
+            return jar
+
+        base_target = target_jar("reflection-base", 1)
+        current_target = target_jar("reflection-current", 2)
+        source = self.root / "reflection-business" / "src" / "biz" / "Entry.java"
+        source.parent.mkdir(parents=True)
+        source.write_text(
+            "package biz; public class Entry { public int run() throws Exception { "
+            "Class<?> type = Class.forName(\"lib.Target\"); "
+            "java.lang.reflect.Method method = type.getDeclaredMethod(\"changed\"); "
+            "Object target = type.getDeclaredConstructor().newInstance(); "
+            "return ((Integer) method.invoke(target)).intValue(); } }",
+            encoding="utf-8",
+        )
+        classes = self.root / "reflection-business" / "classes"
+        classes.mkdir()
+        completed = subprocess.run(
+            ["javac", "-g", "-d", str(classes), str(source)],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        business = self.root / "reflection-business" / "business.jar"
+        with zipfile.ZipFile(business, "w") as archive:
+            archive.write(classes / "biz" / "Entry.class", "biz/Entry.class")
+
+        def side(target, version):
+            result = self._side(target, version)
+            result["artifacts"] = [{
+                "path": str(business), "logical_location": "app/business.jar",
+                "loader_realm": "application-loader", "path_kind": "business_classes",
+                "slot": 0, "coord": "business", "lineage": "business",
+                "runtime_code_source_origin_identity": "reflection-business",
+            }, {
+                "path": str(target), "logical_location": "lib/target.jar",
+                "loader_realm": "application-loader", "path_kind": "classpath",
+                "slot": 1, "coord": f"com.acme:target:{version}",
+                "lineage": "com.acme:target",
+                "runtime_code_source_origin_identity": "reflection-target",
+            }]
+            result["runtime_profile"]["business_entrypoint_profile"] = {
+                "coverage_status": "complete",
+                "methods": [{
+                    "initiating_loader_realm_identity": "application-loader",
+                    "class_name": "biz/Entry",
+                    "member_name": "run",
+                    "descriptor": "()I",
+                }],
+            }
+            return result
+
+        config = {
+            "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+            "source_usage": {"decision": "skip_source", "decision_source": "explicit_config"},
+            "asm_jar": str(self.asm_jar),
+            "base": side(base_target, "1"),
+            "current": side(current_target, "2"),
+            "runtime_comparison": {
+                "controlled_profile_fields": ["loader_topology"],
+                "declared_upgrade_payload_scope": ["artifact-bytes"],
+            },
+        }
+
+        result = run_pipeline(config, output_root=self.root / "reflection-report")
+        generation = Path(result["generation_directory"])
+        formal = json.loads(
+            (generation / "binary_formal_results.json").read_text(encoding="utf-8")
+        )
+        target = next(
+            item for item in formal["by_api"]
+            if item["display_owner"] == "lib/Target"
+            and str(item["display_member"]).startswith("changed")
+        )
+        overlay = json.loads(
+            (generation / "binary_runtime_semantic_overlay.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(target["reachability_status"], "reachable")
+        self.assertTrue(any(
+            row["semantic_edge_kind"] == "reflection_method_invocation"
+            and row["path_certainty"] == "exact"
+            for row in overlay["rows"]
+        ))
+        overlay["rows"] = [
+            row for row in overlay["rows"]
+            if row["semantic_edge_kind"] != "reflection_method_invocation"
+        ]
+        overlay_path = generation / "binary_runtime_semantic_overlay.json"
+        overlay_path.write_text(
+            json.dumps(overlay, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        manifest_path = generation / "result_generation.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["sidecar_content_identities"][overlay_path.name] = hashlib.sha256(
+            overlay_path.read_bytes()
+        ).hexdigest()
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        tampered = validate_generation(config, generation)
+        self.assertTrue(any(
+            issue["reason_code"] == "ORACLE_RUNTIME_SEMANTIC_EDGE_SET_MISMATCH"
+            for issue in tampered["issues"]
+        ), tampered["issues"])
+
+    def test_exact_method_handle_lookup_reaches_dependency_change(self):
+        def target(label, value):
+            return self._compile_sources_jar(label, {
+                "lib/Target.java": (
+                    "package lib; public class Target { "
+                    f"public int changed() {{ return {value}; }} }}"
+                ),
+            })
+
+        base_target = target("method-handle-base", 1)
+        current_target = target("method-handle-current", 2)
+        business = self._compile_sources_jar("method-handle-business", {
+            "biz/Entry.java": (
+                "package biz; public class Entry { public int run() throws Throwable { "
+                "java.lang.invoke.MethodHandle handle = java.lang.invoke.MethodHandles.lookup()"
+                ".findVirtual(lib.Target.class, \"changed\", "
+                "java.lang.invoke.MethodType.methodType(int.class)); "
+                "return (int) handle.invokeExact(new lib.Target()); } }"
+            ),
+        }, classpath=(current_target,))
+
+        def side(target_jar, version):
+            result = self._side(target_jar, version)
+            result["artifacts"] = [{
+                "path": str(business), "logical_location": "app/business.jar",
+                "loader_realm": "application-loader", "path_kind": "business_classes",
+                "slot": 0, "coord": "business", "lineage": "business",
+                "runtime_code_source_origin_identity": "method-handle-business",
+            }, {
+                "path": str(target_jar), "logical_location": "lib/target.jar",
+                "loader_realm": "application-loader", "path_kind": "classpath",
+                "slot": 1, "coord": f"com.acme:target:{version}",
+                "lineage": "com.acme:target",
+                "runtime_code_source_origin_identity": "method-handle-target",
+            }]
+            result["runtime_profile"]["business_entrypoint_profile"] = {
+                "coverage_status": "complete", "methods": [{
+                    "initiating_loader_realm_identity": "application-loader",
+                    "class_name": "biz/Entry", "member_name": "run",
+                    "descriptor": "()I",
+                }],
+            }
+            return result
+
+        config = {
+            "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+            "source_usage": {
+                "decision": "skip_source", "decision_source": "explicit_config",
+            },
+            "asm_jar": str(self.asm_jar),
+            "base": side(base_target, "1"),
+            "current": side(current_target, "2"),
+            "runtime_comparison": {
+                "controlled_profile_fields": ["loader_topology"],
+                "declared_upgrade_payload_scope": ["artifact-bytes"],
+            },
+        }
+        result = run_pipeline(config, output_root=self.root / "method-handle-report")
+        generation = Path(result["generation_directory"])
+        formal = json.loads(
+            (generation / "binary_formal_results.json").read_text(encoding="utf-8")
+        )["by_api"]
+        changed = next(
+            item for item in formal
+            if item["display_owner"] == "lib/Target"
+            and str(item["display_member"]).startswith("changed")
+        )
+        overlay = json.loads(
+            (generation / "binary_runtime_semantic_overlay.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(changed["reachability_status"], "reachable")
+        self.assertTrue(any(
+            row["semantic_edge_kind"] == "method_handle_invocation"
+            and row["path_certainty"] == "exact"
+            for row in overlay["rows"]
+        ))
+
+    def test_invoked_registered_dynamic_proxy_handler_reaches_dependency_change(self):
+        def api_jar(label, value):
+            source = self.root / label / "src" / "api" / "Api.java"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                f"package api; public class Api {{ public int value() {{ return {value}; }} }}",
+                encoding="utf-8",
+            )
+            classes = self.root / label / "classes"
+            classes.mkdir()
+            completed = subprocess.run(
+                ["javac", "-g", "-d", str(classes), str(source)],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            jar = self.root / label / "api.jar"
+            with zipfile.ZipFile(jar, "w") as archive:
+                archive.write(classes / "api" / "Api.class", "api/Api.class")
+            return jar
+
+        base_api = api_jar("proxy-base", 1)
+        current_api = api_jar("proxy-current", 2)
+        source_root = self.root / "proxy-business" / "src"
+        sources = {
+            "biz/Action.java": "package biz; public interface Action { int run(); }",
+            "biz/Handler.java": (
+                "package biz; public class Handler implements java.lang.reflect.InvocationHandler { "
+                "public Object invoke(Object proxy, java.lang.reflect.Method method, Object[] args) { "
+                "return Integer.valueOf(new api.Api().value()); } }"
+            ),
+            "biz/Entry.java": (
+                "package biz; public class Entry { public int run() { "
+                "Action action = (Action) java.lang.reflect.Proxy.newProxyInstance("
+                "Action.class.getClassLoader(), new Class<?>[]{Action.class}, new Handler()); "
+                "return action.run(); } }"
+            ),
+        }
+        paths = []
+        for relative, content in sources.items():
+            path = source_root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+            paths.append(path)
+        classes = self.root / "proxy-business" / "classes"
+        classes.mkdir()
+        completed = subprocess.run(
+            ["javac", "-g", "-cp", str(current_api), "-d", str(classes), *map(str, paths)],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        business = self.root / "proxy-business" / "business.jar"
+        with zipfile.ZipFile(business, "w") as archive:
+            for class_file in classes.rglob("*.class"):
+                archive.write(class_file, class_file.relative_to(classes).as_posix())
+
+        def side(api, version):
+            result = self._side(api, version)
+            result["artifacts"] = [{
+                "path": str(business), "logical_location": "app/business.jar",
+                "loader_realm": "application-loader", "path_kind": "business_classes",
+                "slot": 0, "coord": "business", "lineage": "business",
+                "runtime_code_source_origin_identity": "proxy-business",
+            }, {
+                "path": str(api), "logical_location": "lib/api.jar",
+                "loader_realm": "application-loader", "path_kind": "classpath",
+                "slot": 1, "coord": f"com.acme:api:{version}", "lineage": "com.acme:api",
+                "runtime_code_source_origin_identity": "proxy-api",
+            }]
+            result["runtime_profile"]["business_entrypoint_profile"] = {
+                "coverage_status": "complete",
+                "methods": [{
+                    "initiating_loader_realm_identity": "application-loader",
+                    "class_name": "biz/Entry", "member_name": "run", "descriptor": "()I",
+                }],
+            }
+            return result
+
+        config = {
+            "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+            "source_usage": {"decision": "skip_source", "decision_source": "explicit_config"},
+            "asm_jar": str(self.asm_jar),
+            "base": side(base_api, "1"), "current": side(current_api, "2"),
+            "runtime_comparison": {
+                "controlled_profile_fields": ["loader_topology"],
+                "declared_upgrade_payload_scope": ["artifact-bytes"],
+            },
+        }
+
+        result = run_pipeline(config, output_root=self.root / "proxy-report")
+        generation = Path(result["generation_directory"])
+        formal = json.loads(
+            (generation / "binary_formal_results.json").read_text(encoding="utf-8")
+        )
+        target = next(
+            item for item in formal["by_api"]
+            if item["display_owner"] == "api/Api"
+            and str(item["display_member"]).startswith("value")
+        )
+        overlay = json.loads(
+            (generation / "binary_runtime_semantic_overlay.json").read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(target["reachability_status"], "reachable")
+        self.assertTrue(any(
+            row["semantic_edge_kind"] == "dynamic_proxy_callback"
+            and row["path_certainty"] == "exact"
+            for row in overlay["rows"]
+        ))
+
+    def test_mybatis_mapper_proxy_dispatch_reaches_packaged_runtime_chain(self):
+        def runtime(label, value):
+            return self._compile_sources_jar(label, {
+                "org/apache/ibatis/annotations/Mapper.java": (
+                    "package org.apache.ibatis.annotations; import java.lang.annotation.*; "
+                    "@Retention(RetentionPolicy.RUNTIME) @Target(ElementType.TYPE) "
+                    "public @interface Mapper {}"
+                ),
+                "org/apache/ibatis/session/SqlSession.java": (
+                    "package org.apache.ibatis.session; public interface SqlSession {}"
+                ),
+                "org/apache/ibatis/binding/MapperProxy.java": (
+                    "package org.apache.ibatis.binding; public class MapperProxy { "
+                    "public Object invoke(Object proxy, java.lang.reflect.Method method, Object[] args) { "
+                    f"return Integer.valueOf({value}); }} }}"
+                ),
+                "org/apache/ibatis/binding/MapperMethod.java": (
+                    "package org.apache.ibatis.binding; public class MapperMethod { "
+                    "public Object execute(org.apache.ibatis.session.SqlSession session, Object[] args) { "
+                    "return null; } }"
+                ),
+            })
+
+        base_runtime = runtime("mybatis-base", 1)
+        current_runtime = runtime("mybatis-current", 2)
+        business = self._compile_sources_jar("mybatis-business", {
+            "biz/DemoMapper.java": (
+                "package biz; @org.apache.ibatis.annotations.Mapper "
+                "public interface DemoMapper { int findOne(); }"
+            ),
+            "biz/Entry.java": (
+                "package biz; public class Entry { public int run(DemoMapper mapper) { "
+                "return mapper.findOne(); } }"
+            ),
+        }, classpath=(current_runtime,))
+
+        def side(runtime_jar, version):
+            result = self._side(runtime_jar, version)
+            result["artifacts"] = [{
+                "path": str(business), "logical_location": "app/business.jar",
+                "loader_realm": "application-loader", "path_kind": "business_classes",
+                "slot": 0, "coord": "business", "lineage": "business",
+                "runtime_code_source_origin_identity": "mybatis-business",
+            }, {
+                "path": str(runtime_jar), "logical_location": "lib/mybatis.jar",
+                "loader_realm": "application-loader", "path_kind": "classpath",
+                "slot": 1, "coord": f"org.mybatis:mybatis:{version}",
+                "lineage": "org.mybatis:mybatis",
+                "runtime_code_source_origin_identity": "mybatis-runtime",
+            }]
+            result["runtime_profile"]["business_entrypoint_profile"] = {
+                "coverage_status": "complete",
+                "methods": [{
+                    "initiating_loader_realm_identity": "application-loader",
+                    "class_name": "biz/Entry", "member_name": "run",
+                    "descriptor": "(Lbiz/DemoMapper;)I",
+                }],
+            }
+            return result
+
+        config = {
+            "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+            "source_usage": {"decision": "skip_source", "decision_source": "explicit_config"},
+            "asm_jar": str(self.asm_jar),
+            "base": side(base_runtime, "1"), "current": side(current_runtime, "2"),
+            "runtime_comparison": {
+                "controlled_profile_fields": ["loader_topology"],
+                "declared_upgrade_payload_scope": ["artifact-bytes"],
+            },
+        }
+
+        result = run_pipeline(config, output_root=self.root / "mybatis-report")
+        generation = Path(result["generation_directory"])
+        formal = json.loads(
+            (generation / "binary_formal_results.json").read_text(encoding="utf-8")
+        )
+        target = next(
+            item for item in formal["by_api"]
+            if item["display_owner"] == "org/apache/ibatis/binding/MapperProxy"
+            and str(item["display_member"]).startswith("invoke")
+        )
+        overlay = json.loads(
+            (generation / "binary_runtime_semantic_overlay.json").read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(target["reachability_status"], "reachable")
+        self.assertTrue(any(
+            row["semantic_edge_kind"] == "mybatis_mapper_proxy_dispatch"
+            and row["target_dependency_coord"] == "org.mybatis:mybatis:2"
+            for row in overlay["rows"]
+        ))
+
+    def test_transactional_business_method_reaches_packaged_interceptor_chain(self):
+        def runtime(label, value):
+            return self._compile_sources_jar(label, {
+                "org/springframework/transaction/annotation/Transactional.java": (
+                    "package org.springframework.transaction.annotation; import java.lang.annotation.*; "
+                    "@Retention(RetentionPolicy.RUNTIME) @Target({ElementType.TYPE,ElementType.METHOD}) "
+                    "public @interface Transactional {}"
+                ),
+                "org/aopalliance/intercept/MethodInvocation.java": (
+                    "package org.aopalliance.intercept; public interface MethodInvocation {}"
+                ),
+                "org/springframework/transaction/interceptor/TransactionInterceptor.java": (
+                    "package org.springframework.transaction.interceptor; public class TransactionInterceptor { "
+                    "public Object invoke(org.aopalliance.intercept.MethodInvocation invocation) { "
+                    f"return Integer.valueOf({value}); }} }}"
+                ),
+                "org/springframework/transaction/interceptor/TransactionAspectSupport.java": (
+                    "package org.springframework.transaction.interceptor; public class TransactionAspectSupport { "
+                    "public interface InvocationCallback {} "
+                    "public Object invokeWithinTransaction(java.lang.reflect.Method method, Class<?> type, "
+                    "InvocationCallback callback) { return null; } }"
+                ),
+                "org/springframework/aop/framework/ReflectiveMethodInvocation.java": (
+                    "package org.springframework.aop.framework; public class ReflectiveMethodInvocation { "
+                    "public Object proceed() { return null; } }"
+                ),
+            })
+
+        base_runtime = runtime("transaction-base", 1)
+        current_runtime = runtime("transaction-current", 2)
+        business = self._compile_sources_jar("transaction-business", {
+            "biz/Service.java": (
+                "package biz; public class Service { "
+                "@org.springframework.transaction.annotation.Transactional "
+                "public int work() { return 7; } }"
+            ),
+            "biz/Entry.java": (
+                "package biz; public class Entry { public int run() { return new Service().work(); } }"
+            ),
+        }, classpath=(current_runtime,))
+
+        def side(runtime_jar, version):
+            result = self._side(runtime_jar, version)
+            result["artifacts"] = [{
+                "path": str(business), "logical_location": "app/business.jar",
+                "loader_realm": "application-loader", "path_kind": "business_classes",
+                "slot": 0, "coord": "business", "lineage": "business",
+                "runtime_code_source_origin_identity": "transaction-business",
+            }, {
+                "path": str(runtime_jar), "logical_location": "lib/spring-runtime.jar",
+                "loader_realm": "application-loader", "path_kind": "classpath",
+                "slot": 1, "coord": f"org.springframework:spring-tx:{version}",
+                "lineage": "org.springframework:spring-tx",
+                "runtime_code_source_origin_identity": "transaction-runtime",
+            }]
+            result["runtime_profile"]["container_and_launcher_kind"] = "spring-boot-executable-jar"
+            result["runtime_profile"]["business_entrypoint_profile"] = {
+                "coverage_status": "complete",
+                "methods": [{
+                    "initiating_loader_realm_identity": "application-loader",
+                    "class_name": "biz/Entry", "member_name": "run", "descriptor": "()I",
+                }],
+            }
+            return result
+
+        config = {
+            "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+            "source_usage": {"decision": "skip_source", "decision_source": "explicit_config"},
+            "asm_jar": str(self.asm_jar),
+            "base": side(base_runtime, "1"), "current": side(current_runtime, "2"),
+            "runtime_comparison": {
+                "controlled_profile_fields": ["loader_topology"],
+                "declared_upgrade_payload_scope": ["artifact-bytes"],
+            },
+        }
+
+        result = run_pipeline(config, output_root=self.root / "transaction-report")
+        generation = Path(result["generation_directory"])
+        formal = json.loads(
+            (generation / "binary_formal_results.json").read_text(encoding="utf-8")
+        )
+        target = next(
+            item for item in formal["by_api"]
+            if item["display_owner"].endswith("TransactionInterceptor")
+            and str(item["display_member"]).startswith("invoke")
+        )
+        overlay = json.loads(
+            (generation / "binary_runtime_semantic_overlay.json").read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(target["reachability_status"], "reachable")
+        self.assertEqual(
+            target["current_dependency_coords"],
+            ["org.springframework:spring-tx:2"],
+        )
+        self.assertTrue(any(
+            row["semantic_edge_kind"] == "spring_transaction_proxy_dispatch"
+            and row["path_certainty"] == "exact"
+            for row in overlay["rows"]
+        ))
+
+    def test_component_wiring_and_spring_data_proxy_use_runtime_activation(self):
+        def framework(label, value):
+            return self._compile_sources_jar(label, {
+                "org/springframework/stereotype/Component.java": (
+                    "package org.springframework.stereotype; import java.lang.annotation.*; "
+                    "@Retention(RetentionPolicy.RUNTIME) @Target(ElementType.TYPE) public @interface Component {}"
+                ),
+                "org/springframework/context/annotation/ComponentScan.java": (
+                    "package org.springframework.context.annotation; import java.lang.annotation.*; "
+                    "@Retention(RetentionPolicy.RUNTIME) @Target(ElementType.TYPE) "
+                    "public @interface ComponentScan { String[] value() default {}; }"
+                ),
+                "org/springframework/context/annotation/Profile.java": (
+                    "package org.springframework.context.annotation; import java.lang.annotation.*; "
+                    "@Retention(RetentionPolicy.RUNTIME) @Target({ElementType.TYPE,ElementType.METHOD}) "
+                    "public @interface Profile { String[] value(); }"
+                ),
+                "org/springframework/context/annotation/Primary.java": (
+                    "package org.springframework.context.annotation; import java.lang.annotation.*; "
+                    "@Retention(RetentionPolicy.RUNTIME) @Target({ElementType.TYPE,ElementType.METHOD}) "
+                    "public @interface Primary {}"
+                ),
+                "org/springframework/data/repository/Repository.java": (
+                    "package org.springframework.data.repository; public interface Repository<T,ID> {}"
+                ),
+                "org/springframework/data/jpa/repository/JpaRepository.java": (
+                    "package org.springframework.data.jpa.repository; public interface JpaRepository<T,ID> "
+                    "extends org.springframework.data.repository.Repository<T,ID> { java.util.List<T> findAll(); }"
+                ),
+                "org/springframework/data/jpa/repository/support/SimpleJpaRepository.java": (
+                    "package org.springframework.data.jpa.repository.support; public class SimpleJpaRepository<T,ID> { "
+                    f"public java.util.List<T> findAll() {{ return {value} == 1 "
+                    "? new java.util.ArrayList<T>() : java.util.Collections.emptyList(); } }"
+                ),
+                "lib/Service.java": "package lib; public interface Service { int ping(); }",
+                "lib/LibService.java": (
+                    "package lib; @org.springframework.stereotype.Component "
+                    "@org.springframework.context.annotation.Primary "
+                    "@org.springframework.context.annotation.Profile(\"prod\") "
+                    f"public class LibService implements Service {{ public int ping() {{ return {value}; }} }}"
+                ),
+                "lib/BackupService.java": (
+                    "package lib; @org.springframework.stereotype.Component "
+                    "@org.springframework.context.annotation.Profile(\"prod\") "
+                    f"public class BackupService implements Service {{ public int ping() {{ return {value + 10}; }} }}"
+                ),
+            })
+
+        base_framework = framework("wiring-base", 1)
+        current_framework = framework("wiring-current", 2)
+        business = self._compile_sources_jar("wiring-business", {
+            "biz/DemoRepository.java": (
+                "package biz; public interface DemoRepository extends "
+                "org.springframework.data.jpa.repository.JpaRepository<Object,Long> {}"
+            ),
+            "biz/Config.java": (
+                "package biz; @org.springframework.context.annotation.ComponentScan(\"lib\") "
+                "public class Config {}"
+            ),
+            "biz/Entry.java": (
+                "package biz; public class Entry { public int run(lib.Service service, DemoRepository repo) { "
+                "return service.ping() + repo.findAll().size(); } }"
+            ),
+        }, classpath=(current_framework,))
+
+        def side(framework_jar, version):
+            result = self._side(framework_jar, version)
+            result["artifacts"] = [{
+                "path": str(business), "logical_location": "app/business.jar",
+                "loader_realm": "application-loader", "path_kind": "business_classes",
+                "slot": 0, "coord": "business", "lineage": "business",
+                "runtime_code_source_origin_identity": "wiring-business",
+            }, {
+                "path": str(framework_jar), "logical_location": "lib/framework.jar",
+                "loader_realm": "application-loader", "path_kind": "classpath",
+                "slot": 1, "coord": f"com.acme:framework:{version}",
+                "lineage": "com.acme:framework",
+                "runtime_code_source_origin_identity": "wiring-framework",
+            }]
+            profile = result["runtime_profile"]
+            profile["container_and_launcher_kind"] = "spring-boot-executable-jar"
+            profile["active_profile_identities"] = ["prod"]
+            profile["business_entrypoint_profile"] = {
+                "coverage_status": "complete", "main_class": "biz.Application",
+                "methods": [{
+                    "initiating_loader_realm_identity": "application-loader",
+                    "class_name": "biz/Entry", "member_name": "run",
+                    "descriptor": "(Llib/Service;Lbiz/DemoRepository;)I",
+                }],
+            }
+            return result
+
+        config = {
+            "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+            "source_usage": {"decision": "skip_source", "decision_source": "explicit_config"},
+            "asm_jar": str(self.asm_jar),
+            "base": side(base_framework, "1"), "current": side(current_framework, "2"),
+            "runtime_comparison": {
+                "controlled_profile_fields": ["loader_topology"],
+                "declared_upgrade_payload_scope": ["artifact-bytes"],
+            },
+        }
+
+        result = run_pipeline(config, output_root=self.root / "wiring-report")
+        generation = Path(result["generation_directory"])
+        formal = json.loads(
+            (generation / "binary_formal_results.json").read_text(encoding="utf-8")
+        )["by_api"]
+        overlay = json.loads(
+            (generation / "binary_runtime_semantic_overlay.json").read_text(encoding="utf-8")
+        )
+        ping = next(
+            item for item in formal if item["display_owner"] == "lib/LibService"
+            and str(item["display_member"]).startswith("ping")
+        )
+        backup_ping = next(
+            item for item in formal if item["display_owner"] == "lib/BackupService"
+            and str(item["display_member"]).startswith("ping")
+        )
+        find_all = next(
+            item for item in formal if item["display_owner"].endswith("SimpleJpaRepository")
+            and str(item["display_member"]).startswith("findAll")
+        )
+
+        self.assertEqual(ping["reachability_status"], "reachable")
+        self.assertEqual(
+            backup_ping["reachability_status"], "uncertain"
+        )
+        self.assertEqual(find_all["reachability_status"], "reachable")
+        self.assertIn("spring_bean_wiring_dispatch", {
+            row["semantic_edge_kind"] for row in overlay["rows"]
+        })
+        wiring_edges = [
+            row for row in overlay["rows"]
+            if row["semantic_edge_kind"] == "spring_bean_wiring_dispatch"
+        ]
+        self.assertEqual(
+            {
+                (row["target_class_name"], row["path_certainty"])
+                for row in wiring_edges
+                if row["target_member_name"] == "ping"
+            },
+            {("lib/LibService", "exact")},
+        )
+        self.assertIn("spring_data_repository_proxy_dispatch", {
+            row["semantic_edge_kind"] for row in overlay["rows"]
+        })
+
+    def test_custom_spring_data_factory_does_not_claim_simple_repository_dispatch(self):
+        def framework(label, value):
+            return self._compile_sources_jar(label, {
+                "org/springframework/data/repository/Repository.java": (
+                    "package org.springframework.data.repository; "
+                    "public interface Repository<T,ID> {}"
+                ),
+                "org/springframework/data/jpa/repository/JpaRepository.java": (
+                    "package org.springframework.data.jpa.repository; "
+                    "public interface JpaRepository<T,ID> extends "
+                    "org.springframework.data.repository.Repository<T,ID> { "
+                    "java.util.List<T> findAll(); }"
+                ),
+                "org/springframework/data/jpa/repository/config/EnableJpaRepositories.java": (
+                    "package org.springframework.data.jpa.repository.config; "
+                    "import java.lang.annotation.*; "
+                    "@Retention(RetentionPolicy.RUNTIME) @Target(ElementType.TYPE) "
+                    "public @interface EnableJpaRepositories { "
+                    "Class<?> repositoryFactoryBeanClass(); }"
+                ),
+                "org/springframework/data/jpa/repository/support/SimpleJpaRepository.java": (
+                    "package org.springframework.data.jpa.repository.support; "
+                    "public class SimpleJpaRepository<T,ID> { "
+                    f"public java.util.List<T> findAll() {{ return {value} == 1 "
+                    "? new java.util.ArrayList<T>() : java.util.Collections.emptyList(); } }"
+                ),
+            })
+
+        base_framework = framework("custom-repository-base", 1)
+        current_framework = framework("custom-repository-current", 2)
+        business = self._compile_sources_jar("custom-repository-business", {
+            "biz/DemoRepository.java": (
+                "package biz; public interface DemoRepository extends "
+                "org.springframework.data.jpa.repository.JpaRepository<Object,Long> {}"
+            ),
+            "biz/CustomFactory.java": (
+                "package biz; public class CustomFactory {}"
+            ),
+            "biz/Config.java": (
+                "package biz; "
+                "@org.springframework.data.jpa.repository.config.EnableJpaRepositories("
+                "repositoryFactoryBeanClass=biz.CustomFactory.class) "
+                "public class Config {}"
+            ),
+            "biz/Entry.java": (
+                "package biz; public class Entry { "
+                "public int run(DemoRepository repository) { "
+                "return repository.findAll().size(); } }"
+            ),
+        }, classpath=(current_framework,))
+
+        def side(framework_jar, version):
+            payload = self._side(framework_jar, version)
+            payload["artifacts"] = [{
+                "path": str(business), "logical_location": "app/business.jar",
+                "loader_realm": "application-loader", "path_kind": "business_classes",
+                "slot": 0, "coord": "business", "lineage": "business",
+                "runtime_code_source_origin_identity": "custom-repository-business",
+            }, {
+                "path": str(framework_jar), "logical_location": "lib/framework.jar",
+                "loader_realm": "application-loader", "path_kind": "classpath",
+                "slot": 1, "coord": f"com.acme:data:{version}",
+                "lineage": "com.acme:data",
+                "runtime_code_source_origin_identity": "custom-repository-framework",
+            }]
+            payload["runtime_profile"]["container_and_launcher_kind"] = (
+                "spring-boot-executable-jar"
+            )
+            payload["runtime_profile"]["business_entrypoint_profile"] = {
+                "coverage_status": "complete", "activated_frameworks": ["spring_boot"],
+                "methods": [{
+                    "initiating_loader_realm_identity": "application-loader",
+                    "class_name": "biz/Entry", "member_name": "run",
+                    "descriptor": "(Lbiz/DemoRepository;)I",
+                }],
+            }
+            return payload
+
+        result = run_pipeline({
+            "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+            "source_usage": {
+                "decision": "skip_source", "decision_source": "explicit_config",
+            },
+            "asm_jar": str(self.asm_jar),
+            "base": side(base_framework, "1"),
+            "current": side(current_framework, "2"),
+            "runtime_comparison": {
+                "controlled_profile_fields": ["loader_topology"],
+                "declared_upgrade_payload_scope": ["artifact-bytes"],
+            },
+        }, output_root=self.root / "custom-repository-report")
+        generation = Path(result["generation_directory"])
+        overlay = json.loads(
+            (generation / "binary_runtime_semantic_overlay.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertIn(
+            "spring_data_custom_repository_factory", overlay["coverage_gaps"]
+        )
+        self.assertFalse(any(
+            row["semantic_edge_kind"] == "spring_data_repository_proxy_dispatch"
+            for row in overlay["rows"]
+        ))
+
+    def test_spring_aop_and_security_filter_callbacks_remain_reachable(self):
+        def framework(label, value):
+            return self._compile_sources_jar(label, {
+                "org/aspectj/lang/annotation/Aspect.java": (
+                    "package org.aspectj.lang.annotation; import java.lang.annotation.*; "
+                    "@Retention(RetentionPolicy.RUNTIME) @Target(ElementType.TYPE) public @interface Aspect {}"
+                ),
+                "org/aspectj/lang/annotation/Around.java": (
+                    "package org.aspectj.lang.annotation; import java.lang.annotation.*; "
+                    "@Retention(RetentionPolicy.RUNTIME) @Target(ElementType.METHOD) "
+                    "public @interface Around { String value(); }"
+                ),
+                "io/micrometer/observation/annotation/Observed.java": (
+                    "package io.micrometer.observation.annotation; "
+                    "import java.lang.annotation.*; "
+                    "@Retention(RetentionPolicy.RUNTIME) "
+                    "@Target({ElementType.TYPE,ElementType.METHOD}) "
+                    "public @interface Observed {}"
+                ),
+                "io/micrometer/observation/aop/ObservedAspect.java": (
+                    "package io.micrometer.observation.aop; "
+                    "@org.aspectj.lang.annotation.Aspect "
+                    "public class ObservedAspect { "
+                    "@org.aspectj.lang.annotation.Around(\"@within("
+                    "io.micrometer.observation.annotation.Observed) && "
+                    "!@annotation(io.micrometer.observation.annotation.Observed) && "
+                    "execution(* *.*(..))\") public void observeClass() {} }"
+                ),
+                "org/springframework/context/annotation/Bean.java": (
+                    "package org.springframework.context.annotation; import java.lang.annotation.*; "
+                    "@Retention(RetentionPolicy.RUNTIME) @Target(ElementType.METHOD) public @interface Bean {}"
+                ),
+                "jakarta/servlet/Filter.java": (
+                    "package jakarta.servlet; public interface Filter { void doFilter(); }"
+                ),
+                "org/springframework/security/web/SecurityFilterChain.java": (
+                    "package org.springframework.security.web; public interface SecurityFilterChain {}"
+                ),
+                "org/springframework/security/config/annotation/web/builders/HttpSecurity.java": (
+                    "package org.springframework.security.config.annotation.web.builders; "
+                    "public class HttpSecurity { public HttpSecurity addFilter(jakarta.servlet.Filter filter) { return this; } "
+                    "public org.springframework.security.web.SecurityFilterChain build() { return null; } }"
+                ),
+                "lib/Api.java": (
+                    f"package lib; public class Api {{ public int changed() {{ return {value}; }} }}"
+                ),
+                "lib/LibFilter.java": (
+                    "package lib; public class LibFilter implements jakarta.servlet.Filter { "
+                    f"public void doFilter() {{ System.out.print({value}); }} }}"
+                ),
+            })
+
+        base_framework = framework("aop-security-base", 1)
+        current_framework = framework("aop-security-current", 2)
+        business = self._compile_sources_jar("aop-security-business", {
+            "biz/Service.java": "package biz; public class Service { public int work() { return 1; } }",
+            "biz/ObservedService.java": (
+                "package biz; "
+                "@io.micrometer.observation.annotation.Observed "
+                "public class ObservedService { public void observed() {} "
+                "@io.micrometer.observation.annotation.Observed "
+                "public void suppressed() {} }"
+            ),
+            "biz/TracingAspect.java": (
+                "package biz; @org.aspectj.lang.annotation.Aspect public class TracingAspect { "
+                "@org.aspectj.lang.annotation.Around(\"execution(* biz.Service.work(..))\") "
+                "public int around() { return new lib.Api().changed(); } }"
+            ),
+            "biz/SecurityConfig.java": (
+                "package biz; public class SecurityConfig { @org.springframework.context.annotation.Bean "
+                "public org.springframework.security.web.SecurityFilterChain chain("
+                "org.springframework.security.config.annotation.web.builders.HttpSecurity http) { "
+                "return http.addFilter(new lib.LibFilter()).build(); } }"
+            ),
+            "biz/Entry.java": (
+                "package biz; public class Entry { public int run() { return new Service().work(); } }"
+            ),
+        }, classpath=(current_framework,))
+
+        def side(framework_jar, version):
+            result = self._side(framework_jar, version)
+            result["artifacts"] = [{
+                "path": str(business), "logical_location": "app/business.jar",
+                "loader_realm": "application-loader", "path_kind": "business_classes",
+                "slot": 0, "coord": "business", "lineage": "business",
+                "runtime_code_source_origin_identity": "aop-security-business",
+            }, {
+                "path": str(framework_jar), "logical_location": "lib/framework.jar",
+                "loader_realm": "application-loader", "path_kind": "classpath",
+                "slot": 1, "coord": f"com.acme:framework:{version}",
+                "lineage": "com.acme:framework",
+                "runtime_code_source_origin_identity": "aop-security-framework",
+            }]
+            result["runtime_profile"]["container_and_launcher_kind"] = "spring-boot-executable-jar"
+            result["runtime_profile"]["business_entrypoint_profile"] = {
+                "coverage_status": "complete", "methods": [{
+                    "initiating_loader_realm_identity": "application-loader",
+                    "class_name": "biz/Entry", "member_name": "run", "descriptor": "()I",
+                }],
+            }
+            return result
+
+        config = {
+            "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+            "source_usage": {"decision": "skip_source", "decision_source": "explicit_config"},
+            "asm_jar": str(self.asm_jar),
+            "base": side(base_framework, "1"), "current": side(current_framework, "2"),
+            "runtime_comparison": {
+                "controlled_profile_fields": ["loader_topology"],
+                "declared_upgrade_payload_scope": ["artifact-bytes"],
+            },
+        }
+
+        result = run_pipeline(config, output_root=self.root / "aop-security-report")
+        generation = Path(result["generation_directory"])
+        formal = json.loads(
+            (generation / "binary_formal_results.json").read_text(encoding="utf-8")
+        )["by_api"]
+        overlay = json.loads(
+            (generation / "binary_runtime_semantic_overlay.json").read_text(encoding="utf-8")
+        )
+        api = next(item for item in formal if item["display_owner"] == "lib/Api")
+        callback = next(
+            item for item in formal if item["display_owner"] == "lib/LibFilter"
+            and str(item["display_member"]).startswith("doFilter")
+        )
+
+        self.assertEqual(api["reachability_status"], "reachable")
+        self.assertEqual(callback["reachability_status"], "reachable")
+        kinds = {row["semantic_edge_kind"] for row in overlay["rows"]}
+        self.assertIn("spring_aop_dispatch", kinds)
+        self.assertIn("spring_security_filter_dispatch", kinds)
+        observed_edges = [
+            row for row in overlay["rows"]
+            if row["semantic_edge_kind"] == "spring_aop_dispatch"
+            and row["target_class_name"]
+            == "io/micrometer/observation/aop/ObservedAspect"
+        ]
+        self.assertEqual(
+            {(row["caller_class_name"], row["caller_member_name"], row["path_certainty"])
+             for row in observed_edges},
+            {("biz/ObservedService", "observed", "possible")},
+        )
+
+    def test_declarative_client_and_dubbo_spi_dispatch_are_preserved(self):
+        def framework(label, value):
+            jar = self._compile_sources_jar(label, {
+                "org/springframework/cloud/openfeign/FeignClient.java": (
+                    "package org.springframework.cloud.openfeign; import java.lang.annotation.*; "
+                    "@Retention(RetentionPolicy.RUNTIME) @Target(ElementType.TYPE) "
+                    "public @interface FeignClient { String value(); }"
+                ),
+                "feign/SynchronousMethodHandler.java": (
+                    "package feign; public class SynchronousMethodHandler { "
+                    f"public Object invoke(Object[] args) {{ return Integer.valueOf({value}); }} }}"
+                ),
+                "org/apache/dubbo/common/extension/ExtensionLoader.java": (
+                    "package org.apache.dubbo.common.extension; public class ExtensionLoader { "
+                    "public Object getExtension(String name) { return null; } }"
+                ),
+                "demo/DubboService.java": (
+                    "package demo; public interface DubboService { int execute(); }"
+                ),
+                "demo/Provider.java": (
+                    f"package demo; public class Provider implements DubboService {{ "
+                    f"public int execute() {{ return {value}; }} }}"
+                ),
+            })
+            with zipfile.ZipFile(jar, "a") as archive:
+                archive.writestr(
+                    "META-INF/dubbo/demo.DubboService",
+                    "fast=demo.Provider\n",
+                )
+            return jar
+
+        base_framework = framework("dispatch-base", 1)
+        current_framework = framework("dispatch-current", 2)
+        business = self._compile_sources_jar("dispatch-business", {
+            "biz/RemoteClient.java": (
+                "package biz; @org.springframework.cloud.openfeign.FeignClient(\"remote\") "
+                "public interface RemoteClient { int call(); }"
+            ),
+            "biz/Entry.java": (
+                "package biz; public class Entry { public int run(RemoteClient client) { "
+                "org.apache.dubbo.common.extension.ExtensionLoader loader = "
+                "new org.apache.dubbo.common.extension.ExtensionLoader(); "
+                "demo.DubboService service = (demo.DubboService) loader.getExtension(\"fast\"); "
+                "return client.call() + service.execute(); } }"
+            ),
+        }, classpath=(current_framework,))
+
+        def side(framework_jar, version):
+            result = self._side(framework_jar, version)
+            result["artifacts"] = [{
+                "path": str(business), "logical_location": "app/business.jar",
+                "loader_realm": "application-loader", "path_kind": "business_classes",
+                "slot": 0, "coord": "business", "lineage": "business",
+                "runtime_code_source_origin_identity": "dispatch-business",
+            }, {
+                "path": str(framework_jar), "logical_location": "lib/framework.jar",
+                "loader_realm": "application-loader", "path_kind": "classpath",
+                "slot": 1, "coord": f"com.acme:dispatch:{version}",
+                "lineage": "com.acme:dispatch",
+                "runtime_code_source_origin_identity": "dispatch-framework",
+            }]
+            result["runtime_profile"]["container_and_launcher_kind"] = "spring-boot-executable-jar"
+            result["runtime_profile"]["business_entrypoint_profile"] = {
+                "coverage_status": "complete", "methods": [{
+                    "initiating_loader_realm_identity": "application-loader",
+                    "class_name": "biz/Entry", "member_name": "run",
+                    "descriptor": "(Lbiz/RemoteClient;)I",
+                }],
+            }
+            return result
+
+        config = {
+            "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+            "source_usage": {"decision": "skip_source", "decision_source": "explicit_config"},
+            "asm_jar": str(self.asm_jar),
+            "base": side(base_framework, "1"), "current": side(current_framework, "2"),
+            "runtime_comparison": {
+                "controlled_profile_fields": ["loader_topology"],
+                "declared_upgrade_payload_scope": ["artifact-bytes"],
+            },
+        }
+
+        result = run_pipeline(config, output_root=self.root / "dispatch-report")
+        generation = Path(result["generation_directory"])
+        formal = json.loads(
+            (generation / "binary_formal_results.json").read_text(encoding="utf-8")
+        )["by_api"]
+        overlay = json.loads(
+            (generation / "binary_runtime_semantic_overlay.json").read_text(encoding="utf-8")
+        )
+        feign = next(
+            item for item in formal if item["display_owner"] == "feign/SynchronousMethodHandler"
+        )
+        provider = next(
+            item for item in formal if item["display_owner"] == "demo/Provider"
+            and str(item["display_member"]).startswith("execute")
+        )
+
+        self.assertEqual(feign["reachability_status"], "reachable")
+        self.assertEqual(provider["reachability_status"], "reachable")
+        kinds = {row["semantic_edge_kind"] for row in overlay["rows"]}
+        self.assertIn("declarative_http_client_dispatch", kinds)
+        self.assertIn("dubbo_spi_dispatch", kinds)
+
+    def test_web_binding_keeps_removed_dependency_field_reachable_as_data_contract(self):
+        base_dto = self._compile_sources_jar("dto-base", {
+            "lib/Dto.java": (
+                "package lib; public class Dto { "
+                "public String removed; public String retained; }"
+            ),
+        })
+        current_dto = self._compile_sources_jar("dto-current", {
+            "lib/Dto.java": (
+                "package lib; public class Dto { public String retained; }"
+            ),
+        })
+        business = self._compile_sources_jar("dto-business", {
+            "org/springframework/web/bind/annotation/GetMapping.java": (
+                "package org.springframework.web.bind.annotation; "
+                "import java.lang.annotation.*; @Retention(RetentionPolicy.RUNTIME) "
+                "@Target(ElementType.METHOD) public @interface GetMapping {}"
+            ),
+            "biz/Controller.java": (
+                "package biz; public class Controller { "
+                "@org.springframework.web.bind.annotation.GetMapping "
+                "public lib.Dto endpoint(lib.Dto request) { return request; } }"
+            ),
+        }, classpath=(current_dto,))
+
+        def side(dto, version):
+            result = self._side(dto, version)
+            result["artifacts"] = [{
+                "path": str(business), "logical_location": "app/business.jar",
+                "loader_realm": "application-loader", "path_kind": "business_classes",
+                "slot": 0, "coord": "business", "lineage": "business",
+                "runtime_code_source_origin_identity": "dto-business",
+            }, {
+                "path": str(dto), "logical_location": "lib/dto.jar",
+                "loader_realm": "application-loader", "path_kind": "classpath",
+                "slot": 1, "coord": f"com.acme:dto:{version}",
+                "lineage": "com.acme:dto",
+                "runtime_code_source_origin_identity": "dto-dependency",
+            }]
+            result["runtime_profile"]["business_entrypoint_profile"] = {
+                "coverage_status": "complete", "methods": [{
+                    "initiating_loader_realm_identity": "application-loader",
+                    "class_name": "biz/Controller", "member_name": "endpoint",
+                    "descriptor": "(Llib/Dto;)Llib/Dto;",
+                }],
+            }
+            return result
+
+        config = {
+            "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+            "source_usage": {
+                "decision": "skip_source", "decision_source": "explicit_config",
+            },
+            "asm_jar": str(self.asm_jar),
+            "base": side(base_dto, "1"), "current": side(current_dto, "2"),
+            "runtime_comparison": {
+                "controlled_profile_fields": ["loader_topology"],
+                "declared_upgrade_payload_scope": ["artifact-bytes"],
+            },
+        }
+        result = run_pipeline(config, output_root=self.root / "data-contract-report")
+        generation = Path(result["generation_directory"])
+        formal = json.loads(
+            (generation / "binary_formal_results.json").read_text(encoding="utf-8")
+        )["by_api"]
+        removed = next(
+            item for item in formal
+            if item["display_owner"] == "lib/Dto"
+            and str(item["display_member"]).startswith("removed")
+        )
+        overlay = json.loads(
+            (generation / "binary_runtime_semantic_overlay.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(removed["reachability_status"], "reachable")
+        self.assertTrue(any(
+            row["semantic_edge_kind"] == "implicit_data_contract_dispatch"
+            and row["target_class_name"] == "lib/Dto"
+            and row["target_member_name"] == "removed"
+            and row["path_certainty"] == "exact"
+            for row in overlay["rows"]
+        ))
+
+    def test_step1_runtime_materialization_runs_without_handwritten_binary_config(self):
+        base_core, current_core, scheduler, app = (
+            self._automatic_scheduled_entry_fixture()
+        )
+        report = self.root / "auto-materialized-report"
+        dependencies = report / "evidence" / "dependencies"
+        dependencies.mkdir(parents=True)
+
+        def digest(path):
+            return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+        manifest = {
+            "schema": "java-upgrade-analyzer.step1-dependency-jars.v3",
+            "items": [],
+            "business_artifacts": [],
+            "runtime_closure": {},
+        }
+        provenance = {"sides": []}
+        for side, core, version in (
+            ("base", base_core, "1.0"),
+            ("current", current_core, "2.0"),
+        ):
+            manifest["business_artifacts"].append({
+                "side": side,
+                "retained_path": str(app),
+                "sha256": digest(app),
+                "outer_artifact_path": str(app),
+                "outer_artifact_sha256": digest(app),
+                "container_and_launcher_kind": "spring-boot-executable-jar",
+            })
+            for index, (jar, coord, dependency_version) in enumerate((
+                (scheduler, "com.acme:scheduler", "1.0"),
+                (core, "com.acme:core", version),
+            )):
+                manifest["items"].append({
+                    "side": side,
+                    "coord": coord,
+                    "version": dependency_version,
+                    "lib_entry": f"BOOT-INF/lib/{Path(jar).name}",
+                    "retained_path": str(jar),
+                    "nested_jar_sha256": digest(jar),
+                    "outer_artifact_sha256": digest(app),
+                    "runtime_classpath_index": index,
+                    "purposes": ["binary_runtime"],
+                })
+            manifest["runtime_closure"][side] = {
+                "coverage_status": "complete",
+                "coverage_gaps": [],
+            }
+            provenance["sides"].append({
+                "side": side,
+                "target_module": "app",
+                "jdk_home": str(self.home),
+                "artifact_sha256": digest(app),
+            })
+        (dependencies / "dependency_jars.json").write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+        (dependencies / "build_provenance.json").write_text(
+            json.dumps(provenance), encoding="utf-8"
+        )
+
+        config = materialize_binary_pipeline_config(report)
+        config["source_usage"] = {
+            "decision": "skip_source",
+            "decision_source": "explicit_config",
+        }
+        config["asm_jar"] = str(self.asm_jar)
+        result = run_pipeline(
+            config,
+            output_root=report / ".runtime" / "binary_authority",
+        )
+        formal = json.loads(
+            (Path(result["generation_directory"]) / "binary_formal_results.json")
+            .read_text(encoding="utf-8")
+        )
+        target = next(
+            item for item in formal["by_api"]
+            if item["display_owner"] == "api/Api"
+            and str(item["display_member"]).startswith("value")
+        )
+
+        self.assertEqual(target["reachability_status"], "reachable")
+        self.assertEqual(
+            target["paths"][0]["entrypoint_dependency_coords"],
+            ["com.acme:scheduler:1.0"],
+        )
+
     def test_end_to_end_generation_is_content_bound_and_immutable(self):
         base = self._jar("base", 1, service_provider="demo.OldProvider")
         current = self._jar("current", 2, service_provider="demo.NewProvider")
@@ -469,6 +1943,15 @@ class BinaryPipelineTest(unittest.TestCase):
         self.assertEqual(
             timings["result_generation_identity"],
             first["result_generation_identity"],
+        )
+        progress = json.loads(
+            (
+                output / "binary_observability" / "latest_in_progress.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(progress["status"], "completed")
+        self.assertEqual(
+            progress["last_completed_phase"], "validated_generation_activation"
         )
         generation = Path(first["generation_directory"])
         summary = json.loads((generation / "binary_summary.json").read_text())
@@ -623,6 +2106,34 @@ class BinaryPipelineTest(unittest.TestCase):
         self.assertNotEqual(
             validation["validation_run_identity"], first["analysis_context_identity"]
         )
+        formal_path = generation / "binary_formal_results.json"
+        manifest_path = generation / "result_generation.json"
+        original_formal = formal_path.read_bytes()
+        original_manifest = manifest_path.read_bytes()
+        manipulated = json.loads(original_formal)
+        manipulated["by_api"][0]["reachability_status"] = (
+            "not_found_in_static_analysis"
+        )
+        manipulated["by_api"][0]["impact_conclusion"] = "inconclusive"
+        formal_path.write_text(
+            json.dumps(
+                manipulated, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            ) + "\n",
+            encoding="utf-8",
+        )
+        manifest = json.loads(original_manifest)
+        manifest["sidecar_content_identities"][formal_path.name] = hashlib.sha256(
+            formal_path.read_bytes()
+        ).hexdigest()
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        conclusion_tampered = validate_generation(config, generation)
+        self.assertTrue(any(
+            item["reason_code"] == "ORACLE_API_AGGREGATION_MISMATCH"
+            for item in conclusion_tampered["issues"]
+        ), conclusion_tampered["issues"])
+        formal_path.write_bytes(original_formal)
+        manifest_path.write_bytes(original_manifest)
         summary_path = generation / "binary_summary.json"
         summary_path.write_text("{}\n", encoding="utf-8")
         tampered = validate_generation(config, generation)
@@ -648,7 +2159,7 @@ class BinaryPipelineTest(unittest.TestCase):
                 ),
                 "demo/hierarchy/Child.java": (
                     "package demo.hierarchy; public class Child extends "
-                    f"{parent} {{ }}"
+                    f"{parent} {{ public int call() {{ return value(); }} }}"
                 ),
                 "demo/spi/Service.java": (
                     "package demo.spi; public interface Service { String run(); }"
@@ -689,7 +2200,7 @@ class BinaryPipelineTest(unittest.TestCase):
         business_source.write_text(
             "package biz; import java.util.ServiceLoader; "
             "public class Main { public String entry(){ return "
-            "new demo.hierarchy.Child().value() + \":\" + "
+            "new demo.hierarchy.Child().call() + \":\" + "
             "ServiceLoader.load(demo.spi.Service.class).findFirst()"
             ".orElseThrow().run(); } }",
             encoding="utf-8",
@@ -728,7 +2239,9 @@ class BinaryPipelineTest(unittest.TestCase):
                     "slot": 1,
                     "coord": f"com.acme:semantic:{version}",
                     "lineage": "com.acme:semantic",
-                    "runtime_code_source_origin_identity": "semantic:dependency",
+                    "runtime_code_source_origin_identity": (
+                        f"semantic:dependency:{version}"
+                    ),
                 }],
                 "runtime_profile": {
                     "container_and_launcher_kind": "java-classpath",
@@ -770,8 +2283,12 @@ class BinaryPipelineTest(unittest.TestCase):
             "base": side(base_dependency, "1"),
             "current": side(current_dependency, "2"),
             "runtime_comparison": {
+                "comparison_intent": "release_snapshot",
                 "controlled_profile_fields": ["loader_topology"],
                 "declared_upgrade_payload_scope": ["artifact-bytes"],
+                "changed_or_unknown_profile_fields": [
+                    "runtime_code_source_origin_mapping_identity"
+                ],
             },
         }
         report = self.root / "semantic-report"
@@ -932,6 +2449,11 @@ class BinaryPipelineTest(unittest.TestCase):
         base = self._jar("source-base", 1)
         current = self._jar("source-current", 2, uses_system_out=True)
         current_source = self.root / "source-current" / "src"
+        kotlin_source = current_source / "demo" / "KotlinConsumer.kt"
+        kotlin_source.write_text(
+            "package demo\nclass KotlinConsumer { fun value() = Api().value() }\n",
+            encoding="utf-8",
+        )
         config = {
             "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
             "source_usage": {
@@ -962,6 +2484,25 @@ class BinaryPipelineTest(unittest.TestCase):
             output_root=report / ".runtime" / "binary_authority",
         )
         self.assertEqual(result["source_usage"]["decision"], "use_source")
+        attestation = json.loads(
+            (
+                Path(result["generation_directory"])
+                / "binary_source_attestation.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(attestation["coverage_status"], "partial")
+        self.assertEqual(attestation["source_sets"][0]["owner_type"], "dependency")
+        self.assertEqual(attestation["source_sets"][0]["owner_coord"], "com.acme:api:2")
+        self.assertEqual(attestation["file_count"], 2)
+        self.assertEqual(
+            attestation["language_file_counts"], {"java": 1, "kotlin": 1}
+        )
+        self.assertEqual(
+            attestation["coverage_gaps"][0]["reason_code"],
+            "BINARY_SOURCE_LANGUAGE_NOT_MAPPED",
+        )
+        self.assertGreaterEqual(attestation["mapped_binary_member_count"], 1)
+        self.assertEqual(len(attestation["files"][0]["sha256"]), 64)
         api_dir = report / "evidence" / "api_changes"
         publish_step4(report, api_dir)
         source_dir = report / "evidence" / "source_analysis"
@@ -975,6 +2516,15 @@ class BinaryPipelineTest(unittest.TestCase):
         self.assertEqual(mapped["二进制制品"], "com.acme:api:2")
         self.assertEqual(mapped["源码位置"], "demo/Api.java:1")
         self.assertTrue(mapped["源码声明"])
+        source_review = (source_dir / "review.md").read_text(encoding="utf-8")
+        self.assertIn("kotlin 1 个", source_review)
+        self.assertIn("coverage_gaps.csv", source_review)
+        with (source_dir / "coverage_gaps.csv").open(
+            encoding="utf-8-sig", newline=""
+        ) as handle:
+            gap_rows = list(csv.DictReader(handle))
+        self.assertEqual(gap_rows[0]["源码文件"], "demo/KotlinConsumer.kt")
+        self.assertTrue((source_dir / "source_snapshot.json").is_file())
         with (source_dir / "candidate_relationships.csv").open(
             encoding="utf-8-sig", newline=""
         ) as handle:

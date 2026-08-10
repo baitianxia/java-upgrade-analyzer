@@ -53,7 +53,7 @@ public final class ClassDefinitionVerifier {
             if("definition_input_footer".equals(type))break;
             if(!"class_name".equals(type))throw new IOException("bad frame type");
             String name=new String(Base64.getDecoder().decode(field(json,"class_name_b64")),StandardCharsets.UTF_8);
-            if(!name.matches("[A-Za-z_$][A-Za-z0-9_$]*(?:/[A-Za-z_$][A-Za-z0-9_$]*)*"))throw new IOException("unsafe class name");
+            if(!name.matches("(?:[A-Za-z_$][A-Za-z0-9_$]*|package-info|module-info)(?:/(?:[A-Za-z_$][A-Za-z0-9_$]*|package-info|module-info))*"))throw new IOException("unsafe class name");
             names.add(name);
         }
         if(names.size()!=expected || frame(in)!=null)throw new IOException("input count/trailing bytes");
@@ -65,14 +65,19 @@ public final class ClassDefinitionVerifier {
                 Path path=root.resolve(internal+".class").normalize();
                 if(!path.startsWith(root))throw new IOException("class path escaped root");
                 byte[] bytes=Files.readAllBytes(path);
+                boolean classLoaded=false;
                 try{
                     Class<?> type=Class.forName(internal.replace('/','.'),false,loader);
+                    classLoaded=true;
+                    // Resolve the class's own executable/field descriptors.  Do
+                    // not enumerate InnerClasses: a loadable outer class may
+                    // legitimately advertise optional nested implementations
+                    // whose dependencies are absent until that feature is used.
                     type.getDeclaredConstructors(); type.getDeclaredMethods(); type.getDeclaredFields();
-                    type.getDeclaredClasses();
                     write(out,map("frame_type","class_definition","class_name",internal,"class_bytes_sha256",sha(bytes),"status","definition_ready"));
                     ready++;
                 }catch(Throwable error){
-                    write(out,map("frame_type","class_definition","class_name",internal,"class_bytes_sha256",sha(bytes),"status","verification_failed","failure_kind",error.getClass().getName(),"failure_message",String.valueOf(error.getMessage())));
+                    write(out,map("frame_type","class_definition","class_name",internal,"class_bytes_sha256",sha(bytes),"status","verification_failed","failure_phase",classLoaded?"member_linkage":"class_load","failure_kind",error.getClass().getName(),"failure_message",String.valueOf(error.getMessage())));
                     failed++;
                 }
             }

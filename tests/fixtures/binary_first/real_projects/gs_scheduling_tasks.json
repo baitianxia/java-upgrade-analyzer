@@ -1,0 +1,55 @@
+{
+  "schema": "java-upgrade-analyzer.binary-real-project-guard.v1",
+  "case": "gs-scheduling-tasks",
+  "repository": "spring-guides/gs-scheduling-tasks",
+  "git_revision": "ae04f0228a689bda86a9900d880277effc99b205",
+  "application_coordinate": "com.example:scheduling-tasks-complete:0.0.1-SNAPSHOT",
+  "activated_frameworks": ["spring_boot", "spring_scheduling"],
+  "capabilities": [
+    "spring_boot_final_artifact",
+    "spring_scheduled_business_entrypoint",
+    "complete_nested_runtime_closure",
+    "pinned_source_build"
+  ],
+  "assets": {
+    "application": {
+      "kind": "source_build",
+      "coordinate": "com.example:scheduling-tasks-complete:0.0.1-SNAPSHOT",
+      "filename": "scheduling-tasks-complete-ae04f02.jar",
+      "repository_url": "https://github.com/spring-guides/gs-scheduling-tasks.git",
+      "git_revision": "ae04f0228a689bda86a9900d880277effc99b205",
+      "working_directory": "complete",
+      "build_command": ["mvn", "-q", "-DskipTests", "package"],
+      "artifact_path": "target/scheduling-tasks-complete-0.0.1-SNAPSHOT.jar",
+      "canonicalize_zip": true,
+      "sha256": "cc74ae91e777cc179d92bc3d248516cda3c5a736ff246b79005ce579400fec71"
+    },
+    "base_dependency": {
+      "coordinate": "org.springframework:spring-context:6.0.13",
+      "filename": "spring-context-6.0.13.jar",
+      "url": "https://repo1.maven.org/maven2/org/springframework/spring-context/6.0.13/spring-context-6.0.13.jar",
+      "sha256": "b88dfd5d2f27a562af7971f76e2d2c6626125310633914beabafe6d766ca5e08"
+    }
+  },
+  "current_nested_asset": {
+    "entry": "BOOT-INF/lib/spring-context-6.1.1.jar",
+    "coordinate": "org.springframework:spring-context:6.1.1",
+    "sha256": "b46807c32546320560078dddd95f3b2e6a42b7a643830b323f45b0573bdbfaad"
+  },
+  "entrypoint": {
+    "class_name": "com/example/schedulingtasks/SchedulingTasksApplication",
+    "member_name": "main",
+    "descriptor": "([Ljava/lang/String;)V"
+  },
+  "expected": {
+    "reachable_changed_methods": [],
+    "required_resources": [],
+    "entrypoint": {
+      "class_name": "com/example/schedulingtasks/ScheduledTasks",
+      "member_name": "reportCurrentTime",
+      "descriptor": "()V",
+      "entry_kind": "spring_scheduled",
+      "path_certainty": "exact"
+    }
+  }
+}

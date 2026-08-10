@@ -44,6 +44,8 @@ class BinaryAsmHelperTest(unittest.TestCase):
                     }
                 }
                 public Runnable lambda() { return () -> choose(1); }
+                public double positiveInfinity() { return Double.POSITIVE_INFINITY; }
+                public float notANumber() { return Float.NaN; }
             }
             """,
             encoding="utf-8",
@@ -97,6 +99,18 @@ class BinaryAsmHelperTest(unittest.TestCase):
         }
         self.assertIn("invokedynamic", instruction_kinds)
         self.assertIn("lookupswitch", instruction_kinds)
+        special_floats = {
+            instruction[2]["kind"]
+            for method in methods.values()
+            for instruction in method["instructions"]
+            if instruction[0] == "ldc"
+            and len(instruction) > 2
+            and isinstance(instruction[2], dict)
+            and str(instruction[2].get("kind") or "").startswith("non_finite_")
+        }
+        self.assertEqual(
+            special_floats, {"non_finite_double", "non_finite_float"}
+        )
         self.assertTrue(methods["choose"]["try_catch"])
         attributes = {(item["level"], item["name"]) for item in fact["attribute_inventory"]}
         self.assertIn(("method", "Code"), attributes)

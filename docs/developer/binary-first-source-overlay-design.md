@@ -81,7 +81,7 @@ Step4–Step6 只存在一个 binary-first 引擎。不存在 legacy、shadow、
 
 ## 4. 输入合同
 
-Step4 必须接收显式 `binary_pipeline_config`。模板见仓库根目录 `binary_pipeline_config.example.json`。
+Binary pipeline 在进入 Step4A 前必须持有完整、持久化的 `binary_pipeline_config`，但正常用户流程不要求用户手写：Step1 从 base/current 最终制品自动物化两侧完整有序运行闭包、依赖身份和运行时 profile，Step4 直接消费该结果。仓库根目录 `binary_pipeline_config.example.json` 仅用于高级集成、离线重放或显式覆盖；自动物化失败时系统先给出具体缺失事实，不把内部配置格式转嫁给普通用户。
 
 配置必须固定：
 
@@ -92,7 +92,7 @@ Step4 必须接收显式 `binary_pipeline_config`。模板见仓库根目录 `bi
 - base/current 完整目标 JDK home；
 - resource/security policy；
 - 业务入口及其方法 descriptor；
-- 必填 `source_usage` 用户决定；
+- 必填 `source_usage` 用户决定；用户已直接提供源码时视为 `use_source`，未提供时先说明源码作用再请求选择，不能默认跳过；
 - 当用户选择 `use_source` 时必填 `source_overlay.source_sets`，每个业务或依赖源码集合必须分别记录 `owner_type`、`owner_coord`、`module`、稳定 `source_root` 和源码目录；选择 `skip_source` 时必须不存在 source overlay。
 
 这些事实决定运行时有效性，不能从当前开发机 classpath 或未固定的构建目录猜测。缺失会改变结论的外部事实时，系统明确指出缺口；身份冲突、重复 provider、JDK 不完整、entrypoint 无法绑定或配置与制品 SHA 不一致时直接失败关闭。

@@ -9,13 +9,27 @@ import json
 from pathlib import Path
 import sqlite3
 from typing import Any, Iterable
+import zlib
 
 from binary_artifact_diff import ArtifactSnapshot
 from binary_first_contract import BinaryFirstContractError, canonical_identity
 from binary_first_model import ArtifactInstance
 
 
-SCHEMA_VERSION = "binary-fact-sqlite-v2"
+SCHEMA_VERSION = "binary-fact-sqlite-v3"
+RECONCILIATION_KIND_CODES = {
+    "provider_binding": 1,
+    "class_definition": 2,
+    "member_resolution": 3,
+    "dispatch_resolution": 4,
+    "type_resolution": 5,
+    "class_initialization_resolution": 6,
+    "linkage_resolution": 7,
+    "resource_selection": 8,
+}
+RECONCILIATION_CODE_KINDS = {
+    value: key for key, value in RECONCILIATION_KIND_CODES.items()
+}
 
 
 class BinaryFactStoreError(BinaryFirstContractError):
@@ -111,8 +125,8 @@ class BinaryFactStore:
                 class_contract_digest TEXT NOT NULL,
                 parse_status TEXT NOT NULL,
                 failure_kind TEXT NOT NULL,
-                class_bytes BLOB NOT NULL,
-                fact_json TEXT NOT NULL,
+                class_bytes_zlib BLOB NOT NULL,
+                fact_zlib BLOB NOT NULL,
                 UNIQUE(artifact_instance_identity, physical_entry_label)
             );
             CREATE INDEX IF NOT EXISTS classes_runtime_lookup
@@ -163,15 +177,13 @@ class BinaryFactStore:
             );
 
             CREATE TABLE IF NOT EXISTS reconciliation_records (
-                record_identity TEXT PRIMARY KEY,
-                analysis_context_identity TEXT NOT NULL,
-                record_kind TEXT NOT NULL,
-                status TEXT NOT NULL,
-                subject_identity TEXT NOT NULL,
-                payload_json TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS reconciliation_records_context_kind
-                ON reconciliation_records(analysis_context_identity, record_kind, subject_identity);
+                chunk_identity BLOB PRIMARY KEY,
+                record_kind INTEGER NOT NULL,
+                record_count INTEGER NOT NULL,
+                payload_zlib BLOB NOT NULL
+            ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS reconciliation_records_kind
+                ON reconciliation_records(record_kind);
 
             CREATE TABLE IF NOT EXISTS source_overlays (
                 overlay_identity TEXT PRIMARY KEY,
@@ -319,8 +331,10 @@ class BinaryFactStore:
                             str(record.get("class_contract_digest") or ""),
                             parse_status,
                             str(record.get("failure_kind") or ""),
-                            sqlite3.Binary(class_payload),
-                            _json(record),
+                            sqlite3.Binary(zlib.compress(class_payload, level=1)),
+                            sqlite3.Binary(zlib.compress(
+                                _json(record).encode("utf-8"), level=1
+                            )),
                         ),
                     )
                     counts["classes"] += 1
@@ -510,7 +524,7 @@ class BinaryFactStore:
                 "bytecode_offset": bci,
                 "edge_kind": "type",
                 "opcode": 197,
-                "symbolic_owner": BinaryFactStore._descriptor_owner(descriptor),
+                "symbolic_owner": BinaryFactStore._type_symbolic_owner(descriptor),
                 "symbolic_name": "<type>",
                 "symbolic_descriptor": descriptor,
                 "payload": {
@@ -554,7 +568,7 @@ class BinaryFactStore:
                 descriptor = str(constant.get("descriptor") or "")
                 owner = str(constant.get("owner") or "")
                 if constant_kind == "type":
-                    owner = BinaryFactStore._descriptor_owner(descriptor)
+                    owner = BinaryFactStore._type_symbolic_owner(descriptor)
                 result = [{
                     "bytecode_offset": bci,
                     "edge_kind": "type" if constant_kind == "type" else f"ldc_{constant_kind}",
@@ -604,6 +618,16 @@ class BinaryFactStore:
         return ""
 
     @staticmethod
+    def _type_symbolic_owner(descriptor: str) -> str:
+        """Preserve array/primitive class identities; unwrap only object L-types."""
+        value = str(descriptor or "")
+        if value.startswith("["):
+            return value
+        if value.startswith("L") and value.endswith(";"):
+            return value[1:-1]
+        return value
+
+    @staticmethod
     def _collect_handles(value: Any, output: list[dict[str, Any]]) -> None:
         if isinstance(value, dict):
             if value.get("kind") == "handle":
@@ -623,33 +647,113 @@ class BinaryFactStore:
         subject_identity: str,
         payload: dict[str, Any],
     ) -> str:
-        record_identity = _identity(
-            f"{record_kind}_record_identity",
-            {
-                "analysis_context_identity": analysis_context_identity,
-                "status": status,
-                "subject_identity": subject_identity,
-                "payload": payload,
-            },
-        )
+        return self.add_reconciliation_records([{
+            "analysis_context_identity": analysis_context_identity,
+            "record_kind": record_kind,
+            "status": status,
+            "subject_identity": subject_identity,
+            "payload": payload,
+        }])[0]
+
+    def add_reconciliation_records(
+        self, records: Iterable[dict[str, Any]], *,
+        collect_identities: bool = True,
+    ) -> list[str]:
+        identities = []
+        context_identity = ""
         try:
             with self.connection:
-                self.connection.execute(
-                    "INSERT INTO reconciliation_records VALUES(?,?,?,?,?,?)",
-                    (
-                        record_identity,
-                        analysis_context_identity,
-                        record_kind,
-                        status,
-                        subject_identity,
-                        _json(payload),
-                    ),
-                )
+                pending_kind = ""
+                pending: list[dict[str, Any]] = []
+
+                def flush() -> None:
+                    nonlocal pending_kind, pending
+                    if not pending:
+                        return
+                    chunk_identity = _identity(
+                        "reconciliation_record_chunk_identity",
+                        {
+                            "analysis_context_identity": context_identity,
+                            "record_kind": pending_kind,
+                            "record_identities": [
+                                item["record_identity"] for item in pending
+                            ],
+                        },
+                    )
+                    self.connection.execute(
+                        "INSERT INTO reconciliation_records VALUES(?,?,?,?)",
+                        (
+                            sqlite3.Binary(bytes.fromhex(chunk_identity)),
+                            RECONCILIATION_KIND_CODES[pending_kind],
+                            len(pending),
+                            sqlite3.Binary(zlib.compress(
+                                _json(pending).encode("utf-8"), level=1
+                            )),
+                        ),
+                    )
+                    pending_kind = ""
+                    pending = []
+
+                for raw in records:
+                    analysis_context_identity = str(
+                        raw["analysis_context_identity"]
+                    )
+                    record_kind = str(raw["record_kind"])
+                    if record_kind not in RECONCILIATION_KIND_CODES:
+                        raise BinaryFactStoreError(
+                            "FACT_STORE_RECONCILIATION_KIND_INVALID", record_kind
+                        )
+                    if not context_identity:
+                        context_identity = analysis_context_identity
+                        existing = self.connection.execute(
+                            "SELECT value FROM metadata WHERE key=?",
+                            ("reconciliation_analysis_context_identity",),
+                        ).fetchone()
+                        if existing and existing[0] != context_identity:
+                            raise BinaryFactStoreError(
+                                "FACT_STORE_RECONCILIATION_CONTEXT_CONFLICT",
+                                f"{existing[0]} != {context_identity}",
+                            )
+                        self.connection.execute(
+                            "INSERT OR IGNORE INTO metadata(key,value) VALUES(?,?)",
+                            ("reconciliation_analysis_context_identity", context_identity),
+                        )
+                    elif context_identity != analysis_context_identity:
+                        raise BinaryFactStoreError(
+                            "FACT_STORE_RECONCILIATION_CONTEXT_CONFLICT",
+                            f"{context_identity} != {analysis_context_identity}",
+                        )
+                    status = str(raw["status"])
+                    subject_identity = str(raw["subject_identity"])
+                    payload = dict(raw["payload"])
+                    record_identity = _identity(
+                        f"{record_kind}_record_identity",
+                        {
+                            "analysis_context_identity": analysis_context_identity,
+                            "status": status,
+                            "subject_identity": subject_identity,
+                            "payload": payload,
+                        },
+                    )
+                    if collect_identities:
+                        identities.append(record_identity)
+                    if pending_kind and pending_kind != record_kind:
+                        flush()
+                    pending_kind = record_kind
+                    pending.append({
+                        "record_identity": record_identity,
+                        "status": status,
+                        "subject_identity": subject_identity,
+                        "payload": payload,
+                    })
+                    if len(pending) >= 2_000:
+                        flush()
+                flush()
         except sqlite3.IntegrityError as error:
             raise BinaryFactStoreError(
                 "FACT_STORE_RECONCILIATION_CONFLICT", str(error)
             ) from error
-        return record_identity
+        return identities
 
     def add_source_overlay(
         self,
@@ -708,10 +812,45 @@ class BinaryFactStore:
         }
         if table not in allowed:
             raise BinaryFactStoreError("FACT_STORE_TABLE_INVALID", table)
+        if table == "reconciliation_records" and where:
+            raise BinaryFactStoreError(
+                "FACT_STORE_RECONCILIATION_FILTER_UNSUPPORTED",
+                "read and filter the transparently expanded records",
+            )
         query = f"SELECT * FROM {table}"
         if where:
             query += " WHERE " + where
-        return [dict(row) for row in self.connection.execute(query, tuple(parameters))]
+        rows = [dict(row) for row in self.connection.execute(query, tuple(parameters))]
+        if table == "classes":
+            for row in rows:
+                row["class_bytes"] = zlib.decompress(row.pop("class_bytes_zlib"))
+                row["fact_json"] = zlib.decompress(row.pop("fact_zlib")).decode("utf-8")
+        elif table == "reconciliation_records":
+            context = self.connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                ("reconciliation_analysis_context_identity",),
+            ).fetchone()
+            expanded = []
+            for row in rows:
+                kind = RECONCILIATION_CODE_KINDS[int(row["record_kind"])]
+                records = json.loads(
+                    zlib.decompress(row["payload_zlib"]).decode("utf-8")
+                )
+                if len(records) != int(row["record_count"]):
+                    raise BinaryFactStoreError(
+                        "FACT_STORE_RECONCILIATION_CHUNK_COUNT_INVALID",
+                        bytes(row["chunk_identity"]).hex(),
+                    )
+                expanded.extend({
+                    "record_identity": envelope["record_identity"],
+                    "analysis_context_identity": context[0] if context else "",
+                    "record_kind": kind,
+                    "status": envelope["status"],
+                    "subject_identity": envelope["subject_identity"],
+                    "payload_json": _json(envelope["payload"]),
+                } for envelope in records)
+            rows = expanded
+        return rows
 
     def counts(self) -> dict[str, int]:
         tables = (
@@ -719,10 +858,16 @@ class BinaryFactStore:
             "resources", "reconciliation_records", "source_overlays",
             "inline_overlays",
         )
-        return {
+        result = {
             table: int(self.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
             for table in tables
         }
+        result["reconciliation_records"] = int(
+            self.connection.execute(
+                "SELECT COALESCE(SUM(record_count),0) FROM reconciliation_records"
+            ).fetchone()[0]
+        )
+        return result
 
     def content_identity(self) -> str:
         payload = {"schema_version": SCHEMA_VERSION, "tables": {}}
@@ -751,4 +896,7 @@ class BinaryFactStore:
         return _identity("binary_fact_store_content_identity", payload)
 
 
-__all__ = ["BinaryFactStore", "BinaryFactStoreError", "SCHEMA_VERSION"]
+__all__ = [
+    "BinaryFactStore", "BinaryFactStoreError", "SCHEMA_VERSION",
+    "RECONCILIATION_KIND_CODES",
+]

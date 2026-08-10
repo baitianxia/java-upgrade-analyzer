@@ -103,6 +103,12 @@ class BinaryReportLabelsTest(unittest.TestCase):
                 "entrypoint_activation_reasons": [
                     "spring_boot_auto_configuration_import"
                 ],
+                "mechanism_kinds": [
+                    "method", "mybatis_mapper_proxy_dispatch"
+                ],
+                "mechanism_labels": [
+                    "字节码方法调用", "MyBatis Mapper 代理分派"
+                ],
             }],
         }, {
             "coord": "com.acme:core",
@@ -114,6 +120,13 @@ class BinaryReportLabelsTest(unittest.TestCase):
         self.assertEqual(row["entry_kind"], "Spring 定时任务")
         self.assertEqual(row["consumer_coord"], "com.acme:scheduler:1.0")
         self.assertIn("入口类型：Spring 定时任务", row["chain_summary"])
+        self.assertIn(
+            "路径机制：字节码方法调用 / MyBatis Mapper 代理分派",
+            row["chain_summary"],
+        )
+        self.assertEqual(
+            row["reach_kind"], "字节码方法调用 / MyBatis Mapper 代理分派"
+        )
 
 
 if __name__ == "__main__":

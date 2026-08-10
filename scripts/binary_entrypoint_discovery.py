@@ -15,6 +15,7 @@ import json
 from typing import Any, Mapping
 
 from binary_first_contract import canonical_identity
+from binary_runtime_reconciler import class_load_is_ready
 
 
 DISCOVERY_POLICY_VERSION = "binary-entrypoint-discovery-v1"
@@ -150,6 +151,8 @@ BUSINESS_PATH_KINDS = frozenset({
 
 ACC_PUBLIC = 0x0001
 ACC_STATIC = 0x0008
+ACC_INTERFACE = 0x0200
+ACC_ABSTRACT = 0x0400
 
 
 def _identity(namespace: str, payload: Any) -> str:
@@ -181,6 +184,29 @@ def _descriptor_class_name(descriptor: str) -> str:
     return descriptor[1:-1] if descriptor.startswith("L") and descriptor.endswith(";") else ""
 
 
+def _descriptor_parameters(descriptor: str) -> tuple[str, ...] | None:
+    value = str(descriptor or "")
+    if not value.startswith("("):
+        return None
+    result = []
+    index = 1
+    while index < len(value) and value[index] != ")":
+        start = index
+        while index < len(value) and value[index] == "[":
+            index += 1
+        if index >= len(value):
+            return None
+        if value[index] == "L":
+            end = value.find(";", index)
+            if end < 0:
+                return None
+            index = end + 1
+        else:
+            index += 1
+        result.append(value[start:index])
+    return tuple(result) if index < len(value) and value[index] == ")" else None
+
+
 def _type_descriptors(value: Any) -> set[str]:
     result = set()
     if isinstance(value, Mapping):
@@ -192,6 +218,172 @@ def _type_descriptors(value: Any) -> set[str]:
         for nested in value:
             result.update(_type_descriptors(nested))
     return result
+
+
+def _string_values(value: Any) -> set[str]:
+    result = set()
+    if isinstance(value, str):
+        result.add(value)
+    elif isinstance(value, Mapping):
+        for nested in value.values():
+            result.update(_string_values(nested))
+    elif isinstance(value, (list, tuple)):
+        for nested in value:
+            result.update(_string_values(nested))
+    return result
+
+
+def _annotation_attributes(annotation: Mapping[str, Any]) -> dict[str, tuple[Any, ...]]:
+    """Decode the extractor's ordered annotation attribute representation."""
+    result: dict[str, list[Any]] = {}
+    for raw in annotation.get("values") or ():
+        if not isinstance(raw, (list, tuple)) or len(raw) < 2:
+            continue
+        name = str(raw[0] or "")
+        if not name:
+            continue
+        if raw[1] == "array" and len(raw) >= 3:
+            values = list(raw[2] or ())
+        elif raw[1] == "enum" and len(raw) >= 4:
+            values = [raw[3]]
+        else:
+            values = [raw[1]]
+        result.setdefault(name, []).extend(values)
+    return {key: tuple(values) for key, values in result.items()}
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    normalized = str(value or "").strip().lower()
+    if normalized in {"true", "1", "yes", "on"}:
+        return True
+    if normalized in {"false", "0", "no", "off", ""}:
+        return False
+    return default
+
+
+def _condition_status(
+    realm: str,
+    annotations: tuple[dict[str, Any], ...],
+    runtime_profile: Any,
+    selected_classes: Mapping[
+        tuple[str, str], tuple[Mapping[str, Any], Mapping[str, Any]]
+    ],
+) -> tuple[str, tuple[dict[str, Any], ...]]:
+    """Evaluate the bounded condition subset whose inputs are in RuntimeProfile."""
+    active_profiles = {
+        str(value or "").strip()
+        for value in runtime_profile.payload.get("active_profile_identities") or ()
+    }
+    resolved_properties = {
+        str(key): str(value) for key, value in (
+            runtime_profile.payload.get("resolved_configuration_properties") or {}
+        ).items()
+    }
+    configuration_complete = (
+        str(runtime_profile.payload.get("runtime_configuration_coverage_status") or "")
+        == "complete"
+    )
+    evidence = []
+    unresolved = False
+    for annotation in annotations:
+        descriptor = str(annotation.get("descriptor") or "")
+        attributes = _annotation_attributes(annotation)
+        strings = sorted(
+            value
+            for values in attributes.values()
+            for raw in values
+            for value in _string_values(raw)
+        )
+        types = sorted(
+            _descriptor_class_name(item)
+            for item in _type_descriptors(annotation.get("values") or ())
+            if _descriptor_class_name(item)
+        )
+        if descriptor == "Lorg/springframework/context/annotation/Profile;":
+            candidates = {value for value in strings if value}
+            matched = bool(candidates.intersection(active_profiles))
+            evidence.append({"condition": "profile", "values": sorted(candidates), "matched": matched})
+            if candidates and not matched:
+                return "inactive", tuple(evidence)
+        elif descriptor.endswith("/ConditionalOnClass;"):
+            class_names = set(types) | {value.replace(".", "/") for value in strings if "." in value}
+            matched = bool(class_names) and all(
+                (realm, class_name) in selected_classes for class_name in class_names
+            )
+            evidence.append({"condition": "on_class", "classes": sorted(class_names), "matched": matched})
+            if class_names and not matched:
+                return "inactive", tuple(evidence)
+            if not class_names:
+                unresolved = True
+        elif descriptor.endswith("/ConditionalOnMissingClass;"):
+            class_names = {value.replace(".", "/") for value in strings if "." in value}
+            matched = bool(class_names) and all(
+                (realm, class_name) not in selected_classes for class_name in class_names
+            )
+            evidence.append({"condition": "on_missing_class", "classes": sorted(class_names), "matched": matched})
+            if class_names and not matched:
+                return "inactive", tuple(evidence)
+            if not class_names:
+                unresolved = True
+        elif descriptor.endswith("/ConditionalOnProperty;"):
+            prefix = str((attributes.get("prefix") or ("",))[0] or "").strip()
+            if prefix and not prefix.endswith("."):
+                prefix += "."
+            declared_names = tuple(
+                str(value or "").strip()
+                for value in (
+                    attributes.get("name") or attributes.get("value") or ()
+                )
+                if str(value or "").strip()
+            )
+            names = tuple(prefix + value for value in declared_names)
+            having_value = str(
+                (attributes.get("havingValue") or ("",))[0] or ""
+            )
+            match_if_missing = _as_bool(
+                (attributes.get("matchIfMissing") or (False,))[0]
+            )
+            matched_properties = []
+            missing_properties = []
+            mismatched_properties = []
+            for name in names:
+                if name not in resolved_properties:
+                    if not match_if_missing:
+                        missing_properties.append(name)
+                    continue
+                actual = resolved_properties[name]
+                matched = (
+                    actual == having_value
+                    if having_value
+                    else actual.strip().lower() != "false"
+                )
+                (matched_properties if matched else mismatched_properties).append(name)
+            evidence.append({
+                "condition": "on_property",
+                "properties": list(names),
+                "matched_properties": matched_properties,
+                "missing_properties": missing_properties,
+                "mismatched_properties": mismatched_properties,
+                "having_value": having_value,
+                "match_if_missing": match_if_missing,
+                "configuration_complete": configuration_complete,
+            })
+            if not names:
+                unresolved = True
+            elif mismatched_properties:
+                return "inactive", tuple(evidence)
+            elif missing_properties:
+                if configuration_complete:
+                    return "inactive", tuple(evidence)
+                unresolved = True
+        elif descriptor.startswith(CONDITIONAL_ANNOTATION_PREFIXES):
+            unresolved = True
+            evidence.append({"condition": descriptor, "matched": "unresolved"})
+    return ("unproven" if unresolved else "active"), tuple(evidence)
 
 
 def _annotation_closure(
@@ -363,7 +555,10 @@ def _spring_boot_activation_status(
     launcher = str(
         runtime_profile.payload.get("container_and_launcher_kind") or ""
     ).lower()
-    if launcher in {"spring-boot", "spring_boot", "spring-boot-launcher"}:
+    if launcher in {
+        "spring-boot", "spring_boot", "spring-boot-launcher",
+        "spring-boot-executable-jar",
+    }:
         return "exact", ({"kind": "launcher", "value": launcher},)
 
     members = {
@@ -465,8 +660,18 @@ def discover_binary_entrypoints(
         for item in getattr(reconciliation, "provider_bindings", ())
         if item.get("class_provider_status") == "resolved"
     }
+    class_load_ready = {
+        (
+            str(item.get("initiating_loader_realm_identity") or ""),
+            str(item.get("class_name") or ""),
+        )
+        for item in getattr(reconciliation, "class_definitions", ())
+        if class_load_is_ready(item)
+    }
     selected_classes: dict[tuple[str, str], tuple[dict[str, Any], dict[str, Any]]] = {}
     for (realm, class_name), provider in providers.items():
+        if (realm, class_name) not in class_load_ready:
+            continue
         class_row = class_rows.get(provider.get("selected_class_variant_identity"))
         if class_row is None:
             continue
@@ -497,7 +702,7 @@ def discover_binary_entrypoints(
     ).lower()
     if launcher_kind in {
         "java-jar", "executable-jar", "spring-boot", "spring_boot",
-        "spring-boot-launcher",
+        "spring-boot-launcher", "spring-boot-executable-jar",
     }:
         for resource in store.rows("resources"):
             if str(resource.get("resource_name") or "").upper() != "META-INF/MANIFEST.MF":
@@ -528,6 +733,66 @@ def discover_binary_entrypoints(
     }
     activated_classes.update(declared_activated_classes)
     imported_activated_classes: set[str] = set()
+    jpa_entity_annotations = {
+        "Ljavax/persistence/Entity;", "Ljakarta/persistence/Entity;",
+        "Ljavax/persistence/MappedSuperclass;",
+        "Ljakarta/persistence/MappedSuperclass;",
+    }
+    activated_entity_classes = {
+        str(value or "").replace(".", "/")
+        for value in profile.get("activated_entity_classes") or ()
+        if str(value or "").strip()
+    }
+    for selection in getattr(reconciliation, "resource_selections", ()):
+        if selection.get("resource_selection_status") != "resolved":
+            continue
+        for selected_resource in selection.get("selected_resources") or ():
+            for key, value in selected_resource.get("resource_semantic_facts") or ():
+                if key == "jpa_managed_class" and str(value or "").strip():
+                    activated_entity_classes.add(str(value).replace(".", "/"))
+    if spring_boot_status == "exact":
+        for (_realm, class_name), (class_row, fact) in selected_classes.items():
+            artifact = artifacts.get(class_row.get("artifact_instance_identity")) or {}
+            if (
+                _is_business_artifact(artifact)
+                and _annotation_descriptors(fact).intersection(jpa_entity_annotations)
+            ):
+                activated_entity_classes.add(class_name)
+
+    component_scan_prefixes = {
+        class_name.rsplit("/", 1)[0]
+        for class_name in exact_main_classes
+        if "/" in class_name and spring_boot_status == "exact"
+    }
+    for (realm, _class_name), (class_row, fact) in selected_classes.items():
+        artifact = artifacts.get(class_row.get("artifact_instance_identity")) or {}
+        if not _is_business_artifact(artifact):
+            continue
+        for annotation in _annotations(fact):
+            if annotation.get("descriptor") != "Lorg/springframework/context/annotation/ComponentScan;":
+                continue
+            component_scan_prefixes.update(
+                value.replace(".", "/")
+                for value in _string_values(annotation.get("values") or ())
+                if value and not value.lower().endswith(".class")
+            )
+    component_annotations = {
+        "Lorg/springframework/stereotype/Component;",
+        "Lorg/springframework/stereotype/Service;",
+        "Lorg/springframework/stereotype/Repository;",
+        "Lorg/springframework/stereotype/Controller;",
+        "Lorg/springframework/web/bind/annotation/RestController;",
+        "Lorg/springframework/context/annotation/Configuration;",
+    }
+    for (_realm, class_name), (_row, fact) in selected_classes.items():
+        if (
+            _annotation_descriptors(fact).intersection(component_annotations)
+            and any(
+                class_name == prefix or class_name.startswith(prefix + "/")
+                for prefix in component_scan_prefixes
+            )
+        ):
+            activated_classes.add(class_name)
 
     # @Import on an already activated configuration is a transitive activation
     # proof.  Resolve it to a fixed point over selected classfile facts.
@@ -632,6 +897,9 @@ def discover_binary_entrypoints(
             realm, class_annotations, selected_classes
         )
         class_conditional = _is_conditional(class_annotation_closure)
+        class_condition_status, class_condition_evidence = _condition_status(
+            realm, _annotations(class_fact), runtime_profile, selected_classes
+        )
         hierarchy_types = _hierarchy_types(realm, class_name, selected_classes)
         members = sorted(
             members_by_variant.get(class_row["class_variant_identity"], ()),
@@ -640,10 +908,15 @@ def discover_binary_entrypoints(
                 str(item.get("descriptor") or ""),
             ),
         )
+        concrete_runtime_class = not (
+            int(class_fact.get("class_access") or 0) & (ACC_INTERFACE | ACC_ABSTRACT)
+        )
         for member in members:
             if member.get("member_identity") in declared_members:
                 continue
             contract = _loads(member.get("contract_json") or "{}")
+            if not concrete_runtime_class or int(member.get("access_flags") or 0) & ACC_ABSTRACT:
+                continue
             member_annotations = _annotation_descriptors(contract)
             member_annotation_closure = _annotation_closure(
                 realm, member_annotations, selected_classes
@@ -683,12 +956,25 @@ def discover_binary_entrypoints(
                 conditional = class_conditional or _is_conditional(
                     member_annotation_closure
                 )
-                if conditional:
+                member_condition_status, member_condition_evidence = _condition_status(
+                    realm, _annotations(contract), runtime_profile, selected_classes
+                )
+                if "inactive" in {class_condition_status, member_condition_status}:
+                    continue
+                if conditional and "unproven" in {
+                    class_condition_status, member_condition_status
+                }:
                     certainty = "possible"
                     reason = "framework_condition_not_evaluated"
-                elif entry_kind == "jpa_lifecycle_callback":
+                elif (
+                    entry_kind == "jpa_lifecycle_callback"
+                    and class_name not in activated_entity_classes
+                ):
                     certainty = "possible"
                     reason = "entity_lifecycle_activation_unproven"
+                elif entry_kind == "jpa_lifecycle_callback":
+                    certainty = "exact"
+                    reason = "jpa_entity_registration_proved"
                 elif entry_kind == "java_main" and class_name not in exact_main_classes:
                     certainty = "possible"
                     reason = "business_main_activation_unproven"
@@ -727,8 +1013,266 @@ def discover_binary_entrypoints(
                         "spring_boot_activation_evidence": list(
                             spring_boot_evidence
                         ),
+                        "class_condition_evidence": list(class_condition_evidence),
+                        "member_condition_evidence": list(member_condition_evidence),
                     },
                 )
+
+    # Spring AMQP's MessageListenerAdapter can register a callback by method
+    # name without annotating the receiver. Recover that runtime entry only
+    # from a selected factory method that constructs the adapter with an exact
+    # string literal and an exact receiver parameter type.
+    adapter_owner = (
+        "org/springframework/amqp/rabbit/listener/adapter/MessageListenerAdapter"
+    )
+    for (realm, factory_class), (class_row, class_fact) in sorted(
+        selected_classes.items()
+    ):
+        artifact = artifacts.get(class_row.get("artifact_instance_identity")) or {}
+        factory_active = (
+            spring_boot_status == "exact"
+            and (_is_business_artifact(artifact) or factory_class in activated_classes)
+        )
+        method_facts = {
+            (
+                str((item.get("contract") or {}).get("name") or ""),
+                str((item.get("contract") or {}).get("descriptor") or ""),
+            ): item
+            for item in class_fact.get("methods") or ()
+        }
+        for factory_member in members_by_variant.get(
+            class_row["class_variant_identity"], ()
+        ):
+            if factory_member.get("member_kind") != "method":
+                continue
+            descriptor = str(factory_member.get("descriptor") or "")
+            method_fact = method_facts.get((
+                str(factory_member.get("member_name") or ""), descriptor,
+            )) or {}
+            instructions = list(method_fact.get("instructions") or ())
+            constructor_indexes = [
+                index
+                for index, item in enumerate(instructions)
+                if isinstance(item, (list, tuple)) and len(item) >= 7
+                and item[0] == "method"
+                and str(item[3]) == adapter_owner
+                and str(item[4]) == "<init>"
+                and "Ljava/lang/String;" in str(item[5])
+            ]
+            if not constructor_indexes:
+                continue
+            callback_names = set()
+            for constructor_index in constructor_indexes:
+                preceding_literals = [
+                    str(item[2])
+                    for item in instructions[
+                        max(0, constructor_index - 16):constructor_index
+                    ]
+                    if isinstance(item, (list, tuple)) and len(item) >= 3
+                    and item[0] == "ldc" and isinstance(item[2], str)
+                ]
+                if preceding_literals:
+                    callback_names.add(preceding_literals[-1])
+            receiver_owners = {
+                _descriptor_class_name(parameter)
+                for parameter in (_descriptor_parameters(descriptor) or ())
+                if _descriptor_class_name(parameter)
+            }
+            for receiver_owner in sorted(receiver_owners):
+                selected_receiver = selected_classes.get((realm, receiver_owner))
+                if selected_receiver is None:
+                    continue
+                receiver_row, _receiver_fact = selected_receiver
+                for callback_name in sorted(callback_names):
+                    candidates = [
+                        member
+                        for member in members_by_variant.get(
+                            receiver_row["class_variant_identity"], ()
+                        )
+                        if member.get("member_kind") == "method"
+                        and member.get("member_name") == callback_name
+                    ]
+                    if not candidates:
+                        continue
+                    certainty = "exact" if factory_active and len(candidates) == 1 else "possible"
+                    for candidate in candidates:
+                        add_record(
+                            candidate,
+                            realm=realm,
+                            entry_kind="spring_message_listener",
+                            certainty=certainty,
+                            activation_reason=(
+                                "spring_message_listener_adapter_registration"
+                                if certainty == "exact"
+                                else "spring_message_listener_adapter_activation_unproven"
+                            ),
+                            evidence={
+                                "factory_class": factory_class,
+                                "factory_member": factory_member.get("member_name"),
+                                "factory_descriptor": descriptor,
+                                "adapter_owner": adapter_owner,
+                                "callback_name_literal": callback_name,
+                                "receiver_owner": receiver_owner,
+                                "spring_boot_activation_status": spring_boot_status,
+                            },
+                        )
+
+    activated_resource_names = {
+        str(item or "").removeprefix("classpath:").lstrip("/")
+        for item in profile.get("activated_resource_names") or ()
+        if str(item or "").strip()
+    }
+    import_resource_descriptor = (
+        "Lorg/springframework/context/annotation/ImportResource;"
+    )
+    for (_realm, _class_name), (class_row, class_fact) in selected_classes.items():
+        artifact = artifacts.get(class_row.get("artifact_instance_identity")) or {}
+        if not _is_business_artifact(artifact):
+            continue
+        for annotation in _annotations(class_fact):
+            if annotation.get("descriptor") != import_resource_descriptor:
+                continue
+            for value in _string_values(annotation.get("values") or ()):
+                if value.lower().endswith(".xml"):
+                    activated_resource_names.add(
+                        value.removeprefix("classpath:").lstrip("/")
+                    )
+
+    for selection in getattr(reconciliation, "resource_selections", ()):
+        resource_name = str(selection.get("resource_name") or "")
+        if not resource_name.lower().endswith(".xml"):
+            continue
+        realm = str(selection.get("initiating_loader_realm_identity") or "")
+        resource_exact = resource_name in activated_resource_names
+        for selected_resource in selection.get("selected_resources") or ():
+            for fact_key, raw_value in (
+                selected_resource.get("resource_semantic_facts") or ()
+            ):
+                fact_key = str(fact_key or "")
+                if fact_key == "xml_parse_gap":
+                    coverage_gaps.add(
+                        f"xml_entrypoint_parse_gap:{resource_name}:{raw_value}"
+                    )
+                    continue
+                mybatis_callback = {
+                    "mybatis_plugin_registration": (
+                        "mybatis_plugin_callback", ("intercept",)
+                    ),
+                    "mybatis_type_handler_registration": (
+                        "mybatis_type_handler_callback",
+                        ("setParameter", "getResult"),
+                    ),
+                    "mybatis_statement_type_handler": (
+                        "mybatis_type_handler_callback",
+                        ("setParameter", "getResult"),
+                    ),
+                }.get(fact_key)
+                if mybatis_callback:
+                    entry_kind, callback_names = mybatis_callback
+                    class_name = str(raw_value or "").rsplit("|", 1)[-1].replace(
+                        ".", "/"
+                    )
+                    selected_class = selected_classes.get((realm, class_name))
+                    if selected_class is None:
+                        coverage_gaps.add(
+                            f"mybatis_extension_provider_unresolved:{realm}:{class_name}"
+                        )
+                        continue
+                    class_row, _class_fact = selected_class
+                    candidates = [
+                        item
+                        for item in members_by_variant.get(
+                            class_row["class_variant_identity"], ()
+                        )
+                        if item.get("member_name") in callback_names
+                    ]
+                    if not candidates:
+                        coverage_gaps.add(
+                            f"mybatis_extension_callback_unresolved:{class_name}"
+                        )
+                        continue
+                    certainty = "exact" if resource_exact else "possible"
+                    for candidate in candidates:
+                        add_record(
+                            candidate,
+                            realm=realm,
+                            entry_kind=entry_kind,
+                            certainty=certainty,
+                            activation_reason=(
+                                "mybatis_resource_registration"
+                                if resource_exact
+                                else "mybatis_resource_activation_unproven"
+                            ),
+                            evidence={
+                                "resource_name": resource_name,
+                                "resource_selection_identity": selection.get(
+                                    "resource_selection_identity"
+                                ),
+                                "xml_fact_key": fact_key,
+                                "xml_fact_value": raw_value,
+                            },
+                        )
+                    continue
+                entry_kind = {
+                    "spring_init_method": "spring_xml_init_method",
+                    "spring_scheduled_method": "spring_xml_scheduled",
+                    "spring_quartz_method": "spring_xml_quartz",
+                }.get(fact_key)
+                if not entry_kind:
+                    continue
+                parts = str(raw_value or "").split("|", 2)
+                if len(parts) != 3 or not parts[1] or not parts[2]:
+                    coverage_gaps.add(
+                        f"xml_entrypoint_target_incomplete:{resource_name}:{raw_value}"
+                    )
+                    continue
+                _bean_ref, class_name, method_name = parts
+                class_name = class_name.replace(".", "/")
+                selected_class = selected_classes.get((realm, class_name))
+                if selected_class is None:
+                    coverage_gaps.add(
+                        f"xml_entrypoint_provider_unresolved:{realm}:{class_name}"
+                    )
+                    continue
+                class_row, _class_fact = selected_class
+                candidates = [
+                    item
+                    for item in members_by_variant.get(
+                        class_row["class_variant_identity"], ()
+                    )
+                    if item.get("member_name") == method_name
+                ]
+                if not candidates:
+                    coverage_gaps.add(
+                        f"xml_entrypoint_member_unresolved:{class_name}:{method_name}"
+                    )
+                    continue
+                certainty = "exact" if resource_exact else "possible"
+                if len(candidates) > 1:
+                    certainty = "possible"
+                    coverage_gaps.add(
+                        f"xml_entrypoint_overload_ambiguous:{class_name}:{method_name}"
+                    )
+                for candidate in candidates:
+                    add_record(
+                        candidate,
+                        realm=realm,
+                        entry_kind=entry_kind,
+                        certainty=certainty,
+                        activation_reason=(
+                            "spring_import_resource_activation"
+                            if resource_exact
+                            else "spring_xml_activation_unproven"
+                        ),
+                        evidence={
+                            "resource_name": resource_name,
+                            "resource_selection_identity": selection.get(
+                                "resource_selection_identity"
+                            ),
+                            "xml_fact_key": fact_key,
+                            "xml_fact_value": raw_value,
+                        },
+                    )
 
     records.sort(key=lambda item: (
         0 if item["path_certainty"] == "exact" else 1,

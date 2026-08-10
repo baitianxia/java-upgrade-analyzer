@@ -251,7 +251,7 @@ def gate_step1_scope(d):
         if not lib_entry:
             fail(f"Step1 当前运行依赖缺少 lib_entry：{coord}")
         item = item_by_side_entry.get(("current", lib_entry))
-        if not item or "step5_runtime" not in set(item.get("purposes") or ()):
+        if not item or "binary_runtime" not in set(item.get("purposes") or ()):
             fail(f"Step1 未留存当前运行依赖 JAR：{coord}")
         retained_path = Path(str(item.get("retained_path") or ""))
         expected_sha = str(item.get("nested_jar_sha256") or "").strip()

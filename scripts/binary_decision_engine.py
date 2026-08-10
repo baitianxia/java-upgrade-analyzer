@@ -132,7 +132,7 @@ class BinaryDecisionEngine:
             if not resolution or not caller or not artifact:
                 continue
             key = (
-                str(artifact.get("runtime_code_source_origin_identity") or ""),
+                str(artifact.get("logical_dependency_lineage") or ""),
                 str(artifact.get("runtime_path_kind") or ""),
                 str(caller.get("class_name") or ""),
                 str(caller.get("member_name") or ""),
@@ -498,6 +498,8 @@ class BinaryDecisionEngine:
                 == "complete"
             )
             for entry in artifact_diff.get("entry_deltas") or ():
+                if entry.get("runtime_effective_analysis") is False:
+                    continue
                 if entry["entry_scope"].get("entry_kind") != "class":
                     self._process_resource_delta(
                         entry, comparison_complete, dependency_artifacts
@@ -835,7 +837,7 @@ class BinaryDecisionEngine:
                 },
                 fact_or_mechanism_scope={
                     **scope,
-                    "caller_origin": key[0],
+                    "caller_lineage": key[0],
                     "caller_class": key[2],
                     "caller_member": key[3],
                     "caller_descriptor": key[4],
@@ -860,7 +862,7 @@ class BinaryDecisionEngine:
                 target_identity=target,
                 evidence={
                     "semantic_caller_edge": {
-                        "runtime_code_source_origin_identity": key[0],
+                        "logical_dependency_lineage": key[0],
                         "caller_class": key[2],
                         "caller_member": key[3],
                         "caller_descriptor": key[4],

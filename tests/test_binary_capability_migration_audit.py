@@ -24,39 +24,25 @@ class BinaryCapabilityMigrationAuditTest(unittest.TestCase):
         self.assertTrue(result["registry_structurally_valid"], result["issues"])
         self.assertEqual(result["baseline_family_count"], 9)
         self.assertEqual(result["accounted_family_count"], 9)
+        self.assertEqual(result["baseline_topology_count"], 18)
+        self.assertEqual(result["accounted_topology_count"], 18)
+        self.assertEqual(result["baseline_mechanism_count"], 36)
+        self.assertEqual(result["accounted_mechanism_count"], 36)
         self.assertEqual(result["monitored_deleted_production_path_count"], 48)
+        self.assertEqual(result["monitored_deleted_test_path_count"], 72)
         self.assertEqual(result["monitored_deleted_test_asset_count"], 18)
-        self.assertEqual(result["release_status"], "blocked")
+        self.assertEqual(
+            result["accounted_deleted_test_asset_replacement_count"], 18
+        )
+        self.assertEqual(result["release_status"], "passed")
 
-    def test_known_dropped_mechanisms_remain_explicit_release_blockers(self):
+    def test_every_monitored_mechanism_has_enforced_replacement_evidence(self):
         result = audit_capability_migration(ROOT, self.registry())
 
-        self.assertEqual(result["missing_mechanisms"], [
-            "automatic_runtime_profile_materialization",
-            "branch_mutation_flaky_health_gates",
-            "declarative_http_client_dispatch",
-            "dubbo_spi_dispatch",
-            "dynamic_proxy_dispatch",
-            "generated_topology_and_metamorphic_regression",
-            "implicit_data_contract_dispatch",
-            "mybatis_proxy_dispatch",
-            "nested_executable_materialization",
-            "real_project_rotation",
-            "reflection_and_method_handle_dispatch",
-            "spring_aop_dispatch",
-            "spring_bean_wiring_dispatch",
-            "spring_component_condition_activation",
-            "spring_data_repository_dispatch",
-            "spring_security_filter_dispatch",
-            "spring_transaction_proxy_dispatch",
-            "spring_xml_activation",
-            "typed_tool_failure_matrix",
-        ])
-        self.assertIn(
-            "dependency_source_snapshot_alignment",
-            result["incomplete_mechanisms"],
-        )
-        self.assertIn("jpa_entity_activation_proof", result["incomplete_mechanisms"])
+        self.assertEqual(result["missing_mechanisms"], [])
+        self.assertEqual(result["incomplete_mechanisms"], [])
+        self.assertEqual(result["incomplete_families"], [])
+        self.assertEqual(result["incomplete_topologies"], [])
 
     def test_deleting_a_family_or_test_reference_invalidates_the_registry(self):
         missing_family = self.registry()
@@ -66,6 +52,17 @@ class BinaryCapabilityMigrationAuditTest(unittest.TestCase):
         self.assertTrue(any(
             item["reason_code"] == "CAPABILITY_BASELINE_SET_MISMATCH"
             for item in missing_result["issues"]
+        ))
+
+        missing_test_path = self.registry()
+        missing_test_path["baseline"]["monitored_deleted_test_paths"] = (
+            missing_test_path["baseline"]["monitored_deleted_test_paths"][1:]
+        )
+        test_path_result = audit_capability_migration(ROOT, missing_test_path)
+        self.assertFalse(test_path_result["registry_structurally_valid"])
+        self.assertTrue(any(
+            item["reason_code"] == "CAPABILITY_DELETED_TEST_PATH_SET_MISMATCH"
+            for item in test_path_result["issues"]
         ))
 
         broken_test = copy.deepcopy(self.registry())
@@ -101,6 +98,61 @@ class BinaryCapabilityMigrationAuditTest(unittest.TestCase):
         self.assertTrue(any(
             item["reason_code"] == "CAPABILITY_MECHANISM_SET_MISMATCH"
             for item in mechanism_result["issues"]
+        ))
+
+        self_erased = self.registry()
+        removed = self_erased["baseline"]["monitored_mechanism_ids"].pop()
+        self_erased["mechanism_inventory"] = [
+            item for item in self_erased["mechanism_inventory"]
+            if item["mechanism_id"] != removed
+        ]
+        self_erased_result = audit_capability_migration(ROOT, self_erased)
+        self.assertFalse(self_erased_result["registry_structurally_valid"])
+        self.assertTrue(any(
+            item["reason_code"]
+            == "CAPABILITY_MECHANISM_BASELINE_DECLARATION_MISMATCH"
+            for item in self_erased_result["issues"]
+        ))
+
+        erased_family = self.registry()
+        removed_family = erased_family["baseline"][
+            "legacy_capability_family_ids"
+        ].pop()
+        erased_family["families"] = [
+            item for item in erased_family["families"]
+            if item["family_id"] != removed_family
+        ]
+        erased_family_result = audit_capability_migration(ROOT, erased_family)
+        self.assertFalse(erased_family_result["registry_structurally_valid"])
+        self.assertTrue(any(
+            item["reason_code"] == "CAPABILITY_BASELINE_DECLARATION_MISMATCH"
+            for item in erased_family_result["issues"]
+        ))
+
+        erased_topology = self.registry()
+        removed_topology = erased_topology["baseline"]["legacy_topology_ids"].pop()
+        erased_topology["topology_inventory"] = [
+            item for item in erased_topology["topology_inventory"]
+            if item["topology_id"] != removed_topology
+        ]
+        erased_topology_result = audit_capability_migration(ROOT, erased_topology)
+        self.assertFalse(erased_topology_result["registry_structurally_valid"])
+        self.assertTrue(any(
+            item["reason_code"]
+            == "CAPABILITY_TOPOLOGY_BASELINE_DECLARATION_MISMATCH"
+            for item in erased_topology_result["issues"]
+        ))
+
+        erased_asset_replacement = self.registry()
+        erased_asset_replacement["legacy_asset_replacements"].pop()
+        erased_asset_result = audit_capability_migration(
+            ROOT, erased_asset_replacement
+        )
+        self.assertFalse(erased_asset_result["registry_structurally_valid"])
+        self.assertTrue(any(
+            item["reason_code"]
+            == "CAPABILITY_ASSET_REPLACEMENT_SET_MISMATCH"
+            for item in erased_asset_result["issues"]
         ))
 
 

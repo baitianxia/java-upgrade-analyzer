@@ -83,7 +83,7 @@ Claude Code 会负责：
 | 是否提供源码辅助分析 | 未提交源码时必需确认 | 已提交源码目录、源码仓库或带 `source_overlay` 的配置时直接使用，不再重复确认；未提交时 Step2 会先说明作用与边界，再由你选择补充源码或明确不提供 |
 | 依赖源码路径或 Git 地址 | 选择提供源码时可选 | 依赖包源码仓库本地路径或 HTTPS/SSH Git 地址，用于增加文件/行号、声明与注解、可读上下文和候选关系 |
 | 特殊 JDK | 可选 | 如果 base/current 需要不同 JDK 构建，请说明 |
-| Binary runtime 快照 | 必需 | 按 `binary_pipeline_config.example.json` 固定两侧完整 JDK、最终制品、有序 classpath、loader/resource policy 和业务入口；这是唯一分析引擎的运行时事实输入 |
+| Binary runtime 快照 | 系统自动生成 | Step1 从两侧最终制品、完整运行依赖和目标 JDK 自动生成；特殊 loader/容器部署可用 `binary_pipeline_config.example.json` 显式覆盖。无法证明闭包完整时系统会列出缺口并停止，不要求普通用户手写内部配置 |
 
 说明：
 

@@ -138,6 +138,7 @@ def load_validated_generation(report_dir: str | Path) -> dict[str, Any]:
             "BINARY_GENERATION_VALIDATION_ATTACHMENT_INVALID", str(validation_path)
         )
     source_explanations_path = generation / "binary_source_explanations.json"
+    source_attestation_path = generation / "binary_source_attestation.json"
     return {
         "report_dir": report,
         "active": active,
@@ -158,6 +159,11 @@ def load_validated_generation(report_dir: str | Path) -> dict[str, Any]:
                 "declarations": [],
                 "candidate_relationships": [],
             }
+        ),
+        "source_attestation": (
+            _load_json(source_attestation_path)
+            if source_attestation_path.is_file()
+            else {"coverage_gaps": [], "language_file_counts": {}}
         ),
     }
 
@@ -264,6 +270,7 @@ def _source_usage_view(loaded: Mapping[str, Any]) -> dict[str, Any]:
     coverage = dict(loaded.get("coverage") or {})
     usage = dict(coverage.get("source_usage") or {})
     overlay = dict(coverage.get("source_overlay") or {})
+    attestation = dict(loaded.get("source_attestation") or {})
     decision = str(usage.get("decision") or "").strip()
     decision_source = str(usage.get("decision_source") or "missing")
     if decision == "use_source":
@@ -294,6 +301,10 @@ def _source_usage_view(loaded: Mapping[str, Any]) -> dict[str, Any]:
         "mapped_count": int(overlay.get("mapped_count") or 0),
         "ambiguous_count": int(overlay.get("ambiguous_count") or 0),
         "conflict_count": int(overlay.get("conflict_count") or 0),
+        "language_file_counts": dict(
+            attestation.get("language_file_counts") or {}
+        ),
+        "coverage_gaps": list(attestation.get("coverage_gaps") or ()),
     }
 
 
@@ -853,11 +864,44 @@ def publish_step4(report_dir: str | Path, output_dir: str | Path) -> dict[str, A
             writer = csv.DictWriter(handle, fieldnames=source_fields)
             writer.writeheader()
             writer.writerows(source_review_rows)
+        source_gap_fields = (
+            "原因", "语言", "源码归属", "模块", "源码文件", "解析器", "错误节点",
+        )
+        source_gap_rows = [{
+            "原因": (
+                "该语言暂不提供源码位置/内联证明映射"
+                if gap.get("reason_code") == "BINARY_SOURCE_LANGUAGE_NOT_MAPPED"
+                else "源码解析不完整"
+            ),
+            "语言": str(gap.get("language") or ""),
+            "源码归属": str(gap.get("owner_coord") or ""),
+            "模块": str(gap.get("module") or ""),
+            "源码文件": str(gap.get("logical_path") or ""),
+            "解析器": str(gap.get("actual_parser") or ""),
+            "错误节点": str(gap.get("error_nodes") or ""),
+        } for gap in source_usage["coverage_gaps"]]
+        with open_csv_write(stage / "source_coverage_gaps.csv") as handle:
+            writer = csv.DictWriter(handle, fieldnames=source_gap_fields)
+            writer.writeheader()
+            writer.writerows(source_gap_rows)
+        _atomic_json(
+            stage / "source_snapshot.json", loaded["source_attestation"]
+        )
+        language_summary = "、".join(
+            f"{language} {count} 个"
+            for language, count in sorted(
+                source_usage["language_file_counts"].items()
+            )
+        ) or "未提供源码文件"
         source_lines = [
             "# 源码辅助证据", "",
             f"- 源码状态：{source_usage['label']}",
             f"- 覆盖状态：`{source_usage['coverage_status']}`",
-            f"- 已映射方法：{source_usage['mapped_count']}", "",
+            f"- 已映射方法：{source_usage['mapped_count']}",
+            f"- 源码文件：{language_summary}",
+            f"- 未映射/解析缺口：{len(source_gap_rows)} 个；"
+            "[查看逐文件缺口](coverage_gaps.csv)",
+            "- 完整源码快照与 SHA：[source_snapshot.json](source_snapshot.json)", "",
             source_usage["effect"], "",
         ]
         if source_review_rows:
@@ -946,7 +990,8 @@ def publish_step4(report_dir: str | Path, output_dir: str | Path) -> dict[str, A
             source_usage["effect"], "",
             "源码辅助证据：`../source_analysis/review.md`；"
             "结构化映射：`../source_analysis/method_mappings.csv`；"
-            "候选关系：`../source_analysis/candidate_relationships.csv`。", "",
+            "候选关系：`../source_analysis/candidate_relationships.csv`；"
+            "逐文件缺口：`../source_analysis/coverage_gaps.csv`。", "",
         ))
         _atomic_text(stage / "summary.md", "\n".join(summary_lines))
 
@@ -984,11 +1029,20 @@ def publish_step4(report_dir: str | Path, output_dir: str | Path) -> dict[str, A
             output / "source_candidate_relationships.csv",
             stage / "candidate_relationships.csv",
         )
+        shutil.copyfile(
+            output / "source_coverage_gaps.csv",
+            stage / "coverage_gaps.csv",
+        )
+        shutil.copyfile(
+            output / "source_snapshot.json",
+            stage / "source_snapshot.json",
+        )
 
     _stage_directory(source_output, publish_source)
     for obsolete_source_file in (
         "source_overlay.md", "source_overlay.csv",
         "source_candidate_relationships.csv",
+        "source_coverage_gaps.csv", "source_snapshot.json",
     ):
         (output / obsolete_source_file).unlink()
     return {"phase": "step4", "change_fact_count": len(rows), "output_dir": str(output)}
@@ -1167,6 +1221,12 @@ def _legacy_result_item(
                 "entrypoint_activation_reasons": list(
                     next((candidate.get("entrypoint_activation_reasons") or [] for candidate in item.get("paths") or [] if candidate.get("path_text") == path), [])
                 ),
+                "mechanism_kinds": list(
+                    next((candidate.get("mechanism_kinds") or [] for candidate in item.get("paths") or [] if candidate.get("path_text") == path), [])
+                ),
+                "mechanism_labels": list(
+                    next((candidate.get("mechanism_labels") or [] for candidate in item.get("paths") or [] if candidate.get("path_text") == path), [])
+                ),
             }
             for path in paths
         ],
@@ -1215,6 +1275,11 @@ def _legacy_alert_rows(items: list[dict[str, Any]]) -> list[dict[str, str]]:
                 for value in path_detail.get("entrypoint_dependency_coords") or ()
                 if str(value)
             )
+            mechanism_labels = " / ".join(
+                str(value)
+                for value in path_detail.get("mechanism_labels") or ()
+                if str(value)
+            )
             nodes = [part.strip() for part in str(path).split(" → ") if part.strip()]
             entry = nodes[0] if nodes else str(item.get("business_entry") or "")
             target = nodes[-1] if nodes else f"{item.get('api') or ''}{item.get('api_signature') or ''}"
@@ -1232,6 +1297,7 @@ def _legacy_alert_rows(items: list[dict[str, Any]]) -> list[dict[str, str]]:
                 "review_reason": str(item.get("review_reason") or item.get("user_reason") or ""),
                 "chain_summary": (
                     f"入口类型：{entry_kind or '业务字节码入口'}；入口：{entry}；"
+                    f"路径机制：{mechanism_labels or '字节码直接调用'}；"
                     f"终点：{target}；{max(len(nodes) - 1, 0)} 次调用（{len(nodes)} 个节点）"
                     if path else f"未形成完整链路；目标 API：{target}"
                 ),
@@ -1254,7 +1320,7 @@ def _legacy_alert_rows(items: list[dict[str, Any]]) -> list[dict[str, str]]:
                 "uncertainty_kind": str(item.get("uncertainty_kind") or ""),
                 "business_reachable": "true" if status == "reachable" else "unknown",
                 "entry_kind": entry_kind or ("业务字节码入口" if entry else ""),
-                "reach_kind": "binary_executable_path" if path else "",
+                "reach_kind": mechanism_labels or ("字节码直接调用" if path else ""),
                 "business_entry": entry,
                 "consumer_coord": entrypoint_dependency or ("业务制品" if entry else ""),
                 "consumer_class": consumer_class,

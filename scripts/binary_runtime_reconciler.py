@@ -41,6 +41,42 @@ def _identity(namespace: str, payload: Any) -> str:
     return canonical_identity(namespace, payload, schema_version="1")
 
 
+def _type_provider_owner(symbolic_owner: str) -> str:
+    """Return the defining class needed to resolve a JVM type owner."""
+    value = str(symbolic_owner or "")
+    if not value.startswith("["):
+        return value
+    while value.startswith("["):
+        value = value[1:]
+    if value.startswith("L") and value.endswith(";"):
+        return value[1:-1]
+    # Primitive array classes are created by the JVM and have no classfile
+    # provider. Their original array descriptor remains on the direct edge.
+    return ""
+
+
+def class_load_is_ready(definition: Mapping[str, Any] | None) -> bool:
+    """Whether the JVM loaded the class before any member-enumeration failure.
+
+    A missing type used only by an unrelated field or method can make
+    ``getDeclaredMethods`` fail even though ``Class.forName(..., false, ...)``
+    succeeded. Callback discovery, hierarchy traversal and dispatch need the
+    latter fact; conclusions that require complete reflective enumeration keep
+    using ``class_definition_status``.
+    """
+    if not definition:
+        return False
+    if definition.get("class_load_status") == "ready":
+        return True
+    if definition.get("class_definition_status") == "definition_ready":
+        return True
+    outcome = (
+        (definition.get("evidence") or {}).get("target_jvm_verification")
+        or {}
+    )
+    return outcome.get("failure_phase") == "member_linkage"
+
+
 def _loads(value: str) -> Any:
     return json.loads(value or "{}")
 
@@ -162,6 +198,14 @@ class RuntimeReconciler:
             self.coverage_gaps.add("resource_selection_scope_incomplete")
         self.provider_bindings: dict[tuple[str, str], dict[str, Any]] = {}
         self.definition_records: dict[tuple[str, str], dict[str, Any]] = {}
+        self.class_info_cache: dict[tuple[str, str], dict[str, Any] | None] = {}
+        self.ancestor_type_cache: dict[tuple[str, str], frozenset[str]] = {}
+        self.virtual_dispatch_cache: dict[
+            tuple[str, str, str], tuple[str, ...]
+        ] = {}
+        self.concrete_subtype_cache: dict[
+            str, tuple[tuple[str, str], ...]
+        ] = {}
         for artifact_id, artifact in self.artifacts.items():
             if artifact["coverage_status"] != "complete":
                 self.coverage_gaps.add(f"artifact_fact_coverage_incomplete:{artifact_id}")
@@ -238,7 +282,7 @@ class RuntimeReconciler:
         by_artifact: dict[str, dict[str, list[dict[str, Any]]]] = {}
         for row in self.classes:
             artifact_id = row["artifact_instance_identity"]
-            if artifact_id not in self.artifacts:
+            if artifact_id not in self.artifacts or row["class_name"] == "module-info":
                 continue
             by_artifact.setdefault(artifact_id, {}).setdefault(row["class_name"], []).append(row)
         by_realm: dict[str, dict[str, list[dict[str, Any]]]] = {}
@@ -518,12 +562,22 @@ class RuntimeReconciler:
         initial_classes = {
             row["class_name"] for row in self.classes
             if row["artifact_instance_identity"] in self.artifacts
+            and row["class_name"] != "module-info"
         }
         initial_classes.update(
-            row["symbolic_owner"] for row in self.edges
-            if row["caller_artifact_instance_identity"] in self.artifacts and row["symbolic_owner"]
+            owner
+            for row in self.edges
+            if row["caller_artifact_instance_identity"] in self.artifacts
+            for owner in (_type_provider_owner(row["symbolic_owner"]),)
+            if owner
         )
-        initial_classes.update(self.additional_initial_classes)
+        initial_classes.update(
+            name for name in self.additional_initial_classes if name != "module-info"
+        )
+        # ``_provider`` may ask the platform image about every symbolic owner.
+        # Resolve the whole initial frontier as one framed ASM batch instead of
+        # launching a helper process once per previously unseen JDK class.
+        self.platform.ensure_classes(initial_classes)
         contexts = set()
         pending = [(realm, name) for realm in self.entrypoint_realms for name in initial_classes]
         while pending:
@@ -661,6 +715,17 @@ class RuntimeReconciler:
                 "initiating_loader_realm_identity": realm,
                 "class_name": name,
                 "class_definition_status": definition_status,
+                "class_load_status": (
+                    "ready"
+                    if definition_status == "definition_ready"
+                    or (
+                        (evidence.get("target_jvm_verification") or {}).get(
+                            "failure_phase"
+                        )
+                        == "member_linkage"
+                    )
+                    else "failed"
+                ),
                 "class_definition_resolution_identity": resolution.identity,
                 "provider_binding_identity": provider["provider_binding_identity"],
                 "evidence": evidence,
@@ -679,9 +744,20 @@ class RuntimeReconciler:
         sealed = any(value.lower() == "true" for value in manifest.get("sealed", ()))
         return sealed and not self.capability.sealed_packages_supported
 
+    @staticmethod
+    def _class_load_ready(definition: Mapping[str, Any] | None) -> bool:
+        return class_load_is_ready(definition)
+
     def _class_info(self, provider: Mapping[str, Any]) -> dict[str, Any] | None:
+        cache_key = (
+            str(provider.get("selected_defining_loader_realm_identity") or ""),
+            str(provider.get("selected_class_variant_identity") or ""),
+        )
+        if cache_key in self.class_info_cache:
+            return self.class_info_cache[cache_key]
         fact = self._class_fact(provider)
         if fact is None:
+            self.class_info_cache[cache_key] = None
             return None
         variant = provider["selected_class_variant_identity"]
         row = self.class_by_variant.get(variant)
@@ -714,7 +790,7 @@ class RuntimeReconciler:
                         "descriptor": contract.get("descriptor"),
                         "access_flags": int(contract.get("access") or 0),
                     })
-        return {
+        result = {
             "class_name": fact.get("class_name"),
             "class_variant_identity": variant,
             "defining_loader_realm_identity": provider["selected_defining_loader_realm_identity"],
@@ -724,6 +800,8 @@ class RuntimeReconciler:
             "module_name": module_name,
             "members": members,
         }
+        self.class_info_cache[cache_key] = result
+        return result
 
     def _resolve_symbolic_member(
         self,
@@ -738,7 +816,10 @@ class RuntimeReconciler:
             return None, None
         provider = self._provider(initiating_realm, owner)
         definition = self.definition_records.get((initiating_realm, owner))
-        if provider["class_provider_status"] != "resolved" or not definition or definition["class_definition_status"] != "definition_ready":
+        if (
+            provider["class_provider_status"] != "resolved"
+            or not self._class_load_ready(definition)
+        ):
             return None, provider
         info = self._class_info(provider)
         if info is None:
@@ -768,21 +849,77 @@ class RuntimeReconciler:
                 return resolved, resolved_provider
         return None, provider
 
-    def _is_subtype(self, realm: str, child: str, parent: str, visited=()) -> bool:
-        if child == parent:
-            return True
-        if (realm, child) in visited:
-            return False
+    def _ancestor_types(
+        self, realm: str, child: str, visiting=(),
+    ) -> frozenset[str]:
+        key = (realm, child)
+        cached = self.ancestor_type_cache.get(key)
+        if cached is not None:
+            return cached
+        if key in visiting:
+            return frozenset({child})
         provider = self._provider(realm, child)
         info = self._class_info(provider) if provider.get("class_provider_status") == "resolved" else None
         if not info:
-            return False
+            result = frozenset({child})
+            self.ancestor_type_cache[key] = result
+            return result
         defining = info["defining_loader_realm_identity"]
-        return any(
-            self._is_subtype(defining, candidate, parent, visited + ((realm, child),))
-            for candidate in [info["super_name"], *info["interfaces"]]
-            if candidate
-        )
+        ancestors = {child}
+        for candidate in [info["super_name"], *info["interfaces"]]:
+            if candidate:
+                ancestors.update(
+                    self._ancestor_types(defining, candidate, visiting + (key,))
+                )
+        result = frozenset(ancestors)
+        self.ancestor_type_cache[key] = result
+        return result
+
+    def _is_subtype(self, realm: str, child: str, parent: str, visited=()) -> bool:
+        # ``visited`` remains accepted for callers compiled against the former
+        # recursive API; the cached transitive closure is independent of it.
+        return parent in self._ancestor_types(realm, child)
+
+    def _virtual_dispatch_targets(
+        self,
+        universe: Iterable[tuple[str, str]],
+        owner: str,
+        name: str,
+        descriptor: str,
+    ) -> tuple[str, ...]:
+        key = (owner, name, descriptor)
+        cached = self.virtual_dispatch_cache.get(key)
+        if cached is not None:
+            return cached
+        candidates = self.concrete_subtype_cache.get(owner)
+        if candidates is None:
+            concrete = []
+            for candidate_realm, candidate_name in universe:
+                candidate_definition = self.definition_records.get(
+                    (candidate_realm, candidate_name)
+                )
+                if (
+                    not candidate_definition
+                    or not self._class_load_ready(candidate_definition)
+                    or not self._is_subtype(candidate_realm, candidate_name, owner)
+                ):
+                    continue
+                candidate_provider = self._provider(candidate_realm, candidate_name)
+                info = self._class_info(candidate_provider)
+                if info and not info["access_flags"] & (ACC_INTERFACE | ACC_ABSTRACT):
+                    concrete.append((candidate_realm, candidate_name))
+            candidates = tuple(concrete)
+            self.concrete_subtype_cache[owner] = candidates
+        targets = set()
+        for candidate_realm, candidate_name in candidates:
+            target, _ = self._resolve_symbolic_member(
+                candidate_realm, candidate_name, "method", name, descriptor
+            )
+            if target:
+                targets.add(target["member_identity"])
+        result = tuple(sorted(targets))
+        self.virtual_dispatch_cache[key] = result
+        return result
 
     def _member_accessible(
         self,
@@ -825,13 +962,17 @@ class RuntimeReconciler:
 
     def _type_resolution(self, edge: Mapping[str, Any], caller_realm: str) -> dict[str, Any]:
         owner = str(edge.get("symbolic_owner") or "")
-        provider = self._provider(caller_realm, owner) if owner else None
-        definition = self.definition_records.get((caller_realm, owner)) if owner else None
-        if not owner:
+        provider_owner = _type_provider_owner(owner)
+        provider = self._provider(caller_realm, provider_owner) if provider_owner else None
+        definition = (
+            self.definition_records.get((caller_realm, provider_owner))
+            if provider_owner else None
+        )
+        if not provider_owner:
             status = "primitive_or_array_type"
         elif not provider or provider["class_provider_status"] != "resolved":
             status = "unresolved"
-        elif not definition or definition["class_definition_status"] != "definition_ready":
+        elif not self._class_load_ready(definition):
             status = "class_definition_failed"
         else:
             status = "resolved"
@@ -839,6 +980,7 @@ class RuntimeReconciler:
             "direct_edge_identity": edge["direct_edge_identity"],
             "initiating_loader_realm_identity": caller_realm,
             "symbolic_owner": owner,
+            "resolved_provider_owner": provider_owner,
             "symbolic_descriptor": edge.get("symbolic_descriptor"),
             "type_resolution_status": status,
             "provider_binding_identity": (provider or {}).get("provider_binding_identity", ""),
@@ -864,7 +1006,7 @@ class RuntimeReconciler:
         if (
             provider.get("class_provider_status") != "resolved"
             or not definition
-            or definition.get("class_definition_status") != "definition_ready"
+            or not self._class_load_ready(definition)
         ):
             return [], False
         info = self._class_info(provider)
@@ -930,7 +1072,7 @@ class RuntimeReconciler:
             if (
                 provider.get("class_provider_status") != "resolved"
                 or not definition
-                or definition.get("class_definition_status") != "definition_ready"
+                or not self._class_load_ready(definition)
             ):
                 complete = False
                 return
@@ -1034,8 +1176,24 @@ class RuntimeReconciler:
                 if edge["edge_kind"] == "field" or handle_tag in {1, 2, 3, 4}
                 else "method"
             )
-            provider = self._provider(caller_realm, owner)
-            definition = self.definition_records.get((caller_realm, owner))
+            array_clone = (
+                owner.startswith("[")
+                and kind == "method"
+                and edge["symbolic_name"] == "clone"
+                and edge["symbolic_descriptor"] == "()Ljava/lang/Object;"
+            )
+            # Array classes have no classfile provider.  Their ``clone`` member
+            # is a JVM-defined public operation whose declaration is rooted in
+            # Object; resolving an object-array class still requires its
+            # component class to be definition-ready.
+            definition_owner = (
+                (_type_provider_owner(owner) or "java/lang/Object")
+                if array_clone else owner
+            )
+            provider = self._provider(caller_realm, definition_owner)
+            definition = self.definition_records.get(
+                (caller_realm, definition_owner)
+            )
             payload = {
                 "direct_edge_identity": edge["direct_edge_identity"],
                 "initiating_loader_realm_identity": caller_realm,
@@ -1050,13 +1208,14 @@ class RuntimeReconciler:
             if provider["class_provider_status"] != "resolved":
                 status = "ambiguous" if provider["class_provider_status"] == "ambiguous" else "no_class_definition"
                 linkage_status = status
-            elif not definition or definition["class_definition_status"] != "definition_ready":
+            elif not self._class_load_ready(definition):
                 status = "class_definition_failed"
                 linkage_status = status
             else:
+                resolution_owner = "java/lang/Object" if array_clone else owner
                 member, member_provider = self._resolve_symbolic_member(
                     caller_realm,
-                    owner,
+                    resolution_owner,
                     kind,
                     edge["symbolic_name"],
                     edge["symbolic_descriptor"],
@@ -1071,9 +1230,11 @@ class RuntimeReconciler:
                     payload["resolved_defining_loader_realm_identity"] = member_provider[
                         "selected_defining_loader_realm_identity"
                     ]
+                    if array_clone:
+                        payload["jvm_array_member_semantics"] = "public_clone"
                     if not self._opcode_compatible(edge, member):
                         linkage_status = "incompatible_class_change"
-                    elif not self._member_accessible(
+                    elif not array_clone and not self._member_accessible(
                         str((caller or {}).get("class_name") or ""),
                         caller_realm,
                         member,
@@ -1101,7 +1262,12 @@ class RuntimeReconciler:
                 opcode = int(edge.get("opcode") or 0)
                 handle_tag = int(edge_payload.get("tag") or 0)
                 virtual = opcode in {182, 185} or handle_tag in {5, 9}
-                if not virtual:
+                if array_clone:
+                    dispatch_fixed_by_final_declaration = True
+                    dispatch_status = "exact"
+                    targets = (payload["resolved_member_identity"],)
+                    coverage = "complete"
+                elif not virtual:
                     dispatch_status = "exact"
                     targets = (payload["resolved_member_identity"],)
                     coverage = "complete"
@@ -1118,27 +1284,12 @@ class RuntimeReconciler:
                         targets = (payload["resolved_member_identity"],)
                         coverage = "complete"
                     else:
-                        targets_set = set()
-                        for candidate_realm, candidate_name in universe:
-                            candidate_definition = self.definition_records.get((candidate_realm, candidate_name))
-                            if not candidate_definition or candidate_definition["class_definition_status"] != "definition_ready":
-                                continue
-                            if not self._is_subtype(candidate_realm, candidate_name, owner):
-                                continue
-                            candidate_provider = self._provider(candidate_realm, candidate_name)
-                            info = self._class_info(candidate_provider)
-                            if not info or info["access_flags"] & (ACC_INTERFACE | ACC_ABSTRACT):
-                                continue
-                            target, _ = self._resolve_symbolic_member(
-                                candidate_realm,
-                                candidate_name,
-                                "method",
-                                edge["symbolic_name"],
-                                edge["symbolic_descriptor"],
-                            )
-                            if target:
-                                targets_set.add(target["member_identity"])
-                        targets = tuple(sorted(targets_set))
+                        targets = self._virtual_dispatch_targets(
+                            universe,
+                            owner,
+                            edge["symbolic_name"],
+                            edge["symbolic_descriptor"],
+                        )
                         if not targets:
                             dispatch_status = (
                                 "no_concrete_implementation" if hierarchy_complete else "unresolved"
@@ -1215,70 +1366,39 @@ class RuntimeReconciler:
             record = self._provider(*key)
             providers.append(record)
         definitions = [self.definition_records[key] for key in universe]
-        for record in providers:
-            self.store.add_reconciliation_record(
-                analysis_context_identity=self.context_identity,
-                record_kind="provider_binding",
-                status=record["class_provider_status"],
-                subject_identity=record["provider_binding_identity"],
-                payload=record,
-            )
-        for record in definitions:
-            self.store.add_reconciliation_record(
-                analysis_context_identity=self.context_identity,
-                record_kind="class_definition",
-                status=record["class_definition_status"],
-                subject_identity=record["class_definition_resolution_identity"],
-                payload=record,
-            )
-        for record in member_records:
-            self.store.add_reconciliation_record(
-                analysis_context_identity=self.context_identity,
-                record_kind="member_resolution",
-                status=record["member_resolution_status"],
-                subject_identity=record["member_resolution_identity"],
-                payload=record,
-            )
-        for record in dispatch_records:
-            self.store.add_reconciliation_record(
-                analysis_context_identity=self.context_identity,
-                record_kind="dispatch_resolution",
-                status=record["dispatch_status"],
-                subject_identity=record["dispatch_resolution_identity"],
-                payload=record,
-            )
-        for record in type_records:
-            self.store.add_reconciliation_record(
-                analysis_context_identity=self.context_identity,
-                record_kind="type_resolution",
-                status=record["type_resolution_status"],
-                subject_identity=record["type_resolution_identity"],
-                payload=record,
-            )
-        for record in class_init_records:
-            self.store.add_reconciliation_record(
-                analysis_context_identity=self.context_identity,
-                record_kind="class_initialization_resolution",
-                status=record["class_initialization_status"],
-                subject_identity=record["class_initialization_resolution_identity"],
-                payload=record,
-            )
-        for record in linkage_records:
-            self.store.add_reconciliation_record(
-                analysis_context_identity=self.context_identity,
-                record_kind="linkage_resolution",
-                status=record["linkage_status"],
-                subject_identity=record["linkage_resolution_identity"],
-                payload=record,
-            )
-        for record in resource_records:
-            self.store.add_reconciliation_record(
-                analysis_context_identity=self.context_identity,
-                record_kind="resource_selection",
-                status=record["resource_selection_status"],
-                subject_identity=record["resource_selection_identity"],
-                payload=record,
-            )
+        persistence_groups = (
+            (providers, "provider_binding", "class_provider_status",
+             "provider_binding_identity"),
+            (definitions, "class_definition", "class_definition_status",
+             "class_definition_resolution_identity"),
+            (member_records, "member_resolution", "member_resolution_status",
+             "member_resolution_identity"),
+            (dispatch_records, "dispatch_resolution", "dispatch_status",
+             "dispatch_resolution_identity"),
+            (type_records, "type_resolution", "type_resolution_status",
+             "type_resolution_identity"),
+            (class_init_records, "class_initialization_resolution",
+             "class_initialization_status",
+             "class_initialization_resolution_identity"),
+            (linkage_records, "linkage_resolution", "linkage_status",
+             "linkage_resolution_identity"),
+            (resource_records, "resource_selection", "resource_selection_status",
+             "resource_selection_identity"),
+        )
+        self.store.add_reconciliation_records(
+            (
+                {
+                    "analysis_context_identity": self.context_identity,
+                    "record_kind": kind,
+                    "status": record[status_key],
+                    "subject_identity": record[identity_key],
+                    "payload": record,
+                }
+                for records, kind, status_key, identity_key in persistence_groups
+                for record in records
+            ),
+            collect_identities=False,
+        )
         gaps = tuple(sorted(self.coverage_gaps))
         coverage = "complete" if not gaps else "partial"
         universe_identity = _identity(

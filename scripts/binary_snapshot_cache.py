@@ -18,8 +18,8 @@ from binary_asm_helper import parser_identity, resolve_asm_jar
 from binary_first_contract import BinaryFirstContractError, canonical_identity
 
 
-CACHE_SCHEMA = "java-upgrade-analyzer.binary-snapshot-cache.v1"
-CACHE_POLICY_VERSION = "artifact-content-parser-rebind-v1"
+CACHE_SCHEMA = "java-upgrade-analyzer.binary-snapshot-cache.v2"
+CACHE_POLICY_VERSION = "artifact-content-parser-target-release-rebind-v2"
 
 
 class BinarySnapshotCacheError(BinaryFirstContractError):
@@ -52,10 +52,13 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _cache_key(content_sha256: str, parser_id: str) -> str:
+def _cache_key(
+    content_sha256: str, parser_id: str, target_jvm_major: int | None,
+) -> str:
     return _identity("binary_snapshot_cache_key", {
         "artifact_content_sha256": content_sha256,
         "parser_identity": parser_id,
+        "target_jvm_major": target_jvm_major,
         "cache_policy_version": CACHE_POLICY_VERSION,
     })
 
@@ -175,6 +178,7 @@ def cached_snapshot_archive(
     expected_sha256: str,
     cache_root: str | Path,
     asm_jar: str | Path | None = None,
+    target_jvm_major: int | None = None,
 ) -> SnapshotCacheOutcome:
     archive = Path(path)
     actual_sha = _sha256_file(archive)
@@ -185,7 +189,7 @@ def cached_snapshot_archive(
         )
     asm_path = resolve_asm_jar(asm_jar)
     parser_id, _helper_sha = parser_identity(asm_jar=asm_path)
-    key = _cache_key(actual_sha, parser_id)
+    key = _cache_key(actual_sha, parser_id, target_jvm_major)
     cache_path = Path(cache_root) / "artifact_snapshots" / parser_id / f"{key}.json.zlib"
     cache_status = "miss"
     parser_invocations = 0
@@ -210,6 +214,7 @@ def cached_snapshot_archive(
             artifact_instance_identity=f"CACHE-TEMPLATE:{key}",
             expected_sha256=actual_sha,
             asm_jar=asm_path,
+            target_jvm_major=target_jvm_major,
         )
         parser_invocations = 1
         payload = _template_payload(template)

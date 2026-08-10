@@ -21,6 +21,76 @@ import run_step  # noqa: E402
 
 
 class RunStepMainStateTest(unittest.TestCase):
+    def _git_source_repository(self, root):
+        repository = Path(root) / "dependency-source"
+        source = repository / "src" / "main" / "java" / "demo" / "Api.java"
+        source.parent.mkdir(parents=True)
+        source.write_text("package demo; public class Api {}\n", encoding="utf-8")
+        commands = (
+            ["git", "init", str(repository)],
+            ["git", "-C", str(repository), "config", "user.name", "Test"],
+            ["git", "-C", str(repository), "config", "user.email", "test@example.invalid"],
+            ["git", "-C", str(repository), "add", "."],
+            ["git", "-C", str(repository), "commit", "-m", "fixture"],
+        )
+        for command in commands:
+            completed = subprocess.run(
+                command, capture_output=True, text=True, check=False
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+        commit = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        return repository, source.parent.parent, commit
+
+    def test_dependency_source_git_materialization_pins_resolved_commit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repository, _source_root, commit = self._git_source_repository(root)
+            report = root / ".upgrade-report"
+
+            result = run_step.materialize_dependency_source_git_url(
+                repository.as_uri(), report, clone_timeout=30
+            )
+            metadata = json.loads(
+                Path(result["metadata_path"]).read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(result["resolved_commit"], commit)
+        self.assertEqual(metadata["resolved_commit"], commit)
+        self.assertTrue(result["repo_path"].endswith("/repository"))
+
+    def test_dependency_source_mapping_carries_git_revision_into_binary_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repository, source_root, commit = self._git_source_repository(root)
+            config = root / "binary.json"
+            config.write_text(json.dumps({
+                "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+            }), encoding="utf-8")
+            resolved_path = run_step._resolved_binary_pipeline_config_path(
+                {
+                    "binary_pipeline_config": str(config),
+                    "source_usage_decision": "use_source",
+                    "source_usage_decision_source": "user_interaction",
+                    "dependency_source_mappings": [
+                        f"com.example:demo={source_root}"
+                    ],
+                    "dependency_source_git_materializations": [{
+                        "repo_path": str(repository),
+                        "resolved_commit": commit,
+                    }],
+                },
+                root,
+                root / ".upgrade-report",
+            )
+            resolved = json.loads(resolved_path.read_text(encoding="utf-8"))
+
+        source_set = resolved["source_overlay"]["source_sets"][0]
+        self.assertEqual(source_set["owner_coord"], "com.example:demo")
+        self.assertEqual(source_set["snapshot_revision"], commit)
+
     def test_orchestrator_exposes_no_engine_selection_or_fallback_api(self):
         self.assertFalse(hasattr(run_step, "normalize_binary_engine_mode"))
         self.assertFalse(hasattr(run_step, "validate_binary_engine_mode_transition"))
@@ -53,6 +123,35 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertEqual(
                 resolved["source_usage"]["decision_source"],
                 "user_provided_source",
+            )
+
+    def test_step4_materializes_binary_config_from_step1_when_not_supplied(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = root / ".upgrade-report"
+            automatic = {
+                "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+                "base": {"artifacts": []},
+                "current": {"artifacts": []},
+            }
+            with patch.object(
+                run_step,
+                "materialize_binary_pipeline_config",
+                return_value=automatic,
+            ) as materialize:
+                resolved_path = run_step._resolved_binary_pipeline_config_path(
+                    {"source_usage_decision": "skip_source"},
+                    root,
+                    report,
+                )
+
+            resolved = json.loads(resolved_path.read_text(encoding="utf-8"))
+            materialize.assert_called_once()
+            self.assertEqual(resolved["base"], automatic["base"])
+            self.assertEqual(resolved["source_usage"]["decision"], "skip_source")
+            self.assertTrue(
+                (report / ".runtime/state/binary_pipeline_config.materialized.json")
+                .is_file()
             )
 
     def test_step4_config_without_source_requires_user_decision(self):

@@ -46,14 +46,24 @@ public final class RuntimeOutcomeOracle {
     private static void observe(ClassLoader loader, String binaryName) {
         StringBuilder out = new StringBuilder();
         out.append('{').append(json("class_name")).append(':').append(json(binaryName.replace('.', '/')));
+        String resourceName = binaryName.replace('.', '/') + ".class";
+        String providerResource = "";
+        try {
+            URL resource = loader.getResource(resourceName);
+            if (resource != null) providerResource = resource.toExternalForm();
+        } catch (RuntimeException error) {
+            providerResource = "<resource-error:" + error.getClass().getName() + ">";
+        }
+        out.append(',').append(json("provider_resource_url")).append(':').append(
+            json(providerResource)
+        );
+        boolean classLoaded = false;
         try {
             Class<?> type = Class.forName(binaryName, false, loader);
-            // Reflection metadata resolution forces descriptors, superclasses and
-            // interfaces to link but never executes class initialization.
-            Method[] methods = type.getDeclaredMethods();
-            Field[] fields = type.getDeclaredFields();
-            Constructor<?>[] constructors = type.getDeclaredConstructors();
-            out.append(',').append(json("status")).append(':').append(json("definition_ready"));
+            classLoaded = true;
+            // Preserve the hierarchy as soon as the class itself loads. A later
+            // optional member-signature failure must not erase valid subtype
+            // evidence used by the independent dispatch reconstruction.
             out.append(',').append(json("provider_url")).append(':').append(json(codeSource(type)));
             out.append(',').append(json("loader_kind")).append(':').append(json(loaderKind(type)));
             out.append(',').append(json("modifiers")).append(':').append(type.getModifiers());
@@ -64,14 +74,29 @@ public final class RuntimeOutcomeOracle {
             for (Class<?> iface : type.getInterfaces()) interfaces.add(internal(iface));
             Collections.sort(interfaces);
             out.append(',').append(json("interfaces")).append(':').append(jsonArray(interfaces));
+            // Class-level metadata is independently useful even when a later
+            // optional method/field type prevents exhaustive member linkage.
             out.append(',').append(json("class_annotations")).append(':').append(
                 jsonArray(annotationDescriptors(type))
             );
             out.append(',').append(json("class_annotation_imports")).append(':').append(
                 jsonArray(annotationImports(type))
             );
+            out.append(',').append(json("class_annotation_resources")).append(':').append(
+                jsonArray(annotationResources(type))
+            );
+            out.append(',').append(json("class_annotation_values")).append(':').append(
+                jsonArray(annotationValues(type))
+            );
+            // Reflection metadata resolution forces member descriptors to link
+            // but never executes class initialization.
+            Method[] methods = type.getDeclaredMethods();
+            Field[] fields = type.getDeclaredFields();
+            Constructor<?>[] constructors = type.getDeclaredConstructors();
+            out.append(',').append(json("status")).append(':').append(json("definition_ready"));
             List<String> memberRows = new ArrayList<>();
             List<String> memberAnnotationRows = new ArrayList<>();
+            List<String> memberAnnotationValueRows = new ArrayList<>();
             for (Field field : fields) {
                 memberRows.add("field|" + field.getName() + "|" + descriptor(field.getType())
                     + "|" + field.getModifiers());
@@ -84,6 +109,11 @@ public final class RuntimeOutcomeOracle {
                         method.getName() + "|" + methodDescriptor(method) + "|" + annotation
                     );
                 }
+                for (String value : annotationValues(method)) {
+                    memberAnnotationValueRows.add(
+                        method.getName() + "|" + methodDescriptor(method) + "|" + value
+                    );
+                }
             }
             for (Constructor<?> constructor : constructors) {
                 memberRows.add("method|<init>|" + constructorDescriptor(constructor)
@@ -91,12 +121,19 @@ public final class RuntimeOutcomeOracle {
             }
             Collections.sort(memberRows);
             Collections.sort(memberAnnotationRows);
+            Collections.sort(memberAnnotationValueRows);
             out.append(',').append(json("members")).append(':').append(jsonArray(memberRows));
             out.append(',').append(json("member_annotations")).append(':').append(
                 jsonArray(memberAnnotationRows)
             );
+            out.append(',').append(json("member_annotation_values")).append(':').append(
+                jsonArray(memberAnnotationValueRows)
+            );
         } catch (Throwable error) {
             out.append(',').append(json("status")).append(':').append(json("definition_failed"));
+            out.append(',').append(json("failure_phase")).append(':').append(json(
+                classLoaded ? "member_linkage" : "class_load"
+            ));
             out.append(',').append(json("failure_kind")).append(':').append(json(error.getClass().getName()));
             out.append(',').append(json("failure_message")).append(':').append(json(String.valueOf(error.getMessage())));
         }
@@ -155,6 +192,73 @@ public final class RuntimeOutcomeOracle {
         }
         Collections.sort(result);
         return result;
+    }
+
+    private static List<String> annotationResources(AnnotatedElement element) {
+        List<String> result = new ArrayList<>();
+        try {
+            for (Annotation annotation : element.getDeclaredAnnotations()) {
+                if (!annotation.annotationType().getName().equals(
+                    "org.springframework.context.annotation.ImportResource"
+                )) continue;
+                try {
+                    Object value = annotation.annotationType().getDeclaredMethod("locations")
+                        .invoke(annotation);
+                    if (value instanceof String[]) {
+                        result.addAll(Arrays.asList((String[]) value));
+                    }
+                    Object aliases = annotation.annotationType().getDeclaredMethod("value")
+                        .invoke(annotation);
+                    if (aliases instanceof String[]) {
+                        result.addAll(Arrays.asList((String[]) aliases));
+                    }
+                } catch (ReflectiveOperationException | RuntimeException error) {
+                    result.add("<unresolved:" + error.getClass().getName() + ">");
+                }
+            }
+        } catch (RuntimeException | LinkageError error) {
+            result.add("<unresolved:" + error.getClass().getName() + ">");
+        }
+        Collections.sort(result);
+        return result;
+    }
+
+    private static List<String> annotationValues(AnnotatedElement element) {
+        List<String> result = new ArrayList<>();
+        try {
+            for (Annotation annotation : element.getDeclaredAnnotations()) {
+                String descriptor = "L" + internal(annotation.annotationType()) + ";";
+                for (Method attribute : annotation.annotationType().getDeclaredMethods()) {
+                    try {
+                        Object value = attribute.invoke(annotation);
+                        if (value != null && value.getClass().isArray()) {
+                            int length = java.lang.reflect.Array.getLength(value);
+                            for (int index = 0; index < length; index++) {
+                                result.add(descriptor + "|" + attribute.getName() + "|"
+                                    + annotationValue(java.lang.reflect.Array.get(value, index)));
+                            }
+                        } else {
+                            result.add(descriptor + "|" + attribute.getName() + "|"
+                                + annotationValue(value));
+                        }
+                    } catch (ReflectiveOperationException | RuntimeException error) {
+                        result.add(descriptor + "|" + attribute.getName() + "|<unresolved:"
+                            + error.getClass().getName() + ">");
+                    }
+                }
+            }
+        } catch (RuntimeException | LinkageError error) {
+            result.add("<unresolved>|<unresolved>|" + error.getClass().getName());
+        }
+        Collections.sort(result);
+        return result;
+    }
+
+    private static String annotationValue(Object value) {
+        if (value == null) return "null";
+        if (value instanceof Class<?>) return internal((Class<?>) value);
+        if (value instanceof Enum<?>) return ((Enum<?>) value).name();
+        return String.valueOf(value);
     }
 
     private static String methodDescriptor(Method method) {

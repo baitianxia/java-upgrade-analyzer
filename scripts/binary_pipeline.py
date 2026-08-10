@@ -38,6 +38,7 @@ from binary_first_model import (
 from binary_output import activate_binary_generation, write_binary_generation
 from binary_platform_image import JdkPlatformImage
 from binary_runtime_reconciler import RuntimeCapabilityPolicy, RuntimeReconciler
+from binary_semantic_overlay import build_binary_semantic_overlay
 from binary_snapshot_cache import cached_snapshot_archive
 from binary_source_overlay import build_inline_consumption_overlay, build_source_overlay
 from binary_trace_engine import BinaryTraceEngine
@@ -57,6 +58,50 @@ class BinaryPipelineError(BinaryFirstContractError):
     pass
 
 
+class _PhaseTimingRecorder(list):
+    """Persist non-authoritative progress after every completed phase."""
+
+    ORDER = (
+        "input_and_runtime_profile",
+        "artifact_fact_build_and_local_diff",
+        "target_independent_runtime_reconciliation",
+        "decision_and_projection_freeze",
+        "binary_trace",
+        "immutable_generation_write",
+        "independent_validation",
+        "validated_generation_activation",
+    )
+
+    def __init__(self, output_root: Path, started: float):
+        super().__init__()
+        self.started = started
+        self.directory = output_root / "binary_observability"
+        self.path = self.directory / "latest_in_progress.json"
+
+    def append(self, item):
+        super().append(item)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        completed = str((item or {}).get("phase") or "")
+        try:
+            index = self.ORDER.index(completed)
+        except ValueError:
+            next_phase = "unknown"
+        else:
+            next_phase = self.ORDER[index + 1] if index + 1 < len(self.ORDER) else ""
+        payload = json.dumps({
+            "schema": "java-upgrade-analyzer.binary-progress.v1",
+            "status": "completed" if not next_phase else "running",
+            "last_completed_phase": completed,
+            "current_phase": next_phase,
+            "elapsed_seconds": round(time.perf_counter() - self.started, 6),
+            "phases": list(self),
+            "non_authoritative_observability": True,
+        }, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+        temporary = self.path.with_suffix(".tmp")
+        temporary.write_text(payload, encoding="utf-8")
+        temporary.replace(self.path)
+
+
 SOURCE_USAGE_DECISIONS = {"use_source", "skip_source"}
 SOURCE_USAGE_DECISION_SOURCES = {
     "user_interaction",
@@ -64,6 +109,13 @@ SOURCE_USAGE_DECISION_SOURCES = {
     "explicit_config",
 }
 SOURCE_USAGE_PURPOSE_VERSION = "source-overlay-purpose-v1"
+SOURCE_FILE_LANGUAGES = {
+    ".java": "java",
+    ".kt": "kotlin",
+    ".kts": "kotlin_script",
+    ".scala": "scala",
+    ".groovy": "groovy",
+}
 
 
 def _identity(namespace: str, payload: Any) -> str:
@@ -321,7 +373,10 @@ def _source_methods(source_config: Mapping[str, Any]):
         )
     methods = []
     manifest = []
+    source_set_records = []
     coverage_complete = True
+    coverage_gaps = []
+    language_file_counts: dict[str, int] = {}
     for raw_set in source_sets:
         source_set = dict(raw_set or {})
         roots = [
@@ -347,6 +402,7 @@ def _source_methods(source_config: Mapping[str, Any]):
                 "BINARY_SOURCE_OWNER_REQUIRED",
                 "every source set requires owner_type business/dependency and owner_coord",
             )
+        set_manifest = []
         for root in roots:
             if not root.is_dir():
                 raise BinaryPipelineError("BINARY_SOURCE_ROOT_MISSING", str(root))
@@ -356,28 +412,54 @@ def _source_methods(source_config: Mapping[str, Any]):
                 raise BinaryPipelineError(
                     "BINARY_SOURCE_ROOT_OUTSIDE_SNAPSHOT", str(root)
                 ) from error
-            for path in sorted(root.rglob("*.java")):
+            source_files = sorted(
+                path for path in root.rglob("*")
+                if path.is_file() and path.suffix.lower() in SOURCE_FILE_LANGUAGES
+            )
+            for path in source_files:
                 sha = _sha256_file(path)
                 logical = path.relative_to(common_root).as_posix()
+                language = SOURCE_FILE_LANGUAGES[path.suffix.lower()]
+                language_file_counts[language] = (
+                    language_file_counts.get(language, 0) + 1
+                )
                 manifest_item = {
                     "owner_type": owner_type,
                     "owner_coord": owner_coord,
                     "module": module,
                     "logical_path": logical,
                     "sha256": sha,
+                    "language": language,
                 }
-                manifest.append(manifest_item)
                 analyzer_root = {
                     "root": str(root),
                     "owner_type": owner_type,
                     "owner_coord": owner_coord,
                     "module": module,
                 }
-                parsed, diagnostics = analyze_file(
-                    str(path), analyzer_root,
-                    prefer_tree_sitter=True,
-                    return_diagnostics=True,
-                )
+                if language == "java":
+                    parsed, diagnostics = analyze_file(
+                        str(path), analyzer_root,
+                        prefer_tree_sitter=True,
+                        return_diagnostics=True,
+                    )
+                else:
+                    parsed = []
+                    diagnostics = {
+                        "preferred_parser": "none",
+                        "actual_parser": "skipped",
+                        "fallback_reason": f"unsupported_source_language:{language}",
+                        "tree_sitter_available": False,
+                        "language": language,
+                        "error_nodes": 0,
+                    }
+                    coverage_gaps.append({
+                        "reason_code": "BINARY_SOURCE_LANGUAGE_NOT_MAPPED",
+                        "language": language,
+                        "owner_coord": owner_coord,
+                        "module": module,
+                        "logical_path": logical,
+                    })
                 if diagnostics:
                     # Source is explanatory. Preserve partial coverage but never mutate binary facts.
                     stable_diagnostics = {
@@ -387,18 +469,63 @@ def _source_methods(source_config: Mapping[str, Any]):
                             "tree_sitter_available", "language", "error_nodes",
                         )
                     }
-                    manifest.append({**manifest_item, "diagnostics": stable_diagnostics})
+                    manifest_item["diagnostics"] = stable_diagnostics
                     if (
                         stable_diagnostics.get("actual_parser") == "skipped"
                         or int(stable_diagnostics.get("error_nodes") or 0) > 0
                     ):
                         coverage_complete = False
+                        if language == "java":
+                            coverage_gaps.append({
+                                "reason_code": "BINARY_SOURCE_PARSE_PARTIAL",
+                                "language": language,
+                                "owner_coord": owner_coord,
+                                "module": module,
+                                "logical_path": logical,
+                                "actual_parser": str(
+                                    stable_diagnostics.get("actual_parser") or ""
+                                ),
+                                "error_nodes": int(
+                                    stable_diagnostics.get("error_nodes") or 0
+                                ),
+                            })
+                manifest.append(manifest_item)
+                set_manifest.append(manifest_item)
                 methods.extend(parsed)
+        source_set_records.append({
+            "owner_type": owner_type,
+            "owner_coord": owner_coord,
+            "module": module,
+            "snapshot_revision": str(
+                source_set.get("snapshot_revision") or "content-addressed-only"
+            ),
+            "file_count": len(set_manifest),
+            "source_tree_identity": _identity(
+                "source_tree_identity", {"files": set_manifest}
+            ),
+            "language_file_counts": dict(sorted({
+                language: sum(
+                    item.get("language") == language for item in set_manifest
+                )
+                for language in SOURCE_FILE_LANGUAGES.values()
+                if any(item.get("language") == language for item in set_manifest)
+            }.items())),
+        })
     snapshot_identity = _identity("source_snapshot_identity", {"files": manifest})
     return (
         methods,
         snapshot_identity,
         "complete" if coverage_complete else "partial",
+        {
+            "schema": "java-upgrade-analyzer.binary-source-attestation.v1",
+            "source_snapshot_identity": snapshot_identity,
+            "coverage_status": "complete" if coverage_complete else "partial",
+            "file_count": len(manifest),
+            "language_file_counts": dict(sorted(language_file_counts.items())),
+            "coverage_gaps": coverage_gaps,
+            "source_sets": source_set_records,
+            "files": manifest,
+        },
     )
 
 
@@ -510,12 +637,14 @@ def _source_explanations(
 
 def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[str, Any]:
     pipeline_started = time.perf_counter()
-    phase_timings: list[dict[str, Any]] = []
     if config.get("schema") != "java-upgrade-analyzer.binary-pipeline-input.v1":
         raise BinaryPipelineError("BINARY_PIPELINE_CONFIG_SCHEMA_INVALID", str(config.get("schema")))
     source_usage = _source_usage_contract(config)
     asm_jar = config.get("asm_jar") or None
     output_root = Path(output_root).resolve()
+    phase_timings: list[dict[str, Any]] = _PhaseTimingRecorder(
+        output_root, pipeline_started
+    )
     cache_root = Path(
         str(config.get("cache_root") or (output_root / "binary_cache"))
     ).expanduser().resolve()
@@ -523,6 +652,11 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
     current_config = dict(config.get("current") or {})
     base_platform = JdkPlatformImage(base_config.get("jdk_home", ""), asm_jar=asm_jar)
     current_platform = JdkPlatformImage(current_config.get("jdk_home", ""), asm_jar=asm_jar)
+    if current_platform.identity == base_platform.identity:
+        # Platform facts are immutable and content-addressed. Sharing one
+        # instance avoids parsing the same target JDK twice for an ordinary
+        # dependency upgrade while preserving the same platform identity.
+        current_platform = base_platform
     base_artifacts, base_paths = _artifact_descriptors(list(base_config.get("artifacts") or ()))
     current_artifacts, current_paths = _artifact_descriptors(list(current_config.get("artifacts") or ()))
     base_config["artifacts"] = base_artifacts
@@ -604,6 +738,7 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                     raw["path"], artifact_instance_identity=instance.identity,
                     expected_sha256=instance.content_sha256, asm_jar=asm_jar,
                     cache_root=cache_root,
+                    target_jvm_major=base_platform.java_major,
                 )
                 snapshot = cache_outcome.snapshot
                 cache_metrics[
@@ -625,6 +760,7 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                     raw["path"], artifact_instance_identity=instance.identity,
                     expected_sha256=instance.content_sha256, asm_jar=asm_jar,
                     cache_root=cache_root,
+                    target_jvm_major=current_platform.java_major,
                 )
                 snapshot = cache_outcome.snapshot
                 cache_metrics[
@@ -732,8 +868,9 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
             source_overlay = None
             source_methods = ()
             source_explanations = None
+            source_attestation = None
             if config.get("source_overlay"):
-                methods, source_snapshot, source_coverage = _source_methods(
+                methods, source_snapshot, source_coverage, source_attestation = _source_methods(
                     dict(config["source_overlay"])
                 )
                 source_overlay = build_source_overlay(
@@ -748,6 +885,16 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                     source_methods,
                     source_overlay,
                     analysis_context_identity=context.identity,
+                )
+                mapping_status_counts: dict[str, int] = {}
+                for row in source_overlay.rows:
+                    status = str(row.get("mapping_status") or "unknown")
+                    mapping_status_counts[status] = mapping_status_counts.get(status, 0) + 1
+                source_attestation["mapping_status_counts"] = dict(
+                    sorted(mapping_status_counts.items())
+                )
+                source_attestation["mapped_binary_member_count"] = int(
+                    mapping_status_counts.get("mapped", 0)
                 )
             decisions = BinaryDecisionEngine(
                 analysis_context_identity=context.identity,
@@ -769,6 +916,12 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                     current_runtime,
                     analysis_context_identity=context.identity,
                 )
+            semantic_overlay = build_binary_semantic_overlay(
+                current_store,
+                current_profile,
+                current_runtime,
+                decisions,
+            )
             phase_timings.append({
                 "phase": "decision_and_projection_freeze",
                 "elapsed_seconds": round(time.perf_counter() - decision_started, 6),
@@ -776,11 +929,13 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                     decisions.authoritative_decisions
                 ),
                 "diagnostic_candidate_fact_count": len(decisions.diagnostic_decisions),
+                "runtime_semantic_edge_count": len(semantic_overlay.rows),
             })
             trace_started = time.perf_counter()
             traces = BinaryTraceEngine(
                 current_store, current_profile, current_runtime, decisions,
                 inline_overlay=inline_overlay,
+                semantic_overlay=semantic_overlay,
                 max_visited_nodes=int(config.get("max_trace_nodes") or 1_000_000),
                 max_paths_per_target=int(config.get("max_paths_per_target") or 20),
             ).build()
@@ -902,8 +1057,19 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                 "dependency_direction": "strictly_forward_no_snapshot_rewrite",
             }
             additional = {
-                "base_binary_facts.sqlite": (temp / "base.sqlite").read_bytes(),
-                "current_binary_facts.sqlite": (temp / "current.sqlite").read_bytes(),
+                # Fact stores can be hundreds of MiB on real projects. Keep
+                # their complete evidence, but stream immutable sidecars into
+                # the generation instead of materializing both files in RAM.
+                "base_binary_facts.sqlite": temp / "base.sqlite",
+                "current_binary_facts.sqlite": temp / "current.sqlite",
+                "binary_runtime_semantic_overlay.json": (
+                    json.dumps(
+                        semantic_overlay.as_payload(),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ) + "\n"
+                ).encode("utf-8"),
                 "binary_pairings.json": (
                     json.dumps(
                         {
@@ -980,6 +1146,15 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                 additional["binary_source_explanations.json"] = (
                     json.dumps(
                         source_explanations,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ) + "\n"
+                ).encode("utf-8")
+            if source_attestation is not None:
+                additional["binary_source_attestation.json"] = (
+                    json.dumps(
+                        source_attestation,
                         ensure_ascii=False,
                         sort_keys=True,
                         separators=(",", ":"),

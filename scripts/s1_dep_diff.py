@@ -152,7 +152,15 @@ def _business_content_entries(archive):
                 continue
             target_name = name[len(prefix):]
         else:
-            if name.startswith(('META-INF/', 'BOOT-INF/', 'WEB-INF/', 'lib/')):
+            upper_name = name.upper()
+            packaging_only = (
+                upper_name == 'META-INF/MANIFEST.MF'
+                or upper_name.startswith('META-INF/MAVEN/')
+                or bool(re.fullmatch(
+                    r'META-INF/[^/]+\.(?:SF|RSA|DSA|EC)', upper_name
+                ))
+            )
+            if packaging_only or name.startswith(('BOOT-INF/', 'WEB-INF/', 'lib/')):
                 continue
             target_name = name
         if not target_name:
@@ -191,9 +199,9 @@ def _spring_boot_classpath_order(archive):
 
 
 def materialize_changed_dependency_jars(
-    rows, side_meta, output_dir, current_entries=None,
+    rows, side_meta, output_dir, base_entries=None, current_entries=None,
 ):
-    """Persist Step4 change JARs and the complete Step5 current runtime view once."""
+    """Persist the complete base/current runtime closure used by binary analysis."""
     output_dir = Path(output_dir).resolve()
     jar_dir = output_dir / STEP1_DEPENDENCY_JARS_DIRNAME
     if jar_dir.exists():
@@ -330,26 +338,30 @@ def materialize_changed_dependency_jars(
                 ) or row.get('classifier'),
             )
 
-    for entry in current_entries or []:
-        if str(entry.get('resolution_status') or 'resolved').strip() != 'resolved':
-            continue
-        scope = str(entry.get('scope') or '').strip()
-        if scope in {'test', 'provided', 'optional'}:
-            continue
-        coord = str(entry.get('coord') or '').strip()
-        version = str(entry.get('version') or '').strip()
-        if not coord or version in ('', '-'):
-            continue
-        add_request(
-            'current',
-            entry.get('lib_entry'),
-            coord,
-            version,
-            scope,
-            entry.get('packaged_match_source'),
-            'step5_runtime',
-            entry.get('classifier'),
-        )
+    for side, entries in (
+        ('base', base_entries or ()),
+        ('current', current_entries or ()),
+    ):
+        for entry in entries:
+            if str(entry.get('resolution_status') or 'resolved').strip() != 'resolved':
+                continue
+            scope = str(entry.get('scope') or '').strip()
+            if scope in {'test', 'provided', 'optional'}:
+                continue
+            coord = str(entry.get('coord') or '').strip()
+            version = str(entry.get('version') or '').strip()
+            if not coord or version in ('', '-'):
+                continue
+            add_request(
+                side,
+                entry.get('lib_entry'),
+                coord,
+                version,
+                scope,
+                entry.get('packaged_match_source'),
+                'binary_runtime',
+                entry.get('classifier'),
+            )
 
     items = []
     business_artifacts = []
@@ -372,8 +384,10 @@ def materialize_changed_dependency_jars(
         with zipfile.ZipFile(artifact_path) as outer:
             spring_boot_classpath_order = _spring_boot_classpath_order(outer)
             info_by_name = defaultdict(list)
-            for info in outer.infolist():
+            archive_entry_order = {}
+            for archive_index, info in enumerate(outer.infolist()):
                 info_by_name[info.filename].append(info)
+                archive_entry_order.setdefault(info.filename, archive_index)
             for request in sorted(side_requests, key=lambda item: item['lib_entry']):
                 lib_entry = request['lib_entry']
                 matches = [
@@ -427,38 +441,50 @@ def materialize_changed_dependency_jars(
                             'spring_boot_classpath_index'
                         ),
                     })
+                else:
+                    retained_item.update({
+                        'runtime_classpath_index': archive_entry_order[lib_entry],
+                        'runtime_classpath_authority': 'outer_archive_entry_order',
+                    })
                 items.append(retained_item)
 
-            if side == 'current':
-                business_entries = _business_content_entries(outer)
-                if business_entries:
-                    business_target = jar_dir / side / 'business-classes.jar'
-                    _write_deterministic_archive(
-                        business_target, outer, business_entries
+            business_entries = _business_content_entries(outer)
+            if business_entries:
+                business_target = jar_dir / side / 'business-classes.jar'
+                _write_deterministic_archive(
+                    business_target, outer, business_entries
+                )
+                try:
+                    require_safe_archive(
+                        business_target,
+                        inspect_nested_archives=False,
+                        allow_duplicate_maven_metadata=True,
                     )
-                    try:
-                        require_safe_archive(
-                            business_target,
-                            inspect_nested_archives=False,
-                            allow_duplicate_maven_metadata=True,
-                        )
-                    except Exception:
-                        if business_target.exists():
-                            business_target.unlink()
-                        raise
-                    business_artifacts.append({
-                        'side': 'current',
-                        'kind': 'business_content',
-                        'retained_path': str(business_target),
-                        'sha256': sha256_file(business_target),
-                        'entry_count': len(business_entries),
-                        'class_count': sum(
-                            1 for _source, target in business_entries
-                            if target.endswith('.class')
-                        ),
-                        'outer_artifact_path': str(artifact_path),
-                        'outer_artifact_sha256': outer_sha256,
-                    })
+                except Exception:
+                    if business_target.exists():
+                        business_target.unlink()
+                    raise
+                names = set(outer.namelist())
+                if any(name.startswith('BOOT-INF/classes/') for name in names):
+                    launcher_kind = 'spring-boot-executable-jar'
+                elif any(name.startswith('WEB-INF/classes/') for name in names):
+                    launcher_kind = 'servlet-war'
+                else:
+                    launcher_kind = 'java-classpath'
+                business_artifacts.append({
+                    'side': side,
+                    'kind': 'business_content',
+                    'retained_path': str(business_target),
+                    'sha256': sha256_file(business_target),
+                    'entry_count': len(business_entries),
+                    'class_count': sum(
+                        1 for _source, target in business_entries
+                        if target.endswith('.class')
+                    ),
+                    'outer_artifact_path': str(artifact_path),
+                    'outer_artifact_sha256': outer_sha256,
+                    'container_and_launcher_kind': launcher_kind,
+                })
 
     gav_artifacts = defaultdict(lambda: {'hashes': set(), 'entries': []})
     for item in items:
@@ -496,13 +522,58 @@ def materialize_changed_dependency_jars(
             f'({", ".join(sorted(value["entries"]))})'
         )
 
+    runtime_closure = {}
+    for side, entries in (
+        ('base', base_entries or ()),
+        ('current', current_entries or ()),
+    ):
+        gaps = []
+        expected_entries = []
+        for entry in entries:
+            scope = str(entry.get('scope') or '').strip()
+            status = str(entry.get('resolution_status') or 'resolved').strip()
+            if scope in {'test', 'optional'}:
+                continue
+            if scope == 'provided':
+                gaps.append(
+                    f"external_provided_runtime_not_materialized:{entry.get('coord') or entry.get('lib_entry')}"
+                )
+                continue
+            if status != 'resolved':
+                gaps.append(
+                    f"runtime_dependency_unresolved:{entry.get('lib_entry') or entry.get('coord')}"
+                )
+                continue
+            expected_entries.append(str(entry.get('lib_entry') or ''))
+        retained_entries = sorted({
+            str(item.get('lib_entry') or '')
+            for item in items
+            if item.get('side') == side
+            and 'binary_runtime' in set(item.get('purposes') or ())
+        })
+        missing = sorted(set(expected_entries) - set(retained_entries))
+        gaps.extend(f"runtime_dependency_not_retained:{item}" for item in missing)
+        business_count = sum(
+            1 for item in business_artifacts if item.get('side') == side
+        )
+        if business_count != 1:
+            gaps.append(f"business_artifact_cardinality:{business_count}")
+        runtime_closure[side] = {
+            'coverage_status': 'complete' if not gaps else 'partial',
+            'expected_dependency_count': len(expected_entries),
+            'retained_dependency_count': len(retained_entries),
+            'business_artifact_count': business_count,
+            'coverage_gaps': sorted(set(gaps)),
+        }
+
     manifest_path = output_dir / STEP1_DEPENDENCY_JARS_MANIFEST_FILE
     manifest_path.write_text(
         json.dumps(
             {
-                'schema': 'java-upgrade-analyzer.step1-dependency-jars.v2',
+                'schema': 'java-upgrade-analyzer.step1-dependency-jars.v3',
                 'items': items,
                 'business_artifacts': business_artifacts,
+                'runtime_closure': runtime_closure,
             },
             ensure_ascii=False,
             indent=2,
@@ -6115,6 +6186,7 @@ def main():
         rows,
         {'base': base_meta, 'current': curr_meta},
         out_dir,
+        base_entries=base_entries,
         current_entries=curr_entries,
     )
     if observer is not None and artifact_materialization_token is not None:

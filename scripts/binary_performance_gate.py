@@ -270,6 +270,7 @@ def _analyze_once(
             expected_sha256=artifact["sha256"],
             cache_root=cache_root,
             asm_jar=asm_jar,
+            target_jvm_major=int(profile.payload["target_jvm"]["major"]),
         )
         snapshots.append((instance, outcome.snapshot))
         parser_invocations += outcome.parser_invocation_count
@@ -497,6 +498,8 @@ def evaluate_gate(result: dict[str, Any], gate: dict[str, Any]) -> dict[str, Any
     )
     upper("peak_rss_bytes", measurements.get("peak_rss_bytes"), thresholds.get("peak_rss_bytes"))
     upper("disk_bytes", measurements.get("disk_bytes"), thresholds.get("disk_bytes"))
+    upper("bytes_per_class", cold.get("bytes_per_class"), thresholds.get("bytes_per_class"))
+    upper("bytes_per_edge", cold.get("bytes_per_edge"), thresholds.get("bytes_per_edge"))
     upper(
         "cold_relative_legacy_ratio",
         measurements.get("cold_relative_legacy_ratio"),
@@ -522,14 +525,33 @@ def evaluate_gate(result: dict[str, Any], gate: dict[str, Any]) -> dict[str, Any
         _p95([(item.get("stage_seconds") or {}).get("report_10000", float("inf")) for item in warm_runs]),
         stage_limits.get("report_10000"),
     )
-    expected = required_protocol.get("class_count")
+    invariants = gate.get("accuracy_invariants") or {}
+    expected = invariants.get(
+        "expected_class_count", required_protocol.get("class_count")
+    )
     counts = cold.get("counts") or {}
     if counts.get("classes") != expected:
         issues.append({
             "reason_code": "BINARY_PERFORMANCE_CLASS_CONSERVATION_FAILED",
             "expected": expected, "actual": counts.get("classes"),
         })
-    if any(int(item.get("parser_invocations") or 0) != 0 for item in warm_runs):
+    for count_key, invariant_key in (
+        ("members", "expected_member_count"),
+        ("edges", "expected_edge_count"),
+    ):
+        expected_count = invariants.get(invariant_key)
+        if expected_count is not None and counts.get(count_key) != expected_count:
+            issues.append({
+                "reason_code": "BINARY_PERFORMANCE_FACT_CONSERVATION_FAILED",
+                "fact_kind": count_key,
+                "expected": expected_count,
+                "actual": counts.get(count_key),
+            })
+    expected_warm_parses = int(invariants.get("warm_parser_invocations", 0))
+    if any(
+        int(item.get("parser_invocations") or 0) != expected_warm_parses
+        for item in warm_runs
+    ):
         issues.append({
             "reason_code": "BINARY_PERFORMANCE_WARM_PARSE_NOT_ZERO",
         })

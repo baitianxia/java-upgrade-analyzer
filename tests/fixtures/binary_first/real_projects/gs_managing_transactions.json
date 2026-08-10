@@ -1,0 +1,53 @@
+{
+  "schema": "java-upgrade-analyzer.binary-real-project-guard.v1",
+  "case": "gs-managing-transactions",
+  "repository": "spring-guides/gs-managing-transactions",
+  "git_revision": "efa693451b6a6ca123476c9c6e65eedab9048e2c",
+  "application_coordinate": "com.example:managing-transactions-complete:0.0.1-SNAPSHOT",
+  "activated_frameworks": ["spring_boot", "spring_transaction"],
+  "capabilities": [
+    "spring_boot_final_artifact",
+    "spring_transaction_proxy_dispatch",
+    "spring_aop_dispatch",
+    "complete_nested_runtime_closure",
+    "pinned_source_build"
+  ],
+  "assets": {
+    "application": {
+      "kind": "source_build",
+      "coordinate": "com.example:managing-transactions-complete:0.0.1-SNAPSHOT",
+      "filename": "managing-transactions-complete-efa6934.jar",
+      "repository_url": "https://github.com/spring-guides/gs-managing-transactions.git",
+      "git_revision": "efa693451b6a6ca123476c9c6e65eedab9048e2c",
+      "working_directory": "complete",
+      "build_command": ["mvn", "-q", "-DskipTests", "package"],
+      "artifact_path": "target/managing-transactions-complete-0.0.1-SNAPSHOT.jar",
+      "canonicalize_zip": true,
+      "sha256": "7f5855940d85f3f6457ced0d39c8d45aeb8350d23f7d483d6b65a5940b1d2872"
+    },
+    "base_dependency": {
+      "coordinate": "org.springframework:spring-tx:6.2.19",
+      "filename": "spring-tx-6.2.19.jar",
+      "url": "https://repo1.maven.org/maven2/org/springframework/spring-tx/6.2.19/spring-tx-6.2.19.jar",
+      "sha256": "34a1b6f5d87ef4cca6849e1bc70a0f965eec6476737b3cae73ff2561a266ef73"
+    }
+  },
+  "current_nested_asset": {
+    "entry": "BOOT-INF/lib/spring-tx-7.0.8.jar",
+    "coordinate": "org.springframework:spring-tx:7.0.8",
+    "sha256": "57e8fdb6de949e7ec2617683fec03af0253bdbdf4bf3d2651a926a94413df283"
+  },
+  "entrypoint": {
+    "class_name": "com/example/managingtransactions/AppRunner",
+    "member_name": "run",
+    "descriptor": "([Ljava/lang/String;)V"
+  },
+  "expected": {
+    "semantic_edge_kind": "spring_transaction_proxy_dispatch",
+    "reachable_changed_methods": [
+      "org/springframework/transaction/interceptor/TransactionInterceptor.invoke",
+      "org/springframework/transaction/interceptor/TransactionAspectSupport.invokeWithinTransaction"
+    ],
+    "required_resources": ["schema.sql"]
+  }
+}

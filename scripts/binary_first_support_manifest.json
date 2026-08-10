@@ -10,7 +10,7 @@
       "output_schema": "binary-class-fact-v1",
       "asm_version": "9.9.1",
       "asm_jar_sha256": "6f3828a215c920059a5efa2fb55c233d6c54ec5cadca99ce1b1bdd10077c7ddd",
-      "visitor_policy_version": "asm-lossless-facts-v1",
+      "visitor_policy_version": "asm-lossless-facts-v2",
       "supported_classfile_major_min": 45,
       "supported_classfile_major_max": 70,
       "unsupported_classfile_behavior": "scoped_parse_failure_no_fallback"
@@ -72,7 +72,10 @@
       "runtime_topology": [
         "META-INF/services/*",
         "META-INF/spring.factories",
-        "META-INF/spring/*.imports"
+        "META-INF/spring/*.imports",
+        "META-INF/dubbo/*",
+        "META-INF/dubbo/internal/*",
+        "META-INF/dubbo/external/*"
       ],
       "operational_security": [
         "META-INF/*.SF",
@@ -97,7 +100,7 @@
     },
     "method_implementation": {
       "parser": "version-locked ASM framed helper",
-      "normalization": "asm-lossless-facts-v1",
+      "normalization": "asm-lossless-facts-v2",
       "supported": [
         "same-owner same-name same-descriptor executable method comparison",
         "private methods",
@@ -172,6 +175,11 @@
       "Quartz Job callbacks",
       "dependency callbacks activated by selected Spring Boot AutoConfiguration.imports or spring.factories",
       "transitive Spring @Import activation",
+      "activated Spring XML init-method, scheduled and Quartz method registrations",
+      "Spring AMQP MessageListenerAdapter callbacks bound by exact receiver type and literal method name",
+      "MyBatis plugin and type-handler callbacks registered by activated final-artifact XML",
+      "Spring component-scan scope and exact ConditionalOnClass, ConditionalOnMissingClass and ConditionalOnProperty evaluation",
+      "JPA persistence-unit entity registration proof for lifecycle callbacks",
       "explicit runtime-profile entrypoint declarations"
     ],
     "certainty_policy": {
@@ -185,12 +193,33 @@
       "exact or possible path certainty"
     ],
     "known_exclusions": [
-      "Spring XML scheduled and Quartz MethodInvokingJobDetailFactoryBean registration",
-      "component-scan package and external condition evaluation",
-      "runtime registration performed only through reflection or custom framework code",
-      "dynamic proxy, declarative client, MyBatis mapper and AOP semantic dispatch edges"
+      "custom framework callback registration without bytecode, resource or explicit runtime-profile evidence",
+      "arbitrary user-defined Spring Condition implementations",
+      "runtime-generated callbacks whose target is not recoverable from final bytecode or selected resources"
     ],
     "unsupported_behavior": "retain a possible path or explicit coverage limitation; never promote an unproved dependency callback to exact"
+  },
+  "runtime_semantic_overlay_support_manifest": {
+    "status": "implemented_mechanism_specific_verifiers_v1",
+    "policy_version": "binary-runtime-semantic-overlay-v1",
+    "supported_edge_families": [
+      "exact-literal reflection and MethodHandle lookup followed by invocation",
+      "JDK dynamic proxy registration and InvocationHandler callback",
+      "MyBatis annotation/XML mapper proxy dispatch",
+      "Spring transaction proxy dispatch",
+      "Spring Bean wiring with unique @Primary selection and Spring Data repository proxy dispatch that refuses custom factories",
+      "Spring AOP pointcut and Spring Security filter-chain dispatch",
+      "declarative HTTP client dispatch",
+      "Dubbo SPI resource/provider dispatch",
+      "implicit serialization, web-binding and persistence data-contract dispatch"
+    ],
+    "certainty_policy": "exact only with mechanism-specific activation and unique target proof; unresolved registration, overload or condition remains possible with an explicit coverage gap",
+    "human_evidence": [
+      "localized mechanism label on every published path",
+      "owning dependency coordinate",
+      "mechanism-specific registration evidence"
+    ],
+    "unsupported_behavior": "possible path or scoped coverage gap; never a closed negative conclusion"
   },
   "oracle_support_manifest": {
     "status": "implemented_independent_validation_v1",
@@ -203,9 +232,13 @@
       "independent javap structural type and class-initialization truth",
       "invokedynamic implementation handles and bootstrap linkage inventory",
       "actual target-JVM provider and non-initializing definition observations",
+      "separate provider-resource existence and class-definition readiness checks",
       "member resolution and closed-world dispatch",
       "ordered resource selection",
       "target-JVM reflection reconstruction of automatic framework entrypoints",
+      "independent reconstruction of Spring XML, JPA, reflection, proxy, MyBatis, Spring, Feign, Dubbo and implicit data-contract semantic edges",
+      "closed-world recomputation of formal results, paths, human API aggregation, CSV and summary counts",
+      "user-authorized source snapshot file and revision attestation",
       "generation sidecar integrity and tamper detection"
     ],
     "supported_closed_scope": [
@@ -214,11 +247,12 @@
       "full target JDK",
       "direct method/field/type/class-init facts",
       "invokedynamic implementation handles; bootstrap execution remains possible rather than exact",
-      "Java javac compile-time constant inline binding only with exact source owner+field and base/current bytecode value transition"
+      "Java javac compile-time constant inline binding only with exact source owner+field and base/current bytecode value transition",
+      "typed timeout, missing executable, permission, nonzero exit and empty-output failure boundaries"
     ],
     "known_exclusions": [
-      "arbitrary framework/reflection semantic activation without a mechanism-specific verifier",
-      "standalone MethodHandle/VarHandle signature-polymorphic target proof",
+      "arbitrary custom framework or reflection activation without a mechanism-specific verifier",
+      "VarHandle targets that are not exactly recoverable from lookup literals",
       "Kotlin/Scala inline proof",
       "post-transform agent/plugin bytecode without a declared supported transformer profile",
       "signed/sealed security runtime equivalence"

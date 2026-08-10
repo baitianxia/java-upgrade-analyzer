@@ -1,0 +1,55 @@
+{
+  "schema": "java-upgrade-analyzer.binary-real-project-guard.v1",
+  "case": "gs-messaging-rabbitmq",
+  "repository": "spring-guides/gs-messaging-rabbitmq",
+  "git_revision": "3e112f5e956bf61e6cc1ec92c8a5a9a96f738d86",
+  "application_coordinate": "com.example:messaging-rabbitmq-complete:0.0.1-SNAPSHOT",
+  "activated_frameworks": ["spring_boot", "spring_amqp"],
+  "capabilities": [
+    "spring_boot_final_artifact",
+    "spring_message_listener_adapter_registration",
+    "complete_nested_runtime_closure",
+    "pinned_source_build"
+  ],
+  "assets": {
+    "application": {
+      "kind": "source_build",
+      "coordinate": "com.example:messaging-rabbitmq-complete:0.0.1-SNAPSHOT",
+      "filename": "messaging-rabbitmq-complete-3e112f5.jar",
+      "repository_url": "https://github.com/spring-guides/gs-messaging-rabbitmq.git",
+      "git_revision": "3e112f5e956bf61e6cc1ec92c8a5a9a96f738d86",
+      "working_directory": "complete",
+      "build_command": ["mvn", "-q", "-DskipTests", "package"],
+      "artifact_path": "target/messaging-rabbitmq-complete-0.0.1-SNAPSHOT.jar",
+      "canonicalize_zip": true,
+      "sha256": "0aecec3a588a37a75546507ac5ed0ad90b0bfbcceaee6eb363036426e7373ae3"
+    },
+    "base_dependency": {
+      "coordinate": "org.springframework.amqp:spring-amqp:3.2.11",
+      "filename": "spring-amqp-3.2.11.jar",
+      "url": "https://repo1.maven.org/maven2/org/springframework/amqp/spring-amqp/3.2.11/spring-amqp-3.2.11.jar",
+      "sha256": "33caed2f0eb393f9081204ed721663f101059fa08141002d5c050b10d96e33a8"
+    }
+  },
+  "current_nested_asset": {
+    "entry": "BOOT-INF/lib/spring-amqp-3.2.12.jar",
+    "coordinate": "org.springframework.amqp:spring-amqp:3.2.12",
+    "sha256": "3133b0892574eb76c546656f86eb37743929f3735ad5efbab4dd3ac49a4212e1"
+  },
+  "entrypoint": {
+    "class_name": "com/example/messagingrabbitmq/MessagingRabbitmqApplication",
+    "member_name": "main",
+    "descriptor": "([Ljava/lang/String;)V"
+  },
+  "expected": {
+    "reachable_changed_methods": [],
+    "required_resources": [],
+    "entrypoint": {
+      "class_name": "com/example/messagingrabbitmq/Receiver",
+      "member_name": "receiveMessage",
+      "descriptor": "(Ljava/lang/String;)V",
+      "entry_kind": "spring_message_listener",
+      "path_certainty": "exact"
+    }
+  }
+}

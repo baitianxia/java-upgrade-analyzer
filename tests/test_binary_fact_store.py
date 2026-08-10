@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 import zipfile
+import json
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -38,6 +39,8 @@ class BinaryFactStoreTest(unittest.TestCase):
               private String field = "value";
               public String call() { return field.trim(); }
               public Runnable dynamic() { return this::call; }
+              public Class<?>[] arrayLiterals() { return new Class<?>[]{String[].class, int[].class}; }
+              public Object matrix() { return new String[1][1]; }
             }
             """,
             encoding="utf-8",
@@ -124,6 +127,23 @@ class BinaryFactStoreTest(unittest.TestCase):
 
         self.assertEqual(row["coverage_status"], "complete")
 
+    def test_array_class_literals_and_multianewarray_keep_jvm_descriptors(self):
+        artifact = self.make_jar("array-types.jar")
+        instance = self.instance(artifact, 0)
+        snapshot = self.snapshot(artifact, instance)
+
+        with BinaryFactStore() as store:
+            store.add_artifact_snapshot(instance, snapshot)
+            edges = store.rows("direct_edges", where="edge_kind='type'")
+
+        observed = {
+            (row["symbolic_owner"], row["symbolic_descriptor"])
+            for row in edges
+        }
+        self.assertIn(("[Ljava/lang/String;", "[Ljava/lang/String;"), observed)
+        self.assertIn(("[I", "[I"), observed)
+        self.assertIn(("[[Ljava/lang/String;", "[[Ljava/lang/String;"), observed)
+
     def test_same_coordinate_different_physical_instances_are_not_conflicts(self):
         first_artifact = self.make_jar("first.jar")
         second_artifact = self.make_jar("second.jar")
@@ -141,6 +161,110 @@ class BinaryFactStoreTest(unittest.TestCase):
 
         self.assertEqual(len(instances), 2)
         self.assertNotEqual(instances[0]["artifact_instance_identity"], instances[1]["artifact_instance_identity"])
+
+    def test_reconciliation_payloads_are_streamed_and_compressed(self):
+        database = self.root / "compressed.sqlite"
+        records = (
+            {
+                "analysis_context_identity": "context",
+                "record_kind": "member_resolution",
+                "status": "resolved",
+                "subject_identity": f"subject-{index}",
+                "payload": {
+                    "direct_edge_identity": f"edge-{index}",
+                    "member_resolution_status": "resolved",
+                    "repeated_evidence": "x" * 5_000,
+                },
+            }
+            for index in range(100)
+        )
+        with BinaryFactStore(database) as store:
+            identities = store.add_reconciliation_records(
+                records, collect_identities=False
+            )
+            count = store.counts()["reconciliation_records"]
+            compressed_bytes = store.connection.execute(
+                "SELECT SUM(length(payload_zlib)) FROM reconciliation_records"
+            ).fetchone()[0]
+            identity_bytes = store.connection.execute(
+                "SELECT length(chunk_identity) FROM reconciliation_records LIMIT 1"
+            ).fetchone()[0]
+            chunk_count = store.connection.execute(
+                "SELECT COUNT(*) FROM reconciliation_records"
+            ).fetchone()[0]
+            columns = {
+                row[1] for row in store.connection.execute(
+                    "PRAGMA table_info(reconciliation_records)"
+                )
+            }
+            restored = store.rows("reconciliation_records")
+
+        self.assertEqual(identities, [])
+        self.assertEqual(count, 100)
+        self.assertIn("payload_zlib", columns)
+        self.assertNotIn("payload_json", columns)
+        self.assertNotIn("analysis_context_identity", columns)
+        self.assertNotIn("subject_identity", columns)
+        self.assertNotIn("status", columns)
+        self.assertEqual(identity_bytes, 32)
+        self.assertEqual(chunk_count, 1)
+        self.assertLess(compressed_bytes, 50_000)
+        self.assertEqual(len(restored), 100)
+        self.assertTrue(all(row["analysis_context_identity"] == "context" for row in restored))
+        self.assertTrue(all(row["record_kind"] == "member_resolution" for row in restored))
+        self.assertTrue(all(len(row["record_identity"]) == 64 for row in restored))
+
+    def test_reconciliation_chunks_preserve_counts_across_kind_boundaries(self):
+        records = [
+            {
+                "analysis_context_identity": "context",
+                "record_kind": "member_resolution" if index < 2_501 else "dispatch_resolution",
+                "status": "resolved",
+                "subject_identity": f"subject-{index}",
+                "payload": {"index": index, "value": "shared" * 20},
+            }
+            for index in range(4_100)
+        ]
+        with BinaryFactStore() as store:
+            store.add_reconciliation_records(records, collect_identities=False)
+            logical_count = store.counts()["reconciliation_records"]
+            physical_chunks = store.connection.execute(
+                "SELECT COUNT(*) FROM reconciliation_records"
+            ).fetchone()[0]
+            restored = store.rows("reconciliation_records")
+
+        self.assertEqual(logical_count, 4_100)
+        self.assertEqual(physical_chunks, 3)
+        self.assertEqual(len(restored), 4_100)
+        self.assertEqual(
+            {row["record_kind"] for row in restored},
+            {"member_resolution", "dispatch_resolution"},
+        )
+
+    def test_class_bytes_and_full_facts_are_transparently_compressed(self):
+        artifact = self.make_jar("compressed-class.jar")
+        instance = self.instance(artifact, 0)
+        snapshot = self.snapshot(artifact, instance)
+
+        with BinaryFactStore() as store:
+            store.add_artifact_snapshot(instance, snapshot)
+            columns = {
+                row[1] for row in store.connection.execute("PRAGMA table_info(classes)")
+            }
+            stored_lengths = store.connection.execute(
+                "SELECT length(class_bytes_zlib), length(fact_zlib) FROM classes"
+            ).fetchone()
+            row = store.rows("classes")[0]
+
+        self.assertIn("class_bytes_zlib", columns)
+        self.assertIn("fact_zlib", columns)
+        self.assertNotIn("class_bytes", columns)
+        self.assertNotIn("fact_json", columns)
+        self.assertEqual(row["class_bytes"], self.class_bytes)
+        fact = json.loads(row["fact_json"])
+        self.assertEqual(fact["class_name"], "demo/Caller")
+        self.assertLess(stored_lengths[0], len(self.class_bytes))
+        self.assertLess(stored_lengths[1], len(row["fact_json"].encode("utf-8")))
 
     def test_reingesting_same_physical_identity_fails_closed(self):
         artifact = self.make_jar()

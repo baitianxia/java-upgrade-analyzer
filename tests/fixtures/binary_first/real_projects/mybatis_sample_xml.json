@@ -1,0 +1,50 @@
+{
+  "schema": "java-upgrade-analyzer.binary-real-project-guard.v1",
+  "case": "mybatis-sample-xml",
+  "repository": "mybatis/spring-boot-starter",
+  "git_revision": "bb8bac144e4677cf1bab5a6d27ced2521972adfc",
+  "application_coordinate": "org.mybatis.spring.boot:mybatis-spring-boot-sample-xml:4.0.1",
+  "activated_frameworks": ["spring_boot", "mybatis"],
+  "capabilities": [
+    "spring_boot_final_artifact",
+    "mybatis_mapper_xml_registration",
+    "mybatis_proxy_dispatch",
+    "complete_nested_runtime_closure"
+  ],
+  "assets": {
+    "application": {
+      "coordinate": "org.mybatis.spring.boot:mybatis-spring-boot-sample-xml:4.0.1",
+      "filename": "mybatis-spring-boot-sample-xml-4.0.1.jar",
+      "url": "https://repo1.maven.org/maven2/org/mybatis/spring/boot/mybatis-spring-boot-sample-xml/4.0.1/mybatis-spring-boot-sample-xml-4.0.1.jar",
+      "sha256": "f384cea47aa33d0f9b12289aa4c81f8d22133b16137030498745d06b481a89a7"
+    },
+    "base_dependency": {
+      "coordinate": "org.mybatis:mybatis:3.5.10",
+      "filename": "mybatis-3.5.10.jar",
+      "url": "https://repo1.maven.org/maven2/org/mybatis/mybatis/3.5.10/mybatis-3.5.10.jar",
+      "sha256": "aeb461a7adb95b757367c9f19cc44bf21cd14d5d3c76485465ba32db3cfb4fae"
+    }
+  },
+  "current_nested_asset": {
+    "entry": "BOOT-INF/lib/mybatis-3.5.19.jar",
+    "coordinate": "org.mybatis:mybatis:3.5.19",
+    "sha256": "93eea616ae355751bd5fbabb57f0732713fbe79f3196f33c51a0aeeb4255862a"
+  },
+  "entrypoint": {
+    "class_name": "sample/mybatis/xml/SampleXmlApplication",
+    "member_name": "run",
+    "descriptor": "([Ljava/lang/String;)V"
+  },
+  "expected": {
+    "semantic_edge_kind": "mybatis_mapper_proxy_dispatch",
+    "reachable_changed_methods": [
+      "org/apache/ibatis/binding/MapperProxy.invoke",
+      "org/apache/ibatis/binding/MapperMethod.execute"
+    ],
+    "required_resources": [
+      "mybatis-config.xml",
+      "sample/mybatis/xml/mapper/CityMapper.xml",
+      "sample/mybatis/xml/mapper/HotelMapper.xml"
+    ]
+  }
+}

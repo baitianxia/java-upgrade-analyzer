@@ -38,6 +38,10 @@ from path_runtime import (
 from csv_io import open_csv_read, open_csv_write
 from analysis_contract import build_project_scope, discover_project_modules, write_coverage_report
 from binary_report import BINARY_OUTPUT_RELATIVE_PATH
+from binary_runtime_materializer import (
+    BinaryRuntimeMaterializationError,
+    materialize_binary_pipeline_config,
+)
 from diagnostic_contract import canonical_reason_code, normalize_diagnostic_payload
 from pipeline_constants import (
     DELIVERABLES_DIRNAME,
@@ -2967,6 +2971,21 @@ def _dependency_source_git_origin(repo_path, *, deadline=None):
     return str(stdout or "").strip() if rc == 0 else ""
 
 
+def _dependency_source_git_head(repo_path, *, deadline=None):
+    timeout = _dependency_source_remaining_timeout(deadline)
+    if timeout <= 0:
+        return ""
+    stdout, _stderr, rc = run_cmd(
+        git_cmd() + [
+            "-C", str(repo_path), "rev-parse", "--verify", "HEAD^{commit}",
+        ],
+        timeout=timeout,
+        env={"GIT_TERMINAL_PROMPT": "0"},
+    )
+    value = str(stdout or "").strip().lower()
+    return value if rc == 0 and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", value) else ""
+
+
 def _same_git_transport_url(left, right):
     return str(left or "").strip().rstrip("/") == str(right or "").strip().rstrip("/")
 
@@ -3140,6 +3159,14 @@ def materialize_dependency_source_git_url(git_url, report_dir, clone_timeout=300
         if _is_materialized_dependency_source_repo(
             repo_path, git_url, deadline=deadline,
         ):
+            resolved_commit = _dependency_source_git_head(
+                repo_path, deadline=deadline
+            )
+            if not resolved_commit:
+                raise StepError(
+                    f"依赖源码缓存缺少可固定的提交：{display_url}",
+                    reason_codes=["DEPENDENCY_SOURCE_GIT_COMMIT_UNRESOLVED"],
+                )
             write_json(
                 metadata_path,
                 {
@@ -3149,6 +3176,7 @@ def materialize_dependency_source_git_url(git_url, report_dir, clone_timeout=300
                     "git_url_sha256": git_endpoint_sha256,
                     "git_endpoint_sha256": git_endpoint_sha256,
                     "repo_path": str(repo_path.resolve()),
+                    "resolved_commit": resolved_commit,
                     "status": "ready",
                     "attempts": [],
                 },
@@ -3159,6 +3187,7 @@ def materialize_dependency_source_git_url(git_url, report_dir, clone_timeout=300
                 "git_url_sha256": git_endpoint_sha256,
                 "git_endpoint_sha256": git_endpoint_sha256,
                 "repo_path": str(repo_path.resolve()),
+                "resolved_commit": resolved_commit,
                 "metadata_path": str(metadata_path.resolve()),
                 "reused": True,
                 "clone_attempts": 0,
@@ -3286,6 +3315,15 @@ def materialize_dependency_source_git_url(git_url, report_dir, clone_timeout=300
         else:
             temp_repo.replace(repo_path)
 
+        resolved_commit = _dependency_source_git_head(
+            repo_path, deadline=deadline
+        )
+        if not resolved_commit:
+            raise StepError(
+                f"依赖源码仓库缺少可固定的提交：{display_url}",
+                reason_codes=["DEPENDENCY_SOURCE_GIT_COMMIT_UNRESOLVED"],
+            )
+
         write_json(
             metadata_path,
             {
@@ -3295,6 +3333,7 @@ def materialize_dependency_source_git_url(git_url, report_dir, clone_timeout=300
                 "git_url_sha256": git_endpoint_sha256,
                 "git_endpoint_sha256": git_endpoint_sha256,
                 "repo_path": str(repo_path.resolve()),
+                "resolved_commit": resolved_commit,
                 "status": "ready",
                 "attempts": _sanitize_git_persistence_payload(attempts),
             },
@@ -3305,6 +3344,7 @@ def materialize_dependency_source_git_url(git_url, report_dir, clone_timeout=300
             "git_url_sha256": git_endpoint_sha256,
             "git_endpoint_sha256": git_endpoint_sha256,
             "repo_path": str(repo_path.resolve()),
+            "resolved_commit": resolved_commit,
             "metadata_path": str(metadata_path.resolve()),
             "reused": False,
             "clone_attempts": len(attempts),
@@ -10512,14 +10552,39 @@ def cleanup_step_outputs(step_id, report_dir):
         cleanup_step3_candidate_outputs(report_dir)
 
 
-def _binary_pipeline_config_path(run_context, project_dir):
+def _binary_pipeline_config_path(run_context, project_dir, report_dir):
     value = str(run_context.get("binary_pipeline_config") or "").strip()
     if not value:
-        raise StepError(
-            "BINARY_PIPELINE_CONFIG_REQUIRED: Step4 需要显式的 "
-            "binary_pipeline_config，以固定 base/current runtime closure、"
-            "有序运行路径、目标 JDK、loader/resource policy 和 entrypoint。"
+        try:
+            generated = materialize_binary_pipeline_config(
+                report_dir,
+                runtime_overrides={
+                    key: run_context.get(key)
+                    for key in (
+                        "base_jdk_home",
+                        "current_jdk_home",
+                        "active_profile_identities",
+                        "external_config_snapshot_identities",
+                        "agent_transformer_plugin_profile_identities",
+                    )
+                    if run_context.get(key) not in (None, "", [], ())
+                },
+            )
+        except BinaryRuntimeMaterializationError as error:
+            raise StepError(
+                "BINARY_RUNTIME_AUTO_MATERIALIZATION_FAILED: 系统无法从 Step1 "
+                f"最终制品证据自动生成运行时闭包；{error}",
+                reason_codes=[
+                    error.reason_code,
+                    "BINARY_RUNTIME_AUTO_MATERIALIZATION_FAILED",
+                ],
+            ) from error
+        generated_path = (
+            runtime_state_dir(report_dir)
+            / "binary_pipeline_config.materialized.json"
         )
+        write_json(generated_path, generated)
+        return generated_path
     path = Path(value)
     if not path.is_absolute():
         path = Path(project_dir) / path
@@ -10531,7 +10596,9 @@ def _binary_pipeline_config_path(run_context, project_dir):
 def _resolved_binary_pipeline_config_path(
     run_context, project_dir, report_dir,
 ):
-    source_path = _binary_pipeline_config_path(run_context, project_dir)
+    source_path = _binary_pipeline_config_path(
+        run_context, project_dir, report_dir
+    )
     config = read_json(source_path)
     decision = normalize_source_usage_decision(
         (run_context or {}).get("source_usage_decision"), allow_empty=True
@@ -10598,6 +10665,13 @@ def _resolved_binary_pipeline_config_path(
                     or (run_context or {}).get("primary_module")
                     or "root"
                 ),
+                "snapshot_revision": str(
+                    ((run_context or {}).get("pinned_source_snapshot") or {}).get(
+                        "commit"
+                    )
+                    or (run_context or {}).get("current_resolved_commit")
+                    or "content-addressed-only"
+                ),
             })
         dependency_sets = {}
         for raw_mapping in (run_context or {}).get("dependency_source_mappings") or []:
@@ -10609,12 +10683,37 @@ def _resolved_binary_pipeline_config_path(
             key = (coord, module_root)
             dependency_sets.setdefault(key, []).append(normalized_dir)
         for (coord, module_root), mapped_dirs in sorted(dependency_sets.items()):
+            snapshot_revision = "content-addressed-only"
+            for materialization in (
+                (run_context or {}).get("dependency_source_git_materializations")
+                or []
+            ):
+                repo_path = Path(
+                    str((materialization or {}).get("repo_path") or "")
+                ).expanduser().resolve()
+                try:
+                    Path(module_root).expanduser().resolve().relative_to(repo_path)
+                except ValueError:
+                    continue
+                resolved_commit = str(
+                    (materialization or {}).get("resolved_commit") or ""
+                ).strip().lower()
+                if resolved_commit:
+                    snapshot_revision = resolved_commit
+                    break
+            if snapshot_revision == "content-addressed-only":
+                local_head = _dependency_source_git_head(module_root)
+                if local_head:
+                    snapshot_revision = (
+                        f"{local_head}+content-addressed-worktree"
+                    )
             source_sets.append({
                 "source_dirs": _dedupe_strings(mapped_dirs),
                 "source_root": module_root,
                 "owner_type": "dependency",
                 "owner_coord": coord,
                 "module": Path(module_root).name or coord,
+                "snapshot_revision": snapshot_revision,
             })
         if not source_sets:
             raise StepError(

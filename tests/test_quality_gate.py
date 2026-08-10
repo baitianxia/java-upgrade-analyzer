@@ -22,13 +22,31 @@ class QualityGateTest(unittest.TestCase):
     def test_release_discovers_all_current_tests(self):
         command = quality_gate.command_for("release")
         self.assertEqual(command[-3:], ["discover", "-s", "tests"])
+        self.assertTrue(
+            quality_gate.test_health_command()[-1].endswith(
+                "binary_test_health_gate.py"
+            )
+        )
+        real = quality_gate.real_project_command(
+            "/tmp/audit", cache_root="/tmp/cache", jdk_home="/tmp/jdk"
+        )
+        self.assertTrue(real[1].endswith("binary_real_project_guard.py"))
+        self.assertIn("--download", real)
+        performance = quality_gate.performance_command("/tmp/audit")
+        self.assertTrue(performance[1].endswith("binary_performance_gate.py"))
+        self.assertIn("--gate", performance)
+        matrix = quality_gate.real_project_commands(
+            "/tmp/audit", cache_root="/tmp/cache", jdk_home="/tmp/jdk"
+        )
+        self.assertGreaterEqual(len(matrix), 3)
+        self.assertTrue(all("--manifest" in item for item in matrix))
 
-    def test_release_authorization_is_blocked_by_unmigrated_capabilities(self):
+    def test_release_authorization_requires_every_capability_replacement(self):
         migration = quality_gate.capability_migration_status(ROOT)
         self.assertTrue(migration["registry_structurally_valid"], migration["issues"])
-        self.assertEqual(migration["release_status"], "blocked")
-        self.assertIn("reproducible_test_assets", migration["incomplete_families"])
-        self.assertIn("spring_xml_activation", migration["missing_mechanisms"])
+        self.assertEqual(migration["release_status"], "passed")
+        self.assertEqual(migration["incomplete_families"], [])
+        self.assertEqual(migration["incomplete_mechanisms"], [])
 
     def test_dry_run_is_non_mutating_and_exposes_exact_command(self):
         completed = subprocess.run(

@@ -60,6 +60,8 @@ class BinaryPerformanceGateTest(unittest.TestCase):
                 "warm_end_to_end_p95_seconds": result["measurements"]["warm_end_to_end_p95_seconds"] * 2,
                 "peak_rss_bytes": result["measurements"]["peak_rss_bytes"] * 2,
                 "disk_bytes": result["measurements"]["disk_bytes"] * 2,
+                "bytes_per_class": cold["bytes_per_class"] * 2,
+                "bytes_per_edge": cold["bytes_per_edge"] * 2,
                 "cold_relative_legacy_ratio": 10,
                 "warm_relative_legacy_ratio": 10,
                 "stage_p95_seconds": {
@@ -70,10 +72,24 @@ class BinaryPerformanceGateTest(unittest.TestCase):
                     "report_10000": 10,
                 },
             },
+            "accuracy_invariants": {
+                "expected_class_count": cold["counts"]["classes"],
+                "expected_member_count": cold["counts"]["members"],
+                "expected_edge_count": cold["counts"]["edges"],
+                "warm_parser_invocations": 0,
+            },
         }
         # The small unit fixture intentionally skips the legacy comparator;
         # evaluation must fail rather than interpreting missing relative data as pass.
         self.assertEqual(evaluate_gate(result, gate)["status"], "failed")
+        lost_edge = json.loads(json.dumps(result))
+        lost_edge["measurements"]["cold"]["counts"]["edges"] -= 1
+        lost_evaluation = evaluate_gate(lost_edge, gate)
+        self.assertTrue(any(
+            issue["reason_code"] == "BINARY_PERFORMANCE_FACT_CONSERVATION_FAILED"
+            and issue["fact_kind"] == "edges"
+            for issue in lost_evaluation["issues"]
+        ))
 
         with tempfile.TemporaryDirectory() as output_tmp:
             output = Path(output_tmp) / "result.json"

@@ -228,6 +228,97 @@ class Step1PackagedDepsTest(unittest.TestCase):
             items[0]["runtime_classpath_authority"],
         )
 
+    def test_materialization_keeps_complete_base_and_current_runtime_closure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            side_meta = {}
+            side_entries = {}
+            for side, version in (("base", "1"), ("current", "2")):
+                nested = self._nested_jar_bytes([
+                    ("demo/Dependency.class", f"dependency-{version}".encode()),
+                ])
+                artifact = root / f"{side}.jar"
+                lib_entry = f"BOOT-INF/lib/dependency-{version}.jar"
+                with zipfile.ZipFile(artifact, "w") as archive:
+                    archive.writestr(
+                        "BOOT-INF/classes/biz/Application.class",
+                        f"business-{version}".encode(),
+                    )
+                    archive.writestr(lib_entry, nested)
+                side_meta[side] = {
+                    "artifact_path": str(artifact),
+                    "artifact_sha256": hashlib.sha256(
+                        artifact.read_bytes()
+                    ).hexdigest(),
+                }
+                side_entries[side] = [{
+                    "coord": "com.acme:dependency",
+                    "version": version,
+                    "scope": "runtime",
+                    "lib_entry": lib_entry,
+                    "resolution_status": "resolved",
+                }]
+
+            manifest_path, items = s1_dep_diff.materialize_changed_dependency_jars(
+                [],
+                side_meta,
+                root / "dependencies",
+                base_entries=side_entries["base"],
+                current_entries=side_entries["current"],
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        self.assertEqual({item["side"] for item in items}, {"base", "current"})
+        self.assertTrue(all("binary_runtime" in item["purposes"] for item in items))
+        self.assertEqual(
+            {item["side"] for item in manifest["business_artifacts"]},
+            {"base", "current"},
+        )
+        self.assertTrue(all(
+            item["container_and_launcher_kind"] == "spring-boot-executable-jar"
+            for item in manifest["business_artifacts"]
+        ))
+
+    def test_thin_business_jar_retains_runtime_meta_inf_resources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = root / "app.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("biz/Application.class", b"class")
+                archive.writestr("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\n")
+                archive.writestr("META-INF/services/demo.Service", b"biz.Provider\n")
+                archive.writestr(
+                    "META-INF/persistence.xml",
+                    b"<persistence><persistence-unit><class>biz.Entity</class>"
+                    b"</persistence-unit></persistence>",
+                )
+                archive.writestr(
+                    "META-INF/maven/acme/app/pom.properties",
+                    b"groupId=acme\nartifactId=app\nversion=1\n",
+                )
+
+            manifest_path, _items = s1_dep_diff.materialize_changed_dependency_jars(
+                [],
+                {"current": {
+                    "artifact_path": str(artifact),
+                    "artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                }},
+                root / "dependencies",
+                current_entries=[],
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            business = next(
+                item for item in manifest["business_artifacts"]
+                if item["side"] == "current"
+            )
+            with zipfile.ZipFile(business["retained_path"]) as retained:
+                names = set(retained.namelist())
+
+        self.assertIn("META-INF/services/demo.Service", names)
+        self.assertIn("META-INF/persistence.xml", names)
+        self.assertNotIn("META-INF/MANIFEST.MF", names)
+        self.assertNotIn("META-INF/maven/acme/app/pom.properties", names)
+
     def test_parse_gradle_dependency_report_uses_selected_runtime_version(self):
         deps = s1_dep_diff.parse_gradle_dependency_report(
             """runtimeClasspath - Runtime classpath of source set 'main'.

@@ -17,6 +17,7 @@ import threading
 from typing import Any, Callable, Iterable
 
 from binary_first_contract import BinaryFirstContractError, canonical_identity
+from binary_tool_execution import execute_binary_tool
 from path_runtime import make_short_temp_dir, short_temporary_directory
 
 
@@ -25,7 +26,7 @@ ASM_SHA256 = "6f3828a215c920059a5efa2fb55c233d6c54ec5cadca99ce1b1bdd10077c7ddd"
 MAX_SUPPORTED_CLASS_MAJOR = 70  # Java 26, the maximum declared by ASM 9.9.1.
 PROTOCOL_SCHEMA = "binary-fact-frame-v1"
 OUTPUT_SCHEMA = "binary-class-fact-v1"
-VISITOR_POLICY_VERSION = "asm-lossless-facts-v1"
+VISITOR_POLICY_VERSION = "asm-lossless-facts-v2"
 JAVA_HELPER = Path(__file__).resolve().parent / "java" / "BinaryFactExtractor.java"
 SUPPORT_MANIFEST = Path(__file__).resolve().parent / "binary_first_support_manifest.json"
 
@@ -187,7 +188,7 @@ def _compile_helper(asm_jar_text: str, helper_sha: str) -> tuple[Path, str]:
             "ASM_JAVA_TOOLCHAIN_MISSING", "both java and javac are required for the ASM helper"
         )
     output = make_short_temp_dir(prefix="binary-asm-helper")
-    completed = subprocess.run(
+    completed = execute_binary_tool(
         [
             javac,
             "-encoding", "UTF-8",
@@ -195,17 +196,14 @@ def _compile_helper(asm_jar_text: str, helper_sha: str) -> tuple[Path, str]:
             "-d", str(output),
             str(JAVA_HELPER),
         ],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=60,
-        check=False,
+        stage="binary_asm.compile_helper",
+        reason_prefix="ASM_HELPER_COMPILE",
+        timeout_seconds=60,
     )
-    if completed.returncode != 0:
+    if not completed.succeeded:
         raise BinaryAsmError(
             "ASM_HELPER_COMPILE_FAILED",
-            (completed.stderr or completed.stdout or "javac failed").strip(),
+            json.dumps(completed.failure.to_mapping(), ensure_ascii=False),
         )
     class_file = output / "BinaryFactExtractor.class"
     if not class_file.is_file():

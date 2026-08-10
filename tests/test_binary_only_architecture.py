@@ -34,6 +34,23 @@ class BinaryOnlyArchitectureTest(unittest.TestCase):
         )
         self.assertEqual([item for item in forbidden if item in source], [])
 
+    def test_step1_gate_uses_only_binary_runtime_closure_purpose(self):
+        gate = (SCRIPTS / "gate.py").read_text(encoding="utf-8")
+        materializer = (SCRIPTS / "s1_dep_diff.py").read_text(encoding="utf-8")
+        self.assertIn('"binary_runtime"', gate)
+        self.assertIn("'binary_runtime'", materializer)
+        self.assertNotIn("step5_runtime", gate)
+        self.assertNotIn("step5_runtime", materializer)
+
+    def test_design_does_not_require_normal_users_to_handwrite_binary_config(self):
+        design = (
+            ROOT / "docs/developer/binary-first-source-overlay-design.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("正常用户流程不要求用户手写", design)
+        self.assertIn("Step1", design)
+        self.assertIn("仅用于高级集成", design)
+        self.assertNotIn("Step4 必须接收显式 `binary_pipeline_config`", design)
+
     def test_step_manifest_routes_one_binary_generation_and_report_path(self):
         manifest = json.loads((SCRIPTS / "step_manifest.json").read_text())
         steps = {item["id"]: item for item in manifest["steps"]}

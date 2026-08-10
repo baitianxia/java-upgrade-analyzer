@@ -16,6 +16,75 @@ REGISTRY_PATH = (
     Path(__file__).resolve().parents[1]
     / "tests" / "fixtures" / "binary_first" / "capability_migration.json"
 )
+REQUIRED_FAMILY_IDS = frozenset({
+    "artifact_identity_ownership",
+    "canonical_evidence_identity",
+    "evidence_completeness_visibility",
+    "framework_activation_semantics",
+    "closed_world_pipeline",
+    "reproducible_test_assets",
+    "performance_without_scope_loss",
+    "test_gate_integrity",
+    "module_and_tool_failure_boundaries",
+})
+REQUIRED_MECHANISM_IDS = frozenset({
+    "automatic_runtime_profile_materialization",
+    "binary_framework_entrypoints",
+    "branch_mutation_flaky_health_gates",
+    "declarative_http_client_dispatch",
+    "dependency_boot_registration",
+    "dependency_source_snapshot_alignment",
+    "dubbo_spi_dispatch",
+    "dynamic_proxy_dispatch",
+    "generated_topology_and_metamorphic_regression",
+    "human_report_navigation_and_bounded_detail",
+    "human_entrypoint_evidence",
+    "implicit_data_contract_dispatch",
+    "java_serviceloader_activation",
+    "jvm_array_type_resolution",
+    "javac_constant_inline_binding",
+    "jpa_entity_activation_proof",
+    "mybatis_proxy_dispatch",
+    "mybatis_runtime_extension_registration",
+    "nested_executable_materialization",
+    "long_phase_progress_and_recovery",
+    "real_project_rotation",
+    "whole_dependency_api_enumeration",
+    "reflection_and_method_handle_dispatch",
+    "source_overlay_language_coverage_visibility",
+    "source_overlay_user_choice",
+    "dependency_identity_confirmation_workflow",
+    "deterministic_immutable_generation",
+    "spring_aop_dispatch",
+    "spring_bean_wiring_dispatch",
+    "spring_component_condition_activation",
+    "spring_data_repository_dispatch",
+    "spring_message_listener_adapter_registration",
+    "spring_security_filter_dispatch",
+    "spring_transaction_proxy_dispatch",
+    "spring_xml_activation",
+    "typed_tool_failure_matrix",
+})
+REQUIRED_TOPOLOGY_IDS = frozenset({
+    "business_direct",
+    "same_jar_bridge",
+    "cross_jar_bridge",
+    "business_to_same_jar_bridge",
+    "business_to_cross_jar_bridge",
+    "same_coord_multimodule",
+    "overloaded_method",
+    "constructor",
+    "interface_dispatch",
+    "virtual_dispatch",
+    "static_dispatch",
+    "field_access",
+    "invokedynamic",
+    "reflection",
+    "spi",
+    "framework_proxy",
+    "source_bytecode_agree",
+    "source_bytecode_true_conflict",
+})
 
 
 def _baseline_deleted_paths(
@@ -77,10 +146,17 @@ def audit_capability_migration(
         sys.path.insert(0, str(root))
     issues = []
     allowed_statuses = set(registry.get("status_vocabulary") or ())
-    baseline = set(
+    declared_baseline = set(
         (registry.get("baseline") or {}).get("legacy_capability_family_ids") or ()
     )
+    baseline = set(REQUIRED_FAMILY_IDS)
     baseline_config = registry.get("baseline") or {}
+    if declared_baseline != baseline:
+        issues.append({
+            "reason_code": "CAPABILITY_BASELINE_DECLARATION_MISMATCH",
+            "missing": sorted(baseline - declared_baseline),
+            "extra": sorted(declared_baseline - baseline),
+        })
     baseline_commit = str(baseline_config.get("merge_base") or "")
     monitored_deleted_production = set(
         baseline_config.get("monitored_deleted_production_paths") or ()
@@ -102,6 +178,29 @@ def audit_capability_migration(
             ),
             "not_deleted_from_baseline": sorted(
                 monitored_deleted_production - actual_deleted_production
+            ),
+        })
+
+    monitored_deleted_tests = set(
+        baseline_config.get("monitored_deleted_test_paths") or ()
+    )
+    actual_deleted_tests, test_diff_error = _baseline_deleted_paths(
+        root, baseline_commit, ("tests/*.py",)
+    )
+    if test_diff_error:
+        issues.append({
+            "reason_code": "CAPABILITY_BASELINE_DIFF_UNAVAILABLE",
+            "scope": "tests",
+            "detail": test_diff_error,
+        })
+    elif monitored_deleted_tests != actual_deleted_tests:
+        issues.append({
+            "reason_code": "CAPABILITY_DELETED_TEST_PATH_SET_MISMATCH",
+            "missing_from_registry": sorted(
+                actual_deleted_tests - monitored_deleted_tests
+            ),
+            "not_deleted_from_baseline": sorted(
+                monitored_deleted_tests - actual_deleted_tests
             ),
         })
 
@@ -133,6 +232,48 @@ def audit_capability_migration(
                 monitored_deleted_assets - actual_deleted_assets
             ),
         })
+    asset_replacements = list(registry.get("legacy_asset_replacements") or ())
+    replacement_asset_paths = [
+        str(item.get("legacy_asset_path") or "")
+        for item in asset_replacements
+    ]
+    if len(replacement_asset_paths) != len(set(replacement_asset_paths)):
+        issues.append({"reason_code": "CAPABILITY_ASSET_REPLACEMENT_DUPLICATE"})
+    if set(replacement_asset_paths) != monitored_deleted_assets:
+        issues.append({
+            "reason_code": "CAPABILITY_ASSET_REPLACEMENT_SET_MISMATCH",
+            "missing": sorted(
+                monitored_deleted_assets - set(replacement_asset_paths)
+            ),
+            "extra": sorted(
+                set(replacement_asset_paths) - monitored_deleted_assets
+            ),
+        })
+    for replacement in asset_replacements:
+        legacy_path = str(replacement.get("legacy_asset_path") or "")
+        tests = list(replacement.get("replacement_tests") or ())
+        artifacts = list(replacement.get("replacement_artifacts") or ())
+        if not tests or not artifacts:
+            issues.append({
+                "reason_code": "CAPABILITY_ASSET_REPLACEMENT_EVIDENCE_MISSING",
+                "legacy_asset_path": legacy_path,
+            })
+        for reference in tests:
+            failure = _load_test(str(reference))
+            if failure:
+                issues.append({
+                    "reason_code": "CAPABILITY_ASSET_REPLACEMENT_TEST_INVALID",
+                    "legacy_asset_path": legacy_path,
+                    "reference": reference,
+                    "detail": failure,
+                })
+        for relative in artifacts:
+            if not (root / str(relative)).is_file():
+                issues.append({
+                    "reason_code": "CAPABILITY_ASSET_REPLACEMENT_ARTIFACT_MISSING",
+                    "legacy_asset_path": legacy_path,
+                    "path": relative,
+                })
     families = list(registry.get("families") or ())
     family_ids = [str(item.get("family_id") or "") for item in families]
     if len(family_ids) != len(set(family_ids)):
@@ -145,14 +286,18 @@ def audit_capability_migration(
         })
 
     mechanism_ids = []
+    topology_ids = []
     for record_kind, records, identity_key in (
         ("family", families, "family_id"),
         ("mechanism", registry.get("mechanism_inventory") or (), "mechanism_id"),
+        ("topology", registry.get("topology_inventory") or (), "topology_id"),
     ):
         for item in records:
             identity = str(item.get(identity_key) or "")
             if record_kind == "mechanism":
                 mechanism_ids.append(identity)
+            elif record_kind == "topology":
+                topology_ids.append(identity)
             status = str(item.get("migration_status") or "")
             if not identity:
                 issues.append({
@@ -185,8 +330,8 @@ def audit_capability_migration(
                         "path": relative,
                     })
             test_fields = (
-                ("evidence_tests",) if record_kind == "mechanism"
-                else ("positive_tests", "negative_tests", "independent_tests")
+                ("positive_tests", "negative_tests", "independent_tests")
+                if record_kind == "family" else ("evidence_tests",)
             )
             test_count = 0
             for field in test_fields:
@@ -208,14 +353,39 @@ def audit_capability_migration(
                 })
     if len(mechanism_ids) != len(set(mechanism_ids)):
         issues.append({"reason_code": "CAPABILITY_MECHANISM_DUPLICATE"})
-    expected_mechanisms = set(
+    declared_mechanisms = set(
         baseline_config.get("monitored_mechanism_ids") or ()
     )
+    expected_mechanisms = set(REQUIRED_MECHANISM_IDS)
+    if declared_mechanisms != expected_mechanisms:
+        issues.append({
+            "reason_code": "CAPABILITY_MECHANISM_BASELINE_DECLARATION_MISMATCH",
+            "missing": sorted(expected_mechanisms - declared_mechanisms),
+            "extra": sorted(declared_mechanisms - expected_mechanisms),
+        })
     if set(mechanism_ids) != expected_mechanisms:
         issues.append({
             "reason_code": "CAPABILITY_MECHANISM_SET_MISMATCH",
             "missing": sorted(expected_mechanisms - set(mechanism_ids)),
             "extra": sorted(set(mechanism_ids) - expected_mechanisms),
+        })
+    if len(topology_ids) != len(set(topology_ids)):
+        issues.append({"reason_code": "CAPABILITY_TOPOLOGY_DUPLICATE"})
+    declared_topologies = set(
+        baseline_config.get("legacy_topology_ids") or ()
+    )
+    expected_topologies = set(REQUIRED_TOPOLOGY_IDS)
+    if declared_topologies != expected_topologies:
+        issues.append({
+            "reason_code": "CAPABILITY_TOPOLOGY_BASELINE_DECLARATION_MISMATCH",
+            "missing": sorted(expected_topologies - declared_topologies),
+            "extra": sorted(declared_topologies - expected_topologies),
+        })
+    if set(topology_ids) != expected_topologies:
+        issues.append({
+            "reason_code": "CAPABILITY_TOPOLOGY_SET_MISMATCH",
+            "missing": sorted(expected_topologies - set(topology_ids)),
+            "extra": sorted(set(topology_ids) - expected_topologies),
         })
 
     incomplete_families = sorted(
@@ -230,22 +400,35 @@ def audit_capability_migration(
         item["mechanism_id"] for item in registry.get("mechanism_inventory") or ()
         if item.get("migration_status") != "enforced"
     )
+    incomplete_topologies = sorted(
+        item["topology_id"] for item in registry.get("topology_inventory") or ()
+        if item.get("migration_status") != "enforced"
+    )
     structurally_valid = not issues
     return {
         "schema": "java-upgrade-analyzer.binary-capability-migration-audit.v1",
         "registry_structurally_valid": structurally_valid,
         "release_status": (
             "passed" if structurally_valid and not incomplete_families
-            and not missing_mechanisms else "blocked"
+            and not missing_mechanisms and not incomplete_topologies else "blocked"
         ),
         "baseline_family_count": len(baseline),
         "accounted_family_count": len(set(family_ids)),
+        "baseline_topology_count": len(expected_topologies),
+        "accounted_topology_count": len(set(topology_ids)),
+        "baseline_mechanism_count": len(expected_mechanisms),
+        "accounted_mechanism_count": len(set(mechanism_ids)),
         "monitored_deleted_production_path_count": len(
             actual_deleted_production
         ),
+        "monitored_deleted_test_path_count": len(actual_deleted_tests),
         "monitored_deleted_test_asset_count": len(actual_deleted_assets),
+        "accounted_deleted_test_asset_replacement_count": len(
+            set(replacement_asset_paths)
+        ),
         "incomplete_families": incomplete_families,
         "incomplete_mechanisms": incomplete_mechanisms,
+        "incomplete_topologies": incomplete_topologies,
         "missing_mechanisms": missing_mechanisms,
         "issue_count": len(issues),
         "issues": issues,

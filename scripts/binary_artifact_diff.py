@@ -14,7 +14,9 @@ import fnmatch
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
+import re
 from typing import Any, Iterable, Mapping
+import xml.etree.ElementTree as ET
 import zipfile
 
 from artifact_safety import inspect_archive
@@ -32,6 +34,11 @@ _ARTIFACT_SUPPORT = _SUPPORT["artifact_diff_support_manifest"]
 _SAFETY = _ARTIFACT_SUPPORT["artifact_safety_policy"]
 _ATTRIBUTE_POLICY = _ARTIFACT_SUPPORT["classfile_attribute_policy"]
 _RESOURCE_POLICY = _ARTIFACT_SUPPORT["resource_policy"]
+_XML_DOCTYPE = re.compile(br"<!DOCTYPE\s+[^>]+>", re.IGNORECASE | re.DOTALL)
+_ALLOWED_MYBATIS_DTDS = (
+    b"mybatis.org/dtd/mybatis-3-mapper.dtd",
+    b"mybatis.org/dtd/mybatis-3-config.dtd",
+)
 
 
 class BinaryArtifactDiffError(BinaryFirstContractError):
@@ -66,6 +73,29 @@ def _mr_class_scope(name: str) -> tuple[str, int]:
     return name, 0
 
 
+def _manifest_is_multi_release(archive: zipfile.ZipFile) -> bool:
+    candidates = [
+        info for info in archive.infolist()
+        if not info.is_dir() and info.filename.lower() == "meta-inf/manifest.mf"
+    ]
+    if len(candidates) != 1:
+        return False
+    text = archive.read(candidates[0]).decode("utf-8", errors="replace")
+    attributes: dict[str, str] = {}
+    current = ""
+    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if not line:
+            break
+        if line.startswith(" ") and current:
+            attributes[current] += line[1:]
+            continue
+        key, separator, value = line.partition(":")
+        current = key.strip().lower() if separator else ""
+        if current:
+            attributes[current] = value.strip()
+    return attributes.get("multi-release", "").strip().lower() == "true"
+
+
 def _classify_resource(name: str) -> str:
     if name.endswith("/"):
         return "directory"
@@ -77,6 +107,8 @@ def _classify_resource(name: str) -> str:
         ("runtime_native", _RESOURCE_POLICY["native_extensions"]),
     )
     upper_name = name.upper()
+    if name.lower().endswith(".xml"):
+        return "runtime_topology"
     for category, patterns in categories:
         for pattern in patterns:
             candidate = upper_name if pattern.upper().startswith("META-INF/") else name.lower()
@@ -90,7 +122,11 @@ def _normalized_resource_digest(name: str, category: str, content: bytes) -> str
     if category != "runtime_topology":
         return _sha256_bytes(content)
     text = content.decode("utf-8", errors="surrogateescape").replace("\r\n", "\n").replace("\r", "\n")
-    if name.startswith("META-INF/services/") or name.startswith("META-INF/spring/"):
+    if (
+        name.startswith("META-INF/services/")
+        or name.startswith("META-INF/spring/")
+        or name.startswith("META-INF/dubbo/")
+    ):
         lines = []
         for line in text.splitlines():
             value = line.split("#", 1)[0].strip()
@@ -197,14 +233,186 @@ def _resource_semantic_facts(name: str, category: str, content: bytes) -> tuple[
             for entry in (item.strip() for item in value.split(","))
             if entry
         )
-    if name.startswith("META-INF/services/") or name.startswith("META-INF/spring/"):
+    if (
+        name.startswith("META-INF/services/")
+        or name.startswith("META-INF/spring/")
+        or name.startswith("META-INF/dubbo/")
+    ):
         facts = []
         for line in text.splitlines():
             value = line.split("#", 1)[0].strip()
             if value:
                 facts.append(("ordered_entry", value))
         return tuple(facts)
+    if name.lower().endswith(".xml"):
+        return _xml_runtime_semantic_facts(content)
     return ()
+
+
+def _xml_runtime_semantic_facts(content: bytes) -> tuple[tuple[str, str], ...]:
+    """Extract bounded Spring/MyBatis registration facts without executing XML."""
+    if len(content) > 4 * 1024 * 1024:
+        return (("xml_parse_gap", "resource_too_large"),)
+    upper = content.upper()
+    doctype = _XML_DOCTYPE.search(content)
+    if b"<!ENTITY" in upper or (doctype and b"[" in doctype.group(0)):
+        return (("xml_parse_gap", "doctype_or_entity_rejected"),)
+    if doctype:
+        declaration = doctype.group(0).lower()
+        if not any(marker in declaration for marker in _ALLOWED_MYBATIS_DTDS):
+            return (("xml_parse_gap", "doctype_or_entity_rejected"),)
+        content = content[:doctype.start()] + content[doctype.end():]
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError:
+        return (("xml_parse_gap", "malformed_xml"),)
+
+    def local(value: str) -> str:
+        return str(value or "").rsplit("}", 1)[-1].rsplit(":", 1)[-1]
+
+    def nested_attribute(element: Any, child_tag: str, *names: str) -> str:
+        for name in names:
+            value = str(element.attrib.get(name) or "").strip()
+            if value:
+                return value
+        for child in element:
+            if local(child.tag) != child_tag:
+                continue
+            for name in names:
+                value = str(child.attrib.get(name) or "").strip()
+                if value:
+                    return value
+            text = str(child.text or "").strip()
+            if text:
+                return text
+        return ""
+
+    facts: list[tuple[str, str]] = [("xml_root", local(root.tag))]
+    bean_classes = {}
+    bean_elements = {}
+    for element in root.iter():
+        if local(element.tag) != "bean":
+            continue
+        bean_id = str(
+            element.attrib.get("id")
+            or element.attrib.get("name")
+            or ""
+        ).strip()
+        class_name = str(element.attrib.get("class") or "").strip()
+        if bean_id and class_name:
+            bean_classes[bean_id] = class_name
+            bean_elements[bean_id] = element
+            facts.append(("spring_bean_class", f"{bean_id}|{class_name}"))
+            if str(element.attrib.get("primary") or "").strip().lower() == "true":
+                facts.append(("spring_bean_primary", f"{bean_id}|{class_name}"))
+            init_method = str(element.attrib.get("init-method") or "").strip()
+            if init_method:
+                facts.append((
+                    "spring_init_method",
+                    f"{bean_id}|{class_name}|{init_method}",
+                ))
+
+    for element in root.iter():
+        tag = local(element.tag)
+        if tag == "class" and local(root.tag) == "persistence":
+            managed_class = str(element.text or "").strip()
+            if managed_class:
+                facts.append(("jpa_managed_class", managed_class))
+        if tag == "component-scan":
+            base_package = str(element.attrib.get("base-package") or "").strip()
+            if base_package:
+                facts.append(("spring_component_scan", base_package))
+        if tag == "scan":
+            base_package = str(element.attrib.get("base-package") or "").strip()
+            if base_package:
+                facts.append(("mybatis_mapper_scan", base_package))
+        if tag == "plugin":
+            interceptor = str(element.attrib.get("interceptor") or "").strip()
+            if interceptor:
+                facts.append(("mybatis_plugin_registration", interceptor))
+        if tag == "typeHandler":
+            handler = str(element.attrib.get("handler") or "").strip()
+            java_type = str(element.attrib.get("javaType") or "").strip()
+            if handler:
+                facts.append((
+                    "mybatis_type_handler_registration",
+                    f"{java_type}|{handler}",
+                ))
+        if tag == "scheduled":
+            bean_ref = str(element.attrib.get("ref") or "").strip()
+            method = str(element.attrib.get("method") or "").strip()
+            target = str(element.attrib.get("target") or "").strip()
+            if not bean_ref and target:
+                if "." in target and not target.startswith("&"):
+                    bean_ref, target_method = target.rsplit(".", 1)
+                    method = method or target_method
+                else:
+                    bean_ref = target
+            class_name = bean_classes.get(bean_ref, "")
+            if bean_ref and method:
+                facts.append((
+                    "spring_scheduled_method",
+                    f"{bean_ref}|{class_name}|{method}",
+                ))
+        if tag in {"mapper", "select", "insert", "update", "delete"}:
+            statement_id = str(element.attrib.get("id") or "").strip()
+            if statement_id:
+                facts.append(("mybatis_statement", statement_id))
+                statement_handler = str(
+                    element.attrib.get("typeHandler") or ""
+                ).strip()
+                if statement_handler:
+                    facts.append((
+                        "mybatis_statement_type_handler",
+                        f"{statement_id}|{statement_handler}",
+                    ))
+        if tag == "mapper":
+            namespace = str(element.attrib.get("namespace") or "").strip()
+            if namespace:
+                facts.append(("mybatis_mapper_namespace", namespace))
+    for bean_id, element in bean_elements.items():
+        for child in element:
+            if local(child.tag) != "property":
+                continue
+            property_name = str(child.attrib.get("name") or "").strip()
+            property_ref = nested_attribute(child, "ref", "ref", "bean", "local")
+            if property_name and property_ref:
+                facts.append((
+                    "spring_bean_property_ref",
+                    "|".join((
+                        bean_id,
+                        bean_classes.get(bean_id, ""),
+                        property_name,
+                        property_ref,
+                        bean_classes.get(property_ref, ""),
+                    )),
+                ))
+
+    quartz_classes = {
+        "org.springframework.scheduling.quartz.MethodInvokingJobDetailFactoryBean",
+        "org.springframework.scheduling.quartz.JobDetailFactoryBean",
+    }
+    for bean_id, element in bean_elements.items():
+        if bean_classes.get(bean_id) not in quartz_classes:
+            continue
+        target_ref = ""
+        target_method = ""
+        for child in element:
+            if local(child.tag) != "property":
+                continue
+            name = str(child.attrib.get("name") or "")
+            if name == "targetObject":
+                target_ref = nested_attribute(
+                    child, "ref", "ref", "bean", "local"
+                )
+            elif name == "targetMethod":
+                target_method = nested_attribute(child, "value", "value")
+        if target_ref and target_method:
+            facts.append((
+                "spring_quartz_method",
+                f"{target_ref}|{bean_classes.get(target_ref, '')}|{target_method}",
+            ))
+    return tuple(facts)
 
 
 @dataclass(frozen=True)
@@ -225,6 +433,7 @@ class ArchiveEntryFact:
     comment_sha256: str
     logical_class_entry: str = ""
     multi_release_version: int = 0
+    runtime_effective: bool = False
     resource_category: str = ""
     normalized_resource_digest: str = ""
     resource_semantic_facts: tuple[tuple[str, str], ...] = ()
@@ -255,15 +464,15 @@ class ArtifactSnapshot:
     def class_fact_coverage_status(self) -> str:
         """Coverage of class facts, independent of resource semantics.
 
-        An unregistered resource type makes that resource's semantic comparison
-        incomplete, but it does not make successfully parsed classfiles
-        incomplete.  Keeping those scopes separate prevents one ordinary
-        resource from suppressing every method and field change in the JAR.
+        Unregistered resources and custom attributes make their own changed
+        comparison scopes incomplete, but do not erase successfully parsed
+        class/member facts elsewhere in the artifact. Unknown attributes are
+        ignored by the JVM in the declared no-transformer profile; a changed
+        class carrying one is still kept diagnostic by the local diff.
         """
         incomplete = bool(
             self.safety_reason_codes
             or self.parse_failure_count
-            or self.unknown_attribute_scopes
         )
         return "partial" if incomplete else "complete"
 
@@ -289,6 +498,7 @@ def snapshot_archive(
     artifact_instance_identity: str,
     expected_sha256: str,
     asm_jar: str | Path | None = None,
+    target_jvm_major: int | None = None,
 ) -> ArtifactSnapshot:
     archive_path = Path(path)
     expected_sha256 = _validate_expected_sha(expected_sha256)
@@ -325,8 +535,35 @@ def snapshot_archive(
     archive_comment_sha = _sha256_bytes(b"")
     try:
         with zipfile.ZipFile(archive_path) as archive:
+            archive_infos = archive.infolist()
+            multi_release = _manifest_is_multi_release(archive)
+            versioned_classes: dict[str, list[tuple[int, str]]] = defaultdict(list)
+            for info in archive_infos:
+                if info.is_dir() or not info.filename.endswith(".class"):
+                    continue
+                logical, version = _mr_class_scope(info.filename)
+                versioned_classes[logical].append((version, info.filename))
+            if (
+                multi_release
+                and target_jvm_major is None
+                and any(version > 0 for rows in versioned_classes.values() for version, _ in rows)
+            ):
+                raise BinaryArtifactDiffError(
+                    "ARTIFACT_TARGET_JVM_MAJOR_REQUIRED", str(archive_path)
+                )
+            effective_class_entries = set()
+            for logical, candidates in versioned_classes.items():
+                eligible = [
+                    (version, name) for version, name in candidates
+                    if version == 0 or (
+                        multi_release and target_jvm_major is not None
+                        and version <= int(target_jvm_major)
+                    )
+                ]
+                if eligible:
+                    effective_class_entries.add(max(eligible)[1])
             archive_comment_sha = _sha256_bytes(archive.comment or b"")
-            for archive_ordinal, info in enumerate(archive.infolist()):
+            for archive_ordinal, info in enumerate(archive_infos):
                 name_ordinal = name_counts[info.filename]
                 name_counts[info.filename] += 1
                 try:
@@ -367,6 +604,9 @@ def snapshot_archive(
                     comment_sha256=_sha256_bytes(info.comment or b""),
                     logical_class_entry=logical_class if is_class else "",
                     multi_release_version=mr_version if is_class else 0,
+                    runtime_effective=(
+                        is_class and info.filename in effective_class_entries
+                    ),
                     resource_category=category,
                     normalized_resource_digest=(
                         _normalized_resource_digest(info.filename, category, content)
@@ -378,7 +618,7 @@ def snapshot_archive(
                     ),
                 )
                 entries.append(entry)
-                if is_class:
+                if is_class and info.filename in effective_class_entries:
                     class_inputs.append(BinaryClassInput(
                         artifact_instance_identity,
                         physical_label,
@@ -548,6 +788,108 @@ def _member_deltas(
     return deltas
 
 
+def _runtime_effective_class_delta(
+    old: ArchiveEntryFact | None,
+    new: ArchiveEntryFact | None,
+    *,
+    base_records: Mapping[str, dict[str, Any]],
+    current_records: Mapping[str, dict[str, Any]],
+    comparison_or_runtime_scope: Any,
+) -> tuple[dict[str, Any], str, set[str]]:
+    selected = new or old
+    logical = selected.logical_class_entry
+    scope = {
+        "entry_name": logical,
+        "entry_kind": "class",
+        "logical_class_entry": logical,
+        "runtime_effective": True,
+        "base_physical_entry": old.name if old else "ABSENT",
+        "current_physical_entry": new.name if new else "ABSENT",
+    }
+    old_sha = old.content_sha256 if old else "ABSENT"
+    new_sha = new.content_sha256 if new else "ABSENT"
+    delta = {
+        "entry_scope": scope,
+        "base_content_sha256": old_sha,
+        "current_content_sha256": new_sha,
+        "runtime_effective_analysis": True,
+        "observed_delta_identity": observed_delta_identity(
+            delta_source_kind="artifact_local",
+            comparison_or_runtime_scope=comparison_or_runtime_scope,
+            fact_or_mechanism_scope=scope,
+            base_fingerprint=old_sha,
+            current_fingerprint=new_sha,
+        ),
+    }
+    gaps = set()
+    old_record = (
+        base_records.get(f"{old.name}#occurrence={old.name_ordinal}")
+        if old else None
+    )
+    new_record = (
+        current_records.get(f"{new.name}#occurrence={new.name_ordinal}")
+        if new else None
+    )
+    recognized = set(_ATTRIBUTE_POLICY["recognized_by_typed_facts"])
+    definition_sensitive = set(_ATTRIBUTE_POLICY["definition_sensitive_raw"])
+    diagnostic = set(_ATTRIBUTE_POLICY["diagnostic_only_raw"])
+    known_attributes = recognized | definition_sensitive | diagnostic
+    if old is None or new is None:
+        present_record = new_record or old_record
+        if present_record and present_record.get("frame_type") == "class_fact":
+            category = "contract_changed"
+            # An absent artifact side is still a complete binary observation:
+            # enumerate every member from the present class as added/removed so
+            # a whole-JAR change remains reviewable at API granularity.
+            delta["member_deltas"] = _member_deltas(
+                old_record or {},
+                new_record or {},
+                entry_scope=scope,
+                comparison_or_runtime_scope=comparison_or_runtime_scope,
+            )
+        else:
+            category = "incomplete"
+            gaps.add(f"class_parse:{logical}")
+    elif not old_record or not new_record or {
+        old_record.get("frame_type"), new_record.get("frame_type")
+    } != {"class_fact"}:
+        category = "incomplete"
+        gaps.add(f"class_parse:{logical}")
+    else:
+        old_unknown = {
+            item.get("name") for item in old_record.get("attribute_inventory") or ()
+            if item.get("name") not in known_attributes
+        }
+        new_unknown = {
+            item.get("name") for item in new_record.get("attribute_inventory") or ()
+            if item.get("name") not in known_attributes
+        }
+        if old_unknown or new_unknown:
+            category = "incomplete"
+            gaps.add(
+                f"unknown_attributes:{logical}:"
+                f"{','.join(sorted(old_unknown | new_unknown))}"
+            )
+        elif old_record.get("class_contract_digest") != new_record.get("class_contract_digest"):
+            category = "contract_changed"
+        elif _method_digest_map(old_record) != _method_digest_map(new_record):
+            category = "implementation_changed"
+        elif _attribute_digest_map(old_record, definition_sensitive) != _attribute_digest_map(new_record, definition_sensitive):
+            category = "runtime_metadata_changed"
+        elif _attribute_digest_map(old_record, diagnostic) != _attribute_digest_map(new_record, diagnostic):
+            category = "runtime_diagnostic_metadata_changed"
+        else:
+            category = "classfile_noise_only"
+        delta["member_deltas"] = _member_deltas(
+            old_record,
+            new_record,
+            entry_scope=scope,
+            comparison_or_runtime_scope=comparison_or_runtime_scope,
+        )
+    delta["class_change_category"] = category
+    return delta, category, gaps
+
+
 def compare_artifact_snapshots(
     base: ArtifactSnapshot,
     current: ArtifactSnapshot,
@@ -594,6 +936,17 @@ def compare_artifact_snapshots(
             ),
         }
         if (old or new).kind == "class":
+            old_effective = bool(old and old.runtime_effective)
+            new_effective = bool(new and new.runtime_effective)
+            if not (old_effective and new_effective):
+                delta["runtime_effective_analysis"] = False
+                delta["class_change_category"] = (
+                    "runtime_effective_variant_deferred"
+                    if old_effective or new_effective
+                    else "inactive_multi_release_variant"
+                )
+                entry_deltas.append(delta)
+                continue
             if old is None or new is None:
                 category = "contract_changed"
             else:
@@ -652,6 +1005,34 @@ def compare_artifact_snapshots(
         else:
             delta["container_change_category"] = "directory_metadata"
         entry_deltas.append(delta)
+
+    base_effective = {
+        item.logical_class_entry: item for item in base.entries
+        if item.kind == "class" and item.runtime_effective
+    }
+    current_effective = {
+        item.logical_class_entry: item for item in current.entries
+        if item.kind == "class" and item.runtime_effective
+    }
+    for logical in sorted(set(base_effective) | set(current_effective)):
+        old = base_effective.get(logical)
+        new = current_effective.get(logical)
+        if (
+            old and new and old.alignment_key == new.alignment_key
+        ):
+            continue
+        if old and new and old.content_sha256 == new.content_sha256:
+            continue
+        effective_delta, category, effective_gaps = _runtime_effective_class_delta(
+            old,
+            new,
+            base_records=base_records,
+            current_records=current_records,
+            comparison_or_runtime_scope=comparison_or_runtime_scope,
+        )
+        entry_deltas.append(effective_delta)
+        class_categories.add(category)
+        coverage_gaps.update(effective_gaps)
 
     if not class_categories:
         class_status = "none"
@@ -734,18 +1115,22 @@ def compare_archives(
     current_expected_sha256: str,
     comparison_or_runtime_scope: Any,
     asm_jar: str | Path | None = None,
+    base_target_jvm_major: int | None = None,
+    current_target_jvm_major: int | None = None,
 ) -> tuple[ArtifactSnapshot, ArtifactSnapshot, dict[str, Any]]:
     base = snapshot_archive(
         base_path,
         artifact_instance_identity=base_artifact_instance_identity,
         expected_sha256=base_expected_sha256,
         asm_jar=asm_jar,
+        target_jvm_major=base_target_jvm_major,
     )
     current = snapshot_archive(
         current_path,
         artifact_instance_identity=current_artifact_instance_identity,
         expected_sha256=current_expected_sha256,
         asm_jar=asm_jar,
+        target_jvm_major=current_target_jvm_major,
     )
     return base, current, compare_artifact_snapshots(
         base,

@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import tempfile
 from typing import Any, Mapping
 
@@ -22,10 +23,35 @@ from path_runtime import make_short_temp_dir, short_temporary_directory
 from signature_utils import jvm_method_parameter_signature
 
 
+EDGE_KIND_LABELS = {
+    "method": "字节码方法调用",
+    "field": "字节码字段访问",
+    "type": "字节码类型引用",
+    "class_initialization": "类初始化",
+    "reflection_method_invocation": "反射方法调用",
+    "reflection_constructor_invocation": "反射构造调用",
+    "reflection_field_access": "反射字段访问",
+    "method_handle_invocation": "MethodHandle 调用",
+    "method_handle_field_access": "MethodHandle 字段访问",
+    "dynamic_proxy_callback": "JDK 动态代理回调",
+    "mybatis_mapper_proxy_dispatch": "MyBatis Mapper 代理分派",
+    "spring_transaction_proxy_dispatch": "Spring 事务代理分派",
+    "spring_bean_wiring_dispatch": "Spring Bean 注入分派",
+    "spring_data_repository_proxy_dispatch": "Spring Data 仓库代理分派",
+    "spring_aop_dispatch": "Spring AOP 切面分派",
+    "spring_security_filter_dispatch": "Spring Security 过滤器链",
+    "declarative_http_client_dispatch": "声明式 HTTP 客户端分派",
+    "dubbo_spi_dispatch": "Dubbo SPI 扩展分派",
+    "implicit_data_contract_dispatch": "序列化/绑定数据契约",
+}
+
+
 ENTRY_KIND_LABELS = {
     "declared_runtime_entry": "用户声明的运行入口",
     "java_main": "Java 主程序入口",
     "spring_scheduled": "Spring 定时任务",
+    "spring_xml_scheduled": "Spring XML 定时任务",
+    "spring_xml_quartz": "Spring XML Quartz 定时任务",
     "spring_event_listener": "Spring 事件监听",
     "spring_message_listener": "消息监听",
     "lifecycle_callback": "组件初始化回调",
@@ -70,6 +96,14 @@ def _json_bytes(value: Any) -> bytes:
 
 def _sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _reported_api_identity(
@@ -169,6 +203,11 @@ def _aggregate_by_api(
                     for item in entrypoint_records
                     if item.get("entry_kind")
                 })
+                mechanism_kinds = []
+                for edge in path.get("edges") or ():
+                    kind = str(edge.get("edge_kind") or "")
+                    if kind and kind not in mechanism_kinds:
+                        mechanism_kinds.append(kind)
                 path_records.append({
                     "path_identity": path.get("path_identity"),
                     "path_certainty": path.get("path_certainty"),
@@ -188,6 +227,11 @@ def _aggregate_by_api(
                         for item in entrypoint_records
                         if item.get("activation_reason")
                     }),
+                    "mechanism_kinds": mechanism_kinds,
+                    "mechanism_labels": [
+                        EDGE_KIND_LABELS.get(item, item)
+                        for item in mechanism_kinds
+                    ],
                 })
         dependency_artifacts = []
         dependency_keys = set()
@@ -411,7 +455,7 @@ def write_binary_generation(
     policy_identities: Mapping[str, str],
     source_overlay: SourceOverlayResult | None = None,
     source_usage: Mapping[str, str] | None = None,
-    additional_sidecars: Mapping[str, bytes] | None = None,
+    additional_sidecars: Mapping[str, bytes | Path] | None = None,
 ) -> dict[str, Any]:
     root = Path(output_root)
     root.mkdir(parents=True, exist_ok=True)
@@ -424,18 +468,25 @@ def write_binary_generation(
     )
     encoded = {name: _json_bytes(payload) for name, payload in payloads.items()}
     encoded["binary_formal_results.csv"] = _csv_bytes(payloads["binary_formal_results.json"]["by_api"])
+    sidecar_sources: dict[str, bytes | Path] = dict(encoded)
     for name, content in (additional_sidecars or {}).items():
         safe_name = Path(str(name or "")).name
-        if not safe_name or safe_name != str(name) or safe_name in encoded:
+        if not safe_name or safe_name != str(name) or safe_name in sidecar_sources:
             raise BinaryOutputError(
                 "BINARY_OUTPUT_ADDITIONAL_SIDECAR_INVALID", str(name)
             )
-        if not isinstance(content, bytes):
+        if not isinstance(content, (bytes, Path)) or (
+            isinstance(content, Path) and not content.is_file()
+        ):
             raise BinaryOutputError(
-                "BINARY_OUTPUT_ADDITIONAL_SIDECAR_INVALID", f"{name} must be bytes"
+                "BINARY_OUTPUT_ADDITIONAL_SIDECAR_INVALID",
+                f"{name} must be bytes or an existing Path",
             )
-        encoded[safe_name] = content
-    sidecar_identities = {name: _sha256(content) for name, content in encoded.items()}
+        sidecar_sources[safe_name] = content
+    sidecar_identities = {
+        name: (_sha256(content) if isinstance(content, bytes) else _sha256_file(content))
+        for name, content in sidecar_sources.items()
+    }
     generation = ResultGeneration(
         decisions.analysis_context_identity,
         decisions.active_snapshots,
@@ -477,7 +528,7 @@ def write_binary_generation(
         )
         content_valid = all(
             (destination / name).is_file()
-            and _sha256((destination / name).read_bytes()) == expected
+            and _sha256_file(destination / name) == expected
             for name, expected in sidecar_identities.items()
         )
         if (
@@ -495,14 +546,21 @@ def write_binary_generation(
             strict_preferred=True,
         )
         try:
-            for name, content in encoded.items():
-                (temp / name).write_bytes(content)
+            for name, content in sidecar_sources.items():
+                target = temp / name
+                if isinstance(content, bytes):
+                    target.write_bytes(content)
+                else:
+                    shutil.copyfile(content, target)
+                if _sha256_file(target) != sidecar_identities[name]:
+                    raise BinaryOutputError(
+                        "BINARY_OUTPUT_SIDECAR_CHANGED_DURING_COPY", str(content)
+                    )
             (temp / "result_generation.json").write_bytes(_json_bytes(manifest))
             (temp / "generation_attachments.json").write_bytes(_json_bytes(attachment))
             os.replace(temp, destination)
         finally:
             if temp.exists():
-                import shutil
                 shutil.rmtree(temp)
     return {
         **manifest,
@@ -535,7 +593,7 @@ def activate_binary_generation(
         )
     for name, expected in (manifest.get("sidecar_content_identities") or {}).items():
         path = destination / str(name)
-        if not path.is_file() or _sha256(path.read_bytes()) != expected:
+        if not path.is_file() or _sha256_file(path) != expected:
             raise BinaryOutputError(
                 "BINARY_GENERATION_ACTIVATION_INTEGRITY_FAILED", str(path)
             )
