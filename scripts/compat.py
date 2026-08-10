@@ -29,6 +29,36 @@ from pathlib import Path
 # ── 平台检测 ──────────────────────────────────────────────────────
 IS_WINDOWS = sys.platform == 'win32'
 
+
+def subprocess_platform_kwargs(*, new_process_group=False, platform_name=None):
+    """Return invisible, platform-safe process creation options.
+
+    Python launched from a Windows GUI does not own a console.  Starting a
+    console-subsystem executable (Git, Python, Java, Maven, and similar tools)
+    without ``CREATE_NO_WINDOW`` makes Windows flash a new console for every
+    command.  Keep that policy in one place so product subprocesses cannot
+    accidentally regress to visible windows.
+
+    Git additionally uses an independent process group so timeout cleanup can
+    reap credential and transport helpers.  POSIX keeps the existing session
+    isolation only when that group behavior is requested.
+    """
+    normalized_platform = str(platform_name or '').strip().lower()
+    windows = (
+        IS_WINDOWS
+        if not normalized_platform
+        else normalized_platform in {'nt', 'win32', 'windows'}
+    )
+    if windows:
+        create_no_window = getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)
+        creation_flags = create_no_window
+        if new_process_group:
+            creation_flags |= getattr(
+                subprocess, 'CREATE_NEW_PROCESS_GROUP', 0x00000200
+            )
+        return {'creationflags': creation_flags}
+    return {'start_new_session': True} if new_process_group else {}
+
 # ── stdout/stderr 强制 UTF-8（Windows 默认 GBK 会导致中文乱码）──
 def setup_utf8_io():
     """
@@ -73,7 +103,8 @@ def _detect_subprocess_encoding():
         try:
             # chcp 返回当前代码页，如 "活动代码页: 65001" (65001 = UTF-8)
             result = subprocess.run(
-                ['cmd', '/c', 'chcp'], capture_output=True, timeout=5
+                ['cmd', '/c', 'chcp'], capture_output=True, timeout=5,
+                **subprocess_platform_kwargs(),
             )
             output = result.stdout.decode('mbcs', errors='replace')
             if '65001' in output:
@@ -406,12 +437,7 @@ def _sanitize_git_environment(proc_env):
 
 def _git_process_group_kwargs(is_git):
     """Start Git in an isolated process group so timeouts can reap helpers too."""
-    if not is_git:
-        return {}
-    if IS_WINDOWS:
-        creation_flag = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
-        return {'creationflags': creation_flag} if creation_flag else {}
-    return {'start_new_session': True}
+    return subprocess_platform_kwargs(new_process_group=is_git)
 
 
 def _terminate_subprocess(proc, *, process_group=False):
@@ -424,6 +450,7 @@ def _terminate_subprocess(proc, *, process_group=False):
                 stderr=subprocess.DEVNULL,
                 timeout=5,
                 check=False,
+                **subprocess_platform_kwargs(),
             )
         except (OSError, subprocess.SubprocessError):
             pass
@@ -619,6 +646,7 @@ def run_cmd(
             # 不使用 text=True，手动解码以控制错误处理
             env=proc_env,
             input=input_bytes,
+            **process_group_kwargs,
         )
 
         # 解码输出：先尝试 UTF-8，失败则用系统编码，再失败则替换非法字符
@@ -722,6 +750,7 @@ def _git_executable_works(path):
             timeout=5,
             check=False,
             env=probe_environment,
+            **subprocess_platform_kwargs(),
         )
     except (OSError, subprocess.SubprocessError):
         return False

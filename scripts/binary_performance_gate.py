@@ -29,6 +29,7 @@ from binary_fact_store import BinaryFactStore
 from binary_first_contract import canonical_identity
 from binary_first_model import ArtifactInstance, RuntimeProfile
 from binary_snapshot_cache import cached_snapshot_archive
+from compat import subprocess_platform_kwargs
 from path_runtime import short_temporary_directory
 
 try:
@@ -72,6 +73,7 @@ def _command_version(command: list[str]) -> str:
     completed = subprocess.run(
         command, capture_output=True, text=True, encoding="utf-8",
         errors="replace", check=False,
+        **subprocess_platform_kwargs(),
     )
     text = (completed.stdout or completed.stderr or "").strip().splitlines()
     return text[0] if text else f"exit={completed.returncode}"
@@ -82,6 +84,7 @@ def _jdk_home() -> Path:
         ["java", "-XshowSettings:properties", "-version"],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         check=False,
+        **subprocess_platform_kwargs(),
     )
     for line in completed.stderr.splitlines():
         if "java.home" in line and "=" in line:
@@ -113,6 +116,7 @@ def _compile_template(root: Path) -> bytes:
         ["javac", "-g:none", "-d", str(output), str(source)],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         check=False,
+        **subprocess_platform_kwargs(),
     )
     if completed.returncode != 0:
         raise PerformanceGateError(completed.stderr or "javac failed")
@@ -354,6 +358,7 @@ def _legacy_javap(artifacts: list[dict[str, Any]], classes_per_jar: int) -> dict
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             check=False,
+            **subprocess_platform_kwargs(),
         )
         if completed.returncode != 0:
             raise PerformanceGateError(

@@ -9,6 +9,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+from compat import subprocess_platform_kwargs
+
 
 CATEGORIES = {
     "artifact_facts": ("tests.test_binary_artifact_diff", "tests.test_binary_asm_helper"),
@@ -43,7 +45,9 @@ def main(argv=None) -> int:
     if args.dry_run:
         print(" ".join(command))
         return 0
-    completed = subprocess.run(command, check=False)
+    completed = subprocess.run(
+        command, check=False, **subprocess_platform_kwargs()
+    )
     payload = {
         "schema": "java-upgrade-analyzer.binary-accuracy-benchmark.v1",
         "status": "passed" if completed.returncode == 0 else "failed",

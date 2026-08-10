@@ -8,6 +8,8 @@ import subprocess
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from compat import subprocess_platform_kwargs
+
 
 @dataclass(frozen=True, slots=True)
 class BinaryToolFailure:
@@ -94,6 +96,7 @@ def execute_binary_tool(
         kwargs.update({"encoding": encoding, "errors": "replace"})
     if cwd is not None:
         kwargs["cwd"] = str(Path(cwd).expanduser().resolve())
+    kwargs.update(subprocess_platform_kwargs())
     try:
         completed = runner(list(argv), **kwargs)
     except subprocess.TimeoutExpired as error:

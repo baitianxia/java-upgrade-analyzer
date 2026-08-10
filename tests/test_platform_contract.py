@@ -8,6 +8,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -66,6 +67,82 @@ class PlatformContractTest(unittest.TestCase):
             [r"C:\Git\git.exe", "-c", "core.longpaths=true"],
             command,
         )
+
+    def test_windows_subprocess_policy_hides_every_console_child(self):
+        self.assertEqual(
+            compat.subprocess_platform_kwargs(platform_name="nt"),
+            {"creationflags": 0x08000000},
+        )
+        self.assertEqual(
+            compat.subprocess_platform_kwargs(
+                new_process_group=True, platform_name="win32"
+            ),
+            {"creationflags": 0x08000000 | 0x00000200},
+        )
+        self.assertEqual(
+            compat.subprocess_platform_kwargs(platform_name="posix"),
+            {},
+        )
+        self.assertEqual(
+            compat.subprocess_platform_kwargs(
+                new_process_group=True, platform_name="posix"
+            ),
+            {"start_new_session": True},
+        )
+
+    def test_windows_run_cmd_hides_python_and_other_non_git_children(self):
+        completed = SimpleNamespace(stdout=b"ok\n", stderr=b"", returncode=0)
+        with patch.object(compat, "IS_WINDOWS", True), patch.object(
+            compat.subprocess, "run", return_value=completed,
+        ) as runner:
+            stdout, stderr, returncode = compat.run_cmd(
+                ["python.exe", "--version"]
+            )
+
+        self.assertEqual((stdout, stderr, returncode), ("ok\n", "", 0))
+        self.assertEqual(
+            runner.call_args.kwargs["creationflags"], 0x08000000
+        )
+
+    def test_product_subprocess_calls_expand_the_shared_platform_policy(self):
+        missing = []
+        for source_path in sorted((ROOT / "scripts").glob("*.py")):
+            tree = ast.parse(source_path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call) or not isinstance(
+                    node.func, ast.Attribute
+                ):
+                    continue
+                if not (
+                    isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "subprocess"
+                    and node.func.attr in {"run", "Popen"}
+                ):
+                    continue
+                expanded = [
+                    keyword.value for keyword in node.keywords
+                    if keyword.arg is None
+                ]
+                if not any(
+                    (
+                        isinstance(value, ast.Call)
+                        and isinstance(value.func, ast.Name)
+                        and value.func.id in {
+                            "subprocess_platform_kwargs",
+                            "_background_platform_kwargs",
+                        }
+                    )
+                    or (
+                        isinstance(value, ast.Name)
+                        and value.id == "process_group_kwargs"
+                    )
+                    for value in expanded
+                ):
+                    missing.append(
+                        f"{source_path.name}:{getattr(node, 'lineno', 0)}"
+                    )
+
+        self.assertEqual(missing, [])
 
     def test_path_expanding_temporary_directories_cannot_bypass_shared_runtime(self):
         for path in sorted((ROOT / "scripts").glob("*.py")):

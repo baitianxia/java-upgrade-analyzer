@@ -3,11 +3,13 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import binary_tool_execution  # noqa: E402
 from binary_tool_execution import execute_binary_tool  # noqa: E402
 
 
@@ -81,6 +83,27 @@ class BinaryToolExecutionTest(unittest.TestCase):
         self.assertTrue(result.succeeded)
         self.assertEqual(observed["command"], ["mvn", "package"])
         self.assertEqual(observed["cwd"], str(ROOT.resolve()))
+
+    def test_windows_no_window_policy_is_forwarded_to_typed_tools(self):
+        observed = {}
+
+        def runner(command, **kwargs):
+            observed.update({"command": command, **kwargs})
+            return SimpleNamespace(stdout="ok", stderr="", returncode=0)
+
+        with patch.object(
+            binary_tool_execution,
+            "subprocess_platform_kwargs",
+            return_value={"creationflags": 0x08000000},
+        ):
+            result = execute_binary_tool(
+                ["python.exe", "worker.py"], stage="binary.worker",
+                reason_prefix="BINARY_WORKER", timeout_seconds=30,
+                runner=runner,
+            )
+
+        self.assertTrue(result.succeeded)
+        self.assertEqual(observed["creationflags"], 0x08000000)
 
 
 if __name__ == "__main__":

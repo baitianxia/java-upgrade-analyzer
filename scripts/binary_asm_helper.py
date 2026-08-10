@@ -18,6 +18,7 @@ from typing import Any, Callable, Iterable
 
 from binary_first_contract import BinaryFirstContractError, canonical_identity
 from binary_tool_execution import execute_binary_tool
+from compat import subprocess_platform_kwargs
 from path_runtime import make_short_temp_dir, short_temporary_directory
 
 
@@ -353,6 +354,7 @@ def extract_class_facts(
                 stdin=stdin,
                 stdout=subprocess.PIPE,
                 stderr=stderr,
+                **subprocess_platform_kwargs(),
             )
             timed_out = threading.Event()
 

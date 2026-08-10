@@ -15,7 +15,7 @@ import subprocess
 import sys
 import zipfile
 
-from compat import git_cmd, run_cmd
+from compat import git_cmd, run_cmd, subprocess_platform_kwargs
 
 
 PUBLIC_SCRIPT_RE = re.compile(r"\$\{CLAUDE_SKILL_DIR\}/(scripts/[A-Za-z0-9_./-]+\.py)")
@@ -144,6 +144,7 @@ def _run(command, cwd):
         encoding="utf-8",
         errors="replace",
         timeout=60,
+        **subprocess_platform_kwargs(),
     )
 
 

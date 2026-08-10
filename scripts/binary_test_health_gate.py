@@ -18,6 +18,7 @@ from binary_capability_migration_audit import (
     REGISTRY_PATH,
     audit_capability_migration,
 )
+from compat import subprocess_platform_kwargs
 from path_runtime import short_temporary_directory
 
 
@@ -157,6 +158,7 @@ def mutation_probe(mutations=MUTATIONS) -> dict:
                 errors="replace",
                 check=False,
                 timeout=30,
+                **subprocess_platform_kwargs(),
             )
             rows.append({
                 "mutation_id": mutation["id"],
@@ -189,6 +191,7 @@ def repeat_health_probe(
                 errors="replace",
                 check=False,
                 timeout=timeout_seconds,
+                **subprocess_platform_kwargs(),
             )
             output = f"{completed.stdout}\n{completed.stderr}"
             match = re.search(r"Ran (\d+) tests?", output)

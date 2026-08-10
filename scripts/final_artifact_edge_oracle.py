@@ -17,6 +17,7 @@ import time
 import zipfile
 
 from artifact_safety import inspect_archive
+from compat import subprocess_platform_kwargs
 from edge_truth import EdgeIdentity, canonical_edge_identity
 from path_runtime import short_temporary_directory
 
@@ -568,7 +569,9 @@ def _parse_javap_output(
 
 def _javap_version(javap: str, *, timeout: float) -> str:
     completed = subprocess.run(
-        [javap, "-version"], capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=timeout
+        [javap, "-version"], capture_output=True, text=True, encoding="utf-8",
+        errors="replace", check=False, timeout=timeout,
+        **subprocess_platform_kwargs(),
     )
     return (completed.stdout or completed.stderr).strip()
 
@@ -640,6 +643,7 @@ def _parse_entry_with_javap(
             text=True,
             encoding="utf-8",
             errors="replace",
+            **subprocess_platform_kwargs(),
         )
     except OSError as error:
         return {
@@ -756,6 +760,7 @@ def _parse_entry_group_with_javap(
             text=True,
             encoding="utf-8",
             errors="replace",
+            **subprocess_platform_kwargs(),
         )
     except OSError as error:
         return [

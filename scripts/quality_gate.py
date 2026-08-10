@@ -20,6 +20,7 @@ from binary_capability_migration_audit import (
     REGISTRY_PATH as CAPABILITY_MIGRATION_REGISTRY,
     audit_capability_migration,
 )
+from compat import subprocess_platform_kwargs
 
 
 QUICK_MODULES = (
@@ -95,6 +96,7 @@ def _jdk_home() -> Path:
         ["java", "-XshowSettings:properties", "-version"],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         check=False,
+        **subprocess_platform_kwargs(),
     )
     for line in completed.stderr.splitlines():
         if "java.home" in line and "=" in line:
@@ -176,7 +178,9 @@ def main(argv=None) -> int:
         return 0
     started = datetime.now(timezone.utc)
     print(f"[binary-quality-gate] tests: {' '.join(command)}", flush=True)
-    completed = subprocess.run(command, check=False)
+    completed = subprocess.run(
+        command, check=False, **subprocess_platform_kwargs()
+    )
     health = None
     health_returncode = 0
     real_project = None
@@ -189,6 +193,7 @@ def main(argv=None) -> int:
         health_completed = subprocess.run(
             release_commands[0], check=False, capture_output=True, text=True,
             encoding="utf-8", errors="replace",
+            **subprocess_platform_kwargs(),
         )
         health_returncode = health_completed.returncode
         try:
@@ -211,6 +216,7 @@ def main(argv=None) -> int:
             real_completed = subprocess.run(
                 real_command, check=False, capture_output=True, text=True,
                 encoding="utf-8", errors="replace",
+                **subprocess_platform_kwargs(),
             )
             real_project_returncode = (
                 real_project_returncode or real_completed.returncode
@@ -231,6 +237,7 @@ def main(argv=None) -> int:
         performance_completed = subprocess.run(
             release_commands[-1], check=False, capture_output=True, text=True,
             encoding="utf-8", errors="replace",
+            **subprocess_platform_kwargs(),
         )
         performance_returncode = performance_completed.returncode
         performance_path = audit_root / "performance_result.json"

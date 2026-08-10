@@ -27,6 +27,7 @@ from compat import (
     open_text,
     resolve_repo_input_path,
     run_cmd,
+    subprocess_platform_kwargs,
 )
 from compat import git_cmd
 from artifact_coordinates import artifact_ga
@@ -532,12 +533,10 @@ def _background_record_is_live(payload):
 
 
 def _background_platform_kwargs(platform_name=None):
-    platform_name = str(platform_name or os.name)
-    if platform_name == "nt":
-        # Values from the Windows CreateProcess API.  Referencing numeric
-        # constants also keeps this helper importable and testable on POSIX.
-        return {"creationflags": 0x00000200 | 0x00000008}
-    return {"start_new_session": True}
+    return subprocess_platform_kwargs(
+        new_process_group=True,
+        platform_name=str(platform_name or os.name),
+    )
 
 
 def _background_exit_status(exit_code):

@@ -11,6 +11,8 @@ import subprocess
 import sys
 from typing import Any, Mapping
 
+from compat import subprocess_platform_kwargs
+
 
 REGISTRY_PATH = (
     Path(__file__).resolve().parents[1]
@@ -110,6 +112,7 @@ def _baseline_deleted_paths(
             encoding="utf-8",
             errors="replace",
             check=False,
+            **subprocess_platform_kwargs(new_process_group=True),
         )
     except OSError as error:
         return set(), f"git_start_failed:{type(error).__name__}"
