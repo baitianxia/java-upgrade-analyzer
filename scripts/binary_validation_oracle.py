@@ -3912,24 +3912,22 @@ def _validate_closed_world_results(
 def _validate_source_attestation(
     generation: Path, config: Mapping[str, Any],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Re-hash every user-authorized source file without using the source parser."""
-    usage = dict(config.get("source_usage") or {})
-    decision = str(usage.get("decision") or "")
+    """Re-hash every supplied source file without using the source parser."""
     overlay = dict(config.get("source_overlay") or {})
     path = generation / "binary_source_attestation.json"
-    if decision == "skip_source":
+    if not overlay:
         issues = []
-        if path.exists() or overlay:
+        if path.exists():
             issues.append(_validation_issue(
-                "source_attestation", "ORACLE_UNAUTHORIZED_SOURCE_OVERLAY_PRESENT",
-                attestation_present=path.exists(), config_overlay_present=bool(overlay),
+                "source_attestation", "ORACLE_UNEXPECTED_SOURCE_ATTESTATION_PRESENT",
+                attestation_present=True,
             ))
-        return issues, {"decision": decision, "source_file_count": 0}
-    if decision != "use_source" or not path.is_file():
+        return issues, {"source_input_status": "not_provided", "source_file_count": 0}
+    if not path.is_file():
         return [_validation_issue(
             "source_attestation", "ORACLE_SOURCE_ATTESTATION_MISSING",
-            decision=decision, attestation_present=path.is_file(),
-        )], {"decision": decision, "source_file_count": 0}
+            attestation_present=False,
+        )], {"source_input_status": "provided", "source_file_count": 0}
 
     payload = _load_json(path)
     actual_files = []
@@ -4090,7 +4088,7 @@ def _validate_source_attestation(
             actual=payload.get("coverage_status"),
         ))
     return issues, {
-        "decision": decision,
+        "source_input_status": "provided",
         "source_file_count": len(actual_files),
         "source_snapshot_identity": snapshot_identity,
         "source_coverage_status": expected_coverage_status,

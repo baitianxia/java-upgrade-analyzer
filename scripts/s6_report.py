@@ -2664,15 +2664,15 @@ def write_analysis_scope_artifact(report_dir, findings):
             *[f"- `{name}`" for name in selected_names],
             "",
         ])
-    source_usage = dict((findings or {}).get("source_usage") or {})
-    if source_usage:
+    source_inputs = dict((findings or {}).get("source_inputs") or {})
+    if source_inputs:
         lines.extend([
             "## 源码辅助分析",
             "",
-            f"- **用户选择**：{source_usage.get('label') or '源码选择记录缺失'}",
-            f"- **作用和边界**：{source_usage.get('effect') or '未记录'}",
-            f"- **映射数量**：{int(source_usage.get('mapped_count') or 0)}",
-            f"- **覆盖状态**：`{source_usage.get('coverage_status') or 'not_provided'}`",
+            f"- **源码输入**：{source_inputs.get('label') or '源码输入状态缺失'}",
+            f"- **作用和边界**：{source_inputs.get('effect') or '未记录'}",
+            f"- **映射数量**：{int(source_inputs.get('mapped_count') or 0)}",
+            f"- **覆盖状态**：`{source_inputs.get('coverage_status') or 'not_provided'}`",
         ])
         source_review = (
             Path(report_dir) / "evidence" / "source_analysis" / "review.md"
@@ -3552,6 +3552,7 @@ def collect_findings(d):
         'context':             {},
         'scan_stats':          {},
         'dep_compat_summary':  {},
+        'database_contract':   {},
         'background_signals':  {},
         'impacted_dependencies': [],
         'p0':                  [],
@@ -3693,6 +3694,101 @@ def collect_findings(d):
             'top_coords': sorted(by_coord.items(), key=lambda x: (-x[1], x[0]))[:10],
             'top_rows': dep_compat_rows[:10],
         }
+
+    database_contract_summary_path = static_dir / 's3_database_contract_summary.json'
+    database_contract_csv_path = static_dir / 's3_database_contract_changes.csv'
+    database_contract_review_path = static_dir / 's3_database_contract_changes.md'
+    database_contract_expected = (
+        _evidence_dir(d, EVIDENCE_DEPENDENCIES_DIRNAME)
+        / 'dependency_jars.json'
+    ).is_file()
+    database_contract_summary = load_json(
+        database_contract_summary_path,
+        diagnostics=diagnostics,
+        artifact='step3_database_contract_summary',
+        required=database_contract_expected,
+    )
+    database_contract_rows = load_csv(
+        database_contract_csv_path,
+        diagnostics=diagnostics,
+        artifact='step3_database_contract_changes',
+        required=database_contract_expected,
+    )
+    _validate_csv_contract(
+        database_contract_csv_path,
+        diagnostics=diagnostics,
+        artifact='step3_database_contract_changes',
+        required_column_groups=tuple(
+            {column}
+            for column in (
+                '依赖包', '变化类型', '契约类型', '可信度', '表', '列',
+                '契约位置', '语句或字段', '人工复核建议',
+            )
+        ),
+        require_data=int(database_contract_summary.get('change_count') or 0) > 0,
+    )
+    if database_contract_summary:
+        schema_valid = database_contract_summary.get('schema') == (
+            'java-upgrade-analyzer.database-contract-changes.v1'
+        )
+        if not schema_valid:
+            _record_diagnostic(
+                diagnostics,
+                artifact='step3_database_contract_summary',
+                stage='json_contract',
+                path=database_contract_summary_path,
+                error=ValueError('unsupported database contract summary schema'),
+            )
+        csv_valid = not _artifact_has_fatal_csv_diagnostic(
+            diagnostics, 'step3_database_contract_changes'
+        )
+        effective_rows = database_contract_rows if csv_valid else []
+        expected_count = int(database_contract_summary.get('change_count') or 0)
+        count_matches = expected_count == len(database_contract_rows)
+        if csv_valid and not count_matches:
+            _record_diagnostic(
+                diagnostics,
+                artifact='step3_database_contract_changes',
+                stage='cross_artifact_contract',
+                path=database_contract_csv_path,
+                error=ValueError(
+                    f'summary change_count={expected_count}; csv rows={len(database_contract_rows)}'
+                ),
+            )
+        effective_summary = dict(database_contract_summary)
+        if not schema_valid or not csv_valid or not count_matches:
+            effective_summary['coverage_status'] = 'partial'
+            effective_summary['coverage_gaps'] = sorted(set(
+                list(effective_summary.get('coverage_gaps') or ())
+                + ['database_contract_output_contract_invalid']
+            ))
+        findings['database_contract'] = {
+            **effective_summary,
+            'rows': effective_rows,
+        }
+        findings['scan_stats']['database_contract_changes'] = len(
+            effective_rows
+        )
+        for key, path in (
+            ('database_contract_csv', database_contract_csv_path),
+            ('database_contract_review_md', database_contract_review_path),
+            ('database_contract_summary_json', database_contract_summary_path),
+        ):
+            if path.is_file():
+                findings['artifacts'][key] = relpath_for_report(path, d)
+        read_order = findings['meta']['read_order']
+        insert_at = 3
+        if database_contract_review_path.is_file():
+            read_order.insert(
+                insert_at,
+                'evidence/static_scan/s3_database_contract_changes.md（数据库契约完整复核明细）',
+            )
+            insert_at += 1
+        if database_contract_csv_path.is_file():
+            read_order.insert(
+                insert_at,
+                'evidence/static_scan/s3_database_contract_changes.csv（数据库契约结构化明细）',
+            )
 
     # Step 5 汇总先决定逐链路台账是否应当存在。零变化 API 的正式
     # skipped 结果不生成 alerts.csv，这不是证据缺口。
@@ -8257,13 +8353,13 @@ def _main_report_range(model, noun, displayed_count):
 
 def render_report_scope_notice(findings):
     scope = (findings or {}).get("analysis_scope") or {}
-    source_usage = (findings or {}).get("source_usage") or {}
+    source_inputs = (findings or {}).get("source_inputs") or {}
     source_notice = []
-    if source_usage:
+    if source_inputs:
         source_notice = [
             (
-                f"> **源码辅助分析**：{source_usage.get('label') or '源码选择记录缺失'}。"
-                f"{source_usage.get('effect') or ''}"
+                f"> **源码辅助分析**：{source_inputs.get('label') or '源码输入状态缺失'}。"
+                f"{source_inputs.get('effect') or ''}"
             ),
             "",
         ]
@@ -8324,6 +8420,94 @@ def render_report_scope_notice(findings):
         ),
         "",
     ]
+
+
+def render_database_contract_changes(findings, limit=10):
+    contract = findings.get('database_contract') or {}
+    rows = list(contract.get('rows') or ())
+    artifacts = findings.get('artifacts') or {}
+    review_path = str(artifacts.get('database_contract_review_md') or '').strip()
+    csv_path = str(artifacts.get('database_contract_csv') or '').strip()
+    if not contract and not review_path and not csv_path:
+        return []
+
+    displayed = rows[:limit]
+    status = str(contract.get('coverage_status') or 'unknown')
+    status_label = {
+        'complete': '完整',
+        'partial': '存在证据缺口',
+        'insufficient': '证据不足',
+    }.get(status, '未记录')
+    lines = [
+        f"### 数据库契约变化提醒（展示 {len(displayed)}/{len(rows)}）",
+        "",
+        (
+            "这里比较升级前后制品中的 MyBatis/ORM 数据访问契约。"
+            "它不属于 API 调用可达性结论，也不表示对应 DDL/迁移已经存在或已执行；"
+            "发现变化时，需要人工核对目标环境表结构并执行对应数据访问场景测试。"
+        ),
+        "",
+        f"- 扫描覆盖状态：**{status_label}**",
+        f"- 识别到的契约变化：**{len(rows)}** 条",
+    ]
+    detail_links = []
+    if review_path:
+        detail_links.append(_report_link(review_path, '完整人工复核明细'))
+    if csv_path:
+        detail_links.append(_report_link(csv_path, '结构化明细 CSV'))
+    if detail_links:
+        lines.append("- 全部明细位置：" + "；".join(detail_links))
+    lines.append("")
+
+    gaps = list(contract.get('coverage_gaps') or ())
+    if gaps:
+        lines.extend([
+            (
+                f"> **证据边界**：本次存在 {len(gaps)} 项制品读取或运行时闭包缺口，"
+                "“未识别到变化”不能解释为确认没有数据库契约变化。"
+            ),
+            "",
+        ])
+    if not rows:
+        lines.extend([
+            (
+                "本次未识别到升级前后数据访问契约变化。"
+                if status == 'complete'
+                else "现有证据中未识别到数据访问契约变化。"
+            ),
+            "",
+        ])
+        return lines
+
+    if len(rows) > len(displayed):
+        lines.extend([
+            f"正文仅展示前 {len(displayed)} 条，未展开 {len(rows) - len(displayed)} 条；"
+            "请在上面的完整人工复核明细中逐项查看。",
+            "",
+        ])
+    lines.extend([
+        "| 依赖包 | 变化 | 契约类型 | 可信度 | 表/列 | 契约位置 | 人工复核建议 |",
+        "|---|---|---|---|---|---|---|",
+    ])
+    for row in displayed:
+        table_column = []
+        if row.get('表'):
+            table_column.append(f"表：{row['表']}")
+        if row.get('列'):
+            table_column.append(f"列：{row['列']}")
+        location = f"{row.get('契约位置') or '-'}#{row.get('语句或字段') or '-'}"
+        cells = (
+            row.get('依赖包') or '-',
+            row.get('变化类型') or '-',
+            row.get('契约类型') or '-',
+            row.get('可信度') or '-',
+            '；'.join(table_column) or '-',
+            location,
+            row.get('人工复核建议') or '-',
+        )
+        lines.append("| " + " | ".join(_md_cell(value, 220) for value in cells) + " |")
+    lines.append("")
+    return lines
 
 
 def render_dependency_conclusions(findings, dependency_model=None):
@@ -8435,6 +8619,7 @@ def render_dependency_conclusions(findings, dependency_model=None):
             *_dependency_completed_table(displayed),
             "",
         ])
+    lines.extend(render_database_contract_changes(findings))
     return lines
 
 
@@ -9625,6 +9810,32 @@ def render_user_visible_files(
             ),
             "“一、依赖层面结论”",
         ))
+    database_contract_review_path = str(
+        artifacts.get('database_contract_review_md') or ''
+    ).strip()
+    database_contract_csv_path = str(
+        artifacts.get('database_contract_csv') or ''
+    ).strip()
+    if database_contract_review_path or database_contract_csv_path:
+        file_links = []
+        if database_contract_review_path:
+            file_links.append(
+                _report_link(database_contract_review_path, '数据库契约完整复核明细')
+            )
+        if database_contract_csv_path:
+            file_links.append(
+                _report_link(database_contract_csv_path, '数据库契约明细 CSV')
+            )
+        contract = findings.get('database_contract') or {}
+        rows.append((
+            '<br>'.join(file_links),
+            (
+                '升级前后制品中的 MyBatis/ORM 数据访问契约变化，保留依赖包、'
+                '表/列、证据位置、可信度和人工复核建议；不扫描 DDL/迁移文件'
+            ),
+            f"已识别契约变化全量 {len(contract.get('rows') or [])} 条",
+            '“一、依赖层面结论 / 数据库契约变化提醒”',
+        ))
     changed_path = str(artifacts.get("changed_apis_csv") or "").strip()
     if changed_path:
         rows.append((
@@ -9663,10 +9874,10 @@ def render_user_visible_files(
         rows.append((
             _report_link(source_review_path, "源码辅助分析复核"),
             (
-                "记录用户的源码选择、源码到二进制方法的映射、"
+                "记录业务源码与依赖源码的实际输入状态、源码到二进制方法的映射、"
                 "源码补充信息及其非权威边界"
             ),
-            "用户授权范围内的源码辅助证据全量",
+            "本次已提供源码范围内的辅助证据全量",
             "主报告顶部的源码使用说明",
         ))
     build_provenance_path = str(
@@ -9756,6 +9967,11 @@ _MAIN_REPORT_TOC_ENTRIES = (
     (
         "### 已完成分析的依赖",
         "已完成分析的依赖",
+        1,
+    ),
+    (
+        "### 数据库契约变化提醒",
+        "数据库契约变化提醒",
         1,
     ),
     (

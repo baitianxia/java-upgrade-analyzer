@@ -111,6 +111,31 @@ class ClaudeSkillContractTest(unittest.TestCase):
         self.assertIn(".upgrade-report/.runtime/background/status.json", skill)
         self.assertIn("启动命令返回 `0` 只表示后台进程创建成功", skill)
 
+    def test_step4_execution_environment_is_never_a_user_decision(self):
+        skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
+        rules = (ROOT / "CHECKPOINT_RULES.md").read_text(encoding="utf-8")
+        manifest = json.loads(
+            (ROOT / "scripts" / "step_manifest.json").read_text(encoding="utf-8")
+        )
+        step4 = next(item for item in manifest["steps"] if item["id"] == "step4")
+        interaction_text = json.dumps(
+            step4.get("interaction") or {}, ensure_ascii=False
+        )
+
+        for required in (
+            "Step4 执行方式不是用户决策点",
+            "不得要求用户另开 Git Bash/PowerShell/终端",
+            "不得建议管理员权限、Defender/杀毒软件排除",
+            ".upgrade-report/.runtime/background/status.json",
+            ".upgrade-report/.runtime/background/run.log",
+            ".upgrade-report/.runtime/binary_authority/binary_observability/latest_in_progress.json",
+        ):
+            self.assertIn(required, skill)
+        self.assertIn("前台/后台、终端、超时恢复和性能处置不是用户决策点", rules)
+        self.assertIn("分析范围", interaction_text)
+        for forbidden in ("Defender", "管理员", "Git Bash", "另开终端", "nohup"):
+            self.assertNotIn(forbidden, interaction_text)
+
     def test_cross_session_startup_reads_compact_resume_snapshot_first(self):
         skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
 

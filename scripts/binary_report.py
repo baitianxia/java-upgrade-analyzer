@@ -266,35 +266,30 @@ def _change_object(record: Mapping[str, Any]) -> str:
     )
 
 
-def _source_usage_view(loaded: Mapping[str, Any]) -> dict[str, Any]:
+def _source_inputs_view(loaded: Mapping[str, Any]) -> dict[str, Any]:
     coverage = dict(loaded.get("coverage") or {})
-    usage = dict(coverage.get("source_usage") or {})
+    inputs = dict(coverage.get("source_inputs") or {})
     overlay = dict(coverage.get("source_overlay") or {})
     attestation = dict(loaded.get("source_attestation") or {})
-    decision = str(usage.get("decision") or "").strip()
-    decision_source = str(usage.get("decision_source") or "missing")
-    if decision == "use_source":
-        label = (
-            "用户已提供源码，系统直接使用"
-            if decision_source == "user_provided_source"
-            else "用户选择使用源码"
-        )
-        effect = (
-            "源码用于补充文件/行号、声明与语义解释；"
-            "正式变化、运行时解析和精确可执行边仍由最终二进制制品决定。"
-        )
-    elif decision == "skip_source":
-        label = "用户选择不提供源码"
-        effect = (
-            "本次只执行二进制分析；正式结果仍有效，但源码位置、声明/注解、可读上下文和候选关系覆盖缺失。"
-        )
-    else:
-        label = "源码选择记录缺失"
-        effect = "当前 generation 没有可验证的用户源码选择记录。"
+    business = dict(inputs.get("business") or {})
+    dependencies = dict(inputs.get("dependencies") or {})
+    business_available = business.get("status") == "available"
+    dependency_available = dependencies.get("status") == "available"
+    business_label = (
+        "构建输入已具备并直接使用"
+        if business_available and business.get("origin") == "checkout_build"
+        else ("已提供并直接使用" if business_available else "未提供")
+    )
+    dependency_label = "已提供并直接使用" if dependency_available else "未提供"
+    label = f"业务源码：{business_label}；依赖源码：{dependency_label}"
+    effect = (
+        "可用源码用于补充文件/行号、声明与语义解释；正式变化、运行时解析和精确可执行边"
+        "仍由最终二进制制品决定。未提供的源码类别会单独保留解释覆盖缺口。"
+    )
     return {
-        "decision": decision or "missing",
-        "decision_source": decision_source,
-        "purpose_version": str(usage.get("purpose_version") or "missing"),
+        "purpose_version": str(inputs.get("purpose_version") or "missing"),
+        "business": business,
+        "dependencies": dependencies,
         "label": label,
         "effect": effect,
         "coverage_status": str(overlay.get("coverage_status") or "not_provided"),
@@ -650,7 +645,7 @@ def _trace_metrics_by_change(loaded: Mapping[str, Any]) -> dict[str, dict[str, i
 
 def publish_step4(report_dir: str | Path, output_dir: str | Path) -> dict[str, Any]:
     loaded = load_validated_generation(report_dir)
-    source_usage = _source_usage_view(loaded)
+    source_inputs = _source_inputs_view(loaded)
     source_review_rows = _source_review_rows(loaded)
     source_candidate_rows = _source_candidate_review_rows(loaded)
     decisions = list(loaded["decisions"].get("authoritative_change_facts") or ())
@@ -879,7 +874,7 @@ def publish_step4(report_dir: str | Path, output_dir: str | Path) -> dict[str, A
             "源码文件": str(gap.get("logical_path") or ""),
             "解析器": str(gap.get("actual_parser") or ""),
             "错误节点": str(gap.get("error_nodes") or ""),
-        } for gap in source_usage["coverage_gaps"]]
+        } for gap in source_inputs["coverage_gaps"]]
         with open_csv_write(stage / "source_coverage_gaps.csv") as handle:
             writer = csv.DictWriter(handle, fieldnames=source_gap_fields)
             writer.writeheader()
@@ -890,19 +885,19 @@ def publish_step4(report_dir: str | Path, output_dir: str | Path) -> dict[str, A
         language_summary = "、".join(
             f"{language} {count} 个"
             for language, count in sorted(
-                source_usage["language_file_counts"].items()
+                source_inputs["language_file_counts"].items()
             )
         ) or "未提供源码文件"
         source_lines = [
             "# 源码辅助证据", "",
-            f"- 源码状态：{source_usage['label']}",
-            f"- 覆盖状态：`{source_usage['coverage_status']}`",
-            f"- 已映射方法：{source_usage['mapped_count']}",
+            f"- 源码状态：{source_inputs['label']}",
+            f"- 覆盖状态：`{source_inputs['coverage_status']}`",
+            f"- 已映射方法：{source_inputs['mapped_count']}",
             f"- 源码文件：{language_summary}",
             f"- 未映射/解析缺口：{len(source_gap_rows)} 个；"
             "[查看逐文件缺口](coverage_gaps.csv)",
             "- 完整源码快照与 SHA：[source_snapshot.json](source_snapshot.json)", "",
-            source_usage["effect"], "",
+            source_inputs["effect"], "",
         ]
         if source_review_rows:
             source_lines.extend((
@@ -915,8 +910,8 @@ def publish_step4(report_dir: str | Path, output_dir: str | Path) -> dict[str, A
                 f"{row['源码声明'] or '-'} | {row['注解'] or '-'} |"
                 for row in source_review_rows
             )
-        elif source_usage["decision"] == "skip_source":
-            source_lines.append("本次由用户明确选择不提供源码，因此没有源码映射行；这不影响二进制正式结论。")
+        elif source_inputs["coverage_status"] == "not_provided":
+            source_lines.append("本次没有可用源码输入，因此没有源码映射行；这不影响二进制正式结论。")
         else:
             source_lines.append("已使用源码，但没有方法完成精确 descriptor 映射；请结合覆盖状态和冲突计数复核。")
         candidate_fields = (
@@ -962,7 +957,7 @@ def publish_step4(report_dir: str | Path, output_dir: str | Path) -> dict[str, A
             "excluded_decision_count": len(loaded["decisions"].get("excluded_decisions") or ()),
             "dependency_count": len(dependency_rows),
             "published_api_change_count": len(rows),
-            "source_usage": source_usage,
+            "source_inputs": source_inputs,
             "decision_coverage_status": loaded["summary"].get(
                 "decision_coverage_status"
             ),
@@ -982,12 +977,12 @@ def publish_step4(report_dir: str | Path, output_dir: str | Path) -> dict[str, A
             f"- 诊断候选事实：{summary['diagnostic_candidate_fact_count']}",
             f"- 排除裁决：{summary['excluded_decision_count']}",
             f"- 涉及依赖：{summary['dependency_count']}",
-            f"- 源码选择：{source_usage['label']}",
-            f"- 源码映射：{source_usage['mapped_count']} 个，覆盖状态 `{source_usage['coverage_status']}`",
+            f"- 源码输入：{source_inputs['label']}",
+            f"- 源码映射：{source_inputs['mapped_count']} 个，覆盖状态 `{source_inputs['coverage_status']}`",
             "",
         ]
         summary_lines.extend((
-            source_usage["effect"], "",
+            source_inputs["effect"], "",
             "源码辅助证据：`../source_analysis/review.md`；"
             "结构化映射：`../source_analysis/method_mappings.csv`；"
             "候选关系：`../source_analysis/candidate_relationships.csv`；"
@@ -999,9 +994,9 @@ def publish_step4(report_dir: str | Path, output_dir: str | Path) -> dict[str, A
             "# 运行时变化人工复核", "",
             "本报告按引起变化的依赖包分组。`正式变化` 来自完整二进制裁决；"
             "`诊断候选` 表示证据仍有缺口，不能解释为无影响。", "",
-            f"- 源码选择：{source_usage['label']}",
-            f"- 源码覆盖：`{source_usage['coverage_status']}`；已映射 {source_usage['mapped_count']} 个方法",
-            f"- 作用边界：{source_usage['effect']}", "",
+            f"- 源码输入：{source_inputs['label']}",
+            f"- 源码覆盖：`{source_inputs['coverage_status']}`；已映射 {source_inputs['mapped_count']} 个方法",
+            f"- 作用边界：{source_inputs['effect']}", "",
         ]
         review_dependencies = sorted({row["依赖包"] for row in review_rows})
         for dependency in review_dependencies:
@@ -1394,7 +1389,7 @@ def publish_step5(
     selected_names: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     loaded = load_validated_generation(report_dir)
-    source_usage = _source_usage_view(loaded)
+    source_inputs = _source_inputs_view(loaded)
     by_api = list(loaded["formal"].get("by_api") or ())
     raw_items = [_result_item(item) for item in by_api]
     all_resource_items = [
@@ -1562,7 +1557,7 @@ def publish_step5(
             "included_in_formal_totals": False,
         },
         "coverage": loaded["coverage"],
-        "source_usage": source_usage,
+        "source_inputs": source_inputs,
     }
     output = Path(output_dir).resolve()
     def write(stage: Path) -> None:
@@ -1626,9 +1621,9 @@ def publish_step5(
             f"- 结论不确定：{summary['uncertain']}",
             f"- 静态范围内未发现路径：{summary['not_found_in_static_analysis']}",
             f"- 未完成分析：{summary['not_analyzed']}", "",
-            f"- 源码选择：{source_usage['label']}",
-            f"- 源码映射：{source_usage['mapped_count']} 个，覆盖状态 `{source_usage['coverage_status']}`", "",
-            source_usage["effect"], "",
+            f"- 源码输入：{source_inputs['label']}",
+            f"- 源码映射：{source_inputs['mapped_count']} 个，覆盖状态 `{source_inputs['coverage_status']}`", "",
+            source_inputs["effect"], "",
             "`not_found_in_static_analysis` 不是已确认无影响；静态可执行路径也不等于已完成运行时验证。", "",
             "## 运行时资源激活", "",
         ]
@@ -1686,8 +1681,8 @@ def publish_step5(
             f"- 结论不确定：{summary['uncertain']}",
             f"- 未发现静态路径：{summary['not_found_in_static_analysis']}",
             f"- 未完成分析：{summary['not_analyzed']}",
-            f"- 源码选择：{source_usage['label']}", "",
-            source_usage["effect"], "",
+            f"- 源码输入：{source_inputs['label']}", "",
+            source_inputs["effect"], "",
         )),
     )
     query_index = {
@@ -1747,7 +1742,7 @@ def publish_step6(
     findings["analysis_context_identity"] = (
         loaded["manifest"]["analysis_context_identity"]
     )
-    findings["source_usage"] = _source_usage_view(loaded)
+    findings["source_inputs"] = _source_inputs_view(loaded)
     findings["resource_impacts"] = [
         _resource_activation_item(item)
         for item in loaded["formal"].get("resource_activation_results") or ()

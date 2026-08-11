@@ -102,13 +102,7 @@ class _PhaseTimingRecorder(list):
         temporary.replace(self.path)
 
 
-SOURCE_USAGE_DECISIONS = {"use_source", "skip_source"}
-SOURCE_USAGE_DECISION_SOURCES = {
-    "user_interaction",
-    "user_provided_source",
-    "explicit_config",
-}
-SOURCE_USAGE_PURPOSE_VERSION = "source-overlay-purpose-v1"
+SOURCE_INPUT_PURPOSE_VERSION = "source-input-purpose-v2"
 SOURCE_FILE_LANGUAGES = {
     ".java": "java",
     ".kt": "kotlin",
@@ -148,35 +142,45 @@ def _load_json(path: str | Path) -> dict[str, Any]:
     return value
 
 
-def _source_usage_contract(config: Mapping[str, Any]) -> dict[str, str]:
-    raw = dict(config.get("source_usage") or {})
-    decision = str(raw.get("decision") or "").strip()
-    decision_source = str(raw.get("decision_source") or "").strip()
-    if decision not in SOURCE_USAGE_DECISIONS:
+def _source_inputs_contract(config: Mapping[str, Any]) -> dict[str, Any]:
+    source_sets = list((config.get("source_overlay") or {}).get("source_sets") or [])
+    has_business = any(
+        str((item or {}).get("owner_type") or "") == "business"
+        for item in source_sets
+    )
+    has_dependencies = any(
+        str((item or {}).get("owner_type") or "") == "dependency"
+        for item in source_sets
+    )
+    raw = dict(config.get("source_inputs") or {})
+    business = dict(raw.get("business") or {})
+    dependencies = dict(raw.get("dependencies") or {})
+    expected_business_status = "available" if has_business else "not_provided"
+    expected_dependency_status = "available" if has_dependencies else "not_provided"
+    if business and str(business.get("status") or "") != expected_business_status:
         raise BinaryPipelineError(
-            "BINARY_SOURCE_USAGE_DECISION_REQUIRED",
-            "source_usage.decision must be use_source or skip_source",
+            "BINARY_BUSINESS_SOURCE_STATUS_MISMATCH",
+            "source_inputs.business.status does not match business source sets",
         )
-    if decision_source not in SOURCE_USAGE_DECISION_SOURCES:
+    if dependencies and str(dependencies.get("status") or "") != expected_dependency_status:
         raise BinaryPipelineError(
-            "BINARY_SOURCE_USAGE_DECISION_SOURCE_INVALID",
-            "source_usage.decision_source must record user authorization",
-        )
-    has_overlay = bool(config.get("source_overlay"))
-    if decision == "use_source" and not has_overlay:
-        raise BinaryPipelineError(
-            "BINARY_SOURCE_OVERLAY_INPUT_REQUIRED",
-            "the user chose source assistance but source_overlay is missing",
-        )
-    if decision == "skip_source" and has_overlay:
-        raise BinaryPipelineError(
-            "BINARY_SOURCE_OVERLAY_NOT_CONSENTED",
-            "source_overlay must be absent when the user chose skip_source",
+            "BINARY_DEPENDENCY_SOURCE_STATUS_MISMATCH",
+            "source_inputs.dependencies.status does not match dependency source sets",
         )
     return {
-        "decision": decision,
-        "decision_source": decision_source,
-        "purpose_version": SOURCE_USAGE_PURPOSE_VERSION,
+        "purpose_version": SOURCE_INPUT_PURPOSE_VERSION,
+        "business": {
+            "status": expected_business_status,
+            "origin": str(business.get("origin") or (
+                "provided" if has_business else "not_provided"
+            )),
+        },
+        "dependencies": {
+            "status": expected_dependency_status,
+            "origin": str(dependencies.get("origin") or (
+                "provided" if has_dependencies else "not_provided"
+            )),
+        },
     }
 
 
@@ -639,7 +643,7 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
     pipeline_started = time.perf_counter()
     if config.get("schema") != "java-upgrade-analyzer.binary-pipeline-input.v1":
         raise BinaryPipelineError("BINARY_PIPELINE_CONFIG_SCHEMA_INVALID", str(config.get("schema")))
-    source_usage = _source_usage_contract(config)
+    source_inputs = _source_inputs_contract(config)
     asm_jar = config.get("asm_jar") or None
     output_root = Path(output_root).resolve()
     phase_timings: list[dict[str, Any]] = _PhaseTimingRecorder(
@@ -1191,7 +1195,7 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                     "current_fact_build_input_slice": current_input_slice.identity,
                 },
                 source_overlay=source_overlay,
-                source_usage=source_usage,
+                source_inputs=source_inputs,
                 additional_sidecars=additional,
             )
             phase_timings.append({
@@ -1272,7 +1276,7 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                 "trace_coverage_status": traces.coverage_status,
                 "authoritative_change_fact_count": len(decisions.authoritative_decisions),
                 "diagnostic_candidate_fact_count": len(decisions.diagnostic_decisions),
-                "source_usage": source_usage,
+                "source_inputs": source_inputs,
                 "validation_run_identity": validation["validation_run_identity"],
                 "validation_status": validation["status"],
                 "validation_result_path": validation["validation_result_path"],

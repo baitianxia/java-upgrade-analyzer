@@ -8,7 +8,7 @@
 - base/current 两侧可复核的最终制品；
 - 与两侧运行环境一致的完整目标 JDK；
 - Step1 可留存的 base/current 完整最终制品；系统会自动生成固定制品 SHA、运行路径顺序、loader/resource policy 和业务入口的 `binary_pipeline_config`，仅在特殊部署模型下才需要显式覆盖；
-- 源码输入或明确决定二者之一：用户已提供源码时直接视为 `use_source`；没有提供时必须在说明作用后选择 `use_source` 或 `skip_source`；
+- Step2 已说明源码用途，并通过统一入口收集用户还能提供的源码位置或记录暂不补充；编译模式已取得的业务源码直接使用；
 - 可写的 `.upgrade-report/`。
 
 所有 CSV 使用 UTF-8 BOM，适合 Excel 直接打开。JSON 和 Markdown 使用 UTF-8。
@@ -67,7 +67,7 @@ python3 scripts/run_step.py --step auto \
 
 正常 `run_step.py` 流程从 Step1 的双侧业务制品、完整依赖 JAR 清单和目标 JDK 自动物化以上字段。显式 `binary_pipeline_config` 是高级调试/特殊 loader 部署入口，不是普通用户必须手写的前置条件；自动物化无法证明闭包完整时失败关闭并列出具体缺口。
 
-`source_usage` 是进入 binary pipeline 前的必填合同：`decision` 只能是 `use_source` 或 `skip_source`，`decision_source` 必须证明来源是用户已提交源码、用户交互选择或显式配置。用户已提供源码目录、源码仓库或 `source_overlay` 时直接形成 `use_source`，不重复询问；没有提供时不得默认 `skip_source`。选择 `use_source` 时必须形成 `source_overlay`；选择 `skip_source` 时配置中不得保留 overlay。源码只增加人类可理解的位置和语义，不能改变运行时提供者、变化事实、精确可执行边或正式裁决。
+`source_inputs` 记录业务源码与依赖源码各自的实际可用状态和来源，不是用户授权合同。存在源码时必须形成按 `owner_type`、`owner_coord` 区分的 `source_overlay.source_sets`；缺少某一类源码只产生该类覆盖缺口，不能关闭另一类已经可用的源码。源码只增加人类可理解的位置和语义，不能改变运行时提供者、变化事实、精确可执行边或正式裁决。
 
 可直接调试 generation：
 

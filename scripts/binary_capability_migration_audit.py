@@ -54,7 +54,7 @@ REQUIRED_MECHANISM_IDS = frozenset({
     "whole_dependency_api_enumeration",
     "reflection_and_method_handle_dispatch",
     "source_overlay_language_coverage_visibility",
-    "source_overlay_user_choice",
+    "source_overlay_input_collection",
     "dependency_identity_confirmation_workflow",
     "deterministic_immutable_generation",
     "spring_aop_dispatch",

@@ -16,7 +16,11 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR / "scripts"))
 
 import binary_asm_helper  # noqa: E402
-from binary_pipeline import BinaryPipelineError, run_pipeline  # noqa: E402
+from binary_pipeline import (  # noqa: E402
+    BinaryPipelineError,
+    _source_inputs_contract,
+    run_pipeline,
+)
 from binary_runtime_materializer import materialize_binary_pipeline_config  # noqa: E402
 from binary_report import (  # noqa: E402
     BinaryReportError,
@@ -210,39 +214,34 @@ public class demo.ArrayCasts {
             "jrt:/java.base/java/lang/String.class",
         )
 
-    def test_source_usage_requires_an_explicit_user_decision(self):
-        with self.assertRaises(BinaryPipelineError) as raised:
-            run_pipeline(
-                {"schema": "java-upgrade-analyzer.binary-pipeline-input.v1"},
-                output_root=self.root / "missing-source-decision",
-            )
+    def test_source_inputs_are_derived_from_actual_source_sets(self):
         self.assertEqual(
-            raised.exception.reason_code,
-            "BINARY_SOURCE_USAGE_DECISION_REQUIRED",
+            _source_inputs_contract({}),
+            {
+                "purpose_version": "source-input-purpose-v2",
+                "business": {"status": "not_provided", "origin": "not_provided"},
+                "dependencies": {"status": "not_provided", "origin": "not_provided"},
+            },
         )
 
-    def test_skip_source_rejects_an_implicit_overlay(self):
+    def test_source_input_metadata_cannot_hide_an_available_overlay(self):
+        config = {
+            "source_inputs": {
+                "business": {"status": "not_provided"},
+            },
+            "source_overlay": {
+                "source_sets": [{
+                    "source_dirs": ["/not/read"],
+                    "owner_type": "business",
+                    "owner_coord": "business",
+                }],
+            },
+        }
         with self.assertRaises(BinaryPipelineError) as raised:
-            run_pipeline(
-                {
-                    "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
-                    "source_usage": {
-                        "decision": "skip_source",
-                        "decision_source": "explicit_config",
-                    },
-                    "source_overlay": {
-                        "source_sets": [{
-                            "source_dirs": ["/not/read"],
-                            "owner_type": "business",
-                            "owner_coord": "business",
-                        }],
-                    },
-                },
-                output_root=self.root / "unconsented-source",
-            )
+            _source_inputs_contract(config)
         self.assertEqual(
             raised.exception.reason_code,
-            "BINARY_SOURCE_OVERLAY_NOT_CONSENTED",
+            "BINARY_BUSINESS_SOURCE_STATUS_MISMATCH",
         )
 
     def _jar(
@@ -2055,10 +2054,6 @@ public class demo.ArrayCasts {
         )
 
         config = materialize_binary_pipeline_config(report)
-        config["source_usage"] = {
-            "decision": "skip_source",
-            "decision_source": "explicit_config",
-        }
         config["asm_jar"] = str(self.asm_jar)
         result = run_pipeline(
             config,
@@ -2154,13 +2149,13 @@ public class demo.ArrayCasts {
             (api_dir / "summary.json").read_text()
         )
         self.assertEqual(
-            step4_summary["source_usage"]["decision"], "skip_source"
+            step4_summary["source_inputs"]["business"]["status"], "not_provided"
         )
         self.assertEqual(step4_summary["authoritative_change_fact_count"], 2)
         self.assertEqual(step4_summary["published_api_change_count"], 1)
         self.assertEqual(step4_summary["confirmed_unprojectable_fact_count"], 1)
         self.assertIn(
-            "用户明确选择不提供源码",
+            "业务源码：未提供；依赖源码：未提供",
             (report / "evidence" / "source_analysis" / "review.md").read_text(
                 encoding="utf-8"
             ),
@@ -2189,7 +2184,7 @@ public class demo.ArrayCasts {
             per_dependency_review.read_text(),
         )
         complete_review = (api_dir / "review.md").read_text()
-        self.assertIn("用户选择不提供源码", complete_review)
+        self.assertIn("业务源码：未提供；依赖源码：未提供", complete_review)
         self.assertIn("## com.acme:api\n", complete_review)
         self.assertNotIn("## com.acme:api:1、com.acme:api:2", complete_review)
         self.assertIn("META-INF/services/demo.Service", complete_review)
@@ -2229,7 +2224,7 @@ public class demo.ArrayCasts {
                 b"\xef\xbb\xbf"
             )
         )
-        self.assertIn("用户选择不提供源码", final_report.read_text())
+        self.assertIn("业务源码：未提供；依赖源码：未提供", final_report.read_text())
         rendered_report = final_report.read_text()
         self.assertIn("# Java 依赖升级影响报告", rendered_report)
         self.assertIn("## 一、依赖层面结论", rendered_report)
@@ -2272,7 +2267,7 @@ public class demo.ArrayCasts {
             )
         scope_report = (final_report.parent / "analysis-scope.md").read_text()
         self.assertIn("## 源码辅助分析", scope_report)
-        self.assertIn("用户选择不提供源码", scope_report)
+        self.assertIn("业务源码：未提供；依赖源码：未提供", scope_report)
         impact_detail = (final_report.parent / "all-impact-details.md").read_text()
         self.assertIn("当前系统调用关系", impact_detail)
         self.assertIn("demo.Api.value()", impact_detail)
@@ -2662,7 +2657,9 @@ public class demo.ArrayCasts {
             config,
             output_root=report / ".runtime" / "binary_authority",
         )
-        self.assertEqual(result["source_usage"]["decision"], "use_source")
+        self.assertEqual(
+            result["source_inputs"]["dependencies"]["status"], "available"
+        )
         attestation = json.loads(
             (
                 Path(result["generation_directory"])

@@ -122,18 +122,28 @@ run("python .../run_step.py --step auto")
 - 只在缺少系统无法取得的外部事实、需要授权，或不同选择会实质改变结果时询问用户。
 - 网络、缓存、源码、parser 和工具内部故障先自动重试、修复或安全停止，不要求用户批准降级。
 - 长任务至少每 60 秒输出用户可懂的进度心跳；只有分母可靠时才显示预计剩余时间。
+- **Step4 执行方式不是用户决策点**：不得把前台、后台、另开终端、调整安全软件或继续重试包装成选择卡片。Step4 的用户交互只允许正式状态机声明的分析范围确认。
+- Agent 执行通道可能在 Step4 完成前超时时，首次启动或恢复就必须使用统一入口的 `--background`，随后监视后台状态、进度和日志；不得等前台命令被强制终止后再反复重跑。
+- 不得要求用户另开 Git Bash/PowerShell/终端，不得生成临时 `upgrade-run-step4`、`nohup` 或同类包装脚本，也不得建议管理员权限、Defender/杀毒软件排除、关闭安全控制或修改系统策略来换取性能。
+- 后台任务失败时先读取稳定状态、阶段进度、日志和已验证缓存，自动按同一输入恢复或安全停止。只有确实缺少外部事实或授权时才请求用户；内部超时、工具限制和性能问题不能转化为用户操作。
+- 不得根据多次被中断的累计时间、缓存条目数或未经完成的阶段外推“还需几小时”。预计时间只能来自同一阶段可比较的已完成观测和可靠分母；证据不足时只报告已用时间、当前阶段和进度边界。
 - 用户按 `Ctrl-C` 时终止当前子进程，清理本阶段半成品，保留以前完成的正式产物和当前输入；退出码 `130`。
 - 失败消息说明当前任务、原因、已保留内容和可执行恢复方式，不暴露无用内部协议。
 
 ## 后台执行
 
-需要后台运行时使用统一入口的 `--background`，并读取：
+Step4 或其他可能超过 Agent 单次执行时限的任务，使用统一入口的 `--background`，并读取：
 
 ```text
 .upgrade-report/.runtime/background/status.json
+.upgrade-report/.runtime/background/run.log
+.upgrade-report/.runtime/binary_authority/binary_observability/latest_in_progress.json
+.upgrade-report/.runtime/observability/progress.jsonl
 ```
 
 启动命令返回 `0` 只表示后台进程创建成功，不表示分析步骤或全流程完成。必须继续读取后台状态、主状态和阶段产物，直到完成、待交互或失败。
+
+后台任务由产品统一保存 PATH 快照、隐藏 Windows 控制台窗口并建立独立进程组。不得用 Agent 自己的后台任务、shell job、临时脚本或用户终端替代这一机制。监视期间只转述实际阶段、已用时间和有证据的进度；状态没有变化不是失败，也不是让用户接管执行的理由。
 
 ## 执行阶段
 
@@ -186,6 +196,7 @@ run("python .../run_step.py --step auto")
 - class/provider/member/resource/dispatch 选择均按显式 RuntimeProfile；源码只做解释覆盖。
 - authoritative、candidate、excluded 必须互斥守恒；confirmed-unprojectable 事实保留依赖坐标进入 `review.md`。
 - identity、support、Oracle、sidecar、数据库或性能门失败时不激活 generation，不生成旧引擎结果。
+- Phase 6 是自动执行阶段，不存在“Step4 执行方式”确认。预计可能超过 Agent 单次命令时限时必须从统一入口以 `--background` 启动并由 Agent 持续监视，不得让用户另开终端或调整操作系统安全配置。
 
 Step4 人工复核顺序：
 

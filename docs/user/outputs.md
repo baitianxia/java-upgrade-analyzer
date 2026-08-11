@@ -4,7 +4,7 @@
 
 所有 CSV 文件统一采用 UTF-8 BOM，可直接用 Excel 打开；程序仍可读取历史无 BOM 的 UTF-8 CSV。
 
-使用统一入口的 `--step auto` 时，流程会自动运行到下一个必要确认点。分析对象与实际依赖范围需要确认；升级上下文仅在 JDK、业务源码范围等关键事实无法可靠确定，或用户提供的源码线索产生待采用映射建议时暂停；明确拒绝建议后不会重复询问。依赖 API 变化识别出至少两个候选依赖时保留全量/部分范围选择；0 个或 1 个候选不存在实际范围取舍，系统直接继续。确认范围后，系统触达分析和最终报告连续完成。
+使用统一入口的 `--step auto` 时，流程会自动运行到下一个必要确认点。分析对象与实际依赖范围需要确认；Step2 用一个入口询问是否还能补充相关源码，用户可以混合提交目录和 Git 地址，不需要区分业务源码与依赖源码。编译模式已经取得的业务源码会直接使用；系统只在源码位置无法可靠分类、JDK 等关键事实无法确定，或源码线索产生待采用映射建议时追加确认。依赖 API 变化识别出至少两个候选依赖时保留全量/部分范围选择；0 个或 1 个候选不存在实际范围取舍，系统直接继续。确认范围后，系统触达分析和最终报告连续完成。
 
 步骤内部的网络、fetch、依赖源码缺失、工具超时等故障不会制造额外确认点；系统会重试、使用最终制品证据或记录覆盖缺口。只有必须由用户提供的事实或会改变结论范围的选择才暂停。
 
@@ -140,6 +140,11 @@ Step3 用于识别 JDK、Jakarta、Spring 等框架升级带来的背景风险�
 | `evidence/static_scan/s3_springboot_autoconfig.txt` | 自动装配相关线索 |
 | `evidence/static_scan/s3_dependency_compat.csv` | current 最终制品内依赖 JAR 的兼容性规则命中；每条记录都通过“最终制品内路径”定位到实际打包条目，不读取本地 Maven 仓库 |
 | `evidence/static_scan/s3_dependency_classfile.csv` | current 最终制品内全部依赖 JAR 的字节码版本扫描台账；每个实际打包条目一行，“扫描结论”明确区分完成、风险和未完成 |
+| `evidence/static_scan/s3_database_contract_changes.md` | 给人工复核的完整数据库契约变化明细；按依赖包保留 MyBatis/ORM 表、列、契约位置、可信度和复核建议 |
+| `evidence/static_scan/s3_database_contract_changes.csv` | 与数据库契约 Markdown 相同范围的结构化明细，便于筛选和自动处理 |
+| `evidence/static_scan/s3_database_contract_summary.json` | 程序使用的数据库契约扫描覆盖状态、证据缺口和数量汇总 |
+
+数据库契约检查比较 Step1 保留的升级前后业务制品及其运行时依赖制品，覆盖 MyBatis XML、MyBatis 注解 SQL、JPA/Jakarta Persistence 与 MyBatis-Plus 的持久化映射。普通 DTO 新增字段不会单独判定为数据库契约变化；只有该字段进入 Mapper SQL、结果映射或 ORM 持久化映射时才会记录。MyBatis-Plus 无注解约定式实体通过同一制品内的 `BaseMapper<Entity>` 泛型绑定识别；实体不在同一制品且无法绑定时记录覆盖缺口，不猜测跨制品关系。该检查不扫描 DDL/迁移文件，因此只能提示“数据访问契约发生变化，需要核对目标数据库”，不能证明对应 DDL 已存在或已执行。主报告只展示有限条目，并在“数据库契约变化提醒”处直接给出上述完整明细文件位置。
 
 ## 依赖 API 变化事实
 

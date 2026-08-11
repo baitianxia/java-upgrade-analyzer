@@ -147,10 +147,16 @@
     ],
     "changed_or_unknown_profile_fields": []
   },
-  "source_usage": {
-    "decision": "use_source",
-    "decision_source": "explicit_config",
-    "purpose_version": "source-overlay-purpose-v1"
+  "source_inputs": {
+    "purpose_version": "source-input-purpose-v2",
+    "business": {
+      "status": "available",
+      "origin": "provided"
+    },
+    "dependencies": {
+      "status": "available",
+      "origin": "provided"
+    }
   },
   "source_overlay": {
     "source_sets": [

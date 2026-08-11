@@ -50,7 +50,7 @@
 - base 分支：main
 - current 分支：feature/upgrade
 - 目标模块：app-module
-- 依赖源码路径或 Git 地址：/abs/path/to/dependency-source-repo 或 https://git.example.com/team/dependency-source-repo.git
+- 可补充的源码位置：/abs/path/to/source-repo 或 https://git.example.com/team/dependency-source-repo.git
 ```
 
 如果你已经有升级前后的构建产物，可以这样说：
@@ -80,22 +80,22 @@ Claude Code 会负责：
 | 待分析工程 | 通常已知 | Claude Code 当前打开的工程；如果不是目标工程，请明确路径 |
 | 目标模块 | 必需 | 本次唯一分析的可部署模块；多模块项目必须明确 |
 | 升级前后来源 | 必需 | 通常是 base/current 分支，也可以是已有 base/current JAR/WAR |
-| 是否提供源码辅助分析 | 未提交源码时必需确认 | 已提交源码目录、源码仓库或带 `source_overlay` 的配置时直接使用，不再重复确认；未提交时 Step2 会先说明作用与边界，再由你选择补充源码或明确不提供 |
-| 依赖源码路径或 Git 地址 | 选择提供源码时可选 | 依赖包源码仓库本地路径或 HTTPS/SSH Git 地址，用于增加文件/行号、声明与注解、可读上下文和候选关系 |
+| 是否还能补充相关源码 | 必需确认一次 | 这是收集可选输入，不是源码使用授权；编译模式已取得的业务源码会直接使用。可以一次提交多个源码目录或 Git 地址，也可以暂不补充 |
+| 源码目录或 Git 地址 | 选择补充时可选 | 不要求预先区分业务源码和依赖源码；系统按项目范围与依赖坐标自动分类，只有无法可靠分类时才询问映射 |
 | 特殊 JDK | 可选 | 如果 base/current 需要不同 JDK 构建，请说明 |
 | Binary runtime 快照 | 系统自动生成 | Step1 从两侧最终制品、完整运行依赖和目标 JDK 自动生成；特殊 loader/容器部署可用 `binary_pipeline_config.example.json` 显式覆盖。无法证明闭包完整时系统会列出缺口并停止，不要求普通用户手写内部配置 |
 
 说明：
 
-- 标准 Maven / Gradle 结构下，业务系统源码路径通常不需要你提供，Skill 会从 reactor 或 Gradle project graph 推断。
-- 你主动提交源码目录、源码仓库或带 `source_overlay` 的配置，本身即表示选择使用源码，系统直接进入源码辅助分析。只有系统自动识别到源码、而你没有提交任何源码输入时，才必须先展示源码用途并记录你的 `use_source` 或 `skip_source` 选择；自动识别不能替你默认选择。
+- 编译模式已经取得被分析系统源码，标准 Maven / Gradle 结构下会从 reactor 或 Gradle project graph 推断业务源码范围并直接使用；Step2 询问的是是否还能补充其他相关源码，主要是依赖源码。
+- 直接制品模式通过同一个入口接收被分析系统源码和依赖源码。用户无需判断源码类型；系统自动分类并分别记录覆盖，无法可靠分类时才请求一次归属映射。
 - Maven 项目优先使用对应 base/current revision 内的 `mvnw` / `mvnw.cmd`，没有 Wrapper 时才使用系统 `mvn`；分析器不规定 Maven 最低版本。
 - Gradle 项目同时支持 Groovy DSL 与 Kotlin DSL；优先使用仓库内 `gradlew` / `gradlew.bat`，没有 Wrapper 时才使用系统 `gradle`。多模块选择既可写 `app`，也可写 `:app`。
 - JDK、Maven、Gradle 均以用户工程为准。base/current 可分别使用不同 JDK；实际工具链不兼容时按真实构建命令失败原因阻塞，不会因分析器预设版本白名单提前拒绝。
 - Gradle 自动构建执行目标模块的 `build -x test`；缺失嵌套 JAR 坐标时，优先从 `runtimeClasspath` 的 resolved artifacts 采集“组件坐标 ↔ 物理文件”清单。不支持 artifact inventory 的旧 Gradle/插件才回退到组件依赖树；文件锁冲突只对原命令按 1 秒、3 秒退避重试，不触发组件树回退、不删除锁，也不停止其他 Gradle daemon。Maven 同样保留 `dependency:list` 输出的绝对 artifact 文件。
 - Maven `dependency:list` 漏掉 reactor 内部模块，或 Gradle 只返回 `ProjectComponentIdentifier` 时，Step1 会从目标模块的实际运行时闭包补齐内部模块坐标：Maven 解析继承和 `${revision}`、`${project.version}` 等有效属性，Gradle 按精确 project path 读取实际 group、artifact、version。只补目标闭包中的依赖模块，不把目标模块自身或无关 sibling 纳入依赖；构建工具已经给出的坐标和版本优先，源码模型不能覆盖它们。若内部模块存在唯一主归档，还会用该物理文件匹配自定义 `finalName`。
 - 物理文件精确匹配优先于文件名解释；构建工具未报告 classifier 时，才以清单中的完整 version 为锚唯一推导，例如将 `jffi-1.2.23-native.jar` 解析为 `com.github.jnr:jffi:native`。多个最终身份同时匹配时才保留歧义，不按文件名猜选。项目模型只帮助识别最终制品中实际存在的内部 JAR，不能扩展制品范围。最终依赖版本与内容仍以实际 Fat JAR、Spring Boot JAR 或 WAR 为准。Thin JAR 本身不包含运行时依赖，不能作为正式比较结果。
-- 依赖源码输入指的是依赖包自己的源码仓库，不是当前业务系统源码路径。既可以填写本地目录，也可以直接填写 HTTPS/SSH Git 地址；远端仓库会克隆到 `.upgrade-report/.runtime/cache/dependency_source_git/`，不会切换或修改用户工作区。
+- 系统内部仍区分业务源码和依赖源码：依赖源码指依赖包自己的源码仓库。统一输入支持本地目录和 HTTPS/SSH Git 地址；识别为依赖源码的远端仓库会克隆到 `.upgrade-report/.runtime/cache/dependency_source_git/`，不会切换或修改用户工作区。
 - Git 克隆复用当前环境已有的 SSH key 或 Git 凭据配置，并禁用交互式密码提示；地址不可达或无权限时会明确停止，不会把失败仓库当成有效源码继续分析。
 - base/current 可以使用同一个工程目录；两侧身份由各自确认后的远程分支、tag 或 commit 决定。Skill 会查询远端最新 ref、定向 fetch 并固定到具体 commit，在隔离快照中分析，不会切换或拉取你的当前分支。
 - 直接产物模式会先解析 JAR；只有依赖坐标仍缺失时才使用对应侧源码补全。Step4 的依赖源码默认只取远端：唯一 ref pair 或多个名称指向同一 commit pair 时自动采用；只有两个以上不同 commit pair、且选择会改变源码对比范围时，才把全部歧义依赖及方案编号汇总到一张决策卡中，用户可一次答全。
@@ -103,7 +103,7 @@ Claude Code 会负责：
 - Step5 的 JAR 类型元数据 `javap` 单次超时为 30 秒；超时后对同一命令最多尝试 3 次，按 1 秒、3 秒退避。非超时错误不盲目重试；重试耗尽后只限制对应类型及相关调用路径，不会把一个类的失败提升为全部 API 的全局“未分析”。
 - 分支名只用于定位和展示，确认卡选择会同时绑定 repo、remote、canonical ref、artifact 与当时的 commit SHA。Step1 首次选定的 SHA 是固定快照；后续查询为空或 ref 已移动只触发受控重试和按原 SHA 物化，不会改用新 SHA，也不会要求用户重新确认。Step4 的依赖源码 ref 移动或不可用时不要求用户修复，而是从升级前后最终 JAR 比较同签名方法的规范化字节码，继续识别实现变化。
 - 远端 `ls-remote`/`fetch` 对超时、连接重置、临时 DNS/HTTP 5xx 等瞬时错误最多尝试 3 次，重试间隔为 1 秒、3 秒；已选定 SHA 后，定向查询中的 ref 空结果或新 commit 观测也会重试，但不会替换该 SHA。认证失败等确定性错误不重试。Step4 自动重试耗尽后会记录 `DEPENDENCY_SOURCE_REF_UNAVAILABLE`，不会生成要求用户处理网络、权限或 ref 的确认卡，也不会静默使用本地对象；只有运行前已经明确提供 `allow_local_source=true` 时才允许采用本地兜底。若最终 JAR 方法字节码兜底也无法完成，行为变化覆盖会成为关键缺口，报告不得输出“完整”或“不受影响”结论。
-- 选择提供源码时，源码用于增加文件/行号、声明与注解、可读上下文和候选关系，并在受支持的常量内联场景与字节码共同形成证明；选择不提供时仍完成二进制分析，并在报告中明确标注源码解释覆盖缺失。无论如何，依赖范围、版本、JAR 内容和精确字节码调用边始终以 base/current 最终制品为准。
+- 可用源码用于增加文件/行号、声明与注解、可读上下文和候选关系，并在受支持的常量内联场景与字节码共同形成证明；未提供的业务或依赖源码会分别记录解释覆盖缺口。无论如何，依赖范围、版本、JAR 内容和精确字节码调用边始终以 base/current 最终制品为准。
 - 源码映射不会混进 API 变化目录或变成无归属的路径列表：`evidence/source_analysis/review.md` 和 `method_mappings.csv` 同时展示源码归属依赖、实际二进制制品、方法、文件/行号、声明与注解；`candidate_relationships.csv` 另列源码候选调用关系并明确它不是可执行边。人工复核时可以直接判断是哪一个依赖提供的源码解释。
 - 只提供源码目录不能证明它对应哪一侧制品；这种输入会先要求确认 revision，确认前不会执行 Maven 或 Gradle。
 - 如果存在多个可部署模块且无法唯一判断，Claude Code 必须让你选择目标模块。
@@ -136,14 +136,14 @@ binary 输出使用 `reachability_status`、`static_linkage_status`、`impact_co
 - 输入方式不完整；
 - 两侧最终制品已经提供，但后续上下文仍缺少基准侧或当前侧分支；该信息会合并到已有的依赖范围确认中，不新增一次确认；
 - JDK 版本或业务源码范围无法从制品、构建文件和项目结构可靠确定；
-- 未提交源码时是否提供源码辅助分析；系统已经自动找到源码也不能替用户选择，但用户已主动提交源码时直接使用，不重复询问；
+- 是否还能补充其他相关源码；编译模式已取得的业务源码直接使用，用户只需通过统一入口补充更多源码或明确暂不补充；
 - 用户提供了源码仓库线索，并产生了会改变源码行为覆盖率的映射建议；系统会要求明确采用或拒绝，拒绝后不会重复询问；
 - 依赖坐标或版本无法安全补齐；
 - 依赖源码存在两个以上不同 commit pair，且选择会改变源码差异范围；
 - Step4 识别出至少两个可分析依赖后，选择 Step5 的全量或部分分析范围；0 个或 1 个候选不存在实际范围取舍，系统会直接继续；
 - 是否从某项任务重新分析。
 
-正常流程中的确认顺序是：先确认分析对象与实际依赖范围；若用户尚未提交源码，随后说明源码作用并让用户选择补充源码或明确不提供；若源码已由用户提交则直接使用，不增加一次重复确认。依赖 API 变化完成后确认全量或部分系统触达范围。兼容性线索扫描、系统触达分析和最终报告会自动衔接。
+正常流程中的确认顺序是：先确认分析对象与实际依赖范围；随后说明源码作用，并用一个入口收集所有可补充源码或记录暂不补充。编译模式已取得的业务源码不需要授权或重复提交；用户提交的位置由系统自动分类。依赖 API 变化完成后确认全量或部分系统触达范围。兼容性线索扫描、系统触达分析和最终报告会自动衔接。
 
 Step4 识别出至少两个可分析依赖后会让你选择 Step5 的分析范围：全量分析覆盖更完整，部分分析可以降低耗时，但最终结论只适用于所选范围。范围卡会展示依赖数、变化 API 数，以及按业务最终制品直接字节码引用证据排序的 Top 10 依赖和理由。删除或签名变化不会获得额外权重，依赖源码是否可用只作为解释条件展示。0 个或 1 个候选不存在实际范围取舍，系统会直接继续。确认范围后，系统会连续执行 Step5 和 Step6，不再要求点击“继续”；Step5 会把 binary-first 的四态摘要写成非阻塞 `user_decision_card`，供 Agent 直接转述。内部证据故障由系统自动重试或失败关闭，不会混入范围选择要求用户批准降级。
 
@@ -154,11 +154,11 @@ Step4 识别出至少两个可分析依赖后会让你选择 Step5 的分析范�
 ```
 
 ```text
-依赖源码目录是 /abs/path/to/dependency-source-repo，补充后重新分析系统触达证据。
+可以补充源码，位置是 /abs/path/to/business-source 和 /abs/path/to/dependency-source-repo。
 ```
 
 ```text
-这次不提供源码，按二进制证据继续。
+暂时无法补充其他源码，按现有制品和源码证据继续。
 ```
 
 ```text
@@ -329,7 +329,7 @@ Step6 已经生成了，但我想补充依赖源码后，从 Step5 重新分析�
 |---|---|---|
 | Step1 | 比较 base/current 最终依赖差异 | `evidence/dependencies/dep_changes.csv` |
 | Step2 | 建立升级上下文、源码和依赖映射 | `evidence/context/context.json` |
-| Step3 | 分析运行平台、应用框架及规范/命名空间迁移风险 | `evidence/static_scan/*.csv` |
+| Step3 | 分析运行平台、应用框架、规范/命名空间迁移风险，并比较双侧制品中的 MyBatis/ORM 数据库契约变化 | `evidence/static_scan/*.csv`、`evidence/static_scan/s3_database_contract_changes.md` |
 | Step4 | 比较变更依赖 JAR 的 API 变化 | `evidence/api_changes/changed_dependencies.md`、`evidence/api_changes/all_changed_apis.csv` |
 | Step5 | 追踪变化 API 是否触达业务代码 | `evidence/call_chain/alerts.csv` |
 | Step6 | 生成依赖结论、API 调用关系和两份全量明细 | `deliverables/report.md`、`deliverables/all-affected-dependencies.md`、`deliverables/all-impact-details.md` |
@@ -344,21 +344,21 @@ Step6 已经生成了，但我想补充依赖源码后，从 Step5 重新分析�
 
 如果工具发现多个可部署模块且无法唯一判断，Claude Code 必须让你选择，不能静默选择 root、第一个模块或最大产物。
 
-### 依赖源码路径或 Git 地址应该填什么？
+### 源码路径或 Git 地址应该填什么？
 
-填依赖包自己的源码仓库根目录，例如：
+可以一次填写被分析系统或依赖包的源码目录，例如：
 
 ```text
 /Users/me/source/dependency-project
 ```
 
-也可以直接在 `dependency_source_dirs` 中填写 Git 地址，例如：
+也可以在统一的 `source_locations` 中填写依赖源码 Git 地址，例如：
 
 ```json
-{"dependency_source_dirs":["https://git.example.com/team/dependency-project.git"]}
+{"source_locations":["https://git.example.com/team/dependency-project.git"]}
 ```
 
-不要填当前业务系统的源码目录。当前业务系统源码通常由 Maven reactor 或 Gradle project graph 自动推断。
+不需要自行标注源码类型。编译模式的业务源码通常已由 Maven reactor 或 Gradle project graph 自动推断；直接制品模式可以在同一列表中补充业务源码。
 
 ### 没有依赖源码还能分析吗？
 
@@ -366,7 +366,16 @@ Step6 已经生成了，但我想补充依赖源码后，从 Step5 重新分析�
 
 ### Step4 / Step5 很慢怎么办？
 
-Step4 慢时，让 Claude Code 先查看：
+Step4 可能超过 Agent 单次命令时限时，Claude Code 应从一开始就使用 `run_step.py --background`，并自行监视以下文件；不应要求用户另开 Git Bash/PowerShell、运行 nohup/临时脚本、授予管理员权限或配置 Defender/杀毒排除：
+
+```text
+.upgrade-report/.runtime/background/status.json
+.upgrade-report/.runtime/background/run.log
+.upgrade-report/.runtime/binary_authority/binary_observability/latest_in_progress.json
+.upgrade-report/.runtime/observability/progress.jsonl
+```
+
+Step4 完成后再查看：
 
 ```text
 .upgrade-report/.runtime/observability/step4_timing.csv
@@ -380,7 +389,7 @@ Step5 慢时，让 Claude Code 查看：
 .upgrade-report/.runtime/observability/step5_timing.csv
 ```
 
-不要只看总耗时猜瓶颈。运行时闭包很大、class/edge 很多或独立 Oracle 扫描量很大时，Step4 的整代构建会明显变慢；Step5 只是发布同一 generation 的选择范围和查询视图，不会重新扫描制品。
+不要只看总耗时、缓存条目数或被中断次数猜瓶颈，也不要把多次中断的累计时间外推为剩余时间。运行时闭包很大、class/edge 很多或独立 Oracle 扫描量很大时，Step4 的整代构建会明显变慢；Step5 只是发布同一 generation 的选择范围和查询视图，不会重新扫描制品。统一后台任务失败时，Claude Code 应读取状态和日志后自动恢复或安全停止，而不是让用户选择执行环境。
 
 ### Binary-first 需要哪些分析工具？
 

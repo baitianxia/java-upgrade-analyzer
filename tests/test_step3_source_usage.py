@@ -33,14 +33,18 @@ class Step3SourceUsageTest(unittest.TestCase):
 
             self.assertEqual(completed.returncode, 0, completed.stderr)
             payload = json.loads(coverage.read_text(encoding="utf-8"))
-            self.assertEqual(payload["source_usage_decision"], "skip_source")
+            self.assertEqual(payload["business_source_status"], "not_provided")
+            self.assertEqual(payload["dependency_source_status"], "not_provided")
             self.assertEqual(payload["source_coverage_status"], "not_provided")
             self.assertEqual(
                 payload["executed_scans"],
-                ["dep_compat", "dep_classfile"],
+                ["dep_compat", "dep_classfile", "database_contract"],
             )
             self.assertTrue((output / "s3_dependency_compat.csv").is_file())
             self.assertTrue((output / "s3_dependency_classfile.csv").is_file())
+            self.assertTrue((output / "s3_database_contract_changes.csv").is_file())
+            self.assertTrue((output / "s3_database_contract_summary.json").is_file())
+            self.assertTrue((output / "s3_database_contract_changes.md").is_file())
             self.assertFalse((output / "s3_jdk_removed_api.csv").exists())
 
     def test_dependency_source_only_does_not_claim_user_skipped_source(self):
@@ -66,7 +70,8 @@ class Step3SourceUsageTest(unittest.TestCase):
 
             self.assertEqual(completed.returncode, 0, completed.stderr)
             payload = json.loads(coverage.read_text(encoding="utf-8"))
-            self.assertEqual(payload["source_usage_decision"], "use_source")
+            self.assertEqual(payload["business_source_status"], "not_provided")
+            self.assertEqual(payload["dependency_source_status"], "available")
             self.assertEqual(
                 payload["source_coverage_status"], "dependency_source_only"
             )

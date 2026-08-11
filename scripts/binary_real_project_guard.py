@@ -406,8 +406,10 @@ def materialize_case(
 
     return {
         "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
-        "source_usage": {
-            "decision": "skip_source", "decision_source": "explicit_config",
+        "source_inputs": {
+            "purpose_version": "source-input-purpose-v2",
+            "business": {"status": "not_provided", "origin": "not_provided"},
+            "dependencies": {"status": "not_provided", "origin": "not_provided"},
         },
         "asm_jar": str(resolve_asm_jar()),
         "base": side("base"), "current": side("current"),

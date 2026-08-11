@@ -301,6 +301,7 @@ def gate_scan(d):
         with open(ctx_path, encoding="utf-8", errors="replace") as f:
             ctx = json.load(f)
     issues = []
+    invalid = []
     if ctx.get('jdk_upgraded'):
         for f in [
             's3_jdk_removed_api.csv',
@@ -325,8 +326,61 @@ def gate_scan(d):
         dep_classfile = scan_dir / "s3_dependency_classfile.csv"
         if not dep_classfile.exists():
             issues.append('s3_dependency_classfile.csv')
-    if issues:
-        fail(f"以下扫描文件缺失：{issues}",
+    dependency_jars = evidence_dependencies_dir(d) / 'dependency_jars.json'
+    if dependency_jars.exists():
+        contract_files = (
+            's3_database_contract_changes.csv',
+            's3_database_contract_summary.json',
+            's3_database_contract_changes.md',
+        )
+        for filename in contract_files:
+            if not (scan_dir / filename).exists():
+                issues.append(filename)
+        if not any(filename in issues for filename in contract_files):
+            summary_path = scan_dir / 's3_database_contract_summary.json'
+            csv_path = scan_dir / 's3_database_contract_changes.csv'
+            try:
+                with summary_path.open(encoding='utf-8') as source:
+                    contract_summary = json.load(source)
+                if contract_summary.get('schema') != (
+                    'java-upgrade-analyzer.database-contract-changes.v1'
+                ):
+                    invalid.append('s3_database_contract_summary.json:schema')
+                if contract_summary.get('coverage_status') not in {
+                    'complete', 'partial', 'insufficient'
+                }:
+                    invalid.append('s3_database_contract_summary.json:coverage_status')
+                expected_count = int(contract_summary.get('change_count'))
+                with open_csv_read(csv_path) as source:
+                    reader = csv.DictReader(source)
+                    required_columns = {
+                        '依赖包', '变化类型', '契约类型', '可信度', '表', '列',
+                        '契约位置', '语句或字段', '人工复核建议',
+                    }
+                    if not required_columns.issubset(set(reader.fieldnames or ())):
+                        invalid.append('s3_database_contract_changes.csv:header')
+                    actual_count = sum(1 for row in reader if row)
+                if actual_count != expected_count:
+                    invalid.append('s3_database_contract_changes.csv:row_count')
+                review_text = (
+                    scan_dir / 's3_database_contract_changes.md'
+                ).read_text(encoding='utf-8')
+                if '# 数据库契约变化明细' not in review_text:
+                    invalid.append('s3_database_contract_changes.md:contract')
+            except (
+                OSError, UnicodeError, json.JSONDecodeError, AttributeError,
+                TypeError, ValueError, csv.Error,
+            ) as error:
+                invalid.append(
+                    f's3_database_contract_outputs:{type(error).__name__}'
+                )
+    if issues or invalid:
+        detail = []
+        if issues:
+            detail.append(f"缺失={issues}")
+        if invalid:
+            detail.append(f"无效={invalid}")
+        fail(f"扫描产物未通过门禁：{'；'.join(detail)}",
              [f"{pc} scripts/run_step.py --step step3 --project-dir . --report-dir .upgrade-report"
               for pc in python_cmds()])
     ok("scan 门控通过")

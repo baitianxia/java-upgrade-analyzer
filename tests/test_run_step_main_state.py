@@ -72,8 +72,7 @@ class RunStepMainStateTest(unittest.TestCase):
             resolved_path = run_step._resolved_binary_pipeline_config_path(
                 {
                     "binary_pipeline_config": str(config),
-                    "source_usage_decision": "use_source",
-                    "source_usage_decision_source": "user_interaction",
+                    "source_provision_choice": "provide",
                     "dependency_source_mappings": [
                         f"com.example:demo={source_root}"
                     ],
@@ -90,6 +89,9 @@ class RunStepMainStateTest(unittest.TestCase):
         source_set = resolved["source_overlay"]["source_sets"][0]
         self.assertEqual(source_set["owner_coord"], "com.example:demo")
         self.assertEqual(source_set["snapshot_revision"], commit)
+        self.assertEqual(
+            resolved["source_inputs"]["dependencies"]["status"], "available"
+        )
 
     def test_orchestrator_exposes_no_engine_selection_or_fallback_api(self):
         self.assertFalse(hasattr(run_step, "normalize_binary_engine_mode"))
@@ -119,10 +121,8 @@ class RunStepMainStateTest(unittest.TestCase):
                 root / ".upgrade-report",
             )
             resolved = json.loads(resolved_path.read_text(encoding="utf-8"))
-            self.assertEqual(resolved["source_usage"]["decision"], "use_source")
             self.assertEqual(
-                resolved["source_usage"]["decision_source"],
-                "user_provided_source",
+                resolved["source_inputs"]["business"]["status"], "available"
             )
 
     def test_step4_materializes_binary_config_from_step1_when_not_supplied(self):
@@ -140,7 +140,7 @@ class RunStepMainStateTest(unittest.TestCase):
                 return_value=automatic,
             ) as materialize:
                 resolved_path = run_step._resolved_binary_pipeline_config_path(
-                    {"source_usage_decision": "skip_source"},
+                    {"source_provision_choice": "continue_without"},
                     root,
                     report,
                 )
@@ -148,13 +148,18 @@ class RunStepMainStateTest(unittest.TestCase):
             resolved = json.loads(resolved_path.read_text(encoding="utf-8"))
             materialize.assert_called_once()
             self.assertEqual(resolved["base"], automatic["base"])
-            self.assertEqual(resolved["source_usage"]["decision"], "skip_source")
+            self.assertEqual(
+                resolved["source_inputs"]["business"]["status"], "not_provided"
+            )
+            self.assertEqual(
+                resolved["source_inputs"]["dependencies"]["status"], "not_provided"
+            )
             self.assertTrue(
                 (report / ".runtime/state/binary_pipeline_config.materialized.json")
                 .is_file()
             )
 
-    def test_step4_config_without_source_requires_user_decision(self):
+    def test_step4_config_without_source_records_missing_source_categories(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             config = root / "binary.json"
@@ -164,37 +169,22 @@ class RunStepMainStateTest(unittest.TestCase):
                 }),
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(
-                run_step.StepError, "BINARY_SOURCE_USAGE_DECISION_REQUIRED"
-            ):
-                run_step._resolved_binary_pipeline_config_path(
-                    {"binary_pipeline_config": str(config)},
-                    root,
-                    root / ".upgrade-report",
-                )
-
-            config.write_text(
-                json.dumps({
-                    "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
-                    "source_usage": {
-                        "decision": "skip_source",
-                        "decision_source": "explicit_config",
-                    },
-                }),
-                encoding="utf-8",
-            )
             resolved_path = run_step._resolved_binary_pipeline_config_path(
                 {"binary_pipeline_config": str(config)},
                 root,
                 root / ".upgrade-report",
             )
             resolved = json.loads(resolved_path.read_text(encoding="utf-8"))
-            self.assertEqual(resolved["source_usage"]["decision"], "skip_source")
             self.assertEqual(
-                resolved["source_usage"]["decision_source"], "explicit_config"
+                resolved["source_inputs"],
+                {
+                    "purpose_version": "source-input-purpose-v2",
+                    "business": {"status": "not_provided", "origin": "not_provided"},
+                    "dependencies": {"status": "not_provided", "origin": "not_provided"},
+                },
             )
 
-    def test_user_source_choice_controls_resolved_step4_config(self):
+    def test_source_provision_choice_never_disables_available_source_sets(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             report = root / ".upgrade-report"
@@ -221,14 +211,16 @@ class RunStepMainStateTest(unittest.TestCase):
             skipped_path = run_step._resolved_binary_pipeline_config_path(
                 {
                     "binary_pipeline_config": str(config),
-                    "source_usage_decision": "skip_source",
+                    "source_provision_choice": "continue_without",
                 },
                 root,
                 report,
             )
             skipped = json.loads(skipped_path.read_text())
-            self.assertNotIn("source_overlay", skipped)
-            self.assertEqual(skipped["source_usage"]["decision"], "skip_source")
+            self.assertIn("source_overlay", skipped)
+            self.assertEqual(
+                skipped["source_inputs"]["business"]["status"], "available"
+            )
 
             config.write_text(
                 json.dumps({
@@ -239,7 +231,7 @@ class RunStepMainStateTest(unittest.TestCase):
             used_path = run_step._resolved_binary_pipeline_config_path(
                 {
                     "binary_pipeline_config": str(config),
-                    "source_usage_decision": "use_source",
+                    "source_provision_choice": "provide",
                     "source_dirs": [str(source_dir)],
                     "target_module": "app",
                     "dependency_source_mappings": [
@@ -250,7 +242,8 @@ class RunStepMainStateTest(unittest.TestCase):
                 report,
             )
             used = json.loads(used_path.read_text())
-            self.assertEqual(used["source_usage"]["decision"], "use_source")
+            self.assertEqual(used["source_inputs"]["business"]["status"], "available")
+            self.assertEqual(used["source_inputs"]["dependencies"]["status"], "available")
             self.assertEqual(
                 used["source_overlay"]["source_sets"][0]["source_dirs"],
                 [str(source_dir.resolve())],
@@ -263,6 +256,49 @@ class RunStepMainStateTest(unittest.TestCase):
                 used["source_overlay"]["source_sets"][1]["owner_type"],
                 "dependency",
             )
+
+    def test_checkout_build_source_is_automatic_when_no_more_source_is_provided(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = root / ".upgrade-report"
+            source_dir = root / "src" / "main" / "java"
+            source_dir.mkdir(parents=True)
+            config = root / "binary.json"
+            config.write_text(
+                json.dumps({
+                    "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+                }),
+                encoding="utf-8",
+            )
+
+            resolved_path = run_step._resolved_binary_pipeline_config_path(
+                {
+                    "binary_pipeline_config": str(config),
+                    "analysis_mode": "checkout_build",
+                    "base_branch": "main",
+                    "current_branch": "upgrade",
+                    "source_dirs": [str(source_dir)],
+                    "source_dirs_status": "auto_detected",
+                    "source_provision_choice": "continue_without",
+                    "target_module": "app",
+                },
+                root,
+                report,
+            )
+            resolved = json.loads(resolved_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            resolved["source_overlay"]["source_sets"][0]["owner_type"],
+            "business",
+        )
+        self.assertEqual(
+            resolved["source_inputs"]["business"],
+            {"status": "available", "origin": "checkout_build"},
+        )
+        self.assertEqual(
+            resolved["source_inputs"]["dependencies"]["status"],
+            "not_provided",
+        )
 
     def test_binary_failure_preserves_previous_outputs_and_records_internal_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -285,7 +321,7 @@ class RunStepMainStateTest(unittest.TestCase):
                     run_step._run_binary_step4(
                         run_context={
                             "binary_pipeline_config": str(config),
-                            "source_usage_decision": "skip_source",
+                            "source_provision_choice": "continue_without",
                         },
                         project_dir=root,
                         report_dir=report,
@@ -331,7 +367,7 @@ class RunStepMainStateTest(unittest.TestCase):
                 result = run_step._run_binary_step4(
                     run_context={
                         "binary_pipeline_config": str(config),
-                        "source_usage_decision": "skip_source",
+                        "source_provision_choice": "continue_without",
                     },
                     project_dir=root,
                     report_dir=report,
@@ -348,11 +384,11 @@ class RunStepMainStateTest(unittest.TestCase):
             )
             resolved_config = json.loads(resolved_config_path.read_text())
             self.assertEqual(
-                resolved_config["source_usage"],
+                resolved_config["source_inputs"],
                 {
-                    "decision": "skip_source",
-                    "decision_source": "user_interaction",
-                    "purpose_version": "source-overlay-purpose-v1",
+                    "purpose_version": "source-input-purpose-v2",
+                    "business": {"status": "not_provided", "origin": "not_provided"},
+                    "dependencies": {"status": "not_provided", "origin": "not_provided"},
                 },
             )
             self.assertNotIn("source_overlay", resolved_config)
@@ -493,8 +529,9 @@ class RunStepMainStateTest(unittest.TestCase):
                 manifest_steps,
                 project_dir,
                 run_context={
+                    "analysis_mode": "checkout_build",
                     "target_module": "app",
-                    "source_usage_decision": "skip_source",
+                    "source_provision_choice": "continue_without",
                     "source_dirs": [str(source_dir)],
                     "source_dirs_status": "explicit",
                 },
@@ -545,6 +582,9 @@ class RunStepMainStateTest(unittest.TestCase):
                 manifest_steps,
                 project_dir,
                 run_context={
+                    "analysis_mode": "checkout_build",
+                    "base_branch": "main",
+                    "current_branch": "upgrade",
                     "target_module": "app",
                     "source_dirs": [str(source_dir)],
                     "source_dirs_status": "explicit",
@@ -555,15 +595,16 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertEqual(payload["reason_code"], "STEP2_CONTEXT_FACTS_UNRESOLVED")
         self.assertEqual(
             payload["required_fields"],
-            ["jdk_base", "jdk_current"],
+            ["source_provision_choice", "jdk_base", "jdk_current"],
         )
         self.assertIn("升级前 JDK", payload["question"])
         self.assertIn("升级后 JDK", payload["question"])
-        self.assertNotIn("依赖源码目录", payload["question"])
+        self.assertIn("是否还能补充其他相关源码", payload["question"])
+        self.assertIn("source_provision_choice", payload["response_schema"]["properties"])
         self.assertIn("jdk_base", payload["response_schema"]["properties"])
         self.assertIn("jdk_current", payload["response_schema"]["properties"])
 
-    def test_step2_requires_informed_source_choice_before_auto_continue(self):
+    def test_step2_uses_one_source_provision_choice_and_keeps_internal_statuses(self):
         confirmation = run_step.build_step2_confirmation_requirements(
             {"jdk_base": "8", "jdk_current": "17"},
             {
@@ -571,15 +612,20 @@ class RunStepMainStateTest(unittest.TestCase):
                 "source_dirs_status": "context_detected",
                 "source_repo_hint_suggestions": {},
             },
-            {},
+            {
+                "analysis_mode": "checkout_build",
+                "base_branch": "main",
+                "current_branch": "upgrade",
+                "source_dirs": ["/project/src/main/java"],
+            },
         )
         self.assertTrue(confirmation["required"])
         self.assertEqual(
             confirmation["reason_code"],
-            "step2_source_usage_decision_required",
+            "step2_source_inputs_required",
         )
         self.assertEqual(
-            confirmation["required_fields"], ["source_usage_decision"]
+            confirmation["required_fields"], ["source_provision_choice"]
         )
 
         skipped = run_step.build_step2_confirmation_requirements(
@@ -589,7 +635,12 @@ class RunStepMainStateTest(unittest.TestCase):
                 "source_dirs_status": "missing",
                 "source_repo_hint_suggestions": {},
             },
-            {"source_usage_decision": "skip_source"},
+            {
+                "analysis_mode": "artifact_inputs",
+                "base_artifact_path": "/artifacts/base.jar",
+                "current_artifact_path": "/artifacts/current.jar",
+                "source_provision_choice": "continue_without",
+            },
         )
         self.assertFalse(skipped["required"])
 
@@ -602,7 +653,10 @@ class RunStepMainStateTest(unittest.TestCase):
                 "source_repo_hint_suggestions": {},
             },
             {
-                "source_usage_decision": "use_source",
+                "analysis_mode": "artifact_inputs",
+                "base_artifact_path": "/artifacts/base.jar",
+                "current_artifact_path": "/artifacts/current.jar",
+                "source_provision_choice": "provide",
                 "dependency_source_dirs": ["/repos/library"],
             },
         )
@@ -612,14 +666,16 @@ class RunStepMainStateTest(unittest.TestCase):
             {},
             {
                 "action": "continue",
-                "source_usage_decision": "use_source",
+                "source_provision_choice": "continue_without",
             },
             Path("/project"),
         )
-        self.assertEqual(persisted["source_usage_decision"], "use_source")
         self.assertEqual(
-            persisted["source_usage_purpose_version"],
-            "source-overlay-purpose-v1",
+            persisted["source_provision_choice"], "continue_without"
+        )
+        self.assertEqual(
+            persisted["source_input_purpose_version"],
+            "source-input-purpose-v2",
         )
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -630,15 +686,11 @@ class RunStepMainStateTest(unittest.TestCase):
                 {},
                 {
                     "action": "continue",
-                    "source_dirs": [str(provided_dir)],
+                    "source_locations": [str(provided_dir)],
                 },
                 project_dir,
             )
-        self.assertEqual(provided["source_usage_decision"], "use_source")
-        self.assertEqual(
-            provided["source_usage_decision_source"],
-            "user_provided_source",
-        )
+        self.assertEqual(provided["source_provision_choice"], "provide")
         no_extra_choice = run_step.build_step2_confirmation_requirements(
             {"jdk_base": "8", "jdk_current": "17"},
             {
@@ -685,6 +737,9 @@ class RunStepMainStateTest(unittest.TestCase):
                 },
                 project_dir,
                 run_context={
+                    "analysis_mode": "checkout_build",
+                    "base_branch": "main",
+                    "current_branch": "upgrade",
                     "target_module": "app",
                     "source_dirs": [str(source_dir)],
                     "source_dirs_status": "context_detected",
@@ -692,15 +747,100 @@ class RunStepMainStateTest(unittest.TestCase):
                 main_state=run_step.new_main_state(report_dir),
             )
 
-        self.assertIn("是否为本次分析提供源码", payload["question"])
+        self.assertIn("当前为编译模式", payload["question"])
+        self.assertIn("已经取得并会直接使用被分析系统源码", payload["question"])
+        self.assertIn("一次提交", payload["question"])
         self.assertIn("文件与行号", payload["question"])
-        self.assertIn("不会改变", payload["question"])
-        self.assertIn("不提供源码也可以继续", payload["question"])
-        self.assertEqual(payload["required_fields"], ["source_usage_decision"])
+        self.assertIn("暂时无法补充也可以继续", payload["question"])
+        self.assertEqual(payload["required_fields"], ["source_provision_choice"])
         self.assertEqual(
-            payload["response_schema"]["properties"]["source_usage_decision"]["enum"],
-            ["use_source", "skip_source"],
+            payload["response_schema"]["properties"]["source_provision_choice"]["enum"],
+            ["provide", "continue_without"],
         )
+        self.assertIn("source_locations", payload["response_schema"]["properties"])
+        self.assertNotIn("source_dirs", payload["response_schema"]["properties"])
+        self.assertNotIn("dependency_source_dirs", payload["response_schema"]["properties"])
+
+    def test_unified_source_locations_are_classified_internally(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "business"
+            business_source = project / "src" / "main" / "java"
+            business_source.mkdir(parents=True)
+            dependency = project / "third-party" / "library"
+            (dependency / "src" / "main" / "java").mkdir(parents=True)
+            (dependency / "pom.xml").write_text(
+                "<project><modelVersion>4.0.0</modelVersion>"
+                "<groupId>com.acme</groupId><artifactId>library</artifactId>"
+                "<version>2.0</version></project>",
+                encoding="utf-8",
+            )
+            report = project / ".upgrade-report"
+            context_path = run_step.step2_context_path(report)
+            context_path.parent.mkdir(parents=True)
+            context_path.write_text(
+                json.dumps({
+                    "changed_dependencies": [{"coord": "com.acme:library"}],
+                }),
+                encoding="utf-8",
+            )
+
+            merged = run_step.merge_user_response_into_run_context(
+                {
+                    "report_dir": str(report),
+                    "analysis_mode": "artifact_inputs",
+                },
+                {
+                    "action": "continue",
+                    "source_locations": [str(business_source), str(dependency)],
+                },
+                project,
+            )
+
+        self.assertEqual(merged["source_provision_choice"], "provide")
+        self.assertIn(str(business_source.resolve()), merged["source_dirs"])
+        self.assertIn(str(dependency.resolve()), merged["dependency_source_dirs"])
+        self.assertEqual(merged["unclassified_source_locations"], [])
+        self.assertEqual(
+            {item["owner_type"] for item in merged["source_location_classifications"]},
+            {"business", "dependency"},
+        )
+
+    def test_ambiguous_unified_source_mapping_feeds_dependency_overlay(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "business"
+            project.mkdir()
+            dependency = root / "sources" / "library"
+            dependency_source = dependency / "src" / "main" / "java"
+            dependency_source.mkdir(parents=True)
+            report = project / ".upgrade-report"
+            args = self._make_default_args(project, report)
+
+            context = run_step.build_run_context(
+                args,
+                existing={},
+                seed_payload={
+                    "analysis_mode": "artifact_inputs",
+                    "source_provision_choice": "provide",
+                    "source_locations": [str(dependency)],
+                    "source_location_mappings": [{
+                        "location": str(dependency),
+                        "owner_type": "dependency",
+                        "owner_coord": "com.acme:library",
+                    }],
+                },
+            )
+
+        self.assertIn(
+            f"com.acme:library={dependency.resolve()}",
+            context["dependency_repo_mappings"],
+        )
+        self.assertIn(
+            f"com.acme:library={dependency_source.resolve()}",
+            context["dependency_source_mappings"],
+        )
+        self.assertEqual(context["unclassified_source_locations"], [])
 
     def test_step2_stops_for_explicit_source_hint_decision_without_forcing_acceptance(self):
         confirmation = run_step.build_step2_confirmation_requirements(
@@ -717,7 +857,12 @@ class RunStepMainStateTest(unittest.TestCase):
                     ]
                 },
             },
-            {"source_usage_decision": "use_source"},
+            {
+                "analysis_mode": "artifact_inputs",
+                "source_provision_choice": "provide",
+                "source_dirs": ["/project/src/main/java"],
+                "source_repo_hints": ["/repos/demo-lib"],
+            },
         )
         pending = {
             "step_id": "step2",
@@ -768,7 +913,10 @@ class RunStepMainStateTest(unittest.TestCase):
                 },
             },
             {
-                "source_usage_decision": "use_source",
+                "analysis_mode": "artifact_inputs",
+                "source_provision_choice": "provide",
+                "source_dirs": ["/project/src/main/java"],
+                "source_repo_hints": ["/repos/demo-lib"],
                 "accept_suggested_mappings": False,
             },
         )
@@ -4356,9 +4504,10 @@ class RunStepMainStateTest(unittest.TestCase):
             self._write_text(run_step.step1_current_resolved_path(report_dir), "coord\n", encoding="utf-8")
             args = self._make_default_args(project_dir, report_dir)
             run_context = {
+                "analysis_mode": "checkout_build",
                 "source_dirs": [str((project_dir / "src/main/java").resolve())],
                 "source_dirs_status": "provided",
-                "source_usage_decision": "use_source",
+                "source_provision_choice": "provide",
                 "include_test_scope": True,
             }
             manifest_steps = {"step3": {"gate": "scan"}}
@@ -4384,7 +4533,7 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertNotIn("--target-jdk", captured["script_args"])
         self.assertNotIn("--no-source", captured["script_args"])
 
-    def test_execute_step3_skip_source_disables_source_scan(self):
+    def test_execute_step3_continue_without_more_source_keeps_build_source_scan(self):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
             report_dir = project_dir / ".upgrade-report"
@@ -4392,9 +4541,12 @@ class RunStepMainStateTest(unittest.TestCase):
             self._write_text(run_step.step2_context_path(report_dir), "{}", encoding="utf-8")
             args = self._make_default_args(project_dir, report_dir)
             run_context = {
+                "analysis_mode": "checkout_build",
+                "base_branch": "main",
+                "current_branch": "upgrade",
                 "source_dirs": [str((project_dir / "src/main/java").resolve())],
                 "source_dirs_status": "auto_detected",
-                "source_usage_decision": "skip_source",
+                "source_provision_choice": "continue_without",
             }
             manifest_steps = {"step3": {"gate": "scan"}}
             captured = {}
@@ -4409,7 +4561,7 @@ class RunStepMainStateTest(unittest.TestCase):
                 run_step.execute_step("step3", args, manifest_steps, run_context)
 
         self.assertEqual(captured["script_name"], "s3_scan.py")
-        self.assertIn("--no-source", captured["script_args"])
+        self.assertNotIn("--no-source", captured["script_args"])
         self.assertNotIn("--source-dirs", captured["script_args"])
 
     def test_execute_step4_does_not_pass_business_inputs_via_cli(self):
@@ -4449,7 +4601,7 @@ class RunStepMainStateTest(unittest.TestCase):
             config = project_dir / "binary.json"
             config.write_text("{}", encoding="utf-8")
             run_context["binary_pipeline_config"] = str(config)
-            run_context["source_usage_decision"] = "skip_source"
+            run_context["source_provision_choice"] = "provide"
             manifest_steps = {"step4": {"gate": "binary_diff"}}
             captured = []
 
@@ -5546,7 +5698,7 @@ class RunStepMainStateTest(unittest.TestCase):
                         "source_dirs": [str(source_dir.resolve())],
                         "source_dirs_status": "provided",
                         "binary_pipeline_config": str(config),
-                        "source_usage_decision": "use_source",
+                        "source_provision_choice": "continue_without",
                         "dependency_git_ref_overrides": [
                             {
                                 "coord": "com.example:demo-lib",
@@ -5626,6 +5778,13 @@ class RunStepMainStateTest(unittest.TestCase):
             risk_candidates = self._static_scan_dir(report_dir) / run_step.STEP3_RISK_CANDIDATES_FILE
             risk_candidates.parent.mkdir(parents=True, exist_ok=True)
             risk_candidates.write_text("coord\n", encoding="utf-8")
+            database_contract_files = [
+                self._static_scan_dir(report_dir) / "s3_database_contract_changes.csv",
+                self._static_scan_dir(report_dir) / "s3_database_contract_summary.json",
+                self._static_scan_dir(report_dir) / "s3_database_contract_changes.md",
+            ]
+            for path in database_contract_files:
+                path.write_text("stale\n", encoding="utf-8")
             per_dep_dir = self._api_changes_dir(report_dir) / run_step.PER_DEPENDENCY_DIRNAME / "sample_demo"
             per_dep_dir.mkdir(parents=True)
             candidate_hits = per_dep_dir / "candidate_hits.csv"
@@ -5652,6 +5811,7 @@ class RunStepMainStateTest(unittest.TestCase):
             run_step.cleanup_step_outputs("step3", report_dir)
 
             self.assertFalse(risk_candidates.exists())
+            self.assertTrue(all(not path.exists() for path in database_contract_files))
             self.assertFalse(candidate_hits.exists())
             summary = json.loads(summary_path.read_text(encoding="utf-8"))
             self.assertNotIn("step3", summary)

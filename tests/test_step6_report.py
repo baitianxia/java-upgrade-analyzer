@@ -3856,6 +3856,109 @@ class Step6ReportObjectivityTest(unittest.TestCase):
         self.assertEqual(2, guidance["failure_record_count"])
         self.assertEqual(0, guidance["failure_occurrence_count"])
 
+    def test_database_contract_section_is_bounded_and_links_details_at_section(self):
+        findings = self._human_first_findings()
+        findings["database_contract"] = {
+            "coverage_status": "complete",
+            "coverage_gaps": [],
+            "rows": [
+                {
+                    "依赖包": "com.acme:data-access",
+                    "变化类型": "新增当前契约",
+                    "契约类型": "MyBatis XML SELECT",
+                    "可信度": "确认",
+                    "表": "orders",
+                    "列": f"column_{index}",
+                    "契约位置": "com.acme.OrderMapper",
+                    "语句或字段": f"find{index}",
+                    "人工复核建议": "确认目标数据库结构满足当前契约。",
+                }
+                for index in range(12)
+            ],
+        }
+        findings["artifacts"].update({
+            "database_contract_review_md": (
+                "evidence/static_scan/s3_database_contract_changes.md"
+            ),
+            "database_contract_csv": (
+                "evidence/static_scan/s3_database_contract_changes.csv"
+            ),
+        })
+
+        report = s6_report.generate_report(findings)
+        section = report[
+            report.index("### 数据库契约变化提醒"):
+            report.index("## 二、API 及调用关系")
+        ]
+        toc = report[
+            report.index("## 报告目录"):report.index("## 一、依赖层面结论")
+        ]
+
+        self.assertIn("[数据库契约变化提醒]", toc)
+        self.assertIn("展示 10/12", section)
+        self.assertIn("完整人工复核明细", section)
+        self.assertIn("结构化明细 CSV", section)
+        self.assertIn("不表示对应 DDL/迁移已经存在或已执行", section)
+        self.assertIn("column_9", section)
+        self.assertNotIn("column_10", section)
+        self.assertIn("数据库契约完整复核明细", report)
+
+    def test_database_contract_gap_does_not_render_false_clean_conclusion(self):
+        lines = s6_report.render_database_contract_changes({
+            "database_contract": {
+                "coverage_status": "partial",
+                "coverage_gaps": ["artifact_missing:current:com.acme:data-access"],
+                "rows": [],
+            },
+            "artifacts": {},
+        })
+        text = "\n".join(lines)
+
+        self.assertIn("不能解释为确认没有数据库契约变化", text)
+        self.assertNotIn("本次未识别到升级前后数据访问契约变化", text)
+
+    def test_collect_findings_loads_database_contract_and_rejects_bad_csv_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            dependencies = report_dir / "evidence" / "dependencies"
+            static_scan = report_dir / "evidence" / "static_scan"
+            dependencies.mkdir(parents=True)
+            static_scan.mkdir(parents=True)
+            (dependencies / "dependency_jars.json").write_text(
+                json.dumps({"schema": "java-upgrade-analyzer.step1-dependency-jars.v3"}),
+                encoding="utf-8",
+            )
+            (static_scan / "s3_database_contract_summary.json").write_text(
+                json.dumps({
+                    "schema": "java-upgrade-analyzer.database-contract-changes.v1",
+                    "coverage_status": "complete",
+                    "coverage_gaps": [],
+                    "change_count": 1,
+                }),
+                encoding="utf-8",
+            )
+            (static_scan / "s3_database_contract_changes.md").write_text(
+                "# 数据库契约变化明细\n", encoding="utf-8"
+            )
+            csv_path = static_scan / "s3_database_contract_changes.csv"
+            csv_path.write_text("错误列\nvalue\n", encoding="utf-8")
+
+            findings = s6_report.collect_findings(report_dir)
+
+            self.assertEqual(
+                findings["database_contract"]["coverage_status"], "partial"
+            )
+            self.assertEqual(findings["database_contract"]["rows"], [])
+            self.assertIn(
+                "database_contract_output_contract_invalid",
+                findings["database_contract"]["coverage_gaps"],
+            )
+            self.assertTrue(any(
+                item.get("artifact") == "step3_database_contract_changes"
+                and item.get("stage") == "csv_contract"
+                for item in findings["diagnostics"]
+            ))
+
 
 if __name__ == "__main__":
     unittest.main()

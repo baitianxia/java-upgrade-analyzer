@@ -34,6 +34,12 @@ sys.path.insert(0, str(Path(__file__).parent))
 from compat import open_text, write_text
 from csv_io import open_csv_read, open_csv_write
 from progress_logging import PhaseTimer, emit_progress
+from database_contract_scan import (
+    CSV_NAME as DATABASE_CONTRACT_CSV_NAME,
+    REVIEW_NAME as DATABASE_CONTRACT_REVIEW_NAME,
+    SUMMARY_NAME as DATABASE_CONTRACT_SUMMARY_NAME,
+    scan_database_contracts,
+)
 from pipeline_constants import (
     EVIDENCE_CONTEXT_DIRNAME,
     EVIDENCE_DIRNAME,
@@ -669,6 +675,14 @@ def cleanup_step3_outputs(report_dir):
 
     for _, default_fname in SCAN_FUNCS.values():
         output_path = report_root / default_fname
+        if output_path.exists():
+            output_path.unlink()
+
+    for filename in (
+        DATABASE_CONTRACT_SUMMARY_NAME,
+        DATABASE_CONTRACT_REVIEW_NAME,
+    ):
+        output_path = report_root / filename
         if output_path.exists():
             output_path.unlink()
 
@@ -1854,6 +1868,23 @@ def scan_dependency_classfile_versions(_source_dir, output_path, dep_changes_pat
 # 主函数
 # ══════════════════════════════════════════════════════════════════
 
+def scan_database_contract_changes(_source_dir, output_path, _dep_list_path=None):
+    """Compare retained base/current artifacts; source input is not required."""
+    summary = scan_database_contracts(STEP3_REPORT_DIR, Path(output_path).parent)
+    status = str(summary.get('coverage_status') or 'insufficient')
+    if status != 'complete':
+        record_scan_diagnostic(
+            stage='database_contract_coverage',
+            path=Path(output_path).parent / DATABASE_CONTRACT_SUMMARY_NAME,
+            error=RuntimeError('; '.join(summary.get('coverage_gaps') or [status])),
+        )
+    count = int(summary.get('change_count') or 0)
+    print(
+        f"  database_contract: {count} 个契约变化，覆盖状态 {status} → {output_path}",
+        file=sys.stderr,
+    )
+    return count
+
 SCAN_FUNCS = {
     'jdk_removed':   (scan_jdk_removed,   's3_jdk_removed_api.csv'),
     'javax':         (scan_javax,          's3_jdk_javax_refs.csv'),
@@ -1865,6 +1896,7 @@ SCAN_FUNCS = {
     'sb_autoconfig': (scan_sb_autoconfig,  's3_springboot_autoconfig.txt'),
     'dep_compat':    (scan_dependency_compat, 's3_dependency_compat.csv'),
     'dep_classfile': (scan_dependency_classfile_versions, 's3_dependency_classfile.csv'),
+    'database_contract': (scan_database_contract_changes, DATABASE_CONTRACT_CSV_NAME),
 }
 SOURCE_REQUIRED_SCANS = {
     'jdk_removed', 'javax', 'jdk_internal', 'reflection', 'serialization',
@@ -1879,8 +1911,8 @@ def write_step3_coverage(
     executed_scans,
     coverage_output='',
     *,
-    source_usage_decision='use_source',
-    business_source_coverage_status='',
+    business_source_status='available',
+    dependency_source_status='not_provided',
 ):
     extension_counts = {}
     read_failures = []
@@ -1914,11 +1946,16 @@ def write_step3_coverage(
             + (['scan_operation_failures'] if scan_diagnostics else [])
         ),
         'source_roots': list(source_roots or []),
-        'source_usage_decision': source_usage_decision,
-        'source_coverage_status': business_source_coverage_status or (
-            'not_provided'
-            if source_usage_decision == 'skip_source'
-            else ('complete' if source_roots else 'missing')
+        'business_source_status': business_source_status,
+        'dependency_source_status': dependency_source_status,
+        'source_coverage_status': (
+            'complete'
+            if business_source_status == 'available' and source_roots
+            else (
+                'dependency_source_only'
+                if dependency_source_status == 'available'
+                else 'not_provided'
+            )
         ),
         'planned_scans': planned,
         'executed_scans': executed,
@@ -1967,9 +2004,9 @@ def main():
     ap.add_argument('--source-dirs', nargs='+',
                     help='源码目录列表（Step3 会扫描全部目录）')
     ap.add_argument('--no-source', action='store_true',
-                    help='用户明确选择不提供源码；只执行最终制品可完成的扫描')
+                    help='没有可用源码输入；只执行最终制品可完成的扫描')
     ap.add_argument('--no-business-source', action='store_true',
-                    help='用户提供了依赖源码但没有业务源码；跳过业务源码扫描')
+                    help='只有依赖源码可用；跳过业务源码扫描')
     ap.add_argument('--output',
                     help='输出文件路径（单项扫描时使用）')
     ap.add_argument('--output-dir', default='.upgrade-report',
@@ -2031,7 +2068,7 @@ def main():
     if not source_roots and not business_source_unavailable:
         ap.error('the following arguments are required: --source-dir')
     if args.no_source:
-        print("\nStep 3 扫描：用户选择不提供源码，仅执行最终制品扫描", file=sys.stderr)
+        print("\nStep 3 扫描：没有可用源码输入，仅执行最终制品扫描", file=sys.stderr)
     elif args.no_business_source:
         print("\nStep 3 扫描：已提供依赖源码但没有业务源码，仅执行最终制品扫描", file=sys.stderr)
     else:
@@ -2054,16 +2091,20 @@ def main():
 
     if args.all:
         # 根据升级类型决定运行哪些扫描
-        to_run = []
+        # 数据库契约对比使用 Step1 保留的双侧制品，与源码和升级类型无关。
+        to_run = ['database_contract']
         if args.jdk_upgraded:
             to_run += ['jdk_removed', 'javax', 'jdk_internal', 'reflection', 'serialization', 'jdk_runtime_flags']
         if args.sb_major_upgrade:
             to_run += ['javax', 'sb_config', 'sb_autoconfig']
         if dep_list_path:
             to_run += ['dep_compat', 'dep_classfile']
-        if not to_run:
+        if to_run == ['database_contract'] and not (
+            args.jdk_upgraded or args.sb_major_upgrade or dep_list_path
+        ):
             # 没有指定升级类型，运行全部
             to_run = list(SCAN_FUNCS.keys())
+        to_run = list(dict.fromkeys(to_run))
         if business_source_unavailable:
             to_run = [item for item in to_run if item not in SOURCE_REQUIRED_SCANS]
 
@@ -2109,9 +2150,11 @@ def main():
             to_run,
             executed_scans,
             args.coverage_output,
-            source_usage_decision=('skip_source' if args.no_source else 'use_source'),
-            business_source_coverage_status=(
-                'dependency_source_only' if args.no_business_source else ''
+            business_source_status=(
+                'not_provided' if args.no_source or args.no_business_source else 'available'
+            ),
+            dependency_source_status=(
+                'available' if args.no_business_source else 'not_provided'
             ),
         )
         print(f"\nStep 3 完成：共 {total} 处命中", file=sys.stderr)
@@ -2135,9 +2178,11 @@ def main():
             [args.type],
             [args.type],
             args.coverage_output,
-            source_usage_decision=('skip_source' if args.no_source else 'use_source'),
-            business_source_coverage_status=(
-                'dependency_source_only' if args.no_business_source else ''
+            business_source_status=(
+                'not_provided' if args.no_source or args.no_business_source else 'available'
+            ),
+            dependency_source_status=(
+                'available' if args.no_business_source else 'not_provided'
             ),
         )
         emit_progress(

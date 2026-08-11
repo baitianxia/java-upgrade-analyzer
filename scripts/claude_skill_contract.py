@@ -79,6 +79,11 @@ def audit_public_contract(root: Path) -> tuple[str, ...]:
         ".upgrade-report/.runtime/state/interaction.json",
         "--describe-step1-contract",
         "--response-json",
+        "Step4 执行方式不是用户决策点",
+        "不得要求用户另开 Git Bash/PowerShell/终端",
+        "不得建议管理员权限、Defender/杀毒软件排除",
+        ".upgrade-report/.runtime/background/status.json",
+        ".upgrade-report/.runtime/binary_authority/binary_observability/latest_in_progress.json",
     ):
         if required not in text:
             errors.append(f"missing_public_contract:{required}")

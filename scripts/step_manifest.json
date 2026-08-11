@@ -117,7 +117,7 @@
       "interaction": {
         "type": "decision",
         "status": "awaiting_user_input",
-        "question": "请确认升级口径和项目范围。已提交源码目录、源码仓库或 source_overlay 时系统会直接使用；尚未提交源码时，请决定补充源码还是明确不提供。源码可增加文件/行号、声明与注解、可读上下文和候选关系，并在受支持的常量内联场景与字节码共同形成证明；不会覆盖最终二进制裁决。不提供源码也可以继续，但报告会标注源码解释覆盖缺失。",
+        "question": "请确认升级口径和项目范围。编译模式已经取得并直接使用被分析系统源码；如还能提供其他相关源码，可一次提交目录或 Git 地址，系统自动区分业务源码和依赖源码。直接制品模式也使用同一个入口补充被分析系统及其依赖源码。源码可增加文件/行号、声明与注解、可读上下文和候选关系，但不会覆盖最终二进制裁决；暂不补充也可以继续，报告会分别标注源码证据缺口。",
         "required_fields": [
           "action"
         ],
@@ -166,21 +166,21 @@
               "type": "string",
               "description": "升级后 Spring Boot 版本。仅在自动识别错误时修正。"
             },
-            "source_dirs": {
-              "type": "array",
-              "description": "当 source_usage_decision=use_source 且无法自动推导业务源码范围时提供。"
-            },
-            "source_usage_decision": {
+            "source_provision_choice": {
               "type": "string",
               "enum": [
-                "use_source",
-                "skip_source"
+                "provide",
+                "continue_without"
               ],
-              "description": "未提交源码时必选。用户已经提交源码目录、源码仓库或 source_overlay 时直接视为 use_source，不重复确认；系统自动识别的目录不能替用户选择。"
+              "description": "说明是否能够补充其他相关源码输入；不是对系统已经取得的源码进行使用授权。"
             },
-            "dependency_source_dirs": {
+            "source_locations": {
               "type": "array",
-              "description": "可选。提供依赖源码工程目录、多模块仓库根目录或 Git 地址；Git 地址会克隆到报告内部缓存，系统随后自动推断模块坐标并派生后续所需映射。"
+              "description": "可选。统一提交源码目录、多模块仓库根目录或 Git 地址；系统自动区分业务源码和依赖源码。"
+            },
+            "source_location_mappings": {
+              "type": "array",
+              "description": "仅在系统无法可靠分类某个源码位置时使用；每项包含 location、owner_type，依赖源码可附 owner_coord。"
             },
             "source_repo_hints": {
               "type": "array",
@@ -199,7 +199,7 @@
           {
             "id": "continue",
             "label": "继续",
-            "description": "口径正确；已提交源码时直接使用，未提交时需明确补充源码或不提供。使用源码时系统会建立与最终制品绑定的语义覆盖。"
+            "description": "口径正确；一次补充可提供的相关源码，或明确暂不补充。系统自动分类并建立与最终制品绑定的语义覆盖。"
           },
           {
             "id": "cancel",
@@ -253,7 +253,10 @@
         "evidence/static_scan/s3_springboot_config.csv",
         "evidence/static_scan/s3_springboot_autoconfig.txt",
         "evidence/static_scan/s3_dependency_compat.csv",
-        "evidence/static_scan/s3_dependency_classfile.csv"
+        "evidence/static_scan/s3_dependency_classfile.csv",
+        "evidence/static_scan/s3_database_contract_changes.csv",
+        "evidence/static_scan/s3_database_contract_summary.json",
+        "evidence/static_scan/s3_database_contract_changes.md"
       ],
       "notes": [
         "实际输出受 evidence/context/context.json 中的升级标志控制。"

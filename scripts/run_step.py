@@ -120,8 +120,8 @@ USER_ACTION_LABELS = {
     "cancel": "暂时停止分析",
     "confirm_local_source": "确认使用本地源码",
 }
-SOURCE_USAGE_DECISIONS = {"use_source", "skip_source"}
-SOURCE_USAGE_PURPOSE_VERSION = "source-overlay-purpose-v1"
+SOURCE_PROVISION_CHOICES = {"provide", "continue_without"}
+SOURCE_INPUT_PURPOSE_VERSION = "source-input-purpose-v2"
 SCRIPT_STEP_IDS = {
     "s1_dep_diff.py": "step1",
     "s2_context_from_deps.py": "step2",
@@ -159,7 +159,9 @@ INTENT_PATCH_ALLOWED_SET_FIELDS = {
     "modules",
     "primary_module",
     "source_dirs",
-    "source_usage_decision",
+    "source_provision_choice",
+    "source_locations",
+    "source_location_mappings",
     "source_repo_hints",
     "springboot_base",
     "springboot_current",
@@ -1585,9 +1587,8 @@ def build_step_derived_snapshot(step_id, run_context, report_dir):
         return {
             key: ctx.get(key)
             for key in (
-                "source_usage_decision",
-                "source_usage_decision_source",
-                "source_usage_purpose_version",
+                "source_provision_choice",
+                "source_input_purpose_version",
                 "source_dirs_status",
                 "dependency_source_mapping_conflicts",
                 "unmapped_dependency_coords",
@@ -1600,9 +1601,8 @@ def build_step_derived_snapshot(step_id, run_context, report_dir):
         return {
             key: ctx.get(key)
             for key in (
-                "source_usage_decision",
-                "source_usage_decision_source",
-                "source_usage_purpose_version",
+                "source_provision_choice",
+                "source_input_purpose_version",
                 "dependency_repo_mappings",
                 "dependency_source_mappings",
                 "dependency_source_mapping_conflicts",
@@ -2194,30 +2194,84 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
             "accept_suggested_mappings",
         )
 
-    response_source_decision = (
-        normalize_source_usage_decision(response.get("source_usage_decision"))
-        if "source_usage_decision" in response
+    source_provision_choice = (
+        normalize_source_provision_choice(
+            response.get("source_provision_choice"),
+            "source_provision_choice",
+        )
+        if "source_provision_choice" in response
         else ""
     )
-    source_was_provided = bool(
+    source_locations = normalize_dependency_source_dirs(
+        response.get("source_locations"),
+        project_dir,
+        "source_locations",
+    ) if "source_locations" in response else None
+    source_location_mappings = normalize_source_location_mappings(
+        response.get("source_location_mappings"),
+        project_dir,
+    ) if "source_location_mappings" in response else None
+    if source_locations is not None:
+        updated["source_locations"] = source_locations
+    if source_location_mappings is not None:
+        updated["source_location_mappings"] = source_location_mappings
+    locations_to_classify = (
+        updated.get("source_locations")
+        if source_locations is not None or source_location_mappings is not None
+        else []
+    )
+    if locations_to_classify:
+        classified = classify_source_locations(
+            locations_to_classify,
+            updated,
+            project_dir,
+            mappings=updated.get("source_location_mappings") or [],
+        )
+        updated["unclassified_source_locations"] = list(
+            classified.get("unclassified") or []
+        )
+        updated["source_location_classifications"] = list(
+            classified.get("classifications") or []
+        )
+        classified_business_dirs = list(classified.get("business_source_dirs") or [])
+        if classified_business_dirs:
+            updated["source_dirs"] = _dedupe_strings(
+                list(updated.get("source_dirs") or []) + classified_business_dirs
+            )
+            updated["source_dirs_status"] = "explicit"
+            updated.pop("pinned_source_snapshot", None)
+        classified_dependency_dirs = list(
+            classified.get("dependency_source_dirs") or []
+        )
+        if classified_dependency_dirs:
+            updated["dependency_source_dirs"] = _dedupe_strings(
+                list(updated.get("dependency_source_dirs") or [])
+                + classified_dependency_dirs
+            )
+            updated["dependency_source_git_urls"] = [
+                item
+                for item in updated["dependency_source_dirs"]
+                if is_dependency_source_git_url(item, project_dir)
+            ]
+            updated.pop("dependency_source_git_materializations", None)
+            updated.pop("dependency_repo_mappings", None)
+            updated.pop("dependency_source_mappings", None)
+
+    supplemental_source_was_provided = bool(
         source_dirs
         or dependency_source_dirs
         or source_repo_hints
+        or source_locations
     )
-    if source_was_provided and response_source_decision == "skip_source":
+    if supplemental_source_was_provided and source_provision_choice == "continue_without":
         raise StepError(
-            "本次答复同时提供了源码并选择 skip_source；请删除源码输入，或选择 use_source。"
+            "本次答复同时提供了源码位置并选择暂不补充源码；请保留其中一种输入。"
         )
-    if source_was_provided:
-        # Supplying source is itself an informed opt-in.  Do not force the user
-        # through a redundant second confirmation after they provided it.
-        updated["source_usage_decision"] = "use_source"
-        updated["source_usage_decision_source"] = "user_provided_source"
-        updated["source_usage_purpose_version"] = SOURCE_USAGE_PURPOSE_VERSION
-    elif response_source_decision:
-        updated["source_usage_decision"] = response_source_decision
-        updated["source_usage_decision_source"] = "user_interaction"
-        updated["source_usage_purpose_version"] = SOURCE_USAGE_PURPOSE_VERSION
+    if supplemental_source_was_provided:
+        updated["source_provision_choice"] = "provide"
+    elif source_provision_choice:
+        updated["source_provision_choice"] = source_provision_choice
+    updated["source_input_purpose_version"] = SOURCE_INPUT_PURPOSE_VERSION
 
     for key in ("step5_selected_coords", "step5_selected_names"):
         value = normalize_step5_target_list(response.get(key), key)
@@ -2450,39 +2504,84 @@ def normalize_analysis_mode(raw_value, *, allow_empty=False):
     return value
 
 
-def normalize_source_usage_decision(raw_value, *, allow_empty=False):
+def normalize_source_provision_choice(raw_value, field_name, *, allow_empty=False):
     value = str(raw_value or "").strip()
     if not value:
         if allow_empty:
             return ""
-        raise StepError("source_usage_decision 不能为空")
-    if value not in SOURCE_USAGE_DECISIONS:
+        raise StepError(f"{field_name} 不能为空")
+    if value not in SOURCE_PROVISION_CHOICES:
         raise StepError(
-            "source_usage_decision 仅支持 use_source 或 skip_source"
+            f"{field_name} 仅支持 provide 或 continue_without"
         )
     return value
 
 
-def source_usage_decision_for_context(run_context):
+def source_input_state_for_context(run_context, mapping_summary=None):
     context = dict(run_context or {})
-    decision = normalize_source_usage_decision(
-        context.get("source_usage_decision"), allow_empty=True
+    summary = dict(mapping_summary or {})
+    mode = str(infer_step1_mode_fields(context).get("analysis_mode") or "")
+    provision_choice = normalize_source_provision_choice(
+        context.get("source_provision_choice"),
+        "source_provision_choice",
+        allow_empty=True,
     )
-    if decision:
-        return decision
-    if (
-        (
-            str(context.get("source_dirs_status") or "").strip() == "explicit"
-            and bool(context.get("source_dirs"))
-        )
+    business_available = bool(
+        summary.get("source_dirs")
+        or context.get("source_dirs")
+        or context.get("source_overlay_business_provided")
+    )
+    dependency_available = bool(
+        summary.get("dependency_source_dirs")
+        or summary.get("confirmed_target_mappings")
         or context.get("dependency_source_dirs")
+        or context.get("dependency_source_mappings")
         or context.get("source_repo_hints")
-        or context.get("base_source_project_dir")
-        or context.get("current_source_project_dir")
+        or context.get("source_overlay_dependency_provided")
+    )
+    if business_available:
+        business_status = (
+            "available_from_build" if mode == "checkout_build" else "provided"
+        )
+    else:
+        business_status = "not_provided"
+    if dependency_available:
+        dependency_status = "provided"
+    else:
+        dependency_status = "not_provided"
+    unclassified = list(
+        summary.get("unclassified_source_locations")
+        or context.get("unclassified_source_locations")
+        or []
+    )
+    has_supplemental_input = bool(
+        context.get("source_locations")
+        or dependency_available
+        or context.get("source_repo_hints")
+        or (
+            business_available
+            and mode == "artifact_inputs"
+        )
         or context.get("source_overlay_config_provided")
-    ):
-        return "use_source"
-    return ""
+    )
+    if unclassified:
+        provision_status = "awaiting_mapping"
+    elif provision_choice == "continue_without":
+        provision_status = "complete"
+    elif provision_choice == "provide":
+        provision_status = "complete" if has_supplemental_input else "awaiting_input"
+    else:
+        provision_status = "complete" if has_supplemental_input else "awaiting_choice"
+    return {
+        "analysis_mode": mode,
+        "source_provision_choice": provision_choice,
+        "source_provision_status": provision_status,
+        "business_source_status": business_status,
+        "dependency_source_status": dependency_status,
+        "business_source_available": business_available,
+        "dependency_source_available": dependency_available,
+        "purpose_version": SOURCE_INPUT_PURPOSE_VERSION,
+    }
 
 
 def apply_explicit_step1_mode_selection(run_context):
@@ -3443,6 +3542,148 @@ def normalize_dependency_source_dirs(raw_value, project_dir, config_key="depende
     return normalized
 
 
+def normalize_source_location_mappings(raw_value, project_dir):
+    if raw_value in (None, ""):
+        return None
+    if isinstance(raw_value, dict):
+        iterable = [
+            {"location": location, "owner_type": owner}
+            if isinstance(owner, str)
+            else {"location": location, **dict(owner or {})}
+            for location, owner in raw_value.items()
+        ]
+    elif isinstance(raw_value, list):
+        iterable = raw_value
+    else:
+        raise StepError("source_location_mappings 仅支持对象或对象列表")
+    normalized = []
+    for item in iterable:
+        if not isinstance(item, dict):
+            raise StepError("source_location_mappings 的每一项都必须是对象")
+        location = str(
+            item.get("location")
+            or item.get("path")
+            or item.get("url")
+            or ""
+        ).strip()
+        owner_type = str(item.get("owner_type") or "").strip()
+        if not location or owner_type not in {"business", "dependency"}:
+            raise StepError(
+                "source_location_mappings 每项必须包含 location，以及 business 或 dependency 类型的 owner_type"
+            )
+        normalized_location = (
+            location
+            if is_dependency_source_git_url(location, project_dir)
+            else resolve_repo_input_path(absolutize_path(location, project_dir))
+        )
+        normalized.append({
+            "location": normalized_location,
+            "owner_type": owner_type,
+            "owner_coord": str(item.get("owner_coord") or item.get("coord") or "").strip(),
+        })
+    return normalized
+
+
+def _path_is_within(path, root):
+    try:
+        Path(path).expanduser().resolve().relative_to(
+            Path(root).expanduser().resolve()
+        )
+        return True
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def classify_source_locations(locations, run_context, project_dir, *, mappings=None):
+    """Classify one user-facing source list without exposing ownership choices."""
+    context = dict(run_context or {})
+    manual = {
+        str(item.get("location") or "").strip(): dict(item)
+        for item in (mappings or [])
+        if str((item or {}).get("location") or "").strip()
+    }
+    report_dir = str(context.get("report_dir") or "").strip()
+    relevant_coords = _collect_relevant_dependency_coords(report_dir) if report_dir else []
+    relevant_ga = {artifact_ga(coord) for coord in relevant_coords if artifact_ga(coord)}
+    business_roots = _dedupe_strings(
+        [str(project_dir)]
+        + [
+            str(context.get(key) or "").strip()
+            for key in ("base_source_project_dir", "current_source_project_dir")
+            if str(context.get(key) or "").strip()
+        ]
+    )
+    business_source_dirs = []
+    dependency_source_dirs = []
+    unclassified = []
+    classifications = []
+    for raw_location in locations or []:
+        location = str(raw_location or "").strip()
+        if not location:
+            continue
+        mapping = manual.get(location)
+        is_git = is_dependency_source_git_url(location, project_dir)
+        if mapping:
+            owner_type = mapping["owner_type"]
+            reason = "user_resolved_ambiguous_location"
+        elif is_git:
+            repo_name = Path(location.rstrip("/").rsplit("/", 1)[-1]).stem.lower()
+            matching_ga = [ga for ga in relevant_ga if ga.rsplit(":", 1)[-1].lower() == repo_name]
+            owner_type = "dependency" if matching_ga else ""
+            reason = "git_repository_name_matches_dependency" if owner_type else ""
+        else:
+            local_path = resolve_repo_input_path(absolutize_path(location, project_dir))
+            location = local_path
+            plan = _build_dependency_source_plan(
+                [local_path], relevant_coords=relevant_coords
+            )
+            candidate_ga = {
+                artifact_ga(str(item.get("coord") or ""))
+                for item in (plan.get("candidates") or [])
+                if artifact_ga(str(item.get("coord") or ""))
+            }
+            if relevant_ga and candidate_ga.intersection(relevant_ga):
+                owner_type = "dependency"
+                reason = "maven_coordinate_matches_changed_dependency"
+            elif any(_path_is_within(local_path, root) for root in business_roots):
+                owner_type = "business"
+                reason = "inside_analyzed_project"
+            else:
+                owner_type = ""
+                reason = ""
+        if owner_type == "dependency":
+            dependency_source_dirs.append(location)
+        elif owner_type == "business":
+            if is_git:
+                unclassified.append({
+                    "location": location,
+                    "reason": "business_git_repository_requires_local_checkout",
+                })
+                continue
+            source_plan = _resolve_source_dirs_plan(Path(location))
+            resolved_dirs = list(source_plan.get("source_dirs") or [])
+            if not resolved_dirs and Path(location).is_dir():
+                resolved_dirs = [location]
+            business_source_dirs.extend(resolved_dirs)
+        else:
+            unclassified.append({
+                "location": location,
+                "reason": "source_owner_cannot_be_inferred_reliably",
+            })
+            continue
+        classifications.append({
+            "location": location,
+            "owner_type": owner_type,
+            "reason": reason,
+        })
+    return {
+        "business_source_dirs": _dedupe_strings(business_source_dirs),
+        "dependency_source_dirs": _dedupe_strings(dependency_source_dirs),
+        "unclassified": unclassified,
+        "classifications": classifications,
+    }
+
+
 def normalize_dependency_repo_mappings(raw_value, project_dir, config_key="dependency_repo_mappings"):
     if raw_value in (None, ""):
         return None
@@ -4094,6 +4335,9 @@ def infer_non_pending_target_step_from_payload(user_response):
                 "springboot_base",
                 "springboot_current",
                 "source_dirs",
+                "source_provision_choice",
+                "source_locations",
+                "source_location_mappings",
                 "dependency_source_dirs",
                 "source_repo_hints",
                 "accept_suggested_mappings",
@@ -4642,7 +4886,6 @@ def _normalized_repo_key(repo_path):
 
 def build_step2_source_mapping_summary(run_context, ctx):
     runtime_view = dict(run_context or {})
-    source_usage_decision = source_usage_decision_for_context(runtime_view)
     source_dirs = _dedupe_strings(
         runtime_view.get("source_dirs") or (ctx or {}).get("source_dirs") or []
     )
@@ -4650,22 +4893,15 @@ def build_step2_source_mapping_summary(run_context, ctx):
     if not source_dirs_status:
         source_dirs_status = "context_detected" if source_dirs else "unknown"
     dependency_source_dirs = _dedupe_strings(runtime_view.get("dependency_source_dirs") or [])
-    effective_dependency_source_dirs = (
-        dependency_source_dirs if source_usage_decision == "use_source" else []
-    )
     target_coords = _collect_focus_dependency_coords(runtime_view.get("report_dir") or "", ctx=ctx)
     relevant_coords = _collect_relevant_dependency_coords(runtime_view.get("report_dir") or "", ctx=ctx)
     plan = _build_dependency_source_plan(
-        effective_dependency_source_dirs,
+        dependency_source_dirs,
         relevant_coords=relevant_coords or target_coords,
     )
     discovered_candidates = list(plan.get("candidates") or [])
 
-    current_mapping = (
-        _current_dependency_repo_mapping_map(runtime_view)
-        if source_usage_decision == "use_source"
-        else {}
-    )
+    current_mapping = _current_dependency_repo_mapping_map(runtime_view)
     current_mapping_by_repo = {}
     for coord, repo_path in current_mapping.items():
         repo_key = _normalized_repo_key(repo_path)
@@ -4687,7 +4923,7 @@ def build_step2_source_mapping_summary(run_context, ctx):
     )
     ambiguous_coords = list(plan.get("ambiguous_coords") or [])
     repo_scans = []
-    for repo_path in effective_dependency_source_dirs:
+    for repo_path in dependency_source_dirs:
         repo_key = _normalized_repo_key(repo_path)
         repo_candidates = [
             item for item in discovered_candidates
@@ -4749,20 +4985,31 @@ def build_step2_source_mapping_summary(run_context, ctx):
         else:
             unmapped_target_coords.append(coord)
 
-    suggestions = (
-        build_dependency_repo_mapping_suggestions(runtime_view, ctx)
-        if source_usage_decision == "use_source"
-        else {"confirmed": [], "proposed": [], "ambiguous": [], "unmatched": []}
+    suggestions = build_dependency_repo_mapping_suggestions(runtime_view, ctx)
+    source_input_state = source_input_state_for_context(
+        runtime_view,
+        {
+            "source_dirs": source_dirs,
+            "dependency_source_dirs": dependency_source_dirs,
+            "confirmed_target_mappings": confirmed_target_mappings,
+        },
     )
     return {
-        "source_usage_decision": source_usage_decision or "awaiting_user_decision",
-        "source_usage_decision_source": str(
-            runtime_view.get("source_usage_decision_source") or ""
-        ),
-        "source_usage_purpose_version": SOURCE_USAGE_PURPOSE_VERSION,
+        "business_source_status": source_input_state["business_source_status"],
+        "dependency_source_status": source_input_state["dependency_source_status"],
+        "source_provision_choice": source_input_state["source_provision_choice"],
+        "source_provision_status": source_input_state["source_provision_status"],
+        "source_input_purpose_version": SOURCE_INPUT_PURPOSE_VERSION,
         "source_dirs": source_dirs,
         "source_dirs_status": source_dirs_status,
         "dependency_source_dirs": dependency_source_dirs,
+        "source_locations": list(runtime_view.get("source_locations") or []),
+        "source_location_classifications": list(
+            runtime_view.get("source_location_classifications") or []
+        ),
+        "unclassified_source_locations": list(
+            runtime_view.get("unclassified_source_locations") or []
+        ),
         "target_dependency_coords": target_coords,
         "current_confirmed_repo_matches": _dedupe_strings(runtime_view.get("dependency_repo_mappings") or []),
         "confirmed_target_mappings": confirmed_target_mappings,
@@ -4796,6 +5043,20 @@ def write_step2_source_mapping_summary(report_dir, run_context, ctx):
     return output_path, summary
 
 
+def _source_status_label(status, *, business):
+    value = str(status or "").strip()
+    labels = {
+        "available_from_build": "构建输入已具备，系统直接使用",
+        "provided": "已提供，系统直接使用",
+        "not_provided": "未提供，保留相应源码证据缺口",
+        "awaiting_choice": "等待确认是否能够补充",
+        "awaiting_input": "等待补充源码位置",
+    }
+    if value in labels:
+        return labels[value]
+    return "业务源码状态未记录" if business else "依赖源码状态未记录"
+
+
 def write_step2_review(report_dir, ctx, mapping_summary, runtime_view=None):
     output_path = evidence_context_dir(report_dir) / "review.md"
     counts = dict((mapping_summary or {}).get("counts") or {})
@@ -4824,15 +5085,8 @@ def write_step2_review(report_dir, ctx, mapping_summary, runtime_view=None):
         f"| JDK | {ctx.get('jdk_base') or '未识别'} → {ctx.get('jdk_current') or '未识别'} |",
         f"| Spring Boot | {ctx.get('springboot_base') or '未识别'} → {ctx.get('springboot_current') or '未识别'} |",
         f"| 发生变化的依赖包 | {len(ctx.get('changed_dependencies') or [])} 个 |",
-        (
-            "| 源码辅助选择 | 用户选择提供源码 |"
-            if (mapping_summary or {}).get("source_usage_decision") == "use_source"
-            else (
-                "| 源码辅助选择 | 用户选择不提供源码 |"
-                if (mapping_summary or {}).get("source_usage_decision") == "skip_source"
-                else "| 源码辅助选择 | 等待用户决定 |"
-            )
-        ),
+        f"| 业务源码 | {_source_status_label((mapping_summary or {}).get('business_source_status'), business=True)} |",
+        f"| 依赖源码 | {_source_status_label((mapping_summary or {}).get('dependency_source_status'), business=False)} |",
         f"| 业务源码目录 | {len(source_dirs)} 个 |",
         f"| 已匹配依赖源码 | {counts.get('confirmed_target_mappings', len(mapped))} / {counts.get('target_dependency_coords', 0)} 个目标依赖 |",
     ]
@@ -4854,7 +5108,7 @@ def write_step2_review(report_dir, ctx, mapping_summary, runtime_view=None):
             "提供源码可以增加文件/行号、声明与注解、可读上下文和源码候选关系，"
             "并在受支持的常量内联场景与字节码共同形成证明；"
             "正式变化、运行时提供者、方法解析和精确可执行边仍由最终二进制制品决定。",
-            "选择不提供源码时仍执行完整二进制分析，但报告会明确标注源码语义解释覆盖缺失。",
+            "未补充某类源码时仍执行完整二进制分析，但报告会分别标注对应的源码语义解释覆盖缺失。",
             "",
             "完整结构化证据保存在同目录的 `context.json`、`dep_graph.json` 和 `source_mapping_summary.json`。",
         ]
@@ -4870,13 +5124,24 @@ def build_step2_confirmation_requirements(ctx, mapping_summary, runtime_view=Non
     runtime_view = dict(runtime_view or {})
     reasons = []
     required_fields = []
-    source_usage_decision = source_usage_decision_for_context(runtime_view)
-
-    if not source_usage_decision:
+    source_input_state = source_input_state_for_context(
+        runtime_view, mapping_summary
+    )
+    analysis_mode = source_input_state["analysis_mode"]
+    provision_status = source_input_state["source_provision_status"]
+    if provision_status == "awaiting_choice":
         reasons.append(
-            "尚未由用户决定是否提供源码辅助分析；系统不能默认读取或默认跳过源码"
+            "编译模式已经取得并会直接使用被分析系统源码；请说明是否还能补充其他相关源码，主要是依赖源码"
+            if analysis_mode == "checkout_build"
+            else "直接制品模式可补充被分析系统及其依赖的源码；请说明是否能够提供相关源码"
         )
-        required_fields.append("source_usage_decision")
+        required_fields.append("source_provision_choice")
+    elif provision_status == "awaiting_input":
+        reasons.append("已选择补充源码，但尚未提供源码目录或 Git 地址")
+        required_fields.append("source_locations")
+    elif provision_status == "awaiting_mapping":
+        reasons.append("部分源码位置无法可靠判断归属，需要补充一次归属映射")
+        required_fields.append("source_location_mappings")
 
     if not str(ctx.get("jdk_base") or "").strip() or str(ctx.get("jdk_base") or "").strip() == "unknown":
         reasons.append("未能自动识别升级前 JDK 版本")
@@ -4885,24 +5150,8 @@ def build_step2_confirmation_requirements(ctx, mapping_summary, runtime_view=Non
         reasons.append("未能自动识别升级后 JDK 版本")
         required_fields.append("jdk_current")
 
-    source_dirs = list(mapping_summary.get("source_dirs") or runtime_view.get("source_dirs") or [])
-    source_dirs_status = str(mapping_summary.get("source_dirs_status") or "missing").strip()
-    dependency_source_available = bool(
-        mapping_summary.get("dependency_source_dirs")
-        or runtime_view.get("dependency_source_dirs")
-        or runtime_view.get("dependency_source_mappings")
-        or runtime_view.get("source_repo_hints")
-        or runtime_view.get("source_overlay_config_provided")
-    )
-    if source_usage_decision == "use_source" and (
-        (not source_dirs or source_dirs_status == "missing")
-        and not dependency_source_available
-    ):
-        reasons.append("用户选择使用源码，但尚未提供或定位到任何业务/依赖源码")
-        required_fields.append("source_dirs")
-
     ambiguous_coords = list(mapping_summary.get("ambiguous_coords") or [])
-    if source_usage_decision == "use_source" and ambiguous_coords:
+    if source_input_state["dependency_source_available"] and ambiguous_coords:
         preview = "、".join(
             str((item or {}).get("coord") or "").strip()
             for item in ambiguous_coords[:5]
@@ -4917,7 +5166,7 @@ def build_step2_confirmation_requirements(ctx, mapping_summary, runtime_view=Non
     suggestion_decision_recorded = "accept_suggested_mappings" in runtime_view
     proposed_mappings = (
         []
-        if suggestion_decision_recorded or source_usage_decision != "use_source"
+        if suggestion_decision_recorded or not source_input_state["dependency_source_available"]
         else list(suggestions.get("proposed") or [])
     )
     if proposed_mappings:
@@ -4935,8 +5184,16 @@ def build_step2_confirmation_requirements(ctx, mapping_summary, runtime_view=Non
             "step2_source_mapping_decision_required"
             if proposed_mappings and len(reasons) == 1
             else (
-                "step2_source_usage_decision_required"
-                if required_fields == ["source_usage_decision"]
+                "step2_source_inputs_required"
+                if any(field in required_fields for field in (
+                    "source_provision_choice",
+                    "source_locations",
+                    "source_location_mappings",
+                ))
+                and all(
+                    field in {"source_provision_choice", "source_locations", "source_location_mappings"}
+                    for field in required_fields
+                )
                 else ("step2_context_facts_unresolved" if reasons else "")
             )
         ),
@@ -5362,18 +5619,26 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
         "source_dirs_status": resolve_value(
             None, merged, "source_dirs_status", ""
         ),
-        "source_usage_decision": normalize_source_usage_decision(
-            resolve_value(None, merged, "source_usage_decision", ""),
+        "source_provision_choice": normalize_source_provision_choice(
+            resolve_value(None, merged, "source_provision_choice", ""),
+            "source_provision_choice",
             allow_empty=True,
         ),
-        "source_usage_decision_source": resolve_value(
-            None, merged, "source_usage_decision_source", ""
-        ),
-        "source_usage_purpose_version": resolve_value(
-            None,
+        "source_input_purpose_version": SOURCE_INPUT_PURPOSE_VERSION,
+        "source_locations": resolve_value(
+            cli_list(getattr(args, "source_locations", None)),
             merged,
-            "source_usage_purpose_version",
-            SOURCE_USAGE_PURPOSE_VERSION,
+            "source_locations",
+            [],
+        ),
+        "source_location_mappings": resolve_value(
+            None, merged, "source_location_mappings", []
+        ),
+        "source_location_classifications": resolve_value(
+            None, merged, "source_location_classifications", []
+        ),
+        "unclassified_source_locations": resolve_value(
+            None, merged, "unclassified_source_locations", []
         ),
         "dependency_source_dirs": resolve_value(cli_list(args.dependency_source_dirs), merged, "dependency_source_dirs", []),
         "dependency_source_git_urls": resolve_value(
@@ -5462,6 +5727,37 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
         path_value = result.get(path_key)
         if isinstance(path_value, str) and path_value.strip():
             result[path_key] = absolutize_path(path_value.strip(), project_dir)
+    normalized_source_locations = normalize_dependency_source_dirs(
+        result.get("source_locations"), project_dir, "source_locations"
+    ) or []
+    normalized_source_location_mappings = normalize_source_location_mappings(
+        result.get("source_location_mappings"), project_dir
+    ) or []
+    result["source_locations"] = normalized_source_locations
+    result["source_location_mappings"] = normalized_source_location_mappings
+    if normalized_source_locations:
+        classified = classify_source_locations(
+            normalized_source_locations,
+            result,
+            project_dir,
+            mappings=normalized_source_location_mappings,
+        )
+        result["source_location_classifications"] = list(
+            classified.get("classifications") or []
+        )
+        result["unclassified_source_locations"] = list(
+            classified.get("unclassified") or []
+        )
+        classified_business = list(classified.get("business_source_dirs") or [])
+        if classified_business:
+            result["source_dirs"] = _dedupe_strings(
+                list(result.get("source_dirs") or []) + classified_business
+            )
+            result["source_dirs_status"] = "explicit"
+        result["dependency_source_dirs"] = _dedupe_strings(
+            list(result.get("dependency_source_dirs") or [])
+            + list(classified.get("dependency_source_dirs") or [])
+        )
     dependency_source_inputs = normalize_dependency_source_dirs(
         result.get("dependency_source_dirs"),
         project_dir,
@@ -5512,6 +5808,49 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
         dependency_source_materialization.get("dependency_source_dirs") or []
     )
     result.update(dependency_source_materialization)
+    manual_dependency_repo_mappings = []
+    manual_dependency_source_mappings = []
+    materializations = list(
+        dependency_source_materialization.get(
+            "dependency_source_git_materializations"
+        ) or []
+    )
+    for mapping in result.get("source_location_mappings") or []:
+        if str((mapping or {}).get("owner_type") or "") != "dependency":
+            continue
+        coord = str((mapping or {}).get("owner_coord") or "").strip()
+        location = str((mapping or {}).get("location") or "").strip()
+        if not coord or not location:
+            continue
+        repo_path = location
+        if is_dependency_source_git_url(location, project_dir):
+            endpoint = _canonical_git_endpoint(location)
+            repo_path = next(
+                (
+                    str(item.get("repo_path") or "").strip()
+                    for item in materializations
+                    if _canonical_git_endpoint(item.get("git_endpoint") or item.get("git_url"))
+                    == endpoint
+                ),
+                "",
+            )
+        if not repo_path:
+            continue
+        repo_path = resolve_repo_input_path(absolutize_path(repo_path, project_dir))
+        manual_dependency_repo_mappings.append(f"{coord}={repo_path}")
+        source_plan = _resolve_source_dirs_plan(Path(repo_path))
+        for source_dir in source_plan.get("source_dirs") or []:
+            manual_dependency_source_mappings.append(f"{coord}={source_dir}")
+    if manual_dependency_repo_mappings:
+        result["dependency_repo_mappings"] = _dedupe_strings(
+            list(result.get("dependency_repo_mappings") or [])
+            + manual_dependency_repo_mappings
+        )
+    if manual_dependency_source_mappings:
+        result["dependency_source_mappings"] = _dedupe_strings(
+            list(result.get("dependency_source_mappings") or [])
+            + manual_dependency_source_mappings
+        )
     result["dependency_repo_mappings"] = normalize_dependency_repo_mappings(
         result.get("dependency_repo_mappings"),
         project_dir,
@@ -5645,20 +5984,14 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
         result["unmapped_dependency_coords"] = [
             coord for coord in focus_dependency_coords if coord not in current_mapping_map
         ]
-    binary_config_has_source = False
     binary_config_business_dirs = []
-    binary_config_source_decision = ""
+    binary_config_dependency_source = False
     binary_config_path = str(result.get("binary_pipeline_config") or "").strip()
     if binary_config_path and Path(binary_config_path).is_file():
         binary_config = read_json(binary_config_path) or {}
-        binary_config_source_decision = normalize_source_usage_decision(
-            (binary_config.get("source_usage") or {}).get("decision"),
-            allow_empty=True,
-        )
         source_sets = list(
             (binary_config.get("source_overlay") or {}).get("source_sets") or []
         )
-        binary_config_has_source = bool(source_sets)
         binary_config_business_dirs = _dedupe_strings(
             str(source_dir)
             for source_set in source_sets
@@ -5666,71 +5999,62 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
             for source_dir in ((source_set or {}).get("source_dirs") or [])
             if str(source_dir or "").strip()
         )
-    if binary_config_has_source:
+        binary_config_dependency_source = any(
+            str((source_set or {}).get("owner_type") or "") == "dependency"
+            for source_set in source_sets
+        )
+    if binary_config_business_dirs or binary_config_dependency_source:
         result["source_overlay_config_provided"] = True
+        result["source_overlay_business_provided"] = bool(
+            binary_config_business_dirs
+        )
+        result["source_overlay_dependency_provided"] = bool(
+            binary_config_dependency_source
+        )
         if not result.get("source_dirs") and binary_config_business_dirs:
             result["source_dirs"] = [
                 absolutize_path(item, project_dir)
                 for item in binary_config_business_dirs
             ]
             result["source_dirs_status"] = "explicit"
-    if not result.get("source_usage_decision") and binary_config_source_decision:
-        result["source_usage_decision"] = binary_config_source_decision
-        result["source_usage_decision_source"] = "explicit_config"
-        result["source_usage_purpose_version"] = SOURCE_USAGE_PURPOSE_VERSION
-    if not result.get("source_usage_decision"):
-        source_was_provided = bool(
-            (
-                str(result.get("source_dirs_status") or "").strip() == "explicit"
-                and result.get("source_dirs")
-            )
-            or result.get("dependency_source_dirs")
-            or result.get("source_repo_hints")
-            or result.get("base_source_project_dir")
-            or result.get("current_source_project_dir")
-            or binary_config_has_source
+    supplemental_source_provided = bool(
+        result.get("dependency_source_dirs")
+        or result.get("dependency_source_mappings")
+        or result.get("source_repo_hints")
+        or binary_config_dependency_source
+        or result.get("source_locations")
+        or (
+            result.get("source_dirs")
+            and result.get("analysis_mode") == "artifact_inputs"
         )
-        if source_was_provided:
-            result["source_usage_decision"] = "use_source"
-            result["source_usage_decision_source"] = "user_provided_source"
-            result["source_usage_purpose_version"] = SOURCE_USAGE_PURPOSE_VERSION
-    elif not str(result.get("source_usage_decision_source") or "").strip():
-        result["source_usage_decision_source"] = "user_interaction"
+        or result.get("source_overlay_config_provided")
+    )
+    if supplemental_source_provided and not result.get("source_provision_choice"):
+        result["source_provision_choice"] = "provide"
+    result["source_input_purpose_version"] = SOURCE_INPUT_PURPOSE_VERSION
     return result
 
 
 def validate_run_context_for_step(step_id, run_context):
     source_dirs = list(run_context.get("source_dirs") or [])
-    source_dirs_status = str(run_context.get("source_dirs_status") or "").strip() or "missing"
-    source_usage_decision = source_usage_decision_for_context(run_context)
-    dependency_source_available = bool(
-        run_context.get("dependency_source_dirs")
-        or run_context.get("dependency_source_mappings")
-        or run_context.get("source_repo_hints")
-        or run_context.get("source_overlay_config_provided")
-    )
-
-    if step_id in {"step3", "step4", "step5", "step6"} and not source_usage_decision:
+    source_input_state = source_input_state_for_context(run_context)
+    if (
+        step_id in {"step3", "step4", "step5", "step6"}
+        and source_input_state["source_provision_status"] != "complete"
+    ):
         raise StepError(
-            "尚未决定是否使用源码。用户未提供源码时，必须先说明源码作用并由用户选择提供或不提供。"
+            "源码补充环节尚未完成。请回到 Step2 一次提交可提供的源码位置，"
+            "或明确暂不补充；系统会自动区分业务源码和依赖源码。"
         )
     if (
         step_id == "step3"
-        and source_usage_decision == "use_source"
+        and source_input_state["analysis_mode"] == "checkout_build"
         and not source_dirs
-        and not dependency_source_available
     ):
         raise StepError(
-            "未确认业务源码目录 source_dirs。请回到 Step2 补充或确认 source_dirs 后再继续；"
-            "不要依赖后续步骤临时自动探测。"
+            "编译模式已经取得被分析系统源码，但系统没有定位到业务源码目录。"
+            "请回到 Step2 修正模块或 source_dirs；不能静默退化成无业务源码分析。"
         )
-    if (
-        step_id == "step3"
-        and source_usage_decision == "use_source"
-        and source_dirs_status == "missing"
-        and not dependency_source_available
-    ):
-        raise StepError("业务源码目录仍处于 missing 状态，请先在 Step2 确认 source_dirs。")
 
 
 def ensure_exists(path, message):
@@ -7706,7 +8030,9 @@ def _user_field_label(field):
         "springboot_base": "升级前 Spring Boot 版本",
         "springboot_current": "升级后 Spring Boot 版本",
         "source_dirs": "业务源码目录",
-        "source_usage_decision": "是否提供源码辅助分析",
+        "source_provision_choice": "是否能够补充相关源码",
+        "source_locations": "源码目录或 Git 地址",
+        "source_location_mappings": "无法自动分类的源码归属",
         "dependency_source_dirs": "依赖源码目录或 Git 地址",
         "source_repo_hints": "源码仓库线索",
         "dependency_repo_mappings": "依赖源码映射",
@@ -7739,10 +8065,11 @@ def _user_field_description(field, meta=None):
         "jdk_current": "升级后实际使用的 JDK 主版本。",
         "springboot_base": "升级前实际使用的 Spring Boot 版本。",
         "springboot_current": "升级后实际使用的 Spring Boot 版本。",
-        "source_usage_decision": (
-            "选择提供源码可增加文件/行号、声明与注解、可读上下文和候选关系；"
-            "选择不提供时仍完成二进制分析，但源码解释覆盖会缺失。"
+        "source_provision_choice": (
+            "说明是否还能提供相关源码输入；这不是对系统已有源码的使用授权。"
         ),
+        "source_locations": "可混合提交源码目录和 Git 地址，系统自动识别业务源码及依赖源码。",
+        "source_location_mappings": "仅在系统无法可靠分类某个源码位置时补充归属。",
         "dependency_source_dirs": "相关依赖源码仓库目录、多模块仓库根目录或 HTTPS/SSH Git 地址。",
         "dependency_repo_mappings": "存在多个源码候选时，明确依赖坐标对应的源码仓库。",
         "accept_suggested_mappings": "采用会增加源码行为覆盖；不采用则保留最终制品证据边界。",
@@ -7773,7 +8100,9 @@ def _humanize_interaction_text(text):
         "dependency_repo_mappings": "依赖源码映射",
         "accept_suggested_mappings": "是否采用建议的依赖源码映射",
         "source_dirs": "业务源码目录",
-        "source_usage_decision": "是否提供源码辅助分析",
+        "source_provision_choice": "是否能够补充相关源码",
+        "source_locations": "源码目录或 Git 地址",
+        "source_location_mappings": "无法自动分类的源码归属",
         "target_module": "目标模块",
         "project_scope": "项目范围",
         "step5_selected_coords": "系统触达证据要分析的依赖坐标",
@@ -7851,13 +8180,17 @@ def _decision_card_reply_examples(interaction, selection_options, options):
                 "不采用建议映射，按最终制品 JAR 证据继续",
             ]
         )
-    if "source_usage_decision" in required_fields:
+    if "source_provision_choice" in required_fields:
         examples.extend(
             [
-                "提供源码辅助分析，源码目录是 /path/to/project/src/main/java",
-                "这次不提供源码，按二进制证据继续",
+                "可以补充源码，位置是 /path/to/source-repo",
+                "暂时无法补充其他源码，按现有制品和源码证据继续",
             ]
         )
+    if "source_locations" in required_fields:
+        examples.append("源码位置是 /path/to/project-source 和 /path/to/dependency-source")
+    if "source_location_mappings" in required_fields:
+        examples.append("将无法识别的位置标记为业务源码或对应依赖源码后继续")
     jdk_fields = {"jdk_base", "jdk_current"} & required_fields
     if jdk_fields:
         values = []
@@ -8587,21 +8920,26 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
             reason_text = "；".join(confirmation.get("reasons") or [])
             interaction_meta["type"] = "input_request"
             interaction_meta["reason_code"] = confirmation.get("reason_code")
-            if confirmation.get("reason_code") == "step2_source_usage_decision_required":
+            if confirmation.get("reason_code") == "step2_source_inputs_required":
+                mode = infer_step1_mode_fields(runtime_view).get("analysis_mode")
+                mode_context = (
+                    "当前为编译模式，系统已经取得并会直接使用被分析系统源码，不需要你授权或重复提供。"
+                    if mode == "checkout_build"
+                    else "当前为直接制品模式，你可以同时补充被分析系统源码和相关依赖源码。"
+                )
                 interaction_meta["question"] = (
-                    "是否为本次分析提供源码？提供源码可以补充文件与行号、声明和注解、"
+                    f"{mode_context}是否还能补充其他相关源码？"
+                    "你只需一次提交可提供的源码目录或 Git 地址，系统会自动识别归属；"
+                    "只有无法可靠分类时才会再请求映射。源码可以补充文件与行号、声明和注解、"
                     "可读上下文及源码候选关系，并在受支持的常量内联场景与字节码共同形成证明；"
-                    "不会改变由最终制品确定的"
-                    "正式变化、运行时提供者、方法解析或精确可执行边。"
-                    "不提供源码也可以继续完整二进制分析，但源码语义解释覆盖会明确缺失。"
-                    "请选择提供源码（source_usage_decision=use_source）或不提供源码"
-                    "（source_usage_decision=skip_source）。"
+                    "不会改变由最终制品确定的正式变化、运行时提供者、方法解析或精确可执行边。"
+                    "暂时无法补充也可以继续，报告会分别标注业务源码和依赖源码的证据覆盖。"
                 )
                 interaction_meta["options"] = [
                     {
                         "id": "continue",
-                        "label": "按源码选择继续",
-                        "description": "明确选择提供或不提供源码后继续；系统不会替你默认选择。",
+                        "label": "补充或跳过后继续",
+                        "description": "提交一个统一源码位置列表，或明确暂不补充其他源码。",
                     },
                     {
                         "id": "cancel",
@@ -8923,22 +9261,34 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
     }
     properties = response_schema.setdefault("properties", {})
     if step_id == "step2":
+        for internal_field in (
+            "source_dirs",
+            "dependency_source_dirs",
+            "source_repo_hints",
+        ):
+            properties.pop(internal_field, None)
         properties.setdefault(
-            "source_usage_decision",
+            "source_provision_choice",
             {
                 "type": "string",
-                "enum": ["use_source", "skip_source"],
+                "enum": ["provide", "continue_without"],
                 "description": (
-                    "必选。use_source 表示用户知情后选择提供并使用源码语义覆盖；"
-                    "skip_source 表示用户选择不提供源码，系统只执行二进制分析并记录源码解释覆盖缺口。"
+                    "说明是否能够补充其他相关源码输入。这不是对系统已有源码的使用授权。"
                 ),
             },
         )
         properties.setdefault(
-            "dependency_source_dirs",
+            "source_locations",
             {
                 "type": "array",
-                "description": "可选。提供依赖源码目录或 Git 地址，支持单模块或多模块仓库；Git 地址会克隆到报告内部缓存，系统会自动推断模块坐标、Step4 仓库映射与 Step5 源码映射。",
+                "description": "可选。统一提交可提供的源码目录或 Git 地址；不要求用户区分业务源码和依赖源码，系统会自动分类。",
+            },
+        )
+        properties.setdefault(
+            "source_location_mappings",
+            {
+                "type": "array",
+                "description": "仅在系统无法可靠分类某个源码位置时使用；每项包含 location、owner_type，依赖源码可附 owner_coord。",
             },
         )
     if step_id == "step4":
@@ -8953,20 +9303,6 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
             },
         )
     if step_id == "step2":
-        properties.setdefault(
-            "source_dirs",
-            {
-                "type": "array",
-                "description": "可选但强烈建议确认。业务源码目录，Step3/Step5 将直接消费；若留空，系统仅尝试自动探测并在后续步骤前做强校验。",
-            },
-        )
-        properties.setdefault(
-            "source_repo_hints",
-            {
-                "type": "array",
-                "description": "可选。提供源码线索而非最终映射，支持 path、repo_path、git_path、或 {coord_hint,path,notes}。",
-            },
-        )
         for field_name, label in (
             ("jdk_base", "升级前 JDK 版本"),
             ("jdk_current", "升级后 JDK 版本"),
@@ -10521,6 +10857,9 @@ def step_output_paths_for_cleanup(step_id, report_dir):
             evidence_static_scan_dir(report_dir) / "s3_springboot_autoconfig.txt",
             evidence_static_scan_dir(report_dir) / "s3_dependency_compat.csv",
             evidence_static_scan_dir(report_dir) / "s3_dependency_classfile.csv",
+            evidence_static_scan_dir(report_dir) / "s3_database_contract_changes.csv",
+            evidence_static_scan_dir(report_dir) / "s3_database_contract_summary.json",
+            evidence_static_scan_dir(report_dir) / "s3_database_contract_changes.md",
             evidence_static_scan_dir(report_dir) / STEP3_RISK_CANDIDATES_FILE,
         ],
         "step4": [
@@ -10599,37 +10938,7 @@ def _resolved_binary_pipeline_config_path(
         run_context, project_dir, report_dir
     )
     config = read_json(source_path)
-    decision = normalize_source_usage_decision(
-        (run_context or {}).get("source_usage_decision"), allow_empty=True
-    )
-    decision_source = str(
-        (run_context or {}).get("source_usage_decision_source") or ""
-    ).strip()
-    if not decision:
-        config_decision = normalize_source_usage_decision(
-            (config.get("source_usage") or {}).get("decision"),
-            allow_empty=True,
-        )
-        if config_decision:
-            decision = config_decision
-            decision_source = "explicit_config"
-        elif config.get("source_overlay"):
-            decision = "use_source"
-            decision_source = "user_provided_source"
-    if not decision:
-        raise StepError(
-            "BINARY_SOURCE_USAGE_DECISION_REQUIRED: 运行二进制分析前必须先告知源码作用，"
-            "并由用户明确选择 use_source 或 skip_source。",
-            reason_codes=["BINARY_SOURCE_USAGE_DECISION_REQUIRED"],
-        )
-    if decision == "skip_source":
-        if decision_source == "explicit_config" and config.get("source_overlay"):
-            raise StepError(
-                "BINARY_SOURCE_OVERLAY_NOT_CONSENTED: 显式配置选择 skip_source 时不得保留 source_overlay。",
-                reason_codes=["BINARY_SOURCE_OVERLAY_NOT_CONSENTED"],
-            )
-        config.pop("source_overlay", None)
-    elif config.get("source_overlay"):
+    if config.get("source_overlay"):
         if not list((config.get("source_overlay") or {}).get("source_sets") or []):
             raise StepError(
                 "BINARY_SOURCE_SETS_REQUIRED: source_overlay 必须按业务系统或依赖包分别提供 source_sets。",
@@ -10714,19 +11023,34 @@ def _resolved_binary_pipeline_config_path(
                 "module": Path(module_root).name or coord,
                 "snapshot_revision": snapshot_revision,
             })
-        if not source_sets:
-            raise StepError(
-                "BINARY_SOURCE_OVERLAY_INPUT_REQUIRED: 用户选择提供源码，但没有可用的"
-                "业务源码目录、依赖源码映射或 source_overlay。",
-                reason_codes=["BINARY_SOURCE_OVERLAY_INPUT_REQUIRED"],
-            )
-        config["source_overlay"] = {
-            "source_sets": source_sets,
-        }
-    config["source_usage"] = {
-        "decision": decision,
-        "decision_source": decision_source or "user_interaction",
-        "purpose_version": SOURCE_USAGE_PURPOSE_VERSION,
+        if source_sets:
+            config["source_overlay"] = {"source_sets": source_sets}
+        else:
+            config.pop("source_overlay", None)
+    source_sets = list((config.get("source_overlay") or {}).get("source_sets") or [])
+    has_business_source = any(
+        str((item or {}).get("owner_type") or "") == "business"
+        for item in source_sets
+    )
+    has_dependency_source = any(
+        str((item or {}).get("owner_type") or "") == "dependency"
+        for item in source_sets
+    )
+    analysis_mode = infer_step1_mode_fields(run_context or {}).get("analysis_mode")
+    config["source_inputs"] = {
+        "purpose_version": SOURCE_INPUT_PURPOSE_VERSION,
+        "business": {
+            "status": "available" if has_business_source else "not_provided",
+            "origin": (
+                "checkout_build"
+                if has_business_source and analysis_mode == "checkout_build"
+                else ("provided" if has_business_source else "not_provided")
+            ),
+        },
+        "dependencies": {
+            "status": "available" if has_dependency_source else "not_provided",
+            "origin": "provided" if has_dependency_source else "not_provided",
+        },
     }
     resolved = runtime_state_dir(report_dir) / "binary_pipeline_config.resolved.json"
     write_json(resolved, config)
@@ -10943,22 +11267,24 @@ def execute_step(step_id, args, manifest_steps, run_context, main_state=None):
     elif step_id == "step3":
         validate_run_context_for_step(step_id, run_context)
         ensure_exists(context_json, "Step3 缺少 evidence/context/context.json，请先执行 Step2")
-        use_source = run_context.get("source_usage_decision") == "use_source"
+        source_input_state = source_input_state_for_context(run_context)
+        business_source_available = source_input_state["business_source_available"]
+        dependency_source_available = source_input_state["dependency_source_available"]
         cmd = [
             "--all",
             "--output-dir", str(evidence_static_scan_dir(report_dir)),
             "--report-dir", str(report_dir),
             "--coverage-output", str(runtime_coverage_dir(report_dir) / "s3_coverage.json"),
         ]
-        if not use_source:
+        if not business_source_available and not dependency_source_available:
             cmd.append("--no-source")
-        elif not run_context.get("source_dirs"):
+        elif not business_source_available:
             cmd.append("--no-business-source")
         if dep_current.exists():
             cmd.extend(["--dep-current", str(dep_current)])
         elif dep_changes.exists():
             cmd.extend(["--dep-changes", str(dep_changes)])
-        if use_source and _pinned_snapshot_matches_context(
+        if business_source_available and _pinned_snapshot_matches_context(
             run_context.get("pinned_source_snapshot"), run_context,
         ):
             with materialize_pinned_source_workspace(
@@ -11103,6 +11429,13 @@ def main(argv=None, _skip_environment_contract=False):
         default=None,
     )
     ap.add_argument("--source-dirs", action="append", nargs="+")
+    ap.add_argument(
+        "--source-locations",
+        action="append",
+        nargs="+",
+        default=[],
+        help="统一源码入口；可混合传业务源码目录和依赖源码目录或 Git 地址。",
+    )
     ap.add_argument("--dependency-source-dirs", action="append", nargs="+", default=[])
     ap.add_argument("--dependency-source-mappings", action="append", nargs="+", default=[])
     ap.add_argument("--source-repo-hints", action="append", nargs="+", default=[])
@@ -11142,6 +11475,7 @@ def main(argv=None, _skip_environment_contract=False):
         args.active_maven_profiles or []
     ) if args.active_maven_profiles is not None else None
     args.source_dirs = flatten_cli_values(args.source_dirs)
+    args.source_locations = _dedupe_strings(flatten_cli_values(args.source_locations))
     args.dependency_source_dirs = _dedupe_strings(flatten_cli_values(args.dependency_source_dirs))
     args.dependency_source_mappings = _dedupe_strings(flatten_cli_values(args.dependency_source_mappings))
     args.source_repo_hints = _dedupe_strings(flatten_cli_values(args.source_repo_hints))

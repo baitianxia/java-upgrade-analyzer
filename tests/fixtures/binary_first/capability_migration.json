@@ -203,7 +203,7 @@
       "whole_dependency_api_enumeration",
       "reflection_and_method_handle_dispatch",
       "source_overlay_language_coverage_visibility",
-      "source_overlay_user_choice",
+      "source_overlay_input_collection",
       "dependency_identity_confirmation_workflow",
       "deterministic_immutable_generation",
       "spring_aop_dispatch",
@@ -660,12 +660,12 @@
       "blocking_gaps": []
     },
     {
-      "mechanism_id": "source_overlay_user_choice",
+      "mechanism_id": "source_overlay_input_collection",
       "migration_status": "enforced",
-      "user_effect": "The user is told what source adds, explicitly chooses whether to provide it, and supplied source remains an overlay rather than replacing binary authority.",
+      "user_effect": "The user gets one source-provision interaction without classifying business versus dependency source; build source stays active automatically, supplied locations are classified internally, and source remains an overlay rather than replacing binary authority.",
       "evidence_tests": [
-        "tests.test_binary_pipeline.BinaryPipelineTest.test_source_usage_requires_an_explicit_user_decision",
-        "tests.test_binary_pipeline.BinaryPipelineTest.test_skip_source_rejects_an_implicit_overlay",
+        "tests.test_binary_pipeline.BinaryPipelineTest.test_source_inputs_are_derived_from_actual_source_sets",
+        "tests.test_binary_pipeline.BinaryPipelineTest.test_source_input_metadata_cannot_hide_an_available_overlay",
         "tests.test_binary_source_overlay.BinarySourceOverlayTest.test_descriptor_mismatch_is_conflict_and_binary_graph_remains_complete"
       ],
       "blocking_gaps": []
@@ -971,7 +971,7 @@
       "evidence_tests": [
         "tests.test_step1_packaged_deps.Step1PackagedDepsTest.test_unconfirmed_packaged_version_requires_entry_identity_confirmation",
         "tests.test_step1_packaged_deps.Step1PackagedDepsTest.test_final_artifact_is_authoritative_for_bom_and_exclusion_resolution",
-        "tests.test_run_step_main_state.RunStepMainStateTest.test_step2_requires_informed_source_choice_before_auto_continue"
+        "tests.test_run_step_main_state.RunStepMainStateTest.test_step2_uses_one_source_provision_choice_and_keeps_internal_statuses"
       ],
       "blocking_gaps": []
     }
