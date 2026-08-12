@@ -399,6 +399,76 @@ public class demo.ArrayCasts {
         )
         self.assertEqual(result["validation_status"], "passed")
 
+    def test_two_dependency_pairings_with_same_resource_delta_remain_distinct(self):
+        def resource_jar(label, content):
+            path = self.root / label / f"{label}.jar"
+            path.parent.mkdir(parents=True)
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr("META-INF/LICENSE", content)
+            return path
+
+        base_jar = resource_jar("shared-resource-base", b"old-license")
+        current_jar = resource_jar("shared-resource-current", b"new-license")
+
+        def side(path, version):
+            result = self._side(path, version)
+            result["artifacts"] = [
+                {
+                    "path": str(path),
+                    "logical_location": f"lib/dependency-{suffix}.jar",
+                    "loader_realm": "application-loader",
+                    "path_kind": "classpath",
+                    "slot": index,
+                    "coord": f"com.acme:dependency-{suffix}:{version}",
+                    "lineage": f"com.acme:dependency-{suffix}",
+                    "runtime_code_source_origin_identity": (
+                        f"deployment-dependency-{suffix}"
+                    ),
+                }
+                for index, suffix in enumerate(("a", "b"))
+            ]
+            result["runtime_profile"]["business_entrypoint_profile"] = {
+                "coverage_status": "complete",
+                "methods": [],
+            }
+            return result
+
+        result = run_pipeline({
+            "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+            "source_usage": {
+                "decision": "skip_source",
+                "decision_source": "explicit_config",
+            },
+            "asm_jar": str(self.asm_jar),
+            "base": side(base_jar, "1"),
+            "current": side(current_jar, "2"),
+            "runtime_comparison": {
+                "controlled_profile_fields": ["loader_topology"],
+                "declared_upgrade_payload_scope": ["artifact-bytes"],
+            },
+        }, output_root=self.root / "same-resource-two-pairings-report")
+
+        decisions = json.loads(
+            (Path(result["generation_directory"]) / "binary_decisions.json")
+            .read_text(encoding="utf-8")
+        )
+        raw_resource_decisions = [
+            row for row in decisions["excluded_decisions"]
+            if row["reason_code"]
+            == "ARTIFACT_RESOURCE_OBSERVATION_RECONCILED_BY_SELECTION_VIEW"
+        ]
+        self.assertEqual(len(raw_resource_decisions), 2)
+        self.assertEqual(len({
+            row["disposition_obligation_identity"]
+            for row in raw_resource_decisions
+        }), 2)
+        self.assertEqual({
+            artifact["logical_dependency_lineage"]
+            for row in raw_resource_decisions
+            for artifact in row["dependency_artifacts"]
+        }, {"com.acme:dependency-a", "com.acme:dependency-b"})
+        self.assertEqual(result["validation_status"], "passed")
+
     def test_trace_preserves_independent_entrypoint_paths_for_one_changed_api(self):
         def target(label, value):
             return self._compile_sources_jar(label, {

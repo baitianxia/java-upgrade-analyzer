@@ -3,6 +3,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from pathlib import Path
 import zipfile
@@ -15,6 +16,7 @@ import binary_asm_helper  # noqa: E402
 import binary_artifact_diff  # noqa: E402
 from binary_decision_engine import BinaryDecisionEngine  # noqa: E402
 from binary_fact_store import BinaryFactStore  # noqa: E402
+from binary_first_contract import observed_delta_identity  # noqa: E402
 from binary_first_model import (  # noqa: E402
     AnalysisContext,
     AnalysisScope,
@@ -35,6 +37,169 @@ def jdk_home():
     )
     match = re.search(r"^\s*java\.home\s*=\s*(.+)$", completed.stderr, re.MULTILINE)
     return Path(match.group(1).strip()) if match else None
+
+
+class BinaryDecisionIdentityRegressionTest(unittest.TestCase):
+    def setUp(self):
+        self.base_store = BinaryFactStore()
+        self.current_store = BinaryFactStore()
+
+    def tearDown(self):
+        self.base_store.close()
+        self.current_store.close()
+
+    @staticmethod
+    def runtime(*, providers=(), definitions=()):
+        return SimpleNamespace(
+            identity="unchanged-runtime",
+            provider_bindings=tuple(providers),
+            class_definitions=tuple(definitions),
+            member_resolutions=(),
+            resource_selections=(),
+            coverage_status="complete",
+            coverage_gaps=(),
+        )
+
+    @staticmethod
+    def artifact_observation(pairing, scope, old, new):
+        return observed_delta_identity(
+            delta_source_kind="artifact_local",
+            comparison_or_runtime_scope={
+                "runtime_comparison_identity": "runtime-comparison",
+                "cross_version_artifact_pairing_identity": pairing,
+            },
+            fact_or_mechanism_scope=scope,
+            base_fingerprint=old,
+            current_fingerprint=new,
+        )
+
+    def build(self, diffs, runtime):
+        return BinaryDecisionEngine(
+            analysis_context_identity="analysis-context",
+            runtime_comparison_identity="runtime-comparison",
+            base_store=self.base_store,
+            current_store=self.current_store,
+            base_reconciliation=runtime,
+            current_reconciliation=runtime,
+            artifact_local_diffs=diffs,
+        ).build()
+
+    def test_same_resource_delta_in_two_pairings_has_two_obligations(self):
+        scope = {
+            "entry_name": "META-INF/LICENSE",
+            "name_ordinal": 0,
+            "entry_kind": "resource",
+        }
+        diffs = []
+        upstream = []
+        for suffix in ("a", "b"):
+            observed = self.artifact_observation(
+                f"pairing-{suffix}", scope, "old-license", "new-license"
+            )
+            upstream.append(observed)
+            diffs.append({
+                "base_artifact_instance_identity": f"base-{suffix}",
+                "current_artifact_instance_identity": f"current-{suffix}",
+                "logical_dependency_lineage": f"dependency:{suffix}",
+                "class_comparison_coverage_status": "complete",
+                "entry_deltas": [{
+                    "entry_scope": dict(scope),
+                    "base_content_sha256": "old-license",
+                    "current_content_sha256": "new-license",
+                    "resource_change_category": "distribution_metadata",
+                    "observed_delta_identity": observed,
+                }],
+            })
+
+        bundle = self.build(diffs, self.runtime())
+
+        self.assertEqual(len(bundle.excluded_decisions), 2)
+        self.assertEqual(
+            {row["observed_delta_identity"] for row in bundle.excluded_decisions},
+            set(upstream),
+        )
+        self.assertEqual(len({
+            row["disposition_obligation_identity"]
+            for row in bundle.excluded_decisions
+        }), 2)
+
+    def test_same_member_delta_in_selected_and_shadowed_pairings_is_distinct(self):
+        realm = "application-loader"
+        class_name = "demo/Api"
+        selected = "selected-artifact"
+        provider = {
+            "initiating_loader_realm_identity": realm,
+            "class_name": class_name,
+            "class_provider_status": "resolved",
+            "selected_artifact_instance_identity": selected,
+            "provider_binding_identity": "provider-binding",
+        }
+        definition = {
+            "initiating_loader_realm_identity": realm,
+            "class_name": class_name,
+            "class_definition_status": "definition_ready",
+        }
+        member_scope = {
+            "entry_name": f"{class_name}.class",
+            "name_ordinal": 0,
+            "entry_kind": "class",
+            "member_kind": "method",
+            "member_name": "value",
+            "descriptor": "()I",
+        }
+        diffs = []
+        upstream = []
+        for suffix, artifact in (("selected", selected), ("shadowed", "shadowed-artifact")):
+            entry_scope = {
+                "entry_name": f"{class_name}.class",
+                "name_ordinal": 0,
+                "entry_kind": "class",
+            }
+            entry_observed = self.artifact_observation(
+                f"pairing-{suffix}", entry_scope, "old-class", "new-class"
+            )
+            member_observed = self.artifact_observation(
+                f"pairing-{suffix}", member_scope, "old-member", "new-member"
+            )
+            upstream.append(member_observed)
+            diffs.append({
+                "base_artifact_instance_identity": artifact,
+                "current_artifact_instance_identity": artifact,
+                "logical_dependency_lineage": f"dependency:{suffix}",
+                "class_comparison_coverage_status": "complete",
+                "entry_deltas": [{
+                    "entry_scope": entry_scope,
+                    "base_content_sha256": "old-class",
+                    "current_content_sha256": "new-class",
+                    "class_change_category": "implementation_changed",
+                    "observed_delta_identity": entry_observed,
+                    "member_deltas": [{
+                        "member_scope": dict(member_scope),
+                        "member_change_kind": "implementation_changed",
+                        "base_member_fingerprint": "old-member",
+                        "current_member_fingerprint": "new-member",
+                        "observed_delta_identity": member_observed,
+                    }],
+                }],
+            })
+
+        bundle = self.build(
+            diffs,
+            self.runtime(providers=(provider,), definitions=(definition,)),
+        )
+
+        decisions = (
+            *bundle.authoritative_decisions,
+            *bundle.excluded_decisions,
+        )
+        self.assertEqual(len(decisions), 2)
+        self.assertEqual(
+            {row["evidence"]["upstream_artifact_observed_delta_identity"] for row in decisions},
+            set(upstream),
+        )
+        self.assertEqual(len({
+            row["disposition_obligation_identity"] for row in decisions
+        }), 2)
 
 
 class BinaryDecisionEngineTest(unittest.TestCase):
@@ -270,6 +435,74 @@ class BinaryDecisionEngineTest(unittest.TestCase):
         self.assertEqual(bundle.diagnostic_decisions[0]["fact_kind"], "resource")
         self.assertFalse(bundle.formal_projections)
         self.assertEqual(bundle.candidate_projection_plans[0]["planning_status"], "unbound")
+
+    def test_semantic_member_edges_keep_only_selected_caller_with_its_lineage(self):
+        artifact = self.compile_jar("duplicate-callsite", 1)
+        sha = binary_artifact_diff._sha256_file(artifact)
+        profile_payload = dict(self.profile(sha).payload)
+        profile_payload["ordered_runtime_path_entry_descriptors"] = [
+            {
+                "logical_location": f"lib/dependency-{suffix}.jar",
+                "content_sha256": sha,
+                "path_kind": "classpath",
+                "slot": index,
+                "loader_realm": "application-loader",
+            }
+            for index, suffix in enumerate(("a", "b"))
+        ]
+        profile_payload["runtime_code_source_origin_mapping_identity"] = (
+            "two-dependency-origins"
+        )
+        profile = RuntimeProfile(profile_payload)
+        instances = []
+        store = BinaryFactStore()
+        try:
+            for index, suffix in enumerate(("a", "b")):
+                instance = ArtifactInstance(
+                    outer_artifact_sha256=sha,
+                    container_entry="<artifact>",
+                    content_sha256=sha,
+                    runtime_profile_identity=profile.identity,
+                    path_owner_loader_realm_identity="application-loader",
+                    runtime_path_kind="classpath",
+                    runtime_classpath_index=index,
+                    container_loader_policy_version="flat-parent-first-v1",
+                    runtime_code_source_origin_identity=f"dependency-{suffix}",
+                    coord=f"com.acme:dependency-{suffix}:1",
+                )
+                instances.append(instance)
+                snapshot = binary_artifact_diff.snapshot_archive(
+                    artifact,
+                    artifact_instance_identity=instance.identity,
+                    expected_sha256=sha,
+                    asm_jar=self.asm_jar,
+                )
+                store.add_artifact_snapshot(instance, snapshot)
+            runtime = RuntimeReconciler(
+                store,
+                profile,
+                self.platform,
+                analysis_context_identity="analysis-context",
+            ).reconcile()
+
+            edges = BinaryDecisionEngine._semantic_member_edges(
+                store,
+                runtime,
+                {
+                    instances[0].identity: "com.acme:dependency-a",
+                    instances[1].identity: "com.acme:dependency-b",
+                },
+            )
+        finally:
+            store.close()
+
+        constructor_edges = [
+            key for key in edges
+            if key[2:5] == ("demo/Api", "<init>", "()V")
+        ]
+        self.assertEqual(len(constructor_edges), 1, tuple(edges))
+        self.assertEqual(constructor_edges[0][0], "com.acme:dependency-a")
+        self.assertEqual(constructor_edges[0][11], "application-loader")
 
 
 if __name__ == "__main__":

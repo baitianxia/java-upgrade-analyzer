@@ -8,7 +8,11 @@ from typing import Any, Iterable, Mapping
 
 from binary_artifact_diff import _mr_class_scope
 from binary_fact_store import BinaryFactStore
-from binary_first_contract import canonical_identity, observed_delta_identity
+from binary_first_contract import (
+    BinaryFirstContractError,
+    canonical_identity,
+    observed_delta_identity,
+)
 from binary_first_model import (
     ActiveSnapshot,
     Decision,
@@ -96,11 +100,34 @@ class BinaryDecisionEngine:
         self.projections = []
         self.candidate_plans = []
         self.obligations = []
+        self._obligation_origins = {}
         self.coverage_gaps = set()
-        self._base_providers = self._records_by_key(base_reconciliation.provider_bindings)
-        self._current_providers = self._records_by_key(current_reconciliation.provider_bindings)
-        self._base_definitions = self._records_by_key(base_reconciliation.class_definitions)
-        self._current_definitions = self._records_by_key(current_reconciliation.class_definitions)
+        self._base_artifact_lineages = self._artifact_lineages(
+            "base_artifact_instance_identity"
+        )
+        self._current_artifact_lineages = self._artifact_lineages(
+            "current_artifact_instance_identity"
+        )
+        self._base_providers = self._records_by_key(
+            base_reconciliation.provider_bindings,
+            duplicate_code="PROVIDER_BINDING_SCOPE_DUPLICATE",
+            identity_field="provider_binding_identity",
+        )
+        self._current_providers = self._records_by_key(
+            current_reconciliation.provider_bindings,
+            duplicate_code="PROVIDER_BINDING_SCOPE_DUPLICATE",
+            identity_field="provider_binding_identity",
+        )
+        self._base_definitions = self._records_by_key(
+            base_reconciliation.class_definitions,
+            duplicate_code="CLASS_DEFINITION_SCOPE_DUPLICATE",
+            identity_field="class_definition_resolution_identity",
+        )
+        self._current_definitions = self._records_by_key(
+            current_reconciliation.class_definitions,
+            duplicate_code="CLASS_DEFINITION_SCOPE_DUPLICATE",
+            identity_field="class_definition_resolution_identity",
+        )
         self._base_resources = self._resource_records_by_key(
             base_reconciliation.resource_selections
         )
@@ -112,11 +139,20 @@ class BinaryDecisionEngine:
     def _semantic_member_edges(
         store: BinaryFactStore,
         reconciliation: RuntimeReconciliationResult,
+        artifact_lineages: Mapping[str, str],
     ) -> dict[tuple[Any, ...], tuple[dict[str, Any], dict[str, Any], dict[str, Any]]]:
-        resolutions = {
-            item["direct_edge_identity"]: item
-            for item in reconciliation.member_resolutions
-        }
+        resolutions = BinaryDecisionEngine._unique_index(
+            reconciliation.member_resolutions,
+            ("direct_edge_identity",),
+            duplicate_code="MEMBER_RESOLUTION_EDGE_DUPLICATE",
+            identity_field="member_resolution_identity",
+        )
+        providers = BinaryDecisionEngine._unique_index(
+            reconciliation.provider_bindings,
+            ("initiating_loader_realm_identity", "class_name"),
+            duplicate_code="PROVIDER_BINDING_SCOPE_DUPLICATE",
+            identity_field="provider_binding_identity",
+        )
         output = {}
         for raw in store.connection.execute(
             """
@@ -128,6 +164,7 @@ class BinaryDecisionEngine:
                    caller.class_name AS caller_class_name,
                    caller.member_name AS caller_member_name,
                    caller.descriptor AS caller_descriptor,
+                   caller.class_variant_identity AS caller_class_variant_identity,
                    artifact.runtime_path_kind,
                    artifact.runtime_classpath_index
             FROM direct_edges AS edge
@@ -148,15 +185,42 @@ class BinaryDecisionEngine:
                     "symbolic_owner", "symbolic_name", "symbolic_descriptor",
                 )
             }
-            resolution = resolutions.get(edge["direct_edge_identity"])
+            resolution = resolutions.get((edge["direct_edge_identity"],))
             if not resolution:
                 continue
+            initiating_realm = str(
+                resolution.get("initiating_loader_realm_identity") or ""
+            )
+            provider = providers.get(
+                (initiating_realm, str(raw["caller_class_name"] or ""))
+            )
+            # The fact store contains edges from shadowed class variants too.
+            # Only the provider selected by this loader realm is executable.
+            if (
+                not provider
+                or provider.get("class_provider_status") != "resolved"
+                or provider.get("selected_class_variant_identity")
+                != raw["caller_class_variant_identity"]
+            ):
+                continue
             artifact = {
+                "artifact_instance_identity": edge[
+                    "caller_artifact_instance_identity"
+                ],
+                "logical_dependency_lineage": artifact_lineages.get(
+                    edge["caller_artifact_instance_identity"], ""
+                ),
                 "runtime_path_kind": raw["runtime_path_kind"],
                 "runtime_classpath_index": raw["runtime_classpath_index"],
             }
+            lineage = str(artifact.get("logical_dependency_lineage") or "")
+            if not lineage:
+                lineage = (
+                    f"runtime-slot:{artifact['runtime_path_kind']}:"
+                    f"{artifact['runtime_classpath_index']}"
+                )
             key = (
-                str(artifact.get("logical_dependency_lineage") or ""),
+                lineage,
                 str(artifact.get("runtime_path_kind") or ""),
                 str(raw["caller_class_name"] or ""),
                 str(raw["caller_member_name"] or ""),
@@ -167,30 +231,95 @@ class BinaryDecisionEngine:
                 str(edge.get("symbolic_owner") or ""),
                 str(edge.get("symbolic_name") or ""),
                 str(edge.get("symbolic_descriptor") or ""),
+                initiating_realm,
             )
+            if key in output:
+                first = output[key][0]["direct_edge_identity"]
+                raise BinaryFirstContractError(
+                    "SEMANTIC_MEMBER_EDGE_KEY_DUPLICATE",
+                    f"lineage={lineage}; first={first}; "
+                    f"duplicate={edge['direct_edge_identity']}",
+                )
             output[key] = (edge, resolution, artifact)
         return output
 
+    def _artifact_lineages(self, identity_field: str) -> dict[str, str]:
+        output = {}
+        for artifact_diff in self.artifact_diffs:
+            artifact_identity = str(artifact_diff.get(identity_field) or "")
+            if not artifact_identity or artifact_identity.startswith("ABSENT:"):
+                continue
+            lineage = str(
+                artifact_diff.get("logical_dependency_lineage") or ""
+            ).strip()
+            previous = output.get(artifact_identity)
+            if previous is not None and previous != lineage:
+                raise BinaryFirstContractError(
+                    "ARTIFACT_LINEAGE_IDENTITY_CONFLICT",
+                    f"artifact={artifact_identity}; first={previous}; "
+                    f"duplicate={lineage}",
+                )
+            output[artifact_identity] = lineage
+        return output
+
     @staticmethod
-    def _records_by_key(records):
-        return {
-            (
-                item["initiating_loader_realm_identity"],
-                item["class_name"],
-            ): item
-            for item in records
-        }
+    def _upstream_observed_identity(
+        record: Mapping[str, Any], *, label: str
+    ) -> str:
+        identity = str(record.get("observed_delta_identity") or "").strip()
+        if not identity:
+            raise BinaryFirstContractError(
+                "ARTIFACT_OBSERVED_DELTA_IDENTITY_MISSING", label
+            )
+        return identity
+
+    @staticmethod
+    def _unique_index(
+        records: Iterable[Mapping[str, Any]],
+        key_fields: tuple[str, ...],
+        *,
+        duplicate_code: str,
+        identity_field: str,
+    ) -> dict[tuple[Any, ...], Mapping[str, Any]]:
+        output = {}
+        for item in records:
+            key = tuple(item.get(field) for field in key_fields)
+            previous = output.get(key)
+            if previous is not None:
+                raise BinaryFirstContractError(
+                    duplicate_code,
+                    f"key={key}; first={previous.get(identity_field)}; "
+                    f"duplicate={item.get(identity_field)}",
+                )
+            output[key] = item
+        return output
+
+    @staticmethod
+    def _records_by_key(
+        records: Iterable[Mapping[str, Any]],
+        *,
+        duplicate_code: str,
+        identity_field: str,
+    ) -> dict[tuple[Any, ...], Mapping[str, Any]]:
+        return BinaryDecisionEngine._unique_index(
+            records,
+            ("initiating_loader_realm_identity", "class_name"),
+            duplicate_code=duplicate_code,
+            identity_field=identity_field,
+        )
 
     @staticmethod
     def _resource_records_by_key(records):
-        return {
+        return BinaryDecisionEngine._unique_index(
+            records,
             (
-                item["initiating_loader_realm_identity"],
-                item["resource_name"],
-                item["resource_mechanism"],
-            ): item
-            for item in records
-        }
+                "initiating_loader_realm_identity",
+                "resource_name",
+                "resource_mechanism",
+            ),
+            duplicate_code="RESOURCE_SELECTION_SCOPE_DUPLICATE",
+            identity_field="resource_selection_identity",
+        )
 
     @staticmethod
     def _resource_fingerprint(record: Mapping[str, Any] | None) -> str:
@@ -314,6 +443,26 @@ class BinaryDecisionEngine:
             "change_fact_identity": change_fact_identity,
             **payload,
         }
+        origin = {
+            "reason_code": reason_code,
+            "fact_kind": fact_kind,
+            "fact_scope": dict(fact_scope),
+            "dependency_lineages": sorted({
+                str(item.get("logical_dependency_lineage") or "")
+                for item in payload["dependency_artifacts"]
+                if item.get("logical_dependency_lineage")
+            }),
+        }
+        previous_origin = self._obligation_origins.get(
+            decision.obligation_identity
+        )
+        if previous_origin is not None:
+            raise BinaryFirstContractError(
+                "DISPOSITION_OBLIGATION_DUPLICATE",
+                f"obligation={decision.obligation_identity}; "
+                f"first={previous_origin}; duplicate={origin}",
+            )
+        self._obligation_origins[decision.obligation_identity] = origin
         self.obligations.append(decision.obligation_identity)
         if channel == "authoritative":
             self.authoritative.append(record)
@@ -547,6 +696,9 @@ class BinaryDecisionEngine:
                         "member_change_kind": entry.get("class_change_category"),
                         "base_member_fingerprint": entry["base_content_sha256"],
                         "current_member_fingerprint": entry["current_content_sha256"],
+                        "observed_delta_identity": entry.get(
+                            "observed_delta_identity"
+                        ),
                     },)
                 for realm, _ in keys:
                     base_provider = self._base_providers.get((realm, class_name))
@@ -558,17 +710,28 @@ class BinaryDecisionEngine:
                         (current_provider or {}).get("selected_artifact_instance_identity") == current_artifact
                     )
                     for member_delta in member_deltas:
+                        upstream_observed = self._upstream_observed_identity(
+                            member_delta,
+                            label=(
+                                f"lineage={lineage}; class={class_name}; "
+                                f"member={member_delta.get('member_scope')}"
+                            ),
+                        )
                         scope = {
                             **member_delta["member_scope"],
                             "initiating_loader_realm_identity": realm,
                             "class_name": class_name,
                             "member_change_kind": member_delta["member_change_kind"],
                         }
+                        # Lift the pairing-bound Step4A observation into the
+                        # realm-specific decision scope without dropping its
+                        # artifact identity.
                         observed = observed_delta_identity(
                             delta_source_kind="artifact_local",
                             comparison_or_runtime_scope={
                                 "runtime_comparison_identity": self.runtime_comparison_identity,
                                 "initiating_loader_realm_identity": realm,
+                                "artifact_observed_delta_identity": upstream_observed,
                             },
                             fact_or_mechanism_scope=scope,
                             base_fingerprint=member_delta.get("base_member_fingerprint") or "ABSENT",
@@ -587,7 +750,13 @@ class BinaryDecisionEngine:
                                 reason_code="ARTIFACT_CLASS_SHADOWED_IN_BOTH_RUNTIME_VIEWS",
                                 fact_kind=fact_kind,
                                 fact_scope=scope,
-                                evidence={"base_provider": base_provider, "current_provider": current_provider},
+                                evidence={
+                                    "upstream_artifact_observed_delta_identity": (
+                                        upstream_observed
+                                    ),
+                                    "base_provider": base_provider,
+                                    "current_provider": current_provider,
+                                },
                                 dependency_artifacts=dependency_artifacts,
                             )
                             continue
@@ -630,7 +799,9 @@ class BinaryDecisionEngine:
                             target_identity=target,
                             coverage_gaps=gaps,
                             evidence={
-                                "upstream_artifact_observed_delta_identity": entry.get("observed_delta_identity"),
+                                "upstream_artifact_observed_delta_identity": (
+                                    upstream_observed
+                                ),
                                 "base_provider_binding_identity": (base_provider or {}).get("provider_binding_identity"),
                                 "current_provider_binding_identity": (current_provider or {}).get("provider_binding_identity"),
                                 "base_member_fingerprint": member_delta.get("base_member_fingerprint"),
@@ -648,12 +819,11 @@ class BinaryDecisionEngine:
         dependency_artifacts: Iterable[Mapping[str, Any]],
     ) -> None:
         scope = dict(entry["entry_scope"])
-        observed = observed_delta_identity(
-            delta_source_kind="resource_selection",
-            comparison_or_runtime_scope={"runtime_comparison_identity": self.runtime_comparison_identity},
-            fact_or_mechanism_scope=scope,
-            base_fingerprint=entry["base_content_sha256"],
-            current_fingerprint=entry["current_content_sha256"],
+        # The Step4A identity already binds the artifact pairing. Rebuilding
+        # it from a common resource name/content pair would merge dependencies.
+        observed = self._upstream_observed_identity(
+            entry,
+            label=f"resource={scope}",
         )
         self._decision(
             observed_identity=observed,
@@ -817,9 +987,15 @@ class BinaryDecisionEngine:
         self._process_resource_outcome_deltas()
 
     def _process_member_resolution_deltas(self) -> None:
-        base_edges = self._semantic_member_edges(self.base_store, self.base_runtime)
+        base_edges = self._semantic_member_edges(
+            self.base_store,
+            self.base_runtime,
+            self._base_artifact_lineages,
+        )
         current_edges = self._semantic_member_edges(
-            self.current_store, self.current_runtime
+            self.current_store,
+            self.current_runtime,
+            self._current_artifact_lineages,
         )
         for key in sorted(set(base_edges).intersection(current_edges)):
             base_edge, base_resolution, _base_caller_artifact = base_edges[key]
