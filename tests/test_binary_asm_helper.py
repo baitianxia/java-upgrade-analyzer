@@ -1,10 +1,12 @@
 import io
+import json
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -73,12 +75,41 @@ class BinaryAsmHelperTest(unittest.TestCase):
             self.class_file.read_bytes() if payload is None else payload,
         )
 
-    def test_parser_identity_binds_exact_helper_asm_and_support_manifest(self):
+    def test_parser_identity_binds_exact_helper_asm_and_artifact_diff_contract(self):
         identity, source_sha = helper.parser_identity(asm_jar=self.asm_jar)
 
         self.assertEqual(len(identity), 64)
         self.assertEqual(len(source_sha), 64)
         self.assertEqual(helper._sha256_file(self.asm_jar), helper.ASM_SHA256)
+
+    def test_unrelated_gate_metadata_does_not_invalidate_snapshot_cache(self):
+        original = json.loads(helper.SUPPORT_MANIFEST.read_text(encoding="utf-8"))
+        unrelated = json.loads(json.dumps(original))
+        unrelated["performance_gate"]["sha256"] = "f" * 64
+        relevant = json.loads(json.dumps(original))
+        relevant["artifact_diff_support_manifest"]["artifact_safety_policy"][
+            "max_archive_entries"
+        ] += 1
+        root = Path(self.temp.name)
+        original_path = root / "support-original.json"
+        unrelated_path = root / "support-unrelated.json"
+        relevant_path = root / "support-relevant.json"
+        for path, value in (
+            (original_path, original),
+            (unrelated_path, unrelated),
+            (relevant_path, relevant),
+        ):
+            path.write_text(json.dumps(value), encoding="utf-8")
+
+        with patch.object(helper, "SUPPORT_MANIFEST", original_path):
+            original_identity, _ = helper.parser_identity(asm_jar=self.asm_jar)
+        with patch.object(helper, "SUPPORT_MANIFEST", unrelated_path):
+            unrelated_identity, _ = helper.parser_identity(asm_jar=self.asm_jar)
+        with patch.object(helper, "SUPPORT_MANIFEST", relevant_path):
+            relevant_identity, _ = helper.parser_identity(asm_jar=self.asm_jar)
+
+        self.assertEqual(original_identity, unrelated_identity)
+        self.assertNotEqual(original_identity, relevant_identity)
 
     def test_extracts_contract_ir_dynamic_and_raw_attribute_inventory(self):
         run = helper.extract_class_facts([self.class_input()], asm_jar=self.asm_jar)

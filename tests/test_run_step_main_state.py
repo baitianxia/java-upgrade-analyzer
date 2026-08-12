@@ -18,6 +18,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR / "scripts"))
 
 import run_step  # noqa: E402
+import path_runtime  # noqa: E402
 
 
 class RunStepMainStateTest(unittest.TestCase):
@@ -43,6 +44,85 @@ class RunStepMainStateTest(unittest.TestCase):
             capture_output=True, text=True, check=True,
         ).stdout.strip()
         return repository, source.parent.parent, commit
+
+    def test_main_runs_worktree_recovery_before_step1_preflight(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "project"
+            report = root / ".upgrade-report"
+            project.mkdir()
+            events = []
+            original_preflight = run_step.build_step1_preflight_interaction
+
+            def recover(*args, **kwargs):
+                events.append("recover")
+                return {"removed_count": 0}
+
+            def preflight(run_context):
+                events.append("preflight")
+                return original_preflight(run_context)
+
+            with patch.object(
+                run_step,
+                "recover_worktrees_before_execution",
+                side_effect=recover,
+            ) as recovery, patch.object(
+                run_step,
+                "build_step1_preflight_interaction",
+                side_effect=preflight,
+            ):
+                exit_code = run_step.main(
+                    [
+                        "--step", "step1",
+                        "--project-dir", str(project),
+                        "--report-dir", str(report),
+                    ],
+                    _skip_environment_contract=True,
+                )
+
+        self.assertEqual(exit_code, run_step.EXIT_AWAITING_USER)
+        recovery.assert_called_once()
+        self.assertLess(events.index("recover"), events.index("preflight"))
+
+    def test_startup_recovery_removes_real_interrupted_worktree_and_writes_audit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repository, _source_root, commit = self._git_source_repository(root)
+            report = root / ".upgrade-report"
+            worktree_root = root / "worktrees"
+            worktree = path_runtime.create_detached_worktree(
+                commit,
+                repository,
+                preferred_root=worktree_root,
+            )
+            lease = path_runtime._worktree_lease_path(worktree)
+            payload = json.loads(lease.read_text(encoding="utf-8"))
+            payload.update({"pid": 999_999_999, "process_start_token": "dead"})
+            lease.write_text(json.dumps(payload), encoding="utf-8")
+            args = SimpleNamespace(
+                base_source_project_dir="",
+                current_source_project_dir="",
+                source_dirs=[],
+                source_locations=[],
+                dependency_source_dirs=[],
+            )
+
+            recovery = run_step.recover_worktrees_before_execution(
+                repository,
+                report,
+                args,
+                {},
+                run_step.new_main_state(report),
+            )
+            audit = json.loads(
+                run_step.worktree_recovery_path(report).read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(recovery["status"], "passed")
+        self.assertEqual(recovery["removed_count"], 1)
+        self.assertEqual(audit["removed_count"], 1)
+        self.assertFalse(worktree.exists())
+        self.assertFalse(lease.exists())
 
     def test_dependency_source_git_materialization_pins_resolved_commit(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -6605,6 +6685,185 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertNotIn("base_resolved_commit", updated)
         self.assertNotIn("base_requested_ref", updated)
         self.assertNotIn("base_ref_binding", updated)
+
+    def test_explicit_cli_branch_overrides_restored_suffix_branch_and_ref_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            report_dir = project_dir / ".upgrade-report"
+            args = self._make_default_args(project_dir, report_dir)
+            args.current_branch = "release"
+            old_context = {
+                "current_branch": "release.DEV",
+                "current_branch_explicit": True,
+                "current_requested_ref": "release.DEV",
+                "current_resolved_ref": "origin/release.DEV",
+                "current_resolved_commit": "d" * 40,
+                "current_expected_commit": "d" * 40,
+                "current_ref_remote": "origin",
+                "current_ref_remote_ref": "refs/heads/release.DEV",
+                "current_ref_binding": {
+                    "schema": "java-upgrade-analyzer.remote-ref-binding.v1",
+                    "repo_dir": str(project_dir.resolve()),
+                    "requested_ref": "release.DEV",
+                    "remote": "origin",
+                    "canonical_ref": "refs/heads/release.DEV",
+                    "expected_commit": "d" * 40,
+                    "artifact_path": "",
+                },
+                "pinned_source_snapshot": {
+                    "schema": "java-upgrade-analyzer.pinned-source-snapshot.v1",
+                    "commit": "d" * 40,
+                },
+            }
+
+            context = run_step.build_run_context(
+                args,
+                old_context,
+                {},
+                allow_external_seed=True,
+            )
+
+        self.assertEqual(context["current_branch"], "release")
+        self.assertTrue(context["current_branch_explicit"])
+        for stale_field in (
+            "current_requested_ref",
+            "current_resolved_ref",
+            "current_resolved_commit",
+            "current_expected_commit",
+            "current_ref_remote",
+            "current_ref_remote_ref",
+            "current_ref_binding",
+            "pinned_source_snapshot",
+        ):
+            self.assertNotIn(stale_field, context)
+
+    def test_existing_report_cli_branch_change_restarts_step1_with_clean_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp) / "project"
+            report_dir = project_dir / ".upgrade-report"
+            project_dir.mkdir()
+            args = self._make_default_args(project_dir, report_dir)
+            args.current_branch = "release"
+            main_state = run_step.new_main_state(report_dir)
+            main_state["step1"]["input"] = {
+                "analysis_mode": "checkout_build",
+                "base_branch": "base",
+                "current_branch": "release.DEV",
+                "current_expected_commit": "d" * 40,
+                "current_resolved_commit": "d" * 40,
+                "current_ref_remote_ref": "refs/heads/release.DEV",
+                "current_ref_binding": {
+                    "schema": "java-upgrade-analyzer.remote-ref-binding.v1",
+                    "repo_dir": str(project_dir.resolve()),
+                    "requested_ref": "release.DEV",
+                    "remote": "origin",
+                    "canonical_ref": "refs/heads/release.DEV",
+                    "expected_commit": "d" * 40,
+                    "artifact_path": "",
+                },
+                "pinned_source_snapshot": {"commit": "d" * 40},
+            }
+            main_state["step2"]["input"] = {"marker": "stale-step2"}
+            main_state["state"].update({
+                "current_step": "step4",
+                "completed_step": "step3",
+                "status": "awaiting_user_input",
+                "pending_interaction": {
+                    "step_id": "step4",
+                    "status": "awaiting_user_input",
+                },
+            })
+
+            result = run_step.apply_explicit_cli_step1_branch_overrides(
+                main_state,
+                args,
+                project_dir,
+                report_dir,
+            )
+            saved = run_step.load_main_state(report_dir)
+
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["before"], {"current_branch": "release.DEV"})
+        self.assertEqual(result["after"], {"current_branch": "release"})
+        self.assertEqual(saved["state"]["current_step"], "step1")
+        self.assertIsNone(saved["state"]["pending_interaction"])
+        self.assertEqual(saved["step1"]["input"]["current_branch"], "release")
+        self.assertEqual(saved["step2"]["input"], {})
+        for stale_field in (
+            "current_expected_commit",
+            "current_resolved_commit",
+            "current_ref_remote_ref",
+            "current_ref_binding",
+            "pinned_source_snapshot",
+        ):
+            self.assertNotIn(stale_field, saved["step1"]["input"])
+
+    def test_main_branch_override_bypasses_stale_pending_and_executes_step1(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp) / "project"
+            report_dir = project_dir / ".upgrade-report"
+            project_dir.mkdir()
+            main_state = run_step.new_main_state(report_dir)
+            main_state["step1"]["input"] = {
+                "analysis_mode": "checkout_build",
+                "base_branch": "base",
+                "current_branch": "release.DEV",
+                "target_module": ".",
+                "current_expected_commit": "d" * 40,
+                "current_ref_remote_ref": "refs/heads/release.DEV",
+            }
+            main_state["step4"]["input"] = {"marker": "stale-step4"}
+            main_state["state"].update({
+                "current_step": "step4",
+                "completed_step": "step3",
+                "status": "awaiting_user_input",
+                "pending_interaction": {
+                    "step_id": "step4",
+                    "status": "awaiting_user_input",
+                    "options": [{"id": "continue"}],
+                },
+            })
+            run_step.save_main_state(report_dir, main_state)
+            captured = {}
+
+            def execute(step_id, _args, _manifest_steps, run_context, **_kwargs):
+                captured["step_id"] = step_id
+                captured["run_context"] = dict(run_context)
+                raise run_step.StepError("stop after observing routed input")
+
+            with patch.object(
+                run_step,
+                "load_manifest",
+                return_value=({}, {"step1": {}}),
+            ), patch.object(
+                run_step,
+                "build_step1_preflight_interaction",
+                return_value=None,
+            ), patch.object(
+                run_step,
+                "resolve_step1_refs_for_execution",
+                side_effect=lambda context, _project, **_kwargs: (context, None),
+            ), patch.object(
+                run_step,
+                "execute_step",
+                side_effect=execute,
+            ):
+                exit_code = run_step.main(
+                    [
+                        "--step", "auto",
+                        "--project-dir", str(project_dir),
+                        "--report-dir", str(report_dir),
+                        "--current-branch", "release",
+                    ],
+                    _skip_environment_contract=True,
+                )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(captured["step_id"], "step1")
+        self.assertEqual(captured["run_context"]["current_branch"], "release")
+        self.assertFalse(captured["run_context"].get("current_expected_commit"))
+        self.assertFalse(captured["run_context"].get("current_ref_remote_ref"))
+        self.assertFalse(captured["run_context"].get("current_ref_binding"))
 
     def test_step1_ref_preflight_resolves_both_branches_from_project_remote(self):
         with tempfile.TemporaryDirectory() as tmp:

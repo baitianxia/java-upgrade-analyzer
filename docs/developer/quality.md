@@ -96,7 +96,7 @@ Oracle 失败或证据不足时 generation 不得激活。
 
 ## 性能门
 
-性能门必须同时记录输入规模、冷/热 cache、总耗时、阶段耗时和可取得的峰值内存。固定性能 fixture 位于 `tests/fixtures/binary_first/performance_gate.json`，其内容身份在 support manifest 中固定。
+性能门必须同时记录输入规模、冷/热 cache、总耗时、阶段耗时和可取得的峰值内存。固定性能 fixture 位于 `tests/fixtures/binary_first/performance_gate.json`，其内容身份在 support manifest 中固定。大规模 fact-store 门与两条冷启动完整流水线门都覆盖 400 JAR/100000 class：一条比较完全相同的两侧，另一条确定性替换 current 侧的一个 JAR 并校验 250 条实现变化。完整门继续覆盖 runtime reconciliation、trace、generation 和独立 Oracle，从两侧 SQLite 与已落盘 Oracle 结果读取实际类数、变化数量与种类、正式结果状态和问题数，并逐阶段记录累计峰值 RSS、单独限制完整流水线 RSS，避免配置中的理论规模掩盖事实丢失，也避免缩小样本掩盖超线性协调、全表物化、双侧对象重叠或逐 class 子进程退化。
 
 允许：内容寻址缓存、批量事务、有界并行、索引、避免重复解析。禁止：抽样 API、跳过依赖、缩短路径而不报告、降低描述符/loader 精度、用源码替代制品。
 

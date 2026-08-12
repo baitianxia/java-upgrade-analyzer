@@ -162,7 +162,18 @@ def resolve_asm_jar(explicit_path: str | Path | None = None) -> Path:
 def parser_identity(*, asm_jar: Path | None = None) -> tuple[str, str]:
     asm_jar = resolve_asm_jar(asm_jar)
     helper_sha = _sha256_file(JAVA_HELPER)
-    support_sha = _sha256_file(SUPPORT_MANIFEST)
+    try:
+        support = json.loads(SUPPORT_MANIFEST.read_text(encoding="utf-8"))
+        artifact_diff_support = support["artifact_diff_support_manifest"]
+    except (OSError, UnicodeError, json.JSONDecodeError, KeyError) as error:
+        raise BinaryAsmError(
+            "ASM_ARTIFACT_DIFF_SUPPORT_MANIFEST_INVALID", str(error)
+        ) from error
+    artifact_diff_support_identity = canonical_identity(
+        "artifact_diff_support_manifest_identity",
+        artifact_diff_support,
+        schema_version="1",
+    )
     identity = canonical_identity(
         "binary_asm_parser_identity",
         {
@@ -173,7 +184,13 @@ def parser_identity(*, asm_jar: Path | None = None) -> tuple[str, str]:
             "helper_sha256": helper_sha,
             "visitor_policy_version": VISITOR_POLICY_VERSION,
             "max_supported_class_major": MAX_SUPPORTED_CLASS_MAJOR,
-            "support_manifest_sha256": support_sha,
+            # Snapshot facts depend on the artifact-diff parser/resource/safety
+            # contract, not unrelated release-gate measurements in the same
+            # top-level manifest. This preserves fail-closed invalidation while
+            # avoiding a 500-JAR cold parse after documentation/gate updates.
+            "artifact_diff_support_manifest_identity": (
+                artifact_diff_support_identity
+            ),
         },
         schema_version="1",
     )

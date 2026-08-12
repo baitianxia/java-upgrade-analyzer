@@ -39,9 +39,10 @@ def subprocess_platform_kwargs(*, new_process_group=False, platform_name=None):
     command.  Keep that policy in one place so product subprocesses cannot
     accidentally regress to visible windows.
 
-    Git additionally uses an independent process group so timeout cleanup can
-    reap credential and transport helpers.  POSIX keeps the existing session
-    isolation only when that group behavior is requested.
+    Long-lived detached product tasks may additionally request an independent
+    process group. POSIX Git commands use session isolation for ``killpg``;
+    Windows Git commands deliberately stay on ``CREATE_NO_WINDOW`` alone and
+    use ``taskkill /T`` for timeout cleanup.
     """
     normalized_platform = str(platform_name or '').strip().lower()
     windows = (
@@ -436,12 +437,21 @@ def _sanitize_git_environment(proc_env):
 
 
 def _git_process_group_kwargs(is_git):
-    """Start Git in an isolated process group so timeouts can reap helpers too."""
-    return subprocess_platform_kwargs(new_process_group=is_git)
+    """Return Git process options without coupling Windows pipes to a group.
+
+    Windows timeout cleanup uses ``taskkill /T`` with the root PID and does not
+    require ``CREATE_NEW_PROCESS_GROUP``.  Keeping Git on
+    ``CREATE_NO_WINDOW`` alone also gives GUI-hosted Python the same standard
+    handle setup as every other hidden child.  POSIX still needs a new session
+    because cleanup there uses ``killpg``.
+    """
+    if not is_git or IS_WINDOWS:
+        return subprocess_platform_kwargs()
+    return subprocess_platform_kwargs(new_process_group=True)
 
 
 def _terminate_subprocess(proc, *, process_group=False):
-    """Best-effort termination with process-tree cleanup for isolated Git groups."""
+    """Best-effort process-tree cleanup for Git and detached child tasks."""
     if process_group and IS_WINDOWS:
         try:
             subprocess.run(
@@ -555,8 +565,13 @@ def run_cmd(
                 cwd=cwd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                stdin=subprocess.PIPE if input_text is not None else None,
+                stdin=(
+                    subprocess.PIPE
+                    if input_text is not None
+                    else (subprocess.DEVNULL if command_is_git else None)
+                ),
                 env=proc_env,
+                close_fds=True,
                 **process_group_kwargs,
             )
             stdout_chunks = []
@@ -615,8 +630,9 @@ def run_cmd(
                 cwd=cwd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                stdin=subprocess.PIPE if input_bytes is not None else None,
+                stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
                 env=proc_env,
+                close_fds=True,
                 **process_group_kwargs,
             )
             try:

@@ -135,8 +135,11 @@ class FinalArtifactEdgeOraclePerformanceTest(unittest.TestCase):
             def parse_entry(entry, artifact_sha256, *_args, **_kwargs):
                 return _fake_parse_result(entry, artifact_sha256)
 
+            def parse_group(entries, artifact_sha256, *_args, **_kwargs):
+                return [parse_entry(entry, artifact_sha256) for entry in entries]
+
             with patch.object(oracle, "_javap_version", return_value="21.0.1"), patch.object(
-                oracle, "_parse_entry_with_javap", side_effect=parse_entry
+                oracle, "_parse_entry_group_with_javap", side_effect=parse_group
             ):
                 sequential = oracle.scan_final_artifact(artifact, max_workers=1)
                 oracle.clear_immutable_oracle_cache()
@@ -152,6 +155,36 @@ class FinalArtifactEdgeOraclePerformanceTest(unittest.TestCase):
         self.assertEqual(cached["parsed_class_count"], 0)
         self.assertEqual(cached["cached_class_count"], 3)
         self.assertEqual(cached["cache_hits"], 1)
+
+    def test_full_scan_batches_classes_into_bounded_javap_invocations(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            class_count = oracle.MAX_CLASSES_PER_JAVAP_BATCH * 2 + 5
+            artifact = _fake_artifact(
+                Path(temp_dir) / "many-classes.jar",
+                [f"fixture/Class{index}.class" for index in range(class_count)],
+            )
+            observed_group_sizes = []
+
+            def parse_group(entries, artifact_sha256, *_args, **_kwargs):
+                observed_group_sizes.append(len(entries))
+                return [
+                    _fake_parse_result(entry, artifact_sha256) for entry in entries
+                ]
+
+            with patch.object(
+                oracle, "_javap_version", return_value="21.0.1"
+            ), patch.object(
+                oracle, "_parse_entry_group_with_javap", side_effect=parse_group
+            ):
+                result = oracle.scan_final_artifact(artifact, max_workers=2)
+
+        self.assertTrue(result["complete"], result["failures"])
+        self.assertEqual(result["parsed_class_count"], class_count)
+        self.assertEqual(sum(observed_group_sizes), class_count)
+        self.assertEqual(len(observed_group_sizes), 3)
+        self.assertLessEqual(
+            max(observed_group_sizes), oracle.MAX_CLASSES_PER_JAVAP_BATCH
+        )
 
     def test_concurrent_scan_retains_every_class_parse_failure_in_entry_order(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -179,14 +212,19 @@ class FinalArtifactEdgeOraclePerformanceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             artifact = _fake_artifact(
                 Path(temp_dir) / "many.jar",
-                [f"fixture/Class{index}.class" for index in range(oracle.MAX_JAVAP_WORKERS + 2)],
+                [
+                    f"fixture/Class{index}.class"
+                    for index in range(oracle.MAX_JAVAP_WORKERS * 2)
+                ],
             )
 
-            def parse_entry(entry, artifact_sha256, *_args, **_kwargs):
-                return _fake_parse_result(entry, artifact_sha256)
+            def parse_group(entries, artifact_sha256, *_args, **_kwargs):
+                return [
+                    _fake_parse_result(entry, artifact_sha256) for entry in entries
+                ]
 
             with patch.object(oracle, "_javap_version", return_value="21.0.1"), patch.object(
-                oracle, "_parse_entry_with_javap", side_effect=parse_entry
+                oracle, "_parse_entry_group_with_javap", side_effect=parse_group
             ):
                 result = oracle.scan_final_artifact(artifact, max_workers=999)
 
@@ -243,6 +281,31 @@ class FinalArtifactEdgeOraclePerformanceTest(unittest.TestCase):
         self.assertEqual(second["cache_hits"], 0)
         self.assertTrue(all(row["artifact_sha256"] == first["artifact_sha256"] for row in first["edges"]))
         self.assertTrue(all(row["artifact_sha256"] == second["artifact_sha256"] for row in second["edges"]))
+
+    def test_successful_javap_version_probe_is_reused_across_artifacts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first_artifact = _fake_artifact(
+                root / "first.jar", ["fixture/A.class"], b"first"
+            )
+            second_artifact = _fake_artifact(
+                root / "second.jar", ["fixture/B.class"], b"second"
+            )
+
+            def parse_entry(entry, artifact_sha256, *_args, **_kwargs):
+                return _fake_parse_result(entry, artifact_sha256)
+
+            with patch.object(
+                oracle, "_javap_version", return_value="21.0.1"
+            ) as version_probe, patch.object(
+                oracle, "_parse_entry_with_javap", side_effect=parse_entry
+            ):
+                first = oracle.scan_final_artifact(first_artifact)
+                second = oracle.scan_final_artifact(second_artifact)
+
+        self.assertTrue(first["complete"], first["failures"])
+        self.assertTrue(second["complete"], second["failures"])
+        self.assertEqual(version_probe.call_count, 1)
 
     def test_missing_javap_command_does_not_reuse_another_command_failure(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -700,6 +763,38 @@ class FinalArtifactEdgeOracleTest(unittest.TestCase):
                 {f"BOOT-INF/classes/fixture/{name}.class"},
             )
 
+    def test_batched_javap_falls_back_per_class_to_isolate_malformed_input(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = _write_source(
+                root / "src",
+                "fixture/Valid.java",
+                "package fixture; public class Valid { "
+                "public String call() { return String.valueOf(1); } }",
+            )
+            classes = root / "classes"
+            classes.mkdir()
+            _compile(classes, [source])
+            artifact = root / "mixed.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.write(
+                    classes / "fixture/Valid.class", "fixture/Valid.class"
+                )
+                archive.writestr("fixture/Broken.class", b"not-a-class")
+
+            result = oracle.scan_final_artifact(artifact, max_workers=1)
+
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["completed_class_count"], 2)
+        self.assertEqual(result["parsed_class_count"], 1)
+        self.assertTrue(all(
+            failure.startswith("fixture/Broken.class:")
+            for failure in result["failures"]
+        ), result["failures"])
+        self.assertTrue(any(
+            row["caller_owner"] == "fixture.Valid" for row in result["edges"]
+        ))
+
     def test_only_invokedynamic_classes_require_verbose_javap(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1040,6 +1135,48 @@ public class com.example.ArrayOwner {
             row["caller_owner"] == "fixture.Standalone" and row["callee_owner"] == "java.lang.String"
             for row in result["edges"]
         ))
+
+    def test_same_javap_scan_exposes_independently_parsed_structural_facts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = _write_source(
+                root / "src",
+                "fixture/Structural.java",
+                "package fixture; public class Structural { "
+                "static Object value; public static Object make() { "
+                "value = new String(); return value; } }",
+            )
+            classes = root / "classes"
+            classes.mkdir()
+            _compile(classes, [source])
+            artifact = root / "structural.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.write(
+                    classes / "fixture/Structural.class",
+                    "fixture/Structural.class",
+                )
+            result = oracle.scan_final_artifact(
+                artifact, include_structural_facts=True
+            )
+            cached = oracle.scan_final_artifact(
+                artifact, include_structural_facts=True
+            )
+
+        self.assertTrue(result["complete"], result["failures"])
+        facts = result["structural_facts"]
+        self.assertEqual(facts["class_names"], ["fixture/Structural"])
+        self.assertTrue(any(
+            row[0] == "fixture/Structural" and row[4] == "java/lang/String"
+            for row in facts["type_edges"]
+        ))
+        self.assertTrue(any(
+            row[0] == "fixture/Structural"
+            and row[1] == "method"
+            and row[2] == "make"
+            for row in facts["declared_members"]
+        ))
+        self.assertEqual(cached["cache_hits"], 1)
+        self.assertEqual(cached["structural_facts"], facts)
 
     def test_missing_javap_is_recorded_as_an_incomplete_scan(self):
         with tempfile.TemporaryDirectory() as temp_dir:

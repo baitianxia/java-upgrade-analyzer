@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import csv
+import gc
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import sqlite3
@@ -22,15 +25,29 @@ import xml.etree.ElementTree as ET
 import zipfile
 import zlib
 
-from binary_first_contract import BinaryFirstContractError, canonical_identity
+from binary_first_contract import (
+    BinaryFirstContractError,
+    canonical_identity,
+    canonical_identity_streaming,
+)
 from binary_tool_execution import execute_binary_tool
 from path_runtime import short_temporary_directory
-from final_artifact_edge_oracle import LINKER_BOOTSTRAP_OWNERS, scan_final_artifact
+from final_artifact_edge_oracle import (
+    LINKER_BOOTSTRAP_OWNERS,
+    clear_immutable_oracle_cache,
+    scan_final_artifact,
+)
 
 
 ORACLE_SOURCE = Path(__file__).with_name("java") / "RuntimeOutcomeOracle.java"
 SUPPORT_MANIFEST = Path(__file__).with_name("binary_first_support_manifest.json")
 POLICY_VERSION = "binary-independent-validation-v1"
+# A single target-JVM process retains every Class object it defines until its
+# URLClassLoader and process exit.  Loading a 100k-class application in one
+# invocation therefore makes validation memory scale with the entire runtime
+# closure.  Batching preserves the independent JVM observation while bounding
+# metaspace, reflection metadata and captured JSON for each child process.
+MAX_CLASSES_PER_RUNTIME_ORACLE_PROCESS = 2_000
 _ORACLE_RECONCILIATION_KIND_CODES = {
     "provider_binding": 1,
     "class_definition": 2,
@@ -162,6 +179,29 @@ def _identity(namespace: str, payload: Any) -> str:
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _sqlite_logical_content_sha256(path: Path) -> str:
+    """Hash SQLite content while ignoring non-semantic header counters.
+
+    SQLite backup preserves every database page but may advance the change
+    counter, schema cookie and version-valid-for fields in the 100-byte header.
+    Those fields affect cache invalidation, not table content. Normalizing them
+    lets the Oracle prove that base/current evidence stores are logically
+    identical before reusing an otherwise identical validation observation.
+    """
+
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        header = bytearray(handle.read(100))
+        if len(header) != 100 or not header.startswith(b"SQLite format 3\x00"):
+            return _sha256_file(path)
+        for start, end in ((24, 28), (40, 44), (92, 96)):
+            header[start:end] = b"\x00" * (end - start)
+        digest.update(header)
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
@@ -586,10 +626,8 @@ def _observe_classes(
         rounds = 0
         while pending:
             rounds += 1
-            if rounds > 64:
-                raise BinaryValidationError("BINARY_ORACLE_FIXED_POINT_LIMIT", str(len(pending)))
-            batch = sorted(pending)
-            pending.clear()
+            batch = sorted(pending)[:MAX_CLASSES_PER_RUNTIME_ORACLE_PROCESS]
+            pending.difference_update(batch)
             classes_file = temp / f"classes-{rounds}.txt"
             classes_file.write_text("\n".join(batch) + "\n", encoding="utf-8")
             completed = execute_binary_tool(
@@ -607,17 +645,25 @@ def _observe_classes(
                     "BINARY_ORACLE_EXECUTION_FAILED",
                     json.dumps(completed.failure.to_mapping(), ensure_ascii=False),
                 )
+            observed_batch = set()
             for line in completed.stdout.splitlines():
                 try:
                     row = json.loads(line)
                 except json.JSONDecodeError as error:
                     raise BinaryValidationError("BINARY_ORACLE_OUTPUT_INVALID", line[:200]) from error
                 name = str(row.get("class_name") or "")
+                observed_batch.add(name.replace("/", "."))
                 observations[name] = row
                 if row.get("status") == "definition_ready":
                     for dependency in [row.get("super_name"), *(row.get("interfaces") or ())]:
                         if dependency and dependency not in observations:
                             pending.add(str(dependency).replace("/", "."))
+            missing = set(batch).difference(observed_batch)
+            if missing:
+                raise BinaryValidationError(
+                    "BINARY_ORACLE_OUTPUT_INCOMPLETE",
+                    json.dumps(sorted(missing)[:20], ensure_ascii=False),
+                )
         return observations, helper_identity
 
 
@@ -820,20 +866,37 @@ def _validate_structural_edges(
     inventories: list[dict[str, Any]],
     *,
     javap: str,
+    scan_cache: dict[tuple[Any, ...], dict[str, Any]] | None = None,
+    direct_scan_cache: dict[tuple[str, str], bytes | Mapping[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     issues = []
-    artifact_instances = _rows(connection, "artifact_instances")
     instance_by_sha_slot = {
-        (row["content_sha256"], int(row["runtime_classpath_index"])): row
-        for row in artifact_instances
+        (row["content_sha256"], int(row["runtime_classpath_index"])):
+            row["artifact_instance_identity"]
+        for row in connection.execute(
+            """
+            SELECT artifact_instance_identity,content_sha256,runtime_classpath_index
+            FROM artifact_instances
+            """
+        )
     }
-    members = {row["member_identity"]: row for row in _rows(connection, "members")}
     production_type = defaultdict(set)
     production_init = defaultdict(set)
-    for edge in _rows(connection, "direct_edges"):
-        caller = members[edge["caller_member_identity"]]
+    for edge in connection.execute(
+        """
+        SELECT e.caller_artifact_instance_identity,e.bytecode_offset,
+               e.symbolic_owner,e.edge_kind,e.edge_json,
+               m.class_name AS caller_class_name,
+               m.member_name AS caller_member_name,
+               m.descriptor AS caller_descriptor
+        FROM direct_edges AS e
+        JOIN members AS m ON m.member_identity=e.caller_member_identity
+        WHERE e.edge_kind IN ('type','class_init')
+        """
+    ):
         common = (
-            caller["class_name"], caller["member_name"], caller["descriptor"],
+            edge["caller_class_name"], edge["caller_member_name"],
+            edge["caller_descriptor"],
             int(edge["bytecode_offset"]), edge["symbolic_owner"],
         )
         payload = json.loads(edge["edge_json"])
@@ -856,10 +919,79 @@ def _validate_structural_edges(
         "class_literal": "class_literal",
     }
     for artifact, inventory in zip(artifacts, inventories):
-        instance = instance_by_sha_slot.get((artifact["sha256"], int(artifact["slot"])))
-        if not instance:
+        instance_identity = instance_by_sha_slot.get(
+            (artifact["sha256"], int(artifact["slot"]))
+        )
+        if not instance_identity:
             continue
-        scanned = _scan_structural_edges(Path(artifact["path"]), inventory, javap)
+        artifact_path = Path(artifact["path"])
+        if _sha256_file(artifact_path) != artifact["sha256"]:
+            issues.append(_validation_issue(
+                "artifact_inventory",
+                "ORACLE_ARTIFACT_CHANGED_DURING_STRUCTURAL_VALIDATION",
+                artifact=artifact["path"],
+            ))
+            continue
+        scan_key = (
+            str(artifact["sha256"]),
+            str(javap),
+            tuple(sorted(
+                (str(name), str(entry))
+                for name, entry in inventory["classes"].items()
+            )),
+        )
+        scanned = None
+        direct_scan_payload = (
+            direct_scan_cache.get((str(artifact["sha256"]), str(javap)))
+            if direct_scan_cache is not None else None
+        )
+        direct_scan = (
+            _unpack_oracle_scan(direct_scan_payload)
+            if direct_scan_payload is not None else None
+        )
+        structural = (direct_scan or {}).get("structural_facts") or {}
+        if (
+            direct_scan
+            and direct_scan.get("complete")
+            and set(structural.get("class_names") or ())
+            == {
+                name for name in inventory["classes"]
+                if name != "module-info"
+            }
+        ):
+            # Both validators parse the same immutable javap observation with
+            # separate parsers. Reuse only when the observed class universe is
+            # exactly the independent archive inventory; fat/nested layouts or
+            # any partial scan automatically take the original fallback path.
+            scanned = {
+                "type_edges": {
+                    tuple(item) for item in structural.get("type_edges") or ()
+                },
+                "class_init_edges": {
+                    tuple(item)
+                    for item in structural.get("class_init_edges") or ()
+                },
+                "clinit_classes": set(
+                    structural.get("clinit_classes") or ()
+                ),
+                "semantic_instructions": {
+                    tuple(item)
+                    for item in structural.get("semantic_instructions") or ()
+                },
+                "declared_members": {
+                    tuple(item)
+                    for item in structural.get("declared_members") or ()
+                },
+                "failures": [],
+            }
+        if scanned is None:
+            scanned = scan_cache.get(scan_key) if scan_cache is not None else None
+        if scanned is None:
+            scanned = _scan_structural_edges(
+                artifact_path, inventory, javap
+            )
+            if scan_cache is not None:
+                scan_cache[scan_key] = scanned
         if scanned["failures"]:
             issues.append(_validation_issue(
                 "type_class_init", "ORACLE_STRUCTURAL_SCAN_INCOMPLETE",
@@ -874,8 +1006,8 @@ def _validate_structural_edges(
         declared_members.update(scanned["declared_members"])
         # Production names the trigger, not the opcode mnemonic, identically for
         # the supported active-use opcodes.
-        actual_t = production_type.get(instance["artifact_instance_identity"], set())
-        actual_i = production_init.get(instance["artifact_instance_identity"], set())
+        actual_t = production_type.get(instance_identity, set())
+        actual_i = production_init.get(instance_identity, set())
         for missing in sorted(truth_t - actual_t):
             issues.append(_validation_issue("type_class_init", "ORACLE_TYPE_EDGE_MISSING", edge=missing))
         for extra in sorted(actual_t - truth_t):
@@ -900,8 +1032,29 @@ def _rows(connection: sqlite3.Connection, table: str) -> list[dict[str, Any]]:
     return [dict(row) for row in connection.execute(f"SELECT * FROM {table}")]
 
 
-def _reconciliation(connection: sqlite3.Connection, kind: str) -> list[dict[str, Any]]:
-    result = []
+def _pack_oracle_scan(result: Mapping[str, Any]) -> bytes:
+    """Keep reusable javap evidence compact between independent validators."""
+    return zlib.compress(
+        json.dumps(
+            result,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8"),
+        level=1,
+    )
+
+
+def _unpack_oracle_scan(result: Mapping[str, Any] | bytes) -> dict[str, Any]:
+    if isinstance(result, bytes):
+        return json.loads(zlib.decompress(result).decode("utf-8"))
+    return dict(result)
+
+
+def _iter_reconciliation(
+    connection: sqlite3.Connection,
+    kind: str,
+) -> Iterable[dict[str, Any]]:
     for row in connection.execute(
         "SELECT record_count,payload_zlib FROM reconciliation_records WHERE record_kind=?",
         (_ORACLE_RECONCILIATION_KIND_CODES[kind],),
@@ -911,8 +1064,12 @@ def _reconciliation(connection: sqlite3.Connection, kind: str) -> list[dict[str,
             raise BinaryValidationError(
                 "BINARY_ORACLE_RECONCILIATION_CHUNK_COUNT_INVALID", kind
             )
-        result.extend(item["payload"] for item in records)
-    return result
+        for item in records:
+            yield item["payload"]
+
+
+def _reconciliation(connection: sqlite3.Connection, kind: str) -> list[dict[str, Any]]:
+    return list(_iter_reconciliation(connection, kind))
 
 
 def _member_tuple(value: str) -> tuple[str, str, str, int]:
@@ -1876,21 +2033,42 @@ def _validate_direct_edges(
     artifacts: list[dict[str, Any]],
     *,
     javap: str,
+    scan_cache: dict[
+        tuple[str, str], bytes | Mapping[str, Any]
+    ] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     issues = []
     truth_rows = []
     dynamic_rows = []
     discovery_classes = set()
-    artifact_instances = _rows(connection, "artifact_instances")
     instance_by_sha_slot = {
-        (row["content_sha256"], int(row["runtime_classpath_index"])): row
-        for row in artifact_instances
+        (row["content_sha256"], int(row["runtime_classpath_index"])):
+            row["artifact_instance_identity"]
+        for row in connection.execute(
+            """
+            SELECT artifact_instance_identity,content_sha256,runtime_classpath_index
+            FROM artifact_instances
+            """
+        )
     }
-    members = {row["member_identity"]: row for row in _rows(connection, "members")}
-    production_edges = _rows(connection, "direct_edges")
     production_by_artifact: dict[str, set[tuple[Any, ...]]] = defaultdict(set)
     production_dynamic_by_artifact: dict[str, set[tuple[Any, ...]]] = defaultdict(set)
-    for edge in production_edges:
+    for edge in connection.execute(
+        """
+        SELECT e.caller_artifact_instance_identity,e.edge_kind,
+               e.symbolic_owner,e.symbolic_name,e.symbolic_descriptor,
+               e.opcode,e.bytecode_offset,
+               m.class_name AS caller_class_name,
+               m.member_name AS caller_member_name,
+               m.descriptor AS caller_descriptor
+        FROM direct_edges AS e
+        JOIN members AS m ON m.member_identity=e.caller_member_identity
+        WHERE e.edge_kind IN (
+            'method','field','invokedynamic_bootstrap',
+            'invokedynamic_handle_method','invokedynamic_handle_field'
+        ) OR e.edge_kind LIKE 'invokedynamic_handle_%'
+        """
+    ):
         edge_kind = str(edge["edge_kind"] or "")
         dynamic_bootstrap = (
             edge_kind == "invokedynamic_bootstrap"
@@ -1898,13 +2076,12 @@ def _validate_direct_edges(
             not in LINKER_BOOTSTRAP_OWNERS
         )
         if edge_kind.startswith("invokedynamic_handle_") or dynamic_bootstrap:
-            caller = members[edge["caller_member_identity"]]
             if str(edge["symbolic_descriptor"]).startswith("("):
                 production_dynamic_by_artifact[
                     edge["caller_artifact_instance_identity"]
                 ].add((
-                    caller["class_name"].replace("/", "."),
-                    caller["member_name"], caller["descriptor"],
+                    edge["caller_class_name"].replace("/", "."),
+                    edge["caller_member_name"], edge["caller_descriptor"],
                     edge["symbolic_owner"].replace("/", "."),
                     edge["symbolic_name"], edge["symbolic_descriptor"],
                     int(edge["bytecode_offset"]),
@@ -1912,22 +2089,99 @@ def _validate_direct_edges(
             continue
         if edge_kind not in {"method", "field"}:
             continue
-        caller = members[edge["caller_member_identity"]]
         production_by_artifact[edge["caller_artifact_instance_identity"]].add((
-            caller["class_name"].replace("/", "."), caller["member_name"],
-            caller["descriptor"], edge["symbolic_owner"].replace("/", "."),
+            edge["caller_class_name"].replace("/", "."),
+            edge["caller_member_name"], edge["caller_descriptor"],
+            edge["symbolic_owner"].replace("/", "."),
             edge["symbolic_name"], edge["symbolic_descriptor"],
             _opcode_name(edge["opcode"]), int(edge["bytecode_offset"]),
         ))
+    # Scan independent artifacts concurrently, but keep one javap worker per
+    # artifact so the global process count remains bounded. The previous nested
+    # shape scanned JARs serially while starting up to eight JVMs for tiny
+    # 32-class groups inside each JAR; at 400+ dependencies JVM startup became
+    # the dominant validation cost.
+    scan_results: dict[tuple[str, str], bytes] = {}
+    scan_requests: dict[tuple[str, str], Path] = {}
     for artifact in artifacts:
-        instance = instance_by_sha_slot.get((artifact["sha256"], int(artifact["slot"])))
-        if not instance:
+        scan_key = (str(artifact["sha256"]), str(javap))
+        cached = scan_cache.get(scan_key) if scan_cache is not None else None
+        if cached is not None:
+            scan_results[scan_key] = (
+                cached if isinstance(cached, bytes) else _pack_oracle_scan(cached)
+            )
+        else:
+            scan_requests.setdefault(scan_key, Path(artifact["path"]))
+
+    def scan_request(item: tuple[tuple[str, str], Path]):
+        key, path = item
+        return key, scan_final_artifact(
+            path,
+            javap=javap,
+            max_workers=1,
+            include_structural_facts=True,
+        )
+
+    requests = iter(scan_requests.items())
+    worker_count = min(8, max(1, os.cpu_count() or 1), len(scan_requests))
+    if worker_count:
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="binary-oracle-artifact",
+        ) as executor:
+            active = {}
+            for _ in range(worker_count):
+                try:
+                    request = next(requests)
+                except StopIteration:
+                    break
+                active[executor.submit(scan_request, request)] = request[0]
+            while active:
+                completed, _pending = wait(
+                    active, return_when=FIRST_COMPLETED
+                )
+                for future in completed:
+                    active.pop(future)
+                    scan_key, result = future.result()
+                    packed = _pack_oracle_scan(result)
+                    scan_results[scan_key] = packed
+                    if scan_cache is not None and result.get("complete"):
+                        scan_cache[scan_key] = packed
+                    del result
+                    try:
+                        request = next(requests)
+                    except StopIteration:
+                        continue
+                    active[executor.submit(scan_request, request)] = request[0]
+    # scan_final_artifact keeps immutable serialized results for reuse by
+    # callers.  This validator now owns compact copies, so retaining both
+    # representations would only inflate its validation peak.
+    clear_immutable_oracle_cache()
+
+    for artifact in artifacts:
+        instance_identity = instance_by_sha_slot.get(
+            (artifact["sha256"], int(artifact["slot"]))
+        )
+        if not instance_identity:
             issues.append(_validation_issue(
                 "direct_edge", "ORACLE_ARTIFACT_INSTANCE_UNBOUND",
                 path=artifact["path"], slot=artifact["slot"],
             ))
             continue
-        result = scan_final_artifact(Path(artifact["path"]), javap=javap)
+        scan_key = (str(artifact["sha256"]), str(javap))
+        result = _unpack_oracle_scan(scan_results[scan_key])
+        if (
+            result.get("artifact_sha256")
+            and result["artifact_sha256"] != artifact["sha256"]
+        ):
+            issues.append(_validation_issue(
+                "direct_edge",
+                "ORACLE_ARTIFACT_CHANGED_DURING_DIRECT_EDGE_VALIDATION",
+                artifact=artifact["path"],
+                expected_sha256=artifact["sha256"],
+                actual_sha256=result.get("artifact_sha256"),
+            ))
+            continue
         if not result.get("complete"):
             issues.append(_validation_issue(
                 "direct_edge", "ORACLE_JAVAP_INVENTORY_INCOMPLETE",
@@ -1957,9 +2211,9 @@ def _validate_direct_edges(
             for row in result.get("edges") or ()
             if row.get("callee_owner")
         )
-        actual = production_by_artifact.get(instance["artifact_instance_identity"], set())
+        actual = production_by_artifact.get(instance_identity, set())
         actual_dynamic = production_dynamic_by_artifact.get(
-            instance["artifact_instance_identity"], set()
+            instance_identity, set()
         )
         for missing in sorted(truth - actual):
             issues.append(_validation_issue("direct_edge", "ORACLE_DIRECT_EDGE_MISSING", edge=missing))
@@ -2065,16 +2319,23 @@ def _validate_runtime_outcomes(
             concrete_subtypes[parent].append(class_name)
     for values in concrete_subtypes.values():
         values.sort()
-    artifact_rows = {row["artifact_instance_identity"]: row for row in _rows(connection, "artifact_instances")}
+    artifact_content_by_identity = {
+        row["artifact_instance_identity"]: row["content_sha256"]
+        for row in connection.execute(
+            """
+            SELECT artifact_instance_identity,content_sha256
+            FROM artifact_instances
+            """
+        )
+    }
     artifacts_by_path = {Path(item["path"]).resolve(): item for item in artifacts}
-    providers = _reconciliation(connection, "provider_binding")
     definitions = {
         (row["initiating_loader_realm_identity"], row["class_name"]): row
-        for row in _reconciliation(connection, "class_definition")
+        for row in _iter_reconciliation(connection, "class_definition")
     }
     provider_by_key = {
         (row["initiating_loader_realm_identity"], row["class_name"]): row
-        for row in providers
+        for row in _iter_reconciliation(connection, "provider_binding")
     }
     oracle_contexts = _oracle_runtime_contexts(
         observations, initial_classes, entrypoint_realms, platform_realm
@@ -2114,11 +2375,11 @@ def _validate_runtime_outcomes(
                     realm=realm, class_name=name, selected=selected,
                 ))
         else:
-            selected_row = artifact_rows.get(str(selected))
+            selected_content = artifact_content_by_identity.get(str(selected))
             expected_artifact = artifacts_by_path.get(provider_path)
             if (
-                not selected_row or not expected_artifact
-                or selected_row["content_sha256"] != expected_artifact["sha256"]
+                not selected_content or not expected_artifact
+                or selected_content != expected_artifact["sha256"]
             ):
                 issues.append(_validation_issue(
                     "provider", "ORACLE_ARTIFACT_PROVIDER_MISMATCH",
@@ -2153,61 +2414,105 @@ def _validate_runtime_outcomes(
                 production_class_load_status=definition.get("class_load_status"),
             ))
 
-    member_rows = {row["member_identity"]: row for row in _rows(connection, "members")}
-    direct_edges = {row["direct_edge_identity"]: row for row in _rows(connection, "direct_edges")}
-    member_resolutions = _reconciliation(connection, "member_resolution")
-    for resolution in member_resolutions:
-        edge = direct_edges.get(resolution["direct_edge_identity"])
-        if not edge or edge["edge_kind"] not in {"method", "field"}:
+    provider_count = len(provider_by_key)
+    # Provider/definition validation is complete. Release those decoded
+    # reconciliation graphs before constructing member/edge indexes so the two
+    # largest Oracle views do not overlap at peak RSS.
+    del (
+        definitions,
+        provider_by_key,
+        artifact_content_by_identity,
+        artifacts_by_path,
+    )
+
+    member_symbols = {
+        row["member_identity"]: (
+            row["class_name"], row["member_name"], row["descriptor"],
+        )
+        for row in connection.execute(
+            """
+            SELECT member_identity,class_name,member_name,descriptor
+            FROM members
+            """
+        )
+    }
+    direct_edges = {
+        row["direct_edge_identity"]: (
+            row["edge_kind"], row["symbolic_owner"],
+            row["symbolic_name"], row["symbolic_descriptor"],
+            int(row["opcode"] or 0),
+        )
+        for row in connection.execute(
+            """
+            SELECT direct_edge_identity,edge_kind,symbolic_owner,
+                   symbolic_name,symbolic_descriptor,opcode
+            FROM direct_edges
+            WHERE edge_kind IN ('method','field')
+            """
+        )
+    }
+    member_resolution_count = 0
+    for resolution in _iter_reconciliation(
+        connection, "member_resolution"
+    ):
+        member_resolution_count += 1
+        edge_identity = resolution["direct_edge_identity"]
+        edge = direct_edges.get(edge_identity)
+        if not edge or edge[0] not in {"method", "field"}:
             continue
-        kind = "field" if edge["edge_kind"] == "field" else "method"
+        kind = "field" if edge[0] == "field" else "method"
         oracle_member = resolve_member_cached(
-            edge["symbolic_owner"], kind,
-            edge["symbolic_name"], edge["symbolic_descriptor"],
+            edge[1], kind, edge[2], edge[3],
         )
         status = resolution["member_resolution_status"]
         if oracle_member is None:
             if status == "resolved":
                 issues.append(_validation_issue(
                     "member_resolution", "ORACLE_MEMBER_FALSE_RESOLUTION",
-                    direct_edge_identity=edge["direct_edge_identity"],
+                    direct_edge_identity=edge_identity,
                 ))
             continue
         declaring, _member = oracle_member
         if status != "resolved":
             issues.append(_validation_issue(
                 "member_resolution", "ORACLE_MEMBER_MISSED",
-                direct_edge_identity=edge["direct_edge_identity"], declaring_owner=declaring,
+                direct_edge_identity=edge_identity, declaring_owner=declaring,
             ))
             continue
-        selected_member = member_rows.get(str(resolution.get("resolved_member_identity") or ""))
-        if selected_member and selected_member["class_name"] != declaring:
+        selected_member = member_symbols.get(
+            str(resolution.get("resolved_member_identity") or "")
+        )
+        if selected_member and selected_member[0] != declaring:
             issues.append(_validation_issue(
                 "member_resolution", "ORACLE_MEMBER_OWNER_MISMATCH",
-                direct_edge_identity=edge["direct_edge_identity"],
-                expected_owner=declaring, actual_owner=selected_member["class_name"],
+                direct_edge_identity=edge_identity,
+                expected_owner=declaring, actual_owner=selected_member[0],
             ))
 
-    dispatches = {
-        row["direct_edge_identity"]: row
-        for row in _reconciliation(connection, "dispatch_resolution")
-    }
+    dispatches = {}
+    dispatch_count = 0
+    for row in _iter_reconciliation(connection, "dispatch_resolution"):
+        dispatch_count += 1
+        edge = direct_edges.get(row["direct_edge_identity"])
+        if edge and edge[0] == "method" and edge[4] in {182, 185}:
+            dispatches[row["direct_edge_identity"]] = (
+                row["dispatch_status"],
+                tuple(row.get("implementation_target_identities") or ()),
+            )
     dispatch_target_cache: dict[
         tuple[str, str, str], set[tuple[str, str, str]]
     ] = {}
     for edge_id, edge in direct_edges.items():
-        if edge["edge_kind"] != "method" or int(edge["opcode"] or 0) not in {182, 185}:
+        if edge[0] != "method" or edge[4] not in {182, 185}:
             continue
         dispatch_key = (
-            edge["symbolic_owner"], edge["symbolic_name"],
-            edge["symbolic_descriptor"],
+            edge[1], edge[2], edge[3],
         )
         oracle_targets = dispatch_target_cache.get(dispatch_key)
         if oracle_targets is None:
             oracle_targets = set()
             declaration = resolve_member_cached(
-                edge["symbolic_owner"], "method", edge["symbolic_name"],
-                edge["symbolic_descriptor"],
+                edge[1], "method", edge[2], edge[3],
             )
             declaration_fixed = bool(
                 declaration
@@ -2225,20 +2530,19 @@ def _validate_runtime_outcomes(
             elif declaration_fixed:
                 oracle_targets.add(dispatch_symbol(declaration))
             else:
-                for class_name in concrete_subtypes.get(edge["symbolic_owner"], ()):
+                for class_name in concrete_subtypes.get(edge[1], ()):
                     target = resolve_member_cached(
-                        class_name, "method", edge["symbolic_name"],
-                        edge["symbolic_descriptor"],
+                        class_name, "method", edge[2], edge[3],
                     )
                     if target:
                         oracle_targets.add(dispatch_symbol(target))
             dispatch_target_cache[dispatch_key] = oracle_targets
-        production = dispatches.get(edge_id) or {}
+        production = dispatches.get(edge_id) or ("", ())
         target_symbols = set()
-        for target_id in production.get("implementation_target_identities") or ():
-            row = member_rows.get(target_id)
-            if row:
-                target_symbols.add((row["class_name"], row["member_name"], row["descriptor"]))
+        for target_id in production[1]:
+            symbol = member_symbols.get(target_id)
+            if symbol:
+                target_symbols.add(symbol)
         application_oracle_targets = {
             item for item in oracle_targets
             if any(item[0] in inventory["classes"] for inventory in inventories)
@@ -2249,19 +2553,19 @@ def _validate_runtime_outcomes(
                 direct_edge_identity=edge_id,
                 expected=sorted(application_oracle_targets), actual=sorted(target_symbols),
             ))
-        if application_oracle_targets and production.get("dispatch_status") not in {
+        if application_oracle_targets and production[0] not in {
             "possible", "partial_possible_set", "proven_receiver", "exact"
         }:
             issues.append(_validation_issue(
                 "dispatch", "ORACLE_DISPATCH_STATUS_MISMATCH",
-                direct_edge_identity=edge_id, status=production.get("dispatch_status"),
+                direct_edge_identity=edge_id, status=production[0],
             ))
 
     return issues, {
         "runtime_observations": observations,
-        "provider_count": len(providers),
-        "member_resolution_count": len(member_resolutions),
-        "dispatch_count": len(dispatches),
+        "provider_count": provider_count,
+        "member_resolution_count": member_resolution_count,
+        "dispatch_count": dispatch_count,
     }
 
 
@@ -2372,10 +2676,37 @@ def _validate_cross_version_semantics(
     observations_by_side: Mapping[str, Mapping[str, Mapping[str, Any]]],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     issues = []
-    base_edges = {tuple(item) for item in truth_parts["base"]["direct_edges"]}
-    current_edges = {tuple(item) for item in truth_parts["current"]["direct_edges"]}
+    current_edges = truth_parts["current"]["direct_edges"]
+    base_ordered = sorted(truth_parts["base"]["direct_edges"])
+    current_ordered = sorted(current_edges)
     expected_resolution_changes = set()
-    for edge in sorted(base_edges.intersection(current_edges)):
+    base_index = 0
+    current_index = 0
+    while (
+        base_index < len(base_ordered)
+        and current_index < len(current_ordered)
+    ):
+        base_edge = base_ordered[base_index]
+        current_edge = current_ordered[current_index]
+        if base_edge < current_edge:
+            base_index += 1
+            continue
+        if current_edge < base_edge:
+            current_index += 1
+            continue
+        edge = tuple(current_edge)
+        # Match set-intersection semantics exactly: validate each common
+        # symbolic edge once even if duplicate providers emitted it.
+        while (
+            base_index < len(base_ordered)
+            and base_ordered[base_index] == base_edge
+        ):
+            base_index += 1
+        while (
+            current_index < len(current_ordered)
+            and current_ordered[current_index] == current_edge
+        ):
+            current_index += 1
         (
             caller_owner, caller_name, caller_descriptor,
             target_owner, target_name, target_descriptor,
@@ -2399,6 +2730,10 @@ def _validate_cross_version_semantics(
             str(target_descriptor), base_target[0].replace("/", "."),
             current_target[0].replace("/", "."),
         ))
+    # Cross-side membership is complete. Drop the two small sorted reference
+    # arrays before building the current graph; the authoritative truth lists
+    # themselves retain their original order for exact identity compatibility.
+    del base_ordered, current_ordered
 
     decisions = _load_json(generation / "binary_decisions.json")
     actual_resolution_changes = set()
@@ -2432,19 +2767,6 @@ def _validate_cross_version_semantics(
             change=extra,
         ))
 
-    current_graph = defaultdict(set)
-    for edge in current_edges:
-        caller = (str(edge[0]), str(edge[1]), str(edge[2]))
-        if not str(edge[6]).startswith("("):
-            continue
-        target = _resolve_member(
-            observations_by_side["current"], str(edge[3]).replace(".", "/"),
-            "method", edge[4], edge[5],
-        )
-        if target:
-            current_graph[caller].add((
-                target[0].replace("/", "."), str(target[1][1]), str(target[1][2])
-            ))
     entrypoints = {
         (
             str(item.get("class_name") or "").replace("/", "."),
@@ -2457,13 +2779,31 @@ def _validate_cross_version_semantics(
         )
     }
     reached = set(entrypoints)
-    pending = list(entrypoints)
-    while pending:
-        caller = pending.pop()
-        for target in current_graph.get(caller, ()):
-            if target not in reached:
-                reached.add(target)
-                pending.append(target)
+    if entrypoints:
+        current_graph = defaultdict(set)
+        for raw_edge in current_edges:
+            edge = tuple(raw_edge)
+            caller = (str(edge[0]), str(edge[1]), str(edge[2]))
+            if not str(edge[6]).startswith("("):
+                continue
+            target = _resolve_member(
+                observations_by_side["current"],
+                str(edge[3]).replace(".", "/"),
+                "method", edge[4], edge[5],
+            )
+            if target:
+                current_graph[caller].add((
+                    target[0].replace("/", "."),
+                    str(target[1][1]),
+                    str(target[1][2]),
+                ))
+        pending = list(entrypoints)
+        while pending:
+            caller = pending.pop()
+            for target in current_graph.get(caller, ()):
+                if target not in reached:
+                    reached.add(target)
+                    pending.append(target)
 
     base_resources = {
         (item["realm"], item["name"], item["mechanism"]): item["selected"]
@@ -2473,9 +2813,7 @@ def _validate_cross_version_semantics(
         (item["realm"], item["name"], item["mechanism"]): item["selected"]
         for item in truth_parts["current"]["resource_selections"]
     }
-    current_type_edges = {
-        tuple(item) for item in truth_parts["current"]["type_edges"]
-    }
+    current_type_edges = truth_parts["current"]["type_edges"]
     expected_resource_status = {}
     for key in sorted(set(base_resources).intersection(current_resources)):
         realm, name, _mechanism = key
@@ -2492,7 +2830,8 @@ def _validate_cross_version_semantics(
             and str(edge[5]).startswith("(Ljava/lang/Class;")
         }
         activated = False
-        for literal in current_type_edges:
+        for raw_literal in current_type_edges:
+            literal = tuple(raw_literal)
             caller = (
                 str(literal[0]).replace("/", "."),
                 str(literal[1]), str(literal[2]),
@@ -3376,24 +3715,53 @@ def _validate_runtime_semantic_overlay(
     }
 
 
-def _validate_closed_world_results(
-    generation: Path,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Rebuild formal reachability from already independently validated facts.
+def _validated_empty_entrypoint_set(
+    entrypoint_payload: Mapping[str, Any],
+    entrypoint_validation_issues: Iterable[Mapping[str, Any]],
+    entrypoint_truth: Mapping[str, Any] | None,
+) -> bool:
+    """Return true only when two independent views prove that no root exists.
 
-    Direct/reconciliation records are admitted here only after their preceding
-    Oracle validators have compared them with raw artifacts and target-JVM
-    observations. Semantic edges and entrypoints have likewise already been
-    independently rebuilt. This final pass closes those domains over the
-    formal result, API projection, CSV and summary surfaces.
+    Candidate roots are deliberately not compared as an exact set by the
+    entrypoint Oracle because their activation evidence can be incomplete.  A
+    graph-free closed-world pass is therefore allowed only when both candidate
+    counts are zero as well as the independently reconstructed exact set.  Any
+    validation issue, discovery gap, unexpected record or missing truth input
+    fails closed to the ordinary full-graph reconstruction.
     """
-    issues: list[dict[str, Any]] = []
+
+    truth = dict(entrypoint_truth or {})
+    return bool(
+        entrypoint_truth is not None
+        and not tuple(entrypoint_validation_issues)
+        and not tuple(entrypoint_payload.get("records") or ())
+        and not tuple(entrypoint_payload.get("coverage_gaps") or ())
+        and int(truth.get("exact_entrypoint_count") or 0) == 0
+        and int(truth.get("oracle_candidate_entrypoint_count") or 0) == 0
+        and int(truth.get("production_candidate_entrypoint_count") or 0) == 0
+        and not tuple(truth.get("candidate_activation_gaps") or ())
+    )
+
+
+def _load_closed_world_graph(
+    generation: Path,
+    semantic_payload: Mapping[str, Any],
+) -> tuple[
+    dict[str, list[tuple[str, str, str]]],
+    dict[str, list[tuple[str, str, str]]],
+    dict[str, dict[str, Any]],
+    dict[str, dict[str, Any]],
+]:
+    """Materialize the independently validated graph for reachable roots."""
+
     database = generation / "current_binary_facts.sqlite"
-    connection = sqlite3.connect(database)
+    connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
     connection.row_factory = sqlite3.Row
     try:
-        members = {row["member_identity"]: row for row in _rows(connection, "members")}
-        edges = {row["direct_edge_identity"]: row for row in _rows(connection, "direct_edges")}
+        edges = {
+            row["direct_edge_identity"]: row
+            for row in _rows(connection, "direct_edges")
+        }
         resolutions = {
             row["direct_edge_identity"]: row
             for row in _reconciliation(connection, "member_resolution")
@@ -3408,7 +3776,9 @@ def _validate_closed_world_results(
         }
         initializations = {
             row["direct_edge_identity"]: row
-            for row in _reconciliation(connection, "class_initialization_resolution")
+            for row in _reconciliation(
+                connection, "class_initialization_resolution"
+            )
         }
         linkages = {
             row["direct_edge_identity"]: row
@@ -3448,7 +3818,9 @@ def _validate_closed_world_results(
             targets = [resolution["resolved_member_identity"]]
         certainty = (
             "possible"
-            if dispatch.get("dispatch_status") in {"possible", "partial_possible_set"}
+            if dispatch.get("dispatch_status") in {
+                "possible", "partial_possible_set",
+            }
             or executable_linkage
             else "exact"
         )
@@ -3492,7 +3864,6 @@ def _validate_closed_world_results(
         for target in resolution.get("initializer_target_identities") or ():
             admit(str(edge["caller_member_identity"]), str(target), "exact", edge_id)
 
-    semantic_payload = _load_json(generation / "binary_runtime_semantic_overlay.json")
     for row in semantic_payload.get("rows") or ():
         admit(
             str(row.get("caller_member_identity") or ""),
@@ -3514,7 +3885,124 @@ def _validate_closed_world_results(
                 str(row.get("inline_overlay_identity") or ""),
             )
 
+    return (
+        dict(transitions),
+        dict(relation_by_evidence),
+        resolutions,
+        linkages,
+    )
+
+
+def _validate_closed_world_results(
+    generation: Path,
+    *,
+    entrypoint_validation_issues: Iterable[Mapping[str, Any]] = (),
+    entrypoint_truth: Mapping[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Rebuild formal reachability from already independently validated facts.
+
+    Direct/reconciliation records are admitted here only after their preceding
+    Oracle validators have compared them with raw artifacts and target-JVM
+    observations. Semantic edges and entrypoints have likewise already been
+    independently rebuilt. This final pass closes those domains over the
+    formal result, API projection, CSV and summary surfaces.
+    """
+    issues: list[dict[str, Any]] = []
+    decisions_payload = _load_json(generation / "binary_decisions.json")
+    projections_payload = _load_json(generation / "binary_projections.json")
+    formal_payload = _load_json(generation / "binary_formal_results.json")
+    formal_projections = list(
+        projections_payload.get("formal_projections") or ()
+    )
+    if not formal_projections:
+        formal_results = list(formal_payload.get("results") or ())
+        reported_apis = list(formal_payload.get("by_api") or ())
+        if formal_results:
+            issues.append(_validation_issue(
+                "closed_world_results",
+                "ORACLE_FORMAL_PROJECTION_RESULT_SET_MISMATCH",
+                missing=[],
+                extra=sorted(
+                    str(item.get("projection_identity") or "")
+                    for item in formal_results
+                ),
+            ))
+        if reported_apis:
+            issues.append(_validation_issue(
+                "closed_world_results",
+                "ORACLE_API_AGGREGATION_MISMATCH",
+                mismatches=[{
+                    "field": "identity_set",
+                    "missing": [],
+                    "extra": sorted(
+                        str(item.get("reported_api_identity") or "")
+                        for item in reported_apis
+                    ),
+                }],
+            ))
+        csv_path = generation / "binary_formal_results.csv"
+        with csv_path.open(encoding="utf-8-sig", newline="") as handle:
+            if list(csv.DictReader(handle)):
+                issues.append(_validation_issue(
+                    "closed_world_results",
+                    "ORACLE_FORMAL_CSV_PROJECTION_MISMATCH",
+                ))
+        authoritative = list(
+            decisions_payload.get("authoritative_change_facts") or ()
+        )
+        summary = _load_json(generation / "binary_summary.json")
+        summary_expected = {
+            "authoritative_change_fact_count": len(authoritative),
+            "formal_projection_count": 0,
+            "formal_trace_result_count": 0,
+            "unique_reported_api_total": 0,
+            "reachable_total": 0,
+            "uncertain_total": 0,
+            "not_found_in_static_analysis_total": 0,
+            "not_analyzed_total": 0,
+            "probable_impact_total": 0,
+        }
+        summary_mismatches = {
+            key: {"expected": value, "actual": summary.get(key)}
+            for key, value in summary_expected.items()
+            if summary.get(key) != value
+        }
+        if summary_mismatches:
+            issues.append(_validation_issue(
+                "closed_world_results",
+                "ORACLE_SUMMARY_AGGREGATION_MISMATCH",
+                mismatches=summary_mismatches,
+            ))
+        return issues, {
+            "reachability_rebuild_status": (
+                "not_required_no_formal_projections"
+            ),
+            "exact_reachable_node_count": 0,
+            "possible_reachable_node_count": 0,
+            "formal_result_count": len(formal_results),
+            "reported_api_count": len(reported_apis),
+            "formal_identity_set_closed": not issues,
+        }
+
+    semantic_payload = _load_json(generation / "binary_runtime_semantic_overlay.json")
     entrypoint_payload = _load_json(generation / "binary_entrypoints.json")
+    graph_not_required = _validated_empty_entrypoint_set(
+        entrypoint_payload,
+        entrypoint_validation_issues,
+        entrypoint_truth,
+    )
+    if graph_not_required:
+        transitions = {}
+        relation_by_evidence = {}
+        resolutions = {}
+        linkages = {}
+    else:
+        (
+            transitions,
+            relation_by_evidence,
+            resolutions,
+            linkages,
+        ) = _load_closed_world_graph(generation, semantic_payload)
     exact_entrypoints = {
         str(row.get("member_identity") or "")
         for row in entrypoint_payload.get("records") or ()
@@ -3544,7 +4032,6 @@ def _validate_closed_world_results(
         exact_entrypoints | possible_entrypoints, include_possible=True
     )
 
-    decisions_payload = _load_json(generation / "binary_decisions.json")
     decisions = {
         str(row.get("decision_identity") or ""): row
         for row in decisions_payload.get("authoritative_change_facts") or ()
@@ -3553,7 +4040,6 @@ def _validate_closed_world_results(
         str(row.get("change_fact_identity") or ""): row
         for row in decisions.values()
     }
-    projections_payload = _load_json(generation / "binary_projections.json")
     assessments = {
         str(row.get("projection_assessment_identity") or ""): row
         for row in projections_payload.get("authoritative_projection_assessments") or ()
@@ -3585,7 +4071,6 @@ def _validate_closed_world_results(
             "trace_node_limit_exceeded",
         }
     )
-    formal_payload = _load_json(generation / "binary_formal_results.json")
     formal_results = list(formal_payload.get("results") or ())
     result_by_projection = {
         str(row.get("projection_identity") or ""): row for row in formal_results
@@ -3635,6 +4120,14 @@ def _validate_closed_world_results(
             "runtime_verification_executed_by_system": False,
             "exact_path_exists": exact,
         }
+        if graph_not_required:
+            # With a complete, independently proven empty root set no path can
+            # exist, and result completeness is determined solely by the same
+            # global/per-decision gaps used by the production tracer.
+            expected_state.update({
+                "possible_path_exists": False,
+                "path_set_complete": complete,
+            })
         mismatches = {
             key: {"expected": value, "actual": result.get(key)}
             for key, value in expected_state.items()
@@ -3645,7 +4138,18 @@ def _validate_closed_world_results(
         path_linkage_statuses = set()
         for path in result.get("paths") or ():
             entrypoint = str(path.get("entrypoint_member_identity") or "")
-            current_nodes = {entrypoint}
+            valid_entrypoint = entrypoint in (
+                exact_entrypoints | possible_entrypoints
+            )
+            if not valid_entrypoint:
+                issues.append(_validation_issue(
+                    "closed_world_results",
+                    "ORACLE_TRACE_PATH_ENTRYPOINT_MISMATCH",
+                    projection_identity=projection_id,
+                    path_identity=path.get("path_identity"),
+                    entrypoint_member_identity=entrypoint,
+                ))
+            current_nodes = {entrypoint} if valid_entrypoint else set()
             path_certainty = (
                 "possible" if entrypoint in possible_entrypoints else "exact"
             )
@@ -3901,6 +4405,10 @@ def _validate_closed_world_results(
             mismatches=summary_mismatches,
         ))
     return issues, {
+        "reachability_rebuild_status": (
+            "not_required_validated_empty_entrypoint_set"
+            if graph_not_required else "completed_full_graph"
+        ),
         "exact_reachable_node_count": len(exact_reached),
         "possible_reachable_node_count": len(possible_reached),
         "formal_result_count": len(formal_results),
@@ -4117,14 +4625,31 @@ def validate_generation(
     current_artifacts = _artifact_configs(current_side)
     base_jdk = Path(str(base_side.get("jdk_home") or "")).expanduser().resolve()
     current_jdk = Path(str(current_side.get("jdk_home") or "")).expanduser().resolve()
-    base_inventories = [
-        _archive_inventory(Path(item["path"]), _release_major(base_jdk))
-        for item in base_artifacts
-    ]
-    current_inventories = [
-        _archive_inventory(Path(item["path"]), _release_major(current_jdk))
-        for item in current_artifacts
-    ]
+    inventory_cache: dict[tuple[str, int], dict[str, Any]] = {}
+
+    def inventories_for(
+        artifacts: Iterable[Mapping[str, Any]], jdk_home: Path
+    ) -> list[dict[str, Any]]:
+        target_major = _release_major(jdk_home)
+        result = []
+        for item in artifacts:
+            key = (str(item["sha256"]), target_major)
+            path = Path(item["path"])
+            actual_sha256 = _sha256_file(path)
+            if actual_sha256 != key[0]:
+                raise BinaryValidationError(
+                    "BINARY_ORACLE_ARTIFACT_CHANGED_DURING_INVENTORY",
+                    f"{path}: expected={key[0]}; actual={actual_sha256}",
+                )
+            inventory = inventory_cache.get(key)
+            if inventory is None:
+                inventory = _archive_inventory(path, target_major)
+                inventory_cache[key] = inventory
+            result.append(inventory)
+        return result
+
+    base_inventories = inventories_for(base_artifacts, base_jdk)
+    current_inventories = inventories_for(current_artifacts, current_jdk)
     issues = list(integrity_issues)
     for side, inventories in (("base", base_inventories), ("current", current_inventories)):
         for inventory in inventories:
@@ -4146,21 +4671,85 @@ def validate_generation(
 
     helper_identities = {}
     observations_by_side = {}
-    for side_name, side, artifacts, inventories, db_name, jdk_home in (
+    structural_scan_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
+    direct_scan_cache: dict[
+        tuple[str, str], bytes | Mapping[str, Any]
+    ] = {}
+    side_validation_cache: dict[
+        tuple[str, str, str, str],
+        tuple[dict[str, Any], str, dict[str, Any]],
+    ] = {}
+    side_specs = (
         ("base", base_side, base_artifacts, base_inventories, "base_binary_facts.sqlite", base_jdk),
         ("current", current_side, current_artifacts, current_inventories, "current_binary_facts.sqlite", current_jdk),
-    ):
+    )
+    logical_database_identities = {
+        db_name: _sqlite_logical_content_sha256(generation / db_name)
+        for _name, _side, _artifacts, _inventories, db_name, _jdk in side_specs
+    }
+
+    def side_key(side, artifacts, db_name, jdk_home):
+        return (
+            logical_database_identities[db_name],
+            str(jdk_home),
+            json.dumps(
+                artifacts,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            json.dumps(
+                side.get("runtime_profile") or {},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+
+    side_validation_keys = {
+        side_name: side_key(side, artifacts, db_name, jdk_home)
+        for side_name, side, artifacts, _inventories, db_name, jdk_home
+        in side_specs
+    }
+    duplicated_side_keys = {
+        key for key in side_validation_keys.values()
+        if list(side_validation_keys.values()).count(key) > 1
+    }
+    for side_name, side, artifacts, inventories, db_name, jdk_home in side_specs:
         db_path = generation / db_name
+        side_validation_key = side_validation_keys[side_name]
+        cached_side = side_validation_cache.get(side_validation_key)
+        if cached_side is not None:
+            observations, helper_identity, side_truth = cached_side
+            helper_identities[side_name] = helper_identity
+            observations_by_side[side_name] = observations
+            truth_parts[side_name] = side_truth
+            continue
         connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         connection.row_factory = sqlite3.Row
         try:
             javap = str(jdk_home / "bin" / ("javap.exe" if (jdk_home / "bin" / "javap.exe").exists() else "javap"))
             edge_issues, edge_truth = _validate_direct_edges(
-                connection, artifacts, javap=javap
+                connection,
+                artifacts,
+                javap=javap,
+                scan_cache=direct_scan_cache,
             )
             structural_issues, structural_truth = _validate_structural_edges(
-                connection, artifacts, inventories, javap=javap
+                connection,
+                artifacts,
+                inventories,
+                javap=javap,
+                scan_cache=structural_scan_cache,
+                direct_scan_cache=direct_scan_cache,
             )
+            if side_validation_key in duplicated_side_keys:
+                # The other side will reuse the independently proven logical
+                # database/input identity. Release raw javap observations now
+                # so they do not overlap runtime-outcome Oracle indexes.
+                direct_scan_cache.clear()
+                structural_scan_cache.clear()
+                clear_immutable_oracle_cache()
             issues.extend(edge_issues)
             issues.extend(structural_issues)
             independent_classes = {
@@ -4214,9 +4803,15 @@ def validate_generation(
             )
             issues.extend(runtime_issues)
             issues.extend(resource_issues)
-            truth_parts[side_name] = {
+            side_truth = {
                 **edge_truth, **structural_truth, **runtime_truth, **resource_truth,
             }
+            truth_parts[side_name] = side_truth
+            side_validation_cache[side_validation_key] = (
+                observations,
+                helper_identity,
+                side_truth,
+            )
         finally:
             connection.close()
 
@@ -4248,11 +4843,41 @@ def validate_generation(
     )
     issues.extend(semantic_issues)
     truth_parts["runtime_semantic_overlay"] = semantic_truth
-    closed_issues, closed_truth = _validate_closed_world_results(generation)
+    # The following closed-world pass and final truth hashing do not consume
+    # raw class observations or scan caches. Drop those large, independently
+    # reconstructed working sets before any graph materialization so validation
+    # phases do not overlap at the RSS peak.
+    observations_by_side.clear()
+    side_validation_cache.clear()
+    direct_scan_cache.clear()
+    structural_scan_cache.clear()
+    inventory_cache.clear()
+    clear_immutable_oracle_cache()
+    observations = None
+    independent_classes = None
+    javap_members = None
+    cached_side = None
+    inventories = None
+    del base_inventories, current_inventories, side_specs
+    gc.collect()
+    closed_issues, closed_truth = _validate_closed_world_results(
+        generation,
+        entrypoint_validation_issues=entrypoint_issues,
+        entrypoint_truth=entrypoint_truth,
+    )
     issues.extend(closed_issues)
     truth_parts["closed_world_results"] = closed_truth
 
-    truth_set_identity = _identity("binary_oracle_truth_set_identity", truth_parts)
+    # ``truth_parts`` can contain millions of independently reconstructed
+    # rows. The ordinary identity helper canonicalizes the full tree twice and
+    # then allocates one equally large JSON byte string. Stream the exact same
+    # canonical bytes into SHA-256 so validation identity construction is
+    # bounded by nesting depth instead of total project size.
+    truth_set_identity = canonical_identity_streaming(
+        "binary_oracle_truth_set_identity",
+        truth_parts,
+        schema_version="1",
+    )
     support = _load_json(SUPPORT_MANIFEST)
     oracle_manifest_identity = _identity(
         "oracle_support_manifest_identity", support["oracle_support_manifest"]

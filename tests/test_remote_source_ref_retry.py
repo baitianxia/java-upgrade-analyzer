@@ -271,6 +271,46 @@ class RemoteSourceRefRetryTest(unittest.TestCase):
         self.assertEqual(result["refs"][0]["commit"], self.commit)
         self.assertEqual(git_mock.call_count, 2)
 
+    def test_targeted_inventory_discards_suffix_ref_returned_with_exact_ref(self):
+        stdout = "\n".join((
+            f"{'a' * 40}\trefs/heads/release",
+            f"{'b' * 40}\trefs/heads/release.DEV",
+        ))
+        with patch.object(refs, "_git", return_value=(stdout, "", 0)):
+            result = refs._targeted_remote_ref_inventory(
+                "/repo",
+                "origin",
+                "release",
+                retry_attempts=1,
+            )
+
+        self.assertEqual(
+            [item["canonical_ref"] for item in result["refs"]],
+            ["refs/heads/release"],
+        )
+        self.assertEqual(
+            result["attempts"][0]["ignored_unexpected_refs"],
+            ["refs/heads/release.DEV"],
+        )
+
+    def test_targeted_inventory_rejects_suffix_only_as_exact_match(self):
+        stdout = f"{'b' * 40}\trefs/heads/release.DEV\n"
+        with patch.object(refs, "_git", return_value=(stdout, "", 0)) as git_mock:
+            result = refs._targeted_remote_ref_inventory(
+                "/repo",
+                "origin",
+                "release",
+                retry_attempts=2,
+                retry_delays=(),
+            )
+
+        self.assertEqual(result["refs"], [])
+        self.assertEqual(git_mock.call_count, 2)
+        self.assertEqual(
+            result["failures"][0]["reason_code"],
+            "remote_ref_observation_unexpected",
+        )
+
     def test_malformed_targeted_result_retries_then_accepts_valid_ref(self):
         responses = [
             ("truncated-output", "", 0),

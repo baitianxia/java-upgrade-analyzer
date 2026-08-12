@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 from typing import Any, Mapping
 
@@ -55,6 +55,7 @@ class BinaryTraceEngine:
         semantic_overlay: Any | None = None,
         max_visited_nodes: int = 1_000_000,
         max_paths_per_target: int = 20,
+        materialize_graph: bool = True,
     ):
         self.store = store
         self.profile = runtime_profile
@@ -64,36 +65,6 @@ class BinaryTraceEngine:
         self.max_paths_per_target = max_paths_per_target
         self.inline_overlay = inline_overlay
         self.semantic_overlay = semantic_overlay
-        self.members = {row["member_identity"]: row for row in store.rows("members")}
-        self.edges = {row["direct_edge_identity"]: row for row in store.rows("direct_edges")}
-        self.semantic_edges = {
-            row["semantic_edge_identity"]: row
-            for row in getattr(semantic_overlay, "rows", ())
-        }
-        self.providers = {
-            (item["initiating_loader_realm_identity"], item["class_name"]): item
-            for item in reconciliation.provider_bindings
-        }
-        self.member_resolutions = {
-            item["direct_edge_identity"]: item for item in reconciliation.member_resolutions
-        }
-        self.dispatch = {
-            item["direct_edge_identity"]: item for item in reconciliation.dispatch_resolutions
-        }
-        self.type_resolutions = {
-            item["direct_edge_identity"]: item
-            for item in reconciliation.type_resolutions
-        }
-        self.class_initializations = {
-            item["direct_edge_identity"]: item
-            for item in reconciliation.class_initialization_resolutions
-        }
-        self.linkage_resolutions = {
-            item["direct_edge_identity"]: item
-            for item in reconciliation.linkage_resolutions
-        }
-        self.reverse: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        self._build_reverse_graph()
         self.entrypoint_discovery = entrypoint_discovery or discover_binary_entrypoints(
             store, runtime_profile, reconciliation
         )
@@ -103,13 +74,110 @@ class BinaryTraceEngine:
             self.entrypoint_gaps,
         ) = self._entrypoints()
         self.entrypoints = self.exact_entrypoints | self.possible_entrypoints
-        self.entrypoint_records_by_member: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        self.entrypoint_records_by_member: dict[
+            str, list[dict[str, Any]]
+        ] = defaultdict(list)
         for item in self.entrypoint_discovery.records:
             self.entrypoint_records_by_member[item["member_identity"]].append(item)
+        self.providers = {
+            (item["initiating_loader_realm_identity"], item["class_name"]): item
+            for item in reconciliation.provider_bindings
+        }
+        self.reverse: dict[str, list[dict[str, Any]]] = defaultdict(list)
         self._trace_cache: dict[
             tuple[str, ...], tuple[list[dict[str, Any]], list[str]]
         ] = {}
-        self._prepare_batch_graph()
+        if materialize_graph:
+            self.members = {
+                row["member_identity"]: dict(row)
+                for row in store.connection.execute(
+                    """
+                    SELECT member_identity,class_name,member_name,descriptor
+                    FROM members
+                    """
+                )
+            }
+            self.edges = {
+                row["direct_edge_identity"]: dict(row)
+                for row in store.connection.execute(
+                    """
+                    SELECT direct_edge_identity,caller_member_identity,
+                           caller_artifact_instance_identity,instruction_index,
+                           bytecode_offset,edge_kind,opcode,symbolic_owner,
+                           symbolic_name,symbolic_descriptor,edge_json
+                    FROM direct_edges
+                    """
+                )
+            }
+            self.semantic_edges = {
+                row["semantic_edge_identity"]: row
+                for row in getattr(semantic_overlay, "rows", ())
+            }
+            self.member_resolutions = {
+                item["direct_edge_identity"]: item
+                for item in reconciliation.member_resolutions
+            }
+            self.dispatch = {
+                item["direct_edge_identity"]: item
+                for item in reconciliation.dispatch_resolutions
+            }
+            self.type_resolutions = {
+                item["direct_edge_identity"]: item
+                for item in reconciliation.type_resolutions
+            }
+            self.class_initializations = {
+                item["direct_edge_identity"]: item
+                for item in reconciliation.class_initialization_resolutions
+            }
+            self.linkage_resolutions = {
+                item["direct_edge_identity"]: item
+                for item in reconciliation.linkage_resolutions
+            }
+            self._build_reverse_graph()
+            self._prepare_batch_graph()
+        else:
+            if self.entrypoints:
+                raise ValueError(
+                    "graph-free trace construction requires an empty entrypoint set"
+                )
+            self.members = {}
+            self.edges = {}
+            self.semantic_edges = {}
+            self.member_resolutions = {}
+            self.dispatch = {}
+            self.type_resolutions = {}
+            self.class_initializations = {}
+            self.linkage_resolutions = {}
+            self.exact_reachable_nodes = set()
+            self.possible_reachable_nodes = set()
+            self.possible_path_nodes = set()
+            self.graph_stats = {
+                "batch_transition_build": "skipped_no_entrypoints_v1",
+                "graph_materialization_status": "not_required_empty_root_set",
+                "node_count": 0,
+                "effective_edge_count": 0,
+                "possible_edge_count": 0,
+                "runtime_semantic_edge_count": len(
+                    getattr(semantic_overlay, "rows", ())
+                ),
+                "runtime_semantic_overlay_identity": str(
+                    getattr(semantic_overlay, "identity", "") or ""
+                ),
+                "entrypoint_count": 0,
+                "exact_entrypoint_count": 0,
+                "possible_entrypoint_count": 0,
+                "entrypoint_discovery_identity": self.entrypoint_discovery.identity,
+                "exact_reachable_node_count": 0,
+                "possible_reachable_node_count": 0,
+                "exact_scc_count": 0,
+                "exact_largest_scc_size": 0,
+                "possible_scc_count": 0,
+                "possible_largest_scc_size": 0,
+                "path_enumeration": "not_required_empty_root_set_v1",
+            }
+            self.batch_graph_identity = _identity(
+                "binary_batch_trace_graph_identity", self.graph_stats
+            )
         self.decision_by_identity = {
             item["decision_identity"]: item
             for item in (
@@ -853,4 +921,177 @@ class BinaryTraceEngine:
         )
 
 
-__all__ = ["BinaryTraceBundle", "BinaryTraceEngine"]
+def _hydrate_trace_reconciliation(
+    store: BinaryFactStore,
+    reconciliation: RuntimeReconciliationResult,
+) -> RuntimeReconciliationResult:
+    """Restore graph-only record families after selective reconciliation."""
+
+    if not isinstance(reconciliation, RuntimeReconciliationResult):
+        # Test doubles and external callers predating selective retention have
+        # no persisted hydration contract; leave their supplied view untouched.
+        return reconciliation
+    kinds_by_field = {
+        "member_resolutions": "member_resolution",
+        "dispatch_resolutions": "dispatch_resolution",
+        "type_resolutions": "type_resolution",
+        "class_initialization_resolutions": (
+            "class_initialization_resolution"
+        ),
+        "linkage_resolutions": "linkage_resolution",
+    }
+    replacements = {}
+    for field_name, record_kind in kinds_by_field.items():
+        if getattr(reconciliation, field_name):
+            continue
+        replacements[field_name] = tuple(
+            store.reconciliation_payloads(record_kind)
+        )
+    return replace(reconciliation, **replacements) if replacements else reconciliation
+
+
+def build_binary_traces(
+    store: BinaryFactStore,
+    runtime_profile: RuntimeProfile,
+    reconciliation: RuntimeReconciliationResult,
+    decisions: BinaryDecisionBundle,
+    *,
+    inline_overlay: Any | None = None,
+    semantic_overlay: Any | None = None,
+    max_visited_nodes: int = 1_000_000,
+    max_paths_per_target: int = 20,
+) -> BinaryTraceBundle:
+    """Build traces without materializing a graph that has no consumers.
+
+    A graph is observable only through formal/candidate projections or service
+    resource activation decisions. Entrypoint discovery remains mandatory and
+    is still persisted independently, but when none of those consumers exists
+    every possible trace result is provably empty. Building hundreds of
+    thousands of edge dictionaries and SCC indexes in that case only creates a
+    transient memory spike.
+    """
+
+    entrypoint_discovery = discover_binary_entrypoints(
+        store, runtime_profile, reconciliation
+    )
+    targetable_candidate = any(
+        item.get("planning_status") == "targetable"
+        for item in decisions.candidate_projection_plans
+    )
+    service_activation = any(
+        item.get("fact_kind") == "resource"
+        and str((item.get("fact_scope") or {}).get("resource_name") or "").startswith(
+            "META-INF/services/"
+        )
+        for item in decisions.authoritative_decisions
+    )
+    has_trace_results = bool(
+        decisions.formal_projections or targetable_candidate
+    )
+    if has_trace_results and not (
+        entrypoint_discovery.exact_member_identities
+        or entrypoint_discovery.possible_member_identities
+        or service_activation
+    ):
+        return BinaryTraceEngine(
+            store,
+            runtime_profile,
+            reconciliation,
+            decisions,
+            entrypoint_discovery=entrypoint_discovery,
+            inline_overlay=inline_overlay,
+            semantic_overlay=semantic_overlay,
+            max_visited_nodes=max_visited_nodes,
+            max_paths_per_target=max_paths_per_target,
+            materialize_graph=False,
+        ).build()
+    if has_trace_results or service_activation:
+        hydrated = _hydrate_trace_reconciliation(store, reconciliation)
+        return BinaryTraceEngine(
+            store,
+            runtime_profile,
+            hydrated,
+            decisions,
+            entrypoint_discovery=entrypoint_discovery,
+            inline_overlay=inline_overlay,
+            semantic_overlay=semantic_overlay,
+            max_visited_nodes=max_visited_nodes,
+            max_paths_per_target=max_paths_per_target,
+        ).build()
+
+    exact_entrypoints = set(entrypoint_discovery.exact_member_identities)
+    possible_entrypoints = set(entrypoint_discovery.possible_member_identities)
+    graph_stats = {
+        "batch_transition_build": "skipped_no_trace_targets_v1",
+        "graph_materialization_status": "not_required",
+        "node_count": 0,
+        "effective_edge_count": 0,
+        "possible_edge_count": 0,
+        "runtime_semantic_edge_count": len(
+            getattr(semantic_overlay, "rows", ())
+        ),
+        "runtime_semantic_overlay_identity": str(
+            getattr(semantic_overlay, "identity", "") or ""
+        ),
+        "entrypoint_count": len(exact_entrypoints | possible_entrypoints),
+        "exact_entrypoint_count": len(exact_entrypoints),
+        "possible_entrypoint_count": len(possible_entrypoints),
+        "entrypoint_discovery_identity": entrypoint_discovery.identity,
+        "exact_reachable_node_count": len(exact_entrypoints),
+        "possible_reachable_node_count": len(
+            exact_entrypoints | possible_entrypoints
+        ),
+        "exact_scc_count": 0,
+        "exact_largest_scc_size": 0,
+        "possible_scc_count": 0,
+        "possible_largest_scc_size": 0,
+        "path_enumeration": "not_required_no_trace_targets_v1",
+    }
+    batch_graph_identity = _identity(
+        "binary_batch_trace_graph_identity", graph_stats
+    )
+    trace_result_set_digest = _identity(
+        "binary_trace_result_set_digest",
+        {
+            "entrypoint_discovery_identity": entrypoint_discovery.identity,
+            "runtime_semantic_overlay_identity": str(
+                getattr(semantic_overlay, "identity", "") or ""
+            ),
+            "formal_result_identities": [],
+            "candidate_result_identities": [],
+            "resource_activation_result_identities": [],
+        },
+    )
+    gaps = tuple(sorted(set(
+        tuple(entrypoint_discovery.coverage_gaps)
+        + tuple(reconciliation.coverage_gaps)
+        + tuple(getattr(semantic_overlay, "coverage_gaps", ()))
+    )))
+    coverage = "complete" if not gaps else "partial"
+    identity = _identity(
+        "binary_trace_bundle_identity",
+        {
+            "analysis_context_identity": decisions.analysis_context_identity,
+            "trace_result_set_digest": trace_result_set_digest,
+            "coverage_status": coverage,
+            "coverage_gaps": list(gaps),
+            "batch_graph_identity": batch_graph_identity,
+            "graph_stats": graph_stats,
+        },
+    )
+    return BinaryTraceBundle(
+        analysis_context_identity=decisions.analysis_context_identity,
+        formal_results=(),
+        candidate_results=(),
+        trace_result_set_digest=trace_result_set_digest,
+        coverage_status=coverage,
+        coverage_gaps=gaps,
+        identity=identity,
+        graph_stats=graph_stats,
+        resource_activation_results=(),
+        entrypoint_discovery_identity=entrypoint_discovery.identity,
+        entrypoint_records=tuple(entrypoint_discovery.records),
+    )
+
+
+__all__ = ["BinaryTraceBundle", "BinaryTraceEngine", "build_binary_traces"]

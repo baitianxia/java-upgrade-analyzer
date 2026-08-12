@@ -241,15 +241,35 @@ class _Builder:
             for row in store.rows("artifact_instances")
         }
         self.classes = {
-            row["class_variant_identity"]: row for row in store.rows("classes")
+            row["class_variant_identity"]: row
+            for row in store.rows("classes", include_class_bytes=False)
         }
         self.members = {
-            row["member_identity"]: row for row in store.rows("members")
+            row["member_identity"]: dict(row)
+            for row in store.connection.execute(
+                """
+                SELECT member_identity,class_variant_identity,
+                       artifact_instance_identity,class_name,member_kind,
+                       member_name,descriptor,access_flags,contract_json
+                FROM members
+                """
+            )
         }
         self.members_by_variant: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for row in self.members.values():
             self.members_by_variant[row["class_variant_identity"]].append(row)
-        self.direct_edges = list(store.rows("direct_edges"))
+        self.direct_edges = [
+            dict(row)
+            for row in store.connection.execute(
+                """
+                SELECT direct_edge_identity,caller_member_identity,
+                       caller_artifact_instance_identity,instruction_index,
+                       bytecode_offset,edge_kind,opcode,symbolic_owner,
+                       symbolic_name,symbolic_descriptor,edge_json
+                FROM direct_edges
+                """
+            )
+        ]
         class_load_ready = {
             (
                 str(item.get("initiating_loader_realm_identity") or ""),
@@ -259,6 +279,7 @@ class _Builder:
             if class_load_is_ready(item)
         }
         self.selected: dict[tuple[str, str], tuple[dict[str, Any], dict[str, Any]]] = {}
+        selected_facts: dict[str, dict[str, Any]] = {}
         for binding in getattr(reconciliation, "provider_bindings", ()):
             if binding.get("class_provider_status") != "resolved":
                 continue
@@ -268,11 +289,22 @@ class _Builder:
             )
             if selection_key not in class_load_ready:
                 continue
-            row = self.classes.get(binding.get("selected_class_variant_identity"))
+            variant = str(binding.get("selected_class_variant_identity") or "")
+            row = self.classes.get(variant)
             if row is not None:
+                fact = selected_facts.get(variant)
+                if fact is None:
+                    fact = _loads(row.get("fact_json") or "{}")
+                    selected_facts[variant] = fact
                 self.selected[selection_key] = (
-                    row, _loads(row.get("fact_json") or "{}")
+                    row, fact
                 )
+        # ``selected`` owns the rows needed below. Drop shadowed/MR variants
+        # and the duplicate serialized fact strings before semantic indexes are
+        # built from the parsed documents.
+        for row, _fact in self.selected.values():
+            row.pop("fact_json", None)
+        self.classes.clear()
         self.realms = sorted({realm for realm, _name in self.selected})
         self.rows: list[dict[str, Any]] = []
         self.seen = set()
@@ -1135,6 +1167,62 @@ class _Builder:
 
 def build_binary_semantic_overlay(store: Any, runtime_profile: Any,
                                   reconciliation: Any, decisions: Any = None) -> BinarySemanticOverlay:
+    summary_reader = getattr(store, "runtime_trigger_summary", None)
+    if callable(summary_reader):
+        summary = summary_reader()
+        has_relevant_decision = any(
+            (item.get("fact_scope") or {}).get("member_kind") == "field"
+            for item in (
+                *getattr(decisions, "authoritative_decisions", ()),
+                *getattr(decisions, "diagnostic_decisions", ()),
+            )
+        ) if decisions is not None else False
+        has_relevant_resource = store.connection.execute(
+            """
+            SELECT 1 FROM resources
+            WHERE upper(resource_name)<>'META-INF/MANIFEST.MF'
+            LIMIT 1
+            """
+        ).fetchone() is not None
+        has_relevant_direct_edge = store.connection.execute(
+            """
+            SELECT 1 FROM direct_edges
+            WHERE symbolic_owner='java/lang/Class'
+               OR symbolic_owner LIKE 'java/lang/reflect/%'
+               OR symbolic_owner LIKE 'java/lang/invoke/%'
+               OR symbolic_owner LIKE 'org/springframework/%'
+               OR symbolic_owner LIKE 'org/apache/ibatis/%'
+               OR symbolic_owner LIKE 'org/apache/dubbo/%'
+               OR symbolic_owner LIKE 'com/fasterxml/jackson/%'
+               OR symbolic_owner LIKE 'jakarta/persistence/%'
+               OR symbolic_owner LIKE 'javax/persistence/%'
+               OR symbolic_owner LIKE 'feign/%'
+            LIMIT 1
+            """
+        ).fetchone() is not None
+        if not (
+            summary["has_runtime_annotations"]
+            or has_relevant_decision
+            or has_relevant_resource
+            or has_relevant_direct_edge
+        ):
+            payload = {
+                "policy_version": POLICY_VERSION,
+                "runtime_profile_identity": runtime_profile.identity,
+                "runtime_reconciliation_identity": str(
+                    getattr(reconciliation, "identity", "")
+                ),
+                "edge_identities": [],
+                "coverage_gaps": [],
+            }
+            return BinarySemanticOverlay(
+                rows=(),
+                coverage_status="complete",
+                coverage_gaps=(),
+                identity=_identity(
+                    "binary_runtime_semantic_overlay_identity", payload
+                ),
+            )
     return _Builder(store, runtime_profile, reconciliation, decisions).build()
 
 

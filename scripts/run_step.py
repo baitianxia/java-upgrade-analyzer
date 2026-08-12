@@ -32,8 +32,11 @@ from compat import (
 from compat import git_cmd
 from artifact_coordinates import artifact_ga
 from path_runtime import (
+    WorktreeRecoveryError,
     create_detached_worktree,
+    filesystem_git_repository_root,
     git_with_long_paths,
+    recover_owned_stale_worktrees,
     remove_detached_worktree,
 )
 from csv_io import open_csv_read, open_csv_write
@@ -93,6 +96,7 @@ RESUME_CONTEXT_FILE_NAME = "resume_context.md"
 LAST_STEP_SUMMARY_SCHEMA = "java-upgrade-analyzer.last-step-summary.v1"
 BACKGROUND_RUNTIME_DIRNAME = "background"
 BACKGROUND_STATUS_FILE_NAME = "status.json"
+WORKTREE_RECOVERY_FILE_NAME = "git_worktree_recovery.json"
 BACKGROUND_CHILD_ENV = "JUA_BACKGROUND_CHILD"
 BACKGROUND_RUN_ID_ENV = "JUA_BACKGROUND_RUN_ID"
 BACKGROUND_STATUS_PATH_ENV = "JUA_BACKGROUND_STATUS_PATH"
@@ -254,6 +258,10 @@ def runtime_background_dir(report_dir):
 
 def background_status_path(report_dir):
     return runtime_background_dir(report_dir) / BACKGROUND_STATUS_FILE_NAME
+
+
+def worktree_recovery_path(report_dir):
+    return runtime_observability_dir(report_dir) / WORKTREE_RECOVERY_FILE_NAME
 
 
 def step1_dep_changes_path(report_dir):
@@ -2674,10 +2682,12 @@ def _has_explicit_string_value(cli_value, seed_payload, previous, key):
 
 
 def _resolve_branch_value_for_run_context(cli_value, merged, key, default_value, explicit):
+    if isinstance(cli_value, str) and cli_value.strip():
+        # An explicitly supplied branch belongs to this invocation and must
+        # not be shadowed by a value restored from an older report state.
+        return cli_value.strip()
     if explicit:
-        return resolve_value(cli_value, merged, key, default_value)
-    if cli_value not in (None, "", []):
-        return cli_value
+        return resolve_value(None, merged, key, default_value)
     return default_value
 
 
@@ -5511,6 +5521,12 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
     detected_tool = detect_build_tool(project_dir)
     cli_scalar = (lambda value: value) if allow_external_seed else (lambda _value: None)
     cli_list = (lambda value: value) if allow_external_seed else (lambda _value: [])
+    explicit_cli_branches = {
+        side: str(getattr(args, f"{side}_branch", "") or "").strip()
+        for side in ("base", "current")
+        if allow_external_seed
+        and str(getattr(args, f"{side}_branch", "") or "").strip()
+    }
     artifact_input_mode = bool(
         resolve_value(cli_scalar(args.base_artifact_path), merged, "base_artifact_path", "")
         or resolve_value(cli_scalar(args.current_artifact_path), merged, "current_artifact_path", "")
@@ -5709,6 +5725,17 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
         "base_branch_explicit": base_branch_explicit,
         "current_branch_explicit": current_branch_explicit,
     }
+    for side, incoming_branch in explicit_cli_branches.items():
+        branch_field = f"{side}_branch"
+        restored_branch = str(merged.get(branch_field) or "").strip()
+        if incoming_branch == restored_branch:
+            continue
+        # Changing a branch invalidates every identity derived from the old
+        # ref.  In particular, never retain its pinned commit or canonical ref
+        # and later make the new user input appear to have matched that ref.
+        result = _clear_step1_ref_state(result, side)
+        result[branch_field] = incoming_branch
+        result[f"{branch_field}_explicit"] = True
     if "accept_suggested_mappings" in merged:
         result["accept_suggested_mappings"] = parse_bool_like(
             merged.get("accept_suggested_mappings"),
@@ -9882,6 +9909,64 @@ def build_restore_context(main_state, step_id):
     return build_step_input_context(main_state, step_id, fallback_existing={})
 
 
+def apply_explicit_cli_step1_branch_overrides(
+    main_state,
+    args,
+    project_dir,
+    report_dir,
+):
+    """Restart Step1 when this invocation changes a persisted branch input."""
+    branch_patch = {
+        f"{side}_branch": str(getattr(args, f"{side}_branch", "") or "").strip()
+        for side in ("base", "current")
+        if str(getattr(args, f"{side}_branch", "") or "").strip()
+    }
+    if not branch_patch:
+        return {"changed": False, "fields": [], "before": {}, "after": {}}
+
+    step1_input = dict((main_state.get("step1") or {}).get("input") or {})
+    pending_interaction = dict(
+        ((main_state.get("state") or {}).get("pending_interaction") or {})
+    )
+    if not step1_input and not pending_interaction:
+        # A brand-new state is handled directly by build_run_context. Avoid
+        # creating a partial Step1 input that would suppress the other initial
+        # CLI/seed fields in this invocation.
+        return {"changed": False, "fields": [], "before": {}, "after": {}}
+
+    changed_fields = [
+        field
+        for field, value in branch_patch.items()
+        if str(step1_input.get(field) or "").strip() != value
+    ]
+    if not changed_fields:
+        return {"changed": False, "fields": [], "before": {}, "after": {}}
+
+    before = {
+        field: str(step1_input.get(field) or "").strip()
+        for field in changed_fields
+    }
+    updated_input = merge_user_response_into_run_context(
+        step1_input,
+        {field: branch_patch[field] for field in changed_fields},
+        project_dir,
+    )
+    reset_step_state_for_restart(
+        main_state,
+        "step1",
+        report_dir,
+        preserve_current_input=updated_input,
+    )
+    clear_interaction_file(report_dir)
+    save_main_state(report_dir, main_state)
+    return {
+        "changed": True,
+        "fields": changed_fields,
+        "before": before,
+        "after": {field: branch_patch[field] for field in changed_fields},
+    }
+
+
 def resolve_non_pending_structured_response_step(args, main_state, user_response):
     action = str((user_response or {}).get("action") or "").strip()
     if action not in NON_PENDING_BRIDGE_ALLOWED_ACTIONS:
@@ -11411,6 +11496,123 @@ def execute_step(step_id, args, manifest_steps, run_context, main_state=None):
     )
 
 
+_WORKTREE_REPOSITORY_PATH_FIELDS = {
+    "project_dir",
+    "repo_dir",
+    "repo_path",
+    "base_source_project_dir",
+    "current_source_project_dir",
+    "source_dirs",
+    "source_locations",
+    "dependency_source_dirs",
+}
+
+
+def _collect_worktree_repository_path_values(value, *, key=""):
+    if isinstance(value, dict):
+        collected = []
+        for child_key, child_value in value.items():
+            collected.extend(_collect_worktree_repository_path_values(
+                child_value,
+                key=str(child_key or "").strip(),
+            ))
+        return collected
+    if isinstance(value, (list, tuple, set)):
+        collected = []
+        for item in value:
+            collected.extend(_collect_worktree_repository_path_values(item, key=key))
+        return collected
+    if key not in _WORKTREE_REPOSITORY_PATH_FIELDS:
+        return []
+    text = str(value or "").strip()
+    return [text] if text else []
+
+
+def _startup_worktree_repository_roots(
+    project_dir,
+    args,
+    seed_payload,
+    main_state,
+):
+    payloads = [
+        {"project_dir": str(project_dir)},
+        {
+            "base_source_project_dir": args.base_source_project_dir,
+            "current_source_project_dir": args.current_source_project_dir,
+            "source_dirs": args.source_dirs or [],
+            "source_locations": args.source_locations or [],
+            "dependency_source_dirs": args.dependency_source_dirs or [],
+        },
+        seed_payload or {},
+    ]
+    payloads.extend(
+        dict((main_state.get(step_id) or {}).get("input") or {})
+        for step_id in STEP_SEQUENCE
+    )
+    roots = []
+    seen = set()
+    for payload in payloads:
+        for value in _collect_worktree_repository_path_values(payload):
+            root = filesystem_git_repository_root(value)
+            if root is None:
+                continue
+            identity = os.path.normcase(os.path.abspath(str(root)))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            roots.append(root)
+    return roots
+
+
+def recover_worktrees_before_execution(
+    project_dir,
+    report_dir,
+    args,
+    seed_payload,
+    main_state,
+):
+    """Recover analyzer-owned stale worktrees before any analysis Git call."""
+    repositories = _startup_worktree_repository_roots(
+        project_dir,
+        args,
+        seed_payload,
+        main_state,
+    )
+    payload = {
+        "schema": "java-upgrade-analyzer.git-worktree-recovery.v1",
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "status": "passed",
+        "repository_count": len(repositories),
+        "removed_count": 0,
+        "repositories": [],
+        "errors": [],
+    }
+    try:
+        for repository in repositories:
+            result = recover_owned_stale_worktrees(
+                repository,
+                runner=run_cmd,
+                git_command=git_cmd(),
+            )
+            payload["repositories"].append({
+                "repository": str(repository),
+                **result,
+            })
+            payload["removed_count"] += len(result.get("removed") or [])
+    except WorktreeRecoveryError as exc:
+        payload["status"] = "failed"
+        payload["errors"].append(str(exc))
+        failure_result = dict(getattr(exc, "result", {}) or {})
+        payload["repositories"].append({
+            "repository": str(repository),
+            **failure_result,
+        })
+        write_json(worktree_recovery_path(report_dir), payload)
+        raise
+    write_json(worktree_recovery_path(report_dir), payload)
+    return payload
+
+
 def main(argv=None, _skip_environment_contract=False):
     argv_values = list(sys.argv[1:] if argv is None else argv)
     ap = argparse.ArgumentParser(description="统一执行 Java 升级分析的单个 Step")
@@ -11511,6 +11713,45 @@ def main(argv=None, _skip_environment_contract=False):
     seed_payload = load_seed_json_arg(args.seed_json, project_dir)
     report_dir = Path(args.report_dir).resolve()
     main_state = load_main_state(report_dir, manifest_path=args.manifest)
+    try:
+        worktree_recovery = recover_worktrees_before_execution(
+            project_dir,
+            report_dir,
+            args,
+            seed_payload,
+            main_state,
+        )
+    except WorktreeRecoveryError:
+        print(
+            "启动前未能安全清理上次分析留下的临时 Git 工作区，"
+            "本次尚未执行任何分析步骤。",
+            file=sys.stderr,
+        )
+        print(f"诊断：{worktree_recovery_path(report_dir)}", file=sys.stderr)
+        return 1
+    removed_worktrees = int(worktree_recovery.get("removed_count") or 0)
+    if removed_worktrees:
+        print(
+            f"启动恢复：已清理 {removed_worktrees} 个上次中断留下的临时 Git 工作区。",
+            file=sys.stderr,
+        )
+    cli_branch_override = apply_explicit_cli_step1_branch_overrides(
+        main_state,
+        args,
+        project_dir,
+        report_dir,
+    )
+    if cli_branch_override.get("changed"):
+        changed_labels = [
+            "基准侧" if field == "base_branch" else "当前侧"
+            for field in cli_branch_override.get("fields") or []
+        ]
+        print(
+            "检测到本轮显式更新了"
+            + "、".join(changed_labels)
+            + "分支；已清除旧 ref/commit 绑定，并从分析对象与依赖范围重新分析。",
+            file=sys.stderr,
+        )
     manifest_data, manifest_steps = load_manifest(args.manifest)
     pending_interaction = (main_state.get("state") or {}).get("pending_interaction")
     if pending_interaction:
@@ -11535,7 +11776,9 @@ def main(argv=None, _skip_environment_contract=False):
     has_structured_response = bool(args.response_json or args.response_file)
     if has_structured_response:
         structured_user_response = resolve_user_response(args, project_dir)
-    if args.step == "auto" and has_structured_response and not pending_interaction:
+    if cli_branch_override.get("changed"):
+        step_id = "step1"
+    elif args.step == "auto" and has_structured_response and not pending_interaction:
         step_id = ""
     elif (
         args.step == "auto"

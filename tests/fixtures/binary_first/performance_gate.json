@@ -17,6 +17,37 @@
     "jar_count": 400,
     "class_count": 100000,
     "classes_per_jar": 250,
+    "full_pipeline_probe": {
+      "jar_count": 400,
+      "class_count": 100000,
+      "comparison": "identical-base-current-cold-output",
+      "includes": [
+        "artifact_fact_build_and_local_diff",
+        "target_independent_runtime_reconciliation",
+        "decision_and_projection_freeze",
+        "binary_trace",
+        "immutable_generation_write",
+        "independent_validation",
+        "validated_generation_activation"
+      ]
+    },
+    "changed_full_pipeline_probe": {
+      "jar_count": 400,
+      "class_count": 100000,
+      "comparison": "nonidentical-base-current-cold-output",
+      "changed_jar_count": 1,
+      "changed_class_count": 250,
+      "current_artifact_identity": "a137fd2033b9b47d85bb6b64193a156fadda38d3cbfb81c8912bb9683f748d56",
+      "includes": [
+        "artifact_fact_build_and_local_diff",
+        "target_independent_runtime_reconciliation",
+        "decision_and_projection_freeze",
+        "binary_trace",
+        "immutable_generation_write",
+        "independent_validation",
+        "validated_generation_activation"
+      ]
+    },
     "large_api_query_count": 10000,
     "tool_versions": {
       "python": "3.14.6",
@@ -28,7 +59,9 @@
     "sample_runs": {
       "cold": 1,
       "warm": 3,
-      "legacy": 1
+      "legacy": 1,
+      "full_pipeline": 1,
+      "changed_full_pipeline": 1
     },
     "p95_method": "nearest-rank",
     "cold_cleanup_rule": "delete binary snapshot cache and SQLite before run",
@@ -37,7 +70,7 @@
   },
   "recorded_measurements": {
     "captured_at": "2026-08-09",
-    "cold_end_to_end_seconds": 131.282159,
+    "cold_end_to_end_seconds": 133.875000,
     "warm_end_to_end_samples_seconds": [
       56.641780,
       53.809838,
@@ -45,33 +78,148 @@
     ],
     "warm_end_to_end_p95_seconds": 56.641780,
     "legacy_end_to_end_seconds": 71.307301,
-    "cold_relative_legacy_ratio": 1.841076,
+    "cold_relative_legacy_ratio": 1.877437,
     "warm_relative_legacy_ratio": 0.794328,
     "stage_seconds": {
-      "cold_inventory": 0.124322,
-      "cold_parse_and_cache": 84.229144,
-      "cold_db_write_and_index": 46.750035,
+      "cold_inventory": 0.129838,
+      "cold_parse_and_cache": 84.035438,
+      "cold_db_write_and_index": 49.457658,
       "warm_parse_and_cache_p95": 7.968490,
       "warm_db_write_and_index_p95": 48.363277,
       "batch_query_10000_p95": 0.186453,
-      "report_10000_p95": 0.010554
+      "report_10000_p95": 0.010554,
+      "cold_batch_query_10000": 0.048926,
+      "cold_report_10000": 0.008291
     },
-    "peak_rss_bytes": 1232764928,
-    "sqlite_bytes": 1022636032,
-    "cache_bytes": 26629955,
-    "disk_bytes": 1049265987,
-    "bytes_per_class": 10492.65987,
-    "bytes_per_edge": 2556.59008,
+    "peak_rss_bytes": 2788769792,
+    "cold_peak_rss_bytes": 178634752,
+    "sqlite_bytes": 817324032,
+    "cache_bytes": 26630684,
+    "disk_bytes": 843954716,
+    "bytes_per_class": 8439.54716,
+    "bytes_per_edge": 2043.31008,
     "class_count": 100000,
     "member_count": 300000,
     "edge_count": 400000,
     "cold_parser_invocations": 400,
     "warm_parser_invocations": 0,
-    "warm_cache_hits": 400
+    "warm_cache_hits": 400,
+    "full_pipeline_probe": {
+      "captured_at": "2026-08-11",
+      "comparison": "identical-base-current-cold-output",
+      "jar_count": 400,
+      "current_jar_count": 400,
+      "expected_class_count": 100000,
+      "class_count": 100000,
+      "base_class_count": 100000,
+      "current_class_count": 100000,
+      "end_to_end_seconds": 327.012462,
+      "peak_rss_bytes": 1867071488,
+      "phase_seconds": {
+        "input_and_runtime_profile": 0.210300,
+        "artifact_fact_build_and_local_diff": 130.046140,
+        "target_independent_runtime_reconciliation": 82.396510,
+        "decision_and_projection_freeze": 1.828715,
+        "binary_trace": 0.001077,
+        "immutable_generation_write": 1.750125,
+        "independent_validation": 109.991538,
+        "validated_generation_activation": 0.774140
+      },
+      "phase_peak_rss_bytes": {
+        "input_and_runtime_profile": 38010880,
+        "artifact_fact_build_and_local_diff": 67289088,
+        "target_independent_runtime_reconciliation": 1504083968,
+        "decision_and_projection_freeze": 1507622912,
+        "binary_trace": 1507622912,
+        "immutable_generation_write": 1507622912,
+        "independent_validation": 1867071488,
+        "validated_generation_activation": 1867071488
+      },
+      "validation_status": "passed",
+      "validation_issue_count": 0,
+      "authoritative_change_fact_count": 0,
+      "authoritative_member_change_kind_counts": {},
+      "formal_api_result_count": 0,
+      "formal_reachability_status_counts": {},
+      "formal_impact_conclusion_counts": {},
+      "cold_parser_invocations": 400,
+      "artifact_snapshot_hits": 0
+    },
+    "changed_full_pipeline_probe": {
+      "captured_at": "2026-08-12",
+      "comparison": "nonidentical-base-current-cold-output",
+      "jar_count": 400,
+      "current_jar_count": 400,
+      "expected_class_count": 100000,
+      "class_count": 100000,
+      "base_class_count": 100000,
+      "current_class_count": 100000,
+      "end_to_end_seconds": 411.492058,
+      "peak_rss_bytes": 2788769792,
+      "phase_seconds": {
+        "input_and_runtime_profile": 0.196108,
+        "artifact_fact_build_and_local_diff": 124.575344,
+        "target_independent_runtime_reconciliation": 126.872931,
+        "decision_and_projection_freeze": 21.333358,
+        "binary_trace": 0.182046,
+        "immutable_generation_write": 1.763877,
+        "independent_validation": 135.809714,
+        "validated_generation_activation": 0.735436
+      },
+      "phase_peak_rss_bytes": {
+        "input_and_runtime_profile": 38535168,
+        "artifact_fact_build_and_local_diff": 54509568,
+        "target_independent_runtime_reconciliation": 1965883392,
+        "decision_and_projection_freeze": 2328068096,
+        "binary_trace": 2328068096,
+        "immutable_generation_write": 2328068096,
+        "independent_validation": 2788769792,
+        "validated_generation_activation": 2788769792
+      },
+      "validation_status": "passed",
+      "validation_issue_count": 0,
+      "authoritative_change_fact_count": 250,
+      "authoritative_member_change_kind_counts": {
+        "implementation_changed": 250
+      },
+      "formal_api_result_count": 250,
+      "formal_reachability_status_counts": {
+        "not_found_in_static_analysis": 250
+      },
+      "formal_impact_conclusion_counts": {
+        "inconclusive": 250
+      },
+      "parser_invocations": 401,
+      "artifact_snapshot_hits": 399
+    }
   },
   "thresholds": {
     "cold_end_to_end_seconds": 170.0,
     "warm_end_to_end_p95_seconds": 75.0,
+    "full_pipeline_end_to_end_seconds": 400.0,
+    "full_pipeline_peak_rss_bytes": 2147483648,
+    "full_pipeline_phase_seconds": {
+      "input_and_runtime_profile": 1.0,
+      "artifact_fact_build_and_local_diff": 160.0,
+      "target_independent_runtime_reconciliation": 105.0,
+      "decision_and_projection_freeze": 3.5,
+      "binary_trace": 0.5,
+      "immutable_generation_write": 3.5,
+      "independent_validation": 140.0,
+      "validated_generation_activation": 1.5
+    },
+    "changed_full_pipeline_end_to_end_seconds": 500.0,
+    "changed_full_pipeline_peak_rss_bytes": 3221225472,
+    "changed_full_pipeline_phase_seconds": {
+      "input_and_runtime_profile": 1.0,
+      "artifact_fact_build_and_local_diff": 170.0,
+      "target_independent_runtime_reconciliation": 165.0,
+      "decision_and_projection_freeze": 30.0,
+      "binary_trace": 1.0,
+      "immutable_generation_write": 3.5,
+      "independent_validation": 170.0,
+      "validated_generation_activation": 1.5
+    },
     "stage_p95_seconds": {
       "inventory": 0.3,
       "parse_and_cache": 110.0,
@@ -79,10 +227,10 @@
       "batch_query_10000": 0.4,
       "report_10000": 0.05
     },
-    "peak_rss_bytes": 1717986918,
-    "disk_bytes": 1395864371,
-    "bytes_per_class": 14000,
-    "bytes_per_edge": 3500,
+    "peak_rss_bytes": 3221225472,
+    "disk_bytes": 1073741824,
+    "bytes_per_class": 11000,
+    "bytes_per_edge": 2700,
     "cold_relative_legacy_ratio": 2.25,
     "warm_relative_legacy_ratio": 1.0
   },
@@ -91,9 +239,29 @@
     "expected_member_count": 300000,
     "expected_edge_count": 400000,
     "warm_parser_invocations": 0,
+    "full_pipeline_expected_class_count": 100000,
+    "full_pipeline_validation_issue_count": 0,
+    "full_pipeline_expected_authoritative_change_fact_count": 0,
+    "full_pipeline_expected_formal_api_result_count": 0,
+    "full_pipeline_expected_authoritative_member_change_kind_counts": {},
+    "full_pipeline_expected_formal_reachability_status_counts": {},
+    "full_pipeline_expected_formal_impact_conclusion_counts": {},
+    "changed_full_pipeline_expected_class_count": 100000,
+    "changed_full_pipeline_validation_issue_count": 0,
+    "changed_full_pipeline_expected_authoritative_change_fact_count": 250,
+    "changed_full_pipeline_expected_formal_api_result_count": 250,
+    "changed_full_pipeline_expected_authoritative_member_change_kind_counts": {
+      "implementation_changed": 250
+    },
+    "changed_full_pipeline_expected_formal_reachability_status_counts": {
+      "not_found_in_static_analysis": 250
+    },
+    "changed_full_pipeline_expected_formal_impact_conclusion_counts": {
+      "inconclusive": 250
+    },
     "cache_digest_validation_required": true,
     "class_or_edge_reduction_allowed": false
   },
   "rerun_command": "python3 scripts/binary_performance_gate.py --work-root /tmp/jua-binary-performance-400x250 --output /tmp/jua-binary-performance-result.json --gate tests/fixtures/binary_first/performance_gate.json",
-  "scope_note": "The 400-JAR gate measures inventory, ASM parse/cache, SQLite write/index, 10k indexed queries, report serialization, RSS and disk. Runtime reconciliation and Oracle correctness are covered by independent functional fixtures because loading 100k definitions into a target JVM would measure verifier stress rather than the persisted graph scale contract."
+  "scope_note": "Every scale probe uses all 400 JARs and 100000 classes. The two cold full-pipeline probes cover artifact facts/local diff, runtime reconciliation, decision/trace, generation writing, target-JVM verification, the independent Oracle and activation, with observed base/current class counts, persisted Oracle findings, per-phase RSS samples and dedicated RSS ceilings. One probe compares identical sides; the second deterministically replaces one current-side JAR and verifies all 250 resulting implementation changes, so the higher-memory changed-result path is continuously enforced."
 }

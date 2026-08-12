@@ -64,6 +64,31 @@ class RemoteSourceRefsTest(unittest.TestCase):
         self.assertEqual(result["resolved_commit"], self.current_commit)
         self.assertEqual(result["resolution_mode"], "live_remote")
 
+    def test_exact_branch_wins_when_dot_dev_suffix_branch_coexists(self):
+        self.add_remote(
+            "origin",
+            {
+                "release": self.base_commit,
+                "release.DEV": self.current_commit,
+            },
+        )
+
+        result = resolve_remote_source_ref(self.repo, "release")
+        suffix_result = resolve_remote_source_ref(self.repo, "release.DEV")
+
+        self.assertEqual(result["status"], "remote_source_resolved")
+        self.assertEqual(result["resolved_ref"], "origin/release")
+        self.assertEqual(result["remote_ref"], "refs/heads/release")
+        self.assertEqual(result["resolved_commit"], self.base_commit)
+        self.assertEqual(
+            [item["canonical_ref"] for item in result["candidates"]],
+            ["refs/heads/release"],
+        )
+        self.assertEqual(suffix_result["status"], "remote_source_resolved")
+        self.assertEqual(suffix_result["resolved_ref"], "origin/release.DEV")
+        self.assertEqual(suffix_result["remote_ref"], "refs/heads/release.DEV")
+        self.assertEqual(suffix_result["resolved_commit"], self.current_commit)
+
     def test_remote_resolution_ignores_inherited_git_repository_routing(self):
         self.add_remote("origin", {"release": self.current_commit})
         foreign = self.root / "foreign"

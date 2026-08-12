@@ -99,6 +99,7 @@ def verify_class_definitions(
         )
     with short_temporary_directory(prefix="definition-input") as temp_text:
         root = Path(temp_text)
+        expected_hashes = {}
         for name in names:
             path = PurePosixPath(name)
             if path.is_absolute() or ".." in path.parts or not name or "." in name:
@@ -107,7 +108,9 @@ def verify_class_definitions(
                 )
             destination = root.joinpath(*path.parts).with_suffix(".class")
             destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_bytes(bytes(selected_class_bytes[name]))
+            content = bytes(selected_class_bytes[name])
+            expected_hashes[name] = hashlib.sha256(content).hexdigest()
+            destination.write_bytes(content)
         protocol = io.BytesIO()
         _write_frame(protocol, _canonical_json({
             "frame_type": "definition_input_header",
@@ -180,7 +183,7 @@ def verify_class_definitions(
             raise ClassDefinitionVerifierError(
                 "CLASS_DEFINITION_PROTOCOL_CLASS_SET_INVALID", name
             )
-        actual_sha = hashlib.sha256(selected_class_bytes[name]).hexdigest()
+        actual_sha = expected_hashes[name]
         if record.get("class_bytes_sha256") != actual_sha:
             raise ClassDefinitionVerifierError(
                 "CLASS_DEFINITION_PROTOCOL_SHA_MISMATCH", name

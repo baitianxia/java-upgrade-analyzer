@@ -353,6 +353,52 @@ public class demo.ArrayCasts {
             },
         }
 
+    def test_changed_api_with_complete_empty_entrypoints_uses_empty_closed_world(self):
+        base = self._jar("empty-roots-base", 1)
+        current = self._jar("empty-roots-current", 2)
+        base_side = self._side(base, "1")
+        current_side = self._side(current, "2")
+        for side in (base_side, current_side):
+            side["runtime_profile"]["business_entrypoint_profile"] = {
+                "coverage_status": "complete", "methods": [],
+            }
+        config = {
+            "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+            "source_usage": {
+                "decision": "skip_source", "decision_source": "explicit_config",
+            },
+            "asm_jar": str(self.asm_jar),
+            "base": base_side,
+            "current": current_side,
+            "runtime_comparison": {
+                "controlled_profile_fields": ["loader_topology"],
+                "declared_upgrade_payload_scope": ["artifact-bytes"],
+            },
+        }
+
+        result = run_pipeline(
+            config, output_root=self.root / "empty-roots-report"
+        )
+        generation = Path(result["generation_directory"])
+        formal = json.loads(
+            (generation / "binary_formal_results.json").read_text(encoding="utf-8")
+        )
+        coverage = json.loads(
+            (generation / "binary_coverage.json").read_text(encoding="utf-8")
+        )
+
+        self.assertTrue(formal["results"])
+        self.assertEqual(
+            {item["reachability_status"] for item in formal["results"]},
+            {"not_found_in_static_analysis"},
+        )
+        self.assertTrue(all(not item["paths"] for item in formal["results"]))
+        self.assertEqual(
+            coverage["batch_graph_stats"]["graph_materialization_status"],
+            "not_required_empty_root_set",
+        )
+        self.assertEqual(result["validation_status"], "passed")
+
     def test_trace_preserves_independent_entrypoint_paths_for_one_changed_api(self):
         def target(label, value):
             return self._compile_sources_jar(label, {

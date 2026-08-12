@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 from threading import Event, Lock
 import time
@@ -65,8 +66,13 @@ PROCEDURE = (
 )
 ORACLE_PROCEDURE_VERSION = "java-upgrade-analyzer.final-artifact-javap.v4"
 MAX_JAVAP_WORKERS = 8
+# Windows' command-line limit is much smaller than POSIX ARG_MAX. On POSIX,
+# larger batches materially reduce target-JVM startup overhead while remaining
+# far below the platform argument boundary, even for long extracted paths.
+MAX_CLASSES_PER_JAVAP_BATCH = 32 if os.name == "nt" else 256
 JAVAP_VERSION_TIMEOUT_SECONDS = 5.0
 _IMMUTABLE_ORACLE_CACHE: dict[tuple[str, str, str, str, str], str] = {}
+_JAVAP_VERSION_CACHE: dict[tuple[str, int, int, int], str] = {}
 _IMMUTABLE_ORACLE_CACHE_LOCK = Lock()
 
 
@@ -81,6 +87,7 @@ def clear_immutable_oracle_cache() -> None:
     """Reset process-local immutable oracle results for isolated tests."""
     with _IMMUTABLE_ORACLE_CACHE_LOCK:
         _IMMUTABLE_ORACLE_CACHE.clear()
+        _JAVAP_VERSION_CACHE.clear()
 
 
 def _oracle_cache_key(
@@ -88,9 +95,14 @@ def _oracle_cache_key(
     jdk_version: str,
     selected_targets: tuple[tuple[str, str, str], ...],
     excluded_nested_jars: tuple[str, ...] = (),
+    include_structural_facts: bool = False,
 ) -> tuple[str, str, str, str, str]:
     target_scope = json.dumps(
-        {"targets": selected_targets, "excluded_nested_jars": excluded_nested_jars},
+        {
+            "targets": selected_targets,
+            "excluded_nested_jars": excluded_nested_jars,
+            "include_structural_facts": include_structural_facts,
+        },
         separators=(",", ":"),
     )
     return artifact_sha256, ORACLE_PROCEDURE_VERSION, PROCEDURE, jdk_version, target_scope
@@ -567,6 +579,126 @@ def _parse_javap_output(
     return rows, failures
 
 
+def parse_structural_javap(output: str) -> dict[str, set]:
+    """Extract type/init/semantic facts from the same independent javap text.
+
+    Direct-edge and structural validation intentionally use different parsers,
+    but they do not need different target-JVM processes. Keeping this parser
+    separate from ``_parse_javap_output`` preserves that independent comparison
+    while sharing only the immutable javap observation.
+    """
+    owner = ""
+    member_name = ""
+    descriptor = ""
+    pending_member: tuple[str, str, int] | None = None
+    type_edges = set()
+    init_edges = set()
+    clinit_classes = set()
+    semantic_instructions = set()
+    declared_members = set()
+    class_names = set()
+
+    def access_flags(header: str) -> int:
+        tokens = set(header.replace("(", " ").split())
+        flags = 0
+        for token, value in (
+            ("public", 0x0001), ("private", 0x0002),
+            ("protected", 0x0004), ("static", 0x0008),
+            ("final", 0x0010), ("abstract", 0x0400),
+        ):
+            if token in tokens:
+                flags |= value
+        return flags
+
+    for line in output.splitlines():
+        declaration = CLASS_DECLARATION_RE.match(line)
+        if declaration:
+            owner = declaration.group(1).replace(".", "/")
+            class_names.add(owner)
+            continue
+        header = HEADER_LINE_RE.match(line)
+        if header and owner:
+            value = header.group("header").strip()
+            if value == "static {}":
+                member_name = "<clinit>"
+                descriptor = "()V"
+                clinit_classes.add(owner)
+                declared_members.add(
+                    (owner, "method", member_name, descriptor, 0x0008)
+                )
+                pending_member = None
+            elif "(" in value:
+                before = value.split("(", 1)[0].split()[-1].strip('"')
+                simple = owner.rsplit("/", 1)[-1]
+                member_name = (
+                    "<init>"
+                    if before in {simple, owner.replace("/", ".")}
+                    else before
+                )
+                descriptor = ""
+                pending_member = ("method", member_name, access_flags(value))
+            else:
+                field_name = value.split("=", 1)[0].split()[-1].strip('"')
+                pending_member = ("field", field_name, access_flags(value))
+            continue
+        stripped = line.strip()
+        if stripped.startswith("descriptor:") and pending_member:
+            descriptor = stripped.split(":", 1)[1].strip()
+            member_kind, member_name, member_flags = pending_member
+            declared_members.add(
+                (owner, member_kind, member_name, descriptor, member_flags)
+            )
+            pending_member = None
+            continue
+        instruction = INSTRUCTION_RE.match(line)
+        if not instruction or not owner or not member_name or not descriptor:
+            continue
+        bci = int(instruction.group(1))
+        opcode = instruction.group(2)
+        rest = instruction.group(3)
+        comment = rest.split("//", 1)[1].strip() if "//" in rest else ""
+        semantic_instructions.add(
+            (owner, member_name, descriptor, bci, opcode, comment)
+        )
+        target = ""
+        class_match = re.match(r'class\s+"?([^"\s]+)"?', comment)
+        if class_match:
+            target = class_match.group(1)
+        if opcode in {
+            "new", "anewarray", "checkcast", "instanceof", "multianewarray"
+        }:
+            if target:
+                type_edges.add(
+                    (owner, member_name, descriptor, bci, target, opcode)
+                )
+        elif opcode in {"ldc", "ldc_w"} and target:
+            type_edges.add(
+                (owner, member_name, descriptor, bci, target, "class_literal")
+            )
+        if opcode in {"invokestatic", "getstatic", "putstatic"}:
+            reference = re.match(
+                r"(?:InterfaceMethod|Method|Field)\s+"
+                r"(?:(?P<owner>[\w/$]+)\.)?",
+                comment,
+            )
+            target_owner = (reference.group("owner") if reference else None) or owner
+            init_edges.add(
+                (owner, member_name, descriptor, bci, target_owner, opcode)
+            )
+        elif opcode == "new" and target:
+            init_edges.add(
+                (owner, member_name, descriptor, bci, target, "new")
+            )
+    return {
+        "type_edges": type_edges,
+        "class_init_edges": init_edges,
+        "clinit_classes": clinit_classes,
+        "semantic_instructions": semantic_instructions,
+        "declared_members": declared_members,
+        "class_names": class_names,
+    }
+
+
 def _javap_version(javap: str, *, timeout: float) -> str:
     completed = subprocess.run(
         [javap, "-version"], capture_output=True, text=True, encoding="utf-8",
@@ -574,6 +706,15 @@ def _javap_version(javap: str, *, timeout: float) -> str:
         **subprocess_platform_kwargs(),
     )
     return (completed.stdout or completed.stderr).strip()
+
+
+def _javap_version_cache_key(javap: str) -> tuple[str, int, int, int]:
+    resolved = shutil.which(javap) or str(Path(javap).expanduser().resolve())
+    try:
+        status = Path(resolved).stat()
+    except OSError:
+        return resolved, 0, 0, 0
+    return resolved, int(status.st_size), int(status.st_mtime_ns), int(status.st_ino)
 
 
 def _javap_major(version: str) -> int | None:
@@ -681,7 +822,13 @@ def _parse_entry_with_javap(
             "parsed": False,
         }
     rows, failures = _parse_javap_output(stdout, artifact_sha256, entry.artifact_entry, version)
-    return {"rows": rows, "failures": failures, "completed": True, "parsed": True}
+    return {
+        "rows": rows,
+        "structural_facts": parse_structural_javap(stdout),
+        "failures": failures,
+        "completed": True,
+        "parsed": True,
+    }
 
 
 def _parse_entry_group_with_javap(
@@ -722,24 +869,29 @@ def _parse_entry_group_with_javap(
                 verbose=force_verbose,
             )
         ]
+    overall_deadline = deadline
+
+    def parse_separately(candidates: list[PackagedClass]) -> list[dict]:
+        return [
+            _parse_entry_with_javap(
+                entry,
+                artifact_sha256,
+                javap,
+                version,
+                cancellation_event,
+                overall_deadline,
+                verbose=force_verbose,
+            )
+            for entry in candidates
+        ]
+
     materialize_errors = {
         entry.extracted_path: error
         for entry in entries
         if (error := _materialize_packaged_class(entry))
     }
     if materialize_errors:
-        return [
-            {
-                "rows": [],
-                "failures": [
-                    f"{entry.artifact_entry}: class materialization failed: "
-                    f"{materialize_errors[entry.extracted_path]}"
-                ] if entry.extracted_path in materialize_errors else [],
-                "completed": entry.extracted_path in materialize_errors,
-                "parsed": False,
-            }
-            for entry in entries
-        ]
+        return parse_separately(entries)
     group_deadline = time.perf_counter() + 30.0
     deadline = min(deadline, group_deadline) if deadline is not None else group_deadline
     if cancellation_event.is_set() or time.perf_counter() >= deadline:
@@ -777,6 +929,14 @@ def _parse_entry_group_with_javap(
         remaining = deadline - time.perf_counter()
         if cancellation_event.is_set() or remaining <= 0:
             _cancel_process(process)
+            if (
+                not cancellation_event.is_set()
+                and (
+                    overall_deadline is None
+                    or time.perf_counter() < overall_deadline
+                )
+            ):
+                return parse_separately(entries)
             return [
                 {"rows": [], "failures": [], "completed": False, "parsed": False}
                 for _entry in entries
@@ -787,16 +947,7 @@ def _parse_entry_group_with_javap(
         except subprocess.TimeoutExpired:
             continue
     if process.returncode != 0:
-        detail = (stderr or stdout).strip().replace("\n", " ")
-        return [
-            {
-                "rows": [],
-                "failures": [f"{entry.artifact_entry}: javap failed: {detail}"],
-                "completed": True,
-                "parsed": False,
-            }
-            for entry in entries
-        ]
+        return parse_separately(entries)
 
     sections: dict[Path, str] = {}
     if force_verbose:
@@ -820,18 +971,17 @@ def _parse_entry_group_with_javap(
     for entry in entries:
         section = sections.get(entry.extracted_path.resolve())
         if section is None:
-            results.append({
-                "rows": [],
-                "failures": [f"{entry.artifact_entry}: javap batch output missing class section"],
-                "completed": True,
-                "parsed": False,
-            })
+            results.extend(parse_separately([entry]))
             continue
         rows, failures = _parse_javap_output(
             section, artifact_sha256, entry.artifact_entry, version
         )
         results.append({
-            "rows": rows, "failures": failures, "completed": True, "parsed": True,
+            "rows": rows,
+            "structural_facts": parse_structural_javap(section),
+            "failures": failures,
+            "completed": True,
+            "parsed": True,
         })
     return results
 
@@ -871,7 +1021,7 @@ def _parse_entry_batch(
     deadline: float | None,
     max_workers: int | None,
     *,
-    batch_javap: bool = False,
+    batch_javap: bool = True,
 ) -> tuple[list[dict | None], int, bool, bool]:
     if not entries:
         return [], 0, False, False
@@ -880,7 +1030,13 @@ def _parse_entry_batch(
     )
     requested_workers = min(MAX_JAVAP_WORKERS, max(1, int(requested_workers)))
     if batch_javap:
-        group_size = min(32, max(1, (len(entries) + requested_workers - 1) // requested_workers))
+        # JVM startup dominates a full-closure scan. Keep argv bounded for
+        # Windows while parsing a group per javap process instead of launching
+        # one target JVM for every class in every dependency JAR.
+        group_size = min(
+            MAX_CLASSES_PER_JAVAP_BATCH,
+            max(1, (len(entries) + requested_workers - 1) // requested_workers),
+        )
         groups = [entries[index:index + group_size] for index in range(0, len(entries), group_size)]
     else:
         groups = [[entry] for entry in entries]
@@ -947,7 +1103,7 @@ def _parse_entry_batch(
 
 def _base_result(artifact_sha256: str, *, elapsed_seconds: float, **values) -> dict:
     class_count = int(values.get("class_count") or 0)
-    return {
+    result = {
         "artifact_sha256": artifact_sha256,
         "class_count": class_count,
         "inventory_class_count": int(values.get("inventory_class_count") or class_count),
@@ -966,6 +1122,16 @@ def _base_result(artifact_sha256: str, *, elapsed_seconds: float, **values) -> d
         "failures": list(values.get("failures") or []),
         "complete": bool(values.get("complete")),
     }
+    structural = values.get("structural_facts")
+    if structural is not None:
+        result["structural_facts"] = {
+            key: [
+                list(value) if isinstance(value, tuple) else value
+                for value in sorted(values)
+            ]
+            for key, values in structural.items()
+        }
+    return result
 
 
 def scan_final_artifact(
@@ -976,6 +1142,7 @@ def scan_final_artifact(
     time_budget_seconds: float | None = None,
     selected_targets: list[dict] | None = None,
     excluded_nested_jars: set[str] | None = None,
+    include_structural_facts: bool = False,
 ) -> dict:
     """Return every executable edge found in the final artifact and nested runtime JARs."""
     artifact = Path(artifact)
@@ -1014,7 +1181,16 @@ def scan_final_artifact(
             )
         version_timeout = min(version_timeout, JAVAP_VERSION_TIMEOUT_SECONDS)
     try:
-        version = _javap_version(javap, timeout=version_timeout)
+        version_cache_key = _javap_version_cache_key(javap)
+        with _IMMUTABLE_ORACLE_CACHE_LOCK:
+            version = _JAVAP_VERSION_CACHE.get(version_cache_key)
+        if version is None:
+            version = _javap_version(javap, timeout=version_timeout)
+            if version:
+                with _IMMUTABLE_ORACLE_CACHE_LOCK:
+                    version = _JAVAP_VERSION_CACHE.setdefault(
+                        version_cache_key, version
+                    )
     except subprocess.TimeoutExpired:
         return _base_result(
             digest,
@@ -1055,7 +1231,11 @@ def scan_final_artifact(
         if str(item or "").strip()
     }))
     cache_key = _oracle_cache_key(
-        digest, version, normalized_targets, normalized_exclusions
+        digest,
+        version,
+        normalized_targets,
+        normalized_exclusions,
+        include_structural_facts,
     )
     with _IMMUTABLE_ORACLE_CACHE_LOCK:
         cached_serialized = _IMMUTABLE_ORACLE_CACHE.get(cache_key)
@@ -1071,6 +1251,7 @@ def scan_final_artifact(
             parse_failure_count=cached["parse_failure_count"],
             cache_hits=1,
             edges=cached["edges"],
+            structural_facts=cached.get("structural_facts"),
             failures=cached["failures"],
             complete=cached["complete"],
         )
@@ -1186,6 +1367,14 @@ def scan_final_artifact(
     parse_failures: list[str] = []
     completed_class_count = 0
     parsed_class_count = 0
+    structural_facts = {
+        "type_edges": set(),
+        "class_init_edges": set(),
+        "clinit_classes": set(),
+        "semantic_instructions": set(),
+        "declared_members": set(),
+        "class_names": set(),
+    }
     for result in results:
         if result is None:
             continue
@@ -1193,6 +1382,9 @@ def scan_final_artifact(
         parse_failures.extend(result["failures"])
         completed_class_count += int(bool(result.get("completed")))
         parsed_class_count += int(bool(result.get("parsed")))
+        if include_structural_facts:
+            for key, values in (result.get("structural_facts") or {}).items():
+                structural_facts[key].update(values)
     failures.extend(parse_failures)
     if timed_out:
         failures.append(f"oracle_time_budget_exceeded:{budget:.3f}s")
@@ -1219,6 +1411,7 @@ def scan_final_artifact(
         timed_out=timed_out,
         interrupted=interrupted,
         edges=rows,
+        structural_facts=(structural_facts if include_structural_facts else None),
         failures=failures,
         complete=complete,
     )
@@ -1229,6 +1422,15 @@ def scan_final_artifact(
                 "inventory_class_count": inventory_class_count,
                 "parse_failure_count": len(parse_failures),
                 "edges": rows,
+                **(
+                    {
+                        "structural_facts": {
+                            key: sorted(values)
+                            for key, values in structural_facts.items()
+                        }
+                    }
+                    if include_structural_facts else {}
+                ),
                 "failures": failures,
                 "complete": complete,
             },

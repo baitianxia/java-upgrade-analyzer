@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import replace
+import gc
 import hashlib
 import json
 from pathlib import Path
@@ -41,7 +41,7 @@ from binary_runtime_reconciler import RuntimeCapabilityPolicy, RuntimeReconciler
 from binary_semantic_overlay import build_binary_semantic_overlay
 from binary_snapshot_cache import cached_snapshot_archive
 from binary_source_overlay import build_inline_consumption_overlay, build_source_overlay
-from binary_trace_engine import BinaryTraceEngine
+from binary_trace_engine import build_binary_traces
 from binary_validation_oracle import validate_generation
 from enhanced_source_analyzer import analyze_file, extract_call_edges_enhanced
 from path_runtime import short_temporary_directory
@@ -79,6 +79,8 @@ class _PhaseTimingRecorder(list):
         self.path = self.directory / "latest_in_progress.json"
 
     def append(self, item):
+        item = dict(item or {})
+        item.setdefault("peak_rss_bytes", _peak_rss_bytes())
         super().append(item)
         self.directory.mkdir(parents=True, exist_ok=True)
         completed = str((item or {}).get("phase") or "")
@@ -671,6 +673,24 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
     current_build = _build_identity_bundle(current_config, current_artifacts)
     base_instances = _artifact_instances(base_artifacts, base_profile)
     current_instances = _artifact_instances(current_artifacts, current_profile)
+    runtime_sides_identical = (
+        base_platform.identity == current_platform.identity
+        and base_profile.identity == current_profile.identity
+        and [
+            (
+                str(raw.get("lineage") or raw.get("coord") or raw["logical_location"]),
+                instance,
+            )
+            for raw, instance in base_instances
+        ]
+        == [
+            (
+                str(raw.get("lineage") or raw.get("coord") or raw["logical_location"]),
+                instance,
+            )
+            for raw, instance in current_instances
+        ]
+    )
     comparison_config = dict(config.get("runtime_comparison") or {})
     runtime_comparison = RuntimeComparison(
         base_profile,
@@ -723,8 +743,18 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
 
     with short_temporary_directory(prefix="binary-pipeline") as temp_text:
         temp = Path(temp_text)
-        base_store = BinaryFactStore(temp / "base.sqlite")
-        current_store = BinaryFactStore(temp / "current.sqlite")
+        base_store = BinaryFactStore(
+            temp / "base.sqlite",
+            defer_secondary_indexes=True,
+            bulk_load_transaction=True,
+        )
+        current_store = BinaryFactStore(
+            temp / "current.sqlite",
+            defer_secondary_indexes=True,
+            bulk_load_transaction=True,
+        )
+        base_store_open = True
+        current_store_open = True
         try:
             artifact_phase_started = time.perf_counter()
             cache_metrics = {
@@ -733,40 +763,28 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                 "artifact_snapshot_corrupt_rebuilt": 0,
                 "classfile_parser_invocations": 0,
             }
-            base_snapshots = {}
-            current_snapshots = {}
             base_by_lineage = {}
             current_by_lineage = {}
             for raw, instance in base_instances:
-                cache_outcome = cached_snapshot_archive(
-                    raw["path"], artifact_instance_identity=instance.identity,
-                    expected_sha256=instance.content_sha256, asm_jar=asm_jar,
-                    cache_root=cache_root,
-                    target_jvm_major=base_platform.java_major,
-                )
-                snapshot = cache_outcome.snapshot
-                cache_metrics[
-                    "artifact_snapshot_hits"
-                    if cache_outcome.cache_status == "hit"
-                    else "artifact_snapshot_misses"
-                ] += 1
-                if cache_outcome.cache_status == "corrupt_rebuilt":
-                    cache_metrics["artifact_snapshot_corrupt_rebuilt"] += 1
-                cache_metrics["classfile_parser_invocations"] += cache_outcome.parser_invocation_count
-                base_store.add_artifact_snapshot(instance, snapshot)
                 lineage = str(raw.get("lineage") or raw.get("coord") or raw["logical_location"])
                 if lineage in base_by_lineage:
                     raise BinaryPipelineError("BINARY_ARTIFACT_LINEAGE_AMBIGUOUS", lineage)
-                base_by_lineage[lineage] = (instance, snapshot)
-                base_snapshots[instance.identity] = snapshot
+                base_by_lineage[lineage] = (raw, instance)
             for raw, instance in current_instances:
+                lineage = str(raw.get("lineage") or raw.get("coord") or raw["logical_location"])
+                if lineage in current_by_lineage:
+                    raise BinaryPipelineError("BINARY_ARTIFACT_LINEAGE_AMBIGUOUS", lineage)
+                current_by_lineage[lineage] = (raw, instance)
+
+            parser_identities = set()
+
+            def load_snapshot(raw, instance, store, target_jvm_major):
                 cache_outcome = cached_snapshot_archive(
                     raw["path"], artifact_instance_identity=instance.identity,
                     expected_sha256=instance.content_sha256, asm_jar=asm_jar,
                     cache_root=cache_root,
-                    target_jvm_major=current_platform.java_major,
+                    target_jvm_major=target_jvm_major,
                 )
-                snapshot = cache_outcome.snapshot
                 cache_metrics[
                     "artifact_snapshot_hits"
                     if cache_outcome.cache_status == "hit"
@@ -775,12 +793,11 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                 if cache_outcome.cache_status == "corrupt_rebuilt":
                     cache_metrics["artifact_snapshot_corrupt_rebuilt"] += 1
                 cache_metrics["classfile_parser_invocations"] += cache_outcome.parser_invocation_count
-                current_store.add_artifact_snapshot(instance, snapshot)
-                lineage = str(raw.get("lineage") or raw.get("coord") or raw["logical_location"])
-                if lineage in current_by_lineage:
-                    raise BinaryPipelineError("BINARY_ARTIFACT_LINEAGE_AMBIGUOUS", lineage)
-                current_by_lineage[lineage] = (instance, snapshot)
-                current_snapshots[instance.identity] = snapshot
+                snapshot = cache_outcome.snapshot
+                parser_identities.add(snapshot.parser_identity)
+                store.add_artifact_snapshot(instance, snapshot)
+                return snapshot
+
             diffs = []
             pairings = []
             for lineage in sorted(set(base_by_lineage) | set(current_by_lineage)):
@@ -788,18 +805,43 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                 current_pair = current_by_lineage.get(lineage)
                 if base_pair and current_pair:
                     status = "exact"
-                    base_instance, base_snapshot = base_pair
-                    current_instance, current_snapshot = current_pair
+                    base_raw, base_instance = base_pair
+                    current_raw, current_instance = current_pair
+                    base_snapshot = load_snapshot(
+                        base_raw, base_instance, base_store,
+                        base_platform.java_major,
+                    )
+                    if runtime_sides_identical:
+                        # The ArtifactInstance (including content, slot, realm,
+                        # origin and runtime profile) is byte-for-byte equal.
+                        # Compare the immutable snapshot with itself and clone
+                        # the completed evidence store once after reconciliation
+                        # instead of parsing/decompressing and inserting every
+                        # unchanged class a second time.
+                        current_snapshot = base_snapshot
+                    else:
+                        current_snapshot = load_snapshot(
+                            current_raw, current_instance, current_store,
+                            current_platform.java_major,
+                        )
                 elif base_pair:
                     status = "base_only"
-                    base_instance, base_snapshot = base_pair
+                    base_raw, base_instance = base_pair
+                    base_snapshot = load_snapshot(
+                        base_raw, base_instance, base_store,
+                        base_platform.java_major,
+                    )
                     current_instance = None
                     current_snapshot = _absent_snapshot(
                         f"ABSENT:current:{lineage}", base_snapshot.parser_identity
                     )
                 else:
                     status = "current_only"
-                    current_instance, current_snapshot = current_pair
+                    current_raw, current_instance = current_pair
+                    current_snapshot = load_snapshot(
+                        current_raw, current_instance, current_store,
+                        current_platform.java_major,
+                    )
                     base_instance = None
                     base_snapshot = _absent_snapshot(
                         f"ABSENT:base:{lineage}", current_snapshot.parser_identity
@@ -825,6 +867,17 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                 )
                 artifact_diff["logical_dependency_lineage"] = lineage
                 diffs.append(artifact_diff)
+                # A snapshot contains all classfile bytes and full ASM facts for
+                # one archive. Pair and persist it immediately so residency is
+                # bounded by the largest base/current JAR rather than the full
+                # 500-JAR input set.
+                del base_snapshot, current_snapshot
+            # Secondary lookup trees are not consulted while immutable archive
+            # facts are appended. Building each tree once is materially cheaper
+            # than maintaining it across hundreds of thousands of inserts, and
+            # the same complete indexes exist before any reconciliation query.
+            base_store.ensure_secondary_indexes()
+            current_store.ensure_secondary_indexes()
             phase_timings.append({
                 "phase": "artifact_fact_build_and_local_diff",
                 "elapsed_seconds": round(
@@ -839,29 +892,63 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
             # newly introduced JDK parameter type) still exists in the other
             # runtime and must not be reported as a provider change merely
             # because it was absent from that side's local discovery seeds.
-            common_runtime_classes = {
-                row["class_name"]
-                for store in (base_store, current_store)
-                for row in store.rows("classes")
+            common_runtime_classes = set()
+            for store in (base_store, current_store):
+                common_runtime_classes.update(
+                    row[0]
+                    for row in store.connection.execute(
+                        "SELECT DISTINCT class_name FROM classes"
+                    )
+                    if row[0]
+                )
+                common_runtime_classes.update(
+                    row[0]
+                    for row in store.connection.execute(
+                        """
+                        SELECT DISTINCT symbolic_owner FROM direct_edges
+                        WHERE symbolic_owner<>''
+                        """
+                    )
+                )
+            base_retained_kinds = {
+                "provider_binding",
+                "class_definition",
+                "resource_selection",
             }
-            common_runtime_classes.update({
-                row["symbolic_owner"]
-                for store in (base_store, current_store)
-                for row in store.rows("direct_edges")
-                if row["symbolic_owner"]
-            })
+            if not runtime_sides_identical:
+                # Only cross-version member-resolution comparison consumes the
+                # base member records. Exact sides prove that pass is empty.
+                base_retained_kinds.add("member_resolution")
+            current_retained_kinds = {
+                "provider_binding",
+                "class_definition",
+                "member_resolution",
+                "resource_selection",
+            }
             base_runtime = RuntimeReconciler(
                 base_store, base_profile, base_platform,
                 analysis_context_identity=context.identity,
                 capability_policy=capability,
                 additional_initial_classes=common_runtime_classes,
-            ).reconcile()
-            current_runtime = RuntimeReconciler(
-                current_store, current_profile, current_platform,
-                analysis_context_identity=context.identity,
-                capability_policy=capability,
-                additional_initial_classes=common_runtime_classes,
-            ).reconcile()
+            ).reconcile(retain_record_kinds=base_retained_kinds)
+            if runtime_sides_identical:
+                # Reconciliation is a deterministic function of the complete
+                # runtime side identity. SQLite backup preserves the full
+                # independently-validatable evidence without constructing a
+                # second million-record Python graph.
+                base_store.connection.commit()
+                base_store.connection.backup(current_store.connection)
+                current_store.connection.commit()
+                current_runtime = base_runtime
+            else:
+                current_runtime = RuntimeReconciler(
+                    current_store, current_profile, current_platform,
+                    analysis_context_identity=context.identity,
+                    capability_policy=capability,
+                    additional_initial_classes=common_runtime_classes,
+                ).reconcile(retain_record_kinds=current_retained_kinds)
+            base_runtime_identity = base_runtime.identity
+            current_runtime_identity = current_runtime.identity
             phase_timings.append({
                 "phase": "target_independent_runtime_reconciliation",
                 "elapsed_seconds": round(
@@ -920,6 +1007,11 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                     current_runtime,
                     analysis_context_identity=context.identity,
                 )
+            # The remaining semantic and trace phases use only the current
+            # runtime. Keep the immutable identity, but release the full base
+            # provider/definition/edge result graph before building the next
+            # large set of indexes.
+            del base_runtime
             semantic_overlay = build_binary_semantic_overlay(
                 current_store,
                 current_profile,
@@ -936,13 +1028,14 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                 "runtime_semantic_edge_count": len(semantic_overlay.rows),
             })
             trace_started = time.perf_counter()
-            traces = BinaryTraceEngine(
+            traces = build_binary_traces(
                 current_store, current_profile, current_runtime, decisions,
                 inline_overlay=inline_overlay,
                 semantic_overlay=semantic_overlay,
                 max_visited_nodes=int(config.get("max_trace_nodes") or 1_000_000),
                 max_paths_per_target=int(config.get("max_paths_per_target") or 20),
-            ).build()
+            )
+            del current_runtime
             phase_timings.append({
                 "phase": "binary_trace",
                 "elapsed_seconds": round(time.perf_counter() - trace_started, 6),
@@ -959,10 +1052,7 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
             })
             base_store.connection.commit()
             current_store.connection.commit()
-            parser_identities = sorted({
-                snapshot.parser_identity
-                for snapshot in (*base_snapshots.values(), *current_snapshots.values())
-            })
+            parser_identities = sorted(parser_identities)
             if len(parser_identities) != 1:
                 raise BinaryPipelineError(
                     "BINARY_PIPELINE_PARSER_IDENTITY_SET_INVALID",
@@ -1021,15 +1111,15 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                         ],
                         "output_identity": _identity(
                             "runtime_reconciliation_pair_identity",
-                            [base_runtime.identity, current_runtime.identity],
+                            [base_runtime_identity, current_runtime_identity],
                         ),
                     },
                     {
                         "phase": "step4b_decision_projection_freeze",
                         "input_identities": [
                             context.identity,
-                            base_runtime.identity,
-                            current_runtime.identity,
+                            base_runtime_identity,
+                            current_runtime_identity,
                         ],
                         "output_identity": decisions.identity,
                         "active_snapshot_identities": {
@@ -1041,7 +1131,7 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                         "phase": "step5b_trace",
                         "input_identities": [
                             decisions.identity,
-                            current_runtime.identity,
+                            current_runtime_identity,
                             traces.entrypoint_discovery_identity,
                         ],
                         "output_identity": traces.identity,
@@ -1198,12 +1288,47 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                 source_inputs=source_inputs,
                 additional_sidecars=additional,
             )
+            result_summary = {
+                "base_runtime_reconciliation_identity": base_runtime_identity,
+                "current_runtime_reconciliation_identity": current_runtime_identity,
+                "decision_bundle_identity": decisions.identity,
+                "trace_bundle_identity": traces.identity,
+                "decision_coverage_status": decisions.coverage_status,
+                "trace_coverage_status": traces.coverage_status,
+                "authoritative_change_fact_count": len(
+                    decisions.authoritative_decisions
+                ),
+                "diagnostic_candidate_fact_count": len(
+                    decisions.diagnostic_decisions
+                ),
+            }
             phase_timings.append({
                 "phase": "immutable_generation_write",
                 "elapsed_seconds": round(
                     time.perf_counter() - generation_write_started, 6
                 ),
             })
+            # Independent validation reconstructs its own truth from immutable
+            # output. Release production graphs and serialized sidecar buffers
+            # first so their complete base/current object graphs do not overlap
+            # the Oracle's equally large indexes at the process RSS peak.
+            additional.clear()
+            del (
+                decisions,
+                traces,
+                semantic_overlay,
+                inline_overlay,
+                source_overlay,
+                source_methods,
+                source_explanations,
+                diffs,
+                pairings,
+            )
+            base_store.close()
+            base_store_open = False
+            current_store.close()
+            current_store_open = False
+            gc.collect()
             validation_started = time.perf_counter()
             validation = validate_generation(config, manifest["generation_directory"])
             phase_timings.append({
@@ -1268,14 +1393,7 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                 "runtime_comparison_identity": runtime_comparison.identity,
                 "analysis_scope_identity": analysis_scope.identity,
                 "analysis_context_identity": context.identity,
-                "base_runtime_reconciliation_identity": base_runtime.identity,
-                "current_runtime_reconciliation_identity": current_runtime.identity,
-                "decision_bundle_identity": decisions.identity,
-                "trace_bundle_identity": traces.identity,
-                "decision_coverage_status": decisions.coverage_status,
-                "trace_coverage_status": traces.coverage_status,
-                "authoritative_change_fact_count": len(decisions.authoritative_decisions),
-                "diagnostic_candidate_fact_count": len(decisions.diagnostic_decisions),
+                **result_summary,
                 "source_inputs": source_inputs,
                 "validation_run_identity": validation["validation_run_identity"],
                 "validation_status": validation["status"],
@@ -1289,8 +1407,10 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                 "peak_rss_scope": "current_process",
             }
         finally:
-            base_store.close()
-            current_store.close()
+            if base_store_open:
+                base_store.close()
+            if current_store_open:
+                current_store.close()
 
 
 def main(argv=None):

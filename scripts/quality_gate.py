@@ -233,7 +233,11 @@ def main(argv=None) -> int:
                     "stderr": (real_completed.stderr or "")[-2000:],
                 }
             real_project.append(real_result)
-        print("[binary-quality-gate] performance: 400 JAR / 100000 classes", flush=True)
+        print(
+            "[binary-quality-gate] performance: 400 JAR / 100000 classes "
+            "+ full 400 JAR / 100000 class pipeline",
+            flush=True,
+        )
         performance_completed = subprocess.run(
             release_commands[-1], check=False, capture_output=True, text=True,
             encoding="utf-8", errors="replace",

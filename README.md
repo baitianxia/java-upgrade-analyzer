@@ -97,11 +97,13 @@ Claude Code 会负责：
 - 物理文件精确匹配优先于文件名解释；构建工具未报告 classifier 时，才以清单中的完整 version 为锚唯一推导，例如将 `jffi-1.2.23-native.jar` 解析为 `com.github.jnr:jffi:native`。多个最终身份同时匹配时才保留歧义，不按文件名猜选。项目模型只帮助识别最终制品中实际存在的内部 JAR，不能扩展制品范围。最终依赖版本与内容仍以实际 Fat JAR、Spring Boot JAR 或 WAR 为准。Thin JAR 本身不包含运行时依赖，不能作为正式比较结果。
 - 系统内部仍区分业务源码和依赖源码：依赖源码指依赖包自己的源码仓库。统一输入支持本地目录和 HTTPS/SSH Git 地址；识别为依赖源码的远端仓库会克隆到 `.upgrade-report/.runtime/cache/dependency_source_git/`，不会切换或修改用户工作区。
 - Git 克隆复用当前环境已有的 SSH key 或 Git 凭据配置，并禁用交互式密码提示；地址不可达或无权限时会明确停止，不会把失败仓库当成有效源码继续分析。
+- 每次正式执行前，系统会按仓库身份和进程租约自动清理上次中断留下的分析器临时 worktree；不会运行全局 `git worktree prune`，也不会删除用户自行创建的 worktree。恢复记录位于 `.upgrade-report/.runtime/observability/git_worktree_recovery.json`，清理无法安全完成时会在任何分析步骤开始前停止。
 - base/current 可以使用同一个工程目录；两侧身份由各自确认后的远程分支、tag 或 commit 决定。Skill 会查询远端最新 ref、定向 fetch 并固定到具体 commit，在隔离快照中分析，不会切换或拉取你的当前分支。
 - 直接产物模式会先解析 JAR；只有依赖坐标仍缺失时才使用对应侧源码补全。Step4 的依赖源码默认只取远端：唯一 ref pair 或多个名称指向同一 commit pair 时自动采用；只有两个以上不同 commit pair、且选择会改变源码对比范围时，才把全部歧义依赖及方案编号汇总到一张决策卡中，用户可一次答全。
 - Step1 先从 fat JAR/WAR 解析坐标；坐标确认后通过一次留存遍历固化 Step4 所需的变化 JAR、Step5 所需的全部 current 运行时 JAR和业务内容。Step4、Step5 直接读取这份清单，不会再次解包 fat JAR、递归查询嵌套 JAR、读取本地 Maven 仓库或下载替代 JAR。Step4 使用的依赖源码只增强 Step1 已确定的 GAV，不会重新发现同坐标依赖。
 - Step5 的 JAR 类型元数据 `javap` 单次超时为 30 秒；超时后对同一命令最多尝试 3 次，按 1 秒、3 秒退避。非超时错误不盲目重试；重试耗尽后只限制对应类型及相关调用路径，不会把一个类的失败提升为全部 API 的全局“未分析”。
 - 分支名只用于定位和展示，确认卡选择会同时绑定 repo、remote、canonical ref、artifact 与当时的 commit SHA。Step1 首次选定的 SHA 是固定快照；后续查询为空或 ref 已移动只触发受控重试和按原 SHA 物化，不会改用新 SHA，也不会要求用户重新确认。Step4 的依赖源码 ref 移动或不可用时不要求用户修复，而是从升级前后最终 JAR 比较同签名方法的规范化字节码，继续识别实现变化。
+- Step1 分支按完整 canonical ref 精确匹配，不使用前缀、后缀或版本近似规则；例如输入 `release` 不会命中 `release.DEV`，输入 `release.DEV` 则会正常命中该完整名称。复用已有报告时，本轮显式 `--base-branch`/`--current-branch` 若与旧输入不同，会清除旧 commit/ref 绑定并从 Step1 重建受影响结果。
 - 远端 `ls-remote`/`fetch` 对超时、连接重置、临时 DNS/HTTP 5xx 等瞬时错误最多尝试 3 次，重试间隔为 1 秒、3 秒；已选定 SHA 后，定向查询中的 ref 空结果或新 commit 观测也会重试，但不会替换该 SHA。认证失败等确定性错误不重试。Step4 自动重试耗尽后会记录 `DEPENDENCY_SOURCE_REF_UNAVAILABLE`，不会生成要求用户处理网络、权限或 ref 的确认卡，也不会静默使用本地对象；只有运行前已经明确提供 `allow_local_source=true` 时才允许采用本地兜底。若最终 JAR 方法字节码兜底也无法完成，行为变化覆盖会成为关键缺口，报告不得输出“完整”或“不受影响”结论。
 - 可用源码用于增加文件/行号、声明与注解、可读上下文和候选关系，并在受支持的常量内联场景与字节码共同形成证明；未提供的业务或依赖源码会分别记录解释覆盖缺口。无论如何，依赖范围、版本、JAR 内容和精确字节码调用边始终以 base/current 最终制品为准。
 - 源码映射不会混进 API 变化目录或变成无归属的路径列表：`evidence/source_analysis/review.md` 和 `method_mappings.csv` 同时展示源码归属依赖、实际二进制制品、方法、文件/行号、声明与注解；`candidate_relationships.csv` 另列源码候选调用关系并明确它不是可执行边。人工复核时可以直接判断是哪一个依赖提供的源码解释。

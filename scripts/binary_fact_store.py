@@ -3,12 +3,13 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import asdict
 import hashlib
 import json
 from pathlib import Path
 import sqlite3
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 import zlib
 
 from binary_artifact_diff import ArtifactSnapshot
@@ -47,14 +48,29 @@ def _identity(namespace: str, payload: Any) -> str:
 
 
 class BinaryFactStore:
-    def __init__(self, path: str | Path = ":memory:"):
+    FACT_INSERT_CHUNK_SIZE = 2_000
+
+    def __init__(
+        self,
+        path: str | Path = ":memory:",
+        *,
+        defer_secondary_indexes: bool = False,
+        bulk_load_transaction: bool = False,
+    ):
         self.path = str(path)
         self.connection = sqlite3.connect(self.path)
         self.connection.row_factory = sqlite3.Row
+        self._runtime_trigger_summary_cache: dict[str, Any] | None = None
+        self._bulk_load_transaction = False
         self.connection.execute("PRAGMA foreign_keys=ON")
         self.connection.execute("PRAGMA journal_mode=MEMORY")
         self.connection.execute("PRAGMA synchronous=NORMAL")
         self._create_schema()
+        if not defer_secondary_indexes:
+            self.ensure_secondary_indexes()
+        self._bulk_load_transaction = bool(bulk_load_transaction)
+        if self._bulk_load_transaction:
+            self.connection.execute("BEGIN")
 
     def close(self):
         self.connection.close()
@@ -88,11 +104,6 @@ class BinaryFactStore:
                 parser_identity TEXT NOT NULL,
                 coverage_status TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS artifact_instances_coord
-                ON artifact_instances(coord);
-            CREATE INDEX IF NOT EXISTS artifact_instances_runtime_slot
-                ON artifact_instances(runtime_profile_identity, loader_realm_identity, runtime_classpath_index);
-
             CREATE TABLE IF NOT EXISTS archive_entries (
                 physical_entry_identity TEXT PRIMARY KEY,
                 artifact_instance_identity TEXT NOT NULL REFERENCES artifact_instances(artifact_instance_identity),
@@ -110,9 +121,6 @@ class BinaryFactStore:
                 entry_json TEXT NOT NULL,
                 UNIQUE(artifact_instance_identity, name, name_ordinal)
             );
-            CREATE INDEX IF NOT EXISTS archive_entries_class
-                ON archive_entries(artifact_instance_identity, logical_class_entry, multi_release_version);
-
             CREATE TABLE IF NOT EXISTS classes (
                 class_variant_identity TEXT PRIMARY KEY,
                 artifact_instance_identity TEXT NOT NULL REFERENCES artifact_instances(artifact_instance_identity),
@@ -129,9 +137,6 @@ class BinaryFactStore:
                 fact_zlib BLOB NOT NULL,
                 UNIQUE(artifact_instance_identity, physical_entry_label)
             );
-            CREATE INDEX IF NOT EXISTS classes_runtime_lookup
-                ON classes(artifact_instance_identity, class_name, multi_release_version);
-
             CREATE TABLE IF NOT EXISTS members (
                 member_identity TEXT PRIMARY KEY,
                 class_variant_identity TEXT NOT NULL REFERENCES classes(class_variant_identity),
@@ -145,9 +150,6 @@ class BinaryFactStore:
                 implementation_digest TEXT NOT NULL,
                 UNIQUE(class_variant_identity, member_kind, member_name, descriptor)
             );
-            CREATE INDEX IF NOT EXISTS members_symbolic_lookup
-                ON members(class_name, member_kind, member_name, descriptor);
-
             CREATE TABLE IF NOT EXISTS direct_edges (
                 direct_edge_identity TEXT PRIMARY KEY,
                 caller_member_identity TEXT NOT NULL REFERENCES members(member_identity),
@@ -163,9 +165,6 @@ class BinaryFactStore:
                 edge_json TEXT NOT NULL,
                 UNIQUE(caller_member_identity, bytecode_offset, instruction_index, edge_kind)
             );
-            CREATE INDEX IF NOT EXISTS direct_edges_symbolic_target
-                ON direct_edges(symbolic_owner, symbolic_name, symbolic_descriptor);
-
             CREATE TABLE IF NOT EXISTS resources (
                 physical_entry_identity TEXT PRIMARY KEY REFERENCES archive_entries(physical_entry_identity),
                 artifact_instance_identity TEXT NOT NULL REFERENCES artifact_instances(artifact_instance_identity),
@@ -182,9 +181,6 @@ class BinaryFactStore:
                 record_count INTEGER NOT NULL,
                 payload_zlib BLOB NOT NULL
             ) WITHOUT ROWID;
-            CREATE INDEX IF NOT EXISTS reconciliation_records_kind
-                ON reconciliation_records(record_kind);
-
             CREATE TABLE IF NOT EXISTS source_overlays (
                 overlay_identity TEXT PRIMARY KEY,
                 analysis_context_identity TEXT NOT NULL,
@@ -211,6 +207,47 @@ class BinaryFactStore:
         )
         self.connection.commit()
 
+    def ensure_secondary_indexes(self) -> None:
+        """Create lookup indexes after an optional append-only bulk load."""
+
+        if self._bulk_load_transaction:
+            self.connection.commit()
+            self._bulk_load_transaction = False
+        self.connection.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS artifact_instances_coord
+                ON artifact_instances(coord);
+            CREATE INDEX IF NOT EXISTS artifact_instances_runtime_slot
+                ON artifact_instances(
+                    runtime_profile_identity,
+                    loader_realm_identity,
+                    runtime_classpath_index
+                );
+            CREATE INDEX IF NOT EXISTS archive_entries_class
+                ON archive_entries(
+                    artifact_instance_identity,
+                    logical_class_entry,
+                    multi_release_version
+                );
+            CREATE INDEX IF NOT EXISTS classes_runtime_lookup
+                ON classes(
+                    artifact_instance_identity,
+                    class_name,
+                    multi_release_version
+                );
+            CREATE INDEX IF NOT EXISTS members_symbolic_lookup
+                ON members(class_name, member_kind, member_name, descriptor);
+            CREATE INDEX IF NOT EXISTS direct_edges_symbolic_target
+                ON direct_edges(
+                    symbolic_owner,
+                    symbolic_name,
+                    symbolic_descriptor
+                );
+            CREATE INDEX IF NOT EXISTS reconciliation_records_kind
+                ON reconciliation_records(record_kind);
+            """
+        )
+
     def add_artifact_snapshot(
         self,
         instance: ArtifactInstance,
@@ -226,6 +263,7 @@ class BinaryFactStore:
                 "FACT_STORE_ARTIFACT_CONTENT_MISMATCH",
                 "snapshot bytes are not the ArtifactInstance content",
             )
+        self._runtime_trigger_summary_cache = None
         entry_by_label = {
             f"{item.name}#occurrence={item.name_ordinal}": item
             for item in snapshot.entries
@@ -233,7 +271,12 @@ class BinaryFactStore:
         payload_by_label = dict(snapshot.class_payloads)
         counts = {"entries": 0, "classes": 0, "members": 0, "edges": 0, "resources": 0}
         try:
-            with self.connection:
+            transaction = (
+                nullcontext()
+                if self._bulk_load_transaction
+                else self.connection
+            )
+            with transaction:
                 self.connection.execute(
                     """
                     INSERT INTO artifact_instances VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
@@ -255,9 +298,9 @@ class BinaryFactStore:
                         snapshot.class_fact_coverage_status,
                     ),
                 )
-                for entry in snapshot.entries:
-                    self.connection.execute(
-                        "INSERT INTO archive_entries VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                self.connection.executemany(
+                    "INSERT INTO archive_entries VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
                         (
                             entry.physical_entry_identity,
                             instance.identity,
@@ -273,23 +316,52 @@ class BinaryFactStore:
                             entry.normalized_resource_digest,
                             _json(entry.resource_semantic_facts),
                             _json(asdict(entry)),
-                        ),
-                    )
-                    counts["entries"] += 1
-                    if entry.kind == "resource":
-                        self.connection.execute(
-                            "INSERT INTO resources VALUES(?,?,?,?,?,?,?)",
-                            (
-                                entry.physical_entry_identity,
-                                instance.identity,
-                                entry.name,
-                                entry.resource_category,
-                                entry.content_sha256,
-                                entry.normalized_resource_digest,
-                                _json(entry.resource_semantic_facts),
-                            ),
                         )
-                        counts["resources"] += 1
+                        for entry in snapshot.entries
+                    ),
+                )
+                counts["entries"] = len(snapshot.entries)
+                resource_entries = tuple(
+                    entry for entry in snapshot.entries
+                    if entry.kind == "resource"
+                )
+                self.connection.executemany(
+                    "INSERT INTO resources VALUES(?,?,?,?,?,?,?)",
+                    (
+                        (
+                            entry.physical_entry_identity,
+                            instance.identity,
+                            entry.name,
+                            entry.resource_category,
+                            entry.content_sha256,
+                            entry.normalized_resource_digest,
+                            _json(entry.resource_semantic_facts),
+                        )
+                        for entry in resource_entries
+                    )
+                )
+                counts["resources"] = len(resource_entries)
+
+                class_rows = []
+                member_rows = []
+                edge_rows = []
+
+                def flush_fact_rows() -> None:
+                    self.connection.executemany(
+                        "INSERT INTO classes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        class_rows,
+                    )
+                    self.connection.executemany(
+                        "INSERT INTO members VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        member_rows,
+                    )
+                    self.connection.executemany(
+                        "INSERT INTO direct_edges VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                        edge_rows,
+                    )
+                    class_rows.clear()
+                    member_rows.clear()
+                    edge_rows.clear()
 
                 for record in snapshot.class_records:
                     label = str(record.get("class_entry") or "")
@@ -317,8 +389,7 @@ class BinaryFactStore:
                         raise BinaryFactStoreError(
                             "FACT_STORE_CLASS_PAYLOAD_UNBOUND", label
                         )
-                    self.connection.execute(
-                        "INSERT INTO classes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    class_rows.append(
                         (
                             variant_identity,
                             instance.identity,
@@ -335,13 +406,15 @@ class BinaryFactStore:
                             sqlite3.Binary(zlib.compress(
                                 _json(record).encode("utf-8"), level=1
                             )),
-                        ),
+                        )
                     )
                     counts["classes"] += 1
                     if parse_status != "parsed":
+                        if len(class_rows) >= self.FACT_INSERT_CHUNK_SIZE:
+                            flush_fact_rows()
                         continue
                     for field in record.get("fields") or ():
-                        self._insert_member(
+                        _member_identity, member_row = self._member_values(
                             variant_identity,
                             instance.identity,
                             class_name,
@@ -349,10 +422,11 @@ class BinaryFactStore:
                             field,
                             "",
                         )
+                        member_rows.append(member_row)
                         counts["members"] += 1
                     for method in record.get("methods") or ():
                         contract = method.get("contract") or {}
-                        member_identity = self._insert_member(
+                        member_identity, member_row = self._member_values(
                             variant_identity,
                             instance.identity,
                             class_name,
@@ -360,6 +434,7 @@ class BinaryFactStore:
                             contract,
                             str(method.get("implementation_digest") or ""),
                         )
+                        member_rows.append(member_row)
                         counts["members"] += 1
                         for instruction_index, instruction in enumerate(method.get("instructions") or ()):
                             for edge in self._instruction_edges(instruction):
@@ -376,8 +451,7 @@ class BinaryFactStore:
                                         "edge_payload": edge["payload"],
                                     },
                                 )
-                                self.connection.execute(
-                                    "INSERT INTO direct_edges VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                                edge_rows.append(
                                     (
                                         edge_identity,
                                         member_identity,
@@ -391,10 +465,19 @@ class BinaryFactStore:
                                         edge["symbolic_name"],
                                         edge["symbolic_descriptor"],
                                         _json(edge["payload"]),
-                                    ),
+                                    )
                                 )
                                 counts["edges"] += 1
+                    # Keep temporary insert tuples bounded for unusually large
+                    # monolithic archives while still crossing the Python/C
+                    # boundary in useful batches.
+                    if len(class_rows) >= self.FACT_INSERT_CHUNK_SIZE:
+                        flush_fact_rows()
+                flush_fact_rows()
         except sqlite3.IntegrityError as error:
+            if self._bulk_load_transaction:
+                self.connection.rollback()
+                self._bulk_load_transaction = False
             raise BinaryFactStoreError(
                 "FACT_STORE_IDENTITY_CONFLICT", str(error)
             ) from error
@@ -409,6 +492,28 @@ class BinaryFactStore:
         contract: dict[str, Any],
         implementation_digest: str,
     ) -> str:
+        member_identity, values = self._member_values(
+            class_variant_identity,
+            artifact_instance_identity,
+            class_name,
+            member_kind,
+            contract,
+            implementation_digest,
+        )
+        self.connection.execute(
+            "INSERT INTO members VALUES(?,?,?,?,?,?,?,?,?,?)", values
+        )
+        return member_identity
+
+    @staticmethod
+    def _member_values(
+        class_variant_identity: str,
+        artifact_instance_identity: str,
+        class_name: str,
+        member_kind: str,
+        contract: dict[str, Any],
+        implementation_digest: str,
+    ) -> tuple[str, tuple[Any, ...]]:
         member_name = str(contract.get("name") or "")
         descriptor = str(contract.get("descriptor") or "")
         member_identity = _identity(
@@ -421,22 +526,19 @@ class BinaryFactStore:
                 "descriptor": descriptor,
             },
         )
-        self.connection.execute(
-            "INSERT INTO members VALUES(?,?,?,?,?,?,?,?,?,?)",
-            (
-                member_identity,
-                class_variant_identity,
-                artifact_instance_identity,
-                class_name,
-                member_kind,
-                member_name,
-                descriptor,
-                int(contract.get("access") or 0),
-                _json(contract),
-                implementation_digest,
-            ),
+        values = (
+            member_identity,
+            class_variant_identity,
+            artifact_instance_identity,
+            class_name,
+            member_kind,
+            member_name,
+            descriptor,
+            int(contract.get("access") or 0),
+            _json(contract),
+            implementation_digest,
         )
-        return member_identity
+        return member_identity, values
 
     @staticmethod
     def _instruction_edges(instruction: Any) -> list[dict[str, Any]]:
@@ -804,7 +906,22 @@ class BinaryFactStore:
                 "FACT_STORE_INLINE_OVERLAY_CONFLICT", str(error)
             ) from error
 
-    def rows(self, table: str, *, where: str = "", parameters: Iterable[Any] = ()) -> list[dict[str, Any]]:
+    def rows(
+        self,
+        table: str,
+        *,
+        where: str = "",
+        parameters: Iterable[Any] = (),
+        include_class_bytes: bool = True,
+        include_class_facts: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Return decoded rows, optionally omitting heavyweight class payloads.
+
+        The historical API transparently expands both compressed classfile bytes
+        and the full ASM fact document.  Metadata-only consumers must opt out so
+        a table scan does not accidentally materialize every classfile twice in
+        Python memory.
+        """
         allowed = {
             "metadata", "artifact_instances", "archive_entries", "classes", "members",
             "direct_edges", "resources", "reconciliation_records", "source_overlays",
@@ -817,14 +934,37 @@ class BinaryFactStore:
                 "FACT_STORE_RECONCILIATION_FILTER_UNSUPPORTED",
                 "read and filter the transparently expanded records",
             )
-        query = f"SELECT * FROM {table}"
+        if table != "classes" and (
+            not include_class_bytes or not include_class_facts
+        ):
+            raise BinaryFactStoreError(
+                "FACT_STORE_CLASS_PAYLOAD_OPTION_INVALID", table
+            )
+        if table == "classes" and (
+            not include_class_bytes or not include_class_facts
+        ):
+            columns = [
+                str(row[1])
+                for row in self.connection.execute("PRAGMA table_info(classes)")
+                if (include_class_bytes or row[1] != "class_bytes_zlib")
+                and (include_class_facts or row[1] != "fact_zlib")
+            ]
+            query = "SELECT " + ",".join(columns) + " FROM classes"
+        else:
+            query = f"SELECT * FROM {table}"
         if where:
             query += " WHERE " + where
         rows = [dict(row) for row in self.connection.execute(query, tuple(parameters))]
         if table == "classes":
             for row in rows:
-                row["class_bytes"] = zlib.decompress(row.pop("class_bytes_zlib"))
-                row["fact_json"] = zlib.decompress(row.pop("fact_zlib")).decode("utf-8")
+                if include_class_bytes:
+                    row["class_bytes"] = zlib.decompress(
+                        row.pop("class_bytes_zlib")
+                    )
+                if include_class_facts:
+                    row["fact_json"] = zlib.decompress(
+                        row.pop("fact_zlib")
+                    ).decode("utf-8")
         elif table == "reconciliation_records":
             context = self.connection.execute(
                 "SELECT value FROM metadata WHERE key=?",
@@ -851,6 +991,110 @@ class BinaryFactStore:
                 } for envelope in records)
             rows = expanded
         return rows
+
+    def reconciliation_payloads(
+        self, record_kind: str
+    ) -> Iterator[dict[str, Any]]:
+        """Yield one persisted reconciliation kind a chunk at a time.
+
+        Selective in-memory reconciliation can later hydrate only the evidence
+        required by a real trace graph. Filtering at the compact chunk table
+        avoids expanding every other reconciliation family as a side effect.
+        """
+
+        kind = str(record_kind or "")
+        code = RECONCILIATION_KIND_CODES.get(kind)
+        if code is None:
+            raise BinaryFactStoreError(
+                "FACT_STORE_RECONCILIATION_KIND_INVALID", kind
+            )
+        for row in self.connection.execute(
+            """
+            SELECT chunk_identity,record_count,payload_zlib
+            FROM reconciliation_records
+            WHERE record_kind=?
+            ORDER BY chunk_identity
+            """,
+            (code,),
+        ):
+            records = json.loads(
+                zlib.decompress(row["payload_zlib"]).decode("utf-8")
+            )
+            if len(records) != int(row["record_count"]):
+                raise BinaryFactStoreError(
+                    "FACT_STORE_RECONCILIATION_CHUNK_COUNT_INVALID",
+                    bytes(row["chunk_identity"]).hex(),
+                )
+            for envelope in records:
+                yield dict(envelope["payload"])
+
+    def class_bytes(self, class_variant_identity: str) -> bytes:
+        """Load one classfile payload by identity without expanding its fact row."""
+        row = self.connection.execute(
+            "SELECT class_bytes_zlib FROM classes WHERE class_variant_identity=?",
+            (str(class_variant_identity),),
+        ).fetchone()
+        if row is None:
+            raise BinaryFactStoreError(
+                "FACT_STORE_CLASS_VARIANT_MISSING", str(class_variant_identity)
+            )
+        return zlib.decompress(row[0])
+
+    def runtime_trigger_summary(self) -> dict[str, Any]:
+        """Return a bounded-memory preflight for semantic/entrypoint builders.
+
+        The full builders require parsed ASM facts for selected classes. Most
+        dependencies have no runtime-visible annotations or callback hierarchy
+        at all, so retaining every parsed fact merely to produce an empty
+        overlay is avoidable. This scan keeps only a small hierarchy-name set
+        and stops retaining each decompressed document immediately.
+        """
+
+        cached = self._runtime_trigger_summary_cache
+        if cached is not None:
+            return cached
+        has_annotations = False
+        hierarchy_types: set[str] = set()
+        for raw in self.connection.execute("SELECT fact_zlib FROM classes"):
+            fact = json.loads(zlib.decompress(raw[0]).decode("utf-8"))
+            hierarchy_types.update(
+                str(value)
+                for value in (
+                    fact.get("super_name"),
+                    *(fact.get("interfaces") or ()),
+                )
+                if value
+            )
+            if fact.get("annotations"):
+                has_annotations = True
+                break
+            if any(
+                (field or {}).get("annotations")
+                for field in fact.get("fields") or ()
+            ):
+                has_annotations = True
+                break
+            if any(
+                ((method or {}).get("contract") or {}).get("annotations")
+                for method in fact.get("methods") or ()
+            ):
+                has_annotations = True
+                break
+        has_main_method = self.connection.execute(
+            """
+            SELECT 1 FROM members
+            WHERE member_kind='method' AND member_name='main'
+              AND descriptor='([Ljava/lang/String;)V'
+            LIMIT 1
+            """
+        ).fetchone() is not None
+        result = {
+            "has_runtime_annotations": has_annotations,
+            "hierarchy_types": frozenset(hierarchy_types),
+            "has_main_method": has_main_method,
+        }
+        self._runtime_trigger_summary_cache = result
+        return result
 
     def counts(self) -> dict[str, int]:
         tables = (

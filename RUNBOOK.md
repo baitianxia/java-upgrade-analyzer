@@ -34,6 +34,9 @@ python3 scripts/run_step.py --step auto \
 
 `runtime-input.json` 示例见 `runtime_config.example.json`。后续业务参数以
 `.upgrade-report/.runtime/state/main_state.json` 为唯一主状态，不要在每一步重新拼接一套参数。
+若确需在复用同一报告时更换 base/current 分支，可在统一入口显式传入新的
+`--base-branch`/`--current-branch`；新值按完整 canonical ref 精确匹配，并会自动清除旧的
+commit/ref binding、回到 Step1 重建。`--seed-json` 仍只用于首次初始化。
 
 恢复运行：
 
@@ -114,6 +117,7 @@ python3 scripts/binary_pipeline.py \
 - generation 激活后若 Step4 人工报告发布失败，调度层恢复上一 active pointer；
 - Step4/5 报告目录使用 stage + replace 发布，不能留下半套文件；
 - 失败证据写入 `.runtime/binary_authority/binary_failures/`；不要删除上一份有效输出；
+- 每次执行在 ref 解析前恢复带有效所有权租约的分析器临时 worktree，并把结果写入 `.runtime/observability/git_worktree_recovery.json`；禁止用全局 `git worktree prune` 代替精确恢复，避免影响用户 worktree；
 - 输入、目标 JDK、loader policy 或 coverage 缺失会失败关闭，不调用其他引擎补算。
 
 ## 性能与进度

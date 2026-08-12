@@ -267,13 +267,16 @@ class PathRuntimeWorktreeReliabilityTest(unittest.TestCase):
             lease.write_text(json.dumps(payload), encoding="utf-8")
             expected = "a" * 40
             removed = []
+            events = []
 
             def runner(command, cwd=None, timeout=None):
                 if "rev-parse" in command:
+                    events.append("rev-parse")
                     return expected, "", 0
                 if "ls-tree" in command:
                     return "tracked.txt\0", "", 0
                 if "remove" in command:
+                    events.append("remove")
                     removed.append(Path(command[-1]).resolve())
                     return "", "", 0
                 if "add" in command:
@@ -297,6 +300,7 @@ class PathRuntimeWorktreeReliabilityTest(unittest.TestCase):
             self.assertFalse(lease.exists())
             self.assertTrue(created.is_dir())
             self.assertTrue(path_runtime._worktree_lease_path(created).is_file())
+            self.assertLess(events.index("remove"), events.index("rev-parse"))
 
     def test_create_never_recovers_a_live_process_worktree_lease(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -337,6 +341,171 @@ class PathRuntimeWorktreeReliabilityTest(unittest.TestCase):
             self.assertTrue(active.is_dir())
             self.assertTrue(active_lease.is_file())
             self.assertTrue(created.is_dir())
+
+    def test_startup_recovery_finds_owned_lease_from_registered_old_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repository = root / "repository"
+            repository.mkdir()
+            old_root = root / "old-root"
+            old_root.mkdir()
+            stale = old_root / "stale"
+            stale.mkdir()
+            lease = path_runtime._write_worktree_lease(repository, stale)
+            payload = json.loads(lease.read_text(encoding="utf-8"))
+            payload["pid"] = 999_999_999
+            lease.write_text(json.dumps(payload), encoding="utf-8")
+            new_root = root / "new-root"
+            new_root.mkdir()
+            removed = []
+
+            def runner(command, cwd=None, timeout=None):
+                if "list" in command:
+                    return (
+                        f"worktree {repository}\0HEAD {'a' * 40}\0\0"
+                        f"worktree {stale}\0HEAD {'b' * 40}\0\0",
+                        "",
+                        0,
+                    )
+                if "remove" in command:
+                    removed.append(Path(command[-1]).resolve())
+                    return "", "", 0
+                raise AssertionError(f"unexpected command: {command}")
+
+            result = path_runtime.recover_owned_stale_worktrees(
+                repository,
+                roots=[new_root],
+                runner=runner,
+                git_command=["git"],
+            )
+
+            self.assertEqual(removed, [stale.resolve()])
+            self.assertEqual(result["removed"], [str(stale.resolve())])
+            self.assertFalse(stale.exists())
+            self.assertFalse(lease.exists())
+
+    def test_recovery_does_not_treat_a_reused_pid_as_the_lease_owner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repository = root / "repository"
+            repository.mkdir()
+            stale = root / "stale"
+            stale.mkdir()
+            lease = path_runtime._write_worktree_lease(repository, stale)
+            payload = json.loads(lease.read_text(encoding="utf-8"))
+            payload.update({"pid": 42, "process_start_token": "old-process"})
+            lease.write_text(json.dumps(payload), encoding="utf-8")
+
+            def runner(command, cwd=None, timeout=None):
+                if "remove" in command:
+                    return "", "", 0
+                raise AssertionError(f"unexpected command: {command}")
+
+            with patch.object(
+                path_runtime, "_process_is_alive", return_value=True
+            ), patch.object(
+                path_runtime, "_process_start_token", return_value="new-process"
+            ):
+                result = path_runtime._recover_stale_worktree_leases(
+                    ["git"],
+                    repository,
+                    [root],
+                    runner,
+                    deadline=path_runtime.time.monotonic() + 30,
+                )
+
+            self.assertEqual(result["removed"], [str(stale.resolve())])
+            self.assertFalse(stale.exists())
+
+    def test_cleanup_failure_blocks_create_before_revision_resolution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repository = root / "repository"
+            repository.mkdir()
+            worktree_root = root / "worktrees"
+            worktree_root.mkdir()
+            stale = worktree_root / "stale"
+            stale.mkdir()
+            lease = path_runtime._write_worktree_lease(repository, stale)
+            payload = json.loads(lease.read_text(encoding="utf-8"))
+            payload["pid"] = 999_999_999
+            lease.write_text(json.dumps(payload), encoding="utf-8")
+            events = []
+
+            def runner(command, cwd=None, timeout=None):
+                if "remove" in command:
+                    events.append("remove")
+                    return "", "fatal: permission denied", 128
+                if "list" in command:
+                    events.append("list")
+                    return f"worktree {stale}\0HEAD {'a' * 40}\0\0", "", 0
+                if "rev-parse" in command:
+                    events.append("rev-parse")
+                    return "a" * 40, "", 0
+                raise AssertionError(f"unexpected command: {command}")
+
+            with patch.object(
+                path_runtime,
+                "short_temp_root_candidates",
+                return_value=[worktree_root],
+            ):
+                with self.assertRaises(path_runtime.WorktreeRecoveryError):
+                    path_runtime.create_detached_worktree(
+                        "a" * 40,
+                        repository,
+                        runner=runner,
+                        git_command=["git"],
+                    )
+
+            self.assertEqual(events, ["remove", "list"])
+            self.assertTrue(stale.is_dir())
+            self.assertTrue(lease.is_file())
+
+    def test_startup_recovery_rejects_success_with_empty_worktree_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repository = Path(tmp) / "repository"
+            repository.mkdir()
+
+            with self.assertRaisesRegex(
+                path_runtime.WorktreeRecoveryError,
+                "git_worktree_list_failed:rc=0:stderr=<empty>",
+            ):
+                path_runtime.recover_owned_stale_worktrees(
+                    repository,
+                    roots=[],
+                    runner=lambda *args, **kwargs: ("", "", 0),
+                    git_command=["git"],
+                )
+
+    def test_startup_recovery_never_removes_unleased_user_worktree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repository = root / "repository"
+            repository.mkdir()
+            user_worktree = root / "user-worktree"
+            user_worktree.mkdir()
+
+            def runner(command, cwd=None, timeout=None):
+                if "list" in command:
+                    return (
+                        f"worktree {repository}\0HEAD {'a' * 40}\0\0"
+                        f"worktree {user_worktree}\0HEAD {'b' * 40}\0\0",
+                        "",
+                        0,
+                    )
+                if "remove" in command:
+                    raise AssertionError("unleased worktree must not be removed")
+                raise AssertionError(f"unexpected command: {command}")
+
+            result = path_runtime.recover_owned_stale_worktrees(
+                repository,
+                roots=[],
+                runner=runner,
+                git_command=["git"],
+            )
+
+            self.assertEqual(result["removed"], [])
+            self.assertTrue(user_worktree.is_dir())
 
     def test_real_worktree_round_trip_ignores_inherited_git_dir(self):
         with tempfile.TemporaryDirectory() as tmp:

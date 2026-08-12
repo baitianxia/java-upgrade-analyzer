@@ -113,30 +113,54 @@ class BinaryDecisionEngine:
         store: BinaryFactStore,
         reconciliation: RuntimeReconciliationResult,
     ) -> dict[tuple[Any, ...], tuple[dict[str, Any], dict[str, Any], dict[str, Any]]]:
-        members = {item["member_identity"]: item for item in store.rows("members")}
-        artifacts = {
-            item["artifact_instance_identity"]: item
-            for item in store.rows("artifact_instances")
-        }
         resolutions = {
             item["direct_edge_identity"]: item
             for item in reconciliation.member_resolutions
         }
         output = {}
-        for edge in store.rows("direct_edges"):
-            if edge.get("edge_kind") != "method":
-                continue
+        for raw in store.connection.execute(
+            """
+            SELECT edge.direct_edge_identity,edge.caller_member_identity,
+                   edge.caller_artifact_instance_identity,
+                   edge.instruction_index,edge.bytecode_offset,edge.edge_kind,
+                   edge.opcode,edge.symbolic_owner,edge.symbolic_name,
+                   edge.symbolic_descriptor,
+                   caller.class_name AS caller_class_name,
+                   caller.member_name AS caller_member_name,
+                   caller.descriptor AS caller_descriptor,
+                   artifact.runtime_path_kind,
+                   artifact.runtime_classpath_index
+            FROM direct_edges AS edge
+            JOIN members AS caller
+              ON caller.member_identity=edge.caller_member_identity
+            JOIN artifact_instances AS artifact
+              ON artifact.artifact_instance_identity=
+                 edge.caller_artifact_instance_identity
+            WHERE edge.edge_kind='method'
+            ORDER BY edge.rowid
+            """
+        ):
+            edge = {
+                key: raw[key] for key in (
+                    "direct_edge_identity", "caller_member_identity",
+                    "caller_artifact_instance_identity", "instruction_index",
+                    "bytecode_offset", "edge_kind", "opcode",
+                    "symbolic_owner", "symbolic_name", "symbolic_descriptor",
+                )
+            }
             resolution = resolutions.get(edge["direct_edge_identity"])
-            caller = members.get(edge["caller_member_identity"])
-            artifact = artifacts.get(edge["caller_artifact_instance_identity"])
-            if not resolution or not caller or not artifact:
+            if not resolution:
                 continue
+            artifact = {
+                "runtime_path_kind": raw["runtime_path_kind"],
+                "runtime_classpath_index": raw["runtime_classpath_index"],
+            }
             key = (
                 str(artifact.get("logical_dependency_lineage") or ""),
                 str(artifact.get("runtime_path_kind") or ""),
-                str(caller.get("class_name") or ""),
-                str(caller.get("member_name") or ""),
-                str(caller.get("descriptor") or ""),
+                str(raw["caller_class_name"] or ""),
+                str(raw["caller_member_name"] or ""),
+                str(raw["caller_descriptor"] or ""),
                 int(edge.get("instruction_index") or 0),
                 int(edge.get("bytecode_offset") or 0),
                 int(edge.get("opcode") or 0),
@@ -215,7 +239,8 @@ class BinaryDecisionEngine:
             })
         variant = record.get("selected_class_variant_identity")
         rows = store.rows(
-            "classes", where="class_variant_identity=?", parameters=(variant,)
+            "classes", where="class_variant_identity=?", parameters=(variant,),
+            include_class_bytes=False, include_class_facts=False,
         )
         if rows:
             class_row = rows[0]
@@ -882,8 +907,14 @@ class BinaryDecisionEngine:
 
     def build(self) -> BinaryDecisionBundle:
         self._process_artifact_diffs()
-        self._process_member_resolution_deltas()
-        self._process_runtime_outcome_deltas()
+        # The reconciliation identity binds every provider, definition,
+        # member, dispatch, type, initialization, linkage and resource outcome.
+        # Equal identities therefore prove that both runtime-derived delta
+        # passes are empty. Artifact-local deltas still run above because a
+        # changed but shadowed artifact can legitimately produce an exclusion.
+        if self.base_runtime.identity != self.current_runtime.identity:
+            self._process_member_resolution_deltas()
+            self._process_runtime_outcome_deltas()
         decision_objects = []
         for record in (*self.authoritative, *self.diagnostic, *self.excluded):
             payload = {
@@ -944,8 +975,6 @@ class BinaryDecisionEngine:
             coverage_gaps=gaps,
             identity=_identity("binary_decision_bundle_identity", payload),
         )
-
-
 __all__ = [
     "BinaryDecisionBundle",
     "BinaryDecisionEngine",

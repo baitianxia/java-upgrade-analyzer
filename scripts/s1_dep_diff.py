@@ -1734,7 +1734,10 @@ def append_cleanup_failure_to_blocked_error(blocked_error, cleanup_exc):
             blocked_error.stderr_excerpt = f"{blocked_error.stderr_excerpt}；此外{cleanup_message}"
         else:
             blocked_error.stderr_excerpt = cleanup_message
-        extra_cause = "临时 worktree 清理失败，请手工执行 `git worktree prune` 并检查 `.git/worktrees`。"
+        extra_cause = (
+            "临时 worktree 清理失败；系统将在下一次启动前按所有权租约自动恢复，"
+            "恢复仍失败时会安全停止并记录诊断。"
+        )
         if extra_cause not in blocked_error.suspected_causes:
             blocked_error.suspected_causes.append(extra_cause)
         return blocked_error

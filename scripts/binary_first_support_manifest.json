@@ -261,8 +261,8 @@
   "performance_gate": {
     "status": "passed",
     "path": "tests/fixtures/binary_first/performance_gate.json",
-    "sha256": "210b23925d80bd9f5fd2472030e4cef39140709610c0ac0f27e46ca89810900e",
-    "dataset": "400 JAR / 100000 class / 10000 indexed API queries",
+    "sha256": "3067d9f2dbaa2b3c13d391d1a93efcd1d5a096d4e85c0b40884ae7b67528acb4",
+    "dataset": "400 JAR / 100000 class store + identical and one-JAR-changed full 400 JAR / 100000 class pipelines",
     "warm_parser_invocations": 0,
     "blocks_binary_authority_switch": false
   },

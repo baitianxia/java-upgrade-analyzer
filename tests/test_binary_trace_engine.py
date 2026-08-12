@@ -5,6 +5,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 import zipfile
 
 
@@ -13,6 +15,7 @@ sys.path.insert(0, str(ROOT_DIR / "scripts"))
 
 import binary_asm_helper  # noqa: E402
 import binary_artifact_diff  # noqa: E402
+import binary_trace_engine  # noqa: E402
 from binary_decision_engine import BinaryDecisionEngine  # noqa: E402
 from binary_fact_store import BinaryFactStore  # noqa: E402
 from binary_first_model import (  # noqa: E402
@@ -20,7 +23,7 @@ from binary_first_model import (  # noqa: E402
 )
 from binary_platform_image import JdkPlatformImage  # noqa: E402
 from binary_runtime_reconciler import RuntimeReconciler  # noqa: E402
-from binary_trace_engine import BinaryTraceEngine  # noqa: E402
+from binary_trace_engine import BinaryTraceEngine, build_binary_traces  # noqa: E402
 
 
 def current_jdk_home():
@@ -32,6 +35,121 @@ def current_jdk_home():
     )
     match = re.search(r"^\s*java\.home\s*=\s*(.+)$", completed.stderr, re.MULTILINE)
     return Path(match.group(1).strip()) if match else None
+
+
+class BinaryTraceFastPathTest(unittest.TestCase):
+    def discovery(self):
+        return SimpleNamespace(
+            exact_member_identities=("entry-member",),
+            possible_member_identities=(),
+            identity="entrypoint-discovery-1",
+            coverage_gaps=(),
+            records=({"member_identity": "entry-member"},),
+        )
+
+    def empty_discovery(self, *, coverage_gaps=()):
+        return SimpleNamespace(
+            exact_member_identities=(),
+            possible_member_identities=(),
+            identity="entrypoint-discovery-empty",
+            coverage_gaps=tuple(coverage_gaps),
+            records=(),
+        )
+
+    def decisions(self, **overrides):
+        values = {
+            "formal_projections": (),
+            "candidate_projection_plans": (),
+            "authoritative_decisions": (),
+            "analysis_context_identity": "analysis-context-1",
+        }
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    def test_no_target_fast_path_preserves_empty_results_and_entrypoints(self):
+        discovery = self.discovery()
+        runtime = SimpleNamespace(coverage_gaps=())
+        with patch.object(
+            binary_trace_engine,
+            "discover_binary_entrypoints",
+            return_value=discovery,
+        ), patch.object(binary_trace_engine, "BinaryTraceEngine") as engine:
+            result = build_binary_traces(
+                object(), object(), runtime, self.decisions()
+            )
+
+        engine.assert_not_called()
+        self.assertEqual(result.formal_results, ())
+        self.assertEqual(result.candidate_results, ())
+        self.assertEqual(result.resource_activation_results, ())
+        self.assertEqual(result.entrypoint_records, discovery.records)
+        self.assertEqual(result.coverage_status, "complete")
+        self.assertEqual(
+            result.graph_stats["graph_materialization_status"], "not_required"
+        )
+
+    def test_every_trace_consumer_routes_to_full_graph_builder(self):
+        cases = {
+            "formal": self.decisions(formal_projections=({"identity": "p"},)),
+            "targetable_candidate": self.decisions(
+                candidate_projection_plans=({"planning_status": "targetable"},)
+            ),
+            "service_activation": self.decisions(authoritative_decisions=({
+                "fact_kind": "resource",
+                "fact_scope": {"resource_name": "META-INF/services/demo.Api"},
+            },)),
+        }
+        for name, decisions in cases.items():
+            with self.subTest(name=name), patch.object(
+                binary_trace_engine,
+                "discover_binary_entrypoints",
+                return_value=self.discovery(),
+            ), patch.object(binary_trace_engine, "BinaryTraceEngine") as engine:
+                expected = object()
+                engine.return_value.build.return_value = expected
+                actual = build_binary_traces(
+                    object(), object(), SimpleNamespace(coverage_gaps=()), decisions
+                )
+
+            self.assertIs(actual, expected)
+            engine.assert_called_once()
+
+    def test_formal_results_with_no_entrypoints_route_to_graph_free_builder(self):
+        decisions = self.decisions(formal_projections=({"identity": "p"},))
+        with patch.object(
+            binary_trace_engine,
+            "discover_binary_entrypoints",
+            return_value=self.empty_discovery(),
+        ), patch.object(binary_trace_engine, "BinaryTraceEngine") as engine:
+            expected = object()
+            engine.return_value.build.return_value = expected
+            actual = build_binary_traces(
+                object(), object(), SimpleNamespace(coverage_gaps=()), decisions
+            )
+
+        self.assertIs(actual, expected)
+        engine.assert_called_once()
+        self.assertFalse(engine.call_args.kwargs["materialize_graph"])
+
+    def test_service_activation_with_no_entrypoints_still_uses_full_graph(self):
+        decisions = self.decisions(authoritative_decisions=({
+            "fact_kind": "resource",
+            "fact_scope": {"resource_name": "META-INF/services/demo.Api"},
+        },))
+        with patch.object(
+            binary_trace_engine,
+            "discover_binary_entrypoints",
+            return_value=self.empty_discovery(),
+        ), patch.object(binary_trace_engine, "BinaryTraceEngine") as engine:
+            expected = object()
+            engine.return_value.build.return_value = expected
+            actual = build_binary_traces(
+                object(), object(), SimpleNamespace(coverage_gaps=()), decisions
+            )
+
+        self.assertIs(actual, expected)
+        engine.assert_called_once()
+        self.assertNotIn("materialize_graph", engine.call_args.kwargs)
 
 
 class BinaryTraceEngineTest(unittest.TestCase):

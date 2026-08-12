@@ -41,6 +41,49 @@ class BinaryFirstContractTest(unittest.TestCase):
         self.assertEqual(performance["status"], "passed")
         self.assertGreater(performance["thresholds"]["cold_end_to_end_seconds"], 0)
         self.assertGreater(performance["thresholds"]["warm_end_to_end_p95_seconds"], 0)
+        self.assertGreater(
+            performance["thresholds"]["full_pipeline_end_to_end_seconds"], 0
+        )
+        self.assertGreater(
+            performance["thresholds"]["full_pipeline_peak_rss_bytes"], 0
+        )
+        self.assertGreater(
+            performance["thresholds"][
+                "changed_full_pipeline_end_to_end_seconds"
+            ],
+            0,
+        )
+        self.assertGreater(
+            performance["thresholds"][
+                "changed_full_pipeline_peak_rss_bytes"
+            ],
+            0,
+        )
+        self.assertGreater(
+            performance["recorded_measurements"]["full_pipeline_probe"][
+                "peak_rss_bytes"
+            ],
+            0,
+        )
+        self.assertEqual(
+            performance["measurement_protocol"]["full_pipeline_probe"][
+                "class_count"
+            ],
+            performance["accuracy_invariants"][
+                "full_pipeline_expected_class_count"
+            ],
+        )
+        changed_protocol = performance["measurement_protocol"][
+            "changed_full_pipeline_probe"
+        ]
+        self.assertEqual(changed_protocol["changed_jar_count"], 1)
+        self.assertEqual(changed_protocol["changed_class_count"], 250)
+        self.assertEqual(
+            performance["recorded_measurements"][
+                "changed_full_pipeline_probe"
+            ]["authoritative_member_change_kind_counts"],
+            {"implementation_changed": 250},
+        )
         self.assertEqual(
             hashlib.sha256(performance_path.read_bytes()).hexdigest(),
             support["performance_gate"]["sha256"],
@@ -95,6 +138,102 @@ class BinaryFirstContractTest(unittest.TestCase):
             contract.canonical_identity(
                 "example", {"value": object()}, schema_version="1"
             )
+        self.assertEqual(
+            error.exception.reason_code, "BINARY_IDENTITY_VALUE_UNSUPPORTED"
+        )
+
+    def test_streaming_canonical_identity_is_byte_equivalent(self):
+        payloads = (
+            {},
+            [],
+            {"unicode": "运行时✓", "escaped": "line\n\"quoted\"\\"},
+            {
+                "nested": [
+                    {"z": None, "a": (True, False, 1, -2, 3.25)},
+                    {"set": {"beta", "alpha"}},
+                ],
+            },
+            {"numbers": [0, -0.0, 1.0e-12, 1.0e20]},
+        )
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                self.assertEqual(
+                    contract.canonical_identity(
+                        "example", payload, schema_version="1"
+                    ),
+                    contract.canonical_identity_streaming(
+                        "example", payload, schema_version="1"
+                    ),
+                )
+
+        for payload in ({1: "invalid-key"}, {"value": object()}):
+            with self.subTest(payload=payload), self.assertRaises(
+                contract.BinaryFirstContractError
+            ):
+                contract.canonical_identity_streaming(
+                    "example", payload, schema_version="1"
+                )
+        with self.assertRaises(ValueError):
+            contract.canonical_identity_streaming(
+                "example", {"value": float("nan")}, schema_version="1"
+            )
+
+    def test_native_type_fast_paths_preserve_the_frozen_identity(self):
+        class DictSubclass(dict):
+            pass
+
+        class ListSubclass(list):
+            pass
+
+        class IntSubclass(int):
+            pass
+
+        payload = DictSubclass({
+            "z": ListSubclass([
+                IntSubclass(7), None, True, {"values": {"beta", "alpha"}},
+            ]),
+            "a": {"unicode": "运行时✓", "tuple": ("x", -2, 3.25)},
+        })
+        expected = (
+            "eef9286e35d4dcd144f938c71c5a4f6a"
+            "c31c8a6540926bda9e47759b6eb92dc8"
+        )
+
+        self.assertEqual(
+            contract.canonical_identity(
+                "fast-path-regression", payload, schema_version="1"
+            ),
+            expected,
+        )
+        self.assertEqual(
+            contract.canonical_identity_streaming(
+                "fast-path-regression", payload, schema_version="1"
+            ),
+            expected,
+        )
+
+    def test_streaming_sequence_is_repeatable_and_byte_equivalent(self):
+        values = ["first", "运行时", "third"]
+        sequence = contract.StreamingCanonicalSequence(lambda: iter(values))
+        payload = {"values": sequence}
+
+        expected = contract.canonical_identity(
+            "example", {"values": values}, schema_version="1"
+        )
+        self.assertEqual(
+            contract.canonical_identity_streaming(
+                "example", payload, schema_version="1"
+            ),
+            expected,
+        )
+        self.assertEqual(
+            contract.canonical_identity_streaming(
+                "example", payload, schema_version="1"
+            ),
+            expected,
+        )
+        with self.assertRaises(contract.BinaryFirstContractError) as error:
+            contract.canonical_identity("example", payload, schema_version="1")
         self.assertEqual(
             error.exception.reason_code, "BINARY_IDENTITY_VALUE_UNSUPPORTED"
         )

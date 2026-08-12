@@ -104,6 +104,97 @@ class PlatformContractTest(unittest.TestCase):
             runner.call_args.kwargs["creationflags"], 0x08000000
         )
 
+    def test_windows_git_capture_uses_no_window_without_a_new_process_group(self):
+        process = SimpleNamespace(returncode=0)
+        process.communicate = lambda input=None, timeout=None: (b"a" * 40 + b"\n", b"")
+        with patch.object(compat, "IS_WINDOWS", True), patch.object(
+            compat, "find_executable", return_value=r"C:\Git\git.exe",
+        ), patch.object(compat.subprocess, "Popen", return_value=process) as popen:
+            stdout, stderr, returncode = compat.run_cmd(
+                ["git", "rev-parse", "--verify", "HEAD^{commit}"],
+                timeout=10,
+            )
+
+        self.assertEqual((stdout.strip(), stderr, returncode), ("a" * 40, "", 0))
+        self.assertEqual(popen.call_args.kwargs["creationflags"], 0x08000000)
+        self.assertEqual(popen.call_args.kwargs["stdin"], subprocess.DEVNULL)
+        self.assertTrue(popen.call_args.kwargs["close_fds"])
+
+    @unittest.skipUnless(os.name == "nt", "requires a real Windows GUI parent")
+    def test_pythonw_parent_repeatedly_captures_real_git_stdout(self):
+        pythonw = Path(sys.executable).with_name("pythonw.exe")
+        real_git = shutil.which("git")
+        if not pythonw.is_file() or not real_git:
+            self.skipTest("pythonw.exe and Git are required")
+        with tempfile.TemporaryDirectory(prefix="jua pythonw git ") as tmp:
+            root = Path(tmp)
+            repository = root / "repository"
+            repository.mkdir()
+            for command in (
+                [real_git, "init", "-q"],
+                [real_git, "config", "user.email", "pythonw@example.invalid"],
+                [real_git, "config", "user.name", "Pythonw Capture"],
+            ):
+                subprocess.run(
+                    command,
+                    cwd=repository,
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+            (repository / "tracked.txt").write_text("capture\n", encoding="utf-8")
+            subprocess.run(
+                [real_git, "add", "tracked.txt"],
+                cwd=repository,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            subprocess.run(
+                [real_git, "commit", "-qm", "capture fixture"],
+                cwd=repository,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            probe = root / "probe.py"
+            result_path = root / "result.json"
+            probe.write_text(
+                "\n".join((
+                    "import json, sys",
+                    "from pathlib import Path",
+                    "sys.path.insert(0, sys.argv[1])",
+                    "from compat import git_cmd, run_cmd",
+                    "rows = []",
+                    "for _ in range(25):",
+                    "    out, err, rc = run_cmd(git_cmd() + "
+                    "['rev-parse', '--verify', 'HEAD^{commit}'], "
+                    "cwd=sys.argv[2], timeout=10)",
+                    "    rows.append({'stdout': out.strip(), 'stderr': err, 'rc': rc})",
+                    "Path(sys.argv[3]).write_text(json.dumps(rows), encoding='utf-8')",
+                )) + "\n",
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                [
+                    str(pythonw),
+                    str(probe),
+                    str(ROOT / "scripts"),
+                    str(repository),
+                    str(result_path),
+                ],
+                timeout=60,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+            )
+            rows = json.loads(result_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(len(rows), 25)
+        self.assertTrue(all(row["rc"] == 0 for row in rows))
+        self.assertTrue(all(re.fullmatch(r"[0-9a-f]{40,64}", row["stdout"]) for row in rows))
+        self.assertTrue(all(row["stderr"] == "" for row in rows))
+
     def test_product_subprocess_calls_expand_the_shared_platform_policy(self):
         missing = []
         for source_path in sorted((ROOT / "scripts").glob("*.py")):

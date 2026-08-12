@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 BRANCH_FUNCTIONS = {
     "_canonical_value",
+    "_iter_canonical_json",
     "artifact_content_identity",
     "derive_formal_result_state",
     "validate_formal_result_state",
@@ -42,11 +43,44 @@ MUTATIONS = (
         "id": "identity_accepts_non_finite_float",
         "module": "binary_first_contract",
         "path": SCRIPTS / "binary_first_contract.py",
-        "old": "allow_nan=False,",
-        "new": "allow_nan=True,",
+        "old": """return json.dumps(
+        canonical,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(\",\", \":\"),
+        allow_nan=False,
+    ).encode(\"utf-8\")""",
+        "new": """return json.dumps(
+        canonical,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(\",\", \":\"),
+        allow_nan=True,
+    ).encode(\"utf-8\")""",
         "test": (
             "tests.test_binary_first_contract.BinaryFirstContractTest."
             "test_canonical_identity_rejects_non_finite_float"
+        ),
+    },
+    {
+        "id": "streaming_identity_accepts_non_finite_float",
+        "module": "binary_first_contract",
+        "path": SCRIPTS / "binary_first_contract.py",
+        "old": """_CANONICAL_JSON_ENCODER = json.JSONEncoder(
+    ensure_ascii=False,
+    sort_keys=True,
+    separators=(\",\", \":\"),
+    allow_nan=False,
+)""",
+        "new": """_CANONICAL_JSON_ENCODER = json.JSONEncoder(
+    ensure_ascii=False,
+    sort_keys=True,
+    separators=(\",\", \":\"),
+    allow_nan=True,
+)""",
+        "test": (
+            "tests.test_binary_first_contract.BinaryFirstContractTest."
+            "test_streaming_canonical_identity_is_byte_equivalent"
         ),
     },
     {

@@ -35,6 +35,12 @@ FORMAL_RUNTIME_VERIFICATION_STATUSES = (
 )
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_CANONICAL_JSON_ENCODER = json.JSONEncoder(
+    ensure_ascii=False,
+    sort_keys=True,
+    separators=(",", ":"),
+    allow_nan=False,
+)
 
 
 class BinaryFirstContractError(ValueError):
@@ -45,18 +51,81 @@ class BinaryFirstContractError(ValueError):
         self.reason_code = str(reason_code or "BINARY_FIRST_CONTRACT_VIOLATION")
 
 
+class StreamingCanonicalSequence:
+    """Repeatable lazy array accepted only by the streaming identity encoder.
+
+    The ordinary identity API intentionally continues to reject arbitrary
+    iterables: accepting a one-shot generator there would make identities
+    depend on call order.  Large, already ordered evidence sets can opt into
+    this wrapper with a factory that returns a fresh iterator for every pass.
+    """
+
+    __slots__ = ("_iterator_factory",)
+
+    def __init__(self, iterator_factory):
+        if not callable(iterator_factory):
+            raise BinaryFirstContractError(
+                "BINARY_STREAMING_SEQUENCE_FACTORY_INVALID",
+                "streaming sequence requires a callable iterator factory",
+            )
+        self._iterator_factory = iterator_factory
+
+    def __iter__(self):
+        return iter(self._iterator_factory())
+
+
 def _canonical_value(value):
+    value_type = type(value)
+    # Identities overwhelmingly consist of ordinary JSON trees. Test their
+    # exact built-in types before the abstract ``Mapping`` checks below;
+    # asking the ABC machinery about every string, integer and boolean in a
+    # large fact graph is pure overhead. Subclasses and extension containers
+    # still fall through to the historical generic branches unchanged.
+    if value is None or value_type in (str, int, float, bool):
+        return value
+    if value_type is dict:
+        if any(not isinstance(key, str) for key in value):
+            raise BinaryFirstContractError(
+                "BINARY_IDENTITY_KEY_INVALID",
+                "identity object keys must be strings",
+            )
+        # The JSON encoder below already sorts object keys. Preserve ordinary
+        # dict/list/tuple containers when every child is natively encodable so
+        # the hot identity path validates once without copying the full tree.
+        for item in value.values():
+            if _canonical_value(item) is not item:
+                break
+        else:
+            return value
+        return {key: _canonical_value(item) for key, item in value.items()}
+    if value_type in (list, tuple):
+        for item in value:
+            if _canonical_value(item) is not item:
+                break
+        else:
+            return value
+        return [_canonical_value(item) for item in value]
+    if value_type is set:
+        canonical_items = [_canonical_value(item) for item in value]
+        return sorted(
+            canonical_items,
+            key=lambda item: json.dumps(
+                item, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ),
+        )
     if isinstance(value, Mapping):
         if any(not isinstance(key, str) for key in value):
             raise BinaryFirstContractError(
                 "BINARY_IDENTITY_KEY_INVALID",
                 "identity object keys must be strings",
             )
-        return {
-            key: _canonical_value(item)
-            for key, item in sorted(value.items(), key=lambda pair: pair[0])
-        }
+        return {key: _canonical_value(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
+        for item in value:
+            if _canonical_value(item) is not item:
+                break
+        else:
+            return value
         return [_canonical_value(item) for item in value]
     if isinstance(value, set):
         canonical_items = [_canonical_value(item) for item in value]
@@ -96,9 +165,108 @@ def canonical_identity(namespace, payload, *, schema_version):
     envelope = {
         "namespace": namespace,
         "schema_version": schema_version,
-        "payload": _canonical_value(payload),
+        # ``canonical_payload_bytes`` canonicalizes the complete envelope.
+        # Canonicalizing the nested payload here as well walked every member,
+        # edge and reconciliation identity tree twice without changing one
+        # output byte.
+        "payload": payload,
     }
     return hashlib.sha256(canonical_payload_bytes(envelope)).hexdigest()
+
+
+def _iter_canonical_json(value):
+    """Yield the existing canonical JSON encoding without copying its tree."""
+    value_type = type(value)
+    if value is None or value_type in (str, int, float, bool):
+        yield _CANONICAL_JSON_ENCODER.encode(value)
+        return
+    if value_type is dict:
+        if any(not isinstance(key, str) for key in value):
+            raise BinaryFirstContractError(
+                "BINARY_IDENTITY_KEY_INVALID",
+                "identity object keys must be strings",
+            )
+        yield "{"
+        for index, key in enumerate(sorted(value)):
+            if index:
+                yield ","
+            yield _CANONICAL_JSON_ENCODER.encode(key)
+            yield ":"
+            yield from _iter_canonical_json(value[key])
+        yield "}"
+        return
+    if value_type in (list, tuple) or value_type is StreamingCanonicalSequence:
+        yield "["
+        for index, item in enumerate(value):
+            if index:
+                yield ","
+            yield from _iter_canonical_json(item)
+        yield "]"
+        return
+    if value_type is set:
+        # Sets have no wire representation of their own. Match
+        # ``_canonical_value`` by sorting each already-canonical item by its
+        # compact JSON text and emitting the collection as an array.
+        items = ["".join(_iter_canonical_json(item)) for item in value]
+        yield "["
+        yield ",".join(sorted(items))
+        yield "]"
+        return
+    if isinstance(value, Mapping):
+        if any(not isinstance(key, str) for key in value):
+            raise BinaryFirstContractError(
+                "BINARY_IDENTITY_KEY_INVALID",
+                "identity object keys must be strings",
+            )
+        yield "{"
+        for index, key in enumerate(sorted(value)):
+            if index:
+                yield ","
+            yield _CANONICAL_JSON_ENCODER.encode(key)
+            yield ":"
+            yield from _iter_canonical_json(value[key])
+        yield "}"
+        return
+    if isinstance(value, (list, tuple, StreamingCanonicalSequence)):
+        yield "["
+        for index, item in enumerate(value):
+            if index:
+                yield ","
+            yield from _iter_canonical_json(item)
+        yield "]"
+        return
+    if isinstance(value, set):
+        items = ["".join(_iter_canonical_json(item)) for item in value]
+        yield "["
+        yield ",".join(sorted(items))
+        yield "]"
+        return
+    if value is None or isinstance(value, (str, int, float, bool)):
+        yield _CANONICAL_JSON_ENCODER.encode(value)
+        return
+    raise BinaryFirstContractError(
+        "BINARY_IDENTITY_VALUE_UNSUPPORTED",
+        f"unsupported identity value type: {type(value).__name__}",
+    )
+
+
+def canonical_identity_streaming(namespace, payload, *, schema_version):
+    """Hash canonical identity bytes with memory bounded by nesting depth."""
+    namespace = str(namespace or "").strip()
+    schema_version = str(schema_version or "").strip()
+    if not namespace or not schema_version:
+        raise BinaryFirstContractError(
+            "BINARY_IDENTITY_NAMESPACE_MISSING",
+            "identity namespace and schema_version are required",
+        )
+    digest = hashlib.sha256()
+    for chunk in _iter_canonical_json({
+        "namespace": namespace,
+        "schema_version": schema_version,
+        "payload": payload,
+    }):
+        digest.update(chunk.encode("utf-8"))
+    return digest.hexdigest()
 
 
 def artifact_content_identity(content_sha256, byte_length, *, schema_version="1"):

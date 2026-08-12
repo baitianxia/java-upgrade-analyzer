@@ -182,12 +182,13 @@ class BinaryRuntimeReconcilerTest(unittest.TestCase):
 
     def test_provider_definition_member_resolution_and_dispatch_are_physical(self):
         with self.build_store() as store:
-            result = RuntimeReconciler(
+            reconciler = RuntimeReconciler(
                 store,
                 self.profile,
                 self.platform,
                 analysis_context_identity="analysis-context-1",
-            ).reconcile()
+            )
+            result = reconciler.reconcile()
             stored = store.counts()["reconciliation_records"]
             init_member = next(
                 item for item in store.rows("members")
@@ -276,6 +277,15 @@ class BinaryRuntimeReconcilerTest(unittest.TestCase):
             impl_value_member in item["implementation_target_identities"]
             for item in interface_dispatch
         ))
+        self.assertTrue(reconciler.concrete_subtype_index_built)
+        self.assertIn(
+            ("application-loader", "demo/Impl"),
+            reconciler.concrete_subtype_cache["demo/Api"],
+        )
+        self.assertEqual(
+            reconciler.artifact_security_unsupported_cache,
+            {self.instance.identity: False},
+        )
         final_dispatch = next(
             item for item in result.dispatch_resolutions
             if item["direct_edge_identity"] == final_call_edge_id
@@ -335,6 +345,43 @@ class BinaryRuntimeReconcilerTest(unittest.TestCase):
             and item["class_name"] == "java/lang/String"
         )
         self.assertTrue(provider["selected_artifact_instance_identity"].startswith("platform-image:"))
+
+    def test_selective_retention_preserves_identity_and_persisted_evidence(self):
+        retained = {
+            "provider_binding", "class_definition", "resource_selection",
+        }
+        with self.build_store() as full_store, self.build_store() as compact_store:
+            full = RuntimeReconciler(
+                full_store,
+                self.profile,
+                self.platform,
+                analysis_context_identity="analysis-context-retention",
+            ).reconcile()
+            compact = RuntimeReconciler(
+                compact_store,
+                self.profile,
+                self.platform,
+                analysis_context_identity="analysis-context-retention",
+            ).reconcile(retain_record_kinds=retained)
+            full_evidence = sorted(
+                full_store.rows("reconciliation_records"),
+                key=lambda item: item["record_identity"],
+            )
+            compact_evidence = sorted(
+                compact_store.rows("reconciliation_records"),
+                key=lambda item: item["record_identity"],
+            )
+
+        self.assertEqual(compact.identity, full.identity)
+        self.assertEqual(compact.provider_bindings, full.provider_bindings)
+        self.assertEqual(compact.class_definitions, full.class_definitions)
+        self.assertEqual(compact.resource_selections, full.resource_selections)
+        self.assertEqual(compact.member_resolutions, ())
+        self.assertEqual(compact.dispatch_resolutions, ())
+        self.assertEqual(compact.type_resolutions, ())
+        self.assertEqual(compact.class_initialization_resolutions, ())
+        self.assertEqual(compact.linkage_resolutions, ())
+        self.assertEqual(compact_evidence, full_evidence)
 
     def test_member_resolution_remains_resolved_when_access_linkage_fails(self):
         current_source = self.root / "current-src" / "demo" / "FinalApi.java"

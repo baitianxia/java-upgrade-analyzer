@@ -10,6 +10,8 @@ outside measured analysis time.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
+from contextlib import closing
 import hashlib
 import json
 import math
@@ -101,17 +103,19 @@ def _java_major(jdk_home: Path) -> int:
     raise PerformanceGateError("JAVA_VERSION missing")
 
 
-def _compile_template(root: Path) -> bytes:
-    source = root / "template" / "p" / "C000000.java"
-    source.parent.mkdir(parents=True)
+def _compile_template(
+    root: Path, *, return_value: int = 1, label: str = "template"
+) -> bytes:
+    source = root / label / "p" / "C000000.java"
+    source.parent.mkdir(parents=True, exist_ok=True)
     source.write_text(
         "package p; public class C000000 { "
-        "public int value(){ return 1; } "
+        f"public int value(){{ return {int(return_value)}; }} "
         "public String text(){ return Integer.toString(value()); } }\n",
         encoding="utf-8",
     )
-    output = root / "template-classes"
-    output.mkdir()
+    output = root / f"{label}-classes"
+    output.mkdir(exist_ok=True)
     completed = subprocess.run(
         ["javac", "-g:none", "-d", str(output), str(source)],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -177,6 +181,52 @@ def build_dataset(root: Path, *, jar_count: int, classes_per_jar: int) -> list[d
         encoding="utf-8",
     )
     return artifacts
+
+
+def build_changed_current_artifacts(
+    root: Path,
+    artifacts: list[dict[str, Any]],
+    *,
+    classes_per_jar: int,
+) -> list[dict[str, Any]]:
+    """Change every method body in one JAR while preserving its class topology."""
+
+    if not artifacts:
+        raise PerformanceGateError("changed-side probe requires at least one artifact")
+    changed_directory = root / "changed-dataset"
+    changed_directory.mkdir(parents=True, exist_ok=True)
+    changed_path = changed_directory / "artifact-0000.jar"
+    template = _compile_template(
+        root, return_value=2, label="changed-template"
+    )
+    first_class = int(artifacts[0].get("first_class_index") or 0)
+    with zipfile.ZipFile(
+        changed_path,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=1,
+    ) as archive:
+        for class_index in range(first_class, first_class + classes_per_jar):
+            owner = f"p/C{class_index:06d}".encode("ascii")
+            if len(owner) != len(b"p/C000000"):
+                raise PerformanceGateError(
+                    "changed-side class owner length overflow"
+                )
+            content = template.replace(b"p/C000000", owner)
+            info = zipfile.ZipInfo(
+                owner.decode("ascii") + ".class", (2026, 1, 1, 0, 0, 0)
+            )
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = 0o100644 << 16
+            archive.writestr(info, content)
+    current = [dict(item) for item in artifacts]
+    current[0] = {
+        **current[0],
+        "path": str(changed_path.resolve()),
+        "sha256": _sha256(changed_path),
+        "byte_length": changed_path.stat().st_size,
+    }
+    return current
 
 
 def _runtime_profile(artifacts: list[dict[str, Any]], jdk_major: int) -> RuntimeProfile:
@@ -262,34 +312,38 @@ def _analyze_once(
     inventory_started = time.perf_counter()
     inventory = _inventory(artifacts)
     inventory_seconds = time.perf_counter() - inventory_started
-    parse_started = time.perf_counter()
-    snapshots = []
+    parse_seconds = 0.0
+    db_seconds = 0.0
     parser_invocations = 0
     cache_hits = 0
-    for index, artifact in enumerate(artifacts):
-        instance = _instance(profile, artifact, index)
-        outcome = cached_snapshot_archive(
-            artifact["path"],
-            artifact_instance_identity=instance.identity,
-            expected_sha256=artifact["sha256"],
-            cache_root=cache_root,
-            asm_jar=asm_jar,
-            target_jvm_major=int(profile.payload["target_jvm"]["major"]),
-        )
-        snapshots.append((instance, outcome.snapshot))
-        parser_invocations += outcome.parser_invocation_count
-        cache_hits += int(outcome.cache_status == "hit")
-    parse_seconds = time.perf_counter() - parse_started
     db_started = time.perf_counter()
     counts = {"entries": 0, "classes": 0, "members": 0, "edges": 0, "resources": 0}
     store = BinaryFactStore(db)
+    db_seconds += time.perf_counter() - db_started
     try:
-        for instance, snapshot in snapshots:
-            added = store.add_artifact_snapshot(instance, snapshot)
+        for index, artifact in enumerate(artifacts):
+            instance = _instance(profile, artifact, index)
+            parse_started = time.perf_counter()
+            outcome = cached_snapshot_archive(
+                artifact["path"],
+                artifact_instance_identity=instance.identity,
+                expected_sha256=artifact["sha256"],
+                cache_root=cache_root,
+                asm_jar=asm_jar,
+                target_jvm_major=int(profile.payload["target_jvm"]["major"]),
+            )
+            parse_seconds += time.perf_counter() - parse_started
+            parser_invocations += outcome.parser_invocation_count
+            cache_hits += int(outcome.cache_status == "hit")
+            db_started = time.perf_counter()
+            added = store.add_artifact_snapshot(instance, outcome.snapshot)
+            db_seconds += time.perf_counter() - db_started
             for key, value in added.items():
                 counts[key] += value
+            del outcome
+        db_started = time.perf_counter()
         store.connection.commit()
-        db_seconds = time.perf_counter() - db_started
+        db_seconds += time.perf_counter() - db_started
         overlay_started = time.perf_counter()
         # Source is intentionally absent in this scale fixture; exercising the
         # optional overlay must not scan or mutate the binary graph.
@@ -373,6 +427,199 @@ def _legacy_javap(artifacts: list[dict[str, Any]], classes_per_jar: int) -> dict
     }
 
 
+def _full_pipeline_probe(
+    artifacts: list[dict[str, Any]],
+    *,
+    root: Path,
+    asm_jar: Path,
+    classes_per_jar: int,
+    jar_limit: int | None = None,
+    current_artifacts: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Measure the full runtime and Oracle phases at the requested scale."""
+    from binary_pipeline import run_pipeline
+
+    selected_base = (
+        artifacts
+        if jar_limit is None
+        else artifacts[:min(len(artifacts), jar_limit)]
+    )
+    all_current = artifacts if current_artifacts is None else current_artifacts
+    selected_current = (
+        all_current
+        if jar_limit is None
+        else all_current[:min(len(all_current), jar_limit)]
+    )
+    if len(selected_base) != len(selected_current):
+        raise PerformanceGateError(
+            "full pipeline base/current artifact counts must match"
+        )
+    output_root = root / "full-pipeline-probe"
+    if output_root.exists():
+        shutil.rmtree(output_root)
+
+    def runtime_artifacts(selected):
+        return [
+            {
+                "path": item["path"],
+                "logical_location": f"lib/artifact-{index:04d}.jar",
+                "loader_realm": "application-loader",
+                "path_kind": "classpath",
+                "slot": index,
+                "coord": f"performance:artifact-{index:04d}:1",
+                "lineage": f"performance:artifact-{index:04d}",
+                "runtime_code_source_origin_identity": (
+                    f"performance-artifact-{index:04d}"
+                ),
+            }
+            for index, item in enumerate(selected)
+        ]
+    runtime_profile = {
+        "container_and_launcher_kind": "java-classpath",
+        "loader_topology": {
+            "coverage_status": "complete",
+            "entrypoint_realms": ["application-loader"],
+            "realms": [
+                {
+                    "identity": "platform-loader",
+                    "kind": "platform",
+                    "delegation": "parent_first",
+                    "module_mode": "named-platform",
+                },
+                {
+                    "identity": "application-loader",
+                    "kind": "application",
+                    "parent": "platform-loader",
+                    "delegation": "parent_first",
+                    "module_mode": "unnamed",
+                },
+            ],
+        },
+        "runtime_security_and_package_sealing_policy_identity": (
+            "standard-unsealed-unsigned-v1"
+        ),
+        "active_profile_identities": ["performance"],
+        "external_config_snapshot_identities": [],
+        "agent_transformer_plugin_profile_identities": [],
+        "business_entrypoint_profile": {
+            "coverage_status": "complete",
+            "methods": [],
+        },
+        "runtime_class_closure_coverage_status": "complete",
+        "resource_selection_coverage_status": "complete",
+    }
+    jdk_home = str(_jdk_home())
+    result = run_pipeline(
+        {
+            "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+            "source_usage": {
+                "decision": "skip_source",
+                "decision_source": "performance_fixture",
+            },
+            "asm_jar": str(asm_jar),
+            "base": {
+                "jdk_home": jdk_home,
+                "artifacts": runtime_artifacts(selected_base),
+                "runtime_profile": runtime_profile,
+            },
+            "current": {
+                "jdk_home": jdk_home,
+                "artifacts": runtime_artifacts(selected_current),
+                "runtime_profile": runtime_profile,
+            },
+            "runtime_comparison": {
+                "controlled_profile_fields": ["loader_topology"],
+                "declared_upgrade_payload_scope": ["artifact-bytes"],
+            },
+        },
+        output_root=output_root,
+    )
+    evidence = _full_pipeline_evidence(result)
+    comparison = (
+        "identical-base-current-cold-output"
+        if [item.get("sha256") for item in selected_base]
+        == [item.get("sha256") for item in selected_current]
+        else "nonidentical-base-current-cold-output"
+    )
+    return {
+        "status": "passed",
+        "comparison": comparison,
+        "jar_count": len(selected_base),
+        "current_jar_count": len(selected_current),
+        "expected_class_count": len(selected_base) * classes_per_jar,
+        "end_to_end_seconds": float(result["total_elapsed_seconds"]),
+        "phase_seconds": {
+            str(item["phase"]): float(item["elapsed_seconds"])
+            for item in result["phase_timings"]
+        },
+        "phase_peak_rss_bytes": {
+            str(item["phase"]): int(item.get("peak_rss_bytes") or 0)
+            for item in result["phase_timings"]
+        },
+        "peak_rss_bytes": int(result.get("peak_rss_bytes") or 0),
+        "parser_invocations": int(
+            result["cache_metrics"]["classfile_parser_invocations"]
+        ),
+        "artifact_snapshot_hits": int(
+            result["cache_metrics"]["artifact_snapshot_hits"]
+        ),
+        **evidence,
+    }
+
+
+def _full_pipeline_evidence(result: dict[str, Any]) -> dict[str, Any]:
+    """Read measured conservation and Oracle values from persisted evidence."""
+    generation = Path(result["generation_directory"])
+    validation = json.loads(
+        Path(result["validation_result_path"]).read_text(encoding="utf-8")
+    )
+    decisions = json.loads(
+        (generation / "binary_decisions.json").read_text(encoding="utf-8")
+    )
+    formal = json.loads(
+        (generation / "binary_formal_results.json").read_text(encoding="utf-8")
+    )
+
+    def class_count(side: str) -> int:
+        with closing(
+            sqlite3.connect(generation / f"{side}_binary_facts.sqlite")
+        ) as connection:
+            return int(
+                connection.execute("SELECT COUNT(*) FROM classes").fetchone()[0]
+            )
+
+    base_class_count = class_count("base")
+    current_class_count = class_count("current")
+    authoritative = list(decisions.get("authoritative_change_facts") or ())
+    formal_by_api = list(formal.get("by_api") or ())
+
+    def histogram(values: Iterable[Any]) -> dict[str, int]:
+        return dict(sorted(Counter(str(value) for value in values).items()))
+
+    return {
+        # Retain the historical aggregate field for gate/result consumers, but
+        # also expose both observed sides so conservation cannot be inferred
+        # from the configured fixture size.
+        "class_count": base_class_count,
+        "base_class_count": base_class_count,
+        "current_class_count": current_class_count,
+        "validation_status": str(validation.get("status") or ""),
+        "validation_issue_count": int(validation.get("issue_count") or 0),
+        "authoritative_change_fact_count": len(authoritative),
+        "authoritative_member_change_kind_counts": histogram(
+            (item.get("fact_scope") or {}).get("member_change_kind")
+            for item in authoritative
+        ),
+        "formal_api_result_count": len(formal_by_api),
+        "formal_reachability_status_counts": histogram(
+            item.get("reachability_status") for item in formal_by_api
+        ),
+        "formal_impact_conclusion_counts": histogram(
+            item.get("impact_conclusion") for item in formal_by_api
+        ),
+    }
+
+
 def _p95(values: list[float]) -> float:
     if not values:
         raise PerformanceGateError("p95 requires samples")
@@ -405,6 +652,22 @@ def run_benchmark(
             f"class conservation failed: {cold['counts']['classes']} != {expected_classes}"
         )
     legacy = _legacy_javap(artifacts, classes_per_jar) if include_legacy else None
+    full_pipeline_probe = _full_pipeline_probe(
+        artifacts,
+        root=root / "identical-full-pipeline",
+        asm_jar=asm_jar,
+        classes_per_jar=classes_per_jar,
+    )
+    changed_artifacts = build_changed_current_artifacts(
+        root, artifacts, classes_per_jar=classes_per_jar
+    )
+    changed_full_pipeline_probe = _full_pipeline_probe(
+        artifacts,
+        current_artifacts=changed_artifacts,
+        root=root / "changed-full-pipeline",
+        asm_jar=asm_jar,
+        classes_per_jar=classes_per_jar,
+    )
     dataset_identity = canonical_identity(
         "binary_performance_dataset_identity",
         {
@@ -445,6 +708,37 @@ def run_benchmark(
             "jar_count": jar_count,
             "class_count": expected_classes,
             "classes_per_jar": classes_per_jar,
+            "full_pipeline_probe": {
+                "jar_count": full_pipeline_probe["jar_count"],
+                "class_count": full_pipeline_probe["class_count"],
+                "comparison": full_pipeline_probe["comparison"],
+                "includes": [
+                    "artifact_fact_build_and_local_diff",
+                    "target_independent_runtime_reconciliation",
+                    "decision_and_projection_freeze",
+                    "binary_trace",
+                    "immutable_generation_write",
+                    "independent_validation",
+                    "validated_generation_activation",
+                ],
+            },
+            "changed_full_pipeline_probe": {
+                "jar_count": changed_full_pipeline_probe["jar_count"],
+                "class_count": changed_full_pipeline_probe["class_count"],
+                "comparison": changed_full_pipeline_probe["comparison"],
+                "changed_jar_count": 1,
+                "changed_class_count": classes_per_jar,
+                "current_artifact_identity": changed_artifacts[0]["sha256"],
+                "includes": [
+                    "artifact_fact_build_and_local_diff",
+                    "target_independent_runtime_reconciliation",
+                    "decision_and_projection_freeze",
+                    "binary_trace",
+                    "immutable_generation_write",
+                    "independent_validation",
+                    "validated_generation_activation",
+                ],
+            },
             "tool_versions": {
                 "python": platform.python_version(),
                 "java": _command_version(["java", "-version"]),
@@ -452,7 +746,13 @@ def run_benchmark(
                 "asm_jar_sha256": _sha256(asm_jar),
             },
             "warmup_runs": 1,
-            "sample_runs": {"cold": 1, "warm": warm_samples, "legacy": int(include_legacy)},
+            "sample_runs": {
+                "cold": 1,
+                "warm": warm_samples,
+                "legacy": int(include_legacy),
+                "full_pipeline": 1,
+                "changed_full_pipeline": 1,
+            },
             "p95_method": "nearest-rank",
             "cold_cleanup_rule": "delete binary snapshot cache and SQLite before run",
             "warm_cache_rule": "all content+parser cache entries must pass digest validation; parser_invocations=0",
@@ -462,9 +762,17 @@ def run_benchmark(
             "warm_runs": warm_runs,
             "warm_end_to_end_p95_seconds": warm_p95,
             "legacy": legacy,
+            "full_pipeline_probe": full_pipeline_probe,
+            "changed_full_pipeline_probe": changed_full_pipeline_probe,
             "cold_relative_legacy_ratio": relative,
             "peak_rss_bytes": max(
-                [cold["peak_rss_bytes"], *[item["peak_rss_bytes"] for item in warm_runs], legacy["peak_rss_bytes"] if legacy else 0]
+                [
+                    cold["peak_rss_bytes"],
+                    *[item["peak_rss_bytes"] for item in warm_runs],
+                    legacy["peak_rss_bytes"] if legacy else 0,
+                    full_pipeline_probe["peak_rss_bytes"],
+                    changed_full_pipeline_probe["peak_rss_bytes"],
+                ]
             ),
             "disk_bytes": cold["db_bytes"] + cold["cache_bytes"],
         },
@@ -482,6 +790,40 @@ def evaluate_gate(result: dict[str, Any], gate: dict[str, Any]) -> dict[str, Any
                 "field": field,
                 "expected": required_protocol.get(field),
                 "actual": protocol.get(field),
+            })
+    required_probe = required_protocol.get("full_pipeline_probe") or {}
+    actual_probe_protocol = protocol.get("full_pipeline_probe") or {}
+    for field in ("jar_count", "class_count", "comparison", "includes"):
+        if (
+            field in required_probe
+            and actual_probe_protocol.get(field) != required_probe[field]
+        ):
+            issues.append({
+                "reason_code": "BINARY_PERFORMANCE_PROTOCOL_MISMATCH",
+                "field": f"full_pipeline_probe.{field}",
+                "expected": required_probe[field],
+                "actual": actual_probe_protocol.get(field),
+            })
+    required_changed_probe = (
+        required_protocol.get("changed_full_pipeline_probe") or {}
+    )
+    actual_changed_probe_protocol = (
+        protocol.get("changed_full_pipeline_probe") or {}
+    )
+    for field in (
+        "jar_count", "class_count", "comparison", "changed_jar_count",
+        "changed_class_count", "current_artifact_identity", "includes",
+    ):
+        if (
+            field in required_changed_probe
+            and actual_changed_probe_protocol.get(field)
+            != required_changed_probe[field]
+        ):
+            issues.append({
+                "reason_code": "BINARY_PERFORMANCE_PROTOCOL_MISMATCH",
+                "field": f"changed_full_pipeline_probe.{field}",
+                "expected": required_changed_probe[field],
+                "actual": actual_changed_probe_protocol.get(field),
             })
     measurements = result.get("measurements") or {}
     thresholds = gate.get("thresholds") or {}
@@ -516,6 +858,50 @@ def evaluate_gate(result: dict[str, Any], gate: dict[str, Any]) -> dict[str, Any
         if legacy_seconds else None
     )
     upper("warm_relative_legacy_ratio", warm_ratio, thresholds.get("warm_relative_legacy_ratio"))
+    full_pipeline = measurements.get("full_pipeline_probe") or {}
+    if "full_pipeline_end_to_end_seconds" in thresholds:
+        upper(
+            "full_pipeline_end_to_end_seconds",
+            full_pipeline.get("end_to_end_seconds"),
+            thresholds.get("full_pipeline_end_to_end_seconds"),
+        )
+    if "full_pipeline_peak_rss_bytes" in thresholds:
+        upper(
+            "full_pipeline_peak_rss_bytes",
+            full_pipeline.get("peak_rss_bytes"),
+            thresholds.get("full_pipeline_peak_rss_bytes"),
+        )
+    for phase, limit in (
+        thresholds.get("full_pipeline_phase_seconds") or {}
+    ).items():
+        upper(
+            f"full_pipeline.{phase}",
+            (full_pipeline.get("phase_seconds") or {}).get(phase),
+            limit,
+        )
+    changed_full_pipeline = (
+        measurements.get("changed_full_pipeline_probe") or {}
+    )
+    if "changed_full_pipeline_end_to_end_seconds" in thresholds:
+        upper(
+            "changed_full_pipeline_end_to_end_seconds",
+            changed_full_pipeline.get("end_to_end_seconds"),
+            thresholds.get("changed_full_pipeline_end_to_end_seconds"),
+        )
+    if "changed_full_pipeline_peak_rss_bytes" in thresholds:
+        upper(
+            "changed_full_pipeline_peak_rss_bytes",
+            changed_full_pipeline.get("peak_rss_bytes"),
+            thresholds.get("changed_full_pipeline_peak_rss_bytes"),
+        )
+    for phase, limit in (
+        thresholds.get("changed_full_pipeline_phase_seconds") or {}
+    ).items():
+        upper(
+            f"changed_full_pipeline.{phase}",
+            (changed_full_pipeline.get("phase_seconds") or {}).get(phase),
+            limit,
+        )
     stage_limits = thresholds.get("stage_p95_seconds") or {}
     upper("cold.inventory", (cold.get("stage_seconds") or {}).get("inventory"), stage_limits.get("inventory"))
     upper("cold.parse_and_cache", (cold.get("stage_seconds") or {}).get("parse_and_cache"), stage_limits.get("parse_and_cache"))
@@ -560,6 +946,167 @@ def evaluate_gate(result: dict[str, Any], gate: dict[str, Any]) -> dict[str, Any
         issues.append({
             "reason_code": "BINARY_PERFORMANCE_WARM_PARSE_NOT_ZERO",
         })
+    expected_probe_classes = invariants.get("full_pipeline_expected_class_count")
+    if expected_probe_classes is not None:
+        observed_sides = {
+            "base": full_pipeline.get(
+                "base_class_count", full_pipeline.get("class_count")
+            ),
+            "current": full_pipeline.get(
+                "current_class_count", full_pipeline.get("class_count")
+            ),
+        }
+        for side, actual_count in observed_sides.items():
+            if actual_count != expected_probe_classes:
+                issues.append({
+                    "reason_code": (
+                        "BINARY_PERFORMANCE_FULL_PIPELINE_CLASS_CONSERVATION_FAILED"
+                    ),
+                    "side": side,
+                    "expected": expected_probe_classes,
+                    "actual": actual_count,
+                })
+    expected_validation_issues = invariants.get(
+        "full_pipeline_validation_issue_count"
+    )
+    if (
+        expected_validation_issues is not None
+        and full_pipeline.get("validation_issue_count")
+        != expected_validation_issues
+    ):
+        issues.append({
+            "reason_code": "BINARY_PERFORMANCE_FULL_PIPELINE_VALIDATION_FAILED",
+            "expected": expected_validation_issues,
+            "actual": full_pipeline.get("validation_issue_count"),
+        })
+    for result_key, invariant_key in (
+        (
+            "authoritative_change_fact_count",
+            "full_pipeline_expected_authoritative_change_fact_count",
+        ),
+        ("formal_api_result_count", "full_pipeline_expected_formal_api_result_count"),
+    ):
+        expected_count = invariants.get(invariant_key)
+        if (
+            expected_count is not None
+            and full_pipeline.get(result_key) != expected_count
+        ):
+            issues.append({
+                "reason_code": "BINARY_PERFORMANCE_FULL_PIPELINE_RESULT_MISMATCH",
+                "metric": result_key,
+                "expected": expected_count,
+                "actual": full_pipeline.get(result_key),
+            })
+    for result_key, invariant_key in (
+        (
+            "authoritative_member_change_kind_counts",
+            "full_pipeline_expected_authoritative_member_change_kind_counts",
+        ),
+        (
+            "formal_reachability_status_counts",
+            "full_pipeline_expected_formal_reachability_status_counts",
+        ),
+        (
+            "formal_impact_conclusion_counts",
+            "full_pipeline_expected_formal_impact_conclusion_counts",
+        ),
+    ):
+        expected_distribution = invariants.get(invariant_key)
+        if (
+            expected_distribution is not None
+            and full_pipeline.get(result_key) != expected_distribution
+        ):
+            issues.append({
+                "reason_code": "BINARY_PERFORMANCE_FULL_PIPELINE_RESULT_MISMATCH",
+                "metric": result_key,
+                "expected": expected_distribution,
+                "actual": full_pipeline.get(result_key),
+            })
+    expected_changed_classes = invariants.get(
+        "changed_full_pipeline_expected_class_count"
+    )
+    if expected_changed_classes is not None:
+        observed_sides = {
+            "base": changed_full_pipeline.get(
+                "base_class_count", changed_full_pipeline.get("class_count")
+            ),
+            "current": changed_full_pipeline.get(
+                "current_class_count", changed_full_pipeline.get("class_count")
+            ),
+        }
+        for side, actual_count in observed_sides.items():
+            if actual_count != expected_changed_classes:
+                issues.append({
+                    "reason_code": (
+                        "BINARY_PERFORMANCE_FULL_PIPELINE_CLASS_CONSERVATION_FAILED"
+                    ),
+                    "probe": "changed_full_pipeline_probe",
+                    "side": side,
+                    "expected": expected_changed_classes,
+                    "actual": actual_count,
+                })
+    expected_changed_validation_issues = invariants.get(
+        "changed_full_pipeline_validation_issue_count"
+    )
+    if (
+        expected_changed_validation_issues is not None
+        and changed_full_pipeline.get("validation_issue_count")
+        != expected_changed_validation_issues
+    ):
+        issues.append({
+            "reason_code": "BINARY_PERFORMANCE_FULL_PIPELINE_VALIDATION_FAILED",
+            "probe": "changed_full_pipeline_probe",
+            "expected": expected_changed_validation_issues,
+            "actual": changed_full_pipeline.get("validation_issue_count"),
+        })
+    for result_key, invariant_key in (
+        (
+            "authoritative_change_fact_count",
+            "changed_full_pipeline_expected_authoritative_change_fact_count",
+        ),
+        (
+            "formal_api_result_count",
+            "changed_full_pipeline_expected_formal_api_result_count",
+        ),
+    ):
+        expected_count = invariants.get(invariant_key)
+        if (
+            expected_count is not None
+            and changed_full_pipeline.get(result_key) != expected_count
+        ):
+            issues.append({
+                "reason_code": "BINARY_PERFORMANCE_FULL_PIPELINE_RESULT_MISMATCH",
+                "probe": "changed_full_pipeline_probe",
+                "metric": result_key,
+                "expected": expected_count,
+                "actual": changed_full_pipeline.get(result_key),
+            })
+    for result_key, invariant_key in (
+        (
+            "authoritative_member_change_kind_counts",
+            "changed_full_pipeline_expected_authoritative_member_change_kind_counts",
+        ),
+        (
+            "formal_reachability_status_counts",
+            "changed_full_pipeline_expected_formal_reachability_status_counts",
+        ),
+        (
+            "formal_impact_conclusion_counts",
+            "changed_full_pipeline_expected_formal_impact_conclusion_counts",
+        ),
+    ):
+        expected_distribution = invariants.get(invariant_key)
+        if (
+            expected_distribution is not None
+            and changed_full_pipeline.get(result_key) != expected_distribution
+        ):
+            issues.append({
+                "reason_code": "BINARY_PERFORMANCE_FULL_PIPELINE_RESULT_MISMATCH",
+                "probe": "changed_full_pipeline_probe",
+                "metric": result_key,
+                "expected": expected_distribution,
+                "actual": changed_full_pipeline.get(result_key),
+            })
     return {
         "schema": "java-upgrade-analyzer.binary-performance-gate-evaluation.v1",
         "status": "passed" if not issues else "failed",
@@ -612,6 +1159,12 @@ def main(argv=None) -> int:
             "cold_seconds": result["measurements"]["cold"]["end_to_end_seconds"],
             "warm_p95_seconds": result["measurements"]["warm_end_to_end_p95_seconds"],
             "legacy_seconds": (result["measurements"]["legacy"] or {}).get("end_to_end_seconds"),
+            "full_pipeline_seconds": (
+                result["measurements"]["full_pipeline_probe"]
+            ).get("end_to_end_seconds"),
+            "changed_full_pipeline_seconds": (
+                result["measurements"]["changed_full_pipeline_probe"]
+            ).get("end_to_end_seconds"),
             "gate_status": (evaluation or {}).get("status"),
         }, sort_keys=True))
         return 0 if not evaluation or evaluation["status"] == "passed" else 1

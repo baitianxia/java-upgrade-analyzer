@@ -640,13 +640,71 @@ def discover_binary_entrypoints(
 ) -> BinaryEntrypointDiscoveryResult:
     """Discover exact and possible callback roots in the selected runtime view."""
 
+    profile = runtime_profile.payload.get("business_entrypoint_profile") or {}
+    summary_reader = getattr(store, "runtime_trigger_summary", None)
+    if callable(summary_reader) and isinstance(profile, Mapping):
+        summary = summary_reader()
+        relevant_resources = any(
+            str(selection.get("resource_name") or "").lower().endswith(".xml")
+            or str(selection.get("resource_name") or "")
+            in AUTO_CONFIGURATION_RESOURCES | {"META-INF/spring.factories"}
+            for selection in getattr(reconciliation, "resource_selections", ())
+        )
+        launcher_kind = str(
+            runtime_profile.payload.get("container_and_launcher_kind") or ""
+        ).lower()
+        manifest_can_activate_main = launcher_kind in {
+            "java-jar", "executable-jar", "spring-boot", "spring_boot",
+            "spring-boot-launcher", "spring-boot-executable-jar",
+        }
+        adapter_registration = store.connection.execute(
+            """
+            SELECT 1 FROM direct_edges
+            WHERE symbolic_owner=
+                'org/springframework/amqp/rabbit/listener/adapter/MessageListenerAdapter'
+            LIMIT 1
+            """
+        ).fetchone() is not None
+        if not (
+            summary["has_runtime_annotations"]
+            or summary["has_main_method"]
+            or set(summary["hierarchy_types"]).intersection(
+                INTERFACE_CALLBACKS
+            )
+            or profile.get("methods")
+            or relevant_resources
+            or manifest_can_activate_main
+            or adapter_registration
+        ) and profile.get("coverage_status") in {None, "complete"}:
+            payload = {
+                "runtime_profile_identity": runtime_profile.identity,
+                "runtime_reconciliation_identity": str(
+                    getattr(reconciliation, "identity", "") or ""
+                ),
+                "discovery_policy_version": DISCOVERY_POLICY_VERSION,
+                "exact_member_identities": [],
+                "possible_member_identities": [],
+                "record_identities": [],
+                "coverage_gaps": [],
+            }
+            return BinaryEntrypointDiscoveryResult(
+                exact_member_identities=(),
+                possible_member_identities=(),
+                records=(),
+                coverage_status="complete",
+                coverage_gaps=(),
+                identity=_identity(
+                    "binary_entrypoint_discovery_identity", payload
+                ),
+            )
+
     artifacts = {
         row["artifact_instance_identity"]: row
         for row in store.rows("artifact_instances")
     }
     class_rows = {
         row["class_variant_identity"]: row
-        for row in store.rows("classes")
+        for row in store.rows("classes", include_class_bytes=False)
     }
     members_by_variant: dict[str, list[dict[str, Any]]] = {}
     for row in store.rows("members"):
@@ -669,22 +727,30 @@ def discover_binary_entrypoints(
         if class_load_is_ready(item)
     }
     selected_classes: dict[tuple[str, str], tuple[dict[str, Any], dict[str, Any]]] = {}
+    selected_facts: dict[str, dict[str, Any]] = {}
     for (realm, class_name), provider in providers.items():
         if (realm, class_name) not in class_load_ready:
             continue
-        class_row = class_rows.get(provider.get("selected_class_variant_identity"))
+        variant = str(provider.get("selected_class_variant_identity") or "")
+        class_row = class_rows.get(variant)
         if class_row is None:
             continue
+        fact = selected_facts.get(variant)
+        if fact is None:
+            fact = _loads(class_row.get("fact_json") or "{}")
+            selected_facts[variant] = fact
         selected_classes[(realm, class_name)] = (
             class_row,
-            _loads(class_row.get("fact_json") or "{}"),
+            fact,
         )
+    for class_row, _fact in selected_classes.values():
+        class_row.pop("fact_json", None)
+    class_rows.clear()
     selected_class_variants = {
         str(row.get("class_variant_identity") or "")
         for row, _fact in selected_classes.values()
     }
 
-    profile = runtime_profile.payload.get("business_entrypoint_profile") or {}
     coverage_gaps = set()
     if not isinstance(profile, Mapping):
         profile = {}

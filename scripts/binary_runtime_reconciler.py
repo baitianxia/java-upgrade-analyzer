@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 import json
 from typing import Any, Iterable, Mapping
+import zlib
 
 from binary_definition_verifier import (
     ClassDefinitionVerifierError,
@@ -13,7 +15,12 @@ from binary_definition_verifier import (
     verify_class_definitions,
 )
 from binary_fact_store import BinaryFactStore
-from binary_first_contract import BinaryFirstContractError, canonical_identity
+from binary_first_contract import (
+    BinaryFirstContractError,
+    StreamingCanonicalSequence,
+    canonical_identity,
+    canonical_identity_streaming,
+)
 from binary_first_model import (
     ClassDefinitionResolution,
     DispatchResolution,
@@ -35,6 +42,27 @@ ACC_ABSTRACT = 0x0400
 
 class RuntimeReconciliationError(BinaryFirstContractError):
     pass
+
+
+class _StoreClassBytes(Mapping[str, bytes]):
+    """Lazy mapping used by the verifier to cap Python classfile residency."""
+
+    def __init__(
+        self,
+        store: BinaryFactStore,
+        variants_by_name: Mapping[str, str],
+    ):
+        self.store = store
+        self.variants_by_name = dict(variants_by_name)
+
+    def __getitem__(self, name: str) -> bytes:
+        return self.store.class_bytes(self.variants_by_name[name])
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.variants_by_name)
+
+    def __len__(self) -> int:
+        return len(self.variants_by_name)
 
 
 def _identity(namespace: str, payload: Any) -> str:
@@ -135,6 +163,146 @@ class RuntimeReconciliationResult:
     identity: str
 
 
+_RECONCILIATION_RECORD_FIELDS = {
+    "provider_binding": (
+        "class_provider_status", "provider_binding_identity",
+    ),
+    "class_definition": (
+        "class_definition_status", "class_definition_resolution_identity",
+    ),
+    "member_resolution": (
+        "member_resolution_status", "member_resolution_identity",
+    ),
+    "dispatch_resolution": (
+        "dispatch_status", "dispatch_resolution_identity",
+    ),
+    "type_resolution": (
+        "type_resolution_status", "type_resolution_identity",
+    ),
+    "class_initialization_resolution": (
+        "class_initialization_status",
+        "class_initialization_resolution_identity",
+    ),
+    "linkage_resolution": (
+        "linkage_status", "linkage_resolution_identity",
+    ),
+    "resource_selection": (
+        "resource_selection_status", "resource_selection_identity",
+    ),
+}
+
+
+class _CompactIdentitySequence:
+    """Store SHA-256 identities at 32 bytes each until canonical hashing."""
+
+    DIGEST_BYTES = 32
+
+    def __init__(self):
+        self._digests = bytearray()
+
+    def append(self, identity: str) -> None:
+        value = str(identity or "")
+        try:
+            digest = bytes.fromhex(value)
+        except ValueError as error:
+            raise RuntimeReconciliationError(
+                "RUNTIME_RECONCILIATION_SUBJECT_IDENTITY_INVALID", value
+            ) from error
+        if len(digest) != self.DIGEST_BYTES or digest.hex() != value:
+            raise RuntimeReconciliationError(
+                "RUNTIME_RECONCILIATION_SUBJECT_IDENTITY_INVALID", value
+            )
+        self._digests.extend(digest)
+
+    def _iter_identities(self) -> Iterator[str]:
+        for offset in range(0, len(self._digests), self.DIGEST_BYTES):
+            yield self._digests[offset:offset + self.DIGEST_BYTES].hex()
+
+    def canonical_sequence(self) -> StreamingCanonicalSequence:
+        return StreamingCanonicalSequence(self._iter_identities)
+
+
+class _ReconciliationAccumulator:
+    """Persist reconciliation evidence in bounded chunks.
+
+    Some consumers need only a subset of the records in Python.  The complete
+    evidence remains in SQLite for the independent Oracle, while unneeded
+    record dictionaries are released after each chunk instead of remaining
+    resident until the whole runtime has been reconciled.
+    """
+
+    CHUNK_SIZE = 2_000
+
+    def __init__(
+        self,
+        store: BinaryFactStore,
+        analysis_context_identity: str,
+        retained_kinds: Iterable[str],
+    ):
+        self.store = store
+        self.analysis_context_identity = analysis_context_identity
+        self.retained_kinds = frozenset(retained_kinds)
+        unknown = self.retained_kinds - set(_RECONCILIATION_RECORD_FIELDS)
+        if unknown:
+            raise RuntimeReconciliationError(
+                "RUNTIME_RECONCILIATION_RETAINED_KIND_INVALID",
+                f"unknown retained reconciliation kinds: {sorted(unknown)}",
+            )
+        self.records = {
+            kind: [] for kind in _RECONCILIATION_RECORD_FIELDS
+        }
+        # Retained records already own their identity strings, so a list stores
+        # only references. For unretained evidence, keeping millions of Python
+        # strings solely for the final result identity is wasteful; compact the
+        # fixed SHA-256 values to 32 bytes and expose them lazily to the exact
+        # canonical streaming encoder.
+        self.subject_identities = {
+            kind: [] if kind in self.retained_kinds else _CompactIdentitySequence()
+            for kind in _RECONCILIATION_RECORD_FIELDS
+        }
+        self.pending = {
+            kind: [] for kind in _RECONCILIATION_RECORD_FIELDS
+        }
+
+    def add(self, kind: str, record: dict[str, Any]) -> None:
+        status_key, identity_key = _RECONCILIATION_RECORD_FIELDS[kind]
+        self.subject_identities[kind].append(record[identity_key])
+        if kind in self.retained_kinds:
+            self.records[kind].append(record)
+        pending = self.pending[kind]
+        pending.append({
+            "analysis_context_identity": self.analysis_context_identity,
+            "record_kind": kind,
+            "status": record[status_key],
+            "subject_identity": record[identity_key],
+            "payload": record,
+        })
+        if len(pending) >= self.CHUNK_SIZE:
+            self._flush_kind(kind)
+
+    def _flush_kind(self, kind: str) -> None:
+        pending = self.pending[kind]
+        if not pending:
+            return
+        self.store.add_reconciliation_records(
+            pending,
+            collect_identities=False,
+        )
+        pending.clear()
+
+    def flush(self) -> None:
+        for kind in _RECONCILIATION_RECORD_FIELDS:
+            self._flush_kind(kind)
+
+    def canonical_subject_identities(
+        self, kind: str
+    ) -> list[str] | StreamingCanonicalSequence:
+        identities = self.subject_identities[kind]
+        if isinstance(identities, _CompactIdentitySequence):
+            return identities.canonical_sequence()
+        return identities
+
+
 class RuntimeReconciler:
     def __init__(
         self,
@@ -181,13 +349,35 @@ class RuntimeReconciler:
                 parameters=(runtime_profile.identity,),
             )
         }
-        self.classes = store.rows("classes")
-        self.members = store.rows("members")
-        self.edges = store.rows("direct_edges")
+        self.classes = store.rows(
+            "classes",
+            include_class_bytes=False,
+            include_class_facts=False,
+        )
         self.class_by_variant = {row["class_variant_identity"]: row for row in self.classes}
+        self.class_fact_headers: dict[str, dict[str, Any]] = {}
+        for row in store.connection.execute(
+            "SELECT class_variant_identity,fact_zlib FROM classes"
+        ):
+            fact = json.loads(zlib.decompress(row["fact_zlib"]).decode("utf-8"))
+            self.class_fact_headers[row["class_variant_identity"]] = {
+                "class_name": fact.get("class_name"),
+                "class_access": fact.get("class_access"),
+                "super_name": fact.get("super_name"),
+                "interfaces": tuple(fact.get("interfaces") or ()),
+            }
         self.members_by_variant: dict[str, list[dict[str, Any]]] = {}
-        for row in self.members:
+        self.member_by_identity: dict[str, dict[str, Any]] = {}
+        for raw in store.connection.execute(
+            """
+            SELECT member_identity,class_variant_identity,class_name,
+                   member_kind,member_name,descriptor,access_flags
+            FROM members
+            """
+        ):
+            row = dict(raw)
             self.members_by_variant.setdefault(row["class_variant_identity"], []).append(row)
+            self.member_by_identity[row["member_identity"]] = row
         self.realms, self.entrypoint_realms, topology_gaps = self._loader_topology(payload)
         self.coverage_gaps = set(topology_gaps)
         profile_coverage = dict(payload.get("field_coverage") or {})
@@ -203,9 +393,12 @@ class RuntimeReconciler:
         self.virtual_dispatch_cache: dict[
             tuple[str, str, str], tuple[str, ...]
         ] = {}
+        self.artifact_manifest_cache: dict[str, dict[str, list[str]]] = {}
+        self.artifact_security_unsupported_cache: dict[str, bool] = {}
         self.concrete_subtype_cache: dict[
             str, tuple[tuple[str, str], ...]
         ] = {}
+        self.concrete_subtype_index_built = False
         for artifact_id, artifact in self.artifacts.items():
             if artifact["coverage_status"] != "complete":
                 self.coverage_gaps.add(f"artifact_fact_coverage_incomplete:{artifact_id}")
@@ -214,6 +407,28 @@ class RuntimeReconciler:
             row for row in self.store.rows("resources")
             if row["artifact_instance_identity"] in self.artifacts
         ]
+        self.resource_categories_by_name: dict[str, set[str]] = {}
+        self.resource_candidates_by_realm_name: dict[
+            tuple[str, str], list[dict[str, Any]]
+        ] = {}
+        for row in self.resource_rows:
+            name = row["resource_name"]
+            artifact = self.artifacts[row["artifact_instance_identity"]]
+            realm = artifact["loader_realm_identity"]
+            self.resource_categories_by_name.setdefault(name, set()).add(
+                row["resource_category"]
+            )
+            self.resource_candidates_by_realm_name.setdefault(
+                (realm, name), []
+            ).append(row)
+        for rows in self.resource_candidates_by_realm_name.values():
+            rows.sort(key=lambda row: (
+                self.artifacts[row["artifact_instance_identity"]][
+                    "runtime_classpath_index"
+                ],
+                row["artifact_instance_identity"],
+                row["physical_entry_identity"],
+            ))
 
     def _loader_topology(self, payload: Mapping[str, Any]):
         topology = payload.get("loader_topology") or {}
@@ -267,6 +482,9 @@ class RuntimeReconciler:
         return realms, tuple(entrypoints), gaps
 
     def _artifact_manifest(self, artifact_identity: str) -> dict[str, list[str]]:
+        cached = self.artifact_manifest_cache.get(artifact_identity)
+        if cached is not None:
+            return cached
         rows = self.store.rows(
             "archive_entries",
             where="artifact_instance_identity=? AND upper(name)='META-INF/MANIFEST.MF'",
@@ -276,6 +494,7 @@ class RuntimeReconciler:
         for row in rows:
             for key, value in _loads(row["resource_semantic_json"]):
                 result.setdefault(str(key).lower(), []).append(str(value))
+        self.artifact_manifest_cache[artifact_identity] = result
         return result
 
     def _effective_class_candidates(self) -> dict[str, dict[str, list[dict[str, Any]]]]:
@@ -327,17 +546,7 @@ class RuntimeReconciler:
         return "classloader_first"
 
     def _own_resource_candidates(self, realm: str, name: str) -> list[dict[str, Any]]:
-        rows = [
-            row for row in self.resource_rows
-            if self.artifacts[row["artifact_instance_identity"]]["loader_realm_identity"] == realm
-            and row["resource_name"] == name
-        ]
-        rows.sort(key=lambda row: (
-            self.artifacts[row["artifact_instance_identity"]]["runtime_classpath_index"],
-            row["artifact_instance_identity"],
-            row["physical_entry_identity"],
-        ))
-        return rows
+        return list(self.resource_candidates_by_realm_name.get((realm, name), ()))
 
     def _selected_resources(
         self,
@@ -374,14 +583,11 @@ class RuntimeReconciler:
         return ordered, gaps
 
     def _resource_selections(self) -> tuple[dict[str, Any], ...]:
-        names = sorted({row["resource_name"] for row in self.resource_rows})
+        names = sorted(self.resource_categories_by_name)
         records = []
         for realm in self.entrypoint_realms:
             for name in names:
-                categories = {
-                    row["resource_category"] for row in self.resource_rows
-                    if row["resource_name"] == name
-                }
+                categories = self.resource_categories_by_name[name]
                 category = next(iter(categories)) if len(categories) == 1 else "unknown"
                 mechanism = self._resource_mechanism(name, category)
                 selected, gaps = self._selected_resources(realm, name, mechanism)
@@ -566,8 +772,18 @@ class RuntimeReconciler:
         }
         initial_classes.update(
             owner
-            for row in self.edges
-            if row["caller_artifact_instance_identity"] in self.artifacts
+            for row in self.store.connection.execute(
+                """
+                SELECT DISTINCT edge.symbolic_owner
+                FROM direct_edges AS edge
+                JOIN artifact_instances AS artifact
+                  ON artifact.artifact_instance_identity =
+                     edge.caller_artifact_instance_identity
+                WHERE artifact.runtime_profile_identity=?
+                  AND edge.symbolic_owner<>''
+                """,
+                (self.profile.identity,),
+            )
             for owner in (_type_provider_owner(row["symbolic_owner"]),)
             if owner
         )
@@ -599,9 +815,9 @@ class RuntimeReconciler:
 
     def _class_fact(self, provider: Mapping[str, Any]) -> dict[str, Any] | None:
         variant = provider.get("selected_class_variant_identity")
-        row = self.class_by_variant.get(variant)
-        if row:
-            return _loads(row["fact_json"])
+        fact = self.class_fact_headers.get(str(variant or ""))
+        if fact:
+            return fact
         for name in (provider.get("class_name"),):
             platform_fact = self.platform.get_class(str(name or ""))
             if platform_fact and platform_fact.class_variant_identity == variant:
@@ -621,7 +837,7 @@ class RuntimeReconciler:
         return "verification_failed"
 
     def _build_definitions(self, universe: Iterable[tuple[str, str]]) -> None:
-        selected_by_realm: dict[str, dict[str, bytes]] = {}
+        selected_by_realm: dict[str, dict[str, str]] = {}
         for realm, name in universe:
             provider = self._provider(realm, name)
             if provider["class_provider_status"] != "resolved":
@@ -631,7 +847,7 @@ class RuntimeReconciler:
             if row and row["parse_status"] == "parsed":
                 selected_by_realm.setdefault(
                     provider["selected_defining_loader_realm_identity"], {}
-                )[name] = bytes(row["class_bytes"])
+                )[name] = str(variant)
         verified: dict[tuple[str, str], dict[str, Any]] = {}
         for realm, selected in selected_by_realm.items():
             realm_config = self.realms.get(realm, {})
@@ -645,7 +861,10 @@ class RuntimeReconciler:
                 self.coverage_gaps.add(f"definition_topology_unsupported:{realm}")
                 continue
             try:
-                outcomes = verify_class_definitions(self.platform, selected)
+                outcomes = verify_class_definitions(
+                    self.platform,
+                    _StoreClassBytes(self.store, selected),
+                )
             except ClassDefinitionVerifierError as error:
                 self.coverage_gaps.add(f"definition_verifier_failed:{realm}:{error.reason_code}")
                 continue
@@ -733,16 +952,24 @@ class RuntimeReconciler:
             self.definition_records[(realm, name)] = record
 
     def _artifact_security_unsupported(self, artifact_identity: str) -> bool:
+        cached = self.artifact_security_unsupported_cache.get(artifact_identity)
+        if cached is not None:
+            return cached
         resources = self.store.rows(
             "resources",
             where="artifact_instance_identity=? AND resource_category='operational_security'",
             parameters=(artifact_identity,),
         )
         if resources and not self.capability.signed_artifacts_supported:
-            return True
-        manifest = self._artifact_manifest(artifact_identity)
-        sealed = any(value.lower() == "true" for value in manifest.get("sealed", ()))
-        return sealed and not self.capability.sealed_packages_supported
+            unsupported = True
+        else:
+            manifest = self._artifact_manifest(artifact_identity)
+            sealed = any(
+                value.lower() == "true" for value in manifest.get("sealed", ())
+            )
+            unsupported = sealed and not self.capability.sealed_packages_supported
+        self.artifact_security_unsupported_cache[artifact_identity] = unsupported
+        return unsupported
 
     @staticmethod
     def _class_load_ready(definition: Mapping[str, Any] | None) -> bool:
@@ -891,9 +1118,11 @@ class RuntimeReconciler:
         cached = self.virtual_dispatch_cache.get(key)
         if cached is not None:
             return cached
-        candidates = self.concrete_subtype_cache.get(owner)
-        if candidates is None:
-            concrete = []
+        if not self.concrete_subtype_index_built:
+            # Build the inverse hierarchy once. The former lazy implementation
+            # rescanned the complete runtime universe for every distinct virtual
+            # owner, turning large dependency closures into O(classes * owners).
+            concrete_by_ancestor: dict[str, list[tuple[str, str]]] = {}
             for candidate_realm, candidate_name in universe:
                 candidate_definition = self.definition_records.get(
                     (candidate_realm, candidate_name)
@@ -901,15 +1130,23 @@ class RuntimeReconciler:
                 if (
                     not candidate_definition
                     or not self._class_load_ready(candidate_definition)
-                    or not self._is_subtype(candidate_realm, candidate_name, owner)
                 ):
                     continue
                 candidate_provider = self._provider(candidate_realm, candidate_name)
                 info = self._class_info(candidate_provider)
-                if info and not info["access_flags"] & (ACC_INTERFACE | ACC_ABSTRACT):
-                    concrete.append((candidate_realm, candidate_name))
-            candidates = tuple(concrete)
-            self.concrete_subtype_cache[owner] = candidates
+                if not info or info["access_flags"] & (ACC_INTERFACE | ACC_ABSTRACT):
+                    continue
+                candidate = (candidate_realm, candidate_name)
+                for ancestor in self._ancestor_types(
+                    candidate_realm, candidate_name
+                ):
+                    concrete_by_ancestor.setdefault(ancestor, []).append(candidate)
+            self.concrete_subtype_cache = {
+                ancestor: tuple(sorted(candidates))
+                for ancestor, candidates in concrete_by_ancestor.items()
+            }
+            self.concrete_subtype_index_built = True
+        candidates = self.concrete_subtype_cache.get(owner, ())
         targets = set()
         for candidate_realm, candidate_name in candidates:
             target, _ = self._resolve_symbolic_member(
@@ -1120,38 +1357,50 @@ class RuntimeReconciler:
         )
         return payload
 
-    def _resolve_edges(self, universe: tuple[tuple[str, str], ...]):
-        member_records = []
-        dispatch_records = []
-        type_records = []
-        class_init_records = []
-        linkage_records = []
+    def _resolve_edges(
+        self,
+        universe: tuple[tuple[str, str], ...],
+        accumulator: _ReconciliationAccumulator,
+    ) -> None:
         artifact_realm = {
             identity: row["loader_realm_identity"] for identity, row in self.artifacts.items()
         }
-        member_by_identity = {row["member_identity"]: row for row in self.members}
+        member_by_identity = self.member_by_identity
         hierarchy_complete = (
             self.profile.complete
             and self.capability.closed_world_dispatch
             and self.profile.payload.get("runtime_class_closure_coverage_status") == "complete"
             and not self.coverage_gaps
         )
-        for edge in self.edges:
+        for raw_edge in self.store.connection.execute(
+            """
+            SELECT direct_edge_identity,caller_member_identity,
+                   caller_artifact_instance_identity,edge_kind,opcode,
+                   symbolic_owner,symbolic_name,symbolic_descriptor,edge_json
+            FROM direct_edges
+            ORDER BY direct_edge_identity
+            """
+        ):
+            edge = dict(raw_edge)
             caller_artifact = edge["caller_artifact_instance_identity"]
             if caller_artifact not in artifact_realm:
                 continue
             caller = member_by_identity.get(edge["caller_member_identity"])
             caller_realm = artifact_realm[caller_artifact]
             if edge["edge_kind"] == "type":
-                type_records.append(self._type_resolution(edge, caller_realm))
+                accumulator.add(
+                    "type_resolution",
+                    self._type_resolution(edge, caller_realm),
+                )
                 continue
             if edge["edge_kind"] == "class_init":
-                class_init_records.append(
+                accumulator.add(
+                    "class_initialization_resolution",
                     self._class_initialization_resolution(
                         edge,
                         caller_realm,
                         str((caller or {}).get("class_name") or ""),
-                    )
+                    ),
                 )
                 continue
             if edge["edge_kind"] == "ldc_constant_dynamic":
@@ -1166,7 +1415,7 @@ class RuntimeReconciler:
                 linkage["linkage_resolution_identity"] = _identity(
                     "linkage_resolution_identity", linkage
                 )
-                linkage_records.append(linkage)
+                accumulator.add("linkage_resolution", linkage)
                 continue
             owner = edge["symbolic_owner"]
             edge_payload = _loads(edge.get("edge_json") or "{}")
@@ -1249,7 +1498,7 @@ class RuntimeReconciler:
                 "member_resolution_status": status,
                 "member_resolution_identity": resolution.identity,
             }
-            member_records.append(member_record)
+            accumulator.add("member_resolution", member_record)
 
             executable_dispatch = edge["edge_kind"] == "method" and kind == "method"
             dispatch_fixed_by_final_declaration = False
@@ -1318,7 +1567,7 @@ class RuntimeReconciler:
                     ),
                 },
             )
-            dispatch_records.append({
+            accumulator.add("dispatch_resolution", {
                 "direct_edge_identity": edge["direct_edge_identity"],
                 "dispatch_status": dispatch_status,
                 "implementation_target_identities": list(targets),
@@ -1341,64 +1590,43 @@ class RuntimeReconciler:
             linkage["linkage_resolution_identity"] = _identity(
                 "linkage_resolution_identity", linkage
             )
-            linkage_records.append(linkage)
-        return (
-            member_records,
-            dispatch_records,
-            type_records,
-            class_init_records,
-            linkage_records,
-        )
+            accumulator.add("linkage_resolution", linkage)
 
-    def reconcile(self) -> RuntimeReconciliationResult:
+    def reconcile(
+        self,
+        *,
+        retain_record_kinds: Iterable[str] | None = None,
+    ) -> RuntimeReconciliationResult:
+        retained_kinds = (
+            set(_RECONCILIATION_RECORD_FIELDS)
+            if retain_record_kinds is None
+            else {str(kind) for kind in retain_record_kinds}
+        )
         universe = self._universe()
         self._build_definitions(universe)
-        (
-            member_records,
-            dispatch_records,
-            type_records,
-            class_init_records,
-            linkage_records,
-        ) = self._resolve_edges(universe)
-        resource_records = self._resource_selections()
         providers = []
         for key in universe:
             record = self._provider(*key)
             providers.append(record)
         definitions = [self.definition_records[key] for key in universe]
-        persistence_groups = (
-            (providers, "provider_binding", "class_provider_status",
-             "provider_binding_identity"),
-            (definitions, "class_definition", "class_definition_status",
-             "class_definition_resolution_identity"),
-            (member_records, "member_resolution", "member_resolution_status",
-             "member_resolution_identity"),
-            (dispatch_records, "dispatch_resolution", "dispatch_status",
-             "dispatch_resolution_identity"),
-            (type_records, "type_resolution", "type_resolution_status",
-             "type_resolution_identity"),
-            (class_init_records, "class_initialization_resolution",
-             "class_initialization_status",
-             "class_initialization_resolution_identity"),
-            (linkage_records, "linkage_resolution", "linkage_status",
-             "linkage_resolution_identity"),
-            (resource_records, "resource_selection", "resource_selection_status",
-             "resource_selection_identity"),
+        accumulator = _ReconciliationAccumulator(
+            self.store,
+            self.context_identity,
+            retained_kinds,
         )
-        self.store.add_reconciliation_records(
-            (
-                {
-                    "analysis_context_identity": self.context_identity,
-                    "record_kind": kind,
-                    "status": record[status_key],
-                    "subject_identity": record[identity_key],
-                    "payload": record,
-                }
-                for records, kind, status_key, identity_key in persistence_groups
-                for record in records
-            ),
-            collect_identities=False,
-        )
+        for record in providers:
+            accumulator.add("provider_binding", record)
+        for record in definitions:
+            accumulator.add("class_definition", record)
+        # The accumulator now owns retained provider/definition references.
+        # Drop the duplicate list containers before resolving the much larger
+        # edge fact sets.
+        providers = accumulator.records["provider_binding"]
+        definitions = accumulator.records["class_definition"]
+        self._resolve_edges(universe, accumulator)
+        for record in self._resource_selections():
+            accumulator.add("resource_selection", record)
+        accumulator.flush()
         gaps = tuple(sorted(self.coverage_gaps))
         coverage = "complete" if not gaps else "partial"
         universe_identity = _identity(
@@ -1414,19 +1642,32 @@ class RuntimeReconciler:
             "analysis_context_identity": self.context_identity,
             "runtime_profile_identity": self.profile.identity,
             "universe_identity": universe_identity,
-            "provider_binding_identities": [item["provider_binding_identity"] for item in providers],
-            "class_definition_identities": [item["class_definition_resolution_identity"] for item in definitions],
-            "member_resolution_identities": [item["member_resolution_identity"] for item in member_records],
-            "dispatch_resolution_identities": [item["dispatch_resolution_identity"] for item in dispatch_records],
-            "type_resolution_identities": [item["type_resolution_identity"] for item in type_records],
-            "class_initialization_resolution_identities": [
-                item["class_initialization_resolution_identity"]
-                for item in class_init_records
-            ],
-            "linkage_resolution_identities": [
-                item["linkage_resolution_identity"] for item in linkage_records
-            ],
-            "resource_selection_identities": [item["resource_selection_identity"] for item in resource_records],
+            "provider_binding_identities": accumulator.canonical_subject_identities(
+                "provider_binding"
+            ),
+            "class_definition_identities": accumulator.canonical_subject_identities(
+                "class_definition"
+            ),
+            "member_resolution_identities": accumulator.canonical_subject_identities(
+                "member_resolution"
+            ),
+            "dispatch_resolution_identities": accumulator.canonical_subject_identities(
+                "dispatch_resolution"
+            ),
+            "type_resolution_identities": accumulator.canonical_subject_identities(
+                "type_resolution"
+            ),
+            "class_initialization_resolution_identities": (
+                accumulator.canonical_subject_identities(
+                    "class_initialization_resolution"
+                )
+            ),
+            "linkage_resolution_identities": accumulator.canonical_subject_identities(
+                "linkage_resolution"
+            ),
+            "resource_selection_identities": accumulator.canonical_subject_identities(
+                "resource_selection"
+            ),
             "coverage_status": coverage,
             "coverage_gaps": list(gaps),
         }
@@ -1434,17 +1675,23 @@ class RuntimeReconciler:
             analysis_context_identity=self.context_identity,
             runtime_profile_identity=self.profile.identity,
             universe_identity=universe_identity,
-            provider_bindings=tuple(providers),
-            class_definitions=tuple(definitions),
-            member_resolutions=tuple(member_records),
-            dispatch_resolutions=tuple(dispatch_records),
-            type_resolutions=tuple(type_records),
-            class_initialization_resolutions=tuple(class_init_records),
-            linkage_resolutions=tuple(linkage_records),
-            resource_selections=resource_records,
+            provider_bindings=tuple(accumulator.records["provider_binding"]),
+            class_definitions=tuple(accumulator.records["class_definition"]),
+            member_resolutions=tuple(accumulator.records["member_resolution"]),
+            dispatch_resolutions=tuple(accumulator.records["dispatch_resolution"]),
+            type_resolutions=tuple(accumulator.records["type_resolution"]),
+            class_initialization_resolutions=tuple(
+                accumulator.records["class_initialization_resolution"]
+            ),
+            linkage_resolutions=tuple(accumulator.records["linkage_resolution"]),
+            resource_selections=tuple(accumulator.records["resource_selection"]),
             coverage_status=coverage,
             coverage_gaps=gaps,
-            identity=_identity("runtime_reconciliation_result_identity", result_payload),
+            identity=canonical_identity_streaming(
+                "runtime_reconciliation_result_identity",
+                result_payload,
+                schema_version="1",
+            ),
         )
 
 

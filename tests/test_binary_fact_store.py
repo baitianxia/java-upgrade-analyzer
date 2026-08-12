@@ -232,6 +232,12 @@ class BinaryFactStoreTest(unittest.TestCase):
                 "SELECT COUNT(*) FROM reconciliation_records"
             ).fetchone()[0]
             restored = store.rows("reconciliation_records")
+            member_payloads = list(
+                store.reconciliation_payloads("member_resolution")
+            )
+            dispatch_payloads = list(
+                store.reconciliation_payloads("dispatch_resolution")
+            )
 
         self.assertEqual(logical_count, 4_100)
         self.assertEqual(physical_chunks, 3)
@@ -240,6 +246,63 @@ class BinaryFactStoreTest(unittest.TestCase):
             {row["record_kind"] for row in restored},
             {"member_resolution", "dispatch_resolution"},
         )
+        self.assertEqual(
+            {row["index"] for row in member_payloads}, set(range(2_501))
+        )
+        self.assertEqual(
+            {row["index"] for row in dispatch_payloads}, set(range(2_501, 4_100))
+        )
+
+    def test_secondary_indexes_can_be_deferred_until_bulk_load_finishes(self):
+        artifact = self.make_jar("deferred-indexes.jar")
+        instance = self.instance(artifact, 0)
+        snapshot = self.snapshot(artifact, instance)
+        expected_indexes = {
+            "artifact_instances_coord",
+            "artifact_instances_runtime_slot",
+            "archive_entries_class",
+            "classes_runtime_lookup",
+            "members_symbolic_lookup",
+            "direct_edges_symbolic_target",
+            "reconciliation_records_kind",
+        }
+
+        with BinaryFactStore(defer_secondary_indexes=True) as store:
+            before = {
+                row[0] for row in store.connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index'"
+                )
+            }
+            store.add_artifact_snapshot(instance, snapshot)
+            store.ensure_secondary_indexes()
+            after = {
+                row[0] for row in store.connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index'"
+                )
+            }
+            class_count = store.connection.execute(
+                "SELECT COUNT(*) FROM classes"
+            ).fetchone()[0]
+
+        self.assertTrue(expected_indexes.isdisjoint(before))
+        self.assertTrue(expected_indexes.issubset(after))
+        self.assertEqual(class_count, 1)
+
+    def test_mid_archive_batch_flush_preserves_exact_fact_identity(self):
+        artifact = self.make_jar("batch-flush.jar")
+        instance = self.instance(artifact, 0)
+        snapshot = self.snapshot(artifact, instance)
+
+        with BinaryFactStore() as regular:
+            regular_counts = regular.add_artifact_snapshot(instance, snapshot)
+            regular_identity = regular.content_identity()
+        with BinaryFactStore() as batched:
+            batched.FACT_INSERT_CHUNK_SIZE = 1
+            batched_counts = batched.add_artifact_snapshot(instance, snapshot)
+            batched_identity = batched.content_identity()
+
+        self.assertEqual(batched_counts, regular_counts)
+        self.assertEqual(batched_identity, regular_identity)
 
     def test_class_bytes_and_full_facts_are_transparently_compressed(self):
         artifact = self.make_jar("compressed-class.jar")
@@ -255,12 +318,25 @@ class BinaryFactStoreTest(unittest.TestCase):
                 "SELECT length(class_bytes_zlib), length(fact_zlib) FROM classes"
             ).fetchone()
             row = store.rows("classes")[0]
+            metadata_only = store.rows(
+                "classes",
+                include_class_bytes=False,
+                include_class_facts=False,
+            )[0]
+            lazy_class_bytes = store.class_bytes(
+                metadata_only["class_variant_identity"]
+            )
 
         self.assertIn("class_bytes_zlib", columns)
         self.assertIn("fact_zlib", columns)
         self.assertNotIn("class_bytes", columns)
         self.assertNotIn("fact_json", columns)
         self.assertEqual(row["class_bytes"], self.class_bytes)
+        self.assertEqual(lazy_class_bytes, self.class_bytes)
+        self.assertNotIn("class_bytes", metadata_only)
+        self.assertNotIn("class_bytes_zlib", metadata_only)
+        self.assertNotIn("fact_json", metadata_only)
+        self.assertNotIn("fact_zlib", metadata_only)
         fact = json.loads(row["fact_json"])
         self.assertEqual(fact["class_name"], "demo/Caller")
         self.assertLess(stored_lengths[0], len(self.class_bytes))

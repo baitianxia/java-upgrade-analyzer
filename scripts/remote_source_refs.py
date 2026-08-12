@@ -133,6 +133,11 @@ def _absence_observation_failure(observations):
             "remote_ref_observation_malformed",
             "remote repeatedly returned malformed ref output; absence cannot be established",
         )
+    if any(item.get("status") == "remote_ref_observation_unexpected" for item in observations):
+        return (
+            "remote_ref_observation_unexpected",
+            "remote returned refs outside the exact requested identity; absence cannot be established",
+        )
     if len(observations) < 2:
         return (
             "remote_ref_observation_unconfirmed",
@@ -778,6 +783,7 @@ def _targeted_remote_ref_inventory(
             f"refs/tags/{short_name}",
             f"refs/tags/{short_name}^{{}}",
         ))
+    expected_refs = set(patterns)
     attempts = []
     stdout = stderr = ""
     rc = 1
@@ -808,20 +814,35 @@ def _targeted_remote_ref_inventory(
             timeout=attempt_timeout,
         )
         if rc == 0:
-            rows, malformed = _parse_remote_rows(stdout)
+            parsed_rows, malformed = _parse_remote_rows(stdout)
+            unexpected_refs = sorted({
+                ref for _commit, ref in parsed_rows if ref not in expected_refs
+            })
+            rows = [
+                (commit, ref)
+                for commit, ref in parsed_rows
+                if ref in expected_refs
+            ]
             if rows and not malformed:
-                attempts.append({
+                attempt_record = {
                     "attempt": attempt_number,
                     "stage": "targeted_ls_remote",
                     "status": "success",
                     "reason": "",
                     "retryable": False,
-                })
+                }
+                if unexpected_refs:
+                    attempt_record["ignored_unexpected_refs"] = unexpected_refs
+                attempts.append(attempt_record)
                 break
             observation_status = (
                 "remote_ref_observation_malformed"
                 if malformed
-                else "remote_ref_observation_empty"
+                else (
+                    "remote_ref_observation_unexpected"
+                    if unexpected_refs
+                    else "remote_ref_observation_empty"
+                )
             )
             absence_observations.append({
                 "status": observation_status,
@@ -831,7 +852,16 @@ def _targeted_remote_ref_inventory(
                 "attempt": attempt_number,
                 "stage": "targeted_ls_remote",
                 "status": observation_status,
-                "reason": "\n".join(malformed) if malformed else "remote returned no matching ref",
+                "reason": (
+                    "\n".join(malformed)
+                    if malformed
+                    else (
+                        "remote returned only unexpected refs: "
+                        + ", ".join(unexpected_refs)
+                        if unexpected_refs
+                        else "remote returned no matching ref"
+                    )
+                ),
                 "retryable": attempt_number < max_attempts,
             })
             observation_failure = _absence_observation_failure(
