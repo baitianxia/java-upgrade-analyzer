@@ -273,10 +273,14 @@ Source overlay 是可选解释层：
 Binary 性能策略：
 
 - 每个 archive/classfile 每 generation 采集一次；
+- Spring Boot 等容器中多个逻辑制品共享同一个外层 JAR 时，按稳定文件身份复用外层摘要，并在输入画像结束前再次完整校验；
 - 内容寻址缓存绑定 artifact SHA、RuntimeProfile、parser 和 policy；
+- 冷缓存解析复用 snapshot 自带的前后摘要校验；相邻 base/current 内容相同时只在内存保留一个解码模板，仍分别校验实际文件并重建 ArtifactInstance 身份；
+- 独立 Oracle 仍对每个 base/current 制品实例分别绑定并比对生产数据库；只有 artifact SHA、目标 `javap` 与 class inventory 都相同的不可变规范化真值才跨侧复用，并在两侧 structural 校验完成后立即释放扫描缓存；
+- target JVM 观测不会抽样或跳过；两侧完成观测和 declared-member 补全后，仅共享 JSON 类型及值都完全相同的只读字段，保持 canonical truth bytes 不变；
 - 批量建图、SCC 和多目标遍历；
 - 缓存完整性失败重建；
-- 记录端到端耗时、phase 耗时、峰值 RSS、archive/class/edge 数和缓存命中。
+- 记录端到端耗时、phase 耗时、主/子进程 CPU、平均核数、主进程与已完成子进程峰值 RSS、archive/class/edge 数、摘要读盘量和缓存层级命中。
 
 任何性能优化必须同时通过独立 Oracle 和性能门。
 

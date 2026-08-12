@@ -190,6 +190,7 @@ def _side_config(
     artifacts = [{
         "path": str(business_path),
         "outer_artifact_path": str(outer_path),
+        "outer_artifact_sha256": str(business.get("outer_artifact_sha256") or ""),
         "container_entry": "BOOT-INF/classes/"
         if business.get("container_and_launcher_kind")
         == "spring-boot-executable-jar"
@@ -229,6 +230,7 @@ def _side_config(
         artifacts.append({
             "path": str(path),
             "outer_artifact_path": str(outer_path),
+            "outer_artifact_sha256": str(item.get("outer_artifact_sha256") or ""),
             "container_entry": str(item.get("lib_entry") or ""),
             "logical_location": f"dependencies/{slot:05d}-{path.name}",
             "loader_realm": "application-loader",

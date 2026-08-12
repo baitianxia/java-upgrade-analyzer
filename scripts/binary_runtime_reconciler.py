@@ -349,11 +349,21 @@ class RuntimeReconciler:
                 parameters=(runtime_profile.identity,),
             )
         }
-        self.classes = store.rows(
-            "classes",
-            include_class_bytes=False,
-            include_class_facts=False,
-        )
+        # Runtime selection needs only these seven scalar fields.  The generic
+        # metadata reader also materializes physical labels and content/contract
+        # digests for every class, retaining several unused Python strings per
+        # row across the whole reconciliation phase.
+        self.classes = [
+            dict(row)
+            for row in store.connection.execute(
+                """
+                SELECT class_variant_identity,artifact_instance_identity,
+                       class_name,class_major,multi_release_version,
+                       parse_status,failure_kind
+                FROM classes
+                """
+            )
+        ]
         self.class_by_variant = {row["class_variant_identity"]: row for row in self.classes}
         self.class_fact_headers: dict[str, dict[str, Any]] = {}
         for row in store.connection.execute(
@@ -403,7 +413,7 @@ class RuntimeReconciler:
             if artifact["coverage_status"] != "complete":
                 self.coverage_gaps.add(f"artifact_fact_coverage_incomplete:{artifact_id}")
         self.effective_candidates = self._effective_class_candidates()
-        self.resource_rows = [
+        resource_rows = [
             row for row in self.store.rows("resources")
             if row["artifact_instance_identity"] in self.artifacts
         ]
@@ -411,7 +421,7 @@ class RuntimeReconciler:
         self.resource_candidates_by_realm_name: dict[
             tuple[str, str], list[dict[str, Any]]
         ] = {}
-        for row in self.resource_rows:
+        for row in resource_rows:
             name = row["resource_name"]
             artifact = self.artifacts[row["artifact_instance_identity"]]
             realm = artifact["loader_realm_identity"]

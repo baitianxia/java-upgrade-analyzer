@@ -563,6 +563,12 @@ def _full_pipeline_probe(
         "artifact_snapshot_hits": int(
             result["cache_metrics"]["artifact_snapshot_hits"]
         ),
+        "artifact_snapshot_disk_hits": int(
+            result["cache_metrics"].get("artifact_snapshot_disk_hits") or 0
+        ),
+        "artifact_snapshot_memory_hits": int(
+            result["cache_metrics"].get("artifact_snapshot_memory_hits") or 0
+        ),
         **evidence,
     }
 

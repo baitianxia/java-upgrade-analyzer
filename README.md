@@ -383,7 +383,7 @@ Step4 完成后再查看：
 .upgrade-report/.runtime/observability/step4_timing.csv
 ```
 
-重点关注 artifact inventory、ASM fact extraction、runtime reconciliation、decision/projection、batch trace、Oracle validation 和 publication 阶段。结合 archive/class/edge 数、缓存命中率与峰值 RSS，可以区分制品解析、运行时裁决、图遍历、独立验证或报告发布的瓶颈。
+重点关注 artifact inventory、ASM fact extraction、runtime reconciliation、decision/projection、batch trace、Oracle validation 和 publication 阶段。结合 archive/class/edge 数、制品摘要执行/复用/读取字节数、磁盘/内存 snapshot 命中、主/子进程 CPU、平均占用核数，以及主进程和已完成子进程峰值 RSS，可以区分重复读盘、制品解析、运行时裁决、图遍历、独立验证或报告发布的瓶颈。`peak_rss_bytes` 只表示分析器主进程；phase 中的 `completed_child_peak_rss_bytes` 是截至该阶段已完成子进程的高水位，两者不能相加当作严格的同时刻进程树峰值。
 
 Step5 慢时，让 Claude Code 查看：
 

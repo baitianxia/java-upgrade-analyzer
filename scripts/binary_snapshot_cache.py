@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import base64
+import binascii
 import hashlib
 import json
 import os
@@ -30,8 +31,41 @@ class BinarySnapshotCacheError(BinaryFirstContractError):
 class SnapshotCacheOutcome:
     snapshot: ArtifactSnapshot
     cache_status: str
+    cache_tier: str
     parser_invocation_count: int
     cache_key: str
+
+
+@dataclass(frozen=True)
+class _DecodedSnapshotTemplate:
+    payload: dict[str, Any]
+    class_payloads: tuple[tuple[str, bytes], ...]
+
+
+class SnapshotTemplateMemo:
+    """A one-entry, caller-owned memo for adjacent base/current rebinding.
+
+    It deliberately retains only the most recently used JAR.  The pipeline
+    processes one lineage at a time, so a larger cache would increase RSS
+    without increasing the normal unchanged-pair hit rate.
+    """
+
+    def __init__(self):
+        self._cache_key = ""
+        self._template: _DecodedSnapshotTemplate | None = None
+
+    def get(self, cache_key: str) -> _DecodedSnapshotTemplate | None:
+        return self._template if self._cache_key == cache_key else None
+
+    def remember(
+        self, cache_key: str, template: _DecodedSnapshotTemplate
+    ) -> None:
+        self._cache_key = str(cache_key)
+        self._template = template
+
+    def clear(self) -> None:
+        self._cache_key = ""
+        self._template = None
 
 
 def _identity(namespace: str, payload: Any) -> str:
@@ -118,7 +152,37 @@ def _write_template(path: Path, cache_key: str, payload: dict[str, Any]) -> None
             os.unlink(temporary_name)
 
 
-def _rebind(payload: dict[str, Any], artifact_instance_identity: str) -> ArtifactSnapshot:
+def _decoded_template(
+    payload: dict[str, Any],
+    *,
+    class_payloads: tuple[tuple[str, bytes], ...] | None = None,
+) -> _DecodedSnapshotTemplate:
+    try:
+        decoded = (
+            tuple(class_payloads)
+            if class_payloads is not None
+            else tuple(
+                (str(label), base64.b64decode(content, validate=True))
+                for label, content in payload["class_payloads"]
+            )
+        )
+    except (KeyError, TypeError, ValueError, binascii.Error) as error:
+        raise BinarySnapshotCacheError(
+            "BINARY_SNAPSHOT_CACHE_CLASS_PAYLOAD_INVALID", str(error)
+        ) from error
+    # The base64 representation exists only for the durable JSON cache.  Keep
+    # decoded immutable bytes in the one-entry memo, not both representations
+    # of the largest adjacent base/current JAR.
+    metadata = dict(payload)
+    metadata.pop("class_payloads", None)
+    return _DecodedSnapshotTemplate(payload=metadata, class_payloads=decoded)
+
+
+def _rebind(
+    template: _DecodedSnapshotTemplate,
+    artifact_instance_identity: str,
+) -> ArtifactSnapshot:
+    payload = template.payload
     entries = []
     for raw in payload["entries"]:
         item = dict(raw)
@@ -157,10 +221,9 @@ def _rebind(payload: dict[str, Any], artifact_instance_identity: str) -> Artifac
         archive_comment_sha256=payload["archive_comment_sha256"],
         entries=tuple(entries),
         class_records=tuple(records),
-        class_payloads=tuple(
-            (label, base64.b64decode(content, validate=True))
-            for label, content in payload["class_payloads"]
-        ),
+        # bytes are immutable and content-addressed, so adjacent base/current
+        # snapshots can safely share them while retaining distinct identities.
+        class_payloads=template.class_payloads,
         safety_reason_codes=tuple(payload["safety_reason_codes"]),
         parse_failure_count=int(payload["parse_failure_count"]),
         unknown_attribute_scopes=tuple(payload["unknown_attribute_scopes"]),
@@ -179,49 +242,77 @@ def cached_snapshot_archive(
     cache_root: str | Path,
     asm_jar: str | Path | None = None,
     target_jvm_major: int | None = None,
+    template_memo: SnapshotTemplateMemo | None = None,
 ) -> SnapshotCacheOutcome:
     archive = Path(path)
-    actual_sha = _sha256_file(archive)
-    if actual_sha != expected_sha256:
+    expected_sha = str(expected_sha256 or "").strip().lower()
+    if len(expected_sha) != 64 or any(
+        character not in "0123456789abcdef" for character in expected_sha
+    ):
         raise BinarySnapshotCacheError(
-            "BINARY_SNAPSHOT_CACHE_ARTIFACT_SHA_MISMATCH",
-            f"expected={expected_sha256}; actual={actual_sha}",
+            "BINARY_SNAPSHOT_CACHE_EXPECTED_SHA256_INVALID", expected_sha
         )
     asm_path = resolve_asm_jar(asm_jar)
     parser_id, _helper_sha = parser_identity(asm_jar=asm_path)
-    key = _cache_key(actual_sha, parser_id, target_jvm_major)
+    # The Step1-bound digest is sufficient to locate a prospective cache entry.
+    # A hit is still independently verified against the current artifact bytes.
+    # On a miss, snapshot_archive performs both its before and after hashes, so
+    # hashing here as well was a third full read with no additional evidence.
+    key = _cache_key(expected_sha, parser_id, target_jvm_major)
     cache_path = Path(cache_root) / "artifact_snapshots" / parser_id / f"{key}.json.zlib"
     cache_status = "miss"
+    cache_tier = "parsed"
     parser_invocations = 0
-    payload = None
-    if cache_path.is_file():
-        try:
-            payload = _decode_template(cache_path, key)
-            if (
-                payload.get("artifact_content_sha256") != actual_sha
-                or payload.get("parser_identity") != parser_id
-            ):
-                raise BinarySnapshotCacheError(
-                    "BINARY_SNAPSHOT_CACHE_CONTENT_MISMATCH", str(cache_path)
-                )
+    template = template_memo.get(key) if template_memo is not None else None
+    if template is not None or cache_path.is_file():
+        actual_sha = _sha256_file(archive)
+        if actual_sha != expected_sha:
+            raise BinarySnapshotCacheError(
+                "BINARY_SNAPSHOT_CACHE_ARTIFACT_SHA_MISMATCH",
+                f"expected={expected_sha}; actual={actual_sha}",
+            )
+        if template is not None:
             cache_status = "hit"
-        except BinarySnapshotCacheError:
-            cache_status = "corrupt_rebuilt"
-            payload = None
-    if payload is None:
-        template = snapshot_archive(
+            cache_tier = "memory"
+        else:
+            try:
+                payload = _decode_template(cache_path, key)
+                if (
+                    payload.get("artifact_content_sha256") != expected_sha
+                    or payload.get("parser_identity") != parser_id
+                ):
+                    raise BinarySnapshotCacheError(
+                        "BINARY_SNAPSHOT_CACHE_CONTENT_MISMATCH", str(cache_path)
+                    )
+                template = _decoded_template(payload)
+                del payload
+                cache_status = "hit"
+                cache_tier = "disk"
+            except BinarySnapshotCacheError:
+                cache_status = "corrupt_rebuilt"
+                template = None
+    if template is None:
+        parsed_snapshot = snapshot_archive(
             archive,
             artifact_instance_identity=f"CACHE-TEMPLATE:{key}",
-            expected_sha256=actual_sha,
+            expected_sha256=expected_sha,
             asm_jar=asm_path,
             target_jvm_major=target_jvm_major,
         )
         parser_invocations = 1
-        payload = _template_payload(template)
+        payload = _template_payload(parsed_snapshot)
         _write_template(cache_path, key, payload)
+        template = _decoded_template(
+            payload,
+            class_payloads=tuple(parsed_snapshot.class_payloads),
+        )
+        del payload
+    if template_memo is not None:
+        template_memo.remember(key, template)
     return SnapshotCacheOutcome(
-        snapshot=_rebind(payload, artifact_instance_identity),
+        snapshot=_rebind(template, artifact_instance_identity),
         cache_status=cache_status,
+        cache_tier=cache_tier,
         parser_invocation_count=parser_invocations,
         cache_key=key,
     )
@@ -231,5 +322,6 @@ __all__ = [
     "BinarySnapshotCacheError",
     "CACHE_POLICY_VERSION",
     "SnapshotCacheOutcome",
+    "SnapshotTemplateMemo",
     "cached_snapshot_archive",
 ]

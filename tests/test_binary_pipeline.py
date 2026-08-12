@@ -2225,6 +2225,11 @@ public class demo.ArrayCasts {
         self.assertTrue(all(
             item["elapsed_seconds"] >= 0 for item in first["phase_timings"]
         ))
+        self.assertTrue(all(
+            item["process_tree_cpu_seconds"] >= 0
+            and item["average_cpu_cores"] >= 0
+            for item in first["phase_timings"]
+        ))
         timings = json.loads(Path(first["phase_timings_path"]).read_text())
         self.assertTrue(timings["non_authoritative_observability"])
         self.assertGreater(timings["peak_rss_bytes"], 0)

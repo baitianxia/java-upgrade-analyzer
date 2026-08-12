@@ -12,6 +12,7 @@ import argparse
 from collections import defaultdict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import csv
+from dataclasses import dataclass
 import gc
 import hashlib
 import json
@@ -69,6 +70,28 @@ _ORACLE_ALLOWED_MYBATIS_DTDS = (
     b"mybatis.org/dtd/mybatis-3-mapper.dtd",
     b"mybatis.org/dtd/mybatis-3-config.dtd",
 )
+
+
+@dataclass(frozen=True)
+class _DirectEdgeTruth:
+    """Immutable javap facts reusable only for the same content/JDK key."""
+
+    artifact_sha256: str
+    direct_edges: frozenset[tuple[Any, ...]]
+    dynamic_handle_edges: frozenset[tuple[Any, ...]]
+    discovery_classes: frozenset[str]
+
+
+@dataclass(frozen=True)
+class _StructuralTruth:
+    """Normalized structural facts reusable only for the same scan key."""
+
+    type_edges: frozenset[tuple[Any, ...]]
+    class_init_edges: frozenset[tuple[Any, ...]]
+    clinit_classes: frozenset[str]
+    semantic_instructions: frozenset[tuple[Any, ...]]
+    declared_members: frozenset[tuple[Any, ...]]
+    failures: tuple[str, ...]
 
 
 _ORACLE_METHOD_ENTRY_KINDS = {
@@ -866,7 +889,7 @@ def _validate_structural_edges(
     inventories: list[dict[str, Any]],
     *,
     javap: str,
-    scan_cache: dict[tuple[Any, ...], dict[str, Any]] | None = None,
+    scan_cache: dict[tuple[Any, ...], _StructuralTruth] | None = None,
     direct_scan_cache: dict[tuple[str, str], bytes | Mapping[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     issues = []
@@ -940,70 +963,87 @@ def _validate_structural_edges(
                 for name, entry in inventory["classes"].items()
             )),
         )
-        scanned = None
-        direct_scan_payload = (
-            direct_scan_cache.get((str(artifact["sha256"]), str(javap)))
-            if direct_scan_cache is not None else None
-        )
-        direct_scan = (
-            _unpack_oracle_scan(direct_scan_payload)
-            if direct_scan_payload is not None else None
-        )
-        structural = (direct_scan or {}).get("structural_facts") or {}
-        if (
-            direct_scan
-            and direct_scan.get("complete")
-            and set(structural.get("class_names") or ())
-            == {
-                name for name in inventory["classes"]
-                if name != "module-info"
-            }
-        ):
-            # Both validators parse the same immutable javap observation with
-            # separate parsers. Reuse only when the observed class universe is
-            # exactly the independent archive inventory; fat/nested layouts or
-            # any partial scan automatically take the original fallback path.
-            scanned = {
-                "type_edges": {
-                    tuple(item) for item in structural.get("type_edges") or ()
-                },
-                "class_init_edges": {
-                    tuple(item)
-                    for item in structural.get("class_init_edges") or ()
-                },
-                "clinit_classes": set(
-                    structural.get("clinit_classes") or ()
-                ),
-                "semantic_instructions": {
-                    tuple(item)
-                    for item in structural.get("semantic_instructions") or ()
-                },
-                "declared_members": {
-                    tuple(item)
-                    for item in structural.get("declared_members") or ()
-                },
-                "failures": [],
-            }
+        scanned = scan_cache.get(scan_key) if scan_cache is not None else None
         if scanned is None:
-            scanned = scan_cache.get(scan_key) if scan_cache is not None else None
-        if scanned is None:
-            scanned = _scan_structural_edges(
-                artifact_path, inventory, javap
+            direct_scan_payload = (
+                direct_scan_cache.get((str(artifact["sha256"]), str(javap)))
+                if direct_scan_cache is not None else None
             )
+            direct_scan = (
+                _unpack_oracle_scan(direct_scan_payload)
+                if direct_scan_payload is not None else None
+            )
+            structural = (direct_scan or {}).get("structural_facts") or {}
+            if (
+                direct_scan
+                and direct_scan.get("complete")
+                and set(structural.get("class_names") or ())
+                == {
+                    name for name in inventory["classes"]
+                    if name != "module-info"
+                }
+            ):
+                # Both validators parse the same immutable javap observation
+                # with separate parsers. Reuse only when the observed class
+                # universe is exactly the independent archive inventory;
+                # fat/nested layouts or any partial scan automatically take
+                # the original fallback path.
+                raw_scanned = {
+                    "type_edges": structural.get("type_edges") or (),
+                    "class_init_edges": structural.get("class_init_edges") or (),
+                    "clinit_classes": structural.get("clinit_classes") or (),
+                    "semantic_instructions": (
+                        structural.get("semantic_instructions") or ()
+                    ),
+                    "declared_members": structural.get("declared_members") or (),
+                    "failures": (),
+                }
+            else:
+                raw_scanned = _scan_structural_edges(
+                    artifact_path, inventory, javap
+                )
+            failures = tuple(str(item) for item in raw_scanned["failures"])
+            if failures:
+                # Preserve the fail-closed behavior: partial structural output
+                # is never normalized or compared as authoritative truth.
+                scanned = _StructuralTruth(
+                    type_edges=frozenset(),
+                    class_init_edges=frozenset(),
+                    clinit_classes=frozenset(),
+                    semantic_instructions=frozenset(),
+                    declared_members=frozenset(),
+                    failures=failures,
+                )
+            else:
+                scanned = _StructuralTruth(
+                    type_edges=frozenset(
+                        (*item[:5], opcode_to_type_use[item[5]])
+                        for item in raw_scanned["type_edges"]
+                    ),
+                    class_init_edges=frozenset(
+                        tuple(item) for item in raw_scanned["class_init_edges"]
+                    ),
+                    clinit_classes=frozenset(raw_scanned["clinit_classes"]),
+                    semantic_instructions=frozenset(
+                        tuple(item) for item in raw_scanned["semantic_instructions"]
+                    ),
+                    declared_members=frozenset(
+                        tuple(item) for item in raw_scanned["declared_members"]
+                    ),
+                    failures=(),
+                )
             if scan_cache is not None:
                 scan_cache[scan_key] = scanned
-        if scanned["failures"]:
+        if scanned.failures:
             issues.append(_validation_issue(
                 "type_class_init", "ORACLE_STRUCTURAL_SCAN_INCOMPLETE",
-                artifact=artifact["path"], failures=scanned["failures"],
+                artifact=artifact["path"], failures=list(scanned.failures),
             ))
             continue
-        truth_t = {
-            (*item[:5], opcode_to_type_use[item[5]]) for item in scanned["type_edges"]
-        }
-        truth_i = set(scanned["class_init_edges"])
-        semantic_instructions.extend(sorted(scanned["semantic_instructions"]))
-        declared_members.update(scanned["declared_members"])
+        truth_t = scanned.type_edges
+        truth_i = scanned.class_init_edges
+        semantic_instructions.extend(sorted(scanned.semantic_instructions))
+        declared_members.update(scanned.declared_members)
         # Production names the trigger, not the opcode mnemonic, identically for
         # the supported active-use opcodes.
         actual_t = production_type.get(instance_identity, set())
@@ -1018,7 +1058,7 @@ def _validate_structural_edges(
             issues.append(_validation_issue("type_class_init", "ORACLE_CLASS_INIT_EDGE_EXTRA", edge=extra))
         truth_type.extend(sorted(truth_t))
         truth_init.extend(sorted(truth_i))
-        clinit_classes.update(scanned["clinit_classes"])
+        clinit_classes.update(scanned.clinit_classes)
     return issues, {
         "type_edges": truth_type,
         "class_init_edges": truth_init,
@@ -1049,6 +1089,58 @@ def _unpack_oracle_scan(result: Mapping[str, Any] | bytes) -> dict[str, Any]:
     if isinstance(result, bytes):
         return json.loads(zlib.decompress(result).decode("utf-8"))
     return dict(result)
+
+
+def _same_json_value(left: Any, right: Any) -> bool:
+    """Compare JSON-like values without conflating bool/int or int/float."""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return (
+            left.keys() == right.keys()
+            and all(_same_json_value(value, right[key]) for key, value in left.items())
+        )
+    if isinstance(left, (list, tuple)):
+        return len(left) == len(right) and all(
+            _same_json_value(left_item, right_item)
+            for left_item, right_item in zip(left, right)
+        )
+    return left == right
+
+
+def _share_equal_observation_values(
+    reference: Mapping[str, Mapping[str, Any]],
+    candidate: dict[str, dict[str, Any]],
+) -> tuple[int, int]:
+    """Share only type-exact, equal, immutable post-observation values.
+
+    Runtime observations are no longer mutated after javap-declared members
+    have been attached.  Sharing equal rows (or equal values in a row whose
+    provider URL differs) therefore changes neither side's evidence nor the
+    canonical validation identity, while avoiding a second retained copy.
+    """
+    shared_rows = 0
+    shared_values = 0
+    for class_name, row in tuple(candidate.items()):
+        reference_row = reference.get(class_name)
+        if not isinstance(reference_row, Mapping):
+            continue
+        same_row = row.keys() == reference_row.keys()
+        for key, value in tuple(row.items()):
+            if key not in reference_row:
+                same_row = False
+                continue
+            reference_value = reference_row[key]
+            if _same_json_value(value, reference_value):
+                if value is not reference_value:
+                    row[key] = reference_value
+                    shared_values += 1
+            else:
+                same_row = False
+        if same_row:
+            candidate[class_name] = reference_row  # type: ignore[assignment]
+            shared_rows += 1
+    return shared_rows, shared_values
 
 
 def _iter_reconciliation(
@@ -2036,6 +2128,7 @@ def _validate_direct_edges(
     scan_cache: dict[
         tuple[str, str], bytes | Mapping[str, Any]
     ] | None = None,
+    truth_cache: dict[tuple[str, str], _DirectEdgeTruth] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     issues = []
     truth_rows = []
@@ -2169,9 +2262,16 @@ def _validate_direct_edges(
             ))
             continue
         scan_key = (str(artifact["sha256"]), str(javap))
-        result = _unpack_oracle_scan(scan_results[scan_key])
+        normalized_truth = (
+            truth_cache.get(scan_key) if truth_cache is not None else None
+        )
+        result = (
+            _unpack_oracle_scan(scan_results[scan_key])
+            if normalized_truth is None else None
+        )
         if (
-            result.get("artifact_sha256")
+            result is not None
+            and result.get("artifact_sha256")
             and result["artifact_sha256"] != artifact["sha256"]
         ):
             issues.append(_validation_issue(
@@ -2182,35 +2282,58 @@ def _validate_direct_edges(
                 actual_sha256=result.get("artifact_sha256"),
             ))
             continue
-        if not result.get("complete"):
+        if result is not None and not result.get("complete"):
             issues.append(_validation_issue(
                 "direct_edge", "ORACLE_JAVAP_INVENTORY_INCOMPLETE",
                 artifact=artifact["path"], failures=result.get("failures") or (),
             ))
             continue
-        truth = {
-            (
-                row["caller_owner"], row["caller_member"], row["caller_descriptor"],
-                row["callee_owner"], row["callee_member"], row["callee_descriptor"],
-                row["opcode_family"], int(row["instruction_offset"]),
+        if normalized_truth is None:
+            rows = result.get("edges") or ()
+            normalized_truth = _DirectEdgeTruth(
+                artifact_sha256=str(result.get("artifact_sha256") or ""),
+                direct_edges=frozenset(
+                    (
+                        row["caller_owner"], row["caller_member"],
+                        row["caller_descriptor"], row["callee_owner"],
+                        row["callee_member"], row["callee_descriptor"],
+                        row["opcode_family"], int(row["instruction_offset"]),
+                    )
+                    for row in rows
+                    if row.get("opcode_family") != "invokedynamic"
+                ),
+                dynamic_handle_edges=frozenset(
+                    (
+                        row["caller_owner"], row["caller_member"],
+                        row["caller_descriptor"], row["callee_owner"],
+                        row["callee_member"], row["callee_descriptor"],
+                        int(row["instruction_offset"]),
+                    )
+                    for row in rows
+                    if row.get("opcode_family") == "invokedynamic"
+                ),
+                discovery_classes=frozenset(
+                    str(row.get("callee_owner") or "").replace(".", "/")
+                    for row in rows if row.get("callee_owner")
+                ),
             )
-            for row in result.get("edges") or ()
-            if row.get("opcode_family") != "invokedynamic"
-        }
-        dynamic_truth = {
-            (
-                row["caller_owner"], row["caller_member"], row["caller_descriptor"],
-                row["callee_owner"], row["callee_member"], row["callee_descriptor"],
-                int(row["instruction_offset"]),
-            )
-            for row in result.get("edges") or ()
-            if row.get("opcode_family") == "invokedynamic"
-        }
-        discovery_classes.update(
-            str(row.get("callee_owner") or "").replace(".", "/")
-            for row in result.get("edges") or ()
-            if row.get("callee_owner")
-        )
+            if truth_cache is not None:
+                truth_cache[scan_key] = normalized_truth
+        if (
+            normalized_truth.artifact_sha256
+            and normalized_truth.artifact_sha256 != artifact["sha256"]
+        ):
+            issues.append(_validation_issue(
+                "direct_edge",
+                "ORACLE_ARTIFACT_CHANGED_DURING_DIRECT_EDGE_VALIDATION",
+                artifact=artifact["path"],
+                expected_sha256=artifact["sha256"],
+                actual_sha256=normalized_truth.artifact_sha256,
+            ))
+            continue
+        truth = normalized_truth.direct_edges
+        dynamic_truth = normalized_truth.dynamic_handle_edges
+        discovery_classes.update(normalized_truth.discovery_classes)
         actual = production_by_artifact.get(instance_identity, set())
         actual_dynamic = production_dynamic_by_artifact.get(
             instance_identity, set()
@@ -4671,10 +4794,11 @@ def validate_generation(
 
     helper_identities = {}
     observations_by_side = {}
-    structural_scan_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
+    structural_scan_cache: dict[tuple[Any, ...], _StructuralTruth] = {}
     direct_scan_cache: dict[
         tuple[str, str], bytes | Mapping[str, Any]
     ] = {}
+    direct_truth_cache: dict[tuple[str, str], _DirectEdgeTruth] = {}
     side_validation_cache: dict[
         tuple[str, str, str, str],
         tuple[dict[str, Any], str, dict[str, Any]],
@@ -4734,6 +4858,7 @@ def validate_generation(
                 artifacts,
                 javap=javap,
                 scan_cache=direct_scan_cache,
+                truth_cache=direct_truth_cache,
             )
             structural_issues, structural_truth = _validate_structural_edges(
                 connection,
@@ -4743,11 +4868,16 @@ def validate_generation(
                 scan_cache=structural_scan_cache,
                 direct_scan_cache=direct_scan_cache,
             )
-            if side_validation_key in duplicated_side_keys:
+            if (
+                side_name == "current"
+                or side_validation_key in duplicated_side_keys
+            ):
                 # The other side will reuse the independently proven logical
-                # database/input identity. Release raw javap observations now
-                # so they do not overlap runtime-outcome Oracle indexes.
+                # database/input identity, or both sides have now completed
+                # structural comparison. Release javap evidence and normalized
+                # lookup tables before runtime-outcome indexes are built.
                 direct_scan_cache.clear()
+                direct_truth_cache.clear()
                 structural_scan_cache.clear()
                 clear_immutable_oracle_cache()
             issues.extend(edge_issues)
@@ -4774,6 +4904,11 @@ def validate_generation(
                 observation = observations.get(class_name)
                 if observation is not None:
                     observation["javap_declared_members"] = sorted(set(values))
+            reference_observations = observations_by_side.get("base")
+            if reference_observations is not None:
+                _share_equal_observation_values(
+                    reference_observations, observations
+                )
             helper_identities[side_name] = helper_identity
             observations_by_side[side_name] = observations
             topology = (side.get("runtime_profile") or {}).get("loader_topology") or {}
@@ -4850,6 +4985,7 @@ def validate_generation(
     observations_by_side.clear()
     side_validation_cache.clear()
     direct_scan_cache.clear()
+    direct_truth_cache.clear()
     structural_scan_cache.clear()
     inventory_cache.clear()
     clear_immutable_oracle_cache()

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import gc
 import hashlib
 import json
@@ -39,7 +40,7 @@ from binary_output import activate_binary_generation, write_binary_generation
 from binary_platform_image import JdkPlatformImage
 from binary_runtime_reconciler import RuntimeCapabilityPolicy, RuntimeReconciler
 from binary_semantic_overlay import build_binary_semantic_overlay
-from binary_snapshot_cache import cached_snapshot_archive
+from binary_snapshot_cache import SnapshotTemplateMemo, cached_snapshot_archive
 from binary_source_overlay import build_inline_consumption_overlay, build_source_overlay
 from binary_trace_engine import build_binary_traces
 from binary_validation_oracle import validate_generation
@@ -75,12 +76,56 @@ class _PhaseTimingRecorder(list):
     def __init__(self, output_root: Path, started: float):
         super().__init__()
         self.started = started
+        self._previous_usage = _resource_usage_snapshot()
         self.directory = output_root / "binary_observability"
         self.path = self.directory / "latest_in_progress.json"
 
     def append(self, item):
         item = dict(item or {})
-        item.setdefault("peak_rss_bytes", _peak_rss_bytes())
+        usage = _resource_usage_snapshot()
+        if usage is None:
+            item.setdefault("peak_rss_bytes", 0)
+            item.setdefault("completed_child_peak_rss_bytes", 0)
+            item.setdefault("self_cpu_seconds", 0.0)
+            item.setdefault("child_cpu_seconds", 0.0)
+            item.setdefault("process_tree_cpu_seconds", 0.0)
+            item.setdefault("average_cpu_cores", 0.0)
+        else:
+            item.setdefault("peak_rss_bytes", usage.self_peak_rss_bytes)
+            item.setdefault(
+                "completed_child_peak_rss_bytes",
+                usage.completed_child_peak_rss_bytes,
+            )
+            previous = self._previous_usage
+            if previous is not None:
+                self_cpu = max(
+                    0.0,
+                    usage.self_user_seconds
+                    + usage.self_system_seconds
+                    - previous.self_user_seconds
+                    - previous.self_system_seconds,
+                )
+                child_cpu = max(
+                    0.0,
+                    usage.child_user_seconds
+                    + usage.child_system_seconds
+                    - previous.child_user_seconds
+                    - previous.child_system_seconds,
+                )
+                process_tree_cpu = self_cpu + child_cpu
+                wall_seconds = float(item.get("elapsed_seconds") or 0.0)
+                item.setdefault("self_cpu_seconds", round(self_cpu, 6))
+                item.setdefault("child_cpu_seconds", round(child_cpu, 6))
+                item.setdefault(
+                    "process_tree_cpu_seconds", round(process_tree_cpu, 6)
+                )
+                item.setdefault(
+                    "average_cpu_cores",
+                    round(process_tree_cpu / wall_seconds, 6)
+                    if wall_seconds > 0
+                    else 0.0,
+                )
+            self._previous_usage = usage
         super().append(item)
         self.directory.mkdir(parents=True, exist_ok=True)
         completed = str((item or {}).get("phase") or "")
@@ -126,12 +171,183 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+@dataclass(frozen=True)
+class _ArtifactDigestRecord:
+    content_sha256: str
+    byte_length: int
+    file_identity: tuple[int, int, int, int, int]
+
+
+class _ArtifactDigestSession:
+    """Reuse hashes only while a file's stable OS identity is unchanged.
+
+    Runtime materialization can expose hundreds of nested artifacts backed by
+    one executable Spring Boot JAR.  Hashing that outer container once per
+    nested entry adds no evidence: every call observes the same path.  This
+    session hashes each unique file once, checks its stat identity on every
+    reuse, and performs a second full hash for outer containers after all
+    ArtifactInstances have been constructed.  A changed file therefore fails
+    closed while the common case performs two reads per outer JAR, not one read
+    per nested dependency.
+    """
+
+    def __init__(self):
+        self._records: dict[Path, _ArtifactDigestRecord] = {}
+        self._revalidate: set[Path] = set()
+        self.hash_request_count = 0
+        self.hash_execution_count = 0
+        self.hash_reuse_count = 0
+        self.hash_bytes = 0
+        self.final_verification_hash_count = 0
+
+    @staticmethod
+    def _file_identity(stat_result) -> tuple[int, int, int, int, int]:
+        return (
+            int(stat_result.st_dev),
+            int(stat_result.st_ino),
+            int(stat_result.st_size),
+            int(getattr(stat_result, "st_mtime_ns", stat_result.st_mtime * 1e9)),
+            int(getattr(stat_result, "st_ctime_ns", stat_result.st_ctime * 1e9)),
+        )
+
+    @staticmethod
+    def _expected_sha256(value: Any, *, path: Path) -> str:
+        expected = str(value or "").strip().lower()
+        if expected and (
+            len(expected) != 64
+            or any(character not in "0123456789abcdef" for character in expected)
+        ):
+            raise BinaryPipelineError(
+                "BINARY_PIPELINE_ARTIFACT_SHA256_INVALID",
+                f"{path}: {expected}",
+            )
+        return expected
+
+    def _hash_stable(self, path: Path) -> _ArtifactDigestRecord:
+        try:
+            before = path.stat()
+            if not path.is_file():
+                raise OSError("not a regular file")
+            content_sha256 = _sha256_file(path)
+            after = path.stat()
+        except OSError as error:
+            raise BinaryPipelineError(
+                "BINARY_PIPELINE_ARTIFACT_MISSING", f"{path}: {error}"
+            ) from error
+        before_identity = self._file_identity(before)
+        after_identity = self._file_identity(after)
+        if before_identity != after_identity:
+            raise BinaryPipelineError(
+                "BINARY_PIPELINE_ARTIFACT_CHANGED_DURING_HASH", str(path)
+            )
+        self.hash_execution_count += 1
+        self.hash_bytes += int(after.st_size)
+        return _ArtifactDigestRecord(
+            content_sha256=content_sha256,
+            byte_length=int(after.st_size),
+            file_identity=after_identity,
+        )
+
+    def digest(
+        self,
+        path: str | Path,
+        *,
+        expected_sha256: Any = "",
+        revalidate_at_end: bool = False,
+    ) -> _ArtifactDigestRecord:
+        resolved = Path(path).expanduser().resolve()
+        expected = self._expected_sha256(expected_sha256, path=resolved)
+        self.hash_request_count += 1
+        try:
+            current_identity = self._file_identity(resolved.stat())
+        except OSError as error:
+            raise BinaryPipelineError(
+                "BINARY_PIPELINE_ARTIFACT_MISSING", f"{resolved}: {error}"
+            ) from error
+        record = self._records.get(resolved)
+        if record is not None and record.file_identity == current_identity:
+            self.hash_reuse_count += 1
+        else:
+            observed = self._hash_stable(resolved)
+            if record is not None and (
+                record.content_sha256 != observed.content_sha256
+            ):
+                raise BinaryPipelineError(
+                    "BINARY_PIPELINE_ARTIFACT_CHANGED_DURING_PROFILE",
+                    str(resolved),
+                )
+            record = observed
+            self._records[resolved] = record
+        if expected and record.content_sha256 != expected:
+            raise BinaryPipelineError(
+                "BINARY_PIPELINE_ARTIFACT_SHA256_MISMATCH",
+                f"{resolved}: expected={expected}; actual={record.content_sha256}",
+            )
+        if revalidate_at_end:
+            self._revalidate.add(resolved)
+        return record
+
+    def revalidate_marked(self) -> None:
+        for path in sorted(self._revalidate, key=str):
+            expected = self._records[path]
+            observed = self._hash_stable(path)
+            self.final_verification_hash_count += 1
+            if observed.content_sha256 != expected.content_sha256:
+                raise BinaryPipelineError(
+                    "BINARY_PIPELINE_OUTER_ARTIFACT_CHANGED_DURING_PROFILE",
+                    str(path),
+                )
+            self._records[path] = observed
+
+    def metrics(self) -> dict[str, int]:
+        return {
+            "artifact_hash_request_count": self.hash_request_count,
+            "artifact_hash_execution_count": self.hash_execution_count,
+            "artifact_hash_reuse_count": self.hash_reuse_count,
+            "artifact_hash_bytes": self.hash_bytes,
+            "outer_artifact_unique_count": len(self._revalidate),
+            "outer_artifact_final_verification_hash_count": (
+                self.final_verification_hash_count
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class _ResourceUsageSnapshot:
+    self_user_seconds: float
+    self_system_seconds: float
+    child_user_seconds: float
+    child_system_seconds: float
+    self_peak_rss_bytes: int
+    completed_child_peak_rss_bytes: int
+
+
+def _rss_bytes_from_rusage(value: int | float) -> int:
+    raw = int(value or 0)
+    return raw if sys.platform == "darwin" else raw * 1024
+
+
+def _resource_usage_snapshot() -> _ResourceUsageSnapshot | None:
+    if resource is None:
+        return None
+    own = resource.getrusage(resource.RUSAGE_SELF)
+    children = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return _ResourceUsageSnapshot(
+        self_user_seconds=float(own.ru_utime or 0.0),
+        self_system_seconds=float(own.ru_stime or 0.0),
+        child_user_seconds=float(children.ru_utime or 0.0),
+        child_system_seconds=float(children.ru_stime or 0.0),
+        self_peak_rss_bytes=_rss_bytes_from_rusage(own.ru_maxrss),
+        completed_child_peak_rss_bytes=_rss_bytes_from_rusage(children.ru_maxrss),
+    )
+
+
 def _peak_rss_bytes() -> int:
     """Return this analyzer process' peak resident set size."""
-    if resource is None:
+    usage = _resource_usage_snapshot()
+    if usage is None:
         return 0
-    value = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss or 0)
-    return value if sys.platform == "darwin" else value * 1024
+    return usage.self_peak_rss_bytes
 
 
 def _load_json(path: str | Path) -> dict[str, Any]:
@@ -216,7 +432,10 @@ def _require_binary_authority_gates(support: Mapping[str, Any]) -> None:
 
 def _artifact_descriptors(
     raw_artifacts: list[Mapping[str, Any]],
+    *,
+    digest_session: _ArtifactDigestSession | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    digest_session = digest_session or _ArtifactDigestSession()
     normalized = []
     path_descriptors = []
     slots = set()
@@ -232,10 +451,14 @@ def _artifact_descriptors(
                 "BINARY_PIPELINE_RUNTIME_SLOT_INVALID", f"duplicate/invalid {loader}:{slot}"
             )
         slots.add((loader, slot))
-        sha = _sha256_file(path)
+        digest = digest_session.digest(
+            path,
+            expected_sha256=raw.get("content_sha256"),
+        )
+        sha = digest.content_sha256
         item = {
             **dict(raw), "path": str(path), "content_sha256": sha,
-            "byte_length": path.stat().st_size, "slot": slot,
+            "byte_length": digest.byte_length, "slot": slot,
         }
         normalized.append(item)
         path_descriptors.append({
@@ -325,12 +548,27 @@ def _runtime_profile(
 
 
 def _artifact_instances(
-    artifacts: list[dict[str, Any]], profile: RuntimeProfile
+    artifacts: list[dict[str, Any]],
+    profile: RuntimeProfile,
+    *,
+    digest_session: _ArtifactDigestSession | None = None,
 ) -> list[tuple[dict[str, Any], ArtifactInstance]]:
+    owns_digest_session = digest_session is None
+    digest_session = digest_session or _ArtifactDigestSession()
     result = []
     for raw in artifacts:
-        outer_path = Path(str(raw.get("outer_artifact_path") or raw["path"]))
-        outer_sha = _sha256_file(outer_path)
+        artifact_path = Path(str(raw["path"])).expanduser().resolve()
+        outer_path = Path(
+            str(raw.get("outer_artifact_path") or artifact_path)
+        ).expanduser().resolve()
+        outer_digest = digest_session.digest(
+            outer_path,
+            expected_sha256=raw.get("outer_artifact_sha256"),
+            # A distinct outer container is not read by snapshot parsing later,
+            # so verify it a second time after all shared references are built.
+            revalidate_at_end=outer_path != artifact_path,
+        )
+        outer_sha = outer_digest.content_sha256
         instance = ArtifactInstance(
             outer_artifact_sha256=outer_sha,
             container_entry=str(raw.get("container_entry") or "<artifact>"),
@@ -348,6 +586,8 @@ def _artifact_instances(
             coord=str(raw.get("coord") or ""),
         )
         result.append((raw, instance))
+    if owns_digest_session:
+        digest_session.revalidate_marked()
     return result
 
 
@@ -663,16 +903,28 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
         # instance avoids parsing the same target JDK twice for an ordinary
         # dependency upgrade while preserving the same platform identity.
         current_platform = base_platform
-    base_artifacts, base_paths = _artifact_descriptors(list(base_config.get("artifacts") or ()))
-    current_artifacts, current_paths = _artifact_descriptors(list(current_config.get("artifacts") or ()))
+    digest_session = _ArtifactDigestSession()
+    base_artifacts, base_paths = _artifact_descriptors(
+        list(base_config.get("artifacts") or ()),
+        digest_session=digest_session,
+    )
+    current_artifacts, current_paths = _artifact_descriptors(
+        list(current_config.get("artifacts") or ()),
+        digest_session=digest_session,
+    )
     base_config["artifacts"] = base_artifacts
     current_config["artifacts"] = current_artifacts
     base_profile = _runtime_profile(base_config, base_platform, base_paths)
     current_profile = _runtime_profile(current_config, current_platform, current_paths)
     base_build = _build_identity_bundle(base_config, base_artifacts)
     current_build = _build_identity_bundle(current_config, current_artifacts)
-    base_instances = _artifact_instances(base_artifacts, base_profile)
-    current_instances = _artifact_instances(current_artifacts, current_profile)
+    base_instances = _artifact_instances(
+        base_artifacts, base_profile, digest_session=digest_session
+    )
+    current_instances = _artifact_instances(
+        current_artifacts, current_profile, digest_session=digest_session
+    )
+    digest_session.revalidate_marked()
     runtime_sides_identical = (
         base_platform.identity == current_platform.identity
         and base_profile.identity == current_profile.identity
@@ -739,6 +991,7 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
         "phase": "input_and_runtime_profile",
         "elapsed_seconds": round(time.perf_counter() - pipeline_started, 6),
         "artifact_count": len(base_artifacts) + len(current_artifacts),
+        **digest_session.metrics(),
     })
 
     with short_temporary_directory(prefix="binary-pipeline") as temp_text:
@@ -759,6 +1012,8 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
             artifact_phase_started = time.perf_counter()
             cache_metrics = {
                 "artifact_snapshot_hits": 0,
+                "artifact_snapshot_disk_hits": 0,
+                "artifact_snapshot_memory_hits": 0,
                 "artifact_snapshot_misses": 0,
                 "artifact_snapshot_corrupt_rebuilt": 0,
                 "classfile_parser_invocations": 0,
@@ -777,6 +1032,7 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                 current_by_lineage[lineage] = (raw, instance)
 
             parser_identities = set()
+            snapshot_template_memo = SnapshotTemplateMemo()
 
             def load_snapshot(raw, instance, store, target_jvm_major):
                 cache_outcome = cached_snapshot_archive(
@@ -784,6 +1040,7 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                     expected_sha256=instance.content_sha256, asm_jar=asm_jar,
                     cache_root=cache_root,
                     target_jvm_major=target_jvm_major,
+                    template_memo=snapshot_template_memo,
                 )
                 cache_metrics[
                     "artifact_snapshot_hits"
@@ -792,6 +1049,10 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                 ] += 1
                 if cache_outcome.cache_status == "corrupt_rebuilt":
                     cache_metrics["artifact_snapshot_corrupt_rebuilt"] += 1
+                if cache_outcome.cache_tier == "disk":
+                    cache_metrics["artifact_snapshot_disk_hits"] += 1
+                elif cache_outcome.cache_tier == "memory":
+                    cache_metrics["artifact_snapshot_memory_hits"] += 1
                 cache_metrics["classfile_parser_invocations"] += cache_outcome.parser_invocation_count
                 snapshot = cache_outcome.snapshot
                 parser_identities.add(snapshot.parser_identity)
@@ -872,6 +1133,11 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                 # bounded by the largest base/current JAR rather than the full
                 # 500-JAR input set.
                 del base_snapshot, current_snapshot
+            # The memo is useful only while an adjacent pair is being rebound.
+            # Release the final decoded JAR before reconciliation and Oracle
+            # indexing so its bytes cannot overlap later phase RSS peaks.
+            snapshot_template_memo.clear()
+            del load_snapshot, snapshot_template_memo
             # Secondary lookup trees are not consulted while immutable archive
             # facts are appended. Building each tree once is materially cheaper
             # than maintaining it across hundreds of thousands of inserts, and

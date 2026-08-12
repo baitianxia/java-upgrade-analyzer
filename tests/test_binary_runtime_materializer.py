@@ -100,6 +100,13 @@ class BinaryRuntimeMaterializerTest(unittest.TestCase):
         for side in ("base", "current"):
             artifacts = config[side]["artifacts"]
             self.assertEqual([item["slot"] for item in artifacts], [0, 1])
+            self.assertEqual(
+                len({item["outer_artifact_sha256"] for item in artifacts}),
+                1,
+            )
+            self.assertRegex(
+                artifacts[0]["outer_artifact_sha256"], r"^[0-9a-f]{64}$"
+            )
             self.assertEqual(artifacts[0]["path_kind"], "business_classes")
             self.assertEqual(artifacts[1]["lineage"], "com.acme:library")
             self.assertTrue(

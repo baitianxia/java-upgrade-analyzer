@@ -98,6 +98,9 @@ class BinaryPerformanceGateTest(unittest.TestCase):
             changed_full_pipeline["formal_impact_conclusion_counts"],
             {"inconclusive": 3},
         )
+        self.assertEqual(
+            changed_full_pipeline["artifact_snapshot_memory_hits"], 1
+        )
         protocol = result["measurement_protocol"]
         cold = result["measurements"]["cold"]
         gate = {
