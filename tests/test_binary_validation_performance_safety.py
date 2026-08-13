@@ -5,6 +5,7 @@ import json
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -279,6 +280,56 @@ class BinaryValidationPerformanceSafetyTest(unittest.TestCase):
             all(event[0] == "validation-runtime" for event in progress_events)
         )
 
+    def test_runtime_oracle_concurrent_batches_preserve_complete_closure(self):
+        barrier = threading.Barrier(3)
+        initial_threads = set()
+        calls = []
+        lock = threading.Lock()
+
+        def execute(command, **_kwargs):
+            names = Path(command[-1]).read_text(encoding="utf-8").splitlines()
+            with lock:
+                calls.append(tuple(names))
+            if names != ["demo.Parent"]:
+                initial_threads.add(threading.current_thread().name)
+                barrier.wait(timeout=2)
+            rows = []
+            for name in names:
+                rows.append({
+                    "class_name": name.replace(".", "/"),
+                    "status": "definition_ready",
+                    "super_name": "" if name == "demo.Parent" else "demo/Parent",
+                    "interfaces": [],
+                })
+            return SimpleNamespace(
+                succeeded=True,
+                stdout="\n".join(json.dumps(row) for row in rows) + "\n",
+                failure=None,
+            )
+
+        initial = [f"demo/C{index}" for index in range(6)]
+        with patch.object(
+            oracle, "MAX_CLASSES_PER_RUNTIME_ORACLE_PROCESS", 2
+        ), patch.object(
+            oracle, "MIN_CLASSES_FOR_CONCURRENT_RUNTIME_ORACLE", 0
+        ), patch.object(
+            oracle.os, "cpu_count", return_value=3
+        ), patch.object(
+            oracle, "_compile_oracle", return_value="helper-identity"
+        ), patch.object(oracle, "execute_binary_tool", side_effect=execute):
+            observations, _helper = oracle._observe_classes(
+                Path("/fixture/jdk"),
+                [{"path": "/fixture/app.jar"}],
+                initial,
+            )
+
+        self.assertEqual(len(initial_threads), 3)
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(
+            set(observations),
+            {name.replace(".", "/") for name in [*initial, "demo.Parent"]},
+        )
+
     def test_runtime_oracle_fails_closed_on_incomplete_batch_output(self):
         calls = []
 
@@ -399,6 +450,45 @@ class BinaryValidationPerformanceSafetyTest(unittest.TestCase):
         )
         self.assertIsNot(
             candidate["demo/C"]["flags"], reference["demo/C"]["flags"]
+        )
+
+    def test_compact_observations_preserve_canonical_truth_exactly(self):
+        repeated = "method|run|()V|1"
+        observations = {
+            "demo/A": {
+                "class_name": "demo/A",
+                "status": "definition_ready",
+                "interfaces": ["demo/Api"],
+                "members": [repeated],
+                "unknown_future_field": [repeated, True, 1],
+            },
+            "demo/B": {
+                "class_name": "demo/B",
+                "status": "definition_ready",
+                "interfaces": ["demo/Api"],
+                "members": [repeated],
+            },
+        }
+        before = oracle.canonical_identity_streaming(
+            "fixture", observations, schema_version="1"
+        )
+
+        compacted = oracle._compact_observations(
+            copy.deepcopy(observations), {}
+        )
+        after = oracle.canonical_identity_streaming(
+            "fixture", compacted, schema_version="1"
+        )
+
+        self.assertEqual(after, before)
+        self.assertIsInstance(compacted["demo/A"], oracle._CompactObservation)
+        self.assertEqual(
+            compacted["demo/A"]["unknown_future_field"],
+            (repeated, True, 1),
+        )
+        self.assertIs(
+            compacted["demo/A"]["members"][0],
+            compacted["demo/B"]["members"][0],
         )
 
     def test_direct_truth_cache_reuses_only_oracle_facts_and_rechecks_database(self):

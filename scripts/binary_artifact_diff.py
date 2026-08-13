@@ -23,7 +23,7 @@ from artifact_safety import inspect_archive
 from binary_asm_helper import BinaryClassInput, BinaryFactRun, extract_class_facts
 from binary_first_contract import (
     BinaryFirstContractError,
-    canonical_identity,
+    canonical_identity_native_json,
     observed_delta_identity,
 )
 
@@ -58,7 +58,9 @@ def _sha256_file(path: Path) -> str:
 
 
 def _identity(namespace: str, payload: Any) -> str:
-    return canonical_identity(namespace, payload, schema_version="1")
+    return canonical_identity_native_json(
+        namespace, payload, schema_version="1"
+    )
 
 
 def _mr_class_scope(name: str) -> tuple[str, int]:

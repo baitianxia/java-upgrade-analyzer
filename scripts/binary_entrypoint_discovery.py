@@ -15,7 +15,10 @@ import json
 from typing import Any, Mapping
 
 from binary_first_contract import canonical_identity
-from binary_runtime_reconciler import class_load_is_ready
+from binary_runtime_reconciler import (
+    class_load_is_ready,
+    hydrate_runtime_reconciliation,
+)
 
 
 DISCOVERY_POLICY_VERSION = "binary-entrypoint-discovery-v1"
@@ -697,6 +700,12 @@ def discover_binary_entrypoints(
                     "binary_entrypoint_discovery_identity", payload
                 ),
             )
+
+    reconciliation = hydrate_runtime_reconciliation(
+        store,
+        reconciliation,
+        ("provider_binding", "class_definition"),
+    )
 
     artifacts = {
         row["artifact_instance_identity"]: row

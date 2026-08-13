@@ -257,20 +257,32 @@ class BinaryTraceFastPathTest(unittest.TestCase):
 
     def test_formal_results_with_no_entrypoints_route_to_graph_free_builder(self):
         decisions = self.decisions(formal_projections=({"identity": "p"},))
+        store = object()
+        runtime = SimpleNamespace(coverage_gaps=())
         with patch.object(
             binary_trace_engine,
             "discover_binary_entrypoints",
             return_value=self.empty_discovery(),
-        ), patch.object(binary_trace_engine, "BinaryTraceEngine") as engine:
+        ), patch.object(
+            binary_trace_engine,
+            "hydrate_runtime_reconciliation",
+            return_value=runtime,
+        ) as hydrate, patch.object(
+            binary_trace_engine,
+            "BinaryTraceEngine",
+        ) as engine:
             expected = object()
             engine.return_value.build.return_value = expected
             actual = build_binary_traces(
-                object(), object(), SimpleNamespace(coverage_gaps=()), decisions
+                store, object(), runtime, decisions
             )
 
         self.assertIs(actual, expected)
         engine.assert_called_once()
         self.assertFalse(engine.call_args.kwargs["materialize_graph"])
+        hydrate.assert_called_once_with(
+            store, runtime, ("provider_binding",)
+        )
 
     def test_service_activation_with_no_entrypoints_still_uses_full_graph(self):
         decisions = self.decisions(authoritative_decisions=({

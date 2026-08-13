@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import gc
@@ -43,8 +44,15 @@ from binary_first_model import (
 )
 from binary_output import activate_binary_generation, write_binary_generation
 from binary_platform_image import JdkPlatformImage
-from binary_runtime_reconciler import RuntimeCapabilityPolicy, RuntimeReconciler
-from binary_semantic_overlay import build_binary_semantic_overlay
+from binary_runtime_reconciler import (
+    RuntimeCapabilityPolicy,
+    RuntimeReconciler,
+    hydrate_runtime_reconciliation,
+)
+from binary_semantic_overlay import (
+    build_binary_semantic_overlay,
+    semantic_overlay_requires_runtime_selection,
+)
 from binary_snapshot_cache import SnapshotTemplateMemo, cached_snapshot_archive
 from binary_source_overlay import build_inline_consumption_overlay, build_source_overlay
 from binary_trace_engine import build_binary_traces
@@ -66,6 +74,34 @@ RESUME_CHECKPOINT_SCHEMA = (
 
 class BinaryPipelineError(BinaryFirstContractError):
     pass
+
+
+def _artifact_snapshot_worker_count(configured: Any, lineage_count: int) -> int:
+    """Return a bounded worker count without accepting lossy JSON coercions."""
+    lineage_count = max(0, int(lineage_count))
+    if configured in (None, ""):
+        if lineage_count == 0:
+            return 0
+        return min(
+            3,
+            max(1, (os.cpu_count() or 1) // 3),
+            lineage_count,
+        )
+    if isinstance(configured, bool) or isinstance(configured, float):
+        raise BinaryPipelineError(
+            "BINARY_ARTIFACT_WORKER_COUNT_INVALID", str(configured)
+        )
+    try:
+        workers = int(configured)
+    except (TypeError, ValueError) as error:
+        raise BinaryPipelineError(
+            "BINARY_ARTIFACT_WORKER_COUNT_INVALID", str(configured)
+        ) from error
+    if not 1 <= workers <= 8:
+        raise BinaryPipelineError(
+            "BINARY_ARTIFACT_WORKER_COUNT_INVALID", str(configured)
+        )
+    return min(workers, lineage_count)
 
 
 class _PhaseTimingRecorder(list):
@@ -884,7 +920,9 @@ def _artifact_safety_policy(
 
 
 def _definition_verification_summary(
-    reconciliation: Any, platform: JdkPlatformImage
+    reconciliation: Any,
+    platform: JdkPlatformImage,
+    store: BinaryFactStore | None = None,
 ) -> dict[str, Any]:
     """Build a bounded public summary of target-JVM definition evidence."""
     status_counts: dict[str, int] = {}
@@ -893,7 +931,15 @@ def _definition_verification_summary(
     target_verified_contexts = []
     verifier_identities = set()
     failures = []
-    for record in reconciliation.class_definitions:
+    records = reconciliation.class_definitions
+    if not records:
+        if store is None:
+            records = ()
+        else:
+            records = store.reconciliation_payloads("class_definition")
+    class_definition_count = 0
+    for record in records:
+        class_definition_count += 1
         status = str(record.get("class_definition_status") or "unknown")
         status_counts[status] = status_counts.get(status, 0) + 1
         evidence = dict(record.get("evidence") or {})
@@ -930,7 +976,7 @@ def _definition_verification_summary(
         "runtime_reconciliation_identity": reconciliation.identity,
         "coverage_status": reconciliation.coverage_status,
         "coverage_gaps": list(reconciliation.coverage_gaps),
-        "class_definition_count": len(reconciliation.class_definitions),
+        "class_definition_count": class_definition_count,
         "definition_status_counts": dict(sorted(status_counts.items())),
         "target_jvm_verified_class_count": len(target_verified_contexts),
         "target_jvm_status_counts": dict(sorted(target_status_counts.items())),
@@ -1613,48 +1659,46 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                 current_by_lineage[lineage] = (raw, instance)
 
             parser_identities = set()
-            snapshot_template_memo = SnapshotTemplateMemo()
-
-            def load_snapshot(raw, instance, store, target_jvm_major):
-                cache_outcome = cached_snapshot_archive(
-                    raw["path"], artifact_instance_identity=instance.identity,
-                    expected_sha256=instance.content_sha256, asm_jar=asm_jar,
-                    jdk_home=current_platform.jdk_home,
-                    cache_root=cache_root,
-                    target_jvm_major=target_jvm_major,
-                    template_memo=snapshot_template_memo,
-                    safety_policy=artifact_safety_policy,
-                )
-                cache_metrics[
-                    "artifact_snapshot_hits"
-                    if cache_outcome.cache_status == "hit"
-                    else "artifact_snapshot_misses"
-                ] += 1
-                if cache_outcome.cache_status == "corrupt_rebuilt":
-                    cache_metrics["artifact_snapshot_corrupt_rebuilt"] += 1
-                if cache_outcome.cache_tier == "disk":
-                    cache_metrics["artifact_snapshot_disk_hits"] += 1
-                elif cache_outcome.cache_tier == "memory":
-                    cache_metrics["artifact_snapshot_memory_hits"] += 1
-                cache_metrics["classfile_parser_invocations"] += cache_outcome.parser_invocation_count
-                snapshot = cache_outcome.snapshot
-                parser_identities.add(snapshot.parser_identity)
-                store.add_artifact_snapshot(instance, snapshot)
-                return snapshot
-
             diffs = []
             pairings = []
-            for lineage in sorted(set(base_by_lineage) | set(current_by_lineage)):
+            lineages = sorted(set(base_by_lineage) | set(current_by_lineage))
+            # Each task drives a bounded Java helper and performs ZIP/I/O work.
+            # Three tasks keep a 12-core workstation busy without multiplying
+            # the helper's 512 MiB hard ceiling excessively.
+            artifact_snapshot_workers = _artifact_snapshot_worker_count(
+                config.get("artifact_snapshot_workers"), len(lineages)
+            )
+
+            def build_lineage_snapshot(lineage):
+                # A pair-local one-entry memo preserves the base/current
+                # content hit while making concurrent tasks independent.
+                snapshot_template_memo = SnapshotTemplateMemo()
+
+                def load_snapshot(raw, instance, target_jvm_major):
+                    return cached_snapshot_archive(
+                        raw["path"],
+                        artifact_instance_identity=instance.identity,
+                        expected_sha256=instance.content_sha256,
+                        asm_jar=asm_jar,
+                        jdk_home=current_platform.jdk_home,
+                        cache_root=cache_root,
+                        target_jvm_major=target_jvm_major,
+                        template_memo=snapshot_template_memo,
+                        safety_policy=artifact_safety_policy,
+                    )
+
                 base_pair = base_by_lineage.get(lineage)
                 current_pair = current_by_lineage.get(lineage)
+                base_outcome = None
+                current_outcome = None
                 if base_pair and current_pair:
                     status = "exact"
                     base_raw, base_instance = base_pair
                     current_raw, current_instance = current_pair
-                    base_snapshot = load_snapshot(
-                        base_raw, base_instance, base_store,
-                        base_platform.java_major,
+                    base_outcome = load_snapshot(
+                        base_raw, base_instance, base_platform.java_major,
                     )
+                    base_snapshot = base_outcome.snapshot
                     if runtime_sides_identical:
                         # The ArtifactInstance (including content, slot, realm,
                         # origin and runtime profile) is byte-for-byte equal.
@@ -1664,17 +1708,18 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                         # unchanged class a second time.
                         current_snapshot = base_snapshot
                     else:
-                        current_snapshot = load_snapshot(
-                            current_raw, current_instance, current_store,
+                        current_outcome = load_snapshot(
+                            current_raw, current_instance,
                             current_platform.java_major,
                         )
+                        current_snapshot = current_outcome.snapshot
                 elif base_pair:
                     status = "base_only"
                     base_raw, base_instance = base_pair
-                    base_snapshot = load_snapshot(
-                        base_raw, base_instance, base_store,
-                        base_platform.java_major,
+                    base_outcome = load_snapshot(
+                        base_raw, base_instance, base_platform.java_major,
                     )
+                    base_snapshot = base_outcome.snapshot
                     current_instance = None
                     current_snapshot = _absent_snapshot(
                         f"ABSENT:current:{lineage}", base_snapshot.parser_identity
@@ -1682,10 +1727,11 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                 else:
                     status = "current_only"
                     current_raw, current_instance = current_pair
-                    current_snapshot = load_snapshot(
-                        current_raw, current_instance, current_store,
+                    current_outcome = load_snapshot(
+                        current_raw, current_instance,
                         current_platform.java_major,
                     )
+                    current_snapshot = current_outcome.snapshot
                     base_instance = None
                     base_snapshot = _absent_snapshot(
                         f"ABSENT:base:{lineage}", current_snapshot.parser_identity
@@ -1700,7 +1746,6 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                     base_instance.identity if base_instance else "",
                     current_instance.identity if current_instance else "",
                 )
-                pairings.append(pairing)
                 artifact_diff = compare_artifact_snapshots(
                     base_snapshot,
                     current_snapshot,
@@ -1710,17 +1755,83 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                     },
                 )
                 artifact_diff["logical_dependency_lineage"] = lineage
+                snapshot_template_memo.clear()
+                return (
+                    pairing, artifact_diff,
+                    base_instance, base_outcome,
+                    current_instance, current_outcome,
+                )
+
+            def record_lineage_snapshot(result):
+                (
+                    pairing, artifact_diff,
+                    base_instance, base_outcome,
+                    current_instance, current_outcome,
+                ) = result
+                outcomes = (
+                    (base_outcome, base_instance, base_store),
+                    (current_outcome, current_instance, current_store),
+                )
+                for outcome, instance, store in outcomes:
+                    if outcome is None:
+                        continue
+                    cache_metrics[
+                        "artifact_snapshot_hits"
+                        if outcome.cache_status == "hit"
+                        else "artifact_snapshot_misses"
+                    ] += 1
+                    if outcome.cache_status == "corrupt_rebuilt":
+                        cache_metrics[
+                            "artifact_snapshot_corrupt_rebuilt"
+                        ] += 1
+                    if outcome.cache_tier == "disk":
+                        cache_metrics["artifact_snapshot_disk_hits"] += 1
+                    elif outcome.cache_tier == "memory":
+                        cache_metrics["artifact_snapshot_memory_hits"] += 1
+                    cache_metrics["classfile_parser_invocations"] += (
+                        outcome.parser_invocation_count
+                    )
+                    parser_identities.add(outcome.snapshot.parser_identity)
+                    store.add_artifact_snapshot(instance, outcome.snapshot)
+                pairings.append(pairing)
                 diffs.append(artifact_diff)
-                # A snapshot contains all classfile bytes and full ASM facts for
-                # one archive. Pair and persist it immediately so residency is
-                # bounded by the largest base/current JAR rather than the full
-                # 500-JAR input set.
-                del base_snapshot, current_snapshot
-            # The memo is useful only while an adjacent pair is being rebound.
-            # Release the final decoded JAR before reconciliation and Oracle
-            # indexing so its bytes cannot overlap later phase RSS peaks.
-            snapshot_template_memo.clear()
-            del load_snapshot, snapshot_template_memo
+
+            if lineages:
+                # Warm helper compilation and its LRU contract on one lineage
+                # before worker threads start, avoiding duplicate javac races.
+                record_lineage_snapshot(build_lineage_snapshot(lineages[0]))
+                remaining = iter(lineages[1:])
+                if artifact_snapshot_workers == 1:
+                    for lineage in remaining:
+                        record_lineage_snapshot(build_lineage_snapshot(lineage))
+                else:
+                    # Submit only a bounded rolling window. Completed snapshots
+                    # can be much larger than their JARs; retaining a Future for
+                    # every dependency would defeat the phase's memory bound.
+                    with ThreadPoolExecutor(
+                        max_workers=artifact_snapshot_workers,
+                        thread_name_prefix="binary-artifact-snapshot",
+                    ) as executor:
+                        active = []
+                        for _ in range(artifact_snapshot_workers):
+                            try:
+                                lineage = next(remaining)
+                            except StopIteration:
+                                break
+                            active.append(executor.submit(
+                                build_lineage_snapshot, lineage
+                            ))
+                        while active:
+                            future = active.pop(0)
+                            record_lineage_snapshot(future.result())
+                            try:
+                                lineage = next(remaining)
+                            except StopIteration:
+                                continue
+                            active.append(executor.submit(
+                                build_lineage_snapshot, lineage
+                            ))
+            del build_lineage_snapshot, record_lineage_snapshot
             # Secondary lookup trees are not consulted while immutable archive
             # facts are appended. Building each tree once is materially cheaper
             # than maintaining it across hundreds of thousands of inserts, and
@@ -1734,6 +1845,7 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                 ),
                 "artifact_count": len(base_artifacts) + len(current_artifacts),
                 "pairing_count": len(pairings),
+                "artifact_snapshot_workers": artifact_snapshot_workers,
             })
             reconciliation_started = time.perf_counter()
             # Reconcile both runtime views over the same symbolic class
@@ -1760,18 +1872,9 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                     )
                 )
             base_retained_kinds = {
-                "provider_binding",
-                "class_definition",
                 "resource_selection",
             }
-            if not runtime_sides_identical:
-                # Only cross-version member-resolution comparison consumes the
-                # base member records. Exact sides prove that pass is empty.
-                base_retained_kinds.add("member_resolution")
             current_retained_kinds = {
-                "provider_binding",
-                "class_definition",
-                "member_resolution",
                 "resource_selection",
             }
             base_runtime = RuntimeReconciler(
@@ -1796,6 +1899,7 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                     capability_policy=capability,
                     additional_initial_classes=common_runtime_classes,
                 ).reconcile(retain_record_kinds=current_retained_kinds)
+            del common_runtime_classes
             base_runtime_identity = base_runtime.identity
             current_runtime_identity = current_runtime.identity
             definition_verification = {
@@ -1804,10 +1908,10 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                 ),
                 "authority": "target_jvm_execution_and_bound_platform_image",
                 "base": _definition_verification_summary(
-                    base_runtime, base_platform
+                    base_runtime, base_platform, base_store
                 ),
                 "current": _definition_verification_summary(
-                    current_runtime, current_platform
+                    current_runtime, current_platform, current_store
                 ),
             }
             phase_timings.append({
@@ -1857,6 +1961,18 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                 current_reconciliation=current_runtime,
                 artifact_local_diffs=diffs,
             ).build()
+            # Provider and definition evidence was deliberately not retained
+            # during the reconciliation/decision peaks. Restore it only when
+            # a downstream semantic consumer is actually present; empty
+            # semantic and entrypoint fast paths use only persisted summaries.
+            if source_overlay is not None or semantic_overlay_requires_runtime_selection(
+                current_store, decisions
+            ):
+                current_runtime = hydrate_runtime_reconciliation(
+                    current_store,
+                    current_runtime,
+                    ("provider_binding", "class_definition"),
+                )
             inline_overlay = None
             if source_overlay is not None:
                 inline_overlay = build_inline_consumption_overlay(

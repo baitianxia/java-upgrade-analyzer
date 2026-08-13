@@ -17,7 +17,10 @@ import binary_artifact_diff  # noqa: E402
 from binary_fact_store import BinaryFactStore  # noqa: E402
 from binary_first_model import ArtifactInstance, RuntimeProfile  # noqa: E402
 from binary_platform_image import JdkPlatformImage  # noqa: E402
-from binary_runtime_reconciler import RuntimeReconciler  # noqa: E402
+from binary_runtime_reconciler import (  # noqa: E402
+    RuntimeReconciler,
+    hydrate_runtime_reconciliation,
+)
 
 
 def current_jdk_home():
@@ -374,6 +377,17 @@ class BinaryRuntimeReconcilerTest(unittest.TestCase):
                 self.platform,
                 analysis_context_identity="analysis-context-retention",
             ).reconcile(retain_record_kinds=retained)
+            hydrated = hydrate_runtime_reconciliation(
+                compact_store,
+                compact,
+                (
+                    "member_resolution",
+                    "dispatch_resolution",
+                    "type_resolution",
+                    "class_initialization_resolution",
+                    "linkage_resolution",
+                ),
+            )
             full_evidence = sorted(
                 full_store.rows("reconciliation_records"),
                 key=lambda item: item["record_identity"],
@@ -392,6 +406,15 @@ class BinaryRuntimeReconcilerTest(unittest.TestCase):
         self.assertEqual(compact.type_resolutions, ())
         self.assertEqual(compact.class_initialization_resolutions, ())
         self.assertEqual(compact.linkage_resolutions, ())
+        self.assertEqual(hydrated.member_resolutions, full.member_resolutions)
+        self.assertEqual(hydrated.dispatch_resolutions, full.dispatch_resolutions)
+        self.assertEqual(hydrated.type_resolutions, full.type_resolutions)
+        self.assertEqual(
+            hydrated.class_initialization_resolutions,
+            full.class_initialization_resolutions,
+        )
+        self.assertEqual(hydrated.linkage_resolutions, full.linkage_resolutions)
+        self.assertEqual(hydrated.identity, compact.identity)
         self.assertEqual(compact_evidence, full_evidence)
 
     def test_member_resolution_remains_resolved_when_access_linkage_fails(self):

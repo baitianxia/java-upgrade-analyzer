@@ -1,6 +1,7 @@
 import sys
 import json
 import hashlib
+import random
 from pathlib import Path
 import unittest
 
@@ -155,9 +156,14 @@ class BinaryFirstContractTest(unittest.TestCase):
                 ],
             },
             {"numbers": [0, -0.0, 1.0e-12, 1.0e20]},
+            {"large_buffer_boundary": "x" * (70 * 1024)},
         )
         for payload in payloads:
             with self.subTest(payload=payload):
+                self.assertEqual(
+                    "".join(contract._iter_canonical_json(payload)),
+                    contract.canonical_payload_bytes(payload).decode("utf-8"),
+                )
                 self.assertEqual(
                     contract.canonical_identity(
                         "example", payload, schema_version="1"
@@ -174,9 +180,80 @@ class BinaryFirstContractTest(unittest.TestCase):
                 contract.canonical_identity_streaming(
                     "example", payload, schema_version="1"
                 )
+            with self.subTest(payload=payload), self.assertRaises(
+                contract.BinaryFirstContractError
+            ):
+                "".join(contract._iter_canonical_json(payload))
         with self.assertRaises(ValueError):
             contract.canonical_identity_streaming(
                 "example", {"value": float("nan")}, schema_version="1"
+            )
+
+    def test_streaming_canonical_identity_randomized_byte_equivalence(self):
+        random_source = random.Random(20260813)
+        scalar_values = (
+            None, False, True, 0, -1, 2**63, -0.0, 3.25, 1.0e-12,
+            "", "ascii", "运行时✓", "line\n\"quoted\"\\", "😀", "\u0000",
+        )
+
+        def value(depth):
+            if depth == 0:
+                return random_source.choice(scalar_values)
+            kind = random_source.randrange(5)
+            if kind == 0:
+                return random_source.choice(scalar_values)
+            if kind == 1:
+                return [value(depth - 1) for _ in range(random_source.randrange(5))]
+            if kind == 2:
+                return tuple(
+                    value(depth - 1) for _ in range(random_source.randrange(5))
+                )
+            if kind == 3:
+                return {
+                    f"key-{index}-{random_source.randrange(1000)}": value(depth - 1)
+                    for index in range(random_source.randrange(5))
+                }
+            return {
+                random_source.choice(("alpha", "beta", "运行时", "😀"))
+                for _ in range(random_source.randrange(5))
+            }
+
+        for index in range(500):
+            payload = value(4)
+            with self.subTest(index=index, payload=payload):
+                self.assertEqual(
+                    contract.canonical_identity(
+                        "randomized-equivalence", payload, schema_version="1"
+                    ),
+                    contract.canonical_identity_streaming(
+                        "randomized-equivalence", payload, schema_version="1"
+                    ),
+                )
+
+    def test_native_json_identity_is_byte_equivalent_for_internal_trees(self):
+        payloads = (
+            None,
+            {"text": "运行时✓", "escaped": "line\n\"quoted\"\\"},
+            {"values": [None, False, True, 0, -1, -0.0, 3.25, 1.0e20]},
+            {"nested": ({"b": 2, "a": 1}, ("x", "😀"))},
+        )
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                self.assertEqual(
+                    contract.canonical_identity(
+                        "native-json", payload, schema_version="1"
+                    ),
+                    contract.canonical_identity_native_json(
+                        "native-json", payload, schema_version="1"
+                    ),
+                )
+        with self.assertRaises(ValueError):
+            contract.canonical_identity_native_json(
+                "native-json", {"value": float("nan")}, schema_version="1"
+            )
+        with self.assertRaises(TypeError):
+            contract.canonical_identity_native_json(
+                "native-json", {"value": {"unsupported"}}, schema_version="1"
             )
 
     def test_native_type_fast_paths_preserve_the_frozen_identity(self):
@@ -212,6 +289,10 @@ class BinaryFirstContractTest(unittest.TestCase):
             ),
             expected,
         )
+        self.assertEqual(
+            "".join(contract._iter_canonical_json(payload)),
+            contract.canonical_payload_bytes(payload).decode("utf-8"),
+        )
 
     def test_container_subclass_fallbacks_match_and_reject_invalid_keys(self):
         class DictSubclass(dict):
@@ -229,6 +310,10 @@ class BinaryFirstContractTest(unittest.TestCase):
         )
         for payload in payloads:
             with self.subTest(container=type(payload).__name__):
+                self.assertEqual(
+                    "".join(contract._iter_canonical_json(payload)),
+                    contract.canonical_payload_bytes(payload).decode("utf-8"),
+                )
                 self.assertEqual(
                     contract.canonical_identity(
                         "container-subclass", payload, schema_version="1"
@@ -250,6 +335,9 @@ class BinaryFirstContractTest(unittest.TestCase):
             self.assertEqual(
                 error.exception.reason_code, "BINARY_IDENTITY_KEY_INVALID"
             )
+        with self.assertRaises(contract.BinaryFirstContractError) as error:
+            "".join(contract._iter_canonical_json(invalid))
+        self.assertEqual(error.exception.reason_code, "BINARY_IDENTITY_KEY_INVALID")
 
     def test_streaming_sequence_is_repeatable_and_byte_equivalent(self):
         values = ["first", "运行时", "third"]
@@ -264,6 +352,10 @@ class BinaryFirstContractTest(unittest.TestCase):
                 "example", payload, schema_version="1"
             ),
             expected,
+        )
+        self.assertEqual(
+            "".join(contract._iter_canonical_json(sequence)),
+            contract.canonical_payload_bytes(values).decode("utf-8"),
         )
         self.assertEqual(
             contract.canonical_identity_streaming(

@@ -27,6 +27,7 @@ SCRIPTS = ROOT / "scripts"
 BRANCH_FUNCTIONS = {
     "_canonical_value",
     "_iter_canonical_json",
+    "_update_canonical_digest",
     "artifact_content_identity",
     "derive_formal_result_state",
     "validate_formal_result_state",

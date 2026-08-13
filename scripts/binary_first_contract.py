@@ -12,6 +12,8 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping
+from functools import lru_cache
+from json.encoder import encode_basestring
 
 
 PHASE_ORDER = (
@@ -41,6 +43,7 @@ _CANONICAL_JSON_ENCODER = json.JSONEncoder(
     separators=(",", ":"),
     allow_nan=False,
 )
+_STREAMING_DIGEST_BUFFER_CHARS = 64 * 1024
 
 
 class BinaryFirstContractError(ValueError):
@@ -174,10 +177,65 @@ def canonical_identity(namespace, payload, *, schema_version):
     return hashlib.sha256(canonical_payload_bytes(envelope)).hexdigest()
 
 
+def canonical_identity_native_json(namespace, payload, *, schema_version):
+    """Hash an internally constructed native JSON tree without a second walk.
+
+    This is deliberately separate from :func:`canonical_identity`. Public and
+    boundary-facing callers must keep the general API, which canonicalizes
+    sets, Mapping subclasses and container subclasses and rejects non-string
+    keys with the frozen reason code. Hot fact builders construct exact
+    dict/list/tuple/scalar trees themselves; JSONEncoder already emits their
+    frozen bytes and rejects unsupported values/NaN, so recursively walking
+    every scalar first adds no correctness evidence.
+    """
+    namespace = str(namespace or "").strip()
+    schema_version = str(schema_version or "").strip()
+    if not namespace or not schema_version:
+        raise BinaryFirstContractError(
+            "BINARY_IDENTITY_NAMESPACE_MISSING",
+            "identity namespace and schema_version are required",
+        )
+    prefix, suffix = _native_identity_envelope_bytes(namespace, schema_version)
+    digest = hashlib.sha256(prefix)
+    digest.update(_CANONICAL_JSON_ENCODER.encode(payload).encode("utf-8"))
+    digest.update(suffix)
+    return digest.hexdigest()
+
+
+@lru_cache(maxsize=256)
+def _native_identity_envelope_bytes(
+    namespace: str, schema_version: str
+) -> tuple[bytes, bytes]:
+    # Object keys are sorted as namespace, payload, schema_version.
+    return (
+        (
+            '{"namespace":' + encode_basestring(namespace) + ',"payload":'
+        ).encode("utf-8"),
+        (
+            ',"schema_version":' + encode_basestring(schema_version) + "}"
+        ).encode("utf-8"),
+    )
+
+
 def _iter_canonical_json(value):
     """Yield the existing canonical JSON encoding without copying its tree."""
     value_type = type(value)
-    if value is None or value_type in (str, int, float, bool):
+    if value is None:
+        yield "null"
+        return
+    if value_type is str:
+        # ``JSONEncoder.encode`` constructs a fresh iterator for every scalar.
+        # This is the exact ensure_ascii=False primitive used by that encoder.
+        yield encode_basestring(value)
+        return
+    if value_type is bool:
+        yield "true" if value else "false"
+        return
+    if value_type is int:
+        yield str(value)
+        return
+    if value_type is float:
+        # Preserve allow_nan=False and JSONEncoder's exact float spelling.
         yield _CANONICAL_JSON_ENCODER.encode(value)
         return
     if value_type is dict:
@@ -190,7 +248,7 @@ def _iter_canonical_json(value):
         for index, key in enumerate(sorted(value)):
             if index:
                 yield ","
-            yield _CANONICAL_JSON_ENCODER.encode(key)
+            yield encode_basestring(key)
             yield ":"
             yield from _iter_canonical_json(value[key])
         yield "}"
@@ -222,7 +280,7 @@ def _iter_canonical_json(value):
         for index, key in enumerate(sorted(value)):
             if index:
                 yield ","
-            yield _CANONICAL_JSON_ENCODER.encode(key)
+            yield encode_basestring(key)
             yield ":"
             yield from _iter_canonical_json(value[key])
         yield "}"
@@ -260,13 +318,120 @@ def canonical_identity_streaming(namespace, payload, *, schema_version):
             "identity namespace and schema_version are required",
         )
     digest = hashlib.sha256()
-    for chunk in _iter_canonical_json({
+    _update_canonical_digest(digest, {
         "namespace": namespace,
         "schema_version": schema_version,
         "payload": payload,
-    }):
-        digest.update(chunk.encode("utf-8"))
+    })
     return digest.hexdigest()
+
+
+def _update_canonical_digest(digest, value):
+    """Write canonical JSON directly into a digest in bounded text blocks.
+
+    ``yield from`` is elegant but makes every scalar traverse each generator
+    frame above it. Runtime truth sets contain millions of shallow scalars, so
+    a direct recursive writer preserves the same bytes while avoiding that
+    multiplicative interpreter overhead.
+    """
+    buffered: list[str] = []
+    buffered_chars = 0
+
+    def append(chunk: str) -> None:
+        nonlocal buffered_chars
+        buffered.append(chunk)
+        buffered_chars += len(chunk)
+        if buffered_chars >= _STREAMING_DIGEST_BUFFER_CHARS:
+            digest.update("".join(buffered).encode("utf-8"))
+            buffered.clear()
+            buffered_chars = 0
+
+    def write(item) -> None:
+        item_type = type(item)
+        if item is None:
+            append("null")
+            return
+        if item_type is str:
+            append(encode_basestring(item))
+            return
+        if item_type is bool:
+            append("true" if item else "false")
+            return
+        if item_type is int:
+            append(str(item))
+            return
+        if item_type is float:
+            append(_CANONICAL_JSON_ENCODER.encode(item))
+            return
+        if item_type is dict:
+            if any(not isinstance(key, str) for key in item):
+                raise BinaryFirstContractError(
+                    "BINARY_IDENTITY_KEY_INVALID",
+                    "identity object keys must be strings",
+                )
+            append("{")
+            for index, key in enumerate(sorted(item)):
+                if index:
+                    append(",")
+                append(encode_basestring(key))
+                append(":")
+                write(item[key])
+            append("}")
+            return
+        if item_type in (list, tuple) or item_type is StreamingCanonicalSequence:
+            append("[")
+            for index, child in enumerate(item):
+                if index:
+                    append(",")
+                write(child)
+            append("]")
+            return
+        if item_type is set:
+            texts = ["".join(_iter_canonical_json(child)) for child in item]
+            append("[")
+            append(",".join(sorted(texts)))
+            append("]")
+            return
+        if isinstance(item, Mapping):
+            if any(not isinstance(key, str) for key in item):
+                raise BinaryFirstContractError(
+                    "BINARY_IDENTITY_KEY_INVALID",
+                    "identity object keys must be strings",
+                )
+            append("{")
+            for index, key in enumerate(sorted(item)):
+                if index:
+                    append(",")
+                append(encode_basestring(key))
+                append(":")
+                write(item[key])
+            append("}")
+            return
+        if isinstance(item, (list, tuple, StreamingCanonicalSequence)):
+            append("[")
+            for index, child in enumerate(item):
+                if index:
+                    append(",")
+                write(child)
+            append("]")
+            return
+        if isinstance(item, set):
+            texts = ["".join(_iter_canonical_json(child)) for child in item]
+            append("[")
+            append(",".join(sorted(texts)))
+            append("]")
+            return
+        if item is None or isinstance(item, (str, int, float, bool)):
+            append(_CANONICAL_JSON_ENCODER.encode(item))
+            return
+        raise BinaryFirstContractError(
+            "BINARY_IDENTITY_VALUE_UNSUPPORTED",
+            f"unsupported identity value type: {type(item).__name__}",
+        )
+
+    write(value)
+    if buffered:
+        digest.update("".join(buffered).encode("utf-8"))
 
 
 def artifact_content_identity(content_sha256, byte_length, *, schema_version="1"):

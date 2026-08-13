@@ -104,6 +104,7 @@ def verify_class_definitions(
     with short_temporary_directory(prefix="definition-input") as temp_text:
         root = Path(temp_text)
         expected_hashes = {}
+        created_parents = set()
         for name in names:
             path = PurePosixPath(name)
             if path.is_absolute() or ".." in path.parts or not name or "." in name:
@@ -111,7 +112,10 @@ def verify_class_definitions(
                     "CLASS_DEFINITION_NAME_INVALID", name
                 )
             destination = root.joinpath(*path.parts).with_suffix(".class")
-            destination.parent.mkdir(parents=True, exist_ok=True)
+            parent = destination.parent
+            if parent not in created_parents:
+                parent.mkdir(parents=True, exist_ok=True)
+                created_parents.add(parent)
             content = bytes(selected_class_bytes[name])
             expected_hashes[name] = hashlib.sha256(content).hexdigest()
             destination.write_bytes(content)

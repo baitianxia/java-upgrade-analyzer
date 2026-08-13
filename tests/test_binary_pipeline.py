@@ -20,6 +20,7 @@ import binary_asm_helper  # noqa: E402
 import binary_pipeline  # noqa: E402
 from binary_pipeline import (  # noqa: E402
     BinaryPipelineError,
+    _artifact_snapshot_worker_count,
     _source_inputs_contract,
     run_pipeline,
 )
@@ -70,6 +71,23 @@ class BinaryPipelineTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
+
+    def test_artifact_snapshot_worker_count_is_bounded_and_exact(self):
+        with patch.object(binary_pipeline.os, "cpu_count", return_value=12):
+            self.assertEqual(_artifact_snapshot_worker_count(None, 20), 3)
+            self.assertEqual(_artifact_snapshot_worker_count(None, 2), 2)
+            self.assertEqual(_artifact_snapshot_worker_count(None, 0), 0)
+        self.assertEqual(_artifact_snapshot_worker_count(8, 3), 3)
+        self.assertEqual(_artifact_snapshot_worker_count("2", 20), 2)
+        for value in (True, False, 0, 9, 1.5, "many"):
+            with self.subTest(value=value), self.assertRaises(
+                BinaryPipelineError
+            ) as error:
+                _artifact_snapshot_worker_count(value, 20)
+            self.assertEqual(
+                error.exception.reason_code,
+                "BINARY_ARTIFACT_WORKER_COUNT_INVALID",
+            )
 
     def test_cli_persists_structured_failure_for_memory_exhaustion(self):
         config = self.root / "config.json"

@@ -13,7 +13,10 @@ from typing import Any, Iterable, Iterator
 import zlib
 
 from binary_artifact_diff import ArtifactSnapshot
-from binary_first_contract import BinaryFirstContractError, canonical_identity
+from binary_first_contract import (
+    BinaryFirstContractError,
+    canonical_identity_native_json,
+)
 from binary_first_model import ArtifactInstance
 
 
@@ -44,7 +47,9 @@ def _json(value: Any) -> str:
 
 
 def _identity(namespace: str, payload: Any) -> str:
-    return canonical_identity(namespace, payload, schema_version="1")
+    return canonical_identity_native_json(
+        namespace, payload, schema_version="1"
+    )
 
 
 class BinaryFactStore:

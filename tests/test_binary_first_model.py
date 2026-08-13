@@ -13,15 +13,21 @@ from binary_first_model import (  # noqa: E402
     AnalysisScope,
     ArtifactInstance,
     BuildIdentityBundle,
+    ClassDefinitionResolution,
     CrossVersionArtifactPairing,
     Decision,
     DispatchResolution,
     FactBuildInputSlice,
+    MemberResolution,
     ProjectionAssessment,
     ProviderBinding,
     ResultGeneration,
     RuntimeComparison,
     RuntimeProfile,
+    _class_definition_resolution_identity_native,
+    _dispatch_resolution_identity_native,
+    _member_resolution_identity_native,
+    _provider_binding_identity_native,
     build_projection_obligations,
     validate_decision_conservation,
     validate_projection_conservation,
@@ -205,6 +211,74 @@ class RuntimeAndArtifactIdentityTest(unittest.TestCase):
 
 
 class BindingDecisionAndSnapshotTest(unittest.TestCase):
+    def test_internal_native_reconciliation_identities_match_public_contract(self):
+        provider_payload = {
+            "runtime_profile_identity": "profile-1",
+            "initiating_loader_realm_identity": "application",
+            "class_name": "example/Service",
+            "class_provider_status": "resolved",
+            "selected_defining_loader_realm_identity": "application",
+            "selected_artifact_instance_identity": "artifact-1",
+            "selected_class_variant_identity": "variant-1",
+            "selection_evidence": {"candidate_count": 1},
+        }
+        provider = ProviderBinding(provider_payload)
+        self.assertEqual(
+            _provider_binding_identity_native(provider_payload), provider.identity
+        )
+
+        definition_evidence = {
+            "target_class_major": 65,
+            "target_jvm_verification": {"status": "definition_ready"},
+        }
+        definition = ClassDefinitionResolution(
+            provider.identity, "variant-1", "definition_ready", definition_evidence
+        )
+        self.assertEqual(
+            _class_definition_resolution_identity_native(
+                provider.identity, "variant-1", "definition_ready", definition_evidence
+            ),
+            definition.identity,
+        )
+
+        member_payload = {
+            "member_resolution_status": "resolved",
+            "direct_edge_identity": "edge-1",
+            "resolved_member_identity": "member-1",
+            "resolution_evidence": {"owner": "example/Service"},
+        }
+        member = MemberResolution(member_payload)
+        self.assertEqual(
+            _member_resolution_identity_native(member_payload), member.identity
+        )
+
+        dispatch_evidence = {
+            "member_resolution_identity": member.identity,
+            "hierarchy_coverage_complete": True,
+        }
+        dispatch = DispatchResolution(
+            "edge-1", "exact", ("member-1",), "complete", dispatch_evidence
+        )
+        self.assertEqual(
+            _dispatch_resolution_identity_native(
+                "edge-1", "exact", ("member-1",), "complete", dispatch_evidence
+            ),
+            dispatch.identity,
+        )
+
+    def test_internal_native_reconciliation_identity_keeps_validation_contract(self):
+        with self.assertRaises(BinaryFirstContractError) as public_error:
+            ProviderBinding({
+                "class_provider_status": "ambiguous",
+                "selected_artifact_instance_identity": "artifact-1",
+            })
+        with self.assertRaises(BinaryFirstContractError) as internal_error:
+            _provider_binding_identity_native({
+                "class_provider_status": "ambiguous",
+                "selected_artifact_instance_identity": "artifact-1",
+            })
+        self.assertEqual(internal_error.exception.reason_code, public_error.exception.reason_code)
+
     def test_nonresolved_provider_cannot_select_physical_instance(self):
         with self.assertRaises(BinaryFirstContractError) as error:
             ProviderBinding({

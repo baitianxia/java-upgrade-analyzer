@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 from typing import Any, Iterable, Mapping
 import zlib
@@ -18,15 +18,15 @@ from binary_fact_store import BinaryFactStore
 from binary_first_contract import (
     BinaryFirstContractError,
     StreamingCanonicalSequence,
-    canonical_identity,
+    canonical_identity_native_json,
     canonical_identity_streaming,
 )
 from binary_first_model import (
-    ClassDefinitionResolution,
-    DispatchResolution,
-    MemberResolution,
-    ProviderBinding,
     RuntimeProfile,
+    _class_definition_resolution_identity_native,
+    _dispatch_resolution_identity_native,
+    _member_resolution_identity_native,
+    _provider_binding_identity_native,
 )
 from binary_platform_image import JdkPlatformImage, PlatformClassFact
 
@@ -65,8 +65,117 @@ class _StoreClassBytes(Mapping[str, bytes]):
         return len(self.variants_by_name)
 
 
+_MISSING_COMPACT_VALUE = object()
+
+
+class _CompactRow(Mapping[str, Any]):
+    """Tuple-backed immutable row for large reconciliation indexes."""
+
+    __slots__ = ("_values",)
+    FIELDS: tuple[str, ...] = ()
+    INDEX: Mapping[str, int] = {}
+
+    def __init__(self, values: Iterable[Any]):
+        values = tuple(values)
+        if len(values) != len(self.FIELDS):
+            raise RuntimeReconciliationError(
+                "RUNTIME_COMPACT_ROW_SHAPE_INVALID",
+                f"{type(self).__name__}: {len(values)} != {len(self.FIELDS)}",
+            )
+        self._values = values
+
+    def __getitem__(self, key: str) -> Any:
+        try:
+            value = self._values[self.INDEX[key]]
+        except KeyError as error:
+            raise KeyError(key) from error
+        if value is _MISSING_COMPACT_VALUE:
+            raise KeyError(key)
+        return value
+
+    def __iter__(self) -> Iterator[str]:
+        return (
+            field for field, value in zip(self.FIELDS, self._values)
+            if value is not _MISSING_COMPACT_VALUE
+        )
+
+    def __len__(self) -> int:
+        return sum(
+            value is not _MISSING_COMPACT_VALUE for value in self._values
+        )
+
+    def __or__(self, other: Mapping[str, Any]) -> dict[str, Any]:
+        return dict(self) | dict(other)
+
+    def __ror__(self, other: Mapping[str, Any]) -> dict[str, Any]:
+        return dict(other) | dict(self)
+
+
+class _ClassRow(_CompactRow):
+    FIELDS = (
+        "class_variant_identity", "artifact_instance_identity", "class_name",
+        "class_major", "multi_release_version", "parse_status", "failure_kind",
+    )
+    INDEX = {name: index for index, name in enumerate(FIELDS)}
+
+
+class _ClassFactHeader(_CompactRow):
+    FIELDS = (
+        "class_name", "class_access", "super_name", "interfaces",
+        "nest_host", "nest_members",
+    )
+    INDEX = {name: index for index, name in enumerate(FIELDS)}
+
+
+class _MemberRow(_CompactRow):
+    FIELDS = (
+        "member_identity", "class_variant_identity", "class_name",
+        "member_kind", "member_name", "descriptor", "access_flags",
+    )
+    INDEX = {name: index for index, name in enumerate(FIELDS)}
+
+
+class _ProviderRuntimeRow(_CompactRow):
+    """Provider fields still consulted after complete evidence is persisted."""
+
+    FIELDS = (
+        "runtime_profile_identity",
+        "initiating_loader_realm_identity",
+        "class_name",
+        "class_provider_status",
+        "provider_binding_identity",
+        "selected_defining_loader_realm_identity",
+        "selected_artifact_instance_identity",
+        "selected_class_variant_identity",
+        "provider_equivalence_set_identity",
+    )
+    INDEX = {name: index for index, name in enumerate(FIELDS)}
+
+
+class _DefinitionRuntimeRow(_CompactRow):
+    """Definition fields still consulted while resolving runtime edges."""
+
+    FIELDS = (
+        "initiating_loader_realm_identity",
+        "class_name",
+        "class_definition_status",
+        "class_load_status",
+        "class_definition_resolution_identity",
+        "provider_binding_identity",
+    )
+    INDEX = {name: index for index, name in enumerate(FIELDS)}
+
+
+def _shared_string(value: Any, pool: dict[str, str]) -> Any:
+    if type(value) is not str:
+        return value
+    return pool.setdefault(value, value)
+
+
 def _identity(namespace: str, payload: Any) -> str:
-    return canonical_identity(namespace, payload, schema_version="1")
+    return canonical_identity_native_json(
+        namespace, payload, schema_version="1"
+    )
 
 
 def _type_provider_owner(symbolic_owner: str) -> str:
@@ -190,6 +299,49 @@ _RECONCILIATION_RECORD_FIELDS = {
         "resource_selection_status", "resource_selection_identity",
     ),
 }
+
+_RECONCILIATION_RESULT_FIELDS_BY_KIND = {
+    "provider_binding": "provider_bindings",
+    "class_definition": "class_definitions",
+    "member_resolution": "member_resolutions",
+    "dispatch_resolution": "dispatch_resolutions",
+    "type_resolution": "type_resolutions",
+    "class_initialization_resolution": "class_initialization_resolutions",
+    "linkage_resolution": "linkage_resolutions",
+    "resource_selection": "resource_selections",
+}
+
+
+def hydrate_runtime_reconciliation(
+    store: BinaryFactStore,
+    reconciliation: RuntimeReconciliationResult,
+    record_kinds: Iterable[str],
+) -> RuntimeReconciliationResult:
+    """Restore exact persisted record families omitted from the Python view.
+
+    Selective reconciliation controls transient memory only; SQLite remains the
+    complete authority. Downstream phases must explicitly hydrate every family
+    they consume so the optimization cannot silently turn absent memory into
+    absent analysis evidence.
+    """
+    if not isinstance(reconciliation, RuntimeReconciliationResult):
+        # Preserve support for test doubles and callers predating selective
+        # retention. They have no persisted hydration contract.
+        return reconciliation
+    requested = {str(kind) for kind in record_kinds}
+    unknown = requested - set(_RECONCILIATION_RESULT_FIELDS_BY_KIND)
+    if unknown:
+        raise RuntimeReconciliationError(
+            "RUNTIME_RECONCILIATION_HYDRATION_KIND_INVALID",
+            f"unknown reconciliation hydration kinds: {sorted(unknown)}",
+        )
+    replacements = {}
+    for kind in sorted(requested):
+        field_name = _RECONCILIATION_RESULT_FIELDS_BY_KIND[kind]
+        if getattr(reconciliation, field_name):
+            continue
+        replacements[field_name] = tuple(store.reconciliation_payloads(kind))
+    return replace(reconciliation, **replacements) if replacements else reconciliation
 
 
 class _CompactIdentitySequence:
@@ -341,6 +493,7 @@ class RuntimeReconciler:
             )
         self.target_java_major = target_major
         self.target_class_major = target_major + 44
+        shared_strings: dict[str, str] = {}
         self.artifacts = {
             row["artifact_instance_identity"]: row
             for row in store.rows(
@@ -349,12 +502,22 @@ class RuntimeReconciler:
                 parameters=(runtime_profile.identity,),
             )
         }
+        for artifact_identity in self.artifacts:
+            shared_strings[artifact_identity] = artifact_identity
         # Runtime selection needs only these seven scalar fields.  The generic
         # metadata reader also materializes physical labels and content/contract
         # digests for every class, retaining several unused Python strings per
         # row across the whole reconciliation phase.
         self.classes = [
-            dict(row)
+            _ClassRow((
+                _shared_string(row[0], shared_strings),
+                _shared_string(row[1], shared_strings),
+                _shared_string(row[2], shared_strings),
+                row[3],
+                row[4],
+                _shared_string(row[5], shared_strings),
+                _shared_string(row[6], shared_strings),
+            ))
             for row in store.connection.execute(
                 """
                 SELECT class_variant_identity,artifact_instance_identity,
@@ -365,21 +528,32 @@ class RuntimeReconciler:
             )
         ]
         self.class_by_variant = {row["class_variant_identity"]: row for row in self.classes}
-        self.class_fact_headers: dict[str, dict[str, Any]] = {}
+        self.class_fact_headers: dict[str, Mapping[str, Any]] = {}
         for row in store.connection.execute(
             "SELECT class_variant_identity,fact_zlib FROM classes"
         ):
             fact = json.loads(zlib.decompress(row["fact_zlib"]).decode("utf-8"))
-            self.class_fact_headers[row["class_variant_identity"]] = {
-                "class_name": fact.get("class_name"),
-                "class_access": fact.get("class_access"),
-                "super_name": fact.get("super_name"),
-                "interfaces": tuple(fact.get("interfaces") or ()),
-                "nest_host": fact.get("nest_host"),
-                "nest_members": tuple(fact.get("nest_members") or ()),
-            }
-        self.members_by_variant: dict[str, list[dict[str, Any]]] = {}
-        self.member_by_identity: dict[str, dict[str, Any]] = {}
+            variant_identity = _shared_string(
+                row["class_variant_identity"], shared_strings
+            )
+            self.class_fact_headers[variant_identity] = (
+                _ClassFactHeader((
+                    _shared_string(fact.get("class_name"), shared_strings),
+                    fact.get("class_access"),
+                    _shared_string(fact.get("super_name"), shared_strings),
+                    tuple(
+                        _shared_string(value, shared_strings)
+                        for value in fact.get("interfaces") or ()
+                    ),
+                    _shared_string(fact.get("nest_host"), shared_strings),
+                    tuple(
+                        _shared_string(value, shared_strings)
+                        for value in fact.get("nest_members") or ()
+                    ),
+                ))
+            )
+        self.members_by_variant: dict[str, list[Mapping[str, Any]]] = {}
+        self.member_by_identity: dict[str, Mapping[str, Any]] = {}
         for raw in store.connection.execute(
             """
             SELECT member_identity,class_variant_identity,class_name,
@@ -387,9 +561,21 @@ class RuntimeReconciler:
             FROM members
             """
         ):
-            row = dict(raw)
+            row = _MemberRow((
+                raw[0],
+                _shared_string(raw[1], shared_strings),
+                _shared_string(raw[2], shared_strings),
+                _shared_string(raw[3], shared_strings),
+                _shared_string(raw[4], shared_strings),
+                _shared_string(raw[5], shared_strings),
+                raw[6],
+            ))
             self.members_by_variant.setdefault(row["class_variant_identity"], []).append(row)
             self.member_by_identity[row["member_identity"]] = row
+        # Every pooled value is now owned by at least one compact row. The
+        # construction dictionary itself would only duplicate those references
+        # throughout reconciliation, so release it before provider graphs grow.
+        shared_strings.clear()
         self.realms, self.entrypoint_realms, topology_gaps = self._loader_topology(payload)
         self.coverage_gaps = set(topology_gaps)
         profile_coverage = dict(payload.get("field_coverage") or {})
@@ -398,8 +584,12 @@ class RuntimeReconciler:
                 self.coverage_gaps.add(f"runtime_profile_field_unknown:{field_name}")
         if payload.get("resource_selection_coverage_status") != "complete":
             self.coverage_gaps.add("resource_selection_scope_incomplete")
-        self.provider_bindings: dict[tuple[str, str], dict[str, Any]] = {}
-        self.definition_records: dict[tuple[str, str], dict[str, Any]] = {}
+        self.provider_bindings: dict[
+            tuple[str, str], Mapping[str, Any]
+        ] = {}
+        self.definition_records: dict[
+            tuple[str, str], Mapping[str, Any]
+        ] = {}
         self.class_info_cache: dict[tuple[str, str], dict[str, Any] | None] = {}
         self.ancestor_type_cache: dict[tuple[str, str], frozenset[str]] = {}
         self.virtual_dispatch_cache: dict[
@@ -772,8 +962,7 @@ class RuntimeReconciler:
                 "selected_artifact_instance_identity": selected_artifact,
                 "selected_class_variant_identity": selected_variant,
             })
-        binding = ProviderBinding(payload)
-        payload["provider_binding_identity"] = binding.identity
+        payload["provider_binding_identity"] = _provider_binding_identity_native(payload)
         return payload
 
     def _universe(self) -> tuple[tuple[str, str], ...]:
@@ -848,7 +1037,11 @@ class RuntimeReconciler:
             return "module_access_failed"
         return "verification_failed"
 
-    def _build_definitions(self, universe: Iterable[tuple[str, str]]) -> None:
+    def _build_definitions(
+        self,
+        universe: Iterable[tuple[str, str]],
+        accumulator: _ReconciliationAccumulator,
+    ) -> None:
         selected_by_realm: dict[str, dict[str, str]] = {}
         for realm, name in universe:
             provider = self._provider(realm, name)
@@ -863,7 +1056,11 @@ class RuntimeReconciler:
                 # parent realm. The verification input must therefore contain
                 # the complete effective provider view seen by that child.
                 selected_by_realm.setdefault(realm, {})[name] = str(variant)
-        verified: dict[tuple[str, str], dict[str, Any]] = {}
+        # Keep each verifier result map under its realm instead of copying all
+        # entries into another tuple-keyed dictionary. Records are popped as
+        # they are persisted below, so complete target-JVM evidence is never
+        # retained in two whole-runtime maps at once.
+        verified_by_realm: dict[str, dict[str, Any]] = {}
         for realm, selected in selected_by_realm.items():
             current = realm
             seen = set()
@@ -895,8 +1092,7 @@ class RuntimeReconciler:
             except ClassDefinitionVerifierError as error:
                 self.coverage_gaps.add(f"definition_verifier_failed:{realm}:{error.reason_code}")
                 continue
-            for name, outcome in outcomes.items():
-                verified[(realm, name)] = outcome
+            verified_by_realm[realm] = outcomes
 
         security_identity = str(
             self.profile.payload.get("runtime_security_and_package_sealing_policy_identity") or ""
@@ -940,7 +1136,7 @@ class RuntimeReconciler:
                     definition_status = "unsupported"
                     evidence["reason"] = "transformer_profile_unsupported"
                 else:
-                    outcome = verified.get((realm, name))
+                    outcome = verified_by_realm.get(realm, {}).pop(name, None)
                     if outcome is None:
                         definition_status = "unsupported"
                         evidence["reason"] = "target_jvm_verification_unavailable"
@@ -950,7 +1146,7 @@ class RuntimeReconciler:
                             else self._definition_status_from_failure(outcome.get("failure_kind", ""))
                         )
                         evidence["target_jvm_verification"] = outcome
-            resolution = ClassDefinitionResolution(
+            resolution_identity = _class_definition_resolution_identity_native(
                 provider["provider_binding_identity"],
                 str(provider.get("selected_class_variant_identity") or name),
                 definition_status,
@@ -971,11 +1167,51 @@ class RuntimeReconciler:
                     )
                     else "failed"
                 ),
-                "class_definition_resolution_identity": resolution.identity,
+                "class_definition_resolution_identity": resolution_identity,
                 "provider_binding_identity": provider["provider_binding_identity"],
                 "evidence": evidence,
             }
+            accumulator.add("class_definition", record)
             self.definition_records[(realm, name)] = record
+            if "class_definition" not in accumulator.retained_kinds:
+                self.definition_records[(realm, name)] = _DefinitionRuntimeRow(
+                    (
+                        record[field]
+                        if field in record else _MISSING_COMPACT_VALUE
+                    )
+                    for field in _DefinitionRuntimeRow.FIELDS
+                )
+
+    def _compact_persisted_runtime_records(
+        self, retained_kinds: frozenset[str] | set[str]
+    ) -> None:
+        """Release full records that SQLite or the result tuple already owns.
+
+        Edge resolution needs only a small scalar subset of provider and
+        definition evidence. Replacing cache values in place releases each
+        full dictionary before constructing the next compact row, avoiding a
+        second whole-cache residency spike. When callers request a family in
+        the returned result, its accumulator list keeps the exact dictionaries
+        and compaction is skipped because it would only add another view.
+        """
+        if "provider_binding" not in retained_kinds:
+            for key, record in self.provider_bindings.items():
+                self.provider_bindings[key] = _ProviderRuntimeRow(
+                    (
+                        record[field]
+                        if field in record else _MISSING_COMPACT_VALUE
+                    )
+                    for field in _ProviderRuntimeRow.FIELDS
+                )
+        if "class_definition" not in retained_kinds:
+            for key, record in self.definition_records.items():
+                self.definition_records[key] = _DefinitionRuntimeRow(
+                    (
+                        record[field]
+                        if field in record else _MISSING_COMPACT_VALUE
+                    )
+                    for field in _DefinitionRuntimeRow.FIELDS
+                )
 
     def _artifact_security_unsupported(self, artifact_identity: str) -> bool:
         cached = self.artifact_security_unsupported_cache.get(artifact_identity)
@@ -1582,11 +1818,13 @@ class RuntimeReconciler:
                         linkage_status = "illegal_access"
                     else:
                         linkage_status = "resolved"
-            resolution = MemberResolution({"member_resolution_status": status, **payload})
+            resolution_identity = _member_resolution_identity_native(
+                {"member_resolution_status": status, **payload}
+            )
             member_record = {
                 **payload,
                 "member_resolution_status": status,
-                "member_resolution_identity": resolution.identity,
+                "member_resolution_identity": resolution_identity,
             }
             accumulator.add("member_resolution", member_record)
 
@@ -1641,13 +1879,13 @@ class RuntimeReconciler:
                         else:
                             dispatch_status = "partial_possible_set"
                             coverage = "partial"
-            dispatch = DispatchResolution(
+            dispatch_identity = _dispatch_resolution_identity_native(
                 edge["direct_edge_identity"],
                 dispatch_status,
                 targets,
                 coverage,
                 {
-                    "member_resolution_identity": resolution.identity,
+                    "member_resolution_identity": resolution_identity,
                     "hierarchy_coverage_complete": hierarchy_complete,
                     "dispatch_fixed_by_final_declaration": (
                         dispatch_fixed_by_final_declaration
@@ -1662,8 +1900,8 @@ class RuntimeReconciler:
                 "dispatch_status": dispatch_status,
                 "implementation_target_identities": list(targets),
                 "dispatch_coverage_status": coverage,
-                "dispatch_resolution_identity": dispatch.identity,
-                "member_resolution_identity": resolution.identity,
+                "dispatch_resolution_identity": dispatch_identity,
+                "member_resolution_identity": resolution_identity,
             })
             linkage = {
                 "direct_edge_identity": edge["direct_edge_identity"],
@@ -1675,7 +1913,7 @@ class RuntimeReconciler:
                     if linkage_status in {"ambiguous", "unresolved", "unsupported"}
                     else "complete"
                 ),
-                "member_resolution_identity": resolution.identity,
+                "member_resolution_identity": resolution_identity,
             }
             linkage["linkage_resolution_identity"] = _identity(
                 "linkage_resolution_identity", linkage
@@ -1693,40 +1931,34 @@ class RuntimeReconciler:
             else {str(kind) for kind in retain_record_kinds}
         )
         universe = self._universe()
-        self._build_definitions(universe)
-        providers = []
-        for key in universe:
-            record = self._provider(*key)
-            providers.append(record)
-        definitions = [self.definition_records[key] for key in universe]
         accumulator = _ReconciliationAccumulator(
             self.store,
             self.context_identity,
             retained_kinds,
         )
-        for record in providers:
+        # Provider evidence is complete once the runtime universe is closed.
+        # Persist it before target-JVM definition evidence is created so both
+        # full record families never occupy the heap together.
+        for key in universe:
+            record = self._provider(*key)
             accumulator.add("provider_binding", record)
-        for record in definitions:
-            accumulator.add("class_definition", record)
-        # The accumulator now owns retained provider/definition references.
-        # Drop the duplicate list containers before resolving the much larger
-        # edge fact sets.
-        providers = accumulator.records["provider_binding"]
-        definitions = accumulator.records["class_definition"]
+        self._compact_persisted_runtime_records(retained_kinds)
+        self._build_definitions(universe, accumulator)
         self._resolve_edges(universe, accumulator)
         for record in self._resource_selections():
             accumulator.add("resource_selection", record)
         accumulator.flush()
         gaps = tuple(sorted(self.coverage_gaps))
         coverage = "complete" if not gaps else "partial"
-        universe_identity = _identity(
+        universe_identity = canonical_identity_streaming(
             "runtime_reconciliation_universe_identity",
             {
                 "runtime_profile_identity": self.profile.identity,
                 "analysis_context_identity": self.context_identity,
-                "contexts": [list(item) for item in universe],
+                "contexts": StreamingCanonicalSequence(lambda: iter(universe)),
                 "capability_policy_identity": self.capability.identity,
             },
+            schema_version="1",
         )
         result_payload = {
             "analysis_context_identity": self.context_identity,
@@ -1790,4 +2022,5 @@ __all__ = [
     "RuntimeReconciliationError",
     "RuntimeReconciliationResult",
     "RuntimeReconciler",
+    "hydrate_runtime_reconciliation",
 ]

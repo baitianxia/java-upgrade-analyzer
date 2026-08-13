@@ -16,6 +16,7 @@ from binary_first_contract import (
     BinaryFirstContractError,
     analysis_context_identity,
     canonical_identity,
+    canonical_identity_native_json,
     disposition_obligation_identity,
     projection_obligation_key,
 )
@@ -466,41 +467,185 @@ class FactBuildInputSlice:
         ))
 
 
+def _validated_provider_binding_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate a provider binding without choosing its identity encoder."""
+    payload = dict(payload or {})
+    status = str(payload.get("class_provider_status") or "")
+    if status not in PROVIDER_STATUSES:
+        raise BinaryFirstContractError("CLASS_PROVIDER_STATUS_INVALID", status)
+    selected_fields = (
+        "selected_defining_loader_realm_identity",
+        "selected_artifact_instance_identity",
+        "selected_class_variant_identity",
+    )
+    if status == "resolved":
+        for key in selected_fields:
+            _required_text(payload, key)
+        if payload.get("provider_equivalence_set_identity"):
+            raise BinaryFirstContractError(
+                "CLASS_PROVIDER_EQUIVALENCE_INVALID",
+                "resolved provider cannot also use an equivalence set",
+            )
+    elif status == "runtime_equivalent":
+        _required_text(payload, "provider_equivalence_set_identity")
+        if any(payload.get(key) for key in selected_fields):
+            raise BinaryFirstContractError(
+                "CLASS_PROVIDER_SELECTION_INVALID",
+                "runtime-equivalent provider must not choose a physical instance",
+            )
+    elif any(payload.get(key) for key in selected_fields):
+        raise BinaryFirstContractError(
+            "CLASS_PROVIDER_SELECTION_INVALID",
+            f"{status} provider must not choose a physical instance",
+        )
+    return payload
+
+
+def _validated_class_definition_payload(
+    provider_binding_identity: str,
+    target_identity: str,
+    status: str,
+    evidence: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate and materialize a class-definition identity payload."""
+    if status not in CLASS_DEFINITION_STATUSES:
+        raise BinaryFirstContractError("CLASS_DEFINITION_STATUS_INVALID", status)
+    if not evidence:
+        raise BinaryFirstContractError(
+            "CLASS_DEFINITION_EVIDENCE_MISSING", "class definition evidence is required"
+        )
+    return {
+        "class_provider_binding_identity": provider_binding_identity,
+        "class_definition_target_identity": target_identity,
+        "class_definition_status": status,
+        "evidence": dict(evidence),
+    }
+
+
+def _validated_member_resolution_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate a member resolution without choosing its identity encoder."""
+    payload = dict(payload or {})
+    status = str(payload.get("member_resolution_status") or "")
+    if status not in MEMBER_RESOLUTION_STATUSES:
+        raise BinaryFirstContractError("MEMBER_RESOLUTION_STATUS_INVALID", status)
+    resolved = payload.get("resolved_member_identity")
+    equivalent = payload.get("member_equivalence_set_identity")
+    if status == "resolved" and (not resolved or equivalent):
+        raise BinaryFirstContractError(
+            "MEMBER_RESOLUTION_TARGET_INVALID", "resolved requires exactly one member"
+        )
+    if status == "runtime_equivalent" and (not equivalent or resolved):
+        raise BinaryFirstContractError(
+            "MEMBER_RESOLUTION_TARGET_INVALID",
+            "runtime_equivalent requires a member equivalence set",
+        )
+    if status not in {"resolved", "runtime_equivalent"} and (resolved or equivalent):
+        raise BinaryFirstContractError(
+            "MEMBER_RESOLUTION_TARGET_INVALID", f"{status} cannot select a member"
+        )
+    return payload
+
+
+def _validated_dispatch_resolution_payload(
+    direct_edge_identity: str,
+    status: str,
+    implementation_target_identities: tuple[str, ...],
+    coverage_status: str,
+    evidence: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate and materialize a dispatch-resolution identity payload."""
+    if status not in DISPATCH_STATUSES:
+        raise BinaryFirstContractError("DISPATCH_STATUS_INVALID", status)
+    target_count = len(implementation_target_identities)
+    if status in {"unresolved", "no_concrete_implementation", "not_applicable"}:
+        if target_count:
+            raise BinaryFirstContractError(
+                "DISPATCH_TARGET_COUNT_INVALID", f"{status} requires zero targets"
+            )
+    elif target_count == 0:
+        raise BinaryFirstContractError(
+            "DISPATCH_TARGET_COUNT_INVALID", f"{status} requires targets"
+        )
+    if status == "partial_possible_set" and coverage_status != "partial":
+        raise BinaryFirstContractError(
+            "DISPATCH_COVERAGE_INVALID", "partial_possible_set requires partial coverage"
+        )
+    if status == "no_concrete_implementation" and coverage_status != "complete":
+        raise BinaryFirstContractError(
+            "DISPATCH_COVERAGE_INVALID",
+            "no_concrete_implementation requires complete hierarchy coverage",
+        )
+    return {
+        "direct_edge_identity": direct_edge_identity,
+        "dispatch_status": status,
+        "implementation_target_identities": list(implementation_target_identities),
+        "coverage_status": coverage_status,
+        "evidence": dict(evidence),
+    }
+
+
+def _provider_binding_identity_native(payload: Mapping[str, Any]) -> str:
+    """Fast internal identity for reconciler-owned native JSON payloads."""
+    return canonical_identity_native_json(
+        "class_provider_binding",
+        _validated_provider_binding_payload(payload),
+        schema_version="1",
+    )
+
+
+def _class_definition_resolution_identity_native(
+    provider_binding_identity: str,
+    target_identity: str,
+    status: str,
+    evidence: Mapping[str, Any],
+) -> str:
+    """Fast internal identity for reconciler-owned native JSON payloads."""
+    return canonical_identity_native_json(
+        "class_definition_resolution",
+        _validated_class_definition_payload(
+            provider_binding_identity, target_identity, status, evidence
+        ),
+        schema_version="1",
+    )
+
+
+def _member_resolution_identity_native(payload: Mapping[str, Any]) -> str:
+    """Fast internal identity for reconciler-owned native JSON payloads."""
+    return canonical_identity_native_json(
+        "member_resolution",
+        _validated_member_resolution_payload(payload),
+        schema_version="1",
+    )
+
+
+def _dispatch_resolution_identity_native(
+    direct_edge_identity: str,
+    status: str,
+    implementation_target_identities: tuple[str, ...],
+    coverage_status: str,
+    evidence: Mapping[str, Any],
+) -> str:
+    """Fast internal identity for reconciler-owned native JSON payloads."""
+    return canonical_identity_native_json(
+        "dispatch_resolution",
+        _validated_dispatch_resolution_payload(
+            direct_edge_identity,
+            status,
+            implementation_target_identities,
+            coverage_status,
+            evidence,
+        ),
+        schema_version="1",
+    )
+
+
 @dataclass(frozen=True)
 class ProviderBinding:
     payload: Mapping[str, Any]
     identity: str = field(init=False)
 
     def __post_init__(self):
-        payload = dict(self.payload or {})
-        status = str(payload.get("class_provider_status") or "")
-        if status not in PROVIDER_STATUSES:
-            raise BinaryFirstContractError("CLASS_PROVIDER_STATUS_INVALID", status)
-        selected_fields = (
-            "selected_defining_loader_realm_identity",
-            "selected_artifact_instance_identity",
-            "selected_class_variant_identity",
-        )
-        if status == "resolved":
-            for key in selected_fields:
-                _required_text(payload, key)
-            if payload.get("provider_equivalence_set_identity"):
-                raise BinaryFirstContractError(
-                    "CLASS_PROVIDER_EQUIVALENCE_INVALID",
-                    "resolved provider cannot also use an equivalence set",
-                )
-        elif status == "runtime_equivalent":
-            _required_text(payload, "provider_equivalence_set_identity")
-            if any(payload.get(key) for key in selected_fields):
-                raise BinaryFirstContractError(
-                    "CLASS_PROVIDER_SELECTION_INVALID",
-                    "runtime-equivalent provider must not choose a physical instance",
-                )
-        elif any(payload.get(key) for key in selected_fields):
-            raise BinaryFirstContractError(
-                "CLASS_PROVIDER_SELECTION_INVALID",
-                f"{status} provider must not choose a physical instance",
-            )
+        payload = _validated_provider_binding_payload(self.payload)
         object.__setattr__(self, "identity", _identity("class_provider_binding", payload))
 
 
@@ -513,18 +658,12 @@ class ClassDefinitionResolution:
     identity: str = field(init=False)
 
     def __post_init__(self):
-        if self.status not in CLASS_DEFINITION_STATUSES:
-            raise BinaryFirstContractError("CLASS_DEFINITION_STATUS_INVALID", self.status)
-        if not self.evidence:
-            raise BinaryFirstContractError(
-                "CLASS_DEFINITION_EVIDENCE_MISSING", "class definition evidence is required"
-            )
-        payload = {
-            "class_provider_binding_identity": self.provider_binding_identity,
-            "class_definition_target_identity": self.target_identity,
-            "class_definition_status": self.status,
-            "evidence": dict(self.evidence),
-        }
+        payload = _validated_class_definition_payload(
+            self.provider_binding_identity,
+            self.target_identity,
+            self.status,
+            self.evidence,
+        )
         object.__setattr__(self, "identity", _identity("class_definition_resolution", payload))
 
 
@@ -534,25 +673,7 @@ class MemberResolution:
     identity: str = field(init=False)
 
     def __post_init__(self):
-        payload = dict(self.payload or {})
-        status = str(payload.get("member_resolution_status") or "")
-        if status not in MEMBER_RESOLUTION_STATUSES:
-            raise BinaryFirstContractError("MEMBER_RESOLUTION_STATUS_INVALID", status)
-        resolved = payload.get("resolved_member_identity")
-        equivalent = payload.get("member_equivalence_set_identity")
-        if status == "resolved" and (not resolved or equivalent):
-            raise BinaryFirstContractError(
-                "MEMBER_RESOLUTION_TARGET_INVALID", "resolved requires exactly one member"
-            )
-        if status == "runtime_equivalent" and (not equivalent or resolved):
-            raise BinaryFirstContractError(
-                "MEMBER_RESOLUTION_TARGET_INVALID",
-                "runtime_equivalent requires a member equivalence set",
-            )
-        if status not in {"resolved", "runtime_equivalent"} and (resolved or equivalent):
-            raise BinaryFirstContractError(
-                "MEMBER_RESOLUTION_TARGET_INVALID", f"{status} cannot select a member"
-            )
+        payload = _validated_member_resolution_payload(self.payload)
         object.__setattr__(self, "identity", _identity("member_resolution", payload))
 
 
@@ -566,34 +687,13 @@ class DispatchResolution:
     identity: str = field(init=False)
 
     def __post_init__(self):
-        if self.status not in DISPATCH_STATUSES:
-            raise BinaryFirstContractError("DISPATCH_STATUS_INVALID", self.status)
-        target_count = len(self.implementation_target_identities)
-        if self.status in {"unresolved", "no_concrete_implementation", "not_applicable"}:
-            if target_count:
-                raise BinaryFirstContractError(
-                    "DISPATCH_TARGET_COUNT_INVALID", f"{self.status} requires zero targets"
-                )
-        elif target_count == 0:
-            raise BinaryFirstContractError(
-                "DISPATCH_TARGET_COUNT_INVALID", f"{self.status} requires targets"
-            )
-        if self.status == "partial_possible_set" and self.coverage_status != "partial":
-            raise BinaryFirstContractError(
-                "DISPATCH_COVERAGE_INVALID", "partial_possible_set requires partial coverage"
-            )
-        if self.status == "no_concrete_implementation" and self.coverage_status != "complete":
-            raise BinaryFirstContractError(
-                "DISPATCH_COVERAGE_INVALID",
-                "no_concrete_implementation requires complete hierarchy coverage",
-            )
-        payload = {
-            "direct_edge_identity": self.direct_edge_identity,
-            "dispatch_status": self.status,
-            "implementation_target_identities": list(self.implementation_target_identities),
-            "coverage_status": self.coverage_status,
-            "evidence": dict(self.evidence),
-        }
+        payload = _validated_dispatch_resolution_payload(
+            self.direct_edge_identity,
+            self.status,
+            self.implementation_target_identities,
+            self.coverage_status,
+            self.evidence,
+        )
         object.__setattr__(self, "identity", _identity("dispatch_resolution", payload))
 
 

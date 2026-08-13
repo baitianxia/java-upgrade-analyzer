@@ -842,8 +842,15 @@ def _parse_entry_group_with_javap(
     force_verbose: bool | None = None,
 ) -> list[dict]:
     if force_verbose is None:
-        verbose_entries = [entry for entry in entries if _entry_requires_verbose_javap(entry)]
-        plain_entries = [entry for entry in entries if not _entry_requires_verbose_javap(entry)]
+        verbose_entries = []
+        plain_entries = []
+        for entry in entries:
+            target = (
+                verbose_entries
+                if _entry_requires_verbose_javap(entry)
+                else plain_entries
+            )
+            target.append(entry)
         if verbose_entries and plain_entries:
             by_path = {}
             for group, verbose in ((plain_entries, False), (verbose_entries, True)):

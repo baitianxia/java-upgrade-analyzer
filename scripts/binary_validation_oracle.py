@@ -13,6 +13,7 @@ from collections import defaultdict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import csv
 from dataclasses import dataclass
+from functools import lru_cache
 import gc
 import hashlib
 import json
@@ -54,6 +55,9 @@ POLICY_VERSION = "binary-independent-validation-v2"
 # closure.  Batching preserves the independent JVM observation while bounding
 # metaspace, reflection metadata and captured JSON for each child process.
 MAX_CLASSES_PER_RUNTIME_ORACLE_PROCESS = 2_000
+# Avoid process-startup concurrency for tiny projects/tests. Above this point
+# each batch has enough reflection work to amortize one isolated JVM process.
+MIN_CLASSES_FOR_CONCURRENT_RUNTIME_ORACLE = 4_000
 _ORACLE_RECONCILIATION_KIND_CODES = {
     "provider_binding": 1,
     "class_definition": 2,
@@ -140,6 +144,81 @@ class _StructuralTruth:
     semantic_instructions: frozenset[tuple[Any, ...]]
     declared_members: frozenset[tuple[Any, ...]]
     failures: tuple[str, ...]
+
+
+_OBSERVATION_FIELDS = (
+    "class_name",
+    "provider_resource_url",
+    "provider_url",
+    "loader_kind",
+    "modifiers",
+    "super_name",
+    "interfaces",
+    "class_annotations",
+    "class_annotation_imports",
+    "class_annotation_resources",
+    "class_annotation_values",
+    "status",
+    "members",
+    "member_annotations",
+    "member_annotation_values",
+    "failure_phase",
+    "failure_kind",
+    "failure_message",
+    "javap_declared_members",
+)
+_OBSERVATION_FIELD_INDEX = {
+    key: index for index, key in enumerate(_OBSERVATION_FIELDS)
+}
+_MISSING_OBSERVATION_VALUE = object()
+
+
+class _CompactObservation(Mapping[str, Any]):
+    """Tuple-backed immutable view of one target-JVM observation.
+
+    The helper emits the same small field vocabulary for every class. Keeping
+    a Python dict (and another copy of those keys) for tens of thousands of
+    classes dominated the Oracle's retained heap. Fixed tuple slots provide
+    O(1) field lookup while unknown future helper fields remain losslessly
+    stored in ``_extras`` so validation fails neither open nor silently.
+    """
+
+    __slots__ = ("_values", "_extras", "_length")
+
+    def __init__(self, row: Mapping[str, Any]):
+        values = [_MISSING_OBSERVATION_VALUE] * len(_OBSERVATION_FIELDS)
+        extras = []
+        for key, value in row.items():
+            index = _OBSERVATION_FIELD_INDEX.get(key)
+            if index is None:
+                extras.append((key, value))
+            else:
+                values[index] = value
+        self._values = tuple(values)
+        self._extras = tuple(extras)
+        self._length = len(row)
+
+    def __getitem__(self, key: str) -> Any:
+        index = _OBSERVATION_FIELD_INDEX.get(key)
+        if index is not None:
+            value = self._values[index]
+            if value is _MISSING_OBSERVATION_VALUE:
+                raise KeyError(key)
+            return value
+        for extra_key, value in self._extras:
+            if key == extra_key:
+                return value
+        raise KeyError(key)
+
+    def __iter__(self):
+        for key, value in zip(_OBSERVATION_FIELDS, self._values):
+            if value is not _MISSING_OBSERVATION_VALUE:
+                yield key
+        for key, _value in self._extras:
+            yield key
+
+    def __len__(self) -> int:
+        return self._length
 
 
 _ORACLE_METHOD_ENTRY_KINDS = {
@@ -798,6 +877,7 @@ def _observe_classes(
     max_attempts: int = 1,
     progress_callback: ValidationProgressCallback | None = None,
     progress_label: str = "",
+    string_pool: dict[str, str] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], str]:
     with short_temporary_directory(prefix="runtime-oracle") as temp_text:
         temp = Path(temp_text)
@@ -821,16 +901,11 @@ def _observe_classes(
             java_options.append(
                 f"-Djava.ext.dirs={jdk_home / 'jre' / 'lib' / 'ext'}"
             )
-        rounds = 0
-        while pending:
-            rounds += 1
-            batch = sorted(pending)[:MAX_CLASSES_PER_RUNTIME_ORACLE_PROCESS]
-            pending.difference_update(batch)
-            classes_file = temp / f"classes-{rounds}.txt"
+
+        def observe_batch(batch: tuple[str, ...], round_number: int):
+            classes_file = temp / f"classes-{round_number}.txt"
             classes_file.write_text("\n".join(batch) + "\n", encoding="utf-8")
             last_problem: dict[str, Any] = {}
-            parsed_rows: dict[str, dict[str, Any]] | None = None
-            discovered_dependencies: set[str] = set()
             attempt_limit = max(int(max_attempts), 1)
             attempts_made = 0
             retryable = False
@@ -839,7 +914,8 @@ def _observe_classes(
                 completed = execute_binary_tool(
                     [
                         str(java), *java_options, "-cp", str(temp / "helper"),
-                        "RuntimeOutcomeOracle", str(classpath_file), str(classes_file),
+                        "RuntimeOutcomeOracle", str(classpath_file),
+                        str(classes_file),
                     ],
                     stage="binary_oracle.runtime_observation",
                     reason_prefix="BINARY_ORACLE_EXECUTION",
@@ -852,7 +928,7 @@ def _observe_classes(
                     if not retryable:
                         break
                     continue
-                candidate_rows: dict[str, dict[str, Any]] = {}
+                candidate_rows = []
                 observed_batch = set()
                 dependencies: set[str] = set()
                 malformed_line = ""
@@ -864,13 +940,16 @@ def _observe_classes(
                         break
                     name = str(row.get("class_name") or "")
                     observed_batch.add(name.replace("/", "."))
-                    candidate_rows[name] = row
+                    candidate_rows.append((name, row))
                     if row.get("status") == "definition_ready":
                         for dependency in [
-                            row.get("super_name"), *(row.get("interfaces") or ())
+                            row.get("super_name"),
+                            *(row.get("interfaces") or ()),
                         ]:
-                            if dependency and dependency not in observations:
-                                dependencies.add(str(dependency).replace("/", "."))
+                            if dependency:
+                                dependencies.add(
+                                    str(dependency).replace("/", ".")
+                                )
                 if malformed_line:
                     last_problem = {
                         "reason_code": "BINARY_ORACLE_OUTPUT_INVALID",
@@ -888,43 +967,111 @@ def _observe_classes(
                     }
                     retryable = False
                     break
-                parsed_rows = candidate_rows
-                discovered_dependencies = dependencies
-                break
-            if parsed_rows is None:
-                last_problem.update({
-                    "attempt_count": attempts_made,
-                    "max_attempts": attempt_limit,
-                    "retryable": retryable,
-                    "retry_exhausted": bool(
-                        retryable and attempts_made >= attempt_limit
-                    ),
-                })
-                original_reason = str(
-                    last_problem.get("reason_code")
-                    or "BINARY_ORACLE_EXECUTION_FAILED"
-                )
-                raise BinaryValidationError(
+                return candidate_rows, dependencies
+            last_problem.update({
+                "attempt_count": attempts_made,
+                "max_attempts": attempt_limit,
+                "retryable": retryable,
+                "retry_exhausted": bool(
+                    retryable and attempts_made >= attempt_limit
+                ),
+            })
+            original_reason = str(
+                last_problem.get("reason_code")
+                or "BINARY_ORACLE_EXECUTION_FAILED"
+            )
+            raise BinaryValidationError(
+                (
+                    "BINARY_ORACLE_EXECUTION_RETRY_EXHAUSTED"
+                    if last_problem["retry_exhausted"] and attempt_limit > 1
+                    else original_reason
+                ),
+                json.dumps(last_problem, ensure_ascii=False),
+            )
+
+        requested = set(pending)
+        rounds = 0
+        workers = (
+            min(
+                3,
+                max(1, os.cpu_count() or 1),
+                max(
+                    1,
                     (
-                        "BINARY_ORACLE_EXECUTION_RETRY_EXHAUSTED"
-                        if last_problem["retry_exhausted"] and attempt_limit > 1
-                        else original_reason
-                    ),
-                    json.dumps(last_problem, ensure_ascii=False),
-                )
-            observations.update(parsed_rows)
-            pending.update(discovered_dependencies)
+                        len(pending) + MAX_CLASSES_PER_RUNTIME_ORACLE_PROCESS - 1
+                    ) // MAX_CLASSES_PER_RUNTIME_ORACLE_PROCESS,
+                ),
+            )
+            if len(pending) >= MIN_CLASSES_FOR_CONCURRENT_RUNTIME_ORACLE
+            else 1
+        )
+
+        def next_batch() -> tuple[str, ...]:
+            batch = tuple(
+                sorted(pending)[:MAX_CLASSES_PER_RUNTIME_ORACLE_PROCESS]
+            )
+            pending.difference_update(batch)
+            return batch
+
+        def merge_batch_result(round_number, batch, result, active=()):
+            candidate_rows, dependencies = result
+            for name, row in candidate_rows:
+                if string_pool is not None:
+                    row = _compact_json_values(row, string_pool)
+                observations[name] = row
+            for dependency in dependencies:
+                internal_name = dependency.replace(".", "/")
+                if (
+                    dependency not in requested
+                    and internal_name not in observations
+                ):
+                    requested.add(dependency)
+                    pending.add(dependency)
+            in_flight = sum(len(item[1]) for item in active)
             _notify_progress(
                 progress_callback,
                 "validation-runtime",
-                f"{progress_label or '目标运行时'}：已完成 JVM 观察批次 {rounds}",
+                f"{progress_label or '目标运行时'}：已完成 JVM 观察批次 {round_number}",
                 len(observations),
-                len(observations) + len(pending),
+                len(observations) + len(pending) + in_flight,
                 f"{batch[0]} … {batch[-1]}" if batch else "",
             )
+
+        if workers == 1:
+            while pending:
+                batch = next_batch()
+                rounds += 1
+                merge_batch_result(
+                    rounds, batch, observe_batch(batch, rounds)
+                )
+        else:
+            # Keep only a rolling window of isolated JVM batches. Results are
+            # merged in submission order; newly discovered hierarchy classes
+            # enter the same sorted queue before the next batch is submitted.
+            # This preserves complete closure without retaining every child
+            # result or starting redundant post-frontier JVMs.
+            with ThreadPoolExecutor(
+                max_workers=workers,
+                thread_name_prefix="binary-oracle-runtime",
+            ) as executor:
+                active = []
+                while pending or active:
+                    while pending and len(active) < workers:
+                        batch = next_batch()
+                        rounds += 1
+                        active.append((
+                            rounds,
+                            batch,
+                            executor.submit(observe_batch, batch, rounds),
+                        ))
+                    round_number, batch, future = active.pop(0)
+                    merge_batch_result(
+                        round_number, batch, future.result(), active
+                    )
         return observations, helper_identity
 
 
+@lru_cache(maxsize=8_192)
 def _file_url_path(value: str) -> Path | None:
     if not value:
         return None
@@ -1154,6 +1301,7 @@ def _validate_structural_edges(
     javap: str,
     scan_cache: dict[tuple[Any, ...], _StructuralTruth] | None = None,
     direct_scan_cache: dict[tuple[str, str], bytes | Mapping[str, Any]] | None = None,
+    string_pool: dict[str, str] | None = None,
     progress_callback: ValidationProgressCallback | None = None,
     progress_label: str = "",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -1290,20 +1438,36 @@ def _validate_structural_edges(
                     failures=failures,
                 )
             else:
+                def compact_tuple(value):
+                    normalized = tuple(value)
+                    return (
+                        _compact_json_values(normalized, string_pool)
+                        if string_pool is not None else normalized
+                    )
+
                 scanned = _StructuralTruth(
                     type_edges=frozenset(
-                        (*item[:5], opcode_to_type_use[item[5]])
+                        compact_tuple(
+                            (*item[:5], opcode_to_type_use[item[5]])
+                        )
                         for item in raw_scanned["type_edges"]
                     ),
                     class_init_edges=frozenset(
-                        tuple(item) for item in raw_scanned["class_init_edges"]
+                        compact_tuple(item)
+                        for item in raw_scanned["class_init_edges"]
                     ),
-                    clinit_classes=frozenset(raw_scanned["clinit_classes"]),
+                    clinit_classes=frozenset(
+                        _pooled_string(str(item), string_pool)
+                        if string_pool is not None else str(item)
+                        for item in raw_scanned["clinit_classes"]
+                    ),
                     semantic_instructions=frozenset(
-                        tuple(item) for item in raw_scanned["semantic_instructions"]
+                        compact_tuple(item)
+                        for item in raw_scanned["semantic_instructions"]
                     ),
                     declared_members=frozenset(
-                        tuple(item) for item in raw_scanned["declared_members"]
+                        compact_tuple(item)
+                        for item in raw_scanned["declared_members"]
                     ),
                     failures=(),
                 )
@@ -1383,24 +1547,68 @@ def _unpack_oracle_scan(result: Mapping[str, Any] | bytes) -> dict[str, Any]:
 
 def _same_json_value(left: Any, right: Any) -> bool:
     """Compare JSON-like values without conflating bool/int or int/float."""
-    if type(left) is not type(right):
-        return False
-    if isinstance(left, dict):
+    if isinstance(left, Mapping) and isinstance(right, Mapping):
         return (
             left.keys() == right.keys()
             and all(_same_json_value(value, right[key]) for key, value in left.items())
         )
-    if isinstance(left, (list, tuple)):
+    if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
         return len(left) == len(right) and all(
             _same_json_value(left_item, right_item)
             for left_item, right_item in zip(left, right)
         )
+    if type(left) is not type(right):
+        return False
     return left == right
+
+
+def _pooled_string(value: str, pool: dict[str, str]) -> str:
+    return pool.setdefault(value, value)
+
+
+def _compact_json_values(value: Any, string_pool: dict[str, str]) -> Any:
+    """Deduplicate strings and freeze JSON arrays without changing encoding."""
+    value_type = type(value)
+    if value_type is str:
+        return _pooled_string(value, string_pool)
+    if value_type in (list, tuple):
+        return tuple(
+            _compact_json_values(item, string_pool) for item in value
+        )
+    if value_type is dict:
+        return {
+            _pooled_string(key, string_pool): _compact_json_values(
+                item, string_pool
+            )
+            for key, item in value.items()
+        }
+    return value
+
+
+def _compact_observations(
+    observations: Mapping[str, Mapping[str, Any]],
+    string_pool: dict[str, str],
+    *,
+    values_compacted: bool = False,
+) -> dict[str, Mapping[str, Any]]:
+    compacted = {}
+    for class_name, row in observations.items():
+        pooled_name = _pooled_string(str(class_name), string_pool)
+        if isinstance(row, _CompactObservation):
+            compacted[pooled_name] = row
+        else:
+            payload = dict(row)
+            if not values_compacted:
+                payload = _compact_json_values(payload, string_pool)
+            compacted[pooled_name] = _CompactObservation(
+                payload
+            )
+    return compacted
 
 
 def _share_equal_observation_values(
     reference: Mapping[str, Mapping[str, Any]],
-    candidate: dict[str, dict[str, Any]],
+    candidate: dict[str, Mapping[str, Any]],
 ) -> tuple[int, int]:
     """Share only type-exact, equal, immutable post-observation values.
 
@@ -1423,12 +1631,15 @@ def _share_equal_observation_values(
             reference_value = reference_row[key]
             if _same_json_value(value, reference_value):
                 if value is not reference_value:
-                    row[key] = reference_value
+                    # Candidate rows are mutable until this sharing pass. A
+                    # compact row can only arrive after whole-row reuse.
+                    if isinstance(row, dict):
+                        row[key] = reference_value
                     shared_values += 1
             else:
                 same_row = False
         if same_row:
-            candidate[class_name] = reference_row  # type: ignore[assignment]
+            candidate[class_name] = reference_row
             shared_rows += 1
     return shared_rows, shared_values
 
@@ -1570,13 +1781,23 @@ def _resolve_member(
     name: str,
     descriptor: str,
     visited: frozenset[str] = frozenset(),
+    declared_members_cache: dict[
+        str, tuple[tuple[str, str, str, int], ...]
+    ] | None = None,
 ) -> tuple[str, tuple[str, str, str, int]] | None:
     if owner in visited:
         return None
     observation = observations.get(owner)
     if not _oracle_class_load_ready(observation):
         return None
-    for member in _declared_members(observation):
+    if declared_members_cache is None:
+        declared_members = _declared_members(observation)
+    else:
+        declared_members = declared_members_cache.get(owner)
+        if declared_members is None:
+            declared_members = tuple(_declared_members(observation))
+            declared_members_cache[owner] = declared_members
+    for member in declared_members:
         if member[:3] == (kind, name, descriptor):
             return owner, member
     if name == "<init>":
@@ -1586,7 +1807,7 @@ def _resolve_member(
         # instance method declared by Object before searching superinterfaces.
         object_member = _resolve_member(
             observations, "java/lang/Object", kind, name, descriptor,
-            visited | {owner},
+            visited | {owner}, declared_members_cache,
         )
         if object_member:
             flags = int(object_member[1][3])
@@ -1601,7 +1822,8 @@ def _resolve_member(
         if not parent:
             continue
         result = _resolve_member(
-            observations, str(parent), kind, name, descriptor, visited | {owner}
+            observations, str(parent), kind, name, descriptor,
+            visited | {owner}, declared_members_cache,
         )
         if result:
             return result
@@ -1813,6 +2035,26 @@ def _validate_entrypoint_discovery(
         path = artifact_path(observation)
         return path is not None and path_kinds_by_path.get(path) in business_path_kinds
 
+    subtype_cache: dict[tuple[str, str], bool] = {}
+
+    def is_subtype_cached(child: str, parent: str) -> bool:
+        key = (child, parent)
+        result = subtype_cache.get(key)
+        if result is None:
+            result = _is_subtype(observations, child, parent)
+            subtype_cache[key] = result
+        return result
+
+    annotation_closure_cache: dict[tuple[str, ...], frozenset[str]] = {}
+
+    def annotation_closure(values: Iterable[str]) -> frozenset[str]:
+        key = tuple(values)
+        result = annotation_closure_cache.get(key)
+        if result is None:
+            result = frozenset(_oracle_annotation_closure(observations, key))
+            annotation_closure_cache[key] = result
+        return result
+
     exact_main_classes = {
         str(profile.get("main_class") or "").strip().replace(".", "/")
     } - {""}
@@ -1985,8 +2227,8 @@ def _validate_entrypoint_discovery(
         for class_name, observation in observations.items():
             if class_name not in activated and not business_owned(observation):
                 continue
-            annotations = _oracle_annotation_closure(
-                observations, observation.get("class_annotations") or ()
+            annotations = annotation_closure(
+                observation.get("class_annotations") or ()
             )
             annotated_types = [class_name]
             annotated_types.extend(
@@ -2025,8 +2267,8 @@ def _validate_entrypoint_discovery(
                 continue
             owned = business_owned(observation)
             active = owned or class_name in activated
-            class_annotations = _oracle_annotation_closure(
-                observations, observation.get("class_annotations") or ()
+            class_annotations = annotation_closure(
+                observation.get("class_annotations") or ()
             )
             conditional_class = any(
                 value.startswith(
@@ -2063,9 +2305,8 @@ def _validate_entrypoint_discovery(
                         "runtime_profile_declaration",
                     ))
                     continue
-                annotations = _oracle_annotation_closure(
-                    observations,
-                    annotation_by_member.get((member_name, descriptor), ()),
+                annotations = annotation_closure(
+                    annotation_by_member.get((member_name, descriptor), ())
                 )
                 candidate_kinds = {
                     _ORACLE_METHOD_ENTRY_KINDS[value]
@@ -2076,7 +2317,7 @@ def _validate_entrypoint_discovery(
                     if annotation in class_annotations and member_name in names:
                         candidate_kinds.add(entry_kind)
                 for interface, callbacks in _ORACLE_INTERFACE_CALLBACKS.items():
-                    if _is_subtype(observations, class_name, interface):
+                    if is_subtype_cached(class_name, interface):
                         entry_kind = callbacks.get(member_name)
                         if entry_kind:
                             candidate_kinds.add(entry_kind)
@@ -2419,6 +2660,7 @@ def _validate_direct_edges(
         tuple[str, str], bytes | Mapping[str, Any]
     ] | None = None,
     truth_cache: dict[tuple[str, str], _DirectEdgeTruth] | None = None,
+    string_pool: dict[str, str] | None = None,
     progress_callback: ValidationProgressCallback | None = None,
     progress_label: str = "",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -2606,30 +2848,45 @@ def _validate_direct_edges(
             continue
         if normalized_truth is None:
             rows = result.get("edges") or ()
+
+            def compact_tuple(value):
+                normalized = tuple(value)
+                return (
+                    _compact_json_values(normalized, string_pool)
+                    if string_pool is not None else normalized
+                )
+
             normalized_truth = _DirectEdgeTruth(
                 artifact_sha256=str(result.get("artifact_sha256") or ""),
                 direct_edges=frozenset(
-                    (
+                    compact_tuple((
                         row["caller_owner"], row["caller_member"],
                         row["caller_descriptor"], row["callee_owner"],
                         row["callee_member"], row["callee_descriptor"],
                         row["opcode_family"], int(row["instruction_offset"]),
-                    )
+                    ))
                     for row in rows
                     if row.get("opcode_family") != "invokedynamic"
                 ),
                 dynamic_handle_edges=frozenset(
-                    (
+                    compact_tuple((
                         row["caller_owner"], row["caller_member"],
                         row["caller_descriptor"], row["callee_owner"],
                         row["callee_member"], row["callee_descriptor"],
                         int(row["instruction_offset"]),
-                    )
+                    ))
                     for row in rows
                     if row.get("opcode_family") == "invokedynamic"
                 ),
                 discovery_classes=frozenset(
-                    str(row.get("callee_owner") or "").replace(".", "/")
+                    (
+                        _pooled_string(
+                            str(row.get("callee_owner") or "").replace(".", "/"),
+                            string_pool,
+                        )
+                        if string_pool is not None
+                        else str(row.get("callee_owner") or "").replace(".", "/")
+                    )
                     for row in rows if row.get("callee_owner")
                 ),
             )
@@ -2687,9 +2944,17 @@ def _validate_runtime_outcomes(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     issues = []
     target_jdk_major = _release_major(jdk_home)
+    application_classes = {
+        class_name
+        for inventory in inventories
+        for class_name in inventory["classes"]
+    }
     member_resolution_cache: dict[
         tuple[str, str, str, str],
         tuple[str, tuple[str, str, str, int]] | None,
+    ] = {}
+    declared_members_cache: dict[
+        str, tuple[tuple[str, str, str, int], ...]
     ] = {}
 
     def resolve_member_cached(
@@ -2699,6 +2964,7 @@ def _validate_runtime_outcomes(
         if key not in member_resolution_cache:
             member_resolution_cache[key] = _resolve_member(
                 observations, owner, kind, name, descriptor,
+                declared_members_cache=declared_members_cache,
             )
         return member_resolution_cache[key]
 
@@ -2723,43 +2989,49 @@ def _validate_runtime_outcomes(
             return "jdk/jfr/Event", member_name, descriptor
         return declaring, member_name, descriptor
 
-    # Build the full transitive subtype relation once.  The former Oracle
-    # repeated a recursive hierarchy walk for every virtual call edge and
-    # every runtime class, which made a complete real-project closure
-    # quadratic without adding any independent evidence.
-    ancestor_cache: dict[str, frozenset[str]] = {}
-
-    def ancestors(class_name: str, visiting: frozenset[str] = frozenset()) -> frozenset[str]:
-        cached = ancestor_cache.get(class_name)
-        if cached is not None:
-            return cached
-        if class_name in visiting:
-            return frozenset()
-        row = observations.get(class_name) or {}
-        direct = {
-            str(value) for value in [
-                row.get("super_name"), *(row.get("interfaces") or ())
-            ] if value
-        }
-        closure = set(direct)
-        for parent in direct:
-            closure.update(ancestors(parent, visiting | {class_name}))
-        result = frozenset(closure)
-        ancestor_cache[class_name] = result
-        return result
-
-    concrete_subtypes: dict[str, list[str]] = defaultdict(list)
+    # Index direct children once, then close only the virtual owners that are
+    # actually queried below. Building a transitive ancestor frozenset and a
+    # one-element subtype list for every leaf class retained hundreds of
+    # thousands of containers even when a class had no descendants.
+    direct_children: dict[str, list[str]] = defaultdict(list)
+    concrete_classes = set()
     for class_name, observation in observations.items():
         if not _oracle_class_load_ready(observation):
             continue
         modifiers = int(observation.get("modifiers") or 0)
-        if modifiers & (0x0200 | 0x0400):
-            continue
-        concrete_subtypes[class_name].append(class_name)
-        for parent in ancestors(class_name):
-            concrete_subtypes[parent].append(class_name)
-    for values in concrete_subtypes.values():
+        if not modifiers & (0x0200 | 0x0400):
+            concrete_classes.add(class_name)
+        for parent in [
+            observation.get("super_name"),
+            *(observation.get("interfaces") or ()),
+        ]:
+            if parent:
+                direct_children[str(parent)].append(class_name)
+    for values in direct_children.values():
         values.sort()
+    nontrivial_concrete_subtypes: dict[str, tuple[str, ...]] = {}
+
+    def concrete_subtypes(owner: str) -> tuple[str, ...]:
+        children = direct_children.get(owner)
+        if not children:
+            return (owner,) if owner in concrete_classes else ()
+        cached = nontrivial_concrete_subtypes.get(owner)
+        if cached is not None:
+            return cached
+        pending = [owner]
+        visited = set()
+        result = []
+        while pending:
+            candidate = pending.pop()
+            if candidate in visited:
+                continue
+            visited.add(candidate)
+            if candidate in concrete_classes:
+                result.append(candidate)
+            pending.extend(direct_children.get(candidate, ()))
+        cached = tuple(sorted(result))
+        nontrivial_concrete_subtypes[owner] = cached
+        return cached
     artifact_content_by_identity = {
         row["artifact_instance_identity"]: row["content_sha256"]
         for row in connection.execute(
@@ -2770,12 +3042,22 @@ def _validate_runtime_outcomes(
         )
     }
     artifacts_by_path = {Path(item["path"]).resolve(): item for item in artifacts}
+    # These indexes are consulted only for four scalar values. Retaining the
+    # full decoded reconciliation payloads (especially definition evidence)
+    # made the Oracle keep a second copy of a large part of the graph alive.
+    # Compact tuples preserve every value used by the checks below while the
+    # authoritative records remain intact in SQLite.
     definitions = {
-        (row["initiating_loader_realm_identity"], row["class_name"]): row
+        (row["initiating_loader_realm_identity"], row["class_name"]): (
+            row["class_definition_status"], row["class_load_status"],
+        )
         for row in _iter_reconciliation(connection, "class_definition")
     }
     provider_by_key = {
-        (row["initiating_loader_realm_identity"], row["class_name"]): row
+        (row["initiating_loader_realm_identity"], row["class_name"]): (
+            row["class_provider_status"],
+            row.get("selected_artifact_instance_identity"),
+        )
         for row in _iter_reconciliation(connection, "provider_binding")
     }
     oracle_contexts = _oracle_runtime_contexts(
@@ -2789,7 +3071,7 @@ def _validate_runtime_outcomes(
                 "provider", "ORACLE_PROVIDER_BINDING_MISSING", realm=realm, class_name=name,
             ))
             continue
-        actual_status = provider["class_provider_status"]
+        actual_status = provider[0]
         provider_location = _oracle_provider_location(oracle)
         if not provider_location:
             if actual_status == "resolved":
@@ -2811,7 +3093,7 @@ def _validate_runtime_outcomes(
                 oracle_provider_url=provider_location,
             ))
             continue
-        selected = provider.get("selected_artifact_instance_identity")
+        selected = provider[1]
         if expected_kind == "platform":
             if not str(selected).startswith("platform-image:"):
                 issues.append(_validation_issue(
@@ -2831,12 +3113,9 @@ def _validate_runtime_outcomes(
                     selected=selected,
                 ))
         definition = definitions.get((realm, name))
-        production_definition_status = (definition or {}).get(
-            "class_definition_status"
-        )
-        production_class_load_ready = (definition or {}).get(
-            "class_load_status"
-        ) == "ready"
+        production_definition_status = definition[0] if definition else None
+        production_class_load_status = definition[1] if definition else None
+        production_class_load_ready = production_class_load_status == "ready"
         oracle_definition_ready = oracle.get("status") == "definition_ready"
         if (
             not definition
@@ -2855,7 +3134,7 @@ def _validate_runtime_outcomes(
                 realm=realm, class_name=name,
                 oracle_status=oracle.get("status"),
                 oracle_failure_phase=oracle.get("failure_phase"),
-                production_class_load_status=definition.get("class_load_status"),
+                production_class_load_status=production_class_load_status,
             ))
 
     provider_count = len(provider_by_key)
@@ -2974,7 +3253,7 @@ def _validate_runtime_outcomes(
             elif declaration_fixed:
                 oracle_targets.add(dispatch_symbol(declaration))
             else:
-                for class_name in concrete_subtypes.get(edge[1], ()):
+                for class_name in concrete_subtypes(edge[1]):
                     target = resolve_member_cached(
                         class_name, "method", edge[2], edge[3],
                     )
@@ -2988,8 +3267,7 @@ def _validate_runtime_outcomes(
             if symbol:
                 target_symbols.add(symbol)
         application_oracle_targets = {
-            item for item in oracle_targets
-            if any(item[0] in inventory["classes"] for inventory in inventories)
+            item for item in oracle_targets if item[0] in application_classes
         }
         if target_symbols != application_oracle_targets:
             issues.append(_validation_issue(
@@ -3124,6 +3402,7 @@ def _validate_cross_version_semantics(
     base_ordered = sorted(truth_parts["base"]["direct_edges"])
     current_ordered = sorted(current_edges)
     expected_resolution_changes = set()
+    declared_members_caches = {"base": {}, "current": {}}
     base_index = 0
     current_index = 0
     while (
@@ -3178,10 +3457,12 @@ def _validate_cross_version_semantics(
         base_target = _resolve_member(
             observations_by_side["base"], normalized_owner,
             member_kind, target_name, target_descriptor,
+            declared_members_cache=declared_members_caches["base"],
         )
         current_target = _resolve_member(
             observations_by_side["current"], normalized_owner,
             member_kind, target_name, target_descriptor,
+            declared_members_cache=declared_members_caches["current"],
         )
         if (
             not base_target and not current_target
@@ -3269,6 +3550,7 @@ def _validate_cross_version_semantics(
                 observations_by_side["current"],
                 str(edge[3]).replace(".", "/"),
                 "method", edge[4], edge[5],
+                declared_members_cache=declared_members_caches["current"],
             )
             if target:
                 current_graph[caller].add((
@@ -5192,6 +5474,10 @@ def validate_generation(
     *,
     progress_callback: ValidationProgressCallback | None = None,
 ) -> dict[str, Any]:
+    # URL resolution is repeated for every observed provider but normally has
+    # only one value per artifact. Scope the memo to this validation run so a
+    # later run cannot inherit stale filesystem/symlink state.
+    _file_url_path.cache_clear()
     progress_callback = progress_callback or _environment_progress_callback()
     tool_policy = _oracle_tool_execution_policy(config)
     generation = Path(generation_directory).resolve()
@@ -5340,6 +5626,7 @@ def validate_generation(
 
     helper_identities = {}
     observations_by_side = {}
+    validation_string_pool: dict[str, str] = {}
     structural_scan_cache: dict[tuple[Any, ...], _StructuralTruth] = {}
     direct_scan_cache: dict[
         tuple[str, str], bytes | Mapping[str, Any]
@@ -5405,6 +5692,7 @@ def validate_generation(
                 javap=javap,
                 scan_cache=direct_scan_cache,
                 truth_cache=direct_truth_cache,
+                string_pool=validation_string_pool,
                 progress_callback=progress_callback,
                 progress_label=side_name,
             )
@@ -5415,6 +5703,7 @@ def validate_generation(
                 javap=javap,
                 scan_cache=structural_scan_cache,
                 direct_scan_cache=direct_scan_cache,
+                string_pool=validation_string_pool,
                 progress_callback=progress_callback,
                 progress_label=side_name,
             )
@@ -5471,6 +5760,7 @@ def validate_generation(
                 **tool_policy,
                 progress_callback=progress_callback,
                 progress_label=side_name,
+                string_pool=validation_string_pool,
             )
             javap_members: dict[str, list[str]] = defaultdict(list)
             for owner, kind, member_name, descriptor, flags in (
@@ -5482,12 +5772,20 @@ def validate_generation(
             for class_name, values in javap_members.items():
                 observation = observations.get(class_name)
                 if observation is not None:
-                    observation["javap_declared_members"] = sorted(set(values))
+                    observation["javap_declared_members"] = tuple(
+                        _pooled_string(value, validation_string_pool)
+                        for value in sorted(set(values))
+                    )
             reference_observations = observations_by_side.get("base")
             if reference_observations is not None:
                 _share_equal_observation_values(
                     reference_observations, observations
                 )
+            observations = _compact_observations(
+                observations,
+                validation_string_pool,
+                values_compacted=True,
+            )
             helper_identities[side_name] = helper_identity
             observations_by_side[side_name] = observations
             runtime_issues, runtime_truth = _validate_runtime_outcomes(
@@ -5590,6 +5888,7 @@ def validate_generation(
     direct_truth_cache.clear()
     structural_scan_cache.clear()
     inventory_cache.clear()
+    validation_string_pool.clear()
     clear_immutable_oracle_cache()
     observations = None
     independent_classes = None

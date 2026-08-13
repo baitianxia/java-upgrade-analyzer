@@ -16,7 +16,10 @@ import re
 from typing import Any, Iterable, Mapping
 
 from binary_first_contract import canonical_identity
-from binary_runtime_reconciler import class_load_is_ready
+from binary_runtime_reconciler import (
+    class_load_is_ready,
+    hydrate_runtime_reconciliation,
+)
 
 
 POLICY_VERSION = "binary-runtime-semantic-overlay-v1"
@@ -1165,67 +1168,81 @@ class _Builder:
         )
 
 
+def semantic_overlay_requires_runtime_selection(
+    store: Any, decisions: Any = None
+) -> bool:
+    """Whether semantic construction needs provider/definition evidence."""
+    summary_reader = getattr(store, "runtime_trigger_summary", None)
+    if not callable(summary_reader):
+        return True
+    summary = summary_reader()
+    has_relevant_decision = any(
+        (item.get("fact_scope") or {}).get("member_kind") == "field"
+        for item in (
+            *getattr(decisions, "authoritative_decisions", ()),
+            *getattr(decisions, "diagnostic_decisions", ()),
+        )
+    ) if decisions is not None else False
+    has_relevant_resource = store.connection.execute(
+        """
+        SELECT 1 FROM resources
+        WHERE upper(resource_name)<>'META-INF/MANIFEST.MF'
+        LIMIT 1
+        """
+    ).fetchone() is not None
+    has_relevant_direct_edge = store.connection.execute(
+        """
+        SELECT 1 FROM direct_edges
+        WHERE symbolic_owner='java/lang/Class'
+           OR symbolic_owner LIKE 'java/lang/reflect/%'
+           OR symbolic_owner LIKE 'java/lang/invoke/%'
+           OR symbolic_owner LIKE 'org/springframework/%'
+           OR symbolic_owner LIKE 'org/apache/ibatis/%'
+           OR symbolic_owner LIKE 'org/apache/dubbo/%'
+           OR symbolic_owner LIKE 'com/fasterxml/jackson/%'
+           OR symbolic_owner LIKE 'jakarta/persistence/%'
+           OR symbolic_owner LIKE 'javax/persistence/%'
+           OR symbolic_owner LIKE 'feign/%'
+        LIMIT 1
+        """
+    ).fetchone() is not None
+    return bool(
+        summary["has_runtime_annotations"]
+        or has_relevant_decision
+        or has_relevant_resource
+        or has_relevant_direct_edge
+    )
+
+
 def build_binary_semantic_overlay(store: Any, runtime_profile: Any,
                                   reconciliation: Any, decisions: Any = None) -> BinarySemanticOverlay:
-    summary_reader = getattr(store, "runtime_trigger_summary", None)
-    if callable(summary_reader):
-        summary = summary_reader()
-        has_relevant_decision = any(
-            (item.get("fact_scope") or {}).get("member_kind") == "field"
-            for item in (
-                *getattr(decisions, "authoritative_decisions", ()),
-                *getattr(decisions, "diagnostic_decisions", ()),
-            )
-        ) if decisions is not None else False
-        has_relevant_resource = store.connection.execute(
-            """
-            SELECT 1 FROM resources
-            WHERE upper(resource_name)<>'META-INF/MANIFEST.MF'
-            LIMIT 1
-            """
-        ).fetchone() is not None
-        has_relevant_direct_edge = store.connection.execute(
-            """
-            SELECT 1 FROM direct_edges
-            WHERE symbolic_owner='java/lang/Class'
-               OR symbolic_owner LIKE 'java/lang/reflect/%'
-               OR symbolic_owner LIKE 'java/lang/invoke/%'
-               OR symbolic_owner LIKE 'org/springframework/%'
-               OR symbolic_owner LIKE 'org/apache/ibatis/%'
-               OR symbolic_owner LIKE 'org/apache/dubbo/%'
-               OR symbolic_owner LIKE 'com/fasterxml/jackson/%'
-               OR symbolic_owner LIKE 'jakarta/persistence/%'
-               OR symbolic_owner LIKE 'javax/persistence/%'
-               OR symbolic_owner LIKE 'feign/%'
-            LIMIT 1
-            """
-        ).fetchone() is not None
-        if not (
-            summary["has_runtime_annotations"]
-            or has_relevant_decision
-            or has_relevant_resource
-            or has_relevant_direct_edge
-        ):
-            payload = {
-                "policy_version": POLICY_VERSION,
-                "runtime_profile_identity": runtime_profile.identity,
-                "runtime_reconciliation_identity": str(
-                    getattr(reconciliation, "identity", "")
-                ),
-                "edge_identities": [],
-                "coverage_gaps": [],
-            }
-            return BinarySemanticOverlay(
-                rows=(),
-                coverage_status="complete",
-                coverage_gaps=(),
-                identity=_identity(
-                    "binary_runtime_semantic_overlay_identity", payload
-                ),
-            )
+    if not semantic_overlay_requires_runtime_selection(store, decisions):
+        payload = {
+            "policy_version": POLICY_VERSION,
+            "runtime_profile_identity": runtime_profile.identity,
+            "runtime_reconciliation_identity": str(
+                getattr(reconciliation, "identity", "")
+            ),
+            "edge_identities": [],
+            "coverage_gaps": [],
+        }
+        return BinarySemanticOverlay(
+            rows=(),
+            coverage_status="complete",
+            coverage_gaps=(),
+            identity=_identity(
+                "binary_runtime_semantic_overlay_identity", payload
+            ),
+        )
+    reconciliation = hydrate_runtime_reconciliation(
+        store,
+        reconciliation,
+        ("provider_binding", "class_definition"),
+    )
     return _Builder(store, runtime_profile, reconciliation, decisions).build()
 
 
 __all__ = [
     "BinarySemanticOverlay", "POLICY_VERSION", "build_binary_semantic_overlay",
+    "semantic_overlay_requires_runtime_selection",
 ]

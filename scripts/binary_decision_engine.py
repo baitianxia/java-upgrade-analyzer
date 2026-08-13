@@ -4,15 +4,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import count
 import json
-from typing import Any, Iterable, Mapping
+import sqlite3
+from typing import Any, Iterable, Iterator, Mapping
 import zlib
 
 from binary_artifact_diff import _mr_class_scope
 from binary_fact_store import BinaryFactStore
 from binary_first_contract import (
     BinaryFirstContractError,
-    canonical_identity,
+    canonical_identity_native_json,
     observed_delta_identity,
 )
 from binary_first_model import (
@@ -27,7 +29,88 @@ from binary_runtime_reconciler import RuntimeReconciliationResult
 
 
 def _identity(namespace: str, payload: Any) -> str:
-    return canonical_identity(namespace, payload, schema_version="1")
+    return canonical_identity_native_json(
+        namespace, payload, schema_version="1"
+    )
+
+
+_MISSING_DECISION_VALUE = object()
+_COMPACT_DECISION_INDEXES: dict[tuple[str, ...], dict[str, int]] = {}
+_TEMP_TABLE_IDS = count()
+
+
+class _CompactDecisionRecord(Mapping[str, Any]):
+    """Tuple-backed reconciliation view used by the cross-side decision pass."""
+
+    __slots__ = ("_fields", "_values", "_extras", "_index", "_length")
+
+    def __init__(
+        self,
+        row: Mapping[str, Any],
+        fields: tuple[str, ...],
+        *,
+        excluded_fields: frozenset[str] = frozenset(),
+    ):
+        self._fields = fields
+        index = _COMPACT_DECISION_INDEXES.get(fields)
+        if index is None:
+            index = {field: offset for offset, field in enumerate(fields)}
+            _COMPACT_DECISION_INDEXES[fields] = index
+        self._index = index
+        self._values = tuple(
+            row[field] if field in row else _MISSING_DECISION_VALUE
+            for field in fields
+        )
+        self._extras = tuple(
+            (key, value) for key, value in row.items()
+            if key not in self._index and key not in excluded_fields
+        )
+        self._length = sum(
+            value is not _MISSING_DECISION_VALUE for value in self._values
+        ) + len(self._extras)
+
+    def __getitem__(self, key: str) -> Any:
+        index = self._index.get(key)
+        if index is not None:
+            value = self._values[index]
+            if value is _MISSING_DECISION_VALUE:
+                raise KeyError(key)
+            return value
+        for extra_key, value in self._extras:
+            if extra_key == key:
+                return value
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        for key, value in zip(self._fields, self._values):
+            if value is not _MISSING_DECISION_VALUE:
+                yield key
+        for key, _value in self._extras:
+            yield key
+
+    def __len__(self) -> int:
+        return self._length
+
+
+_PROVIDER_DECISION_FIELDS = (
+    "initiating_loader_realm_identity",
+    "class_name",
+    "class_provider_status",
+    "provider_binding_identity",
+    "runtime_profile_identity",
+    "selected_artifact_instance_identity",
+    "selected_class_variant_identity",
+    "selected_defining_loader_realm_identity",
+    "selection_evidence",
+)
+_DEFINITION_DECISION_FIELDS = (
+    "initiating_loader_realm_identity",
+    "class_name",
+    "class_definition_status",
+    "class_load_status",
+    "class_definition_resolution_identity",
+    "provider_binding_identity",
+)
 
 
 @dataclass(frozen=True)
@@ -110,37 +193,458 @@ class BinaryDecisionEngine:
         self._current_artifact_lineages = self._artifact_lineages(
             "current_artifact_instance_identity"
         )
-        self._base_providers = self._records_by_key(
-            base_reconciliation.provider_bindings,
+        base_provider_records = self._reconciliation_records(
+            base_store, base_reconciliation, "provider_bindings",
+            "provider_binding",
+        )
+        current_provider_records = self._reconciliation_records(
+            current_store, current_reconciliation, "provider_bindings",
+            "provider_binding",
+        )
+        self._base_providers = self._compact_records_by_key(
+            base_provider_records,
+            _PROVIDER_DECISION_FIELDS,
             duplicate_code="PROVIDER_BINDING_SCOPE_DUPLICATE",
             identity_field="provider_binding_identity",
         )
-        self._current_providers = self._records_by_key(
-            current_reconciliation.provider_bindings,
+        self._current_providers = self._compact_records_by_key(
+            current_provider_records,
+            _PROVIDER_DECISION_FIELDS,
             duplicate_code="PROVIDER_BINDING_SCOPE_DUPLICATE",
             identity_field="provider_binding_identity",
         )
-        self._base_definitions = self._records_by_key(
-            base_reconciliation.class_definitions,
-            duplicate_code="CLASS_DEFINITION_SCOPE_DUPLICATE",
-            identity_field="class_definition_resolution_identity",
+        base_definition_records = self._reconciliation_records(
+            base_store, base_reconciliation, "class_definitions",
+            "class_definition",
         )
-        self._current_definitions = self._records_by_key(
-            current_reconciliation.class_definitions,
+        current_definition_records = self._reconciliation_records(
+            current_store, current_reconciliation, "class_definitions",
+            "class_definition",
+        )
+        self._base_definitions = self._compact_records_by_key(
+            base_definition_records,
+            _DEFINITION_DECISION_FIELDS,
             duplicate_code="CLASS_DEFINITION_SCOPE_DUPLICATE",
             identity_field="class_definition_resolution_identity",
+            excluded_fields=(
+                frozenset()
+                if base_reconciliation.class_definitions
+                else frozenset({"evidence"})
+            ),
+        )
+        self._current_definitions = self._compact_records_by_key(
+            current_definition_records,
+            _DEFINITION_DECISION_FIELDS,
+            duplicate_code="CLASS_DEFINITION_SCOPE_DUPLICATE",
+            identity_field="class_definition_resolution_identity",
+            excluded_fields=(
+                frozenset()
+                if current_reconciliation.class_definitions
+                else frozenset({"evidence"})
+            ),
         )
         self._base_resources = self._resource_records_by_key(
-            base_reconciliation.resource_selections
+            self._reconciliation_records(
+                base_store, base_reconciliation, "resource_selections",
+                "resource_selection",
+            )
         )
         self._current_resources = self._resource_records_by_key(
-            current_reconciliation.resource_selections
+            self._reconciliation_records(
+                current_store, current_reconciliation, "resource_selections",
+                "resource_selection",
+            )
         )
-        self._paired_semantic_member_edges_cache = None
+        self._base_full_definitions = None
+        self._current_full_definitions = None
+        self._paired_semantic_member_outcome_deltas_cache = None
         self._removed_member_consumer_edges_cache = None
         self._current_hierarchy_parent_cache: dict[
             tuple[str, str], tuple[str, ...]
         ] = {}
+
+    @staticmethod
+    def _reconciliation_records(
+        store: BinaryFactStore,
+        reconciliation: RuntimeReconciliationResult,
+        attribute: str,
+        record_kind: str,
+    ) -> Iterable[Mapping[str, Any]]:
+        records = getattr(reconciliation, attribute)
+        return records if records else store.reconciliation_payloads(record_kind)
+
+    @staticmethod
+    def _compact_records_by_key(
+        records: Iterable[Mapping[str, Any]],
+        fields: tuple[str, ...],
+        *,
+        duplicate_code: str,
+        identity_field: str,
+        excluded_fields: frozenset[str] = frozenset(),
+    ) -> dict[tuple[Any, ...], Mapping[str, Any]]:
+        compact_records = (
+            _CompactDecisionRecord(
+                record, fields, excluded_fields=excluded_fields
+            )
+            for record in records
+        )
+        return BinaryDecisionEngine._records_by_key(
+            compact_records,
+            duplicate_code=duplicate_code,
+            identity_field=identity_field,
+        )
+
+    @staticmethod
+    def _member_resolution_payloads(
+        store: BinaryFactStore,
+        reconciliation: RuntimeReconciliationResult,
+    ) -> Iterable[Mapping[str, Any]]:
+        records = reconciliation.member_resolutions
+        return records if records else store.reconciliation_payloads(
+            "member_resolution"
+        )
+
+    def _definition_payload(
+        self, side: str, key: tuple[str, str]
+    ) -> Mapping[str, Any] | None:
+        compact = (
+            self._base_definitions if side == "base"
+            else self._current_definitions
+        ).get(key)
+        if compact is None:
+            return None
+        if "evidence" in compact:
+            return dict(compact)
+        cache_name = (
+            "_base_full_definitions"
+            if side == "base" else "_current_full_definitions"
+        )
+        cache = getattr(self, cache_name)
+        if cache is None:
+            store = self.base_store if side == "base" else self.current_store
+            cache = self._records_by_key(
+                store.reconciliation_payloads("class_definition"),
+                duplicate_code="CLASS_DEFINITION_SCOPE_DUPLICATE",
+                identity_field="class_definition_resolution_identity",
+            )
+            setattr(self, cache_name, cache)
+        return cache.get(key)
+
+    @staticmethod
+    def _provider_payload(
+        record: Mapping[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        return dict(record) if record is not None else None
+
+    @staticmethod
+    def _iter_semantic_member_edges(
+        store: BinaryFactStore,
+        reconciliation: RuntimeReconciliationResult,
+        artifact_lineages: Mapping[str, str],
+        providers: Mapping[tuple[Any, ...], Mapping[str, Any]],
+    ):
+        """Yield executable member edges in the historical semantic-key order.
+
+        Member-resolution evidence is persisted in compressed chunks.  The old
+        comparison expanded all chunks into a 300k-entry Python dictionary and
+        then built another 300k-entry edge dictionary for each side.  A TEMP
+        table keeps the exact join and duplicate checks while bounding Python
+        residency to the current rows.  TEMP state never enters the immutable
+        generation database.
+        """
+        connection = store.connection
+        table_id = next(_TEMP_TABLE_IDS)
+        resolution_table = f"binary_decision_member_resolution_index_{table_id}"
+        lineage_table = f"binary_decision_artifact_lineage_{table_id}"
+        connection.execute(f"DROP TABLE IF EXISTS temp.{resolution_table}")
+        connection.execute(f"DROP TABLE IF EXISTS temp.{lineage_table}")
+        connection.execute(
+            f"""
+            CREATE TEMP TABLE {resolution_table} (
+                direct_edge_identity TEXT PRIMARY KEY,
+                member_resolution_status TEXT NOT NULL,
+                resolved_owner TEXT NOT NULL,
+                resolved_realm TEXT NOT NULL,
+                initiating_realm TEXT NOT NULL
+            ) WITHOUT ROWID
+            """
+        )
+        pending = []
+        try:
+            for resolution in BinaryDecisionEngine._member_resolution_payloads(
+                store, reconciliation
+            ):
+                pending.append((
+                    str(resolution.get("direct_edge_identity") or ""),
+                    str(resolution.get("member_resolution_status") or ""),
+                    str(resolution.get("resolved_owner") or ""),
+                    str(
+                        resolution.get(
+                            "resolved_defining_loader_realm_identity"
+                        ) or ""
+                    ),
+                    str(
+                        resolution.get("initiating_loader_realm_identity") or ""
+                    ),
+                ))
+                if len(pending) >= 2_000:
+                    connection.executemany(
+                        f"INSERT INTO {resolution_table} VALUES(?,?,?,?,?)",
+                        pending,
+                    )
+                    pending.clear()
+            if pending:
+                connection.executemany(
+                    f"INSERT INTO {resolution_table} VALUES(?,?,?,?,?)",
+                    pending,
+                )
+                pending.clear()
+        except sqlite3.IntegrityError as error:
+            raise BinaryFirstContractError(
+                "MEMBER_RESOLUTION_EDGE_DUPLICATE", str(error)
+            ) from error
+
+        connection.execute(
+            f"""
+            CREATE TEMP TABLE {lineage_table} (
+                artifact_instance_identity TEXT PRIMARY KEY,
+                logical_dependency_lineage TEXT NOT NULL
+            ) WITHOUT ROWID
+            """
+        )
+        lineage_rows = []
+        for artifact in store.connection.execute(
+            """
+            SELECT artifact_instance_identity,runtime_path_kind,
+                   runtime_classpath_index
+            FROM artifact_instances
+            """
+        ):
+            artifact_identity = str(artifact["artifact_instance_identity"])
+            lineage_rows.append((
+                artifact_identity,
+                str(artifact_lineages.get(artifact_identity) or (
+                    f"runtime-slot:{artifact['runtime_path_kind']}:"
+                    f"{artifact['runtime_classpath_index']}"
+                )),
+            ))
+        connection.executemany(
+            f"INSERT INTO {lineage_table} VALUES(?,?)", lineage_rows
+        )
+
+        previous_key = None
+        rows = None
+        try:
+            rows = connection.execute(
+                f"""
+                SELECT edge.direct_edge_identity,edge.caller_member_identity,
+                       edge.caller_artifact_instance_identity,
+                       edge.instruction_index,edge.bytecode_offset,
+                       edge.edge_kind,edge.opcode,edge.symbolic_owner,
+                       edge.symbolic_name,edge.symbolic_descriptor,
+                       caller.class_name AS caller_class_name,
+                       caller.member_name AS caller_member_name,
+                       caller.descriptor AS caller_descriptor,
+                       caller.class_variant_identity AS caller_class_variant_identity,
+                       artifact.runtime_path_kind,
+                       lineage.logical_dependency_lineage,
+                       resolution.member_resolution_status,
+                       resolution.resolved_owner,resolution.resolved_realm,
+                       resolution.initiating_realm
+                FROM direct_edges AS edge
+                JOIN members AS caller
+                  ON caller.member_identity=edge.caller_member_identity
+                JOIN artifact_instances AS artifact
+                  ON artifact.artifact_instance_identity=
+                     edge.caller_artifact_instance_identity
+                JOIN temp.{resolution_table} AS resolution
+                  ON resolution.direct_edge_identity=edge.direct_edge_identity
+                JOIN temp.{lineage_table} AS lineage
+                  ON lineage.artifact_instance_identity=
+                     edge.caller_artifact_instance_identity
+                WHERE edge.edge_kind IN ('method', 'field')
+                ORDER BY lineage.logical_dependency_lineage,
+                         artifact.runtime_path_kind,
+                         caller.class_name,caller.member_name,caller.descriptor,
+                         edge.instruction_index,edge.bytecode_offset,edge.opcode,
+                         edge.symbolic_owner,edge.symbolic_name,
+                         edge.symbolic_descriptor,resolution.initiating_realm
+                """
+            )
+            for raw in rows:
+                initiating_realm = str(raw["initiating_realm"] or "")
+                provider = providers.get(
+                    (initiating_realm, str(raw["caller_class_name"] or ""))
+                )
+                # The fact store also contains edges from shadowed variants.
+                if (
+                    not provider
+                    or provider.get("class_provider_status") != "resolved"
+                    or provider.get("selected_class_variant_identity")
+                    != raw["caller_class_variant_identity"]
+                ):
+                    continue
+                key = (
+                    str(raw["logical_dependency_lineage"] or ""),
+                    str(raw["runtime_path_kind"] or ""),
+                    str(raw["caller_class_name"] or ""),
+                    str(raw["caller_member_name"] or ""),
+                    str(raw["caller_descriptor"] or ""),
+                    int(raw["instruction_index"] or 0),
+                    int(raw["bytecode_offset"] or 0),
+                    int(raw["opcode"] or 0),
+                    str(raw["symbolic_owner"] or ""),
+                    str(raw["symbolic_name"] or ""),
+                    str(raw["symbolic_descriptor"] or ""),
+                    initiating_realm,
+                )
+                if key == previous_key:
+                    raise BinaryFirstContractError(
+                        "SEMANTIC_MEMBER_EDGE_KEY_DUPLICATE",
+                        f"key={key}; duplicate={raw['direct_edge_identity']}",
+                    )
+                previous_key = key
+                edge = {
+                    field: raw[field]
+                    for field in (
+                        "direct_edge_identity", "caller_member_identity",
+                        "caller_artifact_instance_identity",
+                        "instruction_index", "bytecode_offset", "edge_kind",
+                        "opcode", "symbolic_owner", "symbolic_name",
+                        "symbolic_descriptor",
+                    )
+                }
+                outcome = (
+                    str(raw["member_resolution_status"] or ""),
+                    str(raw["resolved_owner"] or ""),
+                    str(raw["resolved_realm"] or ""),
+                )
+                yield key, edge, outcome
+        finally:
+            if rows is not None:
+                rows.close()
+            connection.execute(f"DROP TABLE IF EXISTS temp.{resolution_table}")
+            connection.execute(f"DROP TABLE IF EXISTS temp.{lineage_table}")
+
+    @staticmethod
+    def _resolution_payloads_for_edges(
+        store: BinaryFactStore,
+        reconciliation: RuntimeReconciliationResult,
+        edge_identities: set[str],
+    ) -> dict[str, Mapping[str, Any]]:
+        if not edge_identities:
+            return {}
+        output = {}
+        for resolution in BinaryDecisionEngine._member_resolution_payloads(
+            store, reconciliation
+        ):
+            edge_identity = str(resolution.get("direct_edge_identity") or "")
+            if edge_identity not in edge_identities:
+                continue
+            if edge_identity in output:
+                raise BinaryFirstContractError(
+                    "MEMBER_RESOLUTION_EDGE_DUPLICATE", edge_identity
+                )
+            output[edge_identity] = resolution
+        missing = sorted(edge_identities - set(output))
+        if missing:
+            raise BinaryFirstContractError(
+                "MEMBER_RESOLUTION_EDGE_MISSING", str(missing[:10])
+            )
+        return output
+
+    def _paired_semantic_member_outcome_deltas(self):
+        cached = getattr(
+            self, "_paired_semantic_member_outcome_deltas_cache", None
+        )
+        if cached is not None:
+            return cached
+        legacy = getattr(self, "_paired_semantic_member_edges_cache", None)
+        if legacy is not None:
+            base_edges, current_edges = legacy
+            cached = tuple(
+                (
+                    key,
+                    base_edges[key][0],
+                    base_edges[key][1],
+                    current_edges[key][0],
+                    current_edges[key][1],
+                )
+                for key in sorted(set(base_edges).intersection(current_edges))
+                if (
+                    str(base_edges[key][1].get("member_resolution_status") or ""),
+                    str(base_edges[key][1].get("resolved_owner") or ""),
+                    str(base_edges[key][1].get(
+                        "resolved_defining_loader_realm_identity"
+                    ) or ""),
+                ) != (
+                    str(current_edges[key][1].get("member_resolution_status") or ""),
+                    str(current_edges[key][1].get("resolved_owner") or ""),
+                    str(current_edges[key][1].get(
+                        "resolved_defining_loader_realm_identity"
+                    ) or ""),
+                )
+            )
+            self._paired_semantic_member_outcome_deltas_cache = cached
+            return cached
+        base_rows = iter(self._iter_semantic_member_edges(
+            self.base_store,
+            self.base_runtime,
+            self._base_artifact_lineages,
+            self._base_providers,
+        ))
+        current_rows = iter(self._iter_semantic_member_edges(
+            self.current_store,
+            self.current_runtime,
+            self._current_artifact_lineages,
+            self._current_providers,
+        ))
+        compact_deltas = []
+        try:
+            base = next(base_rows, None)
+            current = next(current_rows, None)
+            while base is not None and current is not None:
+                if base[0] < current[0]:
+                    base = next(base_rows, None)
+                    continue
+                if current[0] < base[0]:
+                    current = next(current_rows, None)
+                    continue
+                if base[2] != current[2]:
+                    compact_deltas.append((base[0], base[1], current[1]))
+                base = next(base_rows, None)
+                current = next(current_rows, None)
+        finally:
+            close = getattr(base_rows, "close", None)
+            if close is not None:
+                close()
+            close = getattr(current_rows, "close", None)
+            if close is not None:
+                close()
+        base_edge_ids = {
+            str(item[1]["direct_edge_identity"]) for item in compact_deltas
+        }
+        current_edge_ids = {
+            str(item[2]["direct_edge_identity"]) for item in compact_deltas
+        }
+        base_resolutions = self._resolution_payloads_for_edges(
+            self.base_store, self.base_runtime, base_edge_ids
+        )
+        current_resolutions = self._resolution_payloads_for_edges(
+            self.current_store, self.current_runtime, current_edge_ids
+        )
+        cached = tuple(
+            (
+                key,
+                base_edge,
+                base_resolutions[str(base_edge["direct_edge_identity"])],
+                current_edge,
+                current_resolutions[str(current_edge["direct_edge_identity"])],
+            )
+            for key, base_edge, current_edge in compact_deltas
+        )
+        self._paired_semantic_member_outcome_deltas_cache = cached
+        return cached
 
     @staticmethod
     def _semantic_member_edges(
@@ -148,14 +652,17 @@ class BinaryDecisionEngine:
         reconciliation: RuntimeReconciliationResult,
         artifact_lineages: Mapping[str, str],
     ) -> dict[tuple[Any, ...], tuple[dict[str, Any], dict[str, Any], dict[str, Any]]]:
+        """Compatibility helper retained for focused external tests/callers."""
         resolutions = BinaryDecisionEngine._unique_index(
-            reconciliation.member_resolutions,
+            BinaryDecisionEngine._member_resolution_payloads(store, reconciliation),
             ("direct_edge_identity",),
             duplicate_code="MEMBER_RESOLUTION_EDGE_DUPLICATE",
             identity_field="member_resolution_identity",
         )
         providers = BinaryDecisionEngine._unique_index(
-            reconciliation.provider_bindings,
+            BinaryDecisionEngine._reconciliation_records(
+                store, reconciliation, "provider_bindings", "provider_binding"
+            ),
             ("initiating_loader_realm_identity", "class_name"),
             duplicate_code="PROVIDER_BINDING_SCOPE_DUPLICATE",
             identity_field="provider_binding_identity",
@@ -250,25 +757,6 @@ class BinaryDecisionEngine:
             output[key] = (edge, resolution, artifact)
         return output
 
-    def _paired_semantic_member_edges(self):
-        cached = self._paired_semantic_member_edges_cache
-        if cached is not None:
-            return cached
-        cached = (
-            self._semantic_member_edges(
-                self.base_store,
-                self.base_runtime,
-                self._base_artifact_lineages,
-            ),
-            self._semantic_member_edges(
-                self.current_store,
-                self.current_runtime,
-                self._current_artifact_lineages,
-            ),
-        )
-        self._paired_semantic_member_edges_cache = cached
-        return cached
-
     def _removed_member_consumer_edges(self) -> Mapping[tuple[str, ...], tuple[str, ...]]:
         """Bind current unresolved edges to the member resolved on the base side.
 
@@ -282,11 +770,14 @@ class BinaryDecisionEngine:
         cached = self._removed_member_consumer_edges_cache
         if cached is not None:
             return cached
-        base_edges, current_edges = self._paired_semantic_member_edges()
         grouped: dict[tuple[str, ...], set[str]] = {}
-        for semantic_key in set(base_edges).intersection(current_edges):
-            base_edge, base_resolution, _ = base_edges[semantic_key]
-            current_edge, current_resolution, _ = current_edges[semantic_key]
+        for (
+            _semantic_key,
+            base_edge,
+            base_resolution,
+            current_edge,
+            current_resolution,
+        ) in self._paired_semantic_member_outcome_deltas():
             if (
                 base_resolution.get("member_resolution_status") != "resolved"
                 or current_resolution.get("member_resolution_status")
@@ -841,8 +1332,12 @@ class BinaryDecisionEngine:
                                     "upstream_artifact_observed_delta_identity": (
                                         upstream_observed
                                     ),
-                                    "base_provider": base_provider,
-                                    "current_provider": current_provider,
+                                    "base_provider": self._provider_payload(
+                                        base_provider
+                                    ),
+                                    "current_provider": self._provider_payload(
+                                        current_provider
+                                    ),
                                 },
                                 dependency_artifacts=dependency_artifacts,
                             )
@@ -1066,7 +1561,10 @@ class BinaryDecisionEngine:
                     fact_scope=scope,
                     target_identity=target,
                     coverage_gaps=gaps,
-                    evidence={"base_provider": base, "current_provider": current},
+                    evidence={
+                        "base_provider": self._provider_payload(base),
+                        "current_provider": self._provider_payload(current),
+                    },
                     dependency_artifacts=self._dependency_artifacts(
                         base_identity,
                         current_identity,
@@ -1089,6 +1587,12 @@ class BinaryDecisionEngine:
                 current_fingerprint=new_status,
             )
             definite = {old_status, new_status}.isdisjoint({"ambiguous", "unsupported", "ABSENT"})
+            base_definition_payload = self._definition_payload(
+                "base", (realm, class_name)
+            )
+            current_definition_payload = self._definition_payload(
+                "current", (realm, class_name)
+            )
             self._decision(
                 observed_identity=definition_observed,
                 channel="authoritative" if definite and not gaps else "diagnostic",
@@ -1100,7 +1604,10 @@ class BinaryDecisionEngine:
                 fact_scope=definition_scope,
                 target_identity=target,
                 coverage_gaps=gaps if gaps else (() if definite else ("definition_outcome_not_definite",)),
-                evidence={"base_definition": base_definition, "current_definition": current_definition},
+                evidence={
+                    "base_definition": base_definition_payload,
+                    "current_definition": current_definition_payload,
+                },
                 dependency_artifacts=self._dependency_artifacts(
                     str((base or {}).get("selected_artifact_instance_identity") or ""),
                     str((current or {}).get("selected_artifact_instance_identity") or ""),
@@ -1109,10 +1616,13 @@ class BinaryDecisionEngine:
         self._process_resource_outcome_deltas()
 
     def _process_member_resolution_deltas(self) -> None:
-        base_edges, current_edges = self._paired_semantic_member_edges()
-        for key in sorted(set(base_edges).intersection(current_edges)):
-            base_edge, base_resolution, _base_caller_artifact = base_edges[key]
-            current_edge, current_resolution, _current_caller_artifact = current_edges[key]
+        for (
+            key,
+            base_edge,
+            base_resolution,
+            current_edge,
+            current_resolution,
+        ) in self._paired_semantic_member_outcome_deltas():
             base_status = str(
                 base_resolution.get("member_resolution_status") or ""
             )
@@ -1295,7 +1805,7 @@ class BinaryDecisionEngine:
         # Keep compatibility with richer verifier implementations without
         # relying on hierarchy fields that are absent from today's protocol.
         if not parents:
-            definition = self._current_definitions.get(key) or {}
+            definition = self._definition_payload("current", key) or {}
             observation = (
                 (definition.get("evidence") or {}).get(
                     "target_jvm_verification"

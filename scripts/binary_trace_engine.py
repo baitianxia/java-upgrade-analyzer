@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import json
 from typing import Any, Mapping
 
@@ -16,7 +16,10 @@ from binary_entrypoint_discovery import (
 from binary_fact_store import BinaryFactStore
 from binary_first_contract import canonical_identity, derive_formal_result_state
 from binary_first_model import RuntimeProfile
-from binary_runtime_reconciler import RuntimeReconciliationResult
+from binary_runtime_reconciler import (
+    RuntimeReconciliationResult,
+    hydrate_runtime_reconciliation,
+)
 
 
 ACC_PUBLIC = 0x0001
@@ -1120,27 +1123,17 @@ def _hydrate_trace_reconciliation(
 ) -> RuntimeReconciliationResult:
     """Restore graph-only record families after selective reconciliation."""
 
-    if not isinstance(reconciliation, RuntimeReconciliationResult):
-        # Test doubles and external callers predating selective retention have
-        # no persisted hydration contract; leave their supplied view untouched.
-        return reconciliation
-    kinds_by_field = {
-        "member_resolutions": "member_resolution",
-        "dispatch_resolutions": "dispatch_resolution",
-        "type_resolutions": "type_resolution",
-        "class_initialization_resolutions": (
-            "class_initialization_resolution"
+    return hydrate_runtime_reconciliation(
+        store,
+        reconciliation,
+        (
+            "member_resolution",
+            "dispatch_resolution",
+            "type_resolution",
+            "class_initialization_resolution",
+            "linkage_resolution",
         ),
-        "linkage_resolutions": "linkage_resolution",
-    }
-    replacements = {}
-    for field_name, record_kind in kinds_by_field.items():
-        if getattr(reconciliation, field_name):
-            continue
-        replacements[field_name] = tuple(
-            store.reconciliation_payloads(record_kind)
-        )
-    return replace(reconciliation, **replacements) if replacements else reconciliation
+    )
 
 
 def build_binary_traces(
@@ -1186,10 +1179,17 @@ def build_binary_traces(
         or entrypoint_discovery.possible_member_identities
         or service_activation
     ):
+        # Even an empty-root formal result must bind its changed target to the
+        # selected physical member. Definitions and graph-edge resolutions are
+        # unnecessary here, but omitting providers would silently replace that
+        # member with a symbolic target and change the analysis result.
+        selected = hydrate_runtime_reconciliation(
+            store, reconciliation, ("provider_binding",)
+        )
         return BinaryTraceEngine(
             store,
             runtime_profile,
-            reconciliation,
+            selected,
             decisions,
             entrypoint_discovery=entrypoint_discovery,
             inline_overlay=inline_overlay,
@@ -1199,7 +1199,12 @@ def build_binary_traces(
             materialize_graph=False,
         ).build()
     if has_trace_results or service_activation:
-        hydrated = _hydrate_trace_reconciliation(store, reconciliation)
+        selected = hydrate_runtime_reconciliation(
+            store,
+            reconciliation,
+            ("provider_binding", "class_definition"),
+        )
+        hydrated = _hydrate_trace_reconciliation(store, selected)
         return BinaryTraceEngine(
             store,
             runtime_profile,

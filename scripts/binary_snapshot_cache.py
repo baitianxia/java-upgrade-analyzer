@@ -16,7 +16,10 @@ import zlib
 
 from binary_artifact_diff import ArchiveEntryFact, ArtifactSnapshot, snapshot_archive
 from binary_asm_helper import parser_identity, resolve_asm_jar
-from binary_first_contract import BinaryFirstContractError, canonical_identity
+from binary_first_contract import (
+    BinaryFirstContractError,
+    canonical_identity_native_json,
+)
 
 
 CACHE_SCHEMA = "java-upgrade-analyzer.binary-snapshot-cache.v2"
@@ -69,7 +72,9 @@ class SnapshotTemplateMemo:
 
 
 def _identity(namespace: str, payload: Any) -> str:
-    return canonical_identity(namespace, payload, schema_version="1")
+    return canonical_identity_native_json(
+        namespace, payload, schema_version="1"
+    )
 
 
 def _json_bytes(value: Any) -> bytes:
