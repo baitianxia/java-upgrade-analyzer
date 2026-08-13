@@ -1,0 +1,59 @@
+{
+  "schema": "java-upgrade-analyzer.binary-result-truth.v1",
+  "case": "generated-topology-seed-43",
+  "input": {
+    "generator_policy_version": "binary-generated-dag-v1",
+    "seed": 43,
+    "node_count": 18,
+    "topology_identity": "20b5aa8a616ef3a247b971f5ec9130b0a3b823fdda41670de3108ed82de73b32"
+  },
+  "result_set_policy": "exact",
+  "exact_reachability_statuses": [
+    "reachable",
+    "not_found_in_static_analysis"
+  ],
+  "expected_results": [
+    {
+      "owner": "generated/N003",
+      "member": "call",
+      "descriptor": "()I",
+      "member_kind": "method",
+      "dependency_lineages": ["generated:topology"],
+      "base_dependency_coords": ["generated:topology:1"],
+      "current_dependency_coords": ["generated:topology:2"],
+      "reachability_status": "reachable",
+      "static_linkage_status": "compatible_or_not_applicable",
+      "impact_conclusion": "probable_impact",
+      "runtime_verification_status": "required_not_executed",
+      "exact_path_exists": true,
+      "possible_path_exists": false,
+      "path_set_complete": true,
+      "minimum_path_count": 1,
+      "required_paths": [
+        {
+          "certainty": "exact",
+          "text": "generated.N000.call() → generated.N001.call() → generated.N002.call() → generated.N003.call()"
+        }
+      ]
+    },
+    {
+      "owner": "generated/N017",
+      "member": "call",
+      "descriptor": "()I",
+      "member_kind": "method",
+      "dependency_lineages": ["generated:topology"],
+      "base_dependency_coords": ["generated:topology:1"],
+      "current_dependency_coords": ["generated:topology:2"],
+      "reachability_status": "not_found_in_static_analysis",
+      "static_linkage_status": "compatible_or_not_applicable",
+      "impact_conclusion": "inconclusive",
+      "runtime_verification_status": "undetermined",
+      "exact_path_exists": false,
+      "possible_path_exists": false,
+      "path_set_complete": true,
+      "minimum_path_count": 0,
+      "required_paths": []
+    }
+  ],
+  "forbidden_results": []
+}

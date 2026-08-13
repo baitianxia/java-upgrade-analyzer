@@ -1,4 +1,6 @@
 import csv
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 import hashlib
 import json
 import sys
@@ -14,6 +16,7 @@ from binary_decision_engine import BinaryDecisionBundle  # noqa: E402
 from binary_first_model import ActiveSnapshot, RuntimeProfile  # noqa: E402
 from binary_output import (  # noqa: E402
     BinaryOutputError,
+    _aggregate_by_api,
     activate_binary_generation,
     write_binary_generation,
 )
@@ -185,6 +188,66 @@ class BinaryOutputTest(unittest.TestCase):
         self.assertEqual(csv_rows[0]["reachability_status"], "reachable")
         for name, expected in manifest["sidecar_content_identities"].items():
             self.assertEqual(actual_sidecar_identities[name], expected)
+
+    def test_concurrent_identical_generation_publication_is_idempotent(self):
+        profile = self.profile()
+        decisions, traces = self.bundles()
+        with tempfile.TemporaryDirectory() as tmp:
+            def publish():
+                return write_binary_generation(
+                    tmp, decisions, traces, profile,
+                    policy_identities={"projection_registry": "registry-1"},
+                )
+
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                manifests = list(executor.map(lambda _index: publish(), range(8)))
+            identities = {
+                item["result_generation_identity"] for item in manifests
+            }
+            generation_dirs = list((Path(tmp) / "binary_generations").iterdir())
+            manifest = json.loads((
+                generation_dirs[0] / "result_generation.json"
+            ).read_text(encoding="utf-8"))
+
+        self.assertEqual(len(identities), 1)
+        self.assertEqual(len(generation_dirs), 1)
+        self.assertEqual(manifest["result_generation_identity"], next(iter(identities)))
+
+    def test_unreachable_api_keeps_runtime_verification_undetermined(self):
+        profile = self.profile()
+        decisions, traces = self.bundles()
+        formal = dict(traces.formal_results[0])
+        formal.update({
+            "reachability_status": "not_found_in_static_analysis",
+            "analysis_status": "not_found_in_static_analysis",
+            "is_reachable": False,
+            "impact_conclusion": "inconclusive",
+            "runtime_verification_status": "undetermined",
+            "exact_path_exists": False,
+        })
+        unreachable_traces = replace(traces, formal_results=(formal,))
+
+        by_api = _aggregate_by_api(decisions, unreachable_traces, profile)[0]
+
+        self.assertEqual(
+            by_api["runtime_verification_status"], "undetermined"
+        )
+
+    def test_api_runtime_verification_is_derived_from_reachability(self):
+        profile = self.profile()
+        decisions, traces = self.bundles()
+        inconsistent_formal = dict(traces.formal_results[0])
+        inconsistent_formal["runtime_verification_status"] = "undetermined"
+
+        by_api = _aggregate_by_api(
+            decisions,
+            replace(traces, formal_results=(inconsistent_formal,)),
+            profile,
+        )[0]
+
+        self.assertEqual(
+            by_api["runtime_verification_status"], "required_not_executed"
+        )
 
     def test_large_path_sidecar_is_streamed_and_content_bound(self):
         profile = self.profile()

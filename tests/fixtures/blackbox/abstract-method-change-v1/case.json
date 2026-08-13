@@ -1,0 +1,18 @@
+{
+  "schema": "java-upgrade-analyzer.blackbox-case.v1",
+  "case_id": "abstract-method-change-v1",
+  "dataset_version": 1,
+  "public_entrypoint": "scripts/binary_pipeline.py",
+  "truth_file": "truth.json",
+  "oracle_contract": "member_contract_linkage_closed_set",
+  "capabilities": ["abstract_method_change", "reachable_positive", "unchanged_member_negative"],
+  "library_class": "contract.AbstractApi",
+  "business_class": "contract.AbstractApp",
+  "business_classes": ["contract.AbstractApp", "contract.ConcreteClient"],
+  "oracle_main_class": "contract.OracleMain",
+  "library_lineage": "blackbox:abstract-lib",
+  "base_coordinate": "blackbox:abstract-lib:1.0",
+  "current_coordinate": "blackbox:abstract-lib:2.0",
+  "entrypoints": [{"class_name": "contract/AbstractApp", "member_name": "entry", "descriptor": "(Lcontract/AbstractApi;)Ljava/lang/String;"}],
+  "linkage_probes": [{"mode": "abstract", "owner": "contract/AbstractApi", "member": "changedAbstract", "descriptor": "()Ljava/lang/String;", "member_kind": "method", "linkage_error": "AbstractMethodError"}]
+}

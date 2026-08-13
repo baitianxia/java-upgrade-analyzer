@@ -1,0 +1,77 @@
+{
+  "schema": "java-upgrade-analyzer.workflow-blackbox-truth.v1",
+  "case_id": "step3-public-static-scans-v1",
+  "system_generated": false,
+  "oracle_producers": [
+    {
+      "id": "openjdk-classfile-and-language-contract",
+      "organization": "OpenJDK",
+      "mechanism": "javap classfile inspection and Java platform removal boundaries",
+      "verifies": ["JDK 8 to 17 interval", "compiled artifact classfile versions"]
+    },
+    {
+      "id": "stdlib-source-resource-inventory",
+      "organization": "Python standard library",
+      "mechanism": "closed UTF-8 source, ZIP and XML inventory independent of analyzer output",
+      "verifies": ["source signals", "Spring resource keys", "two-sided MyBatis SQL contract"]
+    }
+  ],
+  "context": {
+    "jdk_base": "8",
+    "jdk_current": "17",
+    "springboot_base": "2.7.18",
+    "springboot_current": "3.2.0",
+    "jdk_upgraded": true,
+    "springboot_major_upgrade": true
+  },
+  "jdk_removed": [
+    {"API": "JAXB", "移除版本": "JDK11", "状态": "REMOVED", "置信度": "CONFIRMED"},
+    {"API": "Applet", "移除版本": "JDK17", "状态": "REMOVED", "置信度": "CONFIRMED"}
+  ],
+  "javax": [
+    {"引用类型": "java_import", "需迁移": "Y"},
+    {"引用类型": "java_fqn", "需迁移": "N"}
+  ],
+  "jdk_internal": [{"API类型": "sun.misc"}],
+  "reflection": [{"反射类型": "Class.forName"}],
+  "serialization": {
+    "risk_count": 1,
+    "required_text": ["MigrationSignals", "未声明 serialVersionUID"]
+  },
+  "runtime_flags": [
+    {"参数": "--illegal-access", "影响版本": "JDK17"}
+  ],
+  "spring_config": [
+    {"配置键": "spring.datasource.url", "当前值": "jdbc:h2:mem:blackbox"},
+    {"配置键": "management.endpoints.web.exposure.include", "当前值": "health"}
+  ],
+  "spring_autoconfig_required_text": [
+    "发现:",
+    "spring.factories",
+    "未发现 AutoConfiguration.imports",
+    "@ConstructorBinding"
+  ],
+  "database_contract": {
+    "summary": {
+      "coverage_status": "complete",
+      "change_count": 1,
+      "confirmed_count": 1,
+      "review_count": 0,
+      "changed_dependency_count": 1
+    },
+    "rows": [
+      {
+        "依赖包": "org.example:demo-lib",
+        "旧版本": "1.0.0",
+        "新版本": "2.0.0",
+        "变化类型": "修改契约",
+        "契约类型": "MyBatis XML SELECT",
+        "可信度": "确认",
+        "表": "orders",
+        "列": "id, new_column",
+        "契约位置": "scan.OrderMapper",
+        "语句或字段": "find"
+      }
+    ]
+  }
+}

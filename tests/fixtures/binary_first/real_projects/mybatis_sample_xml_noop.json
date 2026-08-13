@@ -1,0 +1,75 @@
+{
+  "schema": "java-upgrade-analyzer.binary-real-project-guard.v1",
+  "case": "mybatis-sample-xml-fixed-revision-noop",
+  "repository": "mybatis/spring-boot-starter",
+  "git_revision": "bb8bac144e4677cf1bab5a6d27ced2521972adfc",
+  "application_coordinate": "org.mybatis.spring.boot:mybatis-spring-boot-sample-xml:4.0.1",
+  "activated_frameworks": ["spring_boot", "mybatis"],
+  "capabilities": [
+    "fixed_real_project_revision",
+    "spring_boot_final_artifact",
+    "complete_nested_runtime_closure",
+    "exact_closed_noop_result_set"
+  ],
+  "assets": {
+    "application": {
+      "coordinate": "org.mybatis.spring.boot:mybatis-spring-boot-sample-xml:4.0.1",
+      "filename": "mybatis-spring-boot-sample-xml-4.0.1.jar",
+      "url": "https://repo1.maven.org/maven2/org/mybatis/spring/boot/mybatis-spring-boot-sample-xml/4.0.1/mybatis-spring-boot-sample-xml-4.0.1.jar",
+      "sha256": "f384cea47aa33d0f9b12289aa4c81f8d22133b16137030498745d06b481a89a7"
+    },
+    "base_dependency": {
+      "coordinate": "org.mybatis:mybatis:3.5.19",
+      "filename": "mybatis-3.5.19.jar",
+      "url": "https://repo1.maven.org/maven2/org/mybatis/mybatis/3.5.19/mybatis-3.5.19.jar",
+      "sha256": "93eea616ae355751bd5fbabb57f0732713fbe79f3196f33c51a0aeeb4255862a"
+    }
+  },
+  "current_nested_asset": {
+    "entry": "BOOT-INF/lib/mybatis-3.5.19.jar",
+    "coordinate": "org.mybatis:mybatis:3.5.19",
+    "sha256": "93eea616ae355751bd5fbabb57f0732713fbe79f3196f33c51a0aeeb4255862a"
+  },
+  "entrypoint": {
+    "class_name": "sample/mybatis/xml/SampleXmlApplication",
+    "member_name": "run",
+    "descriptor": "([Ljava/lang/String;)V"
+  },
+  "expected": {
+    "reachable_changed_methods": [],
+    "required_resources": [
+      "mybatis-config.xml",
+      "sample/mybatis/xml/mapper/CityMapper.xml",
+      "sample/mybatis/xml/mapper/HotelMapper.xml"
+    ],
+    "formal_result_truth": {
+      "schema": "java-upgrade-analyzer.binary-result-truth.v1",
+      "result_set_policy": "exact",
+      "exact_reachability_statuses": [
+        "reachable",
+        "uncertain",
+        "not_found_in_static_analysis",
+        "not_analyzed"
+      ],
+      "expected_results": [],
+      "forbidden_results": []
+    },
+    "oracle_provenance": {
+      "system_generated": false,
+      "oracle_kind": "identical-runtime-bytes-exact-empty-v1",
+      "oracle_producers": [
+        {
+          "id": "maven-central-pinned-artifacts",
+          "organization": "Apache Maven Central publishers",
+          "mechanism": "published application/dependency artifacts pinned by SHA-256 and fixed upstream Git revision"
+        },
+        {
+          "id": "independent-zip-byte-identity",
+          "organization": "Python Software Foundation and NIST SHA-256",
+          "mechanism": "complete ordered ZIP inventory and byte digest equality for every base/current runtime artifact"
+        }
+      ],
+      "completeness_argument": "Base and current runtime profiles, coordinates, ordered locations and every artifact byte are identical. Therefore the complete binary change set is empty, so every public semantic result category must also be empty. This expectation is established before and independently of analyzer output."
+    }
+  }
+}

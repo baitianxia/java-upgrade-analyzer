@@ -1,0 +1,57 @@
+{
+  "schema": "java-upgrade-analyzer.runtime-blackbox-truth.v1",
+  "case_id": "artifact-safety-public-contract-v1",
+  "system_generated": false,
+  "oracle_producers": [
+    {
+      "id": "python-stdlib-zipfile-inventory",
+      "organization": "Python Software Foundation",
+      "mechanism": "independent ZIP entry/count/size/compression/nesting and class-header inspection",
+      "verifies": [
+        "duplicate_entry",
+        "entry_count",
+        "uncompressed_size",
+        "expansion_ratio",
+        "nested_depth",
+        "nested_archive_size",
+        "class_size",
+        "protocol_frame_size",
+        "record_count"
+      ]
+    },
+    {
+      "id": "openjdk-class-definition",
+      "organization": "OpenJDK",
+      "mechanism": "actual target-JVM class definition and execution against malformed and unsupported classfiles",
+      "verifies": [
+        "corrupt_classfile",
+        "unsupported_classfile_major",
+        "valid_classfile_control",
+        "heap_option_propagation",
+        "helper_deadline"
+      ]
+    },
+    {
+      "id": "python-elementtree-xml",
+      "organization": "Python Software Foundation",
+      "mechanism": "independent XML parse failure and public coverage-gap comparison",
+      "verifies": ["malformed_runtime_resource_is_explicitly_partial"]
+    }
+  ],
+  "failure_schema": "java-upgrade-analyzer.binary-pipeline-failure.v1",
+  "blocking_reason": "ARTIFACT_SAFETY_POLICY_BLOCKED",
+  "limit_cases": {
+    "max_archive_entries": "ARCHIVE_ENTRY_COUNT_EXCEEDED",
+    "max_total_uncompressed_bytes": "ARCHIVE_UNCOMPRESSED_SIZE_EXCEEDED",
+    "max_expansion_ratio": "ARCHIVE_EXPANSION_RATIO_EXCEEDED",
+    "max_nested_depth": "ARCHIVE_NESTED_DEPTH_EXCEEDED",
+    "max_nested_archive_bytes": "ARCHIVE_NESTED_SIZE_EXCEEDED",
+    "max_class_bytes": "ASM_CLASS_SIZE_LIMIT_EXCEEDED",
+    "max_protocol_frame_bytes": "ASM_INPUT_FRAME_LIMIT_EXCEEDED",
+    "max_fact_records": "ASM_INPUT_RECORD_LIMIT_EXCEEDED"
+  },
+  "corrupt_class_jvm_error": "ClassFormatError",
+  "unsupported_class_jvm_error": "UnsupportedClassVersionError",
+  "malformed_xml_gap_suffix": "malformed_xml",
+  "minimum_helper_heap_megabytes": 16
+}

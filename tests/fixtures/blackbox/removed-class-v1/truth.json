@@ -1,0 +1,95 @@
+{
+  "schema": "java-upgrade-analyzer.blackbox-truth.v1",
+  "case_id": "removed-class-v1",
+  "dataset_version": 1,
+  "scope": "closed_set",
+  "system_generated": false,
+  "human_review": {"status": "not_claimed", "reviewer": ""},
+  "input_evidence": {
+    "algorithm": "sha256-path-nul-content-nul-v1",
+    "source_tree_sha256": "f04467a4ad63794b0c99798aeffc8145bc90996d79bde81f270957dae3eb16f4",
+    "case_algorithm": "sha256-canonical-json-v1",
+    "case_sha256": "f2127123477369ca47adea8c47b1eccaefa312f131ccd651314bb4517aa17cc8",
+    "source_files": [
+      "src/base/contract/RemovedType.java",
+      "src/base/contract/StableApi.java",
+      "src/business/contract/ClassRemovalApp.java",
+      "src/current/contract/StableApi.java",
+      "src/oracle/contract/DefinitionMain.java",
+      "src/oracle/contract/OracleMain.java"
+    ]
+  },
+  "oracle_producers": [
+    {
+      "id": "openjdk-javap-multi-class-inventory-and-callgraph",
+      "organization": "OpenJDK",
+      "mechanism": "independent_bytecode_inventory",
+      "verifies": ["complete_removed_class_public_member_set", "constructor_method_field_edges", "provider_entry_presence"]
+    },
+    {
+      "id": "openjdk-jvm-class-linker",
+      "organization": "OpenJDK",
+      "mechanism": "actual_jvm_execution",
+      "verifies": ["base_class_execution_succeeds", "current_no_class_def_found_error", "business_class_definition_outcome"]
+    }
+  ],
+  "oracle_implementations": [
+    {"path": "tests/blackbox/oracles/openjdk_oracle.py", "sha256": "6e72442077371b86c943f790b5982144497725200da3e89f22f66ca2bfee38ca"}
+  ],
+  "completeness": {
+    "argument": "The declared library class set contains the removed type and one unchanged control class. JAR entry inventory and javap enumerate every public constructor, method and field in the base and prove the removed provider is absent in the current JAR while the control remains. The complete business entrypoint graph determines which removed members are reachable. Isolated JVM runners prove base member execution and business-class definition succeed, while the corresponding current operations fail because the owner class cannot be defined.",
+    "verified_dimensions": ["api_identity", "jvm_descriptor", "closed_result_set", "entrypoint_reachability", "static_linkage"],
+    "known_limits": []
+  },
+  "expected_result_count": 7,
+  "expected_results": [
+    {
+      "owner": "contract/ClassRemovalApp", "member": "", "descriptor": "", "member_kind": "class_definition",
+      "dependency_lineages": [], "base_dependency_coords": ["blackbox:fixture-app:1.0"], "current_dependency_coords": ["blackbox:fixture-app:1.0"],
+      "reachability_status": "not_found_in_static_analysis", "static_linkage_status": "undetermined", "impact_conclusion": "inconclusive", "runtime_verification_status": "undetermined",
+      "exact_path_exists": false, "possible_path_exists": false, "path_set_complete": true, "paths": []
+    },
+    {
+      "owner": "contract/RemovedType", "member": "", "descriptor": "", "member_kind": "provider_topology",
+      "dependency_lineages": [], "base_dependency_coords": ["blackbox:removed-class-lib:1.0"], "current_dependency_coords": [],
+      "reachability_status": "not_found_in_static_analysis", "static_linkage_status": "undetermined", "impact_conclusion": "inconclusive", "runtime_verification_status": "undetermined",
+      "exact_path_exists": false, "possible_path_exists": false, "path_set_complete": true, "paths": []
+    },
+    {
+      "owner": "contract/RemovedType", "member": "<init>", "descriptor": "()V", "member_kind": "method",
+      "dependency_lineages": ["blackbox:removed-class-lib"], "base_dependency_coords": ["blackbox:removed-class-lib:1.0"], "current_dependency_coords": ["blackbox:removed-class-lib:2.0"],
+      "reachability_status": "reachable", "static_linkage_status": "incompatible_if_executed", "impact_conclusion": "probable_impact", "runtime_verification_status": "required_not_executed",
+      "exact_path_exists": true, "possible_path_exists": false, "path_set_complete": true,
+      "paths": [{"certainty": "exact", "text": "contract.ClassRemovalApp.entryConstructor() → contract.RemovedType.<init>()"}]
+    },
+    {
+      "owner": "contract/RemovedType", "member": "reachableMethod", "descriptor": "()Ljava/lang/String;", "member_kind": "method",
+      "dependency_lineages": ["blackbox:removed-class-lib"], "base_dependency_coords": ["blackbox:removed-class-lib:1.0"], "current_dependency_coords": ["blackbox:removed-class-lib:2.0"],
+      "reachability_status": "reachable", "static_linkage_status": "incompatible_if_executed", "impact_conclusion": "probable_impact", "runtime_verification_status": "required_not_executed",
+      "exact_path_exists": true, "possible_path_exists": false, "path_set_complete": true,
+      "paths": [{"certainty": "exact", "text": "contract.ClassRemovalApp.entryMethod(contract.RemovedType) → contract.RemovedType.reachableMethod()"}]
+    },
+    {
+      "owner": "contract/RemovedType", "member": "reachableField", "descriptor": "Ljava/lang/String;", "member_kind": "field",
+      "dependency_lineages": ["blackbox:removed-class-lib"], "base_dependency_coords": ["blackbox:removed-class-lib:1.0"], "current_dependency_coords": ["blackbox:removed-class-lib:2.0"],
+      "reachability_status": "reachable", "static_linkage_status": "incompatible_if_executed", "impact_conclusion": "probable_impact", "runtime_verification_status": "required_not_executed",
+      "exact_path_exists": true, "possible_path_exists": false, "path_set_complete": true,
+      "paths": [{"certainty": "exact", "text": "contract.ClassRemovalApp.entryField(contract.RemovedType) → contract.RemovedType.reachableField"}]
+    },
+    {
+      "owner": "contract/RemovedType", "member": "deadMethod", "descriptor": "()V", "member_kind": "method",
+      "dependency_lineages": ["blackbox:removed-class-lib"], "base_dependency_coords": ["blackbox:removed-class-lib:1.0"], "current_dependency_coords": ["blackbox:removed-class-lib:2.0"],
+      "reachability_status": "not_found_in_static_analysis", "static_linkage_status": "incompatible_if_executed", "impact_conclusion": "inconclusive", "runtime_verification_status": "undetermined",
+      "exact_path_exists": false, "possible_path_exists": false, "path_set_complete": true, "paths": []
+    },
+    {
+      "owner": "contract/RemovedType", "member": "deadField", "descriptor": "I", "member_kind": "field",
+      "dependency_lineages": ["blackbox:removed-class-lib"], "base_dependency_coords": ["blackbox:removed-class-lib:1.0"], "current_dependency_coords": ["blackbox:removed-class-lib:2.0"],
+      "reachability_status": "not_found_in_static_analysis", "static_linkage_status": "incompatible_if_executed", "impact_conclusion": "inconclusive", "runtime_verification_status": "undetermined",
+      "exact_path_exists": false, "possible_path_exists": false, "path_set_complete": true, "paths": []
+    }
+  ],
+  "forbidden_results": [
+    {"owner": "contract/StableApi", "member": "stable", "descriptor": "()Ljava/lang/String;", "member_kind": "method", "oracle_relation": "unchanged_member", "reason": "The control class and method exist unchanged in both library versions."}
+  ]
+}

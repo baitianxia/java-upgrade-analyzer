@@ -278,13 +278,13 @@ def gate_context(d):
     with open(ctx_path, encoding="utf-8", errors="replace") as f:
         ctx = json.load(f)
     missing = [f for f in ['build_tool', 'base_branch', 'current_branch'] if not ctx.get(f)]
-    if missing: fail(f"evidence/context/context.json 缺少字段：{missing}", ["请在 Step2 checkpoint 中补充缺失字段后重跑"])
+    if missing: fail(f"evidence/context/context.json 缺少字段：{missing}", ["Step0 确认记录或 Step2 上下文生成不完整，请从 Step0 修正输入后重跑"])
     needs = []
     if not ctx.get('jdk_base') or ctx.get('jdk_base') == 'unknown': needs.append("jdk_base")
     if not ctx.get('jdk_current') or ctx.get('jdk_current') == 'unknown': needs.append("jdk_current")
     if needs:
         print(
-            f"\n⚠️  以下字段无法自动推断，需在 Step2 checkpoint 中人工确认或补充：{needs}",
+            f"\n⚠️  以下字段无法从 Step0 确认记录与制品证据推断：{needs}",
             file=sys.stderr,
         )
         print(

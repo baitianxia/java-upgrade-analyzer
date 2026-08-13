@@ -1,0 +1,20 @@
+{
+  "schema": "java-upgrade-analyzer.blackbox-case.v1",
+  "case_id": "implementation-change-v1",
+  "dataset_version": 1,
+  "public_entrypoint": "scripts/binary_pipeline.py",
+  "truth_file": "truth.json",
+  "oracle_contract": "implementation_change_closed_set",
+  "capabilities": ["implementation_change", "not_found_negative", "reachable_positive", "unchanged_member_negative"],
+  "library_class": "contract.BehaviorApi",
+  "business_class": "contract.BehaviorApp",
+  "oracle_main_class": "contract.OracleMain",
+  "library_lineage": "blackbox:behavior-lib",
+  "base_coordinate": "blackbox:behavior-lib:1.0",
+  "current_coordinate": "blackbox:behavior-lib:2.0",
+  "entrypoints": [{"class_name": "contract/BehaviorApp", "member_name": "entry", "descriptor": "(Lcontract/BehaviorApi;)I"}],
+  "behavior_probes": [
+    {"mode": "reachable", "owner": "contract/BehaviorApi", "member": "reachableBehavior", "descriptor": "()I", "member_kind": "method", "base_stdout": "1", "current_stdout": "2"},
+    {"mode": "unreachable", "owner": "contract/BehaviorApi", "member": "unreachableBehavior", "descriptor": "()I", "member_kind": "method", "base_stdout": "10", "current_stdout": "20"}
+  ]
+}

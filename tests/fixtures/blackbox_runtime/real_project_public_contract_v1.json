@@ -1,0 +1,36 @@
+{
+  "schema": "java-upgrade-analyzer.runtime-blackbox-truth.v1",
+  "case_id": "real-project-public-contract-v1",
+  "system_generated": false,
+  "oracle_producers": [
+    {
+      "id": "upstream-fixed-revision-and-maven-artifacts",
+      "organization": "MyBatis project and Apache Maven Central publishers",
+      "mechanism": "fixed 40-character upstream Git revision plus published application and dependency artifacts pinned by SHA-256",
+      "verifies": ["real_project_identity", "application_identity", "dependency_identity"]
+    },
+    {
+      "id": "independent-complete-runtime-byte-oracle",
+      "organization": "Python Software Foundation and NIST SHA-256",
+      "mechanism": "pair every ordered base/current runtime artifact and compare complete bytes and ZIP inventories before analyzer execution",
+      "verifies": ["complete_input_equivalence", "exact_empty_change_set"]
+    },
+    {
+      "id": "scheduled-release-public-run",
+      "organization": "GitHub Actions",
+      "mechanism": "scheduled release gate downloads pinned assets, executes the public real-project guard, and requires exact formal-result equality",
+      "verifies": ["public_end_to_end_execution", "independent_oracle_pass", "zero_false_positive"]
+    }
+  ],
+  "manifest": "tests/fixtures/binary_first/real_projects/mybatis_sample_xml_noop.json",
+  "manifest_sha256": "5b77094b42e690ffddd49695df07b38da3f4e1b164ec70536f15cdef19143841",
+  "repository": "mybatis/spring-boot-starter",
+  "git_revision": "bb8bac144e4677cf1bab5a6d27ced2521972adfc",
+  "application_sha256": "f384cea47aa33d0f9b12289aa4c81f8d22133b16137030498745d06b481a89a7",
+  "dependency_sha256": "93eea616ae355751bd5fbabb57f0732713fbe79f3196f33c51a0aeeb4255862a",
+  "expected_result_set_policy": "exact",
+  "expected_result_count": 0,
+  "expected_oracle_kind": "identical-runtime-bytes-exact-empty-v1",
+  "minimum_oracle_producer_count": 2,
+  "scheduled_release_workflow": ".github/workflows/release-regression.yml"
+}

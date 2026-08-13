@@ -119,6 +119,26 @@ class BinaryRuntimeMaterializerTest(unittest.TestCase):
                 "complete",
             )
 
+    def test_materialized_config_carries_step0_jdk_preflight_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self.fixture(Path(tmp))
+            config = materialize_binary_pipeline_config(
+                report,
+                runtime_overrides={
+                    "step0_preflight": {
+                        "sides": {
+                            "base": {"jdk": {"jdk_preflight_identity": "base-jdk"}},
+                            "current": {"jdk": {"jdk_preflight_identity": "current-jdk"}},
+                        }
+                    }
+                },
+            )
+
+        self.assertEqual(config["base"]["jdk_preflight_identity"], "base-jdk")
+        self.assertEqual(
+            config["current"]["jdk_preflight_identity"], "current-jdk"
+        )
+
     def test_missing_one_side_business_artifact_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
             report = self.fixture(Path(tmp))
@@ -181,6 +201,48 @@ class BinaryRuntimeMaterializerTest(unittest.TestCase):
                 "live",
             )
             self.assertEqual(profile["resource_selection_coverage_status"], "complete")
+
+    def test_materializes_manifest_start_class_from_outer_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self.fixture(Path(tmp))
+            manifest_path = report / "evidence" / "dependencies" / "dependency_jars.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            provenance_path = report / "evidence" / "dependencies" / "build_provenance.json"
+            provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+            for business in manifest["business_artifacts"]:
+                retained = Path(business["retained_path"])
+                with zipfile.ZipFile(retained, "w") as archive:
+                    archive.writestr("example/Application.class", b"class-bytes")
+                business["sha256"] = hashlib.sha256(retained.read_bytes()).hexdigest()
+                outer = Path(business["outer_artifact_path"])
+                with zipfile.ZipFile(outer, "w") as archive:
+                    archive.writestr(
+                        "META-INF/MANIFEST.MF",
+                        "Manifest-Version: 1.0\r\n"
+                        "Main-Class: org.springframework.boot.loader.launch.JarLauncher\r\n"
+                        "Start-Class: example.Application\r\n\r\n",
+                    )
+                outer_sha = hashlib.sha256(outer.read_bytes()).hexdigest()
+                business["outer_artifact_sha256"] = outer_sha
+                side = business["side"]
+                for item in manifest["items"]:
+                    if item["side"] == side:
+                        item["outer_artifact_sha256"] = outer_sha
+                for row in provenance["sides"]:
+                    if row["side"] == side:
+                        row["artifact_sha256"] = outer_sha
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+
+            config = materialize_binary_pipeline_config(report)
+
+        for side in ("base", "current"):
+            profile = config[side]["runtime_profile"]
+            self.assertEqual(
+                profile["business_entrypoint_profile"]["main_class"],
+                "example.Application",
+            )
+            self.assertEqual(profile["entrypoint_discovery_coverage_gaps"], [])
 
 
 if __name__ == "__main__":

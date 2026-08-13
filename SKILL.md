@@ -42,7 +42,7 @@ description: "Java 升级兼容性分析。用户提到 JDK、Spring Boot、Spri
 
 1. **最终制品唯一事实源**：依赖、版本、类、方法、字段、资源和调用边以 base/current 最终制品及显式 RuntimeProfile 为准。本地仓库副本、重新下载的 JAR 或源码模型不能替代制品事实。
 2. **单一 Binary-first 权威**：Step4–Step6 只使用 binary-first 引擎。不存在 legacy、shadow、灰度、兼容模式或 fallback；generation 失败时停止并保留上一份已验证结果。
-3. **源码由用户提供或选择**：用户已提交源码目录、仓库或 overlay 时直接使用，不重复确认；没有提交源码时，进入 source overlay 前必须告知源码能增加位置、声明与注解、可读上下文和候选关系，并在受支持的常量内联场景与字节码共同形成证明，但不会覆盖二进制裁决，再由用户选择补充源码或明确不提供。系统不得根据自动发现的目录默认使用或默认跳过源码。
+3. **应用源码必填、依赖源码可选**：两种输入模式都必须在 Step0 提供并确认应用源码。当前 Git 仓库可以自动识别为应用源码，但不能因此跳过确认。依赖包源码可在同一张 Step0 表格中一次补充；源码只增加位置、声明、注解、可读上下文和候选关系，不覆盖二进制裁决。
 4. **依赖包维度贯穿**：每条变化、API、路径和报告必须带 `coord`、base/current 版本、artifact identity 与 lineage。不得用虚构坐标填补无法绑定的事实。
 5. **四维结果**：正式结果分别保留 `reachability_status`、`static_linkage_status`、`impact_conclusion`、`runtime_verification_status`。
 6. **静态触达四态**：`reachable`、`uncertain`、`not_found_in_static_analysis`、`not_analyzed` 四类互斥。`not_found_in_static_analysis` 不等于不受影响；旧 `not_impacted` 不属于新引擎合同。
@@ -54,20 +54,23 @@ description: "Java 升级兼容性分析。用户提到 JDK、Spring Boot、Spri
 
 ## 首次调用协议
 
-首次执行 Step1 前必须先读取静态输入协议：
+首次正式分析前必须先读取 Step0 静态输入协议：
 
 ```bash
-python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --describe-step1-contract
+python "${CLAUDE_SKILL_DIR}/scripts/run_step.py" --describe-step0-contract
 ```
 
-首轮尽量一次收集：
+Step0 只展示一张统一表格，字段顺序固定为：`最终制品`、`版本分支`、`目标模块`、`构建工具`、`JDK目录`、`应用源码`、`依赖包源码`。系统先自动识别，已识别值仍由用户统一确认，无法识别值在同一张表中补齐。`应用源码`必填，`依赖包源码`可选；每一项源码均可填写 Git 地址或本地 Git 仓库目录。
 
-- 待分析工程；
+首轮输入只需要覆盖：
+
+- base/current 最终制品，或由应用源码的 base/current 分支构建制品；
 - 唯一目标可部署模块；
-- base/current 分支、tag、commit 或直接最终制品；
-- 两侧需要的 JDK home；
-- `binary_pipeline_config`，用于固定两侧最终制品、完整目标 JDK、有序运行路径、loader/resource policy 和业务入口；
-- 用户提供的源码目录、仓库或 overlay；若没有源码输入，再收集用户对源码辅助分析的明确选择，并在选择提供时补充源码目录或 Git 地址。
+- base/current 各自的 Maven/Gradle 构建工具；
+- base/current 各自的 JDK home；
+- 应用源码 Git 仓库目录或 Git 地址，以及可选的依赖包源码目录或 Git 地址。
+
+Artifact 模式显示用户原始包名，不显示内部复制名或制品内版本。系统从原始制品识别应用版本并匹配应用源码 ref；同一 commit 的多个 ref 别名不是歧义，不同 commit 才要求用户选择。选择后必须固定到完整 commit SHA。
 
 不能从构建环境猜测会改变运行时结论的 loader、entrypoint 或 JDK image。缺失这些外部事实时明确询问，不用旧引擎兜底。
 
@@ -148,20 +151,22 @@ Step4 或其他可能超过 Agent 单次执行时限的任务，使用统一入�
 
 ## 执行阶段
 
-### Phase 1 [AUTO] Discovery
+### Phase 1 [CHECKPOINT] Confirm Analysis Inputs
 
-- 对应步骤：`step1`
-- 从用户输入、构建模型和最终制品识别候选目标模块与两侧来源。
+- 对应步骤：`step0`
+- 自动识别两种模式下的最终制品/版本分支、唯一目标模块、两侧构建工具、两侧 JDK 目录和应用源码，并在一张统一表格中确认；缺失值也在该表补齐。
+- 即使所有值都自动识别成功，也必须且只需展示一次 Step0 卡片。
 - 用户提供的分支名必须原样传给统一入口，并按完整 canonical ref 精确匹配；不得自行追加、删除或替换任何前缀、后缀。
 - base/current 分支必须固定到具体 commit，在隔离 worktree 中构建，不切换用户工作区。
-- 直接制品模式先验证归档安全、类型和可部署性。
+- 直接制品模式先验证归档安全、类型和可部署性，并保留用户原始包名用于展示。
 
-### Phase 2 [CHECKPOINT] Confirm Dependency Scope
+### Phase 2 [AUTO] Resolve Dependencies
 
 - 对应步骤：`step1`
-- 确认唯一目标模块、两侧构建来源和最终制品依赖范围。
-- 多个可部署模块、分支/产物身份无法唯一确定或依赖坐标存在实质歧义时必须让用户选择。
-- Step1 输出的依赖、坐标和版本以最终 fat JAR/WAR 为准；thin JAR 不能证明完整运行时闭包。
+- Step1 只解析两侧最终制品的依赖、坐标和版本；fat JAR/WAR 是依赖范围事实，thin JAR 不能证明完整运行时闭包。
+- Artifact 模式使用 Step0 已确认的应用源码补全依赖身份，不在 Step1 再索取应用源码。
+- 依赖身份或已提供依赖包源码的仓库/ref 出现实质歧义时，把本轮所有歧义聚合成一张卡片让用户选择；没有歧义时自动继续。
+- 同一 commit 的多个 ref 别名自动合并；不同 commit 才是版本歧义。用户选择后固定完整 commit SHA；依赖包源码允许明确跳过。
 
 人工入口：
 
@@ -175,22 +180,15 @@ Step4 或其他可能超过 Agent 单次执行时限的任务，使用统一入�
 - 从已固定输入生成升级上下文和依赖关系。
 - 标准 Maven/Gradle 源码布局由项目模型推导；源码不能改变制品依赖事实。
 
-### Phase 4 [CHECKPOINT] Confirm Upgrade Context
+- Step2 没有固定用户确认点；Step0 已确认的信息不得重复询问。
 
-- 对应步骤：`step2`
-- 用户已经主动提供源码目录、仓库或 overlay 时直接使用，不再要求二次确认；用户没有提供源码时，必须告知源码的作用与二进制权威边界，并由用户选择补充源码或明确不提供。自动识别到目录不能代替用户选择。
-- 选择提供源码时，再确认无法自动确定的业务源码范围、依赖源码路径和映射；选择不提供时，后续报告明确记录源码解释覆盖缺失。
-- 普通内部证据故障不生成这类 checkpoint。
-
-人工入口：`evidence/context/review.md`。
-
-### Phase 5 [AUTO] Static Scan
+### Phase 4 [AUTO] Static Scan
 
 - 对应步骤：`step3`
 - 扫描 JDK、Jakarta、Spring、配置、内部 API 和 classfile 兼容性线索。
 - Step3 线索是背景风险，不得追加为 Step4 的正式变化 API，也不得覆盖二进制结论。
 
-### Phase 6 [AUTO] Binary Evidence Build
+### Phase 5 [AUTO] Binary Evidence Build
 
 - 对应步骤：`step4`
 - `binary_pipeline_config` 是必需输入。
@@ -209,7 +207,7 @@ Step4 人工复核顺序：
 
 `.runtime/binary_authority/` 只用于权威存储和深度审计，不是普通人工入口。
 
-### Phase 7 [CHECKPOINT] Select Step5 Scope
+### Phase 6 [CHECKPOINT] Select Step5 Scope
 
 - 对应步骤：`step4`
 - 0 或 1 个含正式 API projection 的依赖没有范围取舍，自动继续。
@@ -218,7 +216,7 @@ Step4 人工复核顺序：
 - 完整选择入口是 `evidence/api_changes/changed_dependencies.md`；不要让用户从 API CSV 逐行挑选。
 - 部分范围必须验证用户选择确实命中 Step4 清单；未选依赖只进入范围说明，不得计入“未完成分析”。
 
-### Phase 8 [AUTO] Call Chain Analysis
+### Phase 7 [AUTO] Call Chain Analysis
 
 - 对应步骤：`step5`
 - 只发布已经验证的同一 binary generation，不调用 source-first 引擎。
@@ -228,7 +226,7 @@ Step4 人工复核顺序：
 - 输出：`evidence/call_chain/summary.md`、`summary.json`、`alerts.csv`、`by_api/*.json` 和 `.runtime/indexes/s5_query_index.json`。
 - Step5 成功后生成非阻塞四态卡片并自动进入 Step6，不要求例行确认。
 
-### Phase 9 [AUTO] Final Report
+### Phase 8 [AUTO] Final Report
 
 - 对应步骤：`step6`
 - 只读取 Step5 同 generation、同选择范围的正式结果，不重新分析。
@@ -282,7 +280,9 @@ Step4 人工复核顺序：
 
 ## 何时停下
 
-- 需要用户确认目标模块、两侧来源、RuntimeProfile 或分析范围；
+- Step0 需要用户统一确认正式分析输入；
+- Step1 检出依赖身份或依赖源码版本的实质歧义；
+- Step4 完成后需要用户选择全量或部分分析范围；
 - 需要用户授权外部操作；
 - 主状态处于 `awaiting_*`；
 - 核心制品、身份、目标 JDK、entrypoint、Oracle 或 generation 完整性失败；

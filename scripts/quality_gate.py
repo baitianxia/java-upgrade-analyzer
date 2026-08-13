@@ -35,6 +35,13 @@ QUICK_MODULES = (
     "tests.test_binary_definition_verifier",
     "tests.test_binary_tool_execution",
     "tests.test_binary_capability_migration_audit",
+    "tests.test_binary_result_truth",
+    "tests.test_blackbox_harness",
+    "tests.test_test_trust_gate",
+    "tests.test_test_suite_runner",
+    "tests.blackbox.test_public_binary_cli",
+    "tests.test_ci_quality_contract",
+    "tests.test_platform_contract",
 )
 
 STEP5_MODULES = QUICK_MODULES + (
@@ -59,7 +66,12 @@ def command_for(profile: str) -> list[str]:
         return [sys.executable, "-m", "unittest", *QUICK_MODULES]
     if profile == "step5":
         return [sys.executable, "-m", "unittest", *STEP5_MODULES]
-    return [sys.executable, "-m", "unittest", "discover", "-s", "tests"]
+    suite = "all" if profile == "release" else profile
+    return [
+        sys.executable,
+        str(Path(__file__).with_name("test_suite_runner.py")),
+        "--suite", suite,
+    ]
 
 
 def test_health_command() -> list[str]:
@@ -140,7 +152,14 @@ def capability_migration_status(repository_root: str | Path) -> dict:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Binary-first quality gate")
-    parser.add_argument("--profile", choices=("quick", "step5", "release"), default="quick")
+    parser.add_argument(
+        "--profile",
+        choices=(
+            "blackbox", "whitebox", "performance",
+            "quick", "step5", "release",
+        ),
+        default="quick",
+    )
     parser.add_argument("--json-out", default="")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(

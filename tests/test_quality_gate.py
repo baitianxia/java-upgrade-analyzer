@@ -16,12 +16,19 @@ class QualityGateTest(unittest.TestCase):
             command = quality_gate.command_for(profile)
             rendered = " ".join(command)
             self.assertIn("test_binary_", rendered)
+            self.assertIn("tests.test_binary_result_truth", rendered)
+            self.assertIn("tests.test_blackbox_harness", rendered)
+            self.assertIn("tests.test_test_trust_gate", rendered)
+            self.assertIn("tests.blackbox.test_public_binary_cli", rendered)
+            self.assertIn("tests.test_ci_quality_contract", rendered)
+            self.assertIn("tests.test_platform_contract", rendered)
             self.assertNotIn("s4_jar_compare", rendered)
             self.assertNotIn("s5_call_chain_engine_integrated", rendered)
 
     def test_release_discovers_all_current_tests(self):
         command = quality_gate.command_for("release")
-        self.assertEqual(command[-3:], ["discover", "-s", "tests"])
+        self.assertTrue(command[1].endswith("test_suite_runner.py"))
+        self.assertEqual(command[-2:], ["--suite", "all"])
         self.assertTrue(
             quality_gate.test_health_command()[-1].endswith(
                 "binary_test_health_gate.py"
@@ -40,6 +47,12 @@ class QualityGateTest(unittest.TestCase):
         )
         self.assertGreaterEqual(len(matrix), 3)
         self.assertTrue(all("--manifest" in item for item in matrix))
+
+    def test_named_test_suites_have_stable_quality_gate_profiles(self):
+        for profile in ("blackbox", "whitebox", "performance"):
+            command = quality_gate.command_for(profile)
+            self.assertTrue(command[1].endswith("test_suite_runner.py"))
+            self.assertEqual(command[-2:], ["--suite", profile])
 
     def test_release_authorization_requires_every_capability_replacement(self):
         migration = quality_gate.capability_migration_status(ROOT)

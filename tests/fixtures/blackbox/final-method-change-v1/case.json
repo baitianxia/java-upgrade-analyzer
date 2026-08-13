@@ -1,0 +1,22 @@
+{
+  "schema": "java-upgrade-analyzer.blackbox-case.v1",
+  "case_id": "final-method-change-v1",
+  "dataset_version": 1,
+  "public_entrypoint": "scripts/binary_pipeline.py",
+  "truth_file": "truth.json",
+  "oracle_contract": "member_contract_linkage_closed_set",
+  "capabilities": ["final_method_change", "reachable_positive", "unchanged_member_negative"],
+  "library_class": "contract.FinalApi",
+  "business_class": "contract.FinalApp",
+  "business_classes": ["contract.FinalApp", "contract.FinalClient"],
+  "oracle_main_class": "contract.OracleMain",
+  "definition_oracle_main_class": "contract.DefinitionMain",
+  "business_lineage": "blackbox:fixture-app",
+  "business_coordinate": "blackbox:fixture-app:1.0",
+  "library_lineage": "blackbox:final-lib",
+  "base_coordinate": "blackbox:final-lib:1.0",
+  "current_coordinate": "blackbox:final-lib:2.0",
+  "entrypoints": [{"class_name": "contract/FinalApp", "member_name": "entry", "descriptor": "(Lcontract/FinalApi;)Ljava/lang/String;"}],
+  "linkage_probes": [{"mode": "final", "owner": "contract/FinalApi", "member": "changedFinal", "descriptor": "()Ljava/lang/String;", "member_kind": "method", "linkage_error": "IncompatibleClassChangeError", "error_symbol": "overrides final method"}],
+  "runtime_outcome_probes": [{"owner": "contract/FinalClient", "member_kind": "class_definition", "linkage_error": "IncompatibleClassChangeError", "error_symbol": "overrides final method"}]
+}

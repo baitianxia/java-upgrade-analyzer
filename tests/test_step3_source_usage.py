@@ -7,9 +7,33 @@ from pathlib import Path
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT_DIR / "scripts"))
+
+import run_step  # noqa: E402
 
 
 class Step3SourceUsageTest(unittest.TestCase):
+    def test_business_scan_roots_include_code_and_standard_resources(self):
+        context = {
+            "source_dirs": ["/project/src/main/java"],
+            "project_scope": {
+                "resource_roots": ["/project/src/main/resources"],
+            },
+        }
+        workspace = {
+            "source_dirs": ["/pinned/src/main/java"],
+            "resource_dirs": ["/pinned/src/main/resources"],
+        }
+
+        self.assertEqual(
+            run_step.step3_business_scan_roots(context),
+            ["/project/src/main/java", "/project/src/main/resources"],
+        )
+        self.assertEqual(
+            run_step.step3_business_scan_roots(context, workspace=workspace),
+            ["/pinned/src/main/java", "/pinned/src/main/resources"],
+        )
+
     def test_no_source_runs_binary_only_scans_and_records_coverage_gap(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "static_scan"

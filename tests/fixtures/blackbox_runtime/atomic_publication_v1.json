@@ -1,0 +1,23 @@
+{
+  "schema": "java-upgrade-analyzer.runtime-blackbox-truth.v1",
+  "case_id": "atomic-publication-v1",
+  "system_generated": false,
+  "oracle_producers": [
+    {
+      "id": "os-process-termination",
+      "organization": "operating system",
+      "mechanism": "terminate the public CLI after immutable generation publication and before activation",
+      "verifies": ["real interruption", "nonzero interrupted process"]
+    },
+    {
+      "id": "sha256-prior-output-inventory",
+      "organization": "NIST standardized algorithm",
+      "mechanism": "byte-level active descriptor and prior generation comparison before and after interruption",
+      "verifies": ["prior pointer unchanged", "prior generation byte-identical", "safe retry activation"]
+    }
+  ],
+  "interruption_phase": "independent_validation",
+  "expected_prior_pointer_change_after_interruption": false,
+  "expected_prior_generation_byte_change_count": 0,
+  "expected_retry_validation_status": "passed"
+}

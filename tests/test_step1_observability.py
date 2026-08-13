@@ -89,6 +89,25 @@ class Step1ObservabilityTest(unittest.TestCase):
 
         self.assertEqual(len(calls), 1)
 
+    def test_run_python_persists_bounded_redacted_child_failure_detail(self):
+        secret = "https://user:password@example.test/repository"
+        detail = "❌ 最终制品扫描不完整：" + secret + ("x" * 1000)
+
+        with patch.object(
+            run_step,
+            "run_cmd",
+            return_value=("", "progress\n" + detail + "\n", 1),
+        ):
+            with self.assertRaises(run_step.StepError) as raised:
+                run_step.run_python("s1_dep_diff.py", [], "/tmp", report_dir="/tmp")
+
+        message = str(raised.exception)
+        self.assertIn("最终制品扫描不完整", message)
+        self.assertIn("https://***@example.test/repository", message)
+        self.assertNotIn("user:password", message)
+        self.assertTrue(message.endswith("…"))
+        self.assertLessEqual(len(message), 850)
+
     def test_progress_and_timing_files_are_created_before_step1_finishes(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "evidence/dependencies/dep_changes.csv"

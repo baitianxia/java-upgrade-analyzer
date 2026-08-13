@@ -1,0 +1,83 @@
+{
+  "schema": "java-upgrade-analyzer.blackbox-truth.v1",
+  "case_id": "method-shapes-v1",
+  "dataset_version": 1,
+  "scope": "closed_set",
+  "system_generated": false,
+  "human_review": {"status": "not_claimed", "reviewer": ""},
+  "input_evidence": {
+    "algorithm": "sha256-path-nul-content-nul-v1",
+    "source_tree_sha256": "cb976a5f457039f1225da23a209802b15655323c00d82c762a5f48d3b9f503e8",
+    "case_algorithm": "sha256-canonical-json-v1",
+    "case_sha256": "23db666ad231d1a34f680dfd9871e98620da0be6d450a0614ff1d7aa63c32be5",
+    "source_files": [
+      "src/base/contract/MethodShapes.java",
+      "src/business/contract/MethodShapeApp.java",
+      "src/business/contract/MethodShapeBridge.java",
+      "src/current/contract/MethodShapes.java",
+      "src/oracle/contract/OracleMain.java"
+    ]
+  },
+  "oracle_producers": [
+    {
+      "id": "openjdk-javap-constructor-method-and-callgraph",
+      "organization": "OpenJDK",
+      "mechanism": "independent_bytecode_inventory",
+      "verifies": ["complete_removed_method_set", "constructor_and_descriptor_identity", "complete_direct_call_graph"]
+    },
+    {
+      "id": "openjdk-jvm-method-linker",
+      "organization": "OpenJDK",
+      "mechanism": "actual_jvm_execution",
+      "verifies": ["base_execution_succeeds", "current_no_such_method_error"]
+    }
+  ],
+  "oracle_implementations": [
+    {"path": "tests/blackbox/oracles/openjdk_oracle.py", "sha256": "6e72442077371b86c943f790b5982144497725200da3e89f22f66ca2bfee38ca"}
+  ],
+  "completeness": {
+    "argument": "javap inventories every public constructor and method of the only changed library class, including exact primitive and array descriptors. The declared entrypoint set and both business classes form the complete static graph; the independently computed graph includes a three-edge cross-class path. A separately packaged JVM runner verifies every removed symbol succeeds against the base JAR and fails with NoSuchMethodError against the current JAR.",
+    "verified_dimensions": ["api_identity", "jvm_descriptor", "closed_result_set", "entrypoint_reachability", "static_linkage"],
+    "known_limits": []
+  },
+  "expected_result_count": 5,
+  "expected_results": [
+    {
+      "owner": "contract/MethodShapes", "member": "<init>", "descriptor": "(Ljava/lang/String;)V", "member_kind": "method",
+      "dependency_lineages": ["blackbox:method-shapes-lib"], "base_dependency_coords": ["blackbox:method-shapes-lib:1.0"], "current_dependency_coords": ["blackbox:method-shapes-lib:2.0"],
+      "reachability_status": "reachable", "static_linkage_status": "incompatible_if_executed", "impact_conclusion": "probable_impact", "runtime_verification_status": "required_not_executed",
+      "exact_path_exists": true, "possible_path_exists": false, "path_set_complete": true,
+      "paths": [{"certainty": "exact", "text": "contract.MethodShapeApp.entryConstructor() → contract.MethodShapes.<init>(java.lang.String)"}]
+    },
+    {
+      "owner": "contract/MethodShapes", "member": "removedStatic", "descriptor": "(J)Ljava/lang/String;", "member_kind": "method",
+      "dependency_lineages": ["blackbox:method-shapes-lib"], "base_dependency_coords": ["blackbox:method-shapes-lib:1.0"], "current_dependency_coords": ["blackbox:method-shapes-lib:2.0"],
+      "reachability_status": "reachable", "static_linkage_status": "incompatible_if_executed", "impact_conclusion": "probable_impact", "runtime_verification_status": "required_not_executed",
+      "exact_path_exists": true, "possible_path_exists": false, "path_set_complete": true,
+      "paths": [{"certainty": "exact", "text": "contract.MethodShapeApp.entryStatic() → contract.MethodShapes.removedStatic(long)"}]
+    },
+    {
+      "owner": "contract/MethodShapes", "member": "removedArray", "descriptor": "([Ljava/lang/String;[[I)Ljava/lang/String;", "member_kind": "method",
+      "dependency_lineages": ["blackbox:method-shapes-lib"], "base_dependency_coords": ["blackbox:method-shapes-lib:1.0"], "current_dependency_coords": ["blackbox:method-shapes-lib:2.0"],
+      "reachability_status": "reachable", "static_linkage_status": "incompatible_if_executed", "impact_conclusion": "probable_impact", "runtime_verification_status": "required_not_executed",
+      "exact_path_exists": true, "possible_path_exists": false, "path_set_complete": true,
+      "paths": [{"certainty": "exact", "text": "contract.MethodShapeApp.entryArray(contract.MethodShapes) → contract.MethodShapes.removedArray(java.lang.String[],int[][])"}]
+    },
+    {
+      "owner": "contract/MethodShapes", "member": "removedDeep", "descriptor": "()Ljava/lang/String;", "member_kind": "method",
+      "dependency_lineages": ["blackbox:method-shapes-lib"], "base_dependency_coords": ["blackbox:method-shapes-lib:1.0"], "current_dependency_coords": ["blackbox:method-shapes-lib:2.0"],
+      "reachability_status": "reachable", "static_linkage_status": "incompatible_if_executed", "impact_conclusion": "probable_impact", "runtime_verification_status": "required_not_executed",
+      "exact_path_exists": true, "possible_path_exists": false, "path_set_complete": true,
+      "paths": [{"certainty": "exact", "text": "contract.MethodShapeApp.entryDeep(contract.MethodShapes) → contract.MethodShapeBridge.first(contract.MethodShapes) → contract.MethodShapeBridge.second(contract.MethodShapes) → contract.MethodShapes.removedDeep()"}]
+    },
+    {
+      "owner": "contract/MethodShapes", "member": "removedUnreachable", "descriptor": "()Ljava/lang/String;", "member_kind": "method",
+      "dependency_lineages": ["blackbox:method-shapes-lib"], "base_dependency_coords": ["blackbox:method-shapes-lib:1.0"], "current_dependency_coords": ["blackbox:method-shapes-lib:2.0"],
+      "reachability_status": "not_found_in_static_analysis", "static_linkage_status": "incompatible_if_executed", "impact_conclusion": "inconclusive", "runtime_verification_status": "undetermined",
+      "exact_path_exists": false, "possible_path_exists": false, "path_set_complete": true, "paths": []
+    }
+  ],
+  "forbidden_results": [
+    {"owner": "contract/MethodShapes", "member": "stableMethod", "descriptor": "()Ljava/lang/String;", "member_kind": "method", "oracle_relation": "unchanged_member", "reason": "The method and descriptor are unchanged on both sides."}
+  ]
+}

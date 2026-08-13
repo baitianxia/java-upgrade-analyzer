@@ -50,7 +50,7 @@ class ClaudeSkillContractTest(unittest.TestCase):
                     '--report-dir .upgrade-report',
                     ".upgrade-report/.runtime/state/main_state.json",
                     ".upgrade-report/.runtime/state/interaction.json",
-                    "--describe-step1-contract",
+                    "--describe-step0-contract",
                     "--response-json",
                     "### Phase 8 [AUTO] Call Chain Analysis",
                     "- 对应步骤：`step5`",
@@ -79,7 +79,7 @@ class ClaudeSkillContractTest(unittest.TestCase):
         self.assertTrue(report.clean_copy_without_report_state)
         self.assertEqual(report.failed_resume_returncode, 1)
 
-    def test_clean_copy_completes_public_step1_to_step6_workflow(self):
+    def test_clean_copy_completes_public_step0_to_step6_workflow(self):
         with tempfile.TemporaryDirectory() as tmp:
             report = run_skill_contract(ROOT, Path(tmp), complete_workflow=True)
 
@@ -87,8 +87,16 @@ class ClaudeSkillContractTest(unittest.TestCase):
         self.assertEqual(report.completed_step, "step6")
         self.assertTrue(report.deliverables_verified)
         self.assertEqual(report.successful_rerun_returncode, 0)
-        self.assertEqual(report.step4_api_count, 1)
-        self.assertEqual(report.step5_accounted_api_count, 1)
+        # The Step4/Step5 evidence ledger retains both the artifact removal
+        # fact and the independently reconciled runtime-resolution change.
+        # The formal public result below groups both mechanisms into one API.
+        self.assertEqual(report.step4_api_count, 2)
+        self.assertEqual(report.step5_accounted_api_count, 2)
+        self.assertEqual(report.step4_truth_status, "passed")
+        self.assertEqual(report.step4_false_positive_count, 0)
+        self.assertEqual(report.step4_false_negative_count, 0)
+        self.assertEqual(report.step4_state_mismatch_count, 0)
+        self.assertEqual(report.step4_path_mismatch_count, 0)
 
     def test_repository_public_contract_has_no_undeclared_or_stale_entrypoint(self):
         self.assertEqual(audit_public_contract(ROOT), ())
@@ -98,7 +106,7 @@ class ClaudeSkillContractTest(unittest.TestCase):
         rules = (ROOT / "CHECKPOINT_RULES.md").read_text(encoding="utf-8")
 
         self.assertNotIn("Confirm Impact Judgment", skill)
-        self.assertIn("### Phase 9 [AUTO] Final Report", skill)
+        self.assertIn("### Phase 8 [AUTO] Final Report", skill)
         self.assertIn("completed_with_limits", skill)
         self.assertIn("完整限制清单", rules)
         self.assertIn("Step5 成功后的例行复核", rules)
@@ -164,9 +172,15 @@ class ClaudeSkillContractTest(unittest.TestCase):
 
         self.assertEqual(set(reports), set(TRANSFORM_IDS))
         self.assertTrue(all(report.status == "passed" for report in reports.values()))
-        self.assertTrue(all(report.step4_api_count == 1 for report in reports.values()))
+        self.assertTrue(all(report.step4_api_count == 2 for report in reports.values()))
         self.assertTrue(
-            all(report.step5_accounted_api_count == 1 for report in reports.values())
+            all(report.step5_accounted_api_count == 2 for report in reports.values())
+        )
+        self.assertTrue(
+            all(report.step4_truth_status == "passed" for report in reports.values())
+        )
+        self.assertTrue(
+            all(report.step4_false_positive_count == 0 for report in reports.values())
         )
         self.assertEqual(
             len({report.current_artifact_sha256 for report in reports.values()}),

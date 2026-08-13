@@ -1,0 +1,24 @@
+{
+  "schema": "java-upgrade-analyzer.runtime-blackbox-truth.v1",
+  "case_id": "cache-public-contract-v1",
+  "system_generated": false,
+  "oracle_producers": [
+    {
+      "id": "sha256-content-identity",
+      "organization": "NIST standardized algorithm",
+      "mechanism": "independent artifact and result content hashing",
+      "verifies": ["repeat semantic identity", "immutable generation identity"]
+    },
+    {
+      "id": "independent-process-and-json-observation",
+      "organization": "Python Software Foundation",
+      "mechanism": "cold, warm, corrupted-cache, and concurrent public subprocess execution",
+      "verifies": ["disk cache reuse", "corruption rebuild", "concurrent deterministic publication"]
+    }
+  ],
+  "expected_first_status": "miss",
+  "expected_warm_status": "hit",
+  "expected_corrupt_status": "corrupt_rebuilt",
+  "expected_validation_status": "passed",
+  "expected_concurrent_result_identity_count": 1
+}

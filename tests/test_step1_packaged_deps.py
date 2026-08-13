@@ -319,6 +319,23 @@ class Step1PackagedDepsTest(unittest.TestCase):
         self.assertNotIn("META-INF/MANIFEST.MF", names)
         self.assertNotIn("META-INF/maven/acme/app/pom.properties", names)
 
+    def test_packaging_detection_distinguishes_thin_from_corrupt_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            thin = root / "thin.jar"
+            corrupt = root / "corrupt.jar"
+            with zipfile.ZipFile(thin, "w") as archive:
+                archive.writestr("example/Application.class", b"class")
+            corrupt.write_bytes(b"not-a-zip-archive")
+
+            self.assertEqual(
+                s1_dep_diff._detect_archive_packaging_type(thin), "thin_jar"
+            )
+            with self.assertRaisesRegex(
+                RuntimeError, "最终制品扫描不完整.*archive_open:BadZipFile"
+            ):
+                s1_dep_diff._detect_archive_packaging_type(corrupt)
+
     def test_parse_gradle_dependency_report_uses_selected_runtime_version(self):
         deps = s1_dep_diff.parse_gradle_dependency_report(
             """runtimeClasspath - Runtime classpath of source set 'main'.
@@ -3439,6 +3456,10 @@ class Step1PackagedDepsTest(unittest.TestCase):
                     "base",
                     "--current",
                     "current",
+                    "--base-tool",
+                    "maven",
+                    "--current-tool",
+                    "maven",
                     "--work-dir",
                     str(work_dir),
                     "--output",

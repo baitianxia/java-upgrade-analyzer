@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import csv
 from dataclasses import asdict
+import errno
 import hashlib
 import json
 import os
@@ -19,8 +20,9 @@ from binary_first_model import ResultGeneration, RuntimeProfile
 from binary_source_overlay import SourceOverlayResult
 from binary_trace_engine import BinaryTraceBundle
 from csv_io import open_csv_write
-from path_runtime import make_short_temp_dir, short_temporary_directory
+from path_runtime import make_short_temp_dir
 from signature_utils import jvm_method_parameter_signature
+from streaming_json import write_json_streaming
 
 
 EDGE_KIND_LABELS = {
@@ -28,6 +30,8 @@ EDGE_KIND_LABELS = {
     "field": "字节码字段访问",
     "type": "字节码类型引用",
     "class_initialization": "类初始化",
+    "invokedynamic_handle": "InvokeDynamic 方法句柄候选调用",
+    "invokedynamic_bootstrap": "InvokeDynamic 引导方法候选调用",
     "reflection_method_invocation": "反射方法调用",
     "reflection_constructor_invocation": "反射构造调用",
     "reflection_field_access": "反射字段访问",
@@ -44,6 +48,14 @@ EDGE_KIND_LABELS = {
     "dubbo_spi_dispatch": "Dubbo SPI 扩展分派",
     "implicit_data_contract_dispatch": "序列化/绑定数据契约",
 }
+
+
+def _public_edge_kind(kind: str) -> str:
+    if kind.startswith("invokedynamic_handle_"):
+        return "invokedynamic_handle"
+    if kind.startswith("ldc_bootstrap_handle_"):
+        return "constant_dynamic_handle"
+    return kind
 
 
 ENTRY_KIND_LABELS = {
@@ -92,10 +104,6 @@ def _json_bytes(value: Any) -> bytes:
         )
         + "\n"
     ).encode("utf-8")
-
-
-def _sha256(value: bytes) -> str:
-    return hashlib.sha256(value).hexdigest()
 
 
 def _sha256_file(path: Path) -> str:
@@ -162,6 +170,11 @@ def _aggregate_by_api(
     for reported, items in sorted(groups.items()):
         results = [item["result"] for item in items]
         primary = max(results, key=lambda item: priority[item["reachability_status"]])
+        primary_priority = priority[primary["reachability_status"]]
+        linkage_results = [
+            item for item in results
+            if priority[item["reachability_status"]] == primary_priority
+        ]
         scopes = [item["decision"]["fact_scope"] for item in items]
         target_scope = scopes[0]
         target_owner = str(target_scope.get("class_name") or "").replace("/", ".")
@@ -205,7 +218,7 @@ def _aggregate_by_api(
                 })
                 mechanism_kinds = []
                 for edge in path.get("edges") or ():
-                    kind = str(edge.get("edge_kind") or "")
+                    kind = _public_edge_kind(str(edge.get("edge_kind") or ""))
                     if kind and kind not in mechanism_kinds:
                         mechanism_kinds.append(kind)
                 path_records.append({
@@ -258,10 +271,17 @@ def _aggregate_by_api(
                 else "inconclusive"
             ),
             "static_linkage_status": max(
-                (item.get("static_linkage_status") or "undetermined" for item in results),
+                (
+                    item.get("static_linkage_status") or "undetermined"
+                    for item in linkage_results
+                ),
                 key=lambda value: linkage_priority.get(value, 1),
             ),
-            "runtime_verification_status": "required_not_executed",
+            "runtime_verification_status": (
+                "required_not_executed"
+                if any(bool(item.get("is_reachable")) for item in results)
+                else "undetermined"
+            ),
             "runtime_verification_executed_by_system": False,
             "path_set_complete": all(item["path_set_complete"] for item in results),
             "exact_path_exists": any(item["exact_path_exists"] for item in results),
@@ -429,7 +449,7 @@ def build_output_payloads(
     }
 
 
-def _csv_bytes(rows: list[dict[str, Any]]) -> bytes:
+def _write_csv_sidecar(path: Path, rows: list[dict[str, Any]]) -> Path:
     columns = [
         "reported_api_identity", "display_owner", "display_member", "display_descriptor",
         "reachability_status", "is_reachable", "impact_conclusion", "static_linkage_status",
@@ -437,13 +457,11 @@ def _csv_bytes(rows: list[dict[str, Any]]) -> bytes:
         "path_set_complete", "exact_path_exists", "possible_path_exists",
         "primary_projection_id",
     ]
-    with short_temporary_directory(prefix="binary-output-csv") as temp_text:
-        path = Path(temp_text) / "binary_formal_results.csv"
-        with open_csv_write(path) as handle:
-            writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(rows)
-        return path.read_bytes()
+    with open_csv_write(path) as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    return path
 
 
 def write_binary_generation(
@@ -466,107 +484,139 @@ def write_binary_generation(
         source_overlay=source_overlay,
         source_inputs=source_inputs,
     )
-    encoded = {name: _json_bytes(payload) for name, payload in payloads.items()}
-    encoded["binary_formal_results.csv"] = _csv_bytes(payloads["binary_formal_results.json"]["by_api"])
-    sidecar_sources: dict[str, bytes | Path] = dict(encoded)
-    for name, content in (additional_sidecars or {}).items():
-        safe_name = Path(str(name or "")).name
-        if not safe_name or safe_name != str(name) or safe_name in sidecar_sources:
-            raise BinaryOutputError(
-                "BINARY_OUTPUT_ADDITIONAL_SIDECAR_INVALID", str(name)
-            )
-        if not isinstance(content, (bytes, Path)) or (
-            isinstance(content, Path) and not content.is_file()
-        ):
-            raise BinaryOutputError(
-                "BINARY_OUTPUT_ADDITIONAL_SIDECAR_INVALID",
-                f"{name} must be bytes or an existing Path",
-            )
-        sidecar_sources[safe_name] = content
-    sidecar_identities = {
-        name: (_sha256(content) if isinstance(content, bytes) else _sha256_file(content))
-        for name, content in sidecar_sources.items()
-    }
-    generation = ResultGeneration(
-        decisions.analysis_context_identity,
-        decisions.active_snapshots,
-        traces.trace_result_set_digest,
-        sidecar_identities,
-        dict(policy_identities),
+    staging = make_short_temp_dir(
+        prefix="binary-output-sidecars",
+        preferred_root=root,
+        strict_preferred=True,
     )
-    generations = root / "binary_generations"
-    generations.mkdir(exist_ok=True)
-    destination = generations / generation.identity
-    manifest = {
-        "schema": "java-upgrade-analyzer.binary-result-generation.v1",
-        "result_generation_identity": generation.identity,
-        "analysis_context_identity": decisions.analysis_context_identity,
-        "authority": "binary_first",
-        "active_snapshot_identities": {
-            layer: snapshot.identity for layer, snapshot in decisions.active_snapshots.items()
-        },
-        "trace_result_set_digest": traces.trace_result_set_digest,
-        "sidecar_content_identities": sidecar_identities,
-        "policy_identities": dict(policy_identities),
-        "attachment_policy": "trace-results-bound-by-generation-attachment-v1",
-    }
-    attachment = {
-        "schema": "java-upgrade-analyzer.binary-generation-attachments.v1",
-        "result_generation_identity": generation.identity,
-        "formal_trace_result_identities": [
-            item["trace_result_identity"] for item in traces.formal_results
-        ],
-        "candidate_trace_result_identities": [
-            item["trace_result_identity"] for item in traces.candidate_results
-        ],
-    }
-    if destination.exists():
-        existing_manifest = destination / "result_generation.json"
-        existing = (
-            json.loads(existing_manifest.read_text(encoding="utf-8"))
-            if existing_manifest.is_file() else {}
+    try:
+        sidecar_sources: dict[str, Path] = {}
+        for name, payload in payloads.items():
+            sidecar_sources[name] = write_json_streaming(staging / name, payload)
+        sidecar_sources["binary_formal_results.csv"] = _write_csv_sidecar(
+            staging / "binary_formal_results.csv",
+            payloads["binary_formal_results.json"]["by_api"],
         )
-        content_valid = all(
-            (destination / name).is_file()
-            and _sha256_file(destination / name) == expected
-            for name, expected in sidecar_identities.items()
+        for name, content in (additional_sidecars or {}).items():
+            safe_name = Path(str(name or "")).name
+            if not safe_name or safe_name != str(name) or safe_name in sidecar_sources:
+                raise BinaryOutputError(
+                    "BINARY_OUTPUT_ADDITIONAL_SIDECAR_INVALID", str(name)
+                )
+            if not isinstance(content, (bytes, Path)) or (
+                isinstance(content, Path) and not content.is_file()
+            ):
+                raise BinaryOutputError(
+                    "BINARY_OUTPUT_ADDITIONAL_SIDECAR_INVALID",
+                    f"{name} must be bytes or an existing Path",
+                )
+            if isinstance(content, bytes):
+                staged = staging / safe_name
+                staged.write_bytes(content)
+                sidecar_sources[safe_name] = staged
+            else:
+                sidecar_sources[safe_name] = content
+        sidecar_identities = {
+            name: _sha256_file(content)
+            for name, content in sidecar_sources.items()
+        }
+        generation = ResultGeneration(
+            decisions.analysis_context_identity,
+            decisions.active_snapshots,
+            traces.trace_result_set_digest,
+            sidecar_identities,
+            dict(policy_identities),
         )
-        if (
-            existing.get("result_generation_identity") != generation.identity
-            or existing.get("sidecar_content_identities") != sidecar_identities
-            or not content_valid
-        ):
-            raise BinaryOutputError(
-                "BINARY_GENERATION_IDENTITY_COLLISION", str(destination)
+        generations = root / "binary_generations"
+        generations.mkdir(exist_ok=True)
+        destination = generations / generation.identity
+        manifest = {
+            "schema": "java-upgrade-analyzer.binary-result-generation.v1",
+            "result_generation_identity": generation.identity,
+            "analysis_context_identity": decisions.analysis_context_identity,
+            "authority": "binary_first",
+            "active_snapshot_identities": {
+                layer: snapshot.identity
+                for layer, snapshot in decisions.active_snapshots.items()
+            },
+            "trace_result_set_digest": traces.trace_result_set_digest,
+            "sidecar_content_identities": sidecar_identities,
+            "policy_identities": dict(policy_identities),
+            "attachment_policy": "trace-results-bound-by-generation-attachment-v1",
+        }
+        attachment = {
+            "schema": "java-upgrade-analyzer.binary-generation-attachments.v1",
+            "result_generation_identity": generation.identity,
+            "formal_trace_result_identities": [
+                item["trace_result_identity"] for item in traces.formal_results
+            ],
+            "candidate_trace_result_identities": [
+                item["trace_result_identity"] for item in traces.candidate_results
+            ],
+        }
+
+        def existing_generation_is_valid() -> bool:
+            existing_manifest = destination / "result_generation.json"
+            try:
+                existing = json.loads(existing_manifest.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                return False
+            content_valid = all(
+                (destination / name).is_file()
+                and _sha256_file(destination / name) == expected
+                for name, expected in sidecar_identities.items()
             )
-    else:
-        temp = make_short_temp_dir(
-            prefix="binary-generation",
-            preferred_root=generations,
-            strict_preferred=True,
-        )
-        try:
-            for name, content in sidecar_sources.items():
-                target = temp / name
-                if isinstance(content, bytes):
-                    target.write_bytes(content)
-                else:
+            return bool(
+                content_valid
+                and existing.get("result_generation_identity") == generation.identity
+                and existing.get("sidecar_content_identities") == sidecar_identities
+            )
+
+        if destination.exists():
+            if not existing_generation_is_valid():
+                raise BinaryOutputError(
+                    "BINARY_GENERATION_IDENTITY_COLLISION", str(destination)
+                )
+        else:
+            generation_temp = make_short_temp_dir(
+                prefix="binary-generation",
+                preferred_root=generations,
+                strict_preferred=True,
+            )
+            try:
+                for name, content in sidecar_sources.items():
+                    target = generation_temp / name
                     shutil.copyfile(content, target)
-                if _sha256_file(target) != sidecar_identities[name]:
-                    raise BinaryOutputError(
-                        "BINARY_OUTPUT_SIDECAR_CHANGED_DURING_COPY", str(content)
-                    )
-            (temp / "result_generation.json").write_bytes(_json_bytes(manifest))
-            (temp / "generation_attachments.json").write_bytes(_json_bytes(attachment))
-            os.replace(temp, destination)
-        finally:
-            if temp.exists():
-                shutil.rmtree(temp)
-    return {
-        **manifest,
-        "generation_directory": str(destination),
-        "active_generation_descriptor": "",
-    }
+                    if _sha256_file(target) != sidecar_identities[name]:
+                        raise BinaryOutputError(
+                            "BINARY_OUTPUT_SIDECAR_CHANGED_DURING_COPY", str(content)
+                        )
+                (generation_temp / "result_generation.json").write_bytes(_json_bytes(manifest))
+                (generation_temp / "generation_attachments.json").write_bytes(_json_bytes(attachment))
+                try:
+                    os.replace(generation_temp, destination)
+                except OSError as error:
+                    # Another process may have atomically published the exact
+                    # same content-addressed generation after our existence
+                    # check.  Treat that race as idempotent only after full
+                    # content verification.
+                    if (
+                        error.errno not in {errno.EEXIST, errno.ENOTEMPTY}
+                        or not destination.is_dir()
+                        or not existing_generation_is_valid()
+                    ):
+                        raise
+            finally:
+                if generation_temp.exists():
+                    shutil.rmtree(generation_temp)
+        return {
+            **manifest,
+            "generation_directory": str(destination),
+            "active_generation_descriptor": "",
+        }
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
 
 
 def activate_binary_generation(

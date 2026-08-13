@@ -1,0 +1,68 @@
+{
+  "schema": "java-upgrade-analyzer.blackbox-truth.v1",
+  "case_id": "access-restriction-v1",
+  "dataset_version": 1,
+  "scope": "closed_set",
+  "system_generated": false,
+  "human_review": {"status": "not_claimed", "reviewer": ""},
+  "input_evidence": {
+    "algorithm": "sha256-path-nul-content-nul-v1",
+    "source_tree_sha256": "03f76672114831af3c973df6a0da856a1d15722484574e90d044555b53d64205",
+    "case_algorithm": "sha256-canonical-json-v1",
+    "case_sha256": "d7cd1619c03204593723af0f139e61a67b4a322352bce6ad81cf027a761d1025",
+    "source_files": [
+      "src/base/contract/AccessApi.java",
+      "src/business/contract/AccessApp.java",
+      "src/current/contract/AccessApi.java",
+      "src/oracle/contract/OracleMain.java"
+    ]
+  },
+  "oracle_producers": [
+    {
+      "id": "openjdk-javap-public-access-inventory",
+      "organization": "OpenJDK",
+      "mechanism": "independent_bytecode_inventory",
+      "verifies": ["complete_public_api_removal_set", "entrypoint_member_edges"]
+    },
+    {
+      "id": "openjdk-jvm-access-checker",
+      "organization": "OpenJDK",
+      "mechanism": "actual_jvm_execution",
+      "verifies": ["base_access_succeeds", "current_illegal_access_error"]
+    }
+  ],
+  "oracle_implementations": [
+    {"path": "tests/blackbox/oracles/openjdk_oracle.py", "sha256": "6e72442077371b86c943f790b5982144497725200da3e89f22f66ca2bfee38ca"}
+  ],
+  "completeness": {
+    "argument": "The only base/current public API changes are the three members narrowed from public to private. javap -public independently proves the complete public API removal set and javap bytecode proves the direct entrypoint edges. The separately packaged JVM runner proves each access succeeds on the base classpath and raises IllegalAccessError on the current classpath.",
+    "verified_dimensions": ["api_identity", "jvm_descriptor", "closed_result_set", "entrypoint_reachability", "static_linkage"],
+    "known_limits": []
+  },
+  "expected_result_count": 3,
+  "expected_results": [
+    {
+      "owner": "contract/AccessApi", "member": "restrictedMethod", "descriptor": "()Ljava/lang/String;", "member_kind": "method",
+      "dependency_lineages": ["blackbox:access-fixture-lib"], "base_dependency_coords": ["blackbox:access-fixture-lib:1.0"], "current_dependency_coords": ["blackbox:access-fixture-lib:2.0"],
+      "reachability_status": "reachable", "static_linkage_status": "incompatible_if_executed", "impact_conclusion": "probable_impact", "runtime_verification_status": "required_not_executed",
+      "exact_path_exists": true, "possible_path_exists": false, "path_set_complete": true,
+      "paths": [{"certainty": "exact", "text": "contract.AccessApp.entryMethod(contract.AccessApi) → contract.AccessApi.restrictedMethod()"}]
+    },
+    {
+      "owner": "contract/AccessApi", "member": "restrictedField", "descriptor": "Ljava/lang/String;", "member_kind": "field",
+      "dependency_lineages": ["blackbox:access-fixture-lib"], "base_dependency_coords": ["blackbox:access-fixture-lib:1.0"], "current_dependency_coords": ["blackbox:access-fixture-lib:2.0"],
+      "reachability_status": "reachable", "static_linkage_status": "incompatible_if_executed", "impact_conclusion": "probable_impact", "runtime_verification_status": "required_not_executed",
+      "exact_path_exists": true, "possible_path_exists": false, "path_set_complete": true,
+      "paths": [{"certainty": "exact", "text": "contract.AccessApp.entryField(contract.AccessApi) → contract.AccessApi.restrictedField"}]
+    },
+    {
+      "owner": "contract/AccessApi", "member": "restrictedUnreachable", "descriptor": "()Ljava/lang/String;", "member_kind": "method",
+      "dependency_lineages": ["blackbox:access-fixture-lib"], "base_dependency_coords": ["blackbox:access-fixture-lib:1.0"], "current_dependency_coords": ["blackbox:access-fixture-lib:2.0"],
+      "reachability_status": "not_found_in_static_analysis", "static_linkage_status": "incompatible_if_executed", "impact_conclusion": "inconclusive", "runtime_verification_status": "undetermined",
+      "exact_path_exists": false, "possible_path_exists": false, "path_set_complete": true, "paths": []
+    }
+  ],
+  "forbidden_results": [
+    {"owner": "contract/AccessApi", "member": "stableMethod", "descriptor": "()Ljava/lang/String;", "member_kind": "method", "oracle_relation": "unchanged_member", "reason": "The public method remains unchanged on both sides."}
+  ]
+}

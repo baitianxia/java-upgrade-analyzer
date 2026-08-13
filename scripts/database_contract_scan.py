@@ -623,7 +623,14 @@ def _archive_class_inputs(
             yield BinaryClassInput(identity, info.filename, content)
 
 
-def scan_artifact(coord: str, version: str, side: str, path: Path) -> ArtifactFacts:
+def scan_artifact(
+    coord: str,
+    version: str,
+    side: str,
+    path: Path,
+    *,
+    jdk_home: str | Path | None = None,
+) -> ArtifactFacts:
     result = ArtifactFacts(coord=coord, version=version, side=side, path=path)
     identity = f"{side}:{coord}:{version}:{hashlib.sha256(str(path).encode()).hexdigest()[:12]}"
     try:
@@ -667,7 +674,7 @@ def scan_artifact(coord: str, version: str, side: str, path: Path) -> ArtifactFa
 
     if class_inputs:
         try:
-            run = extract_class_facts(class_inputs)
+            run = extract_class_facts(class_inputs, jdk_home=jdk_home)
             class_records = {
                 str(record.get('class_name') or ''): record
                 for record in run.records
@@ -708,7 +715,9 @@ def scan_artifact(coord: str, version: str, side: str, path: Path) -> ArtifactFa
                                 identity, matching[0], archive.read(info)
                             ))
                     if additional_inputs:
-                        additional_run = extract_class_facts(additional_inputs)
+                        additional_run = extract_class_facts(
+                            additional_inputs, jdk_home=jdk_home,
+                        )
                         class_records.update({
                             str(record.get('class_name') or ''): record
                             for record in additional_run.records
@@ -820,7 +829,12 @@ def compare_artifact_facts(base: ArtifactFacts | None, current: ArtifactFacts | 
 
 
 def _scan_side_rows(
-    coord: str, side: str, rows: list[dict[str, Any]], gaps: list[str]
+    coord: str,
+    side: str,
+    rows: list[dict[str, Any]],
+    gaps: list[str],
+    *,
+    jdk_home: str | Path | None = None,
 ) -> ArtifactFacts | None:
     if not rows:
         return None
@@ -846,7 +860,13 @@ def _scan_side_rows(
         if digest != expected:
             gaps.append(f"artifact_digest_mismatch:{side}:{coord}")
             return None
-    result = scan_artifact(coord, str(row.get("version") or side), side, path)
+    result = scan_artifact(
+        coord,
+        str(row.get("version") or side),
+        side,
+        path,
+        jdk_home=jdk_home,
+    )
     gaps.extend(f"{side}:{coord}:{gap}" for gap in result.gaps)
     return result
 
@@ -910,7 +930,12 @@ def _write_outputs(output_dir: Path, rows: list[dict[str, str]], summary: dict[s
     (output_dir / REVIEW_NAME).write_text("\n".join(lines), encoding="utf-8")
 
 
-def scan_database_contracts(report_dir: str | Path, output_dir: str | Path) -> dict[str, Any]:
+def scan_database_contracts(
+    report_dir: str | Path,
+    output_dir: str | Path,
+    *,
+    jdk_home: str | Path | None = None,
+) -> dict[str, Any]:
     report_root = Path(report_dir)
     output_root = Path(output_dir)
     manifest_path = report_root / "evidence" / "dependencies" / "dependency_jars.json"
@@ -953,8 +978,12 @@ def scan_database_contracts(report_dir: str | Path, output_dir: str | Path) -> d
                     except OSError:
                         # Side scanning below records the concrete integrity gap.
                         pass
-            base = _scan_side_rows(coord, "base", sides["base"], gaps)
-            current = _scan_side_rows(coord, "current", sides["current"], gaps)
+            base = _scan_side_rows(
+                coord, "base", sides["base"], gaps, jdk_home=jdk_home,
+            )
+            current = _scan_side_rows(
+                coord, "current", sides["current"], gaps, jdk_home=jdk_home,
+            )
             rows.extend(compare_artifact_facts(base, current))
 
     rows.sort(key=lambda row: (
@@ -987,8 +1016,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="升级前后数据库访问契约对比")
     parser.add_argument("--report-dir", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--jdk-home", default="")
     args = parser.parse_args()
-    summary = scan_database_contracts(args.report_dir, args.output_dir)
+    summary = scan_database_contracts(
+        args.report_dir,
+        args.output_dir,
+        jdk_home=args.jdk_home or None,
+    )
     print(json.dumps(summary, ensure_ascii=False))
 
 

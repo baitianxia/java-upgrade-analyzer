@@ -5,12 +5,16 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import gc
 import hashlib
 import json
+import os
 from pathlib import Path
+import re
 import sys
 import time
+import traceback
 from typing import Any, Mapping
 
 try:
@@ -19,6 +23,7 @@ except ImportError:  # pragma: no cover - Windows does not provide resource.
     resource = None
 
 from binary_artifact_diff import ArtifactSnapshot, compare_artifact_snapshots, snapshot_archive
+from binary_asm_helper import resolve_asm_jar
 from binary_decision_engine import BinaryDecisionEngine, DEFAULT_RULES
 from binary_fact_store import BinaryFactStore
 from binary_first_contract import (
@@ -46,12 +51,16 @@ from binary_trace_engine import build_binary_traces
 from binary_validation_oracle import validate_generation
 from enhanced_source_analyzer import analyze_file, extract_call_edges_enhanced
 from path_runtime import short_temporary_directory
+from jdk_preflight import JdkPreflightError, preflight_jdk_home
 
 
 SUPPORT_MANIFEST_PATH = Path(__file__).with_name("binary_first_support_manifest.json")
 PERFORMANCE_GATE_PATH = (
     Path(__file__).resolve().parents[1]
     / "tests" / "fixtures" / "binary_first" / "performance_gate.json"
+)
+RESUME_CHECKPOINT_SCHEMA = (
+    "java-upgrade-analyzer.binary-generation-validation-checkpoint.v1"
 )
 
 
@@ -63,6 +72,7 @@ class _PhaseTimingRecorder(list):
     """Persist non-authoritative progress after every completed phase."""
 
     ORDER = (
+        "static_preflight",
         "input_and_runtime_profile",
         "artifact_fact_build_and_local_diff",
         "target_independent_runtime_reconciliation",
@@ -144,9 +154,17 @@ class _PhaseTimingRecorder(list):
             "phases": list(self),
             "non_authoritative_observability": True,
         }, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
-        temporary = self.path.with_suffix(".tmp")
-        temporary.write_text(payload, encoding="utf-8")
-        temporary.replace(self.path)
+        temporary = self.path.with_name(
+            f".{self.path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp"
+        )
+        try:
+            temporary.write_text(payload, encoding="utf-8")
+            temporary.replace(self.path)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
 
 
 SOURCE_INPUT_PURPOSE_VERSION = "source-input-purpose-v2"
@@ -169,6 +187,365 @@ def _sha256_file(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _resume_implementation_identity(asm_jar: str | Path) -> str:
+    scripts_dir = Path(__file__).resolve().parent
+    inputs = [
+        *sorted(scripts_dir.glob("*.py")),
+        *sorted((scripts_dir / "java").glob("*.java")),
+        SUPPORT_MANIFEST_PATH,
+        Path(asm_jar).resolve(),
+    ]
+    records = []
+    for path in inputs:
+        if not path.is_file():
+            continue
+        try:
+            display_path = path.relative_to(scripts_dir).as_posix()
+        except ValueError:
+            display_path = str(path)
+        records.append({
+            "path": display_path,
+            "sha256": _sha256_file(path),
+        })
+    return _identity("binary_pipeline_resume_implementation_identity", records)
+
+
+def _resume_input_artifact_identity(
+    config: Mapping[str, Any], *, digest_session: Any = None,
+) -> str:
+    records = []
+    seen = set()
+    for side_name in ("base", "current"):
+        side = dict(config.get(side_name) or {})
+        for artifact in side.get("artifacts") or ():
+            for field in ("path", "outer_artifact_path"):
+                value = str((artifact or {}).get(field) or "").strip()
+                if not value:
+                    continue
+                path = Path(value).expanduser().resolve()
+                key = str(path)
+                if key in seen:
+                    continue
+                seen.add(key)
+                if not path.is_file():
+                    raise BinaryPipelineError(
+                        "BINARY_RESUME_INPUT_ARTIFACT_MISSING", str(path)
+                    )
+                digest_record = (
+                    getattr(digest_session, "_records", {}).get(path)
+                    if digest_session is not None else None
+                )
+                if digest_record is None:
+                    stat = path.stat()
+                    sha256 = _sha256_file(path)
+                    size_bytes = int(stat.st_size)
+                else:
+                    sha256 = str(digest_record.content_sha256)
+                    size_bytes = int(digest_record.byte_length)
+                records.append({
+                    "path": key,
+                    "sha256": sha256,
+                    "size_bytes": size_bytes,
+                })
+    return _identity("binary_pipeline_resume_input_artifact_identity", records)
+
+
+def _resume_config_identity(config: Mapping[str, Any]) -> str:
+    """Bind semantic config while excluding regenerated worktree root names."""
+    normalized = json.loads(
+        json.dumps(config, ensure_ascii=False, sort_keys=True)
+    )
+    overlay = dict(normalized.get("source_overlay") or {})
+    normalized_sets = []
+    for raw_set in overlay.get("source_sets") or ():
+        source_set = dict(raw_set or {})
+        root_value = str(source_set.get("source_root") or "").strip()
+        root = Path(root_value).expanduser().resolve() if root_value else None
+        logical_dirs = []
+        for raw_dir in source_set.get("source_dirs") or ():
+            source_dir = Path(str(raw_dir)).expanduser().resolve()
+            if root is None:
+                logical_dirs.append(str(source_dir))
+                continue
+            try:
+                logical_dirs.append(source_dir.relative_to(root).as_posix() or ".")
+            except ValueError:
+                # Invalid/out-of-snapshot paths must not accidentally become
+                # resumable merely because a physical prefix was removed.
+                logical_dirs.append(f"outside-snapshot:{source_dir}")
+        source_set["source_root"] = "<immutable-snapshot-root>" if root else ""
+        source_set["source_dirs"] = logical_dirs
+        normalized_sets.append(source_set)
+    if overlay:
+        overlay["source_sets"] = normalized_sets
+        normalized["source_overlay"] = overlay
+    return _identity("binary_pipeline_resume_config_identity", normalized)
+
+
+def _resume_checkpoint_path(output_root: Path) -> Path:
+    return output_root / "binary_observability" / "validation_checkpoint.json"
+
+
+def _write_resume_checkpoint(output_root: Path, payload: Mapping[str, Any]) -> Path:
+    destination = _resume_checkpoint_path(output_root)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(
+        f".{destination.name}.{os.getpid()}.{time.monotonic_ns()}.tmp"
+    )
+    try:
+        temporary.write_text(
+            json.dumps(
+                dict(payload),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(destination)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    return destination
+
+
+def _read_resume_checkpoint(output_root: Path) -> dict[str, Any]:
+    path = _resume_checkpoint_path(output_root)
+    if not path.is_file():
+        return {}
+    try:
+        payload = _load_json(path)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _record_resume_decision(
+    output_root: Path, *, status: str, reason_code: str, checkpoint: Mapping[str, Any],
+) -> None:
+    destination = output_root / "binary_observability" / "latest_resume_decision.json"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(
+        f".{destination.name}.{os.getpid()}.{time.monotonic_ns()}.tmp"
+    )
+    payload = {
+        "schema": "java-upgrade-analyzer.binary-resume-decision.v1",
+        "status": status,
+        "reason_code": reason_code,
+        "result_generation_identity": str(
+            checkpoint.get("result_generation_identity") or ""
+        ),
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "non_authoritative_observability": True,
+    }
+    try:
+        temporary.write_text(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(destination)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _resume_generation_validation(
+    config: Mapping[str, Any],
+    *,
+    output_root: Path,
+    source_inputs: Mapping[str, Any],
+    asm_jar: str | Path,
+    phase_timings: _PhaseTimingRecorder,
+    pipeline_started: float,
+) -> dict[str, Any] | None:
+    checkpoint = _read_resume_checkpoint(output_root)
+    if not checkpoint:
+        return None
+    expected_config_identity = _resume_config_identity(config)
+    checks = (
+        (
+            checkpoint.get("schema") == RESUME_CHECKPOINT_SCHEMA,
+            "BINARY_RESUME_CHECKPOINT_SCHEMA_MISMATCH",
+        ),
+        (
+            checkpoint.get("config_identity") == expected_config_identity,
+            "BINARY_RESUME_CONFIG_CHANGED",
+        ),
+        (
+            checkpoint.get("implementation_identity")
+            == _resume_implementation_identity(asm_jar),
+            "BINARY_RESUME_IMPLEMENTATION_CHANGED",
+        ),
+    )
+    for accepted, reason_code in checks:
+        if not accepted:
+            _record_resume_decision(
+                output_root,
+                status="rejected",
+                reason_code=reason_code,
+                checkpoint=checkpoint,
+            )
+            return None
+    try:
+        current_input_identity = _resume_input_artifact_identity(config)
+    except BinaryFirstContractError:
+        _record_resume_decision(
+            output_root,
+            status="rejected",
+            reason_code="BINARY_RESUME_INPUT_ARTIFACT_UNAVAILABLE",
+            checkpoint=checkpoint,
+        )
+        return None
+    if checkpoint.get("input_artifact_identity") != current_input_identity:
+        _record_resume_decision(
+            output_root,
+            status="rejected",
+            reason_code="BINARY_RESUME_INPUT_ARTIFACT_CHANGED",
+            checkpoint=checkpoint,
+        )
+        return None
+    generation_identity = str(
+        checkpoint.get("result_generation_identity") or ""
+    )
+    if not re.fullmatch(r"[0-9a-f]{64}", generation_identity):
+        _record_resume_decision(
+            output_root,
+            status="rejected",
+            reason_code="BINARY_RESUME_GENERATION_IDENTITY_INVALID",
+            checkpoint=checkpoint,
+        )
+        return None
+    generation = (
+        output_root / "binary_generations" / generation_identity
+    ).resolve()
+    expected_generation = (
+        output_root.resolve() / "binary_generations" / generation_identity
+    )
+    manifest_path = generation / "result_generation.json"
+    if (
+        not generation_identity
+        or generation != expected_generation
+        or not manifest_path.is_file()
+    ):
+        _record_resume_decision(
+            output_root,
+            status="rejected",
+            reason_code="BINARY_RESUME_GENERATION_MISSING",
+            checkpoint=checkpoint,
+        )
+        return None
+    try:
+        manifest = _load_json(manifest_path)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        _record_resume_decision(
+            output_root,
+            status="rejected",
+            reason_code="BINARY_RESUME_GENERATION_MANIFEST_INVALID",
+            checkpoint=checkpoint,
+        )
+        return None
+    if manifest.get("result_generation_identity") != generation_identity:
+        _record_resume_decision(
+            output_root,
+            status="rejected",
+            reason_code="BINARY_RESUME_GENERATION_IDENTITY_MISMATCH",
+            checkpoint=checkpoint,
+        )
+        return None
+    _record_resume_decision(
+        output_root,
+        status="accepted",
+        reason_code="BINARY_RESUME_VALIDATION_ONLY",
+        checkpoint=checkpoint,
+    )
+    validation_started = time.perf_counter()
+    validation = validate_generation(config, generation)
+    phase_timings.append({
+        "phase": "independent_validation",
+        "elapsed_seconds": round(time.perf_counter() - validation_started, 6),
+        "issue_count": len(validation.get("issues") or ()),
+        "resumed_from_generation_checkpoint": True,
+    })
+    if validation["status"] != "passed":
+        raise BinaryPipelineError(
+            "BINARY_INDEPENDENT_VALIDATION_FAILED",
+            json.dumps(validation["issues"][:20], ensure_ascii=False),
+        )
+    manifest["generation_directory"] = str(generation)
+    activation_started = time.perf_counter()
+    manifest["active_generation_descriptor"] = activate_binary_generation(
+        output_root, manifest, validation_result=validation
+    )
+    phase_timings.append({
+        "phase": "validated_generation_activation",
+        "elapsed_seconds": round(time.perf_counter() - activation_started, 6),
+        "resumed_from_generation_checkpoint": True,
+    })
+    try:
+        _resume_checkpoint_path(output_root).unlink()
+    except FileNotFoundError:
+        pass
+    observability = output_root / "binary_observability"
+    observability.mkdir(parents=True, exist_ok=True)
+    cache_metrics = dict(checkpoint.get("cache_metrics") or {})
+    cache_metrics["resumed_generation_checkpoint_count"] = 1
+    cache_metrics_path = observability / "latest_cache_metrics.json"
+    cache_metrics_path.write_text(
+        json.dumps({
+            "schema": "java-upgrade-analyzer.binary-cache-metrics.v1",
+            "result_generation_identity": generation_identity,
+            **cache_metrics,
+        }, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    total_elapsed_seconds = round(time.perf_counter() - pipeline_started, 6)
+    peak_rss_bytes = _peak_rss_bytes()
+    phase_timings_path = observability / "latest_phase_timings.json"
+    phase_timings_path.write_text(
+        json.dumps({
+            "schema": "java-upgrade-analyzer.binary-phase-timings.v1",
+            "result_generation_identity": generation_identity,
+            "total_elapsed_seconds": total_elapsed_seconds,
+            "peak_rss_bytes": peak_rss_bytes,
+            "peak_rss_scope": "current_process",
+            "phases": list(phase_timings),
+            "resumed_from_generation_checkpoint": True,
+            "non_authoritative_observability": True,
+        }, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    return {
+        **manifest,
+        "schema": "java-upgrade-analyzer.binary-pipeline-result.v1",
+        "runtime_comparison_identity": checkpoint["runtime_comparison_identity"],
+        "analysis_scope_identity": checkpoint["analysis_scope_identity"],
+        "analysis_context_identity": checkpoint["analysis_context_identity"],
+        **dict(checkpoint.get("result_summary") or {}),
+        "source_inputs": dict(checkpoint.get("source_inputs") or source_inputs),
+        "artifact_safety_policy": dict(
+            checkpoint.get("artifact_safety_policy") or {}
+        ),
+        "validation_run_identity": validation["validation_run_identity"],
+        "validation_status": validation["status"],
+        "validation_result_path": validation["validation_result_path"],
+        "definition_verification_path": str(
+            generation / "binary_definition_verification.json"
+        ),
+        "cache_metrics": cache_metrics,
+        "cache_metrics_path": str(cache_metrics_path),
+        "phase_timings": list(phase_timings),
+        "phase_timings_path": str(phase_timings_path),
+        "total_elapsed_seconds": total_elapsed_seconds,
+        "peak_rss_bytes": peak_rss_bytes,
+        "peak_rss_scope": "current_process",
+        "resumed_from_generation_checkpoint": True,
+    }
 
 
 @dataclass(frozen=True)
@@ -428,6 +805,149 @@ def _require_binary_authority_gates(support: Mapping[str, Any]) -> None:
             "BINARY_PERFORMANCE_AUTHORITY_GATE_BLOCKED",
             str(PERFORMANCE_GATE_PATH),
         )
+
+
+def _artifact_safety_policy(
+    config: Mapping[str, Any], support: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Resolve only caller-requested limits stricter than the release policy."""
+    defaults = dict(
+        support["artifact_diff_support_manifest"]["artifact_safety_policy"]
+    )
+    raw = dict(config.get("artifact_safety_limits") or {})
+    allowed = {
+        "max_archive_entries",
+        "max_total_uncompressed_bytes",
+        "max_expansion_ratio",
+        "max_nested_depth",
+        "max_nested_archive_bytes",
+        "max_class_bytes",
+        "max_protocol_frame_bytes",
+        "max_fact_records",
+        "helper_timeout_seconds",
+        "helper_max_heap",
+    }
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        raise BinaryPipelineError(
+            "BINARY_ARTIFACT_SAFETY_LIMITS_INVALID",
+            f"unknown fields: {unknown}",
+        )
+    effective = dict(defaults)
+    integer_fields = allowed - {
+        "max_expansion_ratio", "helper_timeout_seconds", "helper_max_heap"
+    }
+    for key in integer_fields:
+        if key not in raw:
+            continue
+        value = raw[key]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < (0 if key == "max_nested_depth" else 1)
+            or value > int(defaults[key])
+        ):
+            raise BinaryPipelineError(
+                "BINARY_ARTIFACT_SAFETY_LIMITS_INVALID", key
+            )
+        effective[key] = value
+    for key in ("max_expansion_ratio", "helper_timeout_seconds"):
+        if key not in raw:
+            continue
+        value = raw[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise BinaryPipelineError(
+                "BINARY_ARTIFACT_SAFETY_LIMITS_INVALID", key
+            )
+        minimum = 1.0 if key == "max_expansion_ratio" else 0.01
+        if not minimum <= float(value) <= float(defaults[key]):
+            raise BinaryPipelineError(
+                "BINARY_ARTIFACT_SAFETY_LIMITS_INVALID", key
+            )
+        effective[key] = float(value)
+    if "helper_max_heap" in raw:
+        value = str(raw["helper_max_heap"] or "")
+        match = re.fullmatch(r"([1-9][0-9]*)m", value)
+        default_match = re.fullmatch(
+            r"([1-9][0-9]*)m", str(defaults["helper_max_heap"])
+        )
+        if (
+            not match
+            or not default_match
+            or not 16 <= int(match.group(1)) <= int(default_match.group(1))
+        ):
+            raise BinaryPipelineError(
+                "BINARY_ARTIFACT_SAFETY_LIMITS_INVALID", "helper_max_heap"
+            )
+        effective["helper_max_heap"] = value
+    return effective
+
+
+def _definition_verification_summary(
+    reconciliation: Any, platform: JdkPlatformImage
+) -> dict[str, Any]:
+    """Build a bounded public summary of target-JVM definition evidence."""
+    status_counts: dict[str, int] = {}
+    target_status_counts: dict[str, int] = {}
+    platform_class_names = set()
+    target_verified_contexts = []
+    verifier_identities = set()
+    failures = []
+    for record in reconciliation.class_definitions:
+        status = str(record.get("class_definition_status") or "unknown")
+        status_counts[status] = status_counts.get(status, 0) + 1
+        evidence = dict(record.get("evidence") or {})
+        name = str(record.get("class_name") or "")
+        if evidence.get("verification") == "target_platform_image":
+            platform_class_names.add(name)
+        verification = dict(evidence.get("target_jvm_verification") or {})
+        if verification:
+            target_verified_contexts.append(
+                f"{record.get('initiating_loader_realm_identity') or ''}:{name}"
+            )
+            target_status = str(verification.get("status") or "unknown")
+            target_status_counts[target_status] = (
+                target_status_counts.get(target_status, 0) + 1
+            )
+            verifier_identity = str(
+                verification.get("class_definition_verifier_identity") or ""
+            )
+            if verifier_identity:
+                verifier_identities.add(verifier_identity)
+        if status != "definition_ready" and len(failures) < 20:
+            failures.append({
+                "class_name": name,
+                "status": status,
+                "reason": str(evidence.get("reason") or ""),
+                "parse_failure_kind": str(
+                    evidence.get("parse_failure_kind") or ""
+                ),
+            })
+    platform_class_names = sorted(platform_class_names)
+    target_verified_contexts.sort()
+    return {
+        "runtime_profile_identity": reconciliation.runtime_profile_identity,
+        "runtime_reconciliation_identity": reconciliation.identity,
+        "coverage_status": reconciliation.coverage_status,
+        "coverage_gaps": list(reconciliation.coverage_gaps),
+        "class_definition_count": len(reconciliation.class_definitions),
+        "definition_status_counts": dict(sorted(status_counts.items())),
+        "target_jvm_verified_class_count": len(target_verified_contexts),
+        "target_jvm_status_counts": dict(sorted(target_status_counts.items())),
+        "target_jvm_verified_context_set_identity": _identity(
+            "target_jvm_verified_class_context_set_identity",
+            target_verified_contexts,
+        ),
+        "class_definition_verifier_identities": sorted(verifier_identities),
+        "platform_definition_ready_count": len(platform_class_names),
+        "platform_class_names": platform_class_names,
+        "failure_count": sum(
+            count for status, count in status_counts.items()
+            if status != "definition_ready"
+        ),
+        "failure_samples": failures,
+        "runtime_platform_image": platform.manifest(),
+    }
 
 
 def _artifact_descriptors(
@@ -896,6 +1416,66 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
     ).expanduser().resolve()
     base_config = dict(config.get("base") or {})
     current_config = dict(config.get("current") or {})
+    preflight_started = time.perf_counter()
+    toolchain_preflight = {}
+    preflight_by_home = {}
+    for side_name, side_config in (
+        ("base", base_config), ("current", current_config),
+    ):
+        home = str(Path(str(side_config.get("jdk_home") or "")).expanduser().resolve())
+        try:
+            observed = preflight_by_home.get(home)
+            if observed is None:
+                observed = preflight_jdk_home(home)
+                preflight_by_home[home] = observed
+        except JdkPreflightError as error:
+            raise BinaryPipelineError(
+                "BINARY_JDK_PREFLIGHT_FAILED",
+                json.dumps({
+                    "side": side_name,
+                    "jdk_home": home,
+                    "reason_code": error.reason_code,
+                    "detail": str(error),
+                    "diagnostic": error.diagnostic,
+                }, ensure_ascii=False, sort_keys=True),
+            ) from error
+        expected = str(side_config.get("jdk_preflight_identity") or "")
+        if expected and expected != observed["jdk_preflight_identity"]:
+            raise BinaryPipelineError(
+                "BINARY_JDK_CHANGED_SINCE_STEP0",
+                json.dumps({
+                    "side": side_name,
+                    "jdk_home": home,
+                    "expected_jdk_preflight_identity": expected,
+                    "actual_jdk_preflight_identity": observed[
+                        "jdk_preflight_identity"
+                    ],
+                }, ensure_ascii=False, sort_keys=True),
+            )
+        toolchain_preflight[side_name] = observed
+    # Resolve and digest-check the parser dependency before opening large fact
+    # stores or reading application artifacts.
+    asm_jar = str(resolve_asm_jar(asm_jar))
+    phase_timings.append({
+        "phase": "static_preflight",
+        "elapsed_seconds": round(time.perf_counter() - preflight_started, 6),
+        "base_jdk_preflight_identity": toolchain_preflight["base"][
+            "jdk_preflight_identity"
+        ],
+        "current_jdk_preflight_identity": toolchain_preflight["current"][
+            "jdk_preflight_identity"
+        ],
+    })
+    resumed_result = _resume_generation_validation(
+        config,
+        output_root=output_root,
+        source_inputs=source_inputs,
+        asm_jar=asm_jar,
+        phase_timings=phase_timings,
+        pipeline_started=pipeline_started,
+    )
+    if resumed_result is not None:
+        return resumed_result
     base_platform = JdkPlatformImage(base_config.get("jdk_home", ""), asm_jar=asm_jar)
     current_platform = JdkPlatformImage(current_config.get("jdk_home", ""), asm_jar=asm_jar)
     if current_platform.identity == base_platform.identity:
@@ -956,6 +1536,7 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
     capability = RuntimeCapabilityPolicy(**dict(config.get("runtime_capability_policy") or {}))
     support = json.loads(SUPPORT_MANIFEST_PATH.read_text(encoding="utf-8"))
     _require_binary_authority_gates(support)
+    artifact_safety_policy = _artifact_safety_policy(config, support)
     scope_fields = {
         "analysis_observability_scope": str(config.get("analysis_observability_scope") or "binary-static-v1"),
         "artifact_diff_support_manifest_identity": _identity(
@@ -1038,9 +1619,11 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                 cache_outcome = cached_snapshot_archive(
                     raw["path"], artifact_instance_identity=instance.identity,
                     expected_sha256=instance.content_sha256, asm_jar=asm_jar,
+                    jdk_home=current_platform.jdk_home,
                     cache_root=cache_root,
                     target_jvm_major=target_jvm_major,
                     template_memo=snapshot_template_memo,
+                    safety_policy=artifact_safety_policy,
                 )
                 cache_metrics[
                     "artifact_snapshot_hits"
@@ -1215,6 +1798,18 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                 ).reconcile(retain_record_kinds=current_retained_kinds)
             base_runtime_identity = base_runtime.identity
             current_runtime_identity = current_runtime.identity
+            definition_verification = {
+                "schema": (
+                    "java-upgrade-analyzer.binary-definition-verification.v1"
+                ),
+                "authority": "target_jvm_execution_and_bound_platform_image",
+                "base": _definition_verification_summary(
+                    base_runtime, base_platform
+                ),
+                "current": _definition_verification_summary(
+                    current_runtime, current_platform
+                ),
+            }
             phase_timings.append({
                 "phase": "target_independent_runtime_reconciliation",
                 "elapsed_seconds": round(
@@ -1430,6 +2025,14 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                         separators=(",", ":"),
                     ) + "\n"
                 ).encode("utf-8"),
+                "binary_definition_verification.json": (
+                    json.dumps(
+                        definition_verification,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ) + "\n"
+                ).encode("utf-8"),
                 "binary_pairings.json": (
                     json.dumps(
                         {
@@ -1574,6 +2177,29 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                     time.perf_counter() - generation_write_started, 6
                 ),
             })
+            _write_resume_checkpoint(output_root, {
+                "schema": RESUME_CHECKPOINT_SCHEMA,
+                "status": "awaiting_independent_validation",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "config_identity": _resume_config_identity(config),
+                "implementation_identity": _resume_implementation_identity(
+                    asm_jar
+                ),
+                "input_artifact_identity": _resume_input_artifact_identity(
+                    config, digest_session=digest_session,
+                ),
+                "result_generation_identity": manifest[
+                    "result_generation_identity"
+                ],
+                "runtime_comparison_identity": runtime_comparison.identity,
+                "analysis_scope_identity": analysis_scope.identity,
+                "analysis_context_identity": context.identity,
+                "result_summary": result_summary,
+                "source_inputs": source_inputs,
+                "artifact_safety_policy": artifact_safety_policy,
+                "cache_metrics": cache_metrics,
+                "phase_timings_before_validation": list(phase_timings),
+            })
             # Independent validation reconstructs its own truth from immutable
             # output. Release production graphs and serialized sidecar buffers
             # first so their complete base/current object graphs do not overlap
@@ -1615,6 +2241,10 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                 "phase": "validated_generation_activation",
                 "elapsed_seconds": round(time.perf_counter() - activation_started, 6),
             })
+            try:
+                _resume_checkpoint_path(output_root).unlink()
+            except FileNotFoundError:
+                pass
             observability = output_root / "binary_observability"
             observability.mkdir(parents=True, exist_ok=True)
             cache_metrics_path = observability / "latest_cache_metrics.json"
@@ -1654,16 +2284,21 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
                 encoding="utf-8",
             )
             return {
-                "schema": "java-upgrade-analyzer.binary-pipeline-result.v1",
                 **manifest,
+                "schema": "java-upgrade-analyzer.binary-pipeline-result.v1",
                 "runtime_comparison_identity": runtime_comparison.identity,
                 "analysis_scope_identity": analysis_scope.identity,
                 "analysis_context_identity": context.identity,
                 **result_summary,
                 "source_inputs": source_inputs,
+                "artifact_safety_policy": artifact_safety_policy,
                 "validation_run_identity": validation["validation_run_identity"],
                 "validation_status": validation["status"],
                 "validation_result_path": validation["validation_result_path"],
+                "definition_verification_path": str(
+                    Path(manifest["generation_directory"])
+                    / "binary_definition_verification.json"
+                ),
                 "cache_metrics": cache_metrics,
                 "cache_metrics_path": str(cache_metrics_path),
                 "phase_timings": phase_timings,
@@ -1685,7 +2320,65 @@ def main(argv=None):
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--result-json", default="")
     args = parser.parse_args(argv)
-    result = run_pipeline(_load_json(args.config), output_root=args.output_root)
+    try:
+        result = run_pipeline(_load_json(args.config), output_root=args.output_root)
+    except Exception as error:
+        detail = str(error)
+        cause: Any = None
+        try:
+            parsed = json.loads(detail)
+        except (TypeError, json.JSONDecodeError):
+            parsed = None
+        if isinstance(parsed, (dict, list)):
+            cause = parsed
+        if isinstance(error, BinaryFirstContractError):
+            reason_code = error.reason_code
+        elif isinstance(error, MemoryError):
+            reason_code = "BINARY_PIPELINE_MEMORY_EXHAUSTED"
+        else:
+            reason_code = "BINARY_PIPELINE_UNHANDLED_FAILURE"
+        progress = {}
+        progress_path = (
+            Path(args.output_root).resolve()
+            / "binary_observability"
+            / "latest_in_progress.json"
+        )
+        if progress_path.is_file():
+            try:
+                candidate = _load_json(progress_path)
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                candidate = {}
+            if isinstance(candidate, dict):
+                progress = candidate
+        failure = {
+            "schema": "java-upgrade-analyzer.binary-pipeline-failure.v1",
+            "status": "failed",
+            "reason_code": reason_code,
+            "failure_type": type(error).__name__,
+            "detail": detail,
+            "cause": cause,
+            "failed_phase": str(progress.get("current_phase") or ""),
+            "last_progress": progress,
+            "traceback": traceback.format_exc()[-32000:],
+            "fail_closed": True,
+        }
+        detailed_encoded = json.dumps(
+            failure, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ) + "\n"
+        if args.result_json:
+            Path(args.result_json).parent.mkdir(parents=True, exist_ok=True)
+            Path(args.result_json).write_text(detailed_encoded, encoding="utf-8")
+        public_failure = {
+            key: value for key, value in failure.items() if key != "traceback"
+        }
+        public_encoded = json.dumps(
+            public_failure,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ) + "\n"
+        print(public_encoded, end="", file=sys.stderr)
+        return 1
     encoded = json.dumps(result, ensure_ascii=False, indent=2) + "\n"
     if args.result_json:
         Path(args.result_json).parent.mkdir(parents=True, exist_ok=True)

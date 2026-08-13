@@ -93,6 +93,53 @@ def _properties(content: bytes) -> dict[str, str]:
     return result
 
 
+def _manifest_attributes(content: bytes) -> dict[str, str]:
+    """Parse the main section of a JAR manifest, including folded values."""
+    text = content.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+    logical_lines: list[str] = []
+    for physical in text.split("\n"):
+        if not physical:
+            break
+        if physical.startswith(" ") and logical_lines:
+            logical_lines[-1] += physical[1:]
+        else:
+            logical_lines.append(physical)
+    attributes: dict[str, str] = {}
+    for line in logical_lines:
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        if key.strip():
+            attributes[key.strip().lower()] = value.strip()
+    return attributes
+
+
+def _packaged_main_class(outer_path: Path, business_path: Path) -> tuple[str, list[str]]:
+    """Resolve only a manifest-declared class present in retained business bytes."""
+    try:
+        with zipfile.ZipFile(outer_path) as outer:
+            attributes = _manifest_attributes(outer.read("META-INF/MANIFEST.MF"))
+        with zipfile.ZipFile(business_path) as business:
+            business_entries = {
+                info.filename for info in business.infolist() if not info.is_dir()
+            }
+    except KeyError:
+        return "", ["packaged_main_class_manifest_missing"]
+    except (OSError, zipfile.BadZipFile, UnicodeError) as error:
+        return "", [f"packaged_main_class_unreadable:{type(error).__name__}"]
+    candidates = [
+        attributes.get("start-class", ""),
+        attributes.get("main-class", ""),
+    ]
+    for candidate in candidates:
+        class_name = str(candidate or "").strip().replace("/", ".")
+        if class_name and class_name.replace(".", "/") + ".class" in business_entries:
+            return class_name, []
+    if any(candidates):
+        return "", ["packaged_main_class_not_in_business_artifact"]
+    return "", ["packaged_main_class_not_declared"]
+
+
 def _packaged_runtime_configuration(path: Path) -> tuple[dict[str, str], list[str]]:
     """Read only unambiguous packaged Properties inputs; YAML remains explicit gap."""
     properties: dict[str, str] = {}
@@ -249,6 +296,9 @@ def _side_config(
     packaged_properties, configuration_gaps = _packaged_runtime_configuration(
         business_path
     )
+    packaged_main_class, main_class_gaps = _packaged_main_class(
+        outer_path, business_path
+    )
     supplied_properties = dict(
         runtime_overrides.get(f"{side}_resolved_configuration_properties")
         or runtime_overrides.get("resolved_configuration_properties")
@@ -309,6 +359,7 @@ def _side_config(
             "discovery_mode": "binary_auto",
             "coverage_status": "complete",
             "methods": [],
+            **({"main_class": packaged_main_class} if packaged_main_class else {}),
         },
         "runtime_class_closure_coverage_status": closure_status,
         "resource_selection_coverage_status": (
@@ -321,6 +372,7 @@ def _side_config(
             + (["external_configuration_snapshot_content_missing"]
                if external_configs and not supplied_properties else [])
         )),
+        "entrypoint_discovery_coverage_gaps": main_class_gaps,
     }
     input_mode = str(
         side_provenance.get("input_mode")
@@ -341,6 +393,14 @@ def _side_config(
     )
     return {
         "jdk_home": str(Path(jdk_home).expanduser().resolve()),
+        "jdk_preflight_identity": str(
+            (
+                ((runtime_overrides.get("step0_preflight") or {}).get("sides") or {})
+                .get(side, {})
+                .get("jdk", {})
+                .get("jdk_preflight_identity", "")
+            )
+        ),
         "artifacts": artifacts,
         "runtime_profile": runtime_profile,
         "build_identity": {

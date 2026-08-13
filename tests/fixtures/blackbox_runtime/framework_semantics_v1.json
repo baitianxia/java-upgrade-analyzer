@@ -1,0 +1,290 @@
+{
+  "schema": "java-upgrade-analyzer.runtime-blackbox-truth.v1",
+  "case_id": "framework-semantics-v1",
+  "system_generated": false,
+  "oracle_producers": [
+    {
+      "id": "openjdk-runtime-and-classfile",
+      "organization": "OpenJDK",
+      "mechanism": "real JVM callback execution plus javap annotation and invocation inventory",
+      "verifies": ["changed callback behavior", "runtime-visible framework declarations"]
+    },
+    {
+      "id": "stdlib-resource-inventory",
+      "organization": "Python Software Foundation",
+      "mechanism": "independent ordered ZIP resource and XML inventory",
+      "verifies": ["framework registration resources", "closed provider and mapping sets"]
+    }
+  ],
+  "cases": {
+    "spring_entrypoints": {
+      "expected_base_stdout": "5",
+      "expected_current_stdout": "10",
+      "target": ["api/Api", "value", "()I", "method"],
+      "required_entry_kinds": [
+        "lifecycle_callback",
+        "spring_event_listener",
+        "spring_scheduled",
+        "spring_web_endpoint"
+      ],
+      "forbidden_entrypoint": ["vendor/ConditionalConfig", "tick", "()I"],
+      "required_meta_entrypoint": [
+        "vendor/Callbacks",
+        "meta",
+        "()I",
+        "spring_scheduled",
+        "exact"
+      ],
+      "expected_state": {
+        "reachability_status": "reachable",
+        "impact_conclusion": "probable_impact",
+        "static_linkage_status": "compatible_or_not_applicable",
+        "runtime_verification_status": "required_not_executed",
+        "exact_path_exists": true,
+        "path_set_complete": true
+      }
+    },
+    "mybatis": {
+      "expected_base_stdout": "111",
+      "expected_current_stdout": "222",
+      "targets": [
+        ["org/apache/ibatis/binding/MapperProxy", "invoke", "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;", "method"],
+        ["vendor/AuditPlugin", "intercept", "(Ljava/lang/Object;)Ljava/lang/Object;", "method"],
+        ["vendor/CodeHandler", "getResult", "(Ljava/lang/Object;)Ljava/lang/Object;", "method"]
+      ],
+      "required_entry_kinds": ["mybatis_plugin_callback", "mybatis_type_handler_callback"],
+      "required_semantic_kinds": ["mybatis_mapper_proxy_dispatch"],
+      "forbidden_exact_entrypoint": [
+        "vendor/UnregisteredPlugin",
+        "intercept",
+        "mybatis_plugin_callback"
+      ]
+    },
+    "spring_proxy_wiring": {
+      "expected_base_stdout": "110",
+      "expected_current_stdout": "220",
+      "targets": [
+        ["org/springframework/transaction/interceptor/TransactionInterceptor", "invoke", "(Lorg/aopalliance/intercept/MethodInvocation;)Ljava/lang/Object;", "method"],
+        ["lib/LibService", "ping", "()I", "method"],
+        ["org/springframework/data/jpa/repository/support/SimpleJpaRepository", "findAll", "()Ljava/util/List;", "method"]
+      ],
+      "required_semantic_kinds": [
+        "spring_bean_wiring_dispatch",
+        "spring_data_repository_proxy_dispatch",
+        "spring_transaction_proxy_dispatch"
+      ],
+      "forbidden_exact_wiring_target": ["lib/SecondaryService", "ping"]
+    },
+    "spring_aop_security": {
+      "expected_base_stdout": "11",
+      "expected_current_stdout": "22",
+      "targets": [
+        ["lib/Api", "changed", "()I", "method"],
+        ["lib/LibFilter", "doFilter", "()V", "method"]
+      ],
+      "required_semantic_kinds": [
+        "spring_aop_dispatch",
+        "spring_security_filter_dispatch"
+      ],
+      "expected_observed_aspect_edges": [
+        ["biz/ObservedService", "observed", "possible"]
+      ],
+      "forbidden_observed_aspect_edge": [
+        "biz/ObservedService",
+        "suppressed"
+      ],
+      "forbidden_exact_security_target": ["lib/UnregisteredFilter", "doFilter"]
+    },
+    "spring_message_listener_adapter": {
+      "expected_base_stdout": "1",
+      "expected_current_stdout": "2",
+      "target": ["target/Api", "value", "()I", "method"],
+      "expected_state": {
+        "reachability_status": "reachable",
+        "impact_conclusion": "probable_impact",
+        "static_linkage_status": "compatible_or_not_applicable",
+        "runtime_verification_status": "required_not_executed",
+        "exact_path_exists": true,
+        "possible_path_exists": false,
+        "path_set_complete": true
+      },
+      "expected_entrypoint": {
+        "class_name": "business/Receiver",
+        "member_name": "receiveMessage",
+        "descriptor": "(Ljava/lang/String;)I",
+        "entry_kind": "spring_message_listener",
+        "path_certainty": "exact",
+        "activation_reason": "spring_message_listener_adapter_registration"
+      },
+      "forbidden_entrypoint": [
+        "business/Receiver",
+        "unregistered",
+        "(Ljava/lang/String;)I"
+      ]
+    },
+    "jpa_lifecycle_activation": {
+      "expected_base_stdout": "11",
+      "expected_current_stdout": "22",
+      "targets": [
+        {
+          "identity": ["target/Api", "entityValue", "()I", "method"],
+          "state": {
+            "reachability_status": "reachable",
+            "impact_conclusion": "probable_impact",
+            "static_linkage_status": "compatible_or_not_applicable",
+            "runtime_verification_status": "required_not_executed",
+            "exact_path_exists": true,
+            "possible_path_exists": false,
+            "path_set_complete": true
+          },
+          "required_path_marker": "business.EntityThing.afterLoad()"
+        },
+        {
+          "identity": ["target/Api", "unprovedValue", "()I", "method"],
+          "state": {
+            "reachability_status": "uncertain",
+            "impact_conclusion": "inconclusive",
+            "static_linkage_status": "compatible_or_not_applicable",
+            "runtime_verification_status": "undetermined",
+            "exact_path_exists": false,
+            "possible_path_exists": true,
+            "path_set_complete": true
+          },
+          "required_path_marker": "business.Unregistered.afterLoad()"
+        }
+      ],
+      "expected_entrypoints": [
+        {
+          "class_name": "business/EntityThing",
+          "member_name": "afterLoad",
+          "entry_kind": "jpa_lifecycle_callback",
+          "path_certainty": "exact",
+          "activation_reason": "jpa_entity_registration_proved"
+        },
+        {
+          "class_name": "business/Unregistered",
+          "member_name": "afterLoad",
+          "entry_kind": "jpa_lifecycle_callback",
+          "path_certainty": "possible",
+          "activation_reason": "entity_lifecycle_activation_unproven"
+        }
+      ]
+    },
+    "spring_xml_quartz": {
+      "expected_base_stdout": "111",
+      "expected_current_stdout": "222",
+      "resource_name": "config/runtime.xml",
+      "targets": [
+        {
+          "identity": ["vendor/ScheduledConfig", "initialize", "()I", "method"],
+          "reachability_status": "reachable",
+          "exact_path_exists": true
+        },
+        {
+          "identity": ["vendor/ScheduledConfig", "tick", "()I", "method"],
+          "reachability_status": "reachable",
+          "exact_path_exists": true
+        },
+        {
+          "identity": ["vendor/ScheduledConfig", "unregistered", "()I", "method"],
+          "reachability_status": "not_found_in_static_analysis",
+          "exact_path_exists": false
+        }
+      ],
+      "expected_entrypoints": [
+        ["vendor/ScheduledConfig", "initialize", "spring_xml_init_method", "exact"],
+        ["vendor/ScheduledConfig", "tick", "spring_xml_quartz", "exact"],
+        ["vendor/ScheduledConfig", "tick", "spring_xml_scheduled", "exact"]
+      ],
+      "forbidden_entrypoint": ["vendor/ScheduledConfig", "unregistered"]
+    },
+    "spring_interface_and_factories": {
+      "expected_base_stdout": "11111",
+      "expected_current_stdout": "22222",
+      "service_resource": "META-INF/spring.factories",
+      "targets": [
+        ["runnerValue", "reachable", true, false],
+        ["lifecycleValue", "reachable", true, false],
+        ["quartzValue", "reachable", true, false],
+        ["factoryValue", "reachable", true, false],
+        ["unregisteredValue", "uncertain", false, true]
+      ],
+      "expected_entrypoints": [
+        ["business/Callbacks", "run", "spring_application_runner", "exact", "business_final_artifact_runtime_trigger"],
+        ["business/Callbacks", "start", "spring_lifecycle_callback", "exact", "business_final_artifact_runtime_trigger"],
+        ["business/Callbacks", "stop", "spring_lifecycle_callback", "exact", "business_final_artifact_runtime_trigger"],
+        ["business/Callbacks", "execute", "quartz_job", "exact", "business_final_artifact_runtime_trigger"],
+        ["vendor/RegisteredListener", "onApplicationEvent", "spring_application_listener", "exact", "spring_factories_runtime_registration"],
+        ["vendor/UnregisteredListener", "onApplicationEvent", "spring_application_listener", "possible", "dependency_framework_activation_unproven"]
+      ]
+    },
+    "spring_transitive_import": {
+      "expected_base_stdout": "11",
+      "expected_current_stdout": "22",
+      "targets": [
+        ["importedValue", "reachable", true, false],
+        ["unimportedValue", "uncertain", false, true]
+      ],
+      "expected_entrypoints": [
+        ["vendor/ImportedConfig", "tick", "spring_scheduled", "exact", "spring_import_from_active_configuration"],
+        ["vendor/UnimportedConfig", "tick", "spring_scheduled", "possible", "dependency_framework_activation_unproven"]
+      ]
+    },
+    "http_dubbo_service": {
+      "expected_base_stdout": "11",
+      "expected_current_stdout": "22",
+      "targets": [
+        ["feign/SynchronousMethodHandler", "invoke", "([Ljava/lang/Object;)Ljava/lang/Object;", "method"],
+        ["demo/Provider", "execute", "()I", "method"]
+      ],
+      "required_semantic_kinds": [
+        "declarative_http_client_dispatch",
+        "dubbo_spi_dispatch"
+      ],
+      "service_resource": "META-INF/services/demo.DubboService",
+      "service_activation_status": "reachable",
+      "forbidden_exact_provider_target": ["demo/Unregistered", "execute"]
+    },
+    "java_and_declared_entrypoints": {
+      "expected_main_stdout": {"base": "1", "current": "2"},
+      "expected_declared_stdout": {"base": "10", "current": "20"},
+      "main_target": ["api/Api", "fromMain", "()I", "method"],
+      "declared_target": ["api/Api", "fromDeclared", "()I", "method"],
+      "main_entrypoint": [
+        "biz/Main", "main", "java_main", "exact",
+        "business_final_artifact_runtime_trigger"
+      ],
+      "declared_entrypoint": [
+        "biz/Declared", "run", "declared_runtime_entry", "exact",
+        "runtime_profile_declaration"
+      ],
+      "selected_target_state": {
+        "reachability_status": "reachable",
+        "exact_path_exists": true,
+        "possible_path_exists": false
+      },
+      "unselected_declared_target_state": {
+        "reachability_status": "not_found_in_static_analysis",
+        "exact_path_exists": false,
+        "possible_path_exists": false
+      },
+      "unselected_main_target_state": {
+        "reachability_status": "uncertain",
+        "exact_path_exists": false,
+        "possible_path_exists": true
+      }
+    },
+    "implicit_data_contract": {
+      "target": ["lib/Dto", "removed", "Ljava/lang/String;", "field"],
+      "semantic_edge_kind": "implicit_data_contract_dispatch",
+      "expected_state": {
+        "reachability_status": "reachable",
+        "impact_conclusion": "probable_impact",
+        "static_linkage_status": "incompatible_if_executed",
+        "runtime_verification_status": "required_not_executed",
+        "exact_path_exists": true,
+        "path_set_complete": true
+      }
+    }
+  }
+}

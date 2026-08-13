@@ -1,0 +1,35 @@
+{
+  "schema": "java-upgrade-analyzer.runtime-blackbox-truth.v1",
+  "case_id": "source-overlay-v1",
+  "system_generated": false,
+  "oracle_producers": [
+    {
+      "id": "openjdk-javap-and-jvm",
+      "organization": "OpenJDK",
+      "mechanism": "compiled descriptor inventory and target-JVM behavior",
+      "verifies": ["binary method descriptor", "binary behavior independent of source text"]
+    },
+    {
+      "id": "authored-source-snapshot-inventory",
+      "organization": "project test authors",
+      "mechanism": "independent source signature and content inspection",
+      "verifies": ["business source present", "dependency descriptor mismatch", "source absent mode"]
+    }
+  ],
+  "target": ["lib/Target", "changed", "()I", "method"],
+  "expected_base_stdout": "1",
+  "expected_current_stdout": "2",
+  "expected_binary_descriptor": "()I",
+  "mismatched_source_descriptor": "(J)I",
+  "conflict_reason_code": "SOURCE_BINARY_DESCRIPTOR_MISMATCH",
+  "explanation_authority": "explanatory_source_overlay_only",
+  "candidate_authority": "source_candidate_only_not_executable_edge",
+  "present_source_inputs": {
+    "business": "available",
+    "dependencies": "available"
+  },
+  "absent_source_inputs": {
+    "business": "not_provided",
+    "dependencies": "not_provided"
+  }
+}

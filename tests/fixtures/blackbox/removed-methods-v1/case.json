@@ -1,0 +1,60 @@
+{
+  "schema": "java-upgrade-analyzer.blackbox-case.v1",
+  "case_id": "removed-methods-v1",
+  "dataset_version": 1,
+  "public_entrypoint": "scripts/binary_pipeline.py",
+  "truth_file": "truth.json",
+  "oracle_contract": "removed_member_linkage_closed_set",
+  "capabilities": [
+    "exact_jvm_descriptor_identity",
+    "method_removal",
+    "not_found_negative",
+    "packaging_noise_invariance",
+    "reachable_positive",
+    "unchanged_member_negative"
+  ],
+  "library_class": "contract.Api",
+  "business_class": "contract.App",
+  "oracle_main_class": "contract.OracleMain",
+  "library_lineage": "blackbox:fixture-lib",
+  "base_coordinate": "blackbox:fixture-lib:1.0",
+  "current_coordinate": "blackbox:fixture-lib:2.0",
+  "entrypoints": [
+    {
+      "class_name": "contract/App",
+      "member_name": "entryRemoved",
+      "descriptor": "(Lcontract/Api;)Ljava/lang/String;"
+    },
+    {
+      "class_name": "contract/App",
+      "member_name": "entryOverload",
+      "descriptor": "(Lcontract/Api;)Ljava/lang/String;"
+    }
+  ],
+  "linkage_probes": [
+    {
+      "mode": "removedReachable",
+      "owner": "contract/Api",
+      "member": "removedReachable",
+      "descriptor": "()Ljava/lang/String;",
+      "member_kind": "method",
+      "linkage_error": "NoSuchMethodError"
+    },
+    {
+      "mode": "removedUnreachable",
+      "owner": "contract/Api",
+      "member": "removedUnreachable",
+      "descriptor": "()Ljava/lang/String;",
+      "member_kind": "method",
+      "linkage_error": "NoSuchMethodError"
+    },
+    {
+      "mode": "selectInt",
+      "owner": "contract/Api",
+      "member": "select",
+      "descriptor": "(I)Ljava/lang/String;",
+      "member_kind": "method",
+      "linkage_error": "NoSuchMethodError"
+    }
+  ]
+}

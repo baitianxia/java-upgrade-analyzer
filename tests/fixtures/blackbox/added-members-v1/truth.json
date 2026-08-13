@@ -1,0 +1,128 @@
+{
+  "schema": "java-upgrade-analyzer.blackbox-truth.v1",
+  "case_id": "added-members-v1",
+  "dataset_version": 1,
+  "scope": "closed_set",
+  "system_generated": false,
+  "human_review": {
+    "status": "not_claimed",
+    "reviewer": ""
+  },
+  "input_evidence": {
+    "algorithm": "sha256-path-nul-content-nul-v1",
+    "source_tree_sha256": "71b3364bf0033a2e010df230461b3d8732553bea73f080568354513afece6eac",
+    "case_algorithm": "sha256-canonical-json-v1",
+    "case_sha256": "2ae982f33872797dfb66ce2da55d7df7d44362fcb51f5ab73030811fabdc3384",
+    "source_files": [
+      "src/base/contract/AdditionApi.java",
+      "src/business/contract/AdditionApp.java",
+      "src/current/contract/AdditionApi.java",
+      "src/oracle/contract/OracleMain.java"
+    ]
+  },
+  "oracle_producers": [
+    {
+      "id": "openjdk-javap-complete-addition-inventory",
+      "organization": "OpenJDK",
+      "mechanism": "independent_bytecode_member_set_difference",
+      "verifies": [
+        "complete_added_member_set",
+        "unchanged_member_set",
+        "complete_direct_call_graph"
+      ]
+    },
+    {
+      "id": "openjdk-jvm-reflection-presence-probe",
+      "organization": "OpenJDK",
+      "mechanism": "actual_jvm_reflection_member_presence",
+      "verifies": [
+        "members_absent_on_base_runtime",
+        "members_present_on_current_runtime",
+        "unchanged_client_behavior"
+      ]
+    }
+  ],
+  "oracle_implementations": [
+    {
+      "path": "tests/blackbox/oracles/openjdk_oracle.py",
+      "sha256": "6e72442077371b86c943f790b5982144497725200da3e89f22f66ca2bfee38ca"
+    }
+  ],
+  "completeness": {
+    "argument": "The fixture contains one dependency class. OpenJDK javap inventories every public base/current member and proves the exact symmetric difference consists only of addedMethod()I and addedField:J. The only declared business entrypoint invokes only the unchanged stable()I member, so neither addition is statically reachable. A separate JVM runner uses reflection to prove both additions are absent on the base runtime and present with the authored values on the current runtime.",
+    "verified_dimensions": [
+      "api_identity",
+      "jvm_descriptor",
+      "closed_result_set",
+      "entrypoint_reachability",
+      "static_linkage"
+    ],
+    "known_limits": []
+  },
+  "expected_result_count": 3,
+  "expected_results": [
+    {
+      "owner": "contract/AdditionApi",
+      "member": "<init>",
+      "descriptor": "()V",
+      "member_kind": "method",
+      "dependency_lineages": ["blackbox:addition-lib"],
+      "base_dependency_coords": ["blackbox:addition-lib:1.0"],
+      "current_dependency_coords": ["blackbox:addition-lib:2.0"],
+      "reachability_status": "not_found_in_static_analysis",
+      "static_linkage_status": "compatible_or_not_applicable",
+      "impact_conclusion": "inconclusive",
+      "runtime_verification_status": "undetermined",
+      "exact_path_exists": false,
+      "possible_path_exists": false,
+      "path_set_complete": true,
+      "paths": []
+    },
+    {
+      "owner": "contract/AdditionApi",
+      "member": "addedField",
+      "descriptor": "J",
+      "member_kind": "field",
+      "oracle_relation": "added_member",
+      "dependency_lineages": ["blackbox:addition-lib"],
+      "base_dependency_coords": ["blackbox:addition-lib:1.0"],
+      "current_dependency_coords": ["blackbox:addition-lib:2.0"],
+      "reachability_status": "not_found_in_static_analysis",
+      "static_linkage_status": "compatible_or_not_applicable",
+      "impact_conclusion": "inconclusive",
+      "runtime_verification_status": "undetermined",
+      "exact_path_exists": false,
+      "possible_path_exists": false,
+      "path_set_complete": true,
+      "paths": []
+    },
+    {
+      "owner": "contract/AdditionApi",
+      "member": "addedMethod",
+      "descriptor": "()I",
+      "member_kind": "method",
+      "oracle_relation": "added_member",
+      "dependency_lineages": ["blackbox:addition-lib"],
+      "base_dependency_coords": ["blackbox:addition-lib:1.0"],
+      "current_dependency_coords": ["blackbox:addition-lib:2.0"],
+      "reachability_status": "not_found_in_static_analysis",
+      "static_linkage_status": "compatible_or_not_applicable",
+      "impact_conclusion": "inconclusive",
+      "runtime_verification_status": "undetermined",
+      "exact_path_exists": false,
+      "possible_path_exists": false,
+      "path_set_complete": true,
+      "paths": []
+    }
+  ],
+  "forbidden_results": [
+    {
+      "owner": "contract/AdditionApi",
+      "member": "stable",
+      "descriptor": "()I",
+      "member_kind": "method",
+      "oracle_relation": "unchanged_member",
+      "reason": "OpenJDK javap reports identical flags, descriptor, and normalized instructions on both sides."
+    }
+  ]
+}

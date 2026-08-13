@@ -1,0 +1,58 @@
+{
+  "schema": "java-upgrade-analyzer.runtime-blackbox-truth.v1",
+  "case_id": "performance-public-contract-v1",
+  "system_generated": false,
+  "oracle_producers": [
+    {
+      "id": "python-stdlib-zip-sha-inventory",
+      "organization": "Python Software Foundation",
+      "mechanism": "independent SHA-256 and complete ZIP class inventory outside the measured system",
+      "verifies": ["jar_count", "class_count", "artifact_identity_set", "class_conservation"]
+    },
+    {
+      "id": "openjdk-javap-template-contract",
+      "organization": "OpenJDK",
+      "mechanism": "javap independently verifies every generated class and the authored method/instruction shape",
+      "verifies": ["valid_classfiles", "member_count", "edge_count", "changed_method_count"]
+    },
+    {
+      "id": "os-monotonic-rss-and-cpu-accounting",
+      "organization": "operating system",
+      "mechanism": "external monotonic wall clock plus process and completed-child CPU accounting and process-reported peak resident set",
+      "verifies": ["public_cli_elapsed_budget", "peak_rss_budget", "cpu_seconds", "average_cpu_core_derivation"]
+    },
+    {
+      "id": "scheduled-release-evidence-replay",
+      "organization": "GitHub Actions and authored engineering SLO",
+      "mechanism": "scheduled release command reruns the full scale while a separate verifier replays recorded measurements against fixed thresholds and semantic invariants",
+      "verifies": ["400_jar_100000_class_execution", "recorded_metric_derivations", "thresholds", "semantic_conservation"]
+    }
+  ],
+  "smoke": {
+    "jar_count": 2,
+    "classes_per_jar": 3,
+    "class_count": 6,
+    "member_count": 18,
+    "edge_count": 24,
+    "changed_jar_count": 1,
+    "changed_class_count": 3,
+    "authoritative_change_fact_count": 3,
+    "formal_api_result_count": 3,
+    "external_elapsed_seconds_max": 60,
+    "cold_seconds_max": 10,
+    "warm_p50_seconds_max": 2,
+    "warm_p95_seconds_max": 2,
+    "full_pipeline_seconds_max": 20,
+    "changed_full_pipeline_seconds_max": 25,
+    "peak_rss_bytes_max": 1073741824
+  },
+  "release_scale": {
+    "jar_count": 400,
+    "classes_per_jar": 250,
+    "class_count": 100000,
+    "changed_jar_count": 1,
+    "changed_class_count": 250,
+    "recorded_gate_sha256": "1d6488edb441bb925ec8a32491eb10881a10b973a8abee781392fd1c1fd22522",
+    "scheduled_release_workflow": ".github/workflows/release-regression.yml"
+  }
+}

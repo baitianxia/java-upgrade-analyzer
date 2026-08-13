@@ -1450,6 +1450,121 @@ def build_step1_coordinate_followup_interaction(
     }
 
 
+def build_step1_coordinate_ambiguity_interaction(unresolved_items):
+    """Ask once for every base/current packaged identity discovered in Step1."""
+    unresolved_items = normalize_unresolved_items(unresolved_items)
+    checklist_lines = []
+    for item in unresolved_items[:50]:
+        side_label = "Base" if item.get("side") == "base" else "Current"
+        selector = item.get("lib_entry") or item.get("entry_id") or item.get("label")
+        reason = item.get("reason_code") or DEPENDENCY_COORDINATES_UNRESOLVED
+        checklist_lines.append(
+            f"{side_label}：{selector}（{reason}）"
+        )
+    if len(unresolved_items) > 50:
+        checklist_lines.append(
+            f"其余 {len(unresolved_items) - 50} 项未在卡片中展开，但仍包含在结构化 unresolved_items 中。"
+        )
+    properties = {
+        "action": {
+            "type": "string",
+            "enum": ["continue", "confirm_unresolved", "cancel"],
+        },
+        "manual_coord_overrides": {
+            "type": "array",
+            "description": "按 artifact:version[:classifier] -> groupId:artifactId 补充可唯一确认的坐标。",
+        },
+        "manual_artifact_identities": {
+            "type": "array",
+            "description": "按 side + lib_entry/entry_id 提供物理条目的完整 Maven 身份。",
+            "items": {
+                "type": "object",
+                "required": [
+                    "side", "lib_entry", "group_id", "artifact_id", "version"
+                ],
+                "properties": {
+                    "side": {"type": "string", "enum": ["base", "current"]},
+                    "entry_id": {"type": "string"},
+                    "lib_entry": {"type": "string"},
+                    "group_id": {"type": "string"},
+                    "artifact_id": {"type": "string"},
+                    "version": {"type": "string"},
+                    "classifier": {"type": "string"},
+                },
+            },
+        },
+        "notes": {"type": "string"},
+    }
+    return {
+        "schema": "java-upgrade-analyzer.interaction.v2",
+        "checkpoint": True,
+        "hard_stop": True,
+        "status": "awaiting_user_input",
+        "kind": "input_request",
+        "step_id": "step1",
+        "reason_code": DEPENDENCY_COORDINATES_UNRESOLVED,
+        "title": "Step1 依赖身份存在歧义",
+        "summary": "Step1 已完成 Base/Current 最终制品扫描，并汇总了全部无法唯一确认的依赖身份。",
+        "question": "请一次处理下面全部依赖身份：补充完整身份，或明确接受 unresolved 并继续。",
+        "required_fields": [],
+        "missing_inputs": [],
+        "fallback_inputs": [],
+        "unresolved_items": unresolved_items,
+        "checklist_lines": checklist_lines,
+        "files_to_review": [],
+        "options": [
+            {
+                "id": "continue",
+                "label": "补充身份后继续",
+                "description": "一次提交全部可确认条目的人工坐标或完整物理条目身份，然后重跑 Step1。",
+            },
+            {
+                "id": "confirm_unresolved",
+                "label": "接受未解析项并继续",
+                "description": "明确允许这些条目保留为 unresolved；后续分析跳过它们并记录覆盖边界。",
+            },
+            {
+                "id": "cancel",
+                "label": "稍后处理",
+                "description": "保留当前输入，稍后再决定。",
+            },
+        ],
+        "action_requirements": {
+            "continue": {
+                "at_least_one_of": [
+                    "manual_coord_overrides", "manual_artifact_identities"
+                ],
+                "description": "补充能够改变身份解析结果的信息。",
+            }
+        },
+        "response_schema": {
+            "type": "object",
+            "required": ["action"],
+            "properties": properties,
+        },
+        "input_normalization": {
+            "enabled": True,
+            "mode": "llm_assisted_structuring",
+            "source": "user_free_text",
+            "target": "response_json",
+            "target_schema_ref": "response_schema",
+            "allowed_actions": ["continue", "confirm_unresolved", "cancel"],
+            "required_fields": [],
+            "rules": [
+                "必须保留 side 与物理条目标识，不能把 Base/Current 同名条目混为一项。",
+                "PACKAGED_VERSION_UNCONFIRMED 必须使用 manual_artifact_identities，不能用 dependency:list 推测版本。",
+                "只有用户明确选择 confirm_unresolved 才能跳过未解析条目。",
+            ],
+        },
+        "runtime_rules": [
+            "Step1 必须同时扫描 Base/Current 后再生成本卡。",
+            "不得把同一轮发现的歧义拆成逐侧或逐条交互。",
+        ],
+        "next_action_rule": "等待用户一次处理全部已发现的依赖身份歧义。",
+        "must_wait_for_user_reply": True,
+    }
+
+
 def parse_manual_coord_overrides(raw_values):
     overrides = {}
     invalid_entries = []
@@ -3149,8 +3264,11 @@ def _detect_archive_packaging_type(artifact_path):
     try:
         with zipfile.ZipFile(str(artifact_path)) as outer_zip:
             names = [name.lower() for name in outer_zip.namelist()]
-    except Exception:
-        return 'unknown'
+    except Exception as exc:
+        raise RuntimeError(
+            f"最终制品扫描不完整：{Path(artifact_path).resolve()}。"
+            f"archive_open:{type(exc).__name__}:{exc}"
+        ) from exc
     if any(name.startswith('boot-inf/lib/') and name.endswith('.jar') for name in names):
         return 'boot_jar'
     if any(name.startswith('web-inf/lib/') and name.endswith('.jar') for name in names):
@@ -5591,7 +5709,8 @@ def main():
     )
     ap.add_argument('--base',           dest='base_branch',    help='基准分支名（自动模式）')
     ap.add_argument('--current',        dest='current_branch', help='当前分支名（自动模式）')
-    ap.add_argument('--tool',           choices=['maven', 'gradle'], default=None)
+    ap.add_argument('--base-tool',      choices=['maven', 'gradle'], default=None)
+    ap.add_argument('--current-tool',   choices=['maven', 'gradle'], default=None)
     ap.add_argument('--work-dir',       default='.')
     ap.add_argument('--base-artifact-path',
                     help='基准侧已编译产物路径（直接产物模式）')
@@ -5640,7 +5759,8 @@ def main():
             or orchestrated_input.get("current_resolved_ref", "")
             or orchestrated_input.get("current_branch", "")
         )
-        args.tool = args.tool or orchestrated_input.get("tool", "maven")
+        args.base_tool = args.base_tool or orchestrated_input.get("base_tool", "")
+        args.current_tool = args.current_tool or orchestrated_input.get("current_tool", "")
         args.base_artifact_path = args.base_artifact_path or orchestrated_input.get("base_artifact_path", "")
         args.current_artifact_path = args.current_artifact_path or orchestrated_input.get("current_artifact_path", "")
         args.base_source_project_dir = args.base_source_project_dir or orchestrated_input.get("base_source_project_dir", "")
@@ -5670,7 +5790,8 @@ def main():
             ]
         if not args.allow_unresolved and orchestrated_input.get("allow_unresolved"):
             args.allow_unresolved = True
-    args.tool = args.tool or 'maven'
+    if args.base_tool not in {'maven', 'gradle'} or args.current_tool not in {'maven', 'gradle'}:
+        ap.error('--base-tool and --current-tool are required and must be maven or gradle')
 
     manual_coord_overrides, invalid_manual_overrides = parse_manual_coord_overrides(args.manual_coord_override)
     if invalid_manual_overrides:
@@ -5795,7 +5916,7 @@ def main():
                         artifact_path=args.base_artifact_path,
                         observer=observer,
                         active_maven_profiles=args.active_maven_profile,
-                        build_tool=args.tool,
+                        build_tool=args.base_tool,
                         source_resolution=confirmed_source_resolution("base"),
                         expected_commit=str(orchestrated_input.get("base_expected_commit") or ""),
                         expected_remote=str(ref_binding.get("remote") or ""),
@@ -5822,7 +5943,7 @@ def main():
                         artifact_path=args.current_artifact_path,
                         observer=observer,
                         active_maven_profiles=args.active_maven_profile,
-                        build_tool=args.tool,
+                        build_tool=args.current_tool,
                         source_resolution=confirmed_source_resolution("current"),
                         expected_commit=str(orchestrated_input.get("current_expected_commit") or ""),
                         expected_remote=str(ref_binding.get("remote") or ""),
@@ -5840,7 +5961,7 @@ def main():
                 manual_coord_overrides=manual_coord_overrides,
                 manual_artifact_identities=manual_artifact_identities,
                 confirmed_unresolved_items=confirmed_unresolved_items,
-                allow_unresolved=unresolved_confirmed,
+                allow_unresolved=True,
                 observer=observer,
                 side="base",
             )
@@ -5852,7 +5973,7 @@ def main():
                 manual_coord_overrides=manual_coord_overrides,
                 manual_artifact_identities=manual_artifact_identities,
                 confirmed_unresolved_items=confirmed_unresolved_items,
-                allow_unresolved=unresolved_confirmed,
+                allow_unresolved=True,
                 observer=observer,
                 side="current",
             )
@@ -5973,7 +6094,7 @@ def main():
                 sys.exit(EXIT_AWAITING_USER)
         except Step1CommandExecutionBlockedError as e:
             interaction = build_step1_command_blocked_interaction(e)
-            print(f"当前输入已进入执行阶段，但 {args.tool} 命令被环境问题阻塞。", file=sys.stderr)
+            print("当前输入已进入执行阶段，但构建工具命令被环境问题阻塞。", file=sys.stderr)
             print(f"  - 阻塞阶段: {e.stage}", file=sys.stderr)
             if e.branch:
                 print(f"  - 失败分支: {e.branch}", file=sys.stderr)
@@ -5995,9 +6116,10 @@ def main():
             attach_unresolved_side(base_meta.get('unresolved_items') or [], 'base')
             + attach_unresolved_side(curr_meta.get('unresolved_items') or [], 'current')
         )
-    elif args.base_branch and args.current_branch and args.tool in {'maven', 'gradle'}:
+    elif args.base_branch and args.current_branch:
         print(
-            f"模式：自动切换分支并使用 {args.tool} 对目标模块执行真实构建",
+            "模式：在固定 revision 的隔离工作区中，分别使用 "
+            f"{args.base_tool}/{args.current_tool} 对目标模块执行真实构建",
             file=sys.stderr,
         )
         try:
@@ -6007,28 +6129,28 @@ def main():
                     args.base_jdk_home, "base",
                     manual_coord_overrides=manual_coord_overrides,
                     manual_artifact_identities=manual_artifact_identities,
-                    allow_unresolved=unresolved_confirmed,
+                    allow_unresolved=True,
                     confirmed_unresolved_items=confirmed_unresolved_items,
                     artifact_cache_dir=Path(args.output).parent / STEP1_ARTIFACTS_DIRNAME if args.output else None,
                 observer=observer,
                 active_maven_profiles=args.active_maven_profile,
-                build_tool=args.tool,
+                build_tool=args.base_tool,
             )
             curr_deps, curr_meta = get_packaged_deps_by_switching_branch(
                     args.current_branch, args.work_dir, args.primary_module, args.modules,
                     "current_jdk_home", args.current_jdk_home, "current",
                     manual_coord_overrides=manual_coord_overrides,
                     manual_artifact_identities=manual_artifact_identities,
-                    allow_unresolved=unresolved_confirmed,
+                    allow_unresolved=True,
                     confirmed_unresolved_items=confirmed_unresolved_items,
                     artifact_cache_dir=Path(args.output).parent / STEP1_ARTIFACTS_DIRNAME if args.output else None,
                 observer=observer,
                 active_maven_profiles=args.active_maven_profile,
-                build_tool=args.tool,
+                build_tool=args.current_tool,
             )
         except Step1CommandExecutionBlockedError as e:
             interaction = build_step1_command_blocked_interaction(e)
-            print(f"当前输入已进入执行阶段，但 {args.tool} 命令被环境问题阻塞。", file=sys.stderr)
+            print("当前输入已进入执行阶段，但构建工具命令被环境问题阻塞。", file=sys.stderr)
             print(f"  - 阻塞阶段: {e.stage}", file=sys.stderr)
             if e.branch:
                 print(f"  - 失败分支: {e.branch}", file=sys.stderr)
@@ -6045,7 +6167,7 @@ def main():
             print("建议人工执行：", file=sys.stderr)
             target_selector = _resolve_single_module_selector(args.primary_module, args.modules, args.work_dir)
             print(f"  git checkout {args.base_branch}", file=sys.stderr)
-            if args.tool == 'gradle':
+            if args.current_tool == 'gradle':
                 target_model = _gradle_target_model(args.work_dir, target_selector)
                 command = ' '.join(gradle_cmd(args.work_dir) + [_gradle_task(target_model, 'build'), '-x', 'test'])
             else:
@@ -6082,6 +6204,17 @@ def main():
             )
         ap.print_help(sys.stderr)
         sys.exit(1)
+
+    if unresolved_records and not unresolved_confirmed:
+        interaction = build_step1_coordinate_ambiguity_interaction(
+            unresolved_records
+        )
+        print(
+            "Step1 已完成 Base/Current 最终制品扫描，发现需要用户决定的依赖身份歧义。",
+            file=sys.stderr,
+        )
+        emit_step_interaction(interaction)
+        sys.exit(EXIT_AWAITING_USER)
 
     print_parse_report('基准分支', base_deps, base_fmt)
     print_parse_report('当前分支', curr_deps, curr_fmt)
@@ -6337,7 +6470,10 @@ def main():
             'target_module': str(args.primary_module or ''),
             'jdk_home': str((meta or {}).get('jdk_home') or resolve_effective_jdk_home(configured_jdk) or ''),
             'build_command': str((meta or {}).get('build_command') or ''),
-            'build_tool': str((meta or {}).get('build_tool') or args.tool or 'maven'),
+            'build_tool': str(
+                (meta or {}).get('build_tool')
+                or (args.base_tool if side == 'base' else args.current_tool)
+            ),
             'artifact_path': artifact_path,
             'original_artifact_path': str((meta or {}).get('original_artifact_path') or artifact_path),
             'artifact_relative_path': str((meta or {}).get('artifact_relative_path') or ''),

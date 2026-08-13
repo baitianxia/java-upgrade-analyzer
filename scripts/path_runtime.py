@@ -570,7 +570,7 @@ def _run_worktree_mutation(command, *, repo_dir, runner, timeout, deadline=None)
 
 
 def _registered_worktree_path_values(stdout):
-    """Parse path values from newline or ``-z`` worktree porcelain output."""
+    """Parse stable newline porcelain output (and legacy NUL fixtures)."""
     text = str(stdout or "")
     records = text.split("\0") if "\0" in text else text.splitlines()
     return [
@@ -599,7 +599,7 @@ def _worktree_registration_state(
     if timeout <= 0:
         return None, "worktree registration check deadline exceeded", -1
     stdout, stderr, rc = runner(
-        git + ["worktree", "list", "--porcelain", "-z"],
+        git + ["-c", "core.quotepath=false", "worktree", "list", "--porcelain"],
         cwd=str(Path(repo_dir).resolve()),
         timeout=timeout,
     )
@@ -822,7 +822,7 @@ def recover_owned_stale_worktrees(
             result = {"errors": ["worktree_recovery_deadline_exceeded"]}
             _raise_worktree_recovery_errors(result)
         stdout, stderr, rc = runner(
-            git + ["worktree", "list", "--porcelain", "-z"],
+            git + ["-c", "core.quotepath=false", "worktree", "list", "--porcelain"],
             cwd=str(repo_dir),
             timeout=remaining,
         )
@@ -882,6 +882,13 @@ def create_detached_worktree(
         preferred_root=preferred_root,
         workspace=repo_dir,
     )
+    if IS_WINDOWS:
+        # The selected root only affects path length. Prefer the shortest
+        # concrete root instead of spending one failed checkout on a longer one.
+        candidate_roots = sorted(
+            candidate_roots,
+            key=lambda value: len(str(Path(value).expanduser().resolve())),
+        )
 
     with _worktree_repository_lock(repo_dir):
         recovery = _recover_stale_worktree_leases(
@@ -924,6 +931,19 @@ def create_detached_worktree(
                 if longest_entry_length
                 else 0
             )
+            if (
+                IS_WINDOWS
+                and predicted_longest
+                and predicted_longest > WINDOWS_SAFE_PATH_LENGTH
+            ):
+                _remove_worktree_lease(worktree)
+                shutil.rmtree(worktree, ignore_errors=True)
+                attempts.append(
+                    f"root={root}:predicted_longest_path={predicted_longest}:"
+                    f"exceeds_windows_safe_budget={WINDOWS_SAFE_PATH_LENGTH}:"
+                    f"longest_entry={longest_entry[:200] or '<unknown>'}"
+                )
+                continue
             _stdout, stderr, rc, history = _run_worktree_mutation(
                 git + [
                     "worktree", "add", "--detach", "--",

@@ -1,3 +1,4 @@
+import json
 import re
 import shutil
 import subprocess
@@ -7,6 +8,7 @@ from types import SimpleNamespace
 import unittest
 from pathlib import Path
 import zipfile
+import zlib
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -201,6 +203,90 @@ class BinaryDecisionIdentityRegressionTest(unittest.TestCase):
             row["disposition_obligation_identity"] for row in decisions
         }), 2)
 
+    def test_removed_inherited_member_keeps_base_resolution_as_trace_anchor(self):
+        semantic_key = ("paired-business-edge",)
+        for kind in ("method", "field"):
+            with self.subTest(kind=kind):
+                engine = BinaryDecisionEngine.__new__(BinaryDecisionEngine)
+                engine._removed_member_consumer_edges_cache = None
+                engine._paired_semantic_member_edges_cache = (
+                    {
+                        semantic_key: (
+                            {
+                                "edge_kind": kind,
+                                "symbolic_name": "inherited",
+                                "symbolic_descriptor": "()I" if kind == "method" else "I",
+                            },
+                            {
+                                "member_resolution_status": "resolved",
+                                "resolved_owner": "demo/Parent",
+                                "initiating_loader_realm_identity": "application-loader",
+                            },
+                            {},
+                        )
+                    },
+                    {
+                        semantic_key: (
+                            {
+                                "edge_kind": kind,
+                                "direct_edge_identity": f"current-{kind}-edge",
+                            },
+                            {
+                                "member_resolution_status": "no_such_member",
+                                "initiating_loader_realm_identity": "application-loader",
+                            },
+                            {},
+                        )
+                    },
+                )
+
+                anchors = engine._removed_member_consumer_edges()
+
+                self.assertEqual(
+                    anchors[(
+                        "application-loader",
+                        "demo/Parent",
+                        kind,
+                        "inherited",
+                        "()I" if kind == "method" else "I",
+                    )],
+                    (f"current-{kind}-edge",),
+                )
+
+    def test_current_hierarchy_uses_selected_variant_facts(self):
+        child_fact = zlib.compress(json.dumps({
+            "class_name": "demo/Child",
+            "super_name": "demo/CurrentParent",
+            "interfaces": ["demo/Marker"],
+        }).encode("utf-8"))
+        rows = {"child-variant": {"fact_zlib": child_fact}}
+
+        class Connection:
+            @staticmethod
+            def execute(_query, parameters):
+                row = rows.get(parameters[0])
+                return SimpleNamespace(fetchone=lambda: row)
+
+        engine = BinaryDecisionEngine.__new__(BinaryDecisionEngine)
+        engine.current_store = SimpleNamespace(connection=Connection())
+        engine._current_providers = {
+            ("application-loader", "demo/Child"): {
+                "selected_class_variant_identity": "child-variant",
+            },
+        }
+        engine._current_definitions = {}
+        engine._current_hierarchy_parent_cache = {}
+
+        self.assertTrue(engine._current_hierarchy_contains(
+            "application-loader", "demo/Child", "demo/CurrentParent"
+        ))
+        self.assertTrue(engine._current_hierarchy_contains(
+            "application-loader", "demo/Child", "demo/Marker"
+        ))
+        self.assertFalse(engine._current_hierarchy_contains(
+            "application-loader", "demo/Child", "demo/ReplacedParent"
+        ))
+
 
 class BinaryDecisionEngineTest(unittest.TestCase):
     @classmethod
@@ -283,7 +369,7 @@ class BinaryDecisionEngineTest(unittest.TestCase):
             "field_coverage": {key: "known" for key in required},
         })
 
-    def instance(self, artifact, profile):
+    def instance(self, artifact, profile, *, origin="deployment-api-jar"):
         sha = binary_artifact_diff._sha256_file(artifact)
         return ArtifactInstance(
             outer_artifact_sha256=sha,
@@ -294,7 +380,7 @@ class BinaryDecisionEngineTest(unittest.TestCase):
             runtime_path_kind="classpath",
             runtime_classpath_index=0,
             container_loader_policy_version="flat-parent-first-v1",
-            runtime_code_source_origin_identity="deployment-api-jar",
+            runtime_code_source_origin_identity=origin,
             coord="com.acme:api:1",
         )
 
@@ -332,6 +418,59 @@ class BinaryDecisionEngineTest(unittest.TestCase):
         store = BinaryFactStore()
         store.add_artifact_snapshot(instance, snapshot)
         return snapshot, store
+
+    def test_content_addressed_extraction_origin_is_not_provider_change(self):
+        artifact = self.compile_jar("same", 1)
+        profile = self.profile(binary_artifact_diff._sha256_file(artifact))
+        comparison, context = self.context(profile, profile)
+        base_instance = self.instance(
+            artifact, profile, origin="sha256:base-outer#business-classes"
+        )
+        current_instance = self.instance(
+            artifact, profile, origin="sha256:current-outer#business-classes"
+        )
+        base_snapshot, base_store = self.snapshot_and_store(
+            artifact, base_instance
+        )
+        current_snapshot, current_store = self.snapshot_and_store(
+            artifact, current_instance
+        )
+        try:
+            artifact_diff = binary_artifact_diff.compare_artifact_snapshots(
+                base_snapshot,
+                current_snapshot,
+                comparison_or_runtime_scope={
+                    "runtime_comparison_identity": comparison.identity
+                },
+            )
+            artifact_diff["logical_dependency_lineage"] = (
+                "application:business"
+            )
+            base_runtime = RuntimeReconciler(
+                base_store, profile, self.platform,
+                analysis_context_identity=context.identity,
+            ).reconcile()
+            current_runtime = RuntimeReconciler(
+                current_store, profile, self.platform,
+                analysis_context_identity=context.identity,
+            ).reconcile()
+            bundle = BinaryDecisionEngine(
+                analysis_context_identity=context.identity,
+                runtime_comparison_identity=comparison.identity,
+                base_store=base_store,
+                current_store=current_store,
+                base_reconciliation=base_runtime,
+                current_reconciliation=current_runtime,
+                artifact_local_diffs=(artifact_diff,),
+            ).build()
+        finally:
+            base_store.close()
+            current_store.close()
+
+        self.assertFalse(any(
+            item["fact_kind"] == "provider_topology"
+            for item in bundle.authoritative_decisions
+        ))
 
     def test_effective_method_body_change_becomes_one_confirmed_targetable_fact(self):
         base_artifact = self.compile_jar("base", 1)

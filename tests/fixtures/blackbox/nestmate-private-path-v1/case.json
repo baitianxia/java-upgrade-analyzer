@@ -1,0 +1,20 @@
+{
+  "schema": "java-upgrade-analyzer.blackbox-case.v1",
+  "case_id": "nestmate-private-path-v1",
+  "dataset_version": 1,
+  "public_entrypoint": "scripts/binary_pipeline.py",
+  "truth_file": "truth.json",
+  "oracle_contract": "implementation_change_closed_set",
+  "capabilities": ["jvm_nestmate_private_access", "implementation_change", "reachable_positive", "unchanged_member_negative"],
+  "library_class": "contract.BehaviorApi",
+  "business_class": "contract.NestBusiness$Member",
+  "business_classes": ["contract.NestBusiness", "contract.NestBusiness$Member"],
+  "oracle_main_class": "contract.OracleMain",
+  "library_lineage": "blackbox:nestmate-lib",
+  "base_coordinate": "blackbox:nestmate-lib:1.0",
+  "current_coordinate": "blackbox:nestmate-lib:2.0",
+  "entrypoints": [{"class_name": "contract/NestBusiness$Member", "member_name": "entry", "descriptor": "(Lcontract/BehaviorApi;)I"}],
+  "behavior_probes": [
+    {"mode": "reachable", "owner": "contract/BehaviorApi", "member": "changed", "descriptor": "()I", "member_kind": "method", "base_stdout": "1", "current_stdout": "2"}
+  ]
+}

@@ -10,7 +10,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import binary_tool_execution  # noqa: E402
-from binary_tool_execution import execute_binary_tool  # noqa: E402
+from binary_tool_execution import (  # noqa: E402
+    execute_binary_tool,
+    tool_failure_is_retryable,
+)
 
 
 class BinaryToolExecutionTest(unittest.TestCase):
@@ -57,6 +60,23 @@ class BinaryToolExecutionTest(unittest.TestCase):
                 self.assertEqual(
                     result.failure.to_mapping()["command"], ["tool"]
                 )
+
+    def test_only_transient_process_failures_are_retryable(self):
+        timeout = execute_binary_tool(
+            ["tool"], stage="test", reason_prefix="TOOL", timeout_seconds=1,
+            runner=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                subprocess.TimeoutExpired(["tool"], 1)
+            ),
+        )
+        missing = execute_binary_tool(
+            ["tool"], stage="test", reason_prefix="TOOL", timeout_seconds=1,
+            runner=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                FileNotFoundError("missing")
+            ),
+        )
+
+        self.assertTrue(tool_failure_is_retryable(timeout.failure))
+        self.assertFalse(tool_failure_is_retryable(missing.failure))
 
     def test_bytes_input_and_output_preserve_protocol_payload(self):
         result = execute_binary_tool(

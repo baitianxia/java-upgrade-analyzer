@@ -35,6 +35,7 @@ BRANCH_FUNCTIONS = {
 }
 REPEAT_MODULES = (
     "tests.test_binary_first_contract",
+    "tests.test_binary_result_truth",
     "tests.test_binary_tool_execution",
     "tests.test_binary_entrypoint_discovery",
 )
@@ -94,6 +95,139 @@ MUTATIONS = (
             "test_reachable_truth_table_preserves_static_reachability"
         ),
     },
+    {
+        "id": "truth_exact_policy_ignores_false_positive",
+        "module": "binary_result_truth",
+        "path": SCRIPTS / "binary_result_truth.py",
+        "old": 'if truth.get("result_set_policy") == "exact":',
+        "new": 'if False and truth.get("result_set_policy") == "exact":',
+        "test": (
+            "tests.test_binary_result_truth.BinaryResultTruthTest."
+            "test_exact_truth_rejects_unexpected_false_positive"
+        ),
+    },
+    {
+        "id": "truth_ignores_state_mismatch",
+        "module": "binary_result_truth",
+        "path": SCRIPTS / "binary_result_truth.py",
+        "old": "if field in expected and actual.get(field) != expected[field]:",
+        "new": "if False and field in expected and actual.get(field) != expected[field]:",
+        "test": (
+            "tests.test_binary_result_truth.BinaryResultTruthTest."
+            "test_truth_rejects_wrong_overload_dependency_and_four_state_result"
+        ),
+    },
+    {
+        "id": "truth_ignores_required_paths",
+        "module": "binary_result_truth",
+        "path": SCRIPTS / "binary_result_truth.py",
+        "old": "for required in required_paths:",
+        "new": "for required in ():",
+        "test": (
+            "tests.test_binary_result_truth.BinaryResultTruthTest."
+            "test_truth_rejects_missing_or_incorrect_required_path"
+        ),
+    },
+    {
+        "id": "access_reduction_treated_as_linkage_compatible",
+        "module": "binary_trace_engine",
+        "path": SCRIPTS / "binary_trace_engine.py",
+        "old": "_visibility_rank(current_access) < _visibility_rank(base_access)",
+        "new": "_visibility_rank(current_access) > _visibility_rank(base_access)",
+        "test": (
+            "tests.test_binary_trace_engine.BinaryTraceFastPathTest."
+            "test_contract_access_reduction_is_linkage_incompatible_without_a_path"
+        ),
+    },
+    {
+        "id": "paired_missing_class_path_downgraded_to_possible",
+        "module": "binary_trace_engine",
+        "path": SCRIPTS / "binary_trace_engine.py",
+        "old": 'if status == "no_such_member"\n        or (\n            paired_artifact_change',
+        "new": 'if status == "no_such_member"\n        or (\n            False and paired_artifact_change',
+        "test": (
+            "tests.test_binary_trace_engine.BinaryTraceFastPathTest."
+            "test_definitive_missing_linkage_edges_are_exact"
+        ),
+    },
+    {
+        "id": "concrete_to_abstract_treated_as_compatible",
+        "module": "binary_trace_engine",
+        "path": SCRIPTS / "binary_trace_engine.py",
+        "old": """not bool(base_access & ACC_ABSTRACT)
+        and bool(current_access & ACC_ABSTRACT)""",
+        "new": """False and not bool(base_access & ACC_ABSTRACT)
+        and bool(current_access & ACC_ABSTRACT)""",
+        "test": (
+            "tests.test_binary_trace_engine.BinaryTraceFastPathTest."
+            "test_concrete_method_becoming_abstract_breaks_binary_compatibility"
+        ),
+    },
+    {
+        "id": "non_final_method_becoming_final_treated_as_compatible",
+        "module": "binary_trace_engine",
+        "path": SCRIPTS / "binary_trace_engine.py",
+        "old": """scope.get("member_kind") == "method"
+        and not bool(base_access & ACC_FINAL)""",
+        "new": """False and scope.get("member_kind") == "method"
+        and not bool(base_access & ACC_FINAL)""",
+        "test": (
+            "tests.test_binary_trace_engine.BinaryTraceFastPathTest."
+            "test_non_final_method_becoming_final_breaks_binary_compatibility"
+        ),
+    },
+    {
+        "id": "failed_caller_definition_treated_as_legal_access",
+        "module": "binary_trace_engine",
+        "path": SCRIPTS / "binary_trace_engine.py",
+        "old": 'and caller_definition_statuses == {"definition_ready"}',
+        "new": "and True",
+        "test": (
+            "tests.test_binary_trace_engine.BinaryTraceFastPathTest."
+            "test_observed_legal_protected_path_refines_access_reduction"
+        ),
+    },
+    {
+        "id": "inherited_removed_member_loses_base_resolution_anchor",
+        "module": "binary_decision_engine",
+        "path": SCRIPTS / "binary_decision_engine.py",
+        "old": "grouped.setdefault(target, set()).add(",
+        "new": "{}.setdefault(target, set()).add(",
+        "test": (
+            "tests.test_binary_decision_engine.BinaryDecisionIdentityRegressionTest."
+            "test_removed_inherited_member_keeps_base_resolution_as_trace_anchor"
+        ),
+    },
+    {
+        "id": "current_hierarchy_ignores_selected_variant_facts",
+        "module": "binary_decision_engine",
+        "path": SCRIPTS / "binary_decision_engine.py",
+        "old": """if variant:
+            row = self.current_store.connection.execute(""",
+        "new": """if False and variant:
+            row = self.current_store.connection.execute(""",
+        "test": (
+            "tests.test_binary_decision_engine.BinaryDecisionIdentityRegressionTest."
+            "test_current_hierarchy_uses_selected_variant_facts"
+        ),
+    },
+    {
+        "id": "validated_nestmate_private_access_is_rejected",
+        "module": "binary_runtime_reconciler",
+        "path": SCRIPTS / "binary_runtime_reconciler.py",
+        "old": """            return (
+                caller_class == owner and caller_realm == defining
+            ) or self._validated_nestmates(
+                caller_class, caller_realm, owner, defining
+            )""",
+        "new": """            return (
+                caller_class == owner and caller_realm == defining
+            )""",
+        "test": (
+            "tests.test_binary_runtime_reconciler.BinaryRuntimeReconcilerTest."
+            "test_private_access_between_validated_nestmates_is_linkage_compatible"
+        ),
+    },
 )
 
 
@@ -151,7 +285,7 @@ def branch_probe() -> dict:
     covered = alternatives & executed
     ratio = len(covered) / len(alternatives) if alternatives else 1.0
     return {
-        "status": "passed" if result.wasSuccessful() and ratio >= 0.80 else "failed",
+        "status": "passed" if result.wasSuccessful() and ratio == 1.0 else "failed",
         "test_count": result.testsRun,
         "branch_alternative_count": len(alternatives),
         "covered_branch_alternative_count": len(covered),

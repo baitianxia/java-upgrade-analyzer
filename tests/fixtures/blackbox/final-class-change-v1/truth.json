@@ -1,0 +1,24 @@
+{
+  "schema": "java-upgrade-analyzer.blackbox-truth.v1",
+  "case_id": "final-class-change-v1",
+  "dataset_version": 1,
+  "scope": "closed_set",
+  "system_generated": false,
+  "human_review": {"status": "not_claimed", "reviewer": ""},
+  "input_evidence": {"algorithm": "sha256-path-nul-content-nul-v1", "source_tree_sha256": "183c13f05f8ac946d8ccecf514e6e1f924c32fadc759b6dcb3bf14558c4b8a68", "case_algorithm": "sha256-canonical-json-v1", "case_sha256": "bff60ad3c860fdd3de5bdf1aae4f4fbd61b9b38a6119578c3768f0f7c2be9671", "source_files": ["src/base/contract/FinalClassParent.java", "src/business/contract/FinalClassApp.java", "src/business/contract/FinalClassChild.java", "src/current/contract/FinalClassParent.java", "src/oracle/contract/DefinitionMain.java", "src/oracle/contract/OracleMain.java"]},
+  "oracle_producers": [
+    {"id": "openjdk-javap-final-class-flags", "organization": "OpenJDK", "mechanism": "independent_class_and_member_inventory", "verifies": ["sole_class_contract_delta_is_acc_final", "public_members_unchanged"]},
+    {"id": "openjdk-jvm-final-superclass-verifier", "organization": "OpenJDK", "mechanism": "actual_jvm_class_definition", "verifies": ["base_child_executes", "current_child_rejected_with_incompatible_class_change_error"]}
+  ],
+  "oracle_implementations": [
+    {"path": "tests/blackbox/oracles/openjdk_oracle.py", "sha256": "6e72442077371b86c943f790b5982144497725200da3e89f22f66ca2bfee38ca"},
+    {"path": "tests/blackbox/oracles/openjdk_class_oracle.py", "sha256": "7ee02b406cf79aa3025f23d903b93a8f96ed56ba758f1fb5a8bdfe33a23ad991"}
+  ],
+  "completeness": {"argument": "OpenJDK javap inventories the only library class and proves all public member identities and bodies are unchanged while the class flags add ACC_FINAL. The only business subclass executes with the base library and the target JVM rejects its definition with the current library.", "verified_dimensions": ["api_identity", "jvm_descriptor", "closed_result_set", "entrypoint_reachability", "static_linkage"], "known_limits": []},
+  "expected_result_count": 2,
+  "expected_results": [
+    {"owner": "contract/FinalClassChild", "member": "", "descriptor": "", "member_kind": "class_definition", "dependency_lineages": [], "base_dependency_coords": ["blackbox:fixture-app:1.0"], "current_dependency_coords": ["blackbox:fixture-app:1.0"], "reachability_status": "not_found_in_static_analysis", "static_linkage_status": "undetermined", "impact_conclusion": "inconclusive", "runtime_verification_status": "undetermined", "exact_path_exists": false, "possible_path_exists": false, "path_set_complete": true, "paths": []},
+    {"owner": "contract/FinalClassParent", "member": "<class>", "descriptor": "Lcontract/FinalClassParent;", "member_kind": "class", "dependency_lineages": ["blackbox:final-class-lib"], "base_dependency_coords": ["blackbox:final-class-lib:1.0"], "current_dependency_coords": ["blackbox:final-class-lib:2.0"], "reachability_status": "not_found_in_static_analysis", "static_linkage_status": "compatible_or_not_applicable", "impact_conclusion": "inconclusive", "runtime_verification_status": "undetermined", "exact_path_exists": false, "possible_path_exists": false, "path_set_complete": true, "paths": []}
+  ],
+  "forbidden_results": [{"owner": "contract/FinalClassParent", "member": "stable", "descriptor": "()Ljava/lang/String;", "member_kind": "method", "oracle_relation": "unchanged_member", "reason": "The method descriptor, flags, and implementation are byte-identical; the compatibility change is at class-definition level."}]
+}

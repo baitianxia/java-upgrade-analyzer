@@ -1,0 +1,39 @@
+{
+  "schema": "java-upgrade-analyzer.workflow-blackbox-truth.v1",
+  "case_id": "checkout-builds-v1",
+  "system_generated": false,
+  "oracle_producers": [
+    {
+      "id": "git-immutable-revision",
+      "organization": "Git project",
+      "mechanism": "independent_rev_parse_and_tree_inventory",
+      "sources": ["git rev-parse", "git ls-tree"],
+      "verifies": ["pinned checkout revision", "closed repository tree inventory"]
+    },
+    {
+      "id": "standard-zip-maven-metadata",
+      "organization": "Python Software Foundation and Apache Maven",
+      "mechanism": "zip_inventory_plus_pom_properties_identity",
+      "sources": ["zipfile", "META-INF/maven/**/pom.properties"],
+      "verifies": ["built artifact ZIP integrity", "embedded Maven coordinate identity"]
+    }
+  ],
+  "maven": {
+    "build_tool": "maven",
+    "dependency_coord": "org.apache.commons:commons-lang3",
+    "dependency_version": "3.14.0",
+    "nested_prefix": "BOOT-INF/lib/commons-lang3-3.14.0.jar"
+  },
+  "gradle": {
+    "build_tool": "gradle",
+    "dependency_coord": "org.example:gradle-lib",
+    "dependency_version": "1.0.0",
+    "nested_prefix": "BOOT-INF/lib/gradle-lib-1.0.0.jar"
+  },
+  "checkpoint": {
+    "exit_code": 4,
+    "step_id": "step0",
+    "kind": "input_request"
+  },
+  "step1_exit_code": 0
+}

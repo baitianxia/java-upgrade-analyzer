@@ -2,6 +2,9 @@
 
 本文定义 binary-first 引擎的开发准入。测试服务于准确性、用户体验和性能，不能用“测试通过”掩盖错误模型或不完整验证。
 
+完整的黑盒、白盒、性能测试划分及第三方 Oracle/真值治理要求见
+[测试体系建设方案](testing-strategy.md)。本文侧重当前 binary-first 能力的具体门禁。
+
 ## 不可突破的门槛
 
 1. 最终制品和目标运行时是正式事实；源码只是可选解释层。
@@ -14,15 +17,31 @@
 
 ## 测试 profiles
 
+按测试类型运行：
+
+```bash
+python3 scripts/quality_gate.py --profile blackbox
+python3 scripts/quality_gate.py --profile whitebox
+python3 scripts/quality_gate.py --profile performance
+```
+
+- `blackbox`：只通过公开 CLI 比较版本化输入和独立闭集真值；
+- `whitebox`：内部模型、算法、集成、错误恢复和实现约束；
+- `performance`：小规模性能/守恒测试；Release 另运行固定大规模门。
+
+按交付阶段运行：
+
 ```bash
 python3 scripts/quality_gate.py --profile quick
 python3 scripts/quality_gate.py --profile step5
 python3 scripts/quality_gate.py --profile release
 ```
 
-- `quick`：模型、制品 diff、target runtime reconciliation、裁决、trace 和 generation 输出；
+- `quick`：测试可信度、闭集黑盒核心案例、跨平台进程合同，以及模型、制品 diff、target runtime reconciliation、裁决、trace 和 generation 输出；
 - `step5`：在 quick 上增加 ASM/fact store/cache/source overlay、端到端 pipeline、查询、调度和用户输出契约；
-- `release`：先以 `python3 -m unittest discover -s tests` 发现并运行全部当前测试，再运行能力/拓扑迁移审计、分支/变异/重复健康门、目录内全部 pinned 真实项目 manifest，以及 400 JAR/10 万 class 性能与范围守恒门；任一阶段失败即阻断。
+- `release`：先由 `test_suite_runner.py --suite all` 做可信度审计、全量 discovery 和唯一分类，再运行全部当前测试；随后运行能力/拓扑迁移审计、分支/变异/重复健康门、目录内全部 pinned 真实项目 manifest，以及 400 JAR/10 万 class 性能与范围守恒门。任一阶段失败即阻断。
+
+系统级准出还受 `tests/fixtures/system_test_capability_matrix.json` 和 `tests/fixtures/system_test_scenario_contracts.json` 约束。矩阵从所有登记的公开 CLI、Step0~Step6 和 binary support manifest 反向盘点能力，并区分 `covered`、`partial`、`missing`。当前基线为 89/89 covered、260 个风险场景维度和 22/22 个细粒度框架机制声明；critical 能力至少需要 nominal 加两个不同逆向维度，high 至少需要 nominal 加一个逆向维度，且每一维必须指向非空第三方真值并由该能力登记的具体黑盒证据实际读取。白盒测试存在不等于公开语义已验证，任何新增能力若没有独立黑盒证据和足够场景都会阻断 `--suite all` 的“全面质量通过”声明。局部 profile 通过只说明对应已执行范围没有回归。
 
 准确性定向门：
 
@@ -94,9 +113,11 @@ Category 只使用当前 binary 能力名；旧引擎 category 不保留调用�
 
 Oracle 失败或证据不足时 generation 不得激活。
 
+黑盒 expected 不能由该 generation 或历史系统输出生成。闭集案例的 API 集合、链接行为和入口可达性必须由外部工具、独立 Oracle 或规范证据交叉确认；Oracle 之间发生冲突时案例进入 quarantine，不能作为通过依据。
+
 ## 性能门
 
-性能门必须同时记录输入规模、冷/热 cache、总耗时、阶段耗时和可取得的峰值内存。固定性能 fixture 位于 `tests/fixtures/binary_first/performance_gate.json`，其内容身份在 support manifest 中固定。大规模 fact-store 门与两条冷启动完整流水线门都覆盖 400 JAR/100000 class：一条比较完全相同的两侧，另一条确定性替换 current 侧的一个 JAR 并校验 250 条实现变化。完整门继续覆盖 runtime reconciliation、trace、generation 和独立 Oracle，从两侧 SQLite 与已落盘 Oracle 结果读取实际类数、变化数量与种类、正式结果状态和问题数，并逐阶段记录累计峰值 RSS、单独限制完整流水线 RSS，避免配置中的理论规模掩盖事实丢失，也避免缩小样本掩盖超线性协调、全表物化、双侧对象重叠或逐 class 子进程退化。
+性能门必须同时记录输入规模、冷/热 cache、总耗时、阶段耗时、P50/P95、CPU 秒、平均核数和可取得的峰值内存；门禁从原始样本复算分位数与平均核数。固定性能 fixture 位于 `tests/fixtures/binary_first/performance_gate.json`，其内容身份在 support manifest 中固定，当前记录来自 2026-08-13 的实际完整运行并含 CPU 原始证据。大规模 fact-store 门与两条冷启动完整流水线门都覆盖 400 JAR/100000 class：一条比较完全相同的两侧，另一条确定性替换 current 侧的一个 JAR 并校验 250 条实现变化。完整门继续覆盖 runtime reconciliation、trace、generation 和独立 Oracle，从两侧 SQLite 与已落盘 Oracle 结果读取实际类数、变化数量与种类、正式结果状态和问题数，并逐阶段记录累计峰值 RSS、单独限制完整流水线 RSS，避免配置中的理论规模掩盖事实丢失，也避免缩小样本掩盖超线性协调、全表物化、双侧对象重叠或逐 class 子进程退化。任何新结果缺少 CPU 证据或派生关系不一致时失败；历史记录若确实没有 CPU 原始数据只能显式声明，不能补造。
 
 允许：内容寻址缓存、批量事务、有界并行、索引、避免重复解析。禁止：抽样 API、跳过依赖、缩短路径而不报告、降低描述符/loader 精度、用源码替代制品。
 
@@ -115,6 +136,7 @@ Oracle 失败或证据不足时 generation 不得激活。
 ## 提交准出
 
 - 所有现存测试实际通过；
+- 系统级 Release 声明前，公开能力矩阵必须全部为 `covered`，且每项有独立黑盒 Oracle；
 - 公开文档与代码一致；
 - 人读报告已抽查依赖身份和阅读路径；
 - 旧引擎入口/参数/活动文档已清除；

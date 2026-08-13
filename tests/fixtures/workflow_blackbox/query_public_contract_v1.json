@@ -1,0 +1,123 @@
+{
+  "schema": "java-upgrade-analyzer.workflow-blackbox-truth.v1",
+  "case_id": "query-public-contract-v1",
+  "system_generated": false,
+  "oracle_producers": [
+    {
+      "id": "authored-public-query-contract",
+      "organization": "java-upgrade-analyzer maintainers",
+      "mechanism": "public CLI contract review with closed overload and scope partitions",
+      "verifies": ["query modes and exactness boundary", "ambiguity and result limit semantics"]
+    },
+    {
+      "id": "independent-reference-graph-walk",
+      "organization": "black-box test data maintainers",
+      "mechanism": "standalone graph enumeration without production imports",
+      "verifies": ["complete one-edge path set", "stable query-to-target resolution"]
+    }
+  ],
+  "cases": [
+    {
+      "id": "signed_exact",
+      "arguments": ["--method", "vendor.Target.changed(java.lang.String)"],
+      "expected": {
+        "chains": ["app.A.run() → vendor.Target.changed(java.lang.String)"],
+        "exact_match": true,
+        "match_mode": "exact",
+        "warnings": []
+      }
+    },
+    {
+      "id": "unsigned_overloads",
+      "arguments": ["--method", "vendor.Target.changed"],
+      "expected": {
+        "chains": [
+          "app.A.run() → vendor.Target.changed(java.lang.String)",
+          "app.B.run() → vendor.Target.changed(int)"
+        ],
+        "exact_match": true,
+        "match_mode": "exact",
+        "warnings": []
+      }
+    },
+    {
+      "id": "wrong_signature_no_broadening",
+      "arguments": ["--method", "vendor.Target.changed(long)"],
+      "expected": {
+        "chains": [],
+        "exact_match": false,
+        "match_mode": "not_found",
+        "warnings": ["未找到精确匹配的调用链。"]
+      }
+    },
+    {
+      "id": "explicit_fuzzy",
+      "arguments": ["--method", "missing.Owner.changed(java.lang.String)", "--fuzzy"],
+      "expected": {
+        "chains": [
+          "app.A.run() → vendor.Target.changed(java.lang.String)",
+          "app.Fuzzy.run() → other.Target.changed(java.lang.String)"
+        ],
+        "exact_match": false,
+        "match_mode": "fuzzy",
+        "warnings": ["当前结果来自 fuzzy 简单名匹配，可能包含同名类/方法误匹配，不能作为确定影响结论。"]
+      }
+    },
+    {
+      "id": "coordinate_exact",
+      "arguments": ["--coord", "alpha:common"],
+      "expected": {
+        "chains": ["app.A.run() → vendor.Target.changed(java.lang.String)"],
+        "exact_match": true,
+        "match_mode": "coord_exact",
+        "matched_coords": ["alpha:common"],
+        "matched_target_count": 1,
+        "unqueryable_target_count": 0,
+        "limit_reached": false,
+        "warnings": []
+      }
+    },
+    {
+      "id": "coordinate_ambiguous",
+      "arguments": ["--coord", "common"],
+      "expected": {
+        "chains": [],
+        "exact_match": false,
+        "match_mode": "coord_ambiguous",
+        "matched_coords": [],
+        "matched_target_count": 0,
+        "unqueryable_target_count": 0,
+        "limit_reached": false,
+        "warnings": ["依赖标识 common 对应多个坐标：alpha:common, beta:common；请使用完整物理制品坐标。"]
+      }
+    },
+    {
+      "id": "package_prefix",
+      "arguments": ["--package", "vendor"],
+      "expected": {
+        "chains": [
+          "app.A.run() → vendor.Target.changed(java.lang.String)",
+          "app.Dto.run() → class:vendor.model.Dto",
+          "app.B.run() → vendor.Target.changed(int)"
+        ],
+        "exact_match": true,
+        "match_mode": "package_prefix",
+        "matched_coords": ["alpha:common", "alpha:extra", "beta:common"],
+        "matched_target_count": 3,
+        "unqueryable_target_count": 0,
+        "limit_reached": false,
+        "warnings": []
+      }
+    },
+    {
+      "id": "method_limit",
+      "arguments": ["--method", "vendor.Target.changed", "--limit", "1"],
+      "expected": {
+        "chains": ["app.A.run() → vendor.Target.changed(java.lang.String)"],
+        "exact_match": true,
+        "match_mode": "exact",
+        "warnings": []
+      }
+    }
+  ]
+}

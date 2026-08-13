@@ -1529,12 +1529,13 @@ def _validate_context_contract(path, context, diagnostics):
 
 
 def count_lines(path):
-    if not os.path.exists(path):
+    path_value = os.fspath(path)
+    if not os.path.exists(path_value):
         return -1
     try:
-        with open_text(path) as f:
+        with open_text(path_value) as f:
             line_count = sum(1 for line in f if line.strip() and not line.startswith('#'))
-        if path.endswith('.csv'):
+        if path_value.lower().endswith('.csv'):
             return max(line_count - 1, 0)  # 排除 CSV 表头
         return line_count
     except (OSError, UnicodeError):

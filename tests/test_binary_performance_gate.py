@@ -1,3 +1,5 @@
+from contextlib import redirect_stdout
+import io
 import json
 import shutil
 import sys
@@ -12,7 +14,11 @@ sys.path.insert(0, str(ROOT_DIR / "scripts"))
 
 import binary_asm_helper  # noqa: E402
 import binary_performance_gate  # noqa: E402
-from binary_performance_gate import evaluate_gate, run_benchmark  # noqa: E402
+from binary_performance_gate import (  # noqa: E402
+    evaluate_gate,
+    evaluate_recorded_gate,
+    run_benchmark,
+)
 
 
 class BinaryPerformanceGateTest(unittest.TestCase):
@@ -46,6 +52,15 @@ class BinaryPerformanceGateTest(unittest.TestCase):
         self.assertEqual(
             result["measurements"]["warm_runs"][0]["cache_hits"], 2
         )
+        warm = result["measurements"]["warm_runs"][0]
+        self.assertGreaterEqual(warm["cpu_seconds"], 0)
+        self.assertGreaterEqual(warm["average_cpu_cores"], 0)
+        self.assertEqual(
+            result["measurements"]["warm_end_to_end_p50_seconds"],
+            warm["end_to_end_seconds"],
+        )
+        self.assertGreater(result["measurements"]["total_measured_cpu_seconds"], 0)
+        self.assertGreater(result["measurements"]["average_cpu_cores"], 0)
         full_pipeline = result["measurements"]["full_pipeline_probe"]
         self.assertEqual(full_pipeline["status"], "passed")
         self.assertEqual(full_pipeline["jar_count"], 2)
@@ -112,6 +127,7 @@ class BinaryPerformanceGateTest(unittest.TestCase):
             },
             "thresholds": {
                 "cold_end_to_end_seconds": cold["end_to_end_seconds"] * 2,
+                "warm_end_to_end_p50_seconds": result["measurements"]["warm_end_to_end_p50_seconds"] * 2,
                 "warm_end_to_end_p95_seconds": result["measurements"]["warm_end_to_end_p95_seconds"] * 2,
                 "peak_rss_bytes": result["measurements"]["peak_rss_bytes"] * 2,
                 "disk_bytes": result["measurements"]["disk_bytes"] * 2,
@@ -197,6 +213,23 @@ class BinaryPerformanceGateTest(unittest.TestCase):
             and issue["metric"] == "full_pipeline_end_to_end_seconds"
             for issue in slow_evaluation["issues"]
         ))
+        invented_p50 = json.loads(json.dumps(result))
+        invented_p50["measurements"]["warm_end_to_end_p50_seconds"] += 1
+        p50_evaluation = evaluate_gate(invented_p50, gate)
+        self.assertTrue(any(
+            issue["reason_code"] == "BINARY_PERFORMANCE_DERIVATION_INVALID"
+            and issue["metric"] == "warm_end_to_end_p50_seconds"
+            for issue in p50_evaluation["issues"]
+        ))
+        missing_cpu = json.loads(json.dumps(result))
+        del missing_cpu["measurements"]["cold"]["cpu_seconds"]
+        cpu_evaluation = evaluate_gate(missing_cpu, gate)
+        self.assertTrue(any(
+            issue["reason_code"]
+            == "BINARY_PERFORMANCE_CPU_MEASUREMENT_INVALID"
+            and issue["run"] == "cold"
+            for issue in cpu_evaluation["issues"]
+        ))
         memory_heavy_pipeline = json.loads(json.dumps(result))
         memory_heavy_pipeline["measurements"]["full_pipeline_probe"][
             "peak_rss_bytes"
@@ -260,13 +293,70 @@ class BinaryPerformanceGateTest(unittest.TestCase):
             gate_path = Path(output_tmp) / "gate.json"
             gate_path.write_text(json.dumps(gate), encoding="utf-8")
             with patch.object(binary_performance_gate, "run_benchmark", return_value=result):
-                returncode = binary_performance_gate.main([
-                    "--output", str(output),
-                    "--gate", str(gate_path),
-                ])
+                with redirect_stdout(io.StringIO()):
+                    returncode = binary_performance_gate.main([
+                        "--output", str(output),
+                        "--gate", str(gate_path),
+                    ])
             persisted = json.loads(output.read_text(encoding="utf-8"))
         self.assertEqual(returncode, 1)
         self.assertEqual(persisted["gate_evaluation"]["status"], "failed")
+
+    def test_checked_in_release_measurements_are_replayed_not_self_attested(self):
+        gate = json.loads((
+            ROOT_DIR / "tests" / "fixtures" / "binary_first"
+            / "performance_gate.json"
+        ).read_text(encoding="utf-8"))
+
+        evaluation = evaluate_recorded_gate(gate)
+
+        self.assertEqual(evaluation["status"], "passed", evaluation["issues"])
+        self.assertEqual(evaluation["jar_count"], 400)
+        self.assertEqual(evaluation["class_count"], 100000)
+        self.assertEqual(evaluation["changed_class_count"], 250)
+        self.assertTrue(evaluation["recorded_measurements_replayed"])
+        self.assertEqual(
+            gate["recorded_measurements"]["warm_end_to_end_p50_seconds"],
+            42.67627699999139,
+        )
+
+        corrupted_p50 = json.loads(json.dumps(gate))
+        corrupted_p50["recorded_measurements"][
+            "warm_end_to_end_p50_seconds"
+        ] = 0
+        p50_evaluation = evaluate_recorded_gate(corrupted_p50)
+        self.assertEqual(p50_evaluation["status"], "failed")
+        self.assertTrue(any(
+            item.get("field") == "warm_p50"
+            for item in p50_evaluation["issues"]
+        ))
+
+        corrupted_cpu = json.loads(json.dumps(gate))
+        corrupted_cpu["recorded_measurements"]["cold_cpu_seconds"] = 0
+        cpu_evaluation = evaluate_recorded_gate(corrupted_cpu)
+        self.assertEqual(cpu_evaluation["status"], "failed")
+        self.assertTrue(any(
+            item["reason_code"] == "BINARY_PERFORMANCE_RECORDED_CPU_INVALID"
+            and item.get("field") == "cold"
+            for item in cpu_evaluation["issues"]
+        ))
+
+        corrupted = json.loads(json.dumps(gate))
+        corrupted["recorded_measurements"]["class_count"] -= 1
+        corrupted_evaluation = evaluate_recorded_gate(corrupted)
+        self.assertEqual(corrupted_evaluation["status"], "failed")
+        self.assertIn(
+            "BINARY_PERFORMANCE_RECORDED_CONSERVATION_INVALID",
+            {item["reason_code"] for item in corrupted_evaluation["issues"]},
+        )
+
+        self_attested = json.loads(json.dumps(gate))
+        self_attested["recorded_measurements"]["changed_full_pipeline_probe"][
+            "formal_api_result_count"
+        ] = 249
+        self.assertEqual(
+            evaluate_recorded_gate(self_attested)["status"], "failed"
+        )
 
     def test_full_pipeline_probe_uses_every_artifact_by_default(self):
         artifacts = [

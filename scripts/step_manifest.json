@@ -10,87 +10,28 @@
   },
   "steps": [
     {
+      "id": "step0",
+      "order": 0,
+      "title": "正式分析信息确认",
+      "gate": null,
+      "interaction": null,
+      "outputs": [
+        ".runtime/state/step0_confirmation.json"
+      ],
+      "notes": [
+        "系统先自动识别可确定的信息，再用一张统一卡片确认全部输入。",
+        "应用源码为必填；依赖包源码可选。",
+        "用户确认后，应用源码 base/current 版本固定到不可变 commit。"
+      ]
+    },
+    {
       "id": "step1",
       "order": 1,
       "title": "分析对象与依赖范围",
       "script": "s1_dep_diff.py",
       "gate": "step1_scope",
-      "interaction": {
-        "type": "review",
-        "status": "awaiting_user_input",
-        "question": "请确认构建来源、目标模块和依赖变化范围是否正确。如果原本只想分析某个模块，但结果覆盖了整个项目，请补充正确的模块范围后重新分析。",
-        "required_fields": [
-          "action"
-        ],
-        "missing_inputs": [],
-        "input_modes": [],
-        "input_normalization": {
-          "enabled": true,
-          "required_fields": [],
-          "allowed_actions": [
-            "continue",
-            "rerun_current_step",
-            "cancel"
-          ]
-        },
-        "response_schema": {
-          "type": "object",
-          "required": [
-            "action"
-          ],
-          "properties": {
-            "action": {
-              "type": "string",
-              "enum": [
-                "continue",
-                "rerun_current_step",
-                "cancel"
-              ]
-            },
-            "primary_module": {
-              "type": "string",
-              "description": "当 action=rerun_current_step 时必填。"
-            },
-            "modules": {
-              "type": "array",
-              "items": {
-                "type": "string"
-              },
-              "description": "当 action=rerun_current_step 时必填，可包含一个或多个模块。"
-            },
-            "notes": {
-              "type": "string"
-            }
-          }
-        },
-        "resume_hint": "若用户要求只分析某个模块，或用户首轮其实已明确模块但本次仍跑成 root 范围，请用结构化用户答复选择 rerun_current_step，并同时传入 primary_module/modules 重跑 Step1。",
-        "options": [
-          {
-            "id": "continue",
-            "label": "继续",
-            "description": "构建结果和依赖变化范围正确，继续整理升级上下文。"
-          },
-          {
-            "id": "rerun_current_step",
-            "label": "按模块重跑",
-            "description": "补充一个或多个目标模块，并重新获取这些模块的依赖变化。"
-          },
-          {
-            "id": "cancel",
-            "label": "稍后处理",
-            "description": "保留当前分析现场，完成复核后再继续。"
-          }
-        ],
-        "action_requirements": {
-          "rerun_current_step": {
-            "at_least_one_of": [
-              "primary_module",
-              "modules"
-            ],
-            "description": "按模块重跑时，至少要明确 primary_module 或 modules。"
-          }
-        }
-      },
+      "auto_continue_on_success": true,
+      "interaction": null,
       "outputs": [
         "evidence/dependencies/dep_alerts.csv",
         "evidence/dependencies/dep_changes.csv",
@@ -102,7 +43,8 @@
         "evidence/dependencies/s1_dependency_jars/"
       ],
       "notes": [
-        "Step1 默认通过真实构建获取依赖结果。",
+        "Step1 只解析最终制品及其依赖身份。",
+        "只有依赖身份或已提供依赖源码存在真正歧义时才请求用户决定。",
         "分支构建使用固定 commit 的隔离临时 worktree，不修改用户当前工作区。"
       ]
     },
@@ -113,110 +55,7 @@
       "script": "s2_context_from_deps.py",
       "gate": "context",
       "auto_continue_on_success": true,
-      "conditional_confirmation": true,
-      "interaction": {
-        "type": "decision",
-        "status": "awaiting_user_input",
-        "question": "请确认升级口径和项目范围。编译模式已经取得并直接使用被分析系统源码；如还能提供其他相关源码，可一次提交目录或 Git 地址，系统自动区分业务源码和依赖源码。直接制品模式也使用同一个入口补充被分析系统及其依赖源码。源码可增加文件/行号、声明与注解、可读上下文和候选关系，但不会覆盖最终二进制裁决；暂不补充也可以继续，报告会分别标注源码证据缺口。",
-        "required_fields": [
-          "action"
-        ],
-        "missing_inputs": [],
-        "input_modes": [],
-        "input_normalization": {
-          "enabled": true,
-          "required_fields": [],
-          "allowed_actions": [
-            "continue",
-            "cancel"
-          ]
-        },
-        "response_schema": {
-          "type": "object",
-          "required": [
-            "action"
-          ],
-          "properties": {
-            "action": {
-              "type": "string",
-              "enum": [
-                "continue",
-                "cancel"
-              ]
-            },
-            "base_branch": {
-              "type": "string"
-            },
-            "current_branch": {
-              "type": "string"
-            },
-            "jdk_base": {
-              "type": "string",
-              "description": "升级前实际使用的 JDK 主版本，例如 8、11、17。仅在自动识别缺失或错误时修正。"
-            },
-            "jdk_current": {
-              "type": "string",
-              "description": "升级后实际使用的 JDK 主版本，例如 17、21。仅在自动识别缺失或错误时修正。"
-            },
-            "springboot_base": {
-              "type": "string",
-              "description": "升级前 Spring Boot 版本。仅在自动识别错误时修正。"
-            },
-            "springboot_current": {
-              "type": "string",
-              "description": "升级后 Spring Boot 版本。仅在自动识别错误时修正。"
-            },
-            "source_provision_choice": {
-              "type": "string",
-              "enum": [
-                "provide",
-                "continue_without"
-              ],
-              "description": "说明是否能够补充其他相关源码输入；不是对系统已经取得的源码进行使用授权。"
-            },
-            "source_locations": {
-              "type": "array",
-              "description": "可选。统一提交源码目录、多模块仓库根目录或 Git 地址；系统自动区分业务源码和依赖源码。"
-            },
-            "source_location_mappings": {
-              "type": "array",
-              "description": "仅在系统无法可靠分类某个源码位置时使用；每项包含 location、owner_type，依赖源码可附 owner_coord。"
-            },
-            "source_repo_hints": {
-              "type": "array",
-              "description": "可选。提供源码仓库线索，支持 path、repo_path、git_path 或 {coord_hint,path,notes}，系统会只对当前系统引用的升级依赖生成建议映射。"
-            },
-            "accept_suggested_mappings": {
-              "type": "boolean",
-              "description": "可选。设为 true 时，系统会接受自动识别出的依赖源码目录结果并写入配置。默认 false（continue 不会自动覆盖现有配置）。"
-            },
-            "notes": {
-              "type": "string"
-            }
-          }
-        },
-        "options": [
-          {
-            "id": "continue",
-            "label": "继续",
-            "description": "口径正确；一次补充可提供的相关源码，或明确暂不补充。系统自动分类并建立与最终制品绑定的语义覆盖。"
-          },
-          {
-            "id": "cancel",
-            "label": "稍后处理",
-            "description": "保留当前分析现场，调整范围或版本信息后再继续。"
-          }
-        ],
-        "action_requirements": {
-          "continue": {
-            "recommended_fields": [
-              "dependency_source_dirs",
-              "source_repo_hints"
-            ],
-            "description": "确认 target_module/project_scope；若未提交任何源码输入，继续前必须明确补充源码或不提供。用户已提交源码时直接使用，不需要二次确认。"
-          }
-        }
-      },
+      "interaction": null,
       "depends_on": [
         "step1"
       ],

@@ -1,0 +1,21 @@
+{
+  "schema": "java-upgrade-analyzer.blackbox-truth.v1",
+  "case_id": "final-method-change-v1",
+  "dataset_version": 1,
+  "scope": "closed_set",
+  "system_generated": false,
+  "human_review": {"status": "not_claimed", "reviewer": ""},
+  "input_evidence": {"algorithm": "sha256-path-nul-content-nul-v1", "source_tree_sha256": "950e98e7531c604f3fda4e48dfba803e049781b68c351097d54c9c3043c38cf2", "case_algorithm": "sha256-canonical-json-v1", "case_sha256": "1ec51f1e1df9daad7eebebd9b8c50579327b2560af92266994b2f56575c4840f", "source_files": ["src/base/contract/FinalApi.java", "src/business/contract/FinalApp.java", "src/business/contract/FinalClient.java", "src/current/contract/FinalApi.java", "src/oracle/contract/DefinitionMain.java", "src/oracle/contract/OracleMain.java"]},
+  "oracle_producers": [
+    {"id": "openjdk-javap-final-flags", "organization": "OpenJDK", "mechanism": "independent_bytecode_contract_inventory", "verifies": ["complete_acc_final_delta", "complete_direct_call_graph"]},
+    {"id": "openjdk-jvm-final-override-verifier", "organization": "OpenJDK", "mechanism": "actual_jvm_execution", "verifies": ["base_override_succeeds", "current_incompatible_class_change_error"]}
+  ],
+  "oracle_implementations": [{"path": "tests/blackbox/oracles/openjdk_oracle.py", "sha256": "6e72442077371b86c943f790b5982144497725200da3e89f22f66ca2bfee38ca"}],
+  "completeness": {"argument": "OpenJDK javap -v inventories every public member and finds exactly one stable identity whose flags add ACC_FINAL. The complete entrypoint graph directly invokes that identity. A pre-existing overriding subclass executes on base and is rejected by the current JVM with IncompatibleClassChangeError.", "verified_dimensions": ["api_identity", "jvm_descriptor", "closed_result_set", "entrypoint_reachability", "static_linkage"], "known_limits": []},
+  "expected_result_count": 2,
+  "expected_results": [
+    {"owner": "contract/FinalClient", "member": "", "descriptor": "", "member_kind": "class_definition", "dependency_lineages": [], "base_dependency_coords": ["blackbox:fixture-app:1.0"], "current_dependency_coords": ["blackbox:fixture-app:1.0"], "reachability_status": "not_found_in_static_analysis", "static_linkage_status": "undetermined", "impact_conclusion": "inconclusive", "runtime_verification_status": "undetermined", "exact_path_exists": false, "possible_path_exists": false, "path_set_complete": true, "paths": []},
+    {"owner": "contract/FinalApi", "member": "changedFinal", "descriptor": "()Ljava/lang/String;", "member_kind": "method", "dependency_lineages": ["blackbox:final-lib"], "base_dependency_coords": ["blackbox:final-lib:1.0"], "current_dependency_coords": ["blackbox:final-lib:2.0"], "reachability_status": "reachable", "static_linkage_status": "incompatible_if_executed", "impact_conclusion": "probable_impact", "runtime_verification_status": "required_not_executed", "exact_path_exists": true, "possible_path_exists": false, "path_set_complete": true, "paths": [{"certainty": "exact", "text": "contract.FinalApp.entry(contract.FinalApi) → contract.FinalApi.changedFinal()"}]}
+  ],
+  "forbidden_results": [{"owner": "contract/FinalApi", "member": "stable", "descriptor": "()Ljava/lang/String;", "member_kind": "method", "oracle_relation": "unchanged_member", "reason": "The stable method has identical flags, descriptor, and instructions."}]
+}

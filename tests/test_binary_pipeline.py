@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 import zipfile
 
@@ -16,6 +17,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR / "scripts"))
 
 import binary_asm_helper  # noqa: E402
+import binary_pipeline  # noqa: E402
 from binary_pipeline import (  # noqa: E402
     BinaryPipelineError,
     _source_inputs_contract,
@@ -34,6 +36,7 @@ from binary_validation_oracle import (  # noqa: E402
     _declared_members,
     _oracle_runtime_contexts,
     _oracle_provider_location,
+    _is_bound_jdk8_platform_path,
     _parse_javap_structural,
     _provider_resource_path,
     _resolve_member,
@@ -67,6 +70,208 @@ class BinaryPipelineTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
+
+    def test_cli_persists_structured_failure_for_memory_exhaustion(self):
+        config = self.root / "config.json"
+        config.write_text("{}", encoding="utf-8")
+        result_path = self.root / "result.json"
+        with patch.object(
+            binary_pipeline, "run_pipeline", side_effect=MemoryError("oom"),
+        ):
+            exit_code = binary_pipeline.main([
+                "--config", str(config),
+                "--output-root", str(self.root / "output"),
+                "--result-json", str(result_path),
+            ])
+
+        failure = json.loads(result_path.read_text(encoding="utf-8"))
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(
+            failure["reason_code"], "BINARY_PIPELINE_MEMORY_EXHAUSTED"
+        )
+        self.assertEqual(failure["failure_type"], "MemoryError")
+        self.assertIn("MemoryError", failure["traceback"])
+
+    def test_validation_checkpoint_resumes_without_rebuilding_generation(self):
+        output = self.root / "resume-output"
+        artifact = self.root / "artifact.jar"
+        artifact.write_bytes(b"artifact")
+        config = {
+            "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+            "base": {"artifacts": [{"path": str(artifact)}]},
+            "current": {"artifacts": [{"path": str(artifact)}]},
+        }
+        generation_identity = "a" * 64
+        generation = output / "binary_generations" / generation_identity
+        generation.mkdir(parents=True)
+        (generation / "result_generation.json").write_text(json.dumps({
+            "schema": "java-upgrade-analyzer.binary-result-generation.v1",
+            "result_generation_identity": generation_identity,
+            "authority": "binary_first",
+            "sidecar_content_identities": {},
+        }), encoding="utf-8")
+        checkpoint = {
+            "schema": binary_pipeline.RESUME_CHECKPOINT_SCHEMA,
+            "config_identity": binary_pipeline._resume_config_identity(config),
+            "implementation_identity": "implementation-1",
+            "input_artifact_identity": (
+                binary_pipeline._resume_input_artifact_identity(config)
+            ),
+            "result_generation_identity": generation_identity,
+            "runtime_comparison_identity": "runtime-comparison-1",
+            "analysis_scope_identity": "scope-1",
+            "analysis_context_identity": "context-1",
+            "result_summary": {"decision_bundle_identity": "decisions-1"},
+            "source_inputs": {},
+            "artifact_safety_policy": {},
+            "cache_metrics": {},
+        }
+        binary_pipeline._write_resume_checkpoint(output, checkpoint)
+        timings = binary_pipeline._PhaseTimingRecorder(
+            output, binary_pipeline.time.perf_counter()
+        )
+        validation = {
+            "status": "passed",
+            "issues": [],
+            "validation_run_identity": "validation-1",
+            "validation_result_path": str(generation / "validation.json"),
+        }
+        with patch.object(
+            binary_pipeline,
+            "_resume_implementation_identity",
+            return_value="implementation-1",
+        ), patch.object(
+            binary_pipeline, "validate_generation", return_value=validation,
+        ) as validate, patch.object(
+            binary_pipeline,
+            "activate_binary_generation",
+            return_value=str(output / "active_binary_generation.json"),
+        ):
+            result = binary_pipeline._resume_generation_validation(
+                config,
+                output_root=output,
+                source_inputs={},
+                asm_jar=self.asm_jar,
+                phase_timings=timings,
+                pipeline_started=binary_pipeline.time.perf_counter(),
+            )
+
+        self.assertTrue(result["resumed_from_generation_checkpoint"])
+        self.assertEqual(
+            result["result_generation_identity"], generation_identity
+        )
+        validate.assert_called_once_with(config, generation.resolve())
+        self.assertFalse(binary_pipeline._resume_checkpoint_path(output).exists())
+
+    def test_validation_checkpoint_is_rejected_when_config_changes(self):
+        output = self.root / "resume-rejected"
+        output.mkdir()
+        checkpoint = {
+            "schema": binary_pipeline.RESUME_CHECKPOINT_SCHEMA,
+            "config_identity": "old-config",
+            "implementation_identity": "implementation-1",
+            "result_generation_identity": "generation-1",
+        }
+        binary_pipeline._write_resume_checkpoint(output, checkpoint)
+        timings = binary_pipeline._PhaseTimingRecorder(
+            output, binary_pipeline.time.perf_counter()
+        )
+        with patch.object(
+            binary_pipeline,
+            "_resume_implementation_identity",
+            return_value="implementation-1",
+        ), patch.object(binary_pipeline, "validate_generation") as validate:
+            result = binary_pipeline._resume_generation_validation(
+                {"schema": "changed"},
+                output_root=output,
+                source_inputs={},
+                asm_jar=self.asm_jar,
+                phase_timings=timings,
+                pipeline_started=binary_pipeline.time.perf_counter(),
+            )
+
+        decision = json.loads((
+            output / "binary_observability" / "latest_resume_decision.json"
+        ).read_text(encoding="utf-8"))
+        self.assertIsNone(result)
+        validate.assert_not_called()
+        self.assertEqual(decision["reason_code"], "BINARY_RESUME_CONFIG_CHANGED")
+
+    def test_validation_checkpoint_rejects_invalid_generation_identity(self):
+        output = self.root / "resume-invalid-generation"
+        artifact = self.root / "resume-artifact.jar"
+        artifact.write_bytes(b"artifact")
+        config = {
+            "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+            "base": {"artifacts": [{"path": str(artifact)}]},
+            "current": {"artifacts": [{"path": str(artifact)}]},
+        }
+        checkpoint = {
+            "schema": binary_pipeline.RESUME_CHECKPOINT_SCHEMA,
+            "config_identity": binary_pipeline._resume_config_identity(config),
+            "implementation_identity": "implementation-1",
+            "input_artifact_identity": (
+                binary_pipeline._resume_input_artifact_identity(config)
+            ),
+            "result_generation_identity": "../../outside",
+        }
+        binary_pipeline._write_resume_checkpoint(output, checkpoint)
+        timings = binary_pipeline._PhaseTimingRecorder(
+            output, binary_pipeline.time.perf_counter()
+        )
+        with patch.object(
+            binary_pipeline,
+            "_resume_implementation_identity",
+            return_value="implementation-1",
+        ), patch.object(binary_pipeline, "validate_generation") as validate:
+            result = binary_pipeline._resume_generation_validation(
+                config,
+                output_root=output,
+                source_inputs={},
+                asm_jar=self.asm_jar,
+                phase_timings=timings,
+                pipeline_started=binary_pipeline.time.perf_counter(),
+            )
+
+        decision = json.loads((
+            output / "binary_observability" / "latest_resume_decision.json"
+        ).read_text(encoding="utf-8"))
+        self.assertIsNone(result)
+        validate.assert_not_called()
+        self.assertEqual(
+            decision["reason_code"],
+            "BINARY_RESUME_GENERATION_IDENTITY_INVALID",
+        )
+
+    def test_resume_config_identity_ignores_only_regenerated_source_root(self):
+        first = {
+            "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+            "source_overlay": {"source_sets": [{
+                "source_root": "/tmp/worktree-a/app",
+                "source_dirs": ["/tmp/worktree-a/app/src/main/java"],
+                "owner_type": "business",
+                "owner_coord": "app",
+                "module": "app",
+                "snapshot_revision": "a" * 40,
+            }]},
+        }
+        second = json.loads(json.dumps(first))
+        second["source_overlay"]["source_sets"][0].update({
+            "source_root": "/tmp/worktree-b/app",
+            "source_dirs": ["/tmp/worktree-b/app/src/main/java"],
+        })
+
+        self.assertEqual(
+            binary_pipeline._resume_config_identity(first),
+            binary_pipeline._resume_config_identity(second),
+        )
+        second["source_overlay"]["source_sets"][0][
+            "snapshot_revision"
+        ] = "b" * 40
+        self.assertNotEqual(
+            binary_pipeline._resume_config_identity(first),
+            binary_pipeline._resume_config_identity(second),
+        )
 
     def tearDown(self):
         self.temp.cleanup()
@@ -142,6 +347,36 @@ public class demo.ArrayCasts {
                 "jrt:/java.base/java/lang/String.class"
             )
         )
+
+    def test_runtime_oracle_recognizes_only_bound_jdk8_platform_archives(self):
+        jdk8 = self.root / "jdk8"
+        runtime_lib = jdk8 / "jre" / "lib"
+        extension = runtime_lib / "ext" / "provider.jar"
+        nested_extension = runtime_lib / "ext" / "nested" / "provider.jar"
+        zip_extension = runtime_lib / "ext" / "provider.zip"
+        classes = jdk8 / "jre" / "classes" / "vendor" / "Override.class"
+        application = self.root / "application.jar"
+        for path in (
+            runtime_lib / "rt.jar",
+            extension,
+            nested_extension,
+            zip_extension,
+            classes,
+            application,
+        ):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"fixture")
+
+        self.assertTrue(
+            _is_bound_jdk8_platform_path(runtime_lib / "rt.jar", jdk8)
+        )
+        self.assertTrue(_is_bound_jdk8_platform_path(extension, jdk8))
+        self.assertFalse(
+            _is_bound_jdk8_platform_path(nested_extension, jdk8)
+        )
+        self.assertFalse(_is_bound_jdk8_platform_path(zip_extension, jdk8))
+        self.assertTrue(_is_bound_jdk8_platform_path(classes, jdk8))
+        self.assertFalse(_is_bound_jdk8_platform_path(application, jdk8))
 
     def test_runtime_oracle_applies_object_fallback_for_interface_methods(self):
         observations = {

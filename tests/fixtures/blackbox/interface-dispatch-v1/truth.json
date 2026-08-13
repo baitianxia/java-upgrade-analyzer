@@ -1,0 +1,63 @@
+{
+  "schema": "java-upgrade-analyzer.blackbox-truth.v1",
+  "case_id": "interface-dispatch-v1",
+  "dataset_version": 1,
+  "scope": "closed_set",
+  "system_generated": false,
+  "human_review": {"status": "not_claimed", "reviewer": ""},
+  "input_evidence": {
+    "algorithm": "sha256-path-nul-content-nul-v1",
+    "source_tree_sha256": "476c6cd8565a29fe868383fe9cdeb9a6c64ba002baec6046f48ddb816daee120",
+    "case_algorithm": "sha256-canonical-json-v1",
+    "case_sha256": "86e78fe5bfcc27f7cce324578ee030b50dd81d2d1d9392c48cc9456531e472a2",
+    "source_files": [
+      "src/base/contract/DefaultService.java",
+      "src/base/contract/DefaultServiceImpl.java",
+      "src/business/contract/DispatchApp.java",
+      "src/current/contract/DefaultService.java",
+      "src/current/contract/DefaultServiceImpl.java",
+      "src/oracle/contract/OracleMain.java"
+    ]
+  },
+  "oracle_producers": [
+    {
+      "id": "openjdk-javap-interface-inventory-and-callgraph",
+      "organization": "OpenJDK",
+      "mechanism": "independent_bytecode_inventory",
+      "verifies": ["complete_removed_default_method_set", "invokeinterface_edges"]
+    },
+    {
+      "id": "openjdk-jvm-interface-linker",
+      "organization": "OpenJDK",
+      "mechanism": "actual_jvm_execution",
+      "verifies": ["base_default_dispatch_succeeds", "current_no_such_method_error"]
+    }
+  ],
+  "oracle_implementations": [
+    {"path": "tests/blackbox/oracles/openjdk_oracle.py", "sha256": "6e72442077371b86c943f790b5982144497725200da3e89f22f66ca2bfee38ca"}
+  ],
+  "completeness": {
+    "argument": "javap inventories every public default method on the only changed interface and independently reads every invokeinterface instruction in the complete business class. The isolated JVM runner instantiates an implementation and proves both base default dispatches succeed while the current runtime raises NoSuchMethodError for each removed interface method.",
+    "verified_dimensions": ["api_identity", "jvm_descriptor", "closed_result_set", "entrypoint_reachability", "static_linkage"],
+    "known_limits": []
+  },
+  "expected_result_count": 2,
+  "expected_results": [
+    {
+      "owner": "contract/DefaultService", "member": "removedReachableDefault", "descriptor": "()Ljava/lang/String;", "member_kind": "method",
+      "dependency_lineages": ["blackbox:interface-dispatch-lib"], "base_dependency_coords": ["blackbox:interface-dispatch-lib:1.0"], "current_dependency_coords": ["blackbox:interface-dispatch-lib:2.0"],
+      "reachability_status": "reachable", "static_linkage_status": "incompatible_if_executed", "impact_conclusion": "probable_impact", "runtime_verification_status": "required_not_executed",
+      "exact_path_exists": true, "possible_path_exists": false, "path_set_complete": true,
+      "paths": [{"certainty": "exact", "text": "contract.DispatchApp.entryDefault(contract.DefaultService) → contract.DefaultService.removedReachableDefault()"}]
+    },
+    {
+      "owner": "contract/DefaultService", "member": "removedUnreachableDefault", "descriptor": "()Ljava/lang/String;", "member_kind": "method",
+      "dependency_lineages": ["blackbox:interface-dispatch-lib"], "base_dependency_coords": ["blackbox:interface-dispatch-lib:1.0"], "current_dependency_coords": ["blackbox:interface-dispatch-lib:2.0"],
+      "reachability_status": "not_found_in_static_analysis", "static_linkage_status": "incompatible_if_executed", "impact_conclusion": "inconclusive", "runtime_verification_status": "undetermined",
+      "exact_path_exists": false, "possible_path_exists": false, "path_set_complete": true, "paths": []
+    }
+  ],
+  "forbidden_results": [
+    {"owner": "contract/DefaultService", "member": "stableDefault", "descriptor": "()Ljava/lang/String;", "member_kind": "method", "oracle_relation": "unchanged_member", "reason": "The default method remains byte-for-byte equivalent on both sides."}
+  ]
+}

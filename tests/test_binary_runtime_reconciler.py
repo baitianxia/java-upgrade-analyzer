@@ -82,6 +82,17 @@ class BinaryRuntimeReconcilerTest(unittest.TestCase):
                   public Class<?> literal() { return Init.class; }
                 }
             """,
+            "demo/NestHost.java": """
+                package demo;
+                public class NestHost {
+                  private String privateValue() { return "nested"; }
+                  public static class Member {
+                    public String call(NestHost host) {
+                      return host.privateValue();
+                    }
+                  }
+                }
+            """,
         }
         source_paths = []
         for relative, content in sources.items():
@@ -465,6 +476,74 @@ class BinaryRuntimeReconcilerTest(unittest.TestCase):
         self.assertEqual(linkage["linkage_status"], "illegal_access")
         self.assertEqual(dispatch["dispatch_status"], "exact")
         self.assertEqual(len(dispatch["implementation_target_identities"]), 1)
+
+    def test_private_access_between_validated_nestmates_is_linkage_compatible(self):
+        with self.build_store() as store:
+            edge_id = next(
+                row["direct_edge_identity"]
+                for row in store.rows("direct_edges")
+                if row["symbolic_owner"] == "demo/NestHost"
+                and row["symbolic_name"] == "privateValue"
+            )
+            result = RuntimeReconciler(
+                store,
+                self.profile,
+                self.platform,
+                analysis_context_identity="analysis-context-nestmate-access",
+            ).reconcile()
+
+        member = next(
+            item for item in result.member_resolutions
+            if item["direct_edge_identity"] == edge_id
+        )
+        linkage = next(
+            item for item in result.linkage_resolutions
+            if item["direct_edge_identity"] == edge_id
+        )
+        self.assertEqual(member["member_resolution_status"], "resolved")
+        self.assertEqual(member["resolved_owner"], "demo/NestHost")
+        self.assertEqual(linkage["linkage_status"], "resolved")
+
+    def test_nestmate_access_fails_closed_for_invalid_runtime_nest_metadata(self):
+        with self.build_store() as store:
+            reconciler = RuntimeReconciler(
+                store,
+                self.profile,
+                self.platform,
+                analysis_context_identity="analysis-context-invalid-nestmates",
+            )
+            reconciler.reconcile()
+            host_provider = reconciler._provider(
+                "application-loader", "demo/NestHost"
+            )
+            host_info = reconciler._class_info(host_provider)
+            self.assertIsNotNone(host_info)
+            original_members = host_info["nest_members"]
+
+            self.assertFalse(reconciler._validated_nestmates(
+                "demo/NestHost$Member", "other-loader",
+                "demo/NestHost", "application-loader",
+            ))
+            self.assertFalse(reconciler._validated_nestmates(
+                "other/NestHost$Member", "application-loader",
+                "demo/NestHost", "application-loader",
+            ))
+            self.assertFalse(reconciler._validated_nestmates(
+                "demo/Caller", "application-loader",
+                "demo/NestHost", "application-loader",
+            ))
+
+            host_info["nest_members"] = ()
+            self.assertFalse(reconciler._validated_nestmates(
+                "demo/NestHost$Member", "application-loader",
+                "demo/NestHost", "application-loader",
+            ))
+            host_info["nest_members"] = original_members
+            host_info["nest_host"] = "demo/OtherHost"
+            self.assertFalse(reconciler._validated_nestmates(
+                "demo/NestHost$Member", "application-loader",
+                "demo/NestHost", "application-loader",
+            ))
 
 
 if __name__ == "__main__":

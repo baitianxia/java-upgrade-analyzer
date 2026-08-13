@@ -1,0 +1,151 @@
+{
+  "schema": "java-upgrade-analyzer.workflow-blackbox-truth.v1",
+  "case_id": "full-public-workflow-v1",
+  "system_generated": false,
+  "oracle_producers": [
+    {
+      "id": "openjdk-classfile-and-linker",
+      "organization": "OpenJDK",
+      "mechanism": "javap_inventory_plus_real_jvm_linkage",
+      "sources": ["javap", "java"],
+      "verifies": ["binary member inventory", "actual JVM linkage outcome"]
+    },
+    {
+      "id": "stdlib-archive-inventory",
+      "organization": "Python Software Foundation",
+      "mechanism": "zip_entry_and_maven_metadata_inventory",
+      "sources": ["zipfile", "hashlib"],
+      "verifies": ["artifact entry inventory", "artifact byte identity"]
+    },
+    {
+      "id": "authored-workflow-contract",
+      "organization": "java-upgrade-analyzer maintainers",
+      "mechanism": "closed_expected_state_and_output_contract",
+      "sources": ["RUNBOOK.md", "scripts/step_manifest.json"],
+      "verifies": ["checkpoint sequence", "required terminal outputs"]
+    }
+  ],
+  "expected_dependency": {
+    "coord": "org.example:demo-lib",
+    "old_version": "1.0.0",
+    "new_version": "2.0.0"
+  },
+  "expected_api": {
+    "owner": "demo/Api",
+    "member": "removed",
+    "descriptor": "()Ljava/lang/String;",
+    "member_kind": "method",
+    "reachability_status": "reachable",
+    "static_linkage_status": "incompatible_if_executed",
+    "impact_conclusion": "probable_impact",
+    "exact_path_exists": true
+  },
+  "expected_api_rows": [
+    {
+      "coord": "org.example:demo-lib",
+      "api_name": "demo.Api.removed",
+      "symbol_kind": "method",
+      "change_type": "REMOVED",
+      "severity": "P0"
+    },
+    {
+      "coord": "org.example:demo-lib",
+      "api_name": "demo.Api.removed",
+      "symbol_kind": "method",
+      "change_type": "MEMBER_RESOLUTION_CHANGED",
+      "severity": "P1"
+    }
+  ],
+  "expected_formal_results": [
+    {
+      "owner": "demo/Api",
+      "member": "removed",
+      "descriptor": "()Ljava/lang/String;",
+      "member_kind": "method",
+      "dependency_lineages": ["org.example:demo-lib"],
+      "base_dependency_coords": ["org.example:demo-lib:1.0.0"],
+      "current_dependency_coords": ["org.example:demo-lib:2.0.0"],
+      "reachability_status": "reachable",
+      "static_linkage_status": "incompatible_if_executed",
+      "impact_conclusion": "probable_impact",
+      "runtime_verification_status": "required_not_executed",
+      "exact_path_exists": true,
+      "possible_path_exists": false,
+      "path_set_complete": true,
+      "paths": [
+        {
+          "certainty": "exact",
+          "text": "example.Application.main(java.lang.String[]) → demo.Api.removed()"
+        }
+      ]
+    }
+  ],
+  "expected_context": {
+    "build_tool": "maven",
+    "jdk_base": "8",
+    "jdk_current": "8",
+    "jdk_upgraded": false,
+    "changed_deps": 1
+  },
+  "expected_checkpoints": [
+    {"step_id": "step0", "kind": "input_request"}
+  ],
+  "expected_completion": {
+    "process_exit_code": 0,
+    "workflow_status": "completed_with_limits",
+    "current_step": "done",
+    "completed_step": "step6"
+  },
+  "expected_report_contract": {
+    "analysis_scope": {
+      "mode": "full",
+      "validation_status": "passed",
+      "available_dependency_count": 1,
+      "included_dependency_count": 1,
+      "total_api_count": 2,
+      "analyzed_api_count": 2,
+      "excluded_dependency_coords": []
+    },
+    "finding_bucket_counts": {
+      "p0": 1,
+      "p1": 1,
+      "p2": 0,
+      "probable_impact": 0,
+      "uncertain": 0,
+      "not_found": 0,
+      "not_analyzed": 0,
+      "needs_input": 0
+    },
+    "csv_row_counts": {
+      "evidence/api_changes/all_changed_apis.csv": 2,
+      "evidence/api_changes/changed_dependencies.csv": 1,
+      "evidence/call_chain/alerts.csv": 2,
+      "deliverables/all-affected-dependencies.csv": 1,
+      "deliverables/all-impact-details.csv": 2
+    },
+    "utf8_bom_csvs": [
+      "evidence/api_changes/all_changed_apis.csv",
+      "evidence/api_changes/changed_dependencies.csv",
+      "evidence/call_chain/alerts.csv",
+      "deliverables/all-affected-dependencies.csv",
+      "deliverables/all-impact-details.csv"
+    ]
+  },
+  "required_outputs": [
+    "evidence/context/context.json",
+    "evidence/context/dep_graph.json",
+    ".runtime/binary_authority/active_binary_generation.json",
+    "evidence/api_changes/all_changed_apis.csv",
+    "evidence/api_changes/changed_dependencies.csv",
+    "evidence/call_chain/summary.json",
+    "evidence/call_chain/summary.md",
+    ".runtime/indexes/s5_query_index.json",
+    ".runtime/findings/s6_findings.json",
+    "deliverables/report.md",
+    "deliverables/all-affected-dependencies.md",
+    "deliverables/all-affected-dependencies.csv",
+    "deliverables/all-impact-details.md",
+    "deliverables/all-impact-details.csv",
+    "deliverables/analysis-scope.md"
+  ]
+}

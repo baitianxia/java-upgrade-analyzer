@@ -1,0 +1,21 @@
+{
+  "schema": "java-upgrade-analyzer.blackbox-case.v1",
+  "case_id": "virtual-inherited-dispatch-v1",
+  "dataset_version": 1,
+  "public_entrypoint": "scripts/binary_pipeline.py",
+  "truth_file": "truth.json",
+  "oracle_contract": "removed_member_linkage_closed_set",
+  "capabilities": ["method_removal", "not_found_negative", "reachable_positive", "unchanged_member_negative", "virtual_inherited_dispatch"],
+  "library_class": "contract.ParentApi",
+  "library_classes": ["contract.ParentApi", "contract.ChildApi"],
+  "business_class": "contract.InheritanceApp",
+  "oracle_main_class": "contract.OracleMain",
+  "library_lineage": "blackbox:inheritance-lib",
+  "base_coordinate": "blackbox:inheritance-lib:1.0",
+  "current_coordinate": "blackbox:inheritance-lib:2.0",
+  "entrypoints": [{"class_name": "contract/InheritanceApp", "member_name": "entry", "descriptor": "(Lcontract/ChildApi;)Ljava/lang/String;"}],
+  "linkage_probes": [
+    {"mode": "reachable", "owner": "contract/ParentApi", "member": "inheritedReachable", "descriptor": "()Ljava/lang/String;", "member_kind": "method", "linkage_error": "NoSuchMethodError"},
+    {"mode": "dormant", "owner": "contract/ParentApi", "member": "inheritedDormant", "descriptor": "()Ljava/lang/String;", "member_kind": "method", "linkage_error": "NoSuchMethodError"}
+  ]
+}

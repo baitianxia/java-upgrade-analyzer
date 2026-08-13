@@ -1520,10 +1520,14 @@ def main():
         )
         for side in ('base', 'current')
     )
-    if artifact_pair_complete:
+    confirmed_jdk_pair_complete = all(
+        normalize_jdk_version(orchestrated_input.get(f'jdk_{side}'))
+        for side in ('base', 'current')
+    )
+    if artifact_pair_complete or confirmed_jdk_pair_complete:
         # Step1 已给出 base/current 的实际业务字节码，不再为补一个声明值而
-        # 启动 Maven/Gradle；只读构建清单用于一致性诊断，避免网络、daemon
-        # 或文件锁反过来阻断流程。
+        # 启动 Maven/Gradle；同样，Step0 已真实执行并绑定用户确认的两侧 JDK
+        # 时也不应在 Step2 再做后置环境探测。只读构建清单仅用于一致性诊断。
         build_jdk_base, build_jdk_cur, _ = detect_jdk_versions_from_manifests(
             base_revision, current_revision,
             git_work_dir, build_tool,

@@ -183,7 +183,15 @@ class Step2SourceDirsTest(unittest.TestCase):
                 "require_pinned_git_commit",
                 side_effect=lambda revision, *_args, **_kwargs: revision,
             ), patch.object(
-                step2, "detect_jdk_versions", return_value=("8", "17")
+                step2,
+                "detect_jdk_versions_from_manifests",
+                return_value=("8", "17", "pom.xml"),
+            ), patch.object(
+                step2,
+                "detect_jdk_versions",
+                side_effect=AssertionError(
+                    "Step0 已确认两侧 JDK 后不应在 Step2 启动构建工具探测"
+                ),
             ), patch.object(
                 step2, "detect_spring_cloud", return_value=(False, None)
             ), patch.object(

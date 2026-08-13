@@ -16,7 +16,11 @@ CATEGORIES = {
     "artifact_facts": ("tests.test_binary_artifact_diff", "tests.test_binary_asm_helper"),
     "runtime_reconciliation": ("tests.test_binary_runtime_reconciler",),
     "decision_projection": ("tests.test_binary_decision_engine", "tests.test_binary_output"),
-    "runtime_bytecode_reachability": ("tests.test_binary_trace_engine", "tests.test_binary_pipeline"),
+    "result_truth": ("tests.test_binary_result_truth",),
+    "runtime_bytecode_reachability": (
+        "tests.test_binary_trace_engine", "tests.test_binary_pipeline",
+        "tests.test_binary_generated_regression",
+    ),
     "query": ("tests.test_s5_query_call_chain",),
 }
 
@@ -29,7 +33,10 @@ def main(argv=None) -> int:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     requested = args.category or (
-        ["artifact_facts", "runtime_reconciliation", "decision_projection"]
+        [
+            "artifact_facts", "runtime_reconciliation", "decision_projection",
+            "result_truth",
+        ]
         if args.profile == "core"
         else list(CATEGORIES)
     )

@@ -1,0 +1,32 @@
+{
+  "schema": "java-upgrade-analyzer.blackbox-case.v1",
+  "case_id": "static-instance-change-v1",
+  "dataset_version": 1,
+  "public_entrypoint": "scripts/binary_pipeline.py",
+  "truth_file": "truth.json",
+  "oracle_contract": "member_contract_linkage_closed_set",
+  "capabilities": [
+    "field_static_instance_change",
+    "method_static_instance_change",
+    "reachable_positive",
+    "unchanged_member_negative"
+  ],
+  "library_class": "contract.DispatchShape",
+  "business_class": "contract.DispatchShapeApp",
+  "oracle_main_class": "contract.OracleMain",
+  "library_lineage": "blackbox:dispatch-shape-lib",
+  "base_coordinate": "blackbox:dispatch-shape-lib:1.0",
+  "current_coordinate": "blackbox:dispatch-shape-lib:2.0",
+  "entrypoints": [
+    {"class_name": "contract/DispatchShapeApp", "member_name": "entryInstanceMethod", "descriptor": "()Ljava/lang/String;"},
+    {"class_name": "contract/DispatchShapeApp", "member_name": "entryStaticMethod", "descriptor": "()Ljava/lang/String;"},
+    {"class_name": "contract/DispatchShapeApp", "member_name": "entryInstanceField", "descriptor": "()I"},
+    {"class_name": "contract/DispatchShapeApp", "member_name": "entryStaticField", "descriptor": "()I"}
+  ],
+  "linkage_probes": [
+    {"mode": "instance-method", "owner": "contract/DispatchShape", "member": "instanceToStatic", "descriptor": "()Ljava/lang/String;", "member_kind": "method", "linkage_error": "IncompatibleClassChangeError"},
+    {"mode": "static-method", "owner": "contract/DispatchShape", "member": "staticToInstance", "descriptor": "()Ljava/lang/String;", "member_kind": "method", "linkage_error": "IncompatibleClassChangeError"},
+    {"mode": "instance-field", "owner": "contract/DispatchShape", "member": "instanceFieldToStatic", "descriptor": "I", "member_kind": "field", "linkage_error": "IncompatibleClassChangeError"},
+    {"mode": "static-field", "owner": "contract/DispatchShape", "member": "staticFieldToInstance", "descriptor": "I", "member_kind": "field", "linkage_error": "IncompatibleClassChangeError"}
+  ]
+}

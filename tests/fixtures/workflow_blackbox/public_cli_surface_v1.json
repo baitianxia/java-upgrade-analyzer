@@ -1,0 +1,159 @@
+{
+  "schema": "java-upgrade-analyzer.workflow-blackbox-truth.v1",
+  "case_id": "public-cli-surface-v1",
+  "system_generated": false,
+  "oracle_producers": [
+    {
+      "id": "maintainer-authored-cli-contract",
+      "organization": "java-upgrade-analyzer maintainers",
+      "mechanism": "versioned_public_command_contract",
+      "verifies": [
+        "complete documented public command set",
+        "complete documented option set",
+        "required help descriptions"
+      ]
+    },
+    {
+      "id": "python-argparse-public-protocol",
+      "organization": "Python Software Foundation",
+      "mechanism": "independent_help_and_parse_error_protocol",
+      "verifies": [
+        "help exits successfully",
+        "unknown options exit with usage error",
+        "parse failures do not expose tracebacks"
+      ]
+    }
+  ],
+  "commands": [
+    {
+      "id": "binary_pipeline",
+      "path": "scripts/binary_pipeline.py",
+      "expected_options": [
+        "--config",
+        "--help",
+        "--output-root",
+        "--result-json"
+      ],
+      "invalid_option_prefix": [
+        "--config",
+        "does-not-exist.json",
+        "--output-root",
+        "unused-output"
+      ],
+      "required_help_markers": ["Run the binary-first analysis generation"]
+    },
+    {
+      "id": "run_step",
+      "path": "scripts/run_step.py",
+      "expected_options": [
+        "--active-maven-profile",
+        "--application-source",
+        "--background",
+        "--base-artifact-path",
+        "--base-branch",
+        "--base-jdk-home",
+        "--base-tool",
+        "--binary-pipeline-config",
+        "--current-artifact-path",
+        "--current-branch",
+        "--current-jdk-home",
+        "--current-tool",
+        "--dependency-source-clone-timeout",
+        "--dependency-source-dirs",
+        "--describe-step0-contract",
+        "--help",
+        "--include-test-scope",
+        "--manifest",
+        "--project-dir",
+        "--report-dir",
+        "--response-file",
+        "--response-json",
+        "--seed-json",
+        "--step",
+        "--strict-risk-gate",
+        "--target-module"
+      ],
+      "required_help_markers": [
+        "统一执行 Java 升级分析的单个 Step",
+        "step0,step1,step2,step3,step4,step5,step6,auto"
+      ]
+    },
+    {
+      "id": "query_call_chain",
+      "path": "scripts/s5_query_call_chain.py",
+      "expected_options": [
+        "--coord",
+        "--fuzzy",
+        "--help",
+        "--json",
+        "--limit",
+        "--max-depth",
+        "--method",
+        "--package",
+        "--report-dir"
+      ],
+      "invalid_option_prefix": [
+        "--report-dir",
+        "does-not-exist",
+        "--method",
+        "sample.Type.call()"
+      ],
+      "required_help_markers": ["按方法、依赖坐标或包前缀查询 Step5 调用链索引"]
+    },
+    {
+      "id": "binary_performance_gate",
+      "path": "scripts/binary_performance_gate.py",
+      "expected_options": [
+        "--classes-per-jar",
+        "--gate",
+        "--help",
+        "--jar-count",
+        "--output",
+        "--skip-legacy",
+        "--verify-recorded-gate",
+        "--warm-samples",
+        "--work-root"
+      ],
+      "required_help_markers": ["Measure binary-first scale performance"]
+    },
+    {
+      "id": "quality_gate",
+      "path": "scripts/quality_gate.py",
+      "expected_options": [
+        "--audit-root",
+        "--dry-run",
+        "--help",
+        "--jdk-home",
+        "--json-out",
+        "--profile",
+        "--real-project-cache"
+      ],
+      "required_help_markers": [
+        "Binary-first quality gate",
+        "blackbox,whitebox,performance,quick,step5,release"
+      ]
+    },
+    {
+      "id": "binary_real_project_guard",
+      "path": "scripts/binary_real_project_guard.py",
+      "expected_options": [
+        "--cache-root",
+        "--download",
+        "--help",
+        "--jdk-home",
+        "--manifest",
+        "--output-root",
+        "--verify-manifest"
+      ],
+      "required_help_markers": [
+        "Pinned real-project final-artifact guard for the binary-first engine."
+      ]
+    }
+  ],
+  "invalid_option_contract": {
+    "argument": "--definitely-unsupported-public-option",
+    "exit_code": 2,
+    "stderr_markers": ["usage:", "unrecognized arguments:"],
+    "forbidden_stderr_markers": ["Traceback"]
+  }
+}

@@ -49,6 +49,14 @@ class BinaryToolResult:
         return self.failure is None and self.returncode == 0
 
 
+def tool_failure_is_retryable(failure: BinaryToolFailure | None) -> bool:
+    """Retry only failures that can plausibly change without configuration edits."""
+    return bool(
+        failure is not None
+        and failure.failure_kind in {"timeout", "start_failed"}
+    )
+
+
 def _failure(
     *, stage: str, prefix: str, kind: str, command: tuple[str, ...],
     timeout_seconds: float, stderr: str, returncode: int | None,
@@ -150,4 +158,9 @@ def execute_binary_tool(
     return BinaryToolResult(stdout, stderr, returncode)
 
 
-__all__ = ["BinaryToolFailure", "BinaryToolResult", "execute_binary_tool"]
+__all__ = [
+    "BinaryToolFailure",
+    "BinaryToolResult",
+    "execute_binary_tool",
+    "tool_failure_is_retryable",
+]

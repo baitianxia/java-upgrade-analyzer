@@ -1,0 +1,79 @@
+{
+  "schema": "java-upgrade-analyzer.workflow-blackbox-truth.v1",
+  "case_id": "step4-scope-selection-v1",
+  "system_generated": false,
+  "oracle_producers": [
+    {
+      "id": "openjdk-two-library-linker",
+      "organization": "OpenJDK",
+      "mechanism": "javap inventories and isolated JVM linkage probes for both libraries",
+      "verifies": ["two removed methods", "two independent NoSuchMethodError outcomes"]
+    },
+    {
+      "id": "stdlib-closed-artifact-inventory",
+      "organization": "Python Software Foundation",
+      "mechanism": "ordered nested JAR and Maven metadata inventory",
+      "verifies": ["exact two-dependency candidate set", "scope inclusion and exclusion partitions"]
+    }
+  ],
+  "checkpoint": {
+    "step_id": "step4",
+    "reason_code": "step4_review_required",
+    "available_dependency_count": 2,
+    "total_api_count": 4,
+    "option_coords": ["org.example:demo-lib", "org.example:other-lib"],
+    "required_fields": ["scope_mode"]
+  },
+  "invalid_partial_without_target": {
+    "exit_code": 1,
+    "stderr_contains": "必须提供非空选择"
+  },
+  "invalid_unknown_target": {
+    "exit_code": 1,
+    "stderr_contains": "未命中当前候选"
+  },
+  "partial": {
+    "process_exit_code": 0,
+    "workflow_status": "completed_with_limits",
+    "scope": {
+      "mode": "partial",
+      "validation_status": "passed",
+      "available_dependency_count": 2,
+      "included_dependency_count": 1,
+      "total_api_count": 4,
+      "analyzed_api_count": 2,
+      "included_dependency_coords": ["org.example:demo-lib"],
+      "excluded_dependency_coords": ["org.example:other-lib"]
+    },
+    "impact_row_count": 2,
+    "forbidden_impact_text": "other.Other.gone"
+  },
+  "full": {
+    "process_exit_code": 0,
+    "workflow_status": "completed_with_limits",
+    "scope": {
+      "mode": "full",
+      "validation_status": "passed",
+      "available_dependency_count": 2,
+      "included_dependency_count": 2,
+      "total_api_count": 4,
+      "analyzed_api_count": 4,
+      "included_dependency_coords": ["org.example:demo-lib", "org.example:other-lib"],
+      "excluded_dependency_coords": []
+    },
+    "impact_row_count": 4
+  },
+  "zero": {
+    "process_exit_code": 0,
+    "scope": {
+      "mode": "full",
+      "validation_status": "passed",
+      "available_dependency_count": 0,
+      "included_dependency_count": 0,
+      "total_api_count": 0,
+      "analyzed_api_count": 0,
+      "included_dependency_coords": [],
+      "excluded_dependency_coords": []
+    }
+  }
+}

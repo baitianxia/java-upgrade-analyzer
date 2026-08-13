@@ -1,0 +1,65 @@
+{
+  "schema": "java-upgrade-analyzer.runtime-blackbox-truth.v1",
+  "case_id": "tool-failure-public-contract-v1",
+  "system_generated": false,
+  "oracle_producers": [
+    {
+      "id": "os-executable-fault-injection",
+      "organization": "operating system",
+      "mechanism": "real executable removal, mode-bit denial, exit status, deadline, and stdout behavior",
+      "verifies": ["missing", "permission_denied", "nonzero_exit", "timeout", "output_empty"]
+    },
+    {
+      "id": "independent-public-json-validator",
+      "organization": "Python Software Foundation",
+      "mechanism": "parse public stderr/result JSON and verify retry/fail-closed state",
+      "verifies": ["malformed_output", "retry_exhausted", "no activation"]
+    }
+  ],
+  "public_failure_schema": "java-upgrade-analyzer.binary-pipeline-failure.v1",
+  "max_attempts": 2,
+  "cases": {
+    "missing": {
+      "phase": "static_preflight",
+      "reason_code": "BINARY_JDK_PREFLIGHT_FAILED",
+      "cause_reason_code": "JDK_REQUIRED_TOOL_MISSING"
+    },
+    "permission": {
+      "phase": "static_preflight",
+      "reason_code": "BINARY_JDK_PREFLIGHT_FAILED",
+      "cause_reason_code": "JDK_JAVA_VERSION_PERMISSION_DENIED"
+    },
+    "nonzero": {
+      "phase": "independent_validation",
+      "reason_code": "BINARY_ORACLE_EXECUTION_NONZERO_EXIT",
+      "failure_kind": "nonzero_exit",
+      "attempt_count": 1,
+      "retryable": false,
+      "retry_exhausted": false
+    },
+    "timeout": {
+      "phase": "independent_validation",
+      "reason_code": "BINARY_ORACLE_EXECUTION_RETRY_EXHAUSTED",
+      "failure_kind": "timeout",
+      "attempt_count": 2,
+      "retryable": true,
+      "retry_exhausted": true
+    },
+    "empty": {
+      "phase": "independent_validation",
+      "reason_code": "BINARY_ORACLE_EXECUTION_OUTPUT_EMPTY",
+      "failure_kind": "output_empty",
+      "attempt_count": 1,
+      "retryable": false,
+      "retry_exhausted": false
+    },
+    "malformed": {
+      "phase": "independent_validation",
+      "reason_code": "BINARY_ORACLE_OUTPUT_INVALID",
+      "failure_kind": "malformed_output",
+      "attempt_count": 1,
+      "retryable": false,
+      "retry_exhausted": false
+    }
+  }
+}

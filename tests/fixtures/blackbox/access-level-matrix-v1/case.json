@@ -1,0 +1,114 @@
+{
+  "schema": "java-upgrade-analyzer.blackbox-case.v1",
+  "case_id": "access-level-matrix-v1",
+  "dataset_version": 1,
+  "public_entrypoint": "scripts/binary_pipeline.py",
+  "truth_file": "truth.json",
+  "oracle_contract": "removed_member_linkage_closed_set",
+  "capabilities": [
+    "access_restriction",
+    "access_restriction_package",
+    "access_restriction_private",
+    "access_restriction_protected",
+    "package_peer_access",
+    "protected_receiver_constraint",
+    "protected_subclass_access",
+    "reachable_positive",
+    "unchanged_member_negative"
+  ],
+  "library_class": "lib.AccessApi",
+  "business_class": "client.AccessApp",
+  "business_classes": [
+    "client.AccessApp", "client.Child", "client.ForeignChild", "lib.Peer"
+  ],
+  "oracle_main_class": "oracle.OracleMain",
+  "definition_oracle_main_class": "oracle.DefinitionMain",
+  "business_coordinate": "blackbox:fixture-app:1.0",
+  "library_lineage": "blackbox:access-level-lib",
+  "base_coordinate": "blackbox:access-level-lib:1.0",
+  "current_coordinate": "blackbox:access-level-lib:2.0",
+  "entrypoints": [
+    {
+      "class_name": "client/Child",
+      "member_name": "entryProtected",
+      "descriptor": "(Lclient/Child;)Ljava/lang/String;"
+    },
+    {
+      "class_name": "client/AccessApp",
+      "member_name": "entryPackage",
+      "descriptor": "(Llib/AccessApi;)Ljava/lang/String;"
+    },
+    {
+      "class_name": "client/ForeignChild",
+      "member_name": "entryProtectedForeign",
+      "descriptor": "(Lclient/ForeignChild;Llib/AccessApi;)Ljava/lang/String;"
+    },
+    {
+      "class_name": "lib/Peer",
+      "member_name": "entryPackagePeer",
+      "descriptor": "(Llib/AccessApi;)Ljava/lang/String;"
+    },
+    {
+      "class_name": "client/AccessApp",
+      "member_name": "entryPrivate",
+      "descriptor": "(Llib/AccessApi;)Ljava/lang/String;"
+    }
+  ],
+  "linkage_probes": [
+    {
+      "mode": "package",
+      "owner": "lib/AccessApi",
+      "member": "packageForOutsider",
+      "descriptor": "()Ljava/lang/String;",
+      "member_kind": "method",
+      "linkage_error": "IllegalAccessError"
+    },
+    {
+      "mode": "private",
+      "owner": "lib/AccessApi",
+      "member": "privateForOutsider",
+      "descriptor": "()Ljava/lang/String;",
+      "member_kind": "method",
+      "linkage_error": "IllegalAccessError"
+    },
+    {
+      "mode": "protected-foreign",
+      "owner": "lib/AccessApi",
+      "member": "protectedForForeignReceiver",
+      "descriptor": "()Ljava/lang/String;",
+      "member_kind": "method",
+      "linkage_error": "VerifyError",
+      "error_symbol": "client/ForeignChild"
+    }
+  ],
+  "behavior_probes": [
+    {
+      "mode": "protected",
+      "owner": "lib/AccessApi",
+      "member": "protectedForSubclass",
+      "descriptor": "()Ljava/lang/String;",
+      "member_kind": "method",
+      "base_stdout": "protected",
+      "current_stdout": "protected",
+      "allow_equal_stdout": true
+    },
+    {
+      "mode": "package-peer",
+      "owner": "lib/AccessApi",
+      "member": "packageForPeer",
+      "descriptor": "()Ljava/lang/String;",
+      "member_kind": "method",
+      "base_stdout": "package-peer",
+      "current_stdout": "package-peer",
+      "allow_equal_stdout": true
+    }
+  ],
+  "runtime_outcome_probes": [
+    {
+      "owner": "client/ForeignChild",
+      "member_kind": "class_definition",
+      "linkage_error": "VerifyError",
+      "error_symbol": "client/ForeignChild"
+    }
+  ]
+}

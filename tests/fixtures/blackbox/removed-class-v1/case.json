@@ -1,0 +1,106 @@
+{
+  "schema": "java-upgrade-analyzer.blackbox-case.v1",
+  "case_id": "removed-class-v1",
+  "dataset_version": 1,
+  "public_entrypoint": "scripts/binary_pipeline.py",
+  "truth_file": "truth.json",
+  "oracle_contract": "removed_member_linkage_closed_set",
+  "capabilities": [
+    "class_removal",
+    "constructor_removal",
+    "field_removal",
+    "method_removal",
+    "not_found_negative",
+    "reachable_positive",
+    "unchanged_member_negative"
+  ],
+  "library_class": "contract.RemovedType",
+  "library_classes": [
+    "contract.RemovedType",
+    "contract.StableApi"
+  ],
+  "business_class": "contract.ClassRemovalApp",
+  "oracle_main_class": "contract.OracleMain",
+  "definition_oracle_main_class": "contract.DefinitionMain",
+  "business_lineage": "blackbox:fixture-app",
+  "business_coordinate": "blackbox:fixture-app:1.0",
+  "library_lineage": "blackbox:removed-class-lib",
+  "base_coordinate": "blackbox:removed-class-lib:1.0",
+  "current_coordinate": "blackbox:removed-class-lib:2.0",
+  "entrypoints": [
+    {
+      "class_name": "contract/ClassRemovalApp",
+      "member_name": "entryConstructor",
+      "descriptor": "()Lcontract/RemovedType;"
+    },
+    {
+      "class_name": "contract/ClassRemovalApp",
+      "member_name": "entryMethod",
+      "descriptor": "(Lcontract/RemovedType;)Ljava/lang/String;"
+    },
+    {
+      "class_name": "contract/ClassRemovalApp",
+      "member_name": "entryField",
+      "descriptor": "(Lcontract/RemovedType;)Ljava/lang/String;"
+    }
+  ],
+  "linkage_probes": [
+    {
+      "mode": "constructor",
+      "owner": "contract/RemovedType",
+      "member": "<init>",
+      "descriptor": "()V",
+      "member_kind": "method",
+      "linkage_error": "NoClassDefFoundError",
+      "error_symbol": "contract/RemovedType"
+    },
+    {
+      "mode": "method",
+      "owner": "contract/RemovedType",
+      "member": "reachableMethod",
+      "descriptor": "()Ljava/lang/String;",
+      "member_kind": "method",
+      "linkage_error": "NoClassDefFoundError",
+      "error_symbol": "contract/RemovedType"
+    },
+    {
+      "mode": "field",
+      "owner": "contract/RemovedType",
+      "member": "reachableField",
+      "descriptor": "Ljava/lang/String;",
+      "member_kind": "field",
+      "linkage_error": "NoClassDefFoundError",
+      "error_symbol": "contract/RemovedType"
+    },
+    {
+      "mode": "deadMethod",
+      "owner": "contract/RemovedType",
+      "member": "deadMethod",
+      "descriptor": "()V",
+      "member_kind": "method",
+      "linkage_error": "NoClassDefFoundError",
+      "error_symbol": "contract/RemovedType"
+    },
+    {
+      "mode": "deadField",
+      "owner": "contract/RemovedType",
+      "member": "deadField",
+      "descriptor": "I",
+      "member_kind": "field",
+      "linkage_error": "NoClassDefFoundError",
+      "error_symbol": "contract/RemovedType"
+    }
+  ],
+  "runtime_outcome_probes": [
+    {
+      "owner": "contract/RemovedType",
+      "member_kind": "provider_topology"
+    },
+    {
+      "owner": "contract/ClassRemovalApp",
+      "member_kind": "class_definition",
+      "linkage_error": "NoClassDefFoundError",
+      "error_symbol": "contract/RemovedType"
+    }
+  ]
+}

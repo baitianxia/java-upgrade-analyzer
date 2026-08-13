@@ -1414,14 +1414,26 @@ def publish_step5(
                 evidence_path=".runtime/binary_authority/active_binary_generation.json",
             )
 
-    def change_for(item: Mapping[str, Any]) -> dict[str, str]:
+    def changes_for(item: Mapping[str, Any]) -> list[dict[str, str]]:
+        exact_facts = []
+        seen = set()
         for fact_identity in item.get("contributing_change_fact_ids") or ():
             exact_fact = changes_by_fact_identity.get(str(fact_identity or ""))
-            if exact_fact is not None:
-                return exact_fact
+            if exact_fact is None:
+                continue
+            identity = (
+                *_change_row_key(exact_fact),
+                str(exact_fact.get("change_type") or ""),
+                str(exact_fact.get("reason_code") or ""),
+            )
+            if identity not in seen:
+                seen.add(identity)
+                exact_facts.append(exact_fact)
+        if exact_facts:
+            return exact_facts
         exact = change_lookup.get(_change_row_key(item))
         if exact is not None:
-            return exact
+            return [exact]
         coord = str(item.get("coord") or "")
         api = str(item.get("api") or "")
         kind = str(item.get("symbol_kind") or "")
@@ -1433,14 +1445,19 @@ def publish_step5(
             {},
         )
         if same_kind:
-            return same_kind
-        return next(
-            (row for key, row in change_lookup.items() if key[0] == coord and key[1] == api),
+            return [same_kind]
+        return [next(
+            (
+                row for key, row in change_lookup.items()
+                if key[0] == coord and key[1] == api
+            ),
             {},
-        )
+        )]
 
     all_items = [
-        _legacy_result_item(item, change_for(item)) for item in raw_items
+        _legacy_result_item(item, change)
+        for item in raw_items
+        for change in changes_for(item)
     ]
     items = list(all_items)
     selected_coord_set = {str(item).strip() for item in selected_coords if str(item).strip()}
@@ -1456,14 +1473,15 @@ def publish_step5(
         for state in ("reachable", "uncertain", "not_found_in_static_analysis", "not_analyzed")
     }
     binary_summary = loaded["summary"]
-    dependency_rows = _read_csv_rows(
-        Path(report_dir).resolve() / "evidence" / "dependencies" / "dep_changes.csv"
-    )
+    # Step5 scope is the set of runtime-effective change targets, not the raw
+    # Step1 inventory.  dep_changes.csv deliberately retains "未变" rows for
+    # provenance; including those here turns a zero-change run into incomplete
+    # analysis of every packaged dependency.
     all_dependency_coords = sorted({
-        str(row.get("coord") or row.get("comparison_key") or "").strip()
-        for row in dependency_rows
-        if str(row.get("coord") or row.get("comparison_key") or "").strip()
-    } | {item["coord"] for item in all_items})
+        str(item.get("coord") or "").strip()
+        for item in (*all_items, *all_resource_items)
+        if str(item.get("coord") or "").strip()
+    })
     if selected_coord_set or selected_name_set:
         included_dependency_coords = sorted({
             coord for coord in all_dependency_coords
@@ -1490,9 +1508,10 @@ def publish_step5(
         "total_api_count": len(all_items),
         "analyzed_api_count": len(items),
         "included_api_count": len(items),
-        "included_reported_api_identities": sorted(
+        "included_reported_api_identities": sorted({
             str(item.get("reported_api_identity") or "") for item in items
-        ),
+            if str(item.get("reported_api_identity") or "")
+        }),
         "excluded_api_count": len(all_items) - len(items),
     }
     summary = {

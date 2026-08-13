@@ -11,9 +11,10 @@
 | 人工复核人 | [user/outputs.md](user/outputs.md) | `.upgrade-report/` 产物、复核顺序、状态语义 |
 | 所有维护者 | [developer/constitution.md](developer/constitution.md) | 工程宪法、不可违背的原则性约束 |
 | 新接手维护者 | [../TODO.md](../TODO.md)、[developer/architecture.md](developer/architecture.md) | 当前待办和架构阅读入口 |
-| 维护者 | [developer/architecture.md](developer/architecture.md) | 当前架构、Step1~Step6 职责、状态模型 |
+| 维护者 | [developer/architecture.md](developer/architecture.md) | 当前架构、Step0~Step6 职责、状态模型 |
 | Step5 修改者 | [developer/step5-design.md](developer/step5-design.md) | binary trace 四态、范围、alerts 台账语义 |
 | 测试/发布负责人 | [developer/quality.md](developer/quality.md) | 质量门禁、测试矩阵、真实项目验证口径 |
+| 测试体系维护者 | [developer/testing-strategy.md](developer/testing-strategy.md) | 黑盒/白盒/性能分层、第三方 Oracle 与真值治理 |
 
 ## 目录职责
 
@@ -27,6 +28,7 @@ docs/
 │   ├── architecture.md
 │   ├── step5-design.md
 │   ├── quality.md
+│   ├── testing-strategy.md
 │   └── technical-sharing.md
 └── archive/                  # 历史设计资料和已归档决策
 ```

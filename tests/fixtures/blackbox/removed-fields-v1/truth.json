@@ -1,0 +1,106 @@
+{
+  "schema": "java-upgrade-analyzer.blackbox-truth.v1",
+  "case_id": "removed-fields-v1",
+  "dataset_version": 1,
+  "scope": "closed_set",
+  "system_generated": false,
+  "human_review": {
+    "status": "not_claimed",
+    "reviewer": ""
+  },
+  "input_evidence": {
+    "algorithm": "sha256-path-nul-content-nul-v1",
+    "source_tree_sha256": "bb6d731c7bd595a1ce3d8f72f24accaaef2689387f6491bbcf967c47eef90409",
+    "case_algorithm": "sha256-canonical-json-v1",
+    "case_sha256": "801e8204f927efabc4b824c6b7c40829144a45fc1a1980a75763d7bd629216b1",
+    "source_files": [
+      "src/base/contract/FieldApi.java",
+      "src/business/contract/FieldApp.java",
+      "src/current/contract/FieldApi.java",
+      "src/oracle/contract/OracleMain.java"
+    ]
+  },
+  "oracle_producers": [
+    {
+      "id": "openjdk-javap-field-inventory-and-callgraph",
+      "organization": "OpenJDK",
+      "mechanism": "independent_bytecode_inventory",
+      "verifies": ["complete_removed_field_set", "entrypoint_field_edges"]
+    },
+    {
+      "id": "openjdk-jvm-field-linker",
+      "organization": "OpenJDK",
+      "mechanism": "actual_jvm_execution",
+      "verifies": ["base_execution_succeeds", "current_no_such_field_error"]
+    }
+  ],
+  "oracle_implementations": [
+    {
+      "path": "tests/blackbox/oracles/openjdk_oracle.py",
+      "sha256": "6e72442077371b86c943f790b5982144497725200da3e89f22f66ca2bfee38ca"
+    }
+  ],
+  "completeness": {
+    "argument": "The fixture has one final dependency class. javap inventories every public base/current field and computes the complete removed member set. The complete business entrypoint set is declared, and javap independently enumerates every getfield instruction from those roots. The JVM Oracle runner is isolated from the analyzed business JAR and verifies each removed field links on the base classpath and fails with NoSuchFieldError on the current classpath.",
+    "verified_dimensions": [
+      "api_identity",
+      "jvm_descriptor",
+      "closed_result_set",
+      "entrypoint_reachability",
+      "static_linkage"
+    ],
+    "known_limits": []
+  },
+  "expected_result_count": 2,
+  "expected_results": [
+    {
+      "owner": "contract/FieldApi",
+      "member": "removedReachableField",
+      "descriptor": "Ljava/lang/String;",
+      "member_kind": "field",
+      "dependency_lineages": ["blackbox:field-fixture-lib"],
+      "base_dependency_coords": ["blackbox:field-fixture-lib:1.0"],
+      "current_dependency_coords": ["blackbox:field-fixture-lib:2.0"],
+      "reachability_status": "reachable",
+      "static_linkage_status": "incompatible_if_executed",
+      "impact_conclusion": "probable_impact",
+      "runtime_verification_status": "required_not_executed",
+      "exact_path_exists": true,
+      "possible_path_exists": false,
+      "path_set_complete": true,
+      "paths": [
+        {
+          "certainty": "exact",
+          "text": "contract.FieldApp.entryRemovedField(contract.FieldApi) → contract.FieldApi.removedReachableField"
+        }
+      ]
+    },
+    {
+      "owner": "contract/FieldApi",
+      "member": "removedUnreachableField",
+      "descriptor": "Ljava/lang/String;",
+      "member_kind": "field",
+      "dependency_lineages": ["blackbox:field-fixture-lib"],
+      "base_dependency_coords": ["blackbox:field-fixture-lib:1.0"],
+      "current_dependency_coords": ["blackbox:field-fixture-lib:2.0"],
+      "reachability_status": "not_found_in_static_analysis",
+      "static_linkage_status": "incompatible_if_executed",
+      "impact_conclusion": "inconclusive",
+      "runtime_verification_status": "undetermined",
+      "exact_path_exists": false,
+      "possible_path_exists": false,
+      "path_set_complete": true,
+      "paths": []
+    }
+  ],
+  "forbidden_results": [
+    {
+      "owner": "contract/FieldApi",
+      "member": "stableField",
+      "descriptor": "Ljava/lang/String;",
+      "member_kind": "field",
+      "oracle_relation": "unchanged_member",
+      "reason": "The field exists unchanged on both sides."
+    }
+  ]
+}

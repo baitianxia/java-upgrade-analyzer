@@ -1,0 +1,27 @@
+{
+  "schema": "java-upgrade-analyzer.blackbox-truth.v1",
+  "case_id": "static-instance-change-v1",
+  "dataset_version": 1,
+  "scope": "closed_set",
+  "system_generated": false,
+  "human_review": {"status": "not_claimed", "reviewer": ""},
+  "input_evidence": {"algorithm": "sha256-path-nul-content-nul-v1", "source_tree_sha256": "f2dccb3423ebae21784360dcb0cf2dc3f23305a5df9def2346b860010a35655d", "case_algorithm": "sha256-canonical-json-v1", "case_sha256": "d10a7b37e9c4d78eda1584ef9afa1bfe39254024466d916dab65ba1af492adcc", "source_files": ["src/base/contract/DispatchShape.java", "src/business/contract/DispatchShapeApp.java", "src/current/contract/DispatchShape.java", "src/oracle/contract/OracleMain.java"]},
+  "oracle_producers": [
+    {"id": "openjdk-javap-member-flags", "organization": "OpenJDK", "mechanism": "independent_bytecode_contract_inventory", "verifies": ["complete_static_instance_flag_delta", "complete_direct_call_graph"]},
+    {"id": "openjdk-jvm-invocation-mode-linker", "organization": "OpenJDK", "mechanism": "actual_jvm_execution", "verifies": ["base_execution_succeeds", "current_incompatible_class_change_error"]}
+  ],
+  "oracle_implementations": [{"path": "tests/blackbox/oracles/openjdk_oracle.py", "sha256": "6e72442077371b86c943f790b5982144497725200da3e89f22f66ca2bfee38ca"}],
+  "completeness": {
+    "argument": "OpenJDK javap -v enumerates the public flags of every member in the only changed class; exactly four identities switch ACC_STATIC while descriptor and visibility remain stable. All four are directly invoked by the complete entrypoint set, and an isolated JVM runner proves invocation-kind mismatch raises IncompatibleClassChangeError only on current.",
+    "verified_dimensions": ["api_identity", "jvm_descriptor", "closed_result_set", "entrypoint_reachability", "static_linkage"],
+    "known_limits": []
+  },
+  "expected_result_count": 4,
+  "expected_results": [
+    {"owner": "contract/DispatchShape", "member": "instanceToStatic", "descriptor": "()Ljava/lang/String;", "member_kind": "method", "dependency_lineages": ["blackbox:dispatch-shape-lib"], "base_dependency_coords": ["blackbox:dispatch-shape-lib:1.0"], "current_dependency_coords": ["blackbox:dispatch-shape-lib:2.0"], "reachability_status": "reachable", "static_linkage_status": "incompatible_if_executed", "impact_conclusion": "probable_impact", "runtime_verification_status": "required_not_executed", "exact_path_exists": true, "possible_path_exists": false, "path_set_complete": true, "paths": [{"certainty": "exact", "text": "contract.DispatchShapeApp.entryInstanceMethod() → contract.DispatchShape.instanceToStatic()"}]},
+    {"owner": "contract/DispatchShape", "member": "staticToInstance", "descriptor": "()Ljava/lang/String;", "member_kind": "method", "dependency_lineages": ["blackbox:dispatch-shape-lib"], "base_dependency_coords": ["blackbox:dispatch-shape-lib:1.0"], "current_dependency_coords": ["blackbox:dispatch-shape-lib:2.0"], "reachability_status": "reachable", "static_linkage_status": "incompatible_if_executed", "impact_conclusion": "probable_impact", "runtime_verification_status": "required_not_executed", "exact_path_exists": true, "possible_path_exists": false, "path_set_complete": true, "paths": [{"certainty": "exact", "text": "contract.DispatchShapeApp.entryStaticMethod() → contract.DispatchShape.staticToInstance()"}]},
+    {"owner": "contract/DispatchShape", "member": "instanceFieldToStatic", "descriptor": "I", "member_kind": "field", "dependency_lineages": ["blackbox:dispatch-shape-lib"], "base_dependency_coords": ["blackbox:dispatch-shape-lib:1.0"], "current_dependency_coords": ["blackbox:dispatch-shape-lib:2.0"], "reachability_status": "reachable", "static_linkage_status": "incompatible_if_executed", "impact_conclusion": "probable_impact", "runtime_verification_status": "required_not_executed", "exact_path_exists": true, "possible_path_exists": false, "path_set_complete": true, "paths": [{"certainty": "exact", "text": "contract.DispatchShapeApp.entryInstanceField() → contract.DispatchShape.instanceFieldToStatic"}]},
+    {"owner": "contract/DispatchShape", "member": "staticFieldToInstance", "descriptor": "I", "member_kind": "field", "dependency_lineages": ["blackbox:dispatch-shape-lib"], "base_dependency_coords": ["blackbox:dispatch-shape-lib:1.0"], "current_dependency_coords": ["blackbox:dispatch-shape-lib:2.0"], "reachability_status": "reachable", "static_linkage_status": "incompatible_if_executed", "impact_conclusion": "probable_impact", "runtime_verification_status": "required_not_executed", "exact_path_exists": true, "possible_path_exists": false, "path_set_complete": true, "paths": [{"certainty": "exact", "text": "contract.DispatchShapeApp.entryStaticField() → contract.DispatchShape.staticFieldToInstance"}]}
+  ],
+  "forbidden_results": [{"owner": "contract/DispatchShape", "member": "stable", "descriptor": "()Ljava/lang/String;", "member_kind": "method", "oracle_relation": "unchanged_member", "reason": "The stable method retains the same flags, descriptor, and bytecode on both sides."}]
+}

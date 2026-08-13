@@ -2,7 +2,8 @@
   "schema_version": 1,
   "oracle_files": [
     "scripts/binary_validation_oracle.py",
-    "scripts/final_artifact_edge_oracle.py"
+    "scripts/final_artifact_edge_oracle.py",
+    "tests/blackbox/oracles/openjdk_oracle.py"
   ],
   "forbidden_modules": [
     "binary_artifact_diff",

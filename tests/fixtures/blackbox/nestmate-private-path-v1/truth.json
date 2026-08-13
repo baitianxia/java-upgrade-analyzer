@@ -1,0 +1,74 @@
+{
+  "schema": "java-upgrade-analyzer.blackbox-truth.v1",
+  "case_id": "nestmate-private-path-v1",
+  "dataset_version": 1,
+  "scope": "closed_set",
+  "system_generated": false,
+  "human_review": {"status": "not_claimed", "reviewer": ""},
+  "input_evidence": {
+    "algorithm": "sha256-path-nul-content-nul-v1",
+    "source_tree_sha256": "4d06272ac71c02cbb1d850ce3bf1b21e100cd78c115fb83b5d1d06a6fc3203f6",
+    "case_algorithm": "sha256-canonical-json-v1",
+    "case_sha256": "41d01f13270ceca5612920571e0421c8c3bfafab621c510a021bac0c5b303eed",
+    "source_files": [
+      "src/base/contract/BehaviorApi.java",
+      "src/business/contract/NestBusiness.java",
+      "src/current/contract/BehaviorApi.java",
+      "src/oracle/contract/OracleMain.java"
+    ]
+  },
+  "oracle_producers": [
+    {
+      "id": "openjdk-javap-nestmate-call-graph",
+      "organization": "OpenJDK",
+      "mechanism": "independent_bytecode_and_nest_attribute_inventory",
+      "verifies": ["complete_changed_method_body_set", "private_nestmate_edge", "complete_direct_call_graph"]
+    },
+    {
+      "id": "openjdk-jvm-nestmate-behavior-probe",
+      "organization": "OpenJDK",
+      "mechanism": "actual_jvm_execution",
+      "verifies": ["base_and_current_execute_without_LinkageError", "observable_return_value_changed"]
+    }
+  ],
+  "oracle_implementations": [
+    {"path": "tests/blackbox/oracles/openjdk_oracle.py", "sha256": "6e72442077371b86c943f790b5982144497725200da3e89f22f66ca2bfee38ca"}
+  ],
+  "completeness": {
+    "argument": "OpenJDK javap compares every public member and normalized public method body of the only changed library class, proves exactly one changed body, and independently enumerates the complete business bytecode path through a private Java nestmate call. JVM executions compiled against the base library and run against both pinned variants prove the nestmate edge links and the authored outputs are 1 and 2.",
+    "verified_dimensions": ["api_identity", "jvm_descriptor", "closed_result_set", "entrypoint_reachability", "static_linkage"],
+    "known_limits": []
+  },
+  "expected_result_count": 1,
+  "expected_results": [
+    {
+      "owner": "contract/BehaviorApi",
+      "member": "changed",
+      "descriptor": "()I",
+      "member_kind": "method",
+      "dependency_lineages": ["blackbox:nestmate-lib"],
+      "base_dependency_coords": ["blackbox:nestmate-lib:1.0"],
+      "current_dependency_coords": ["blackbox:nestmate-lib:2.0"],
+      "reachability_status": "reachable",
+      "static_linkage_status": "compatible_or_not_applicable",
+      "impact_conclusion": "probable_impact",
+      "runtime_verification_status": "required_not_executed",
+      "exact_path_exists": true,
+      "possible_path_exists": false,
+      "path_set_complete": true,
+      "paths": [
+        {"certainty": "exact", "text": "contract.NestBusiness$Member.entry(contract.BehaviorApi) → contract.NestBusiness.bridge(contract.BehaviorApi) → contract.BehaviorApi.changed()"}
+      ]
+    }
+  ],
+  "forbidden_results": [
+    {
+      "owner": "contract/BehaviorApi",
+      "member": "stable",
+      "descriptor": "()I",
+      "member_kind": "method",
+      "oracle_relation": "unchanged_member",
+      "reason": "OpenJDK javap reports identical flags, descriptor, and normalized instructions on both sides."
+    }
+  ]
+}

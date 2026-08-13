@@ -1,0 +1,40 @@
+{
+  "schema": "java-upgrade-analyzer.workflow-blackbox-truth.v1",
+  "case_id": "step0-source-inputs-v1",
+  "system_generated": false,
+  "oracle_producers": [
+    {
+      "id": "authored-step0-source-contract",
+      "organization": "java-upgrade-analyzer maintainers",
+      "mechanism": "public CLI protocol and persisted checkpoint inspection",
+      "sources": ["README.md", "SKILL.md", "CHECKPOINT_RULES.md"],
+      "verifies": ["one unified Step0 card", "required application source", "optional dependency sources"]
+    },
+    {
+      "id": "argparse-and-response-schema-boundary",
+      "organization": "Python Software Foundation",
+      "mechanism": "public process exit status and persisted response-schema inspection",
+      "sources": ["argparse", "json"],
+      "verifies": ["removed Step2 source fields are rejected", "failed input cannot advance the checkpoint"]
+    }
+  ],
+  "unified_source_contract": {
+    "step_id": "step0",
+    "application_source_required_in_modes": ["artifact_inputs", "checkout_build"],
+    "dependency_source_field": "dependency_source_dirs",
+    "dependency_source_optional": true,
+    "source_input_forms": ["Git 地址", "本地 Git 仓库目录"],
+    "row_labels": ["最终制品", "版本分支", "目标模块", "构建工具", "JDK 目录", "应用源码", "依赖包源码"],
+    "application_source_row_index": 5,
+    "dependency_source_row_index": 6,
+    "always_requires_confirmation": true
+  },
+  "legacy_step2_source_protocol_rejected": {
+    "field": "source_provision_choice",
+    "value": "continue_without",
+    "exit_code": 1,
+    "error_contains": "当前检查点未定义的字段",
+    "checkpoint_remains": "step0",
+    "field_absent_from_response_schema": true
+  }
+}

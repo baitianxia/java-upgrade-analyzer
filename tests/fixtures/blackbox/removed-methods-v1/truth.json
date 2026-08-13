@@ -1,0 +1,128 @@
+{
+  "schema": "java-upgrade-analyzer.blackbox-truth.v1",
+  "case_id": "removed-methods-v1",
+  "dataset_version": 1,
+  "scope": "closed_set",
+  "system_generated": false,
+  "human_review": {
+    "status": "not_claimed",
+    "reviewer": ""
+  },
+  "input_evidence": {
+    "algorithm": "sha256-path-nul-content-nul-v1",
+    "source_tree_sha256": "f297be795818300e3f9f5f5f22f8151c6320306d56dd5b7b390e80c62c3be767",
+    "case_algorithm": "sha256-canonical-json-v1",
+    "case_sha256": "07632ff17ec0fad82cfcbf319a7ed1f23de75e698e2c148be2f21d309469db9d",
+    "source_files": [
+      "src/base/contract/Api.java",
+      "src/business/contract/App.java",
+      "src/current/contract/Api.java",
+      "src/oracle/contract/OracleMain.java"
+    ]
+  },
+  "oracle_producers": [
+    {
+      "id": "openjdk-javap-api-and-callgraph",
+      "organization": "OpenJDK",
+      "mechanism": "independent_bytecode_inventory",
+      "verifies": ["complete_removed_method_set", "entrypoint_call_edges"]
+    },
+    {
+      "id": "openjdk-jvm-linker",
+      "organization": "OpenJDK",
+      "mechanism": "actual_jvm_execution",
+      "verifies": ["base_execution_succeeds", "current_no_such_method_error"]
+    }
+  ],
+  "oracle_implementations": [
+    {
+      "path": "tests/blackbox/oracles/openjdk_oracle.py",
+      "sha256": "6e72442077371b86c943f790b5982144497725200da3e89f22f66ca2bfee38ca"
+    }
+  ],
+  "completeness": {
+    "argument": "The fixture has one final dependency class. javap inventories every public base/current method and computes the complete removal set. The complete business entrypoint set is declared, and javap independently enumerates every direct invocation from those roots. The JVM Oracle runner is compiled into a separate JAR that is never included in the analyzed business input. JVM executions verify each removed symbol links on the base classpath and fails with NoSuchMethodError on the current classpath.",
+    "verified_dimensions": [
+      "api_identity",
+      "jvm_descriptor",
+      "closed_result_set",
+      "entrypoint_reachability",
+      "static_linkage"
+    ],
+    "known_limits": []
+  },
+  "expected_result_count": 3,
+  "expected_results": [
+    {
+      "owner": "contract/Api",
+      "member": "removedReachable",
+      "descriptor": "()Ljava/lang/String;",
+      "member_kind": "method",
+      "dependency_lineages": ["blackbox:fixture-lib"],
+      "base_dependency_coords": ["blackbox:fixture-lib:1.0"],
+      "current_dependency_coords": ["blackbox:fixture-lib:2.0"],
+      "reachability_status": "reachable",
+      "static_linkage_status": "incompatible_if_executed",
+      "impact_conclusion": "probable_impact",
+      "runtime_verification_status": "required_not_executed",
+      "exact_path_exists": true,
+      "possible_path_exists": false,
+      "path_set_complete": true,
+      "paths": [
+        {
+          "certainty": "exact",
+          "text": "contract.App.entryRemoved(contract.Api) → contract.Api.removedReachable()"
+        }
+      ]
+    },
+    {
+      "owner": "contract/Api",
+      "member": "removedUnreachable",
+      "descriptor": "()Ljava/lang/String;",
+      "member_kind": "method",
+      "dependency_lineages": ["blackbox:fixture-lib"],
+      "base_dependency_coords": ["blackbox:fixture-lib:1.0"],
+      "current_dependency_coords": ["blackbox:fixture-lib:2.0"],
+      "reachability_status": "not_found_in_static_analysis",
+      "static_linkage_status": "incompatible_if_executed",
+      "impact_conclusion": "inconclusive",
+      "runtime_verification_status": "undetermined",
+      "exact_path_exists": false,
+      "possible_path_exists": false,
+      "path_set_complete": true,
+      "paths": []
+    },
+    {
+      "owner": "contract/Api",
+      "member": "select",
+      "descriptor": "(I)Ljava/lang/String;",
+      "member_kind": "method",
+      "dependency_lineages": ["blackbox:fixture-lib"],
+      "base_dependency_coords": ["blackbox:fixture-lib:1.0"],
+      "current_dependency_coords": ["blackbox:fixture-lib:2.0"],
+      "reachability_status": "reachable",
+      "static_linkage_status": "incompatible_if_executed",
+      "impact_conclusion": "probable_impact",
+      "runtime_verification_status": "required_not_executed",
+      "exact_path_exists": true,
+      "possible_path_exists": false,
+      "path_set_complete": true,
+      "paths": [
+        {
+          "certainty": "exact",
+          "text": "contract.App.entryOverload(contract.Api) → contract.Api.select(int)"
+        }
+      ]
+    }
+  ],
+  "forbidden_results": [
+    {
+      "owner": "contract/Api",
+      "member": "select",
+      "descriptor": "()Ljava/lang/String;",
+      "member_kind": "method",
+      "oracle_relation": "unchanged_member",
+      "reason": "The zero-argument overload exists unchanged on both sides."
+    }
+  ]
+}

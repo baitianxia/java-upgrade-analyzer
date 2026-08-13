@@ -1,0 +1,64 @@
+{
+  "schema": "java-upgrade-analyzer.runtime-blackbox-truth.v1",
+  "case_id": "runtime-topology-v1",
+  "system_generated": false,
+  "oracle_producers": [
+    {
+      "id": "openjdk-classloader-execution",
+      "organization": "OpenJDK",
+      "mechanism": "actual JVM multi-release, classpath, parent-first and resource loading",
+      "verifies": ["selected class bytes", "provider order", "resource order"]
+    },
+    {
+      "id": "stdlib-ordered-zip-inventory",
+      "organization": "Python Software Foundation",
+      "mechanism": "closed ordered archive entry and manifest inventory",
+      "verifies": ["multi-release entries", "duplicate providers", "resource contents"]
+    }
+  ],
+  "cases": {
+    "multi_release": {
+      "target": ["lib/Target", "value", "()I", "method"],
+      "expected_base_stdout": "1",
+      "expected_current_stdout": "2",
+      "selected_current_entry": "META-INF/versions/9/lib/Target.class#occurrence=0",
+      "expected_state": {
+        "reachability_status": "reachable",
+        "impact_conclusion": "probable_impact",
+        "static_linkage_status": "compatible_or_not_applicable",
+        "runtime_verification_status": "required_not_executed",
+        "exact_path_exists": true,
+        "path_set_complete": true
+      }
+    },
+    "classpath_and_resources": {
+      "expected_base_stdout": "1:A:AB",
+      "expected_current_stdout": "2:B:BA",
+      "class_name": "dup/Provider",
+      "first_resource_name": "config/value.txt",
+      "resource_name": "META-INF/services/example.Service",
+      "base_selected_lineage": "blackbox:provider-a",
+      "current_selected_lineage": "blackbox:provider-b",
+      "base_resource_order": ["blackbox:provider-a", "blackbox:provider-b"],
+      "current_resource_order": ["blackbox:provider-b", "blackbox:provider-a"]
+    },
+    "parent_first": {
+      "expected_base_stdout": "1",
+      "expected_current_stdout": "3",
+      "shadow_stdout": "2",
+      "class_name": "dup/Provider",
+      "selected_lineage": "blackbox:parent-provider"
+    },
+    "target_jvm_definition": {
+      "expected_base_stdout": "1:platform",
+      "expected_current_stdout": "2:platform",
+      "required_platform_classes": [
+        "java/io/PrintStream",
+        "java/lang/Object",
+        "java/lang/System"
+      ],
+      "expected_definition_status": "definition_ready",
+      "expected_target_verification_status": "definition_ready"
+    }
+  }
+}

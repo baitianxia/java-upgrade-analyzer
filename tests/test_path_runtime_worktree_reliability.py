@@ -15,6 +15,70 @@ import path_runtime  # noqa: E402
 
 
 class PathRuntimeWorktreeReliabilityTest(unittest.TestCase):
+    def test_registration_uses_stable_porcelain_command_without_z(self):
+        commands = []
+
+        def runner(command, cwd=None, timeout=None):
+            commands.append(list(command))
+            return "worktree /repo/work tree\nHEAD deadbeef\n\n", "", 0
+
+        registered, _stderr, rc = path_runtime._worktree_registration_state(
+            ["git"], "/repo", "/repo/work tree", runner,
+        )
+
+        self.assertEqual(rc, 0)
+        self.assertTrue(registered)
+        self.assertEqual(
+            commands,
+            [[
+                "git", "-c", "core.quotepath=false", "worktree", "list",
+                "--porcelain",
+            ]],
+        )
+        self.assertNotIn("-z", commands[0])
+
+    def test_newline_porcelain_preserves_unicode_and_space_in_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            expected = Path(tmp) / "工作 tree"
+            parsed = path_runtime._registered_worktree_path_values(
+                f"worktree {expected}\nHEAD {'a' * 40}\n\n"
+            )
+
+        self.assertEqual(parsed, [expected.resolve()])
+
+    def test_windows_path_budget_is_checked_before_git_add(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree_root = root / "worktrees"
+            commands = []
+
+            def runner(command, cwd=None, timeout=None):
+                commands.append(list(command))
+                if "rev-parse" in command:
+                    return "a" * 40, "", 0
+                if "ls-tree" in command:
+                    return ("deep/" + "x" * 180 + ".class\0"), "", 0
+                raise AssertionError(f"unexpected command: {command}")
+
+            with patch.object(path_runtime, "IS_WINDOWS", True), patch.object(
+                path_runtime, "WINDOWS_SAFE_PATH_LENGTH", 100,
+            ), patch.object(
+                path_runtime,
+                "short_temp_root_candidates",
+                return_value=[worktree_root],
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "exceeds_windows_safe_budget",
+                ):
+                    path_runtime.create_detached_worktree(
+                        "a" * 40,
+                        root,
+                        runner=runner,
+                        git_command=["git"],
+                    )
+
+        self.assertFalse(any("add" in command for command in commands))
+
     def test_add_retries_git_lock_contention_on_the_same_target(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

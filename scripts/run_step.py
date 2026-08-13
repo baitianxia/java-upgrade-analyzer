@@ -14,6 +14,7 @@ import threading
 import time
 import traceback
 import uuid
+import zipfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,8 +23,10 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 sys.path.insert(0, str(Path(__file__).parent))
 
 from compat import (
+    gradle_cmd,
     infer_maven_coord_locations,
     infer_maven_coords,
+    mvn_cmd,
     open_text,
     resolve_repo_input_path,
     run_cmd,
@@ -42,6 +45,8 @@ from path_runtime import (
 from csv_io import open_csv_read, open_csv_write
 from analysis_contract import build_project_scope, discover_project_modules, write_coverage_report
 from binary_report import BINARY_OUTPUT_RELATIVE_PATH
+from binary_asm_helper import BinaryAsmError, resolve_asm_jar
+from jdk_preflight import JdkPreflightError, preflight_jdk_home
 from binary_runtime_materializer import (
     BinaryRuntimeMaterializationError,
     materialize_binary_pipeline_config,
@@ -78,7 +83,11 @@ from s4_contract import (
     STEP3_RISK_CANDIDATES_FILE,
 )
 from step1_ref_resolution import resolve_step1_ref
-from remote_source_refs import classify_fetch_failure
+from remote_source_refs import (
+    classify_fetch_failure,
+    match_remote_refs_by_version,
+    materialize_remote_source_candidate,
+)
 from runtime_contract import contract_payload
 from progress_logging import emit_progress
 from reason_guidance import REASON_GUIDANCE_SCHEMA, guidance_for_reason_code
@@ -94,14 +103,18 @@ MAIN_STATE_FILE_NAME = "main_state.json"
 LAST_STEP_SUMMARY_FILE_NAME = "last_step_summary.json"
 RESUME_CONTEXT_FILE_NAME = "resume_context.md"
 LAST_STEP_SUMMARY_SCHEMA = "java-upgrade-analyzer.last-step-summary.v1"
+MAIN_STATE_SCHEMA = "java-upgrade-analyzer.main-state.v3"
 BACKGROUND_RUNTIME_DIRNAME = "background"
 BACKGROUND_STATUS_FILE_NAME = "status.json"
+STEP0_PREFLIGHT_FILE_NAME = "step0_preflight.json"
+STEP1_RUNTIME_PREFLIGHT_FILE_NAME = "step1_runtime_preflight.json"
 WORKTREE_RECOVERY_FILE_NAME = "git_worktree_recovery.json"
 BACKGROUND_CHILD_ENV = "JUA_BACKGROUND_CHILD"
 BACKGROUND_RUN_ID_ENV = "JUA_BACKGROUND_RUN_ID"
 BACKGROUND_STATUS_PATH_ENV = "JUA_BACKGROUND_STATUS_PATH"
 TERMINAL_WORKFLOW_STATUSES = {"completed", "completed_with_limits"}
 USER_TASK_NAMES = {
+    "step0": "正式分析信息确认",
     "step1": "分析对象与依赖范围",
     "step2": "升级上下文",
     "step3": "兼容性线索",
@@ -110,6 +123,7 @@ USER_TASK_NAMES = {
     "step6": "分析报告",
 }
 STEP_COMPLETION_DESCRIPTIONS = {
+    "step0": "已确认分析输入、应用源码版本、构建工具和 JDK 目录。",
     "step1": "已固定分析对象、目标模块和最终制品依赖范围。",
     "step2": "已整理升级前后版本、源码范围和依赖上下文。",
     "step3": "已完成 JDK、Spring Boot 与依赖兼容性线索扫描。",
@@ -124,8 +138,6 @@ USER_ACTION_LABELS = {
     "cancel": "暂时停止分析",
     "confirm_local_source": "确认使用本地源码",
 }
-SOURCE_PROVISION_CHOICES = {"provide", "continue_without"}
-SOURCE_INPUT_PURPOSE_VERSION = "source-input-purpose-v2"
 SCRIPT_STEP_IDS = {
     "s1_dep_diff.py": "step1",
     "s2_context_from_deps.py": "step2",
@@ -133,61 +145,53 @@ SCRIPT_STEP_IDS = {
     "binary_pipeline.py": "step4",
 }
 STEP1_MAVEN_MODULE_SEP = re.compile(r"\[INFO\]\s*---.*@\s*(\S+)\s*---")
+SOURCE_INPUT_PURPOSE_VERSION = "source-input-purpose-v3"
 INTENT_PATCH_ALLOWED_SET_FIELDS = {
-    "accept_suggested_mappings",
-    "analysis_mode",
+    "application_source",
     "binary_pipeline_config",
     "active_maven_profiles",
     "base_artifact_path",
     "base_branch",
+    "base_tool",
     "base_allow_local_source",
     "base_allow_dirty_local_source",
     "base_jdk_home",
-    "base_source_project_dir",
     "current_artifact_path",
     "current_branch",
+    "current_tool",
     "current_allow_local_source",
     "current_allow_dirty_local_source",
     "base_expected_commit",
     "current_expected_commit",
     "current_jdk_home",
-    "current_source_project_dir",
-    "jdk_base",
-    "jdk_current",
     "dependency_source_clone_timeout",
     "source_ref_selections",
     "dependency_source_dirs",
+    "dependency_source_ref_selections",
+    "dependency_source_ref_bindings",
+    "skip_dependency_source_coords",
     "retry_remote_fetch",
     "manual_coord_overrides",
     "manual_artifact_identities",
-    "modules",
-    "primary_module",
-    "source_dirs",
-    "source_provision_choice",
-    "source_locations",
-    "source_location_mappings",
-    "source_repo_hints",
-    "springboot_base",
-    "springboot_current",
     "selected_targets",
     "scope_mode",
     "step5_selected_coords",
     "step5_selected_names",
     "strict_risk_gate",
     "target_module",
-    "tool",
 }
 INTENT_PATCH_RESERVED_TOP_LEVEL_FIELDS = {"action", "intent_patch", "notes", "restart_step_id"}
 
 
 class StepError(RuntimeError):
-    def __init__(self, message, reason_codes=None):
+    def __init__(self, message, reason_codes=None, diagnostic=None):
         super().__init__(message)
         self.reason_codes = list(dict.fromkeys(
             str(code).strip()
             for code in (reason_codes or [])
             if str(code).strip()
         ))
+        self.diagnostic = dict(diagnostic or {})
 
 
 class StepInteractionRequired(StepError):
@@ -305,10 +309,6 @@ def step2_context_path(report_dir):
 
 def step2_dep_graph_path(report_dir):
     return evidence_context_dir(report_dir) / "dep_graph.json"
-
-
-def step2_source_mapping_summary_path(report_dir):
-    return evidence_context_dir(report_dir) / "source_mapping_summary.json"
 
 
 def step4_api_changes_dir(report_dir):
@@ -1394,6 +1394,18 @@ def main_state_path(report_dir):
     return runtime_state_dir(report_dir) / MAIN_STATE_FILE_NAME
 
 
+def step0_confirmation_path(report_dir):
+    return runtime_state_dir(report_dir) / "step0_confirmation.json"
+
+
+def step0_preflight_path(report_dir):
+    return runtime_state_dir(report_dir) / STEP0_PREFLIGHT_FILE_NAME
+
+
+def step1_runtime_preflight_path(report_dir):
+    return runtime_state_dir(report_dir) / STEP1_RUNTIME_PREFLIGHT_FILE_NAME
+
+
 def last_step_summary_path(report_dir):
     return runtime_state_dir(report_dir) / LAST_STEP_SUMMARY_FILE_NAME
 
@@ -1408,8 +1420,9 @@ def empty_step_state():
 
 def new_main_state(report_dir, manifest_path=""):
     state = {
+        "schema": MAIN_STATE_SCHEMA,
         "state": {
-            "current_step": "step1",
+            "current_step": "step0",
             "completed_step": None,
             "status": "idle",
             "blocking_reason": None,
@@ -1429,7 +1442,7 @@ def new_main_state(report_dir, manifest_path=""):
 
 def ensure_main_state_structure(data, report_dir, manifest_path=""):
     base = new_main_state(report_dir, manifest_path=manifest_path)
-    if not isinstance(data, dict):
+    if not isinstance(data, dict) or data.get("schema") != MAIN_STATE_SCHEMA:
         return base
     merged = dict(base)
     merged_state = dict(base["state"])
@@ -1440,10 +1453,6 @@ def ensure_main_state_structure(data, report_dir, manifest_path=""):
     merged_state["saved_at"] = datetime.now().isoformat()
     current_step = str(merged_state.get("current_step") or "").strip()
     if current_step != "done":
-        # Before this invariant was introduced, every successful individual
-        # step persisted ``completed`` even though another step was still
-        # pending.  Normalize those durable states on read/write so consumers
-        # can reserve terminal statuses for a finished workflow.
         if str(merged_state.get("status") or "").strip() in TERMINAL_WORKFLOW_STATUSES:
             merged_state["status"] = "ready"
         merged_state["completion_summary"] = None
@@ -1520,8 +1529,8 @@ def previous_step_output(main_state, step_id):
 
 
 def build_step_input_context(main_state, step_id, fallback_existing=None):
-    if step_id == "step1":
-        existing = (main_state.get("step1") or {}).get("input") or {}
+    if step_id in {"step0", "step1"}:
+        existing = (main_state.get(step_id) or {}).get("input") or {}
         if existing:
             return dict(existing)
         return dict(fallback_existing or {})
@@ -1575,6 +1584,21 @@ def store_step_input(main_state, step_id, run_context):
 
 def build_step_derived_snapshot(step_id, run_context, report_dir):
     ctx = dict(run_context or {})
+    if step_id == "step0":
+        return {
+            key: ctx.get(key)
+            for key in (
+                "step0_confirmed",
+                "analysis_mode",
+                "base_resolved_commit",
+                "current_resolved_commit",
+                "base_tool",
+                "current_tool",
+                "base_jdk_home",
+                "current_jdk_home",
+            )
+            if key in ctx
+        }
     if step_id == "step1":
         return {
             key: ctx.get(key)
@@ -1595,7 +1619,6 @@ def build_step_derived_snapshot(step_id, run_context, report_dir):
         return {
             key: ctx.get(key)
             for key in (
-                "source_provision_choice",
                 "source_input_purpose_version",
                 "source_dirs_status",
                 "dependency_source_mapping_conflicts",
@@ -1609,7 +1632,6 @@ def build_step_derived_snapshot(step_id, run_context, report_dir):
         return {
             key: ctx.get(key)
             for key in (
-                "source_provision_choice",
                 "source_input_purpose_version",
                 "dependency_repo_mappings",
                 "dependency_source_mappings",
@@ -1875,11 +1897,6 @@ def build_canonical_user_response(user_response):
 def apply_user_response_clears(updated, clear_fields):
     result = dict(updated or {})
     for field in clear_fields or []:
-        if field == "source_dirs":
-            result.pop("source_dirs", None)
-            result.pop("source_dirs_status", None)
-            result.pop("pinned_source_snapshot", None)
-            continue
         if field == "dependency_source_dirs":
             result.pop("dependency_source_dirs", None)
             result.pop("dependency_source_git_urls", None)
@@ -1888,10 +1905,6 @@ def apply_user_response_clears(updated, clear_fields):
             result.pop("dependency_source_mappings", None)
             result.pop("dependency_source_mapping_conflicts", None)
             result.pop("unmapped_dependency_coords", None)
-            continue
-        if field == "source_repo_hints":
-            result.pop("source_repo_hints", None)
-            result.pop("accept_suggested_mappings", None)
             continue
         if field in ("base_branch", "current_branch"):
             side = field.split("_", 1)[0]
@@ -2094,10 +2107,23 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
         if branch_was_supplied or path_changed:
             updated = _clear_step1_ref_state(updated, side)
 
-    primary_module_explicit = False
-    if "analysis_mode" in response:
-        updated["analysis_mode"] = normalize_analysis_mode(response.get("analysis_mode"), allow_empty=True)
-        updated = apply_explicit_step1_mode_selection(updated)
+    application_source_value = response.get("application_source")
+    if isinstance(application_source_value, str) and application_source_value.strip():
+        incoming_source = application_source_value.strip()
+        if incoming_source != str(updated.get("application_source") or "").strip():
+            for side in ("base", "current"):
+                updated = _clear_step1_ref_state(updated, side)
+            for key in (
+                "application_source_repo_path",
+                "application_source_materialization",
+                "application_source_display",
+                "base_source_project_dir",
+                "current_source_project_dir",
+                "pinned_source_snapshot",
+            ):
+                updated.pop(key, None)
+        updated["application_source"] = incoming_source
+        updated.setdefault("input_origins", {})["application_source"] = "user"
     if isinstance(response.get("binary_pipeline_config"), str) and response.get(
         "binary_pipeline_config"
     ).strip():
@@ -2105,24 +2131,28 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
             response["binary_pipeline_config"].strip(), project_dir
         )
 
-    for key in ("base_branch", "current_branch", "target_module", "primary_module", "tool"):
+    for key in (
+        "base_branch",
+        "current_branch",
+        "target_module",
+        "base_tool",
+        "current_tool",
+    ):
         value = response.get(key)
         if isinstance(value, str) and value.strip():
             updated[key] = value.strip()
-            if key in ("target_module", "primary_module"):
-                primary_module_explicit = True
+            if key == "target_module":
                 updated["target_module"] = value.strip()
                 updated["primary_module"] = value.strip()
+                updated["modules"] = [value.strip()]
                 updated.pop("pinned_source_snapshot", None)
-            if key == "tool":
+            if key in {"base_tool", "current_tool"}:
                 updated["tool_explicit"] = True
                 updated.pop("pinned_source_snapshot", None)
+                updated.setdefault("input_origins", {})[key] = "user"
             if key in ("base_branch", "current_branch"):
                 updated[f"{key}_explicit"] = True
-    for key in ("jdk_base", "jdk_current", "springboot_base", "springboot_current"):
-        value = response.get(key)
-        if isinstance(value, (str, int, float)) and str(value).strip():
-            updated[key] = str(value).strip()
+            updated.setdefault("input_origins", {})[key] = "user"
     for side in ("base", "current"):
         expected_field = f"{side}_expected_commit"
         value = response.get(expected_field)
@@ -2135,24 +2165,7 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
         value = response.get(key)
         if isinstance(value, str) and value.strip():
             updated[key] = absolutize_path(value.strip(), project_dir)
-
-    modules_value = normalize_modules_value(response.get("modules"))
-    if modules_value is not None:
-        updated["modules"] = modules_value
-    elif primary_module_explicit:
-        # If the user explicitly corrected primary_module, keep modules aligned
-        # instead of inheriting a stale module selection from prior checkpoint state.
-        updated["modules"] = [updated["primary_module"]]
-    if updated.get("primary_module") and not (updated.get("modules") or []):
-        updated["modules"] = [updated["primary_module"]]
-    if (not updated.get("primary_module")) and len(updated.get("modules") or []) == 1:
-        updated["primary_module"] = updated["modules"][0]
-    if (modules_value is not None or primary_module_explicit) and "source_dirs" not in response:
-        # Module-scope corrections must invalidate stale root-level source_dirs so
-        # the next Step1 run can re-detect module-specific source directories.
-        updated.pop("source_dirs", None)
-        updated.pop("source_dirs_status", None)
-        updated.pop("pinned_source_snapshot", None)
+            updated.setdefault("input_origins", {})[key] = "user"
 
     if response.get("active_maven_profiles") is not None:
         previous_profiles = list(updated.get("active_maven_profiles") or [])
@@ -2163,12 +2176,6 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
             updated.pop("source_dirs", None)
             updated.pop("source_dirs_status", None)
             updated.pop("pinned_source_snapshot", None)
-
-    source_dirs = normalize_source_dirs(response.get("source_dirs"), project_dir)
-    if source_dirs is not None:
-        updated["source_dirs"] = source_dirs
-        updated["source_dirs_status"] = "explicit"
-        updated.pop("pinned_source_snapshot", None)
 
     dependency_source_dirs = normalize_dependency_source_dirs(
         response.get("dependency_source_dirs"),
@@ -2186,100 +2193,78 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
         updated.pop("dependency_repo_mappings", None)
         updated.pop("dependency_source_mappings", None)
 
-    source_repo_hints = normalize_source_repo_hints(
-        response.get("source_repo_hints"),
-        project_dir,
-        "source_repo_hints",
-    )
-    if source_repo_hints is not None:
-        updated["source_repo_hints"] = source_repo_hints
-        if "accept_suggested_mappings" not in response:
-            updated.pop("accept_suggested_mappings", None)
+    if response.get("dependency_source_ref_selections") is not None:
+        selections = response.get("dependency_source_ref_selections")
+        if isinstance(selections, dict):
+            selections = [selections]
+        if not isinstance(selections, list) or any(
+            not isinstance(item, dict) for item in selections
+        ):
+            raise StepError("dependency_source_ref_selections 必须是对象数组。")
+        updated["dependency_source_ref_selections"] = [dict(item) for item in selections]
+    if response.get("dependency_source_ref_bindings") is not None:
+        bindings = response.get("dependency_source_ref_bindings")
+        if not isinstance(bindings, list) or any(
+            not isinstance(item, dict) for item in bindings
+        ):
+            raise StepError("dependency_source_ref_bindings 必须是对象数组。")
+        merged_bindings = {
+            str((item or {}).get("coord") or "").strip(): dict(item)
+            for item in (updated.get("dependency_source_ref_bindings") or [])
+            if str((item or {}).get("coord") or "").strip()
+        }
+        changed_coords = set()
+        for item in bindings:
+            coord = str(item.get("coord") or "").strip()
+            if not coord:
+                raise StepError("dependency_source_ref_bindings 的每项都必须包含 coord。")
+            merged_bindings[coord] = dict(item)
+            changed_coords.add(coord)
+        updated["dependency_source_ref_bindings"] = list(merged_bindings.values())
 
-    if "accept_suggested_mappings" in response:
-        updated["accept_suggested_mappings"] = parse_bool_like(
-            response.get("accept_suggested_mappings"),
-            "accept_suggested_mappings",
-        )
-
-    source_provision_choice = (
-        normalize_source_provision_choice(
-            response.get("source_provision_choice"),
-            "source_provision_choice",
-        )
-        if "source_provision_choice" in response
-        else ""
-    )
-    source_locations = normalize_dependency_source_dirs(
-        response.get("source_locations"),
-        project_dir,
-        "source_locations",
-    ) if "source_locations" in response else None
-    source_location_mappings = normalize_source_location_mappings(
-        response.get("source_location_mappings"),
-        project_dir,
-    ) if "source_location_mappings" in response else None
-    if source_locations is not None:
-        updated["source_locations"] = source_locations
-    if source_location_mappings is not None:
-        updated["source_location_mappings"] = source_location_mappings
-    locations_to_classify = (
-        updated.get("source_locations")
-        if source_locations is not None or source_location_mappings is not None
-        else []
-    )
-    if locations_to_classify:
-        classified = classify_source_locations(
-            locations_to_classify,
-            updated,
-            project_dir,
-            mappings=updated.get("source_location_mappings") or [],
-        )
-        updated["unclassified_source_locations"] = list(
-            classified.get("unclassified") or []
-        )
-        updated["source_location_classifications"] = list(
-            classified.get("classifications") or []
-        )
-        classified_business_dirs = list(classified.get("business_source_dirs") or [])
-        if classified_business_dirs:
-            updated["source_dirs"] = _dedupe_strings(
-                list(updated.get("source_dirs") or []) + classified_business_dirs
-            )
-            updated["source_dirs_status"] = "explicit"
-            updated.pop("pinned_source_snapshot", None)
-        classified_dependency_dirs = list(
-            classified.get("dependency_source_dirs") or []
-        )
-        if classified_dependency_dirs:
-            updated["dependency_source_dirs"] = _dedupe_strings(
-                list(updated.get("dependency_source_dirs") or [])
-                + classified_dependency_dirs
-            )
-            updated["dependency_source_git_urls"] = [
-                item
-                for item in updated["dependency_source_dirs"]
-                if is_dependency_source_git_url(item, project_dir)
-            ]
-            updated.pop("dependency_source_git_materializations", None)
-            updated.pop("dependency_repo_mappings", None)
-            updated.pop("dependency_source_mappings", None)
-
-    supplemental_source_was_provided = bool(
-        source_dirs
-        or dependency_source_dirs
-        or source_repo_hints
-        or source_locations
-    )
-    if supplemental_source_was_provided and source_provision_choice == "continue_without":
-        raise StepError(
-            "本次答复同时提供了源码位置并选择暂不补充源码；请保留其中一种输入。"
-        )
-    if supplemental_source_was_provided:
-        updated["source_provision_choice"] = "provide"
-    elif source_provision_choice:
-        updated["source_provision_choice"] = source_provision_choice
-    updated["source_input_purpose_version"] = SOURCE_INPUT_PURPOSE_VERSION
+        repo_mappings = []
+        for raw_mapping in updated.get("dependency_repo_mappings") or []:
+            coord, _repo_path = _split_dependency_repo_mapping_value(raw_mapping)
+            if coord not in changed_coords:
+                repo_mappings.append(raw_mapping)
+        source_mappings = []
+        for raw_mapping in updated.get("dependency_source_mappings") or []:
+            coord, _source_dir = _split_dependency_repo_mapping_value(raw_mapping)
+            if coord not in changed_coords:
+                source_mappings.append(raw_mapping)
+        for binding in bindings:
+            coord = str(binding.get("coord") or "").strip()
+            repo_path = str(binding.get("repo_path") or "").strip()
+            if repo_path:
+                repo_mappings.append(f"{coord}={repo_path}")
+            for source_dir in binding.get("source_dirs") or []:
+                if str(source_dir or "").strip():
+                    source_mappings.append(f"{coord}={source_dir}")
+        updated["dependency_repo_mappings"] = _dedupe_strings(repo_mappings)
+        updated["dependency_source_mappings"] = _dedupe_strings(source_mappings)
+    if response.get("skip_dependency_source_coords") is not None:
+        raw_skips = response.get("skip_dependency_source_coords")
+        if isinstance(raw_skips, str):
+            raw_skips = [raw_skips]
+        if not isinstance(raw_skips, list):
+            raise StepError("skip_dependency_source_coords 必须是字符串数组。")
+        updated["skip_dependency_source_coords"] = _dedupe_strings(raw_skips)
+        skipped = set(updated["skip_dependency_source_coords"])
+        updated["dependency_source_ref_bindings"] = [
+            dict(item)
+            for item in (updated.get("dependency_source_ref_bindings") or [])
+            if str((item or {}).get("coord") or "").strip() not in skipped
+        ]
+        updated["dependency_repo_mappings"] = [
+            item
+            for item in (updated.get("dependency_repo_mappings") or [])
+            if _split_dependency_repo_mapping_value(item)[0] not in skipped
+        ]
+        updated["dependency_source_mappings"] = [
+            item
+            for item in (updated.get("dependency_source_mappings") or [])
+            if _split_dependency_repo_mapping_value(item)[0] not in skipped
+        ]
 
     for key in ("step5_selected_coords", "step5_selected_names"):
         value = normalize_step5_target_list(response.get(key), key)
@@ -2305,6 +2290,7 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
         value = response.get(key)
         if isinstance(value, str) and value.strip():
             updated[key] = absolutize_path(value.strip(), project_dir)
+            updated.setdefault("input_origins", {})[key] = "user"
 
     for key in (
         "include_test_scope",
@@ -2358,7 +2344,6 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
     if str(response.get("action") or "").strip() == "confirm_unresolved":
         updated["allow_unresolved"] = True
 
-    updated = apply_explicit_step1_mode_selection(updated)
     return apply_user_response_clears(updated, clear_fields)
 
 
@@ -2371,6 +2356,21 @@ def print_output(stdout, stderr):
         sys.stderr.write(stderr)
         if not stderr.endswith("\n"):
             sys.stderr.write("\n")
+
+
+def _subprocess_failure_detail(stderr, stdout, *, limit=800):
+    """Return one bounded, credential-redacted diagnostic line for persistence."""
+    lines = [
+        line.strip()
+        for line in str(stderr or stdout or "").splitlines()
+        if line.strip()
+    ]
+    if not lines:
+        return ""
+    detail = _redact_git_sensitive_text(lines[-1])
+    if len(detail) > limit:
+        detail = detail[: max(limit - 1, 0)].rstrip() + "…"
+    return detail
 
 
 def run_python(script_name, script_args, cwd, report_dir=None, timeout=None):
@@ -2453,7 +2453,41 @@ def run_python(script_name, script_args, cwd, report_dir=None, timeout=None):
     if interaction is not None:
         raise StepInteractionRequired(interaction)
     if rc != 0:
-        raise StepError(f"{script_name} 执行失败，退出码={rc}")
+        detail = _subprocess_failure_detail(stderr, filtered_stdout)
+        suffix = f"：{detail}" if detail else ""
+        structured_result = {}
+        if "--result-json" in script_args:
+            result_index = script_args.index("--result-json") + 1
+            if result_index < len(script_args):
+                result_path = Path(str(script_args[result_index]))
+                if result_path.is_file():
+                    try:
+                        candidate = read_json(result_path)
+                    except (OSError, UnicodeError, json.JSONDecodeError):
+                        candidate = {}
+                    if isinstance(candidate, dict):
+                        structured_result = candidate
+        reason_codes = []
+        for candidate in (
+            structured_result.get("reason_code"),
+            (structured_result.get("cause") or {}).get("reason_code")
+            if isinstance(structured_result.get("cause"), dict) else "",
+        ):
+            if str(candidate or "").strip():
+                reason_codes.append(str(candidate).strip())
+        diagnostic = _sanitize_git_persistence_payload({
+            "script": script_name,
+            "exit_code": rc,
+            "command": [str(value) for value in cmd],
+            "stderr_tail": str(stderr or "")[-16000:],
+            "stdout_tail": str(filtered_stdout or "")[-4000:],
+            "structured_result": structured_result,
+        })
+        raise StepError(
+            f"{script_name} 执行失败，退出码={rc}{suffix}",
+            reason_codes=reason_codes,
+            diagnostic=diagnostic,
+        )
 
 
 def detect_source_dirs(project_dir):
@@ -2510,100 +2544,6 @@ def normalize_analysis_mode(raw_value, *, allow_empty=False):
     if value not in {"artifact_inputs", "checkout_build"}:
         raise StepError("analysis_mode 仅支持 artifact_inputs 或 checkout_build")
     return value
-
-
-def normalize_source_provision_choice(raw_value, field_name, *, allow_empty=False):
-    value = str(raw_value or "").strip()
-    if not value:
-        if allow_empty:
-            return ""
-        raise StepError(f"{field_name} 不能为空")
-    if value not in SOURCE_PROVISION_CHOICES:
-        raise StepError(
-            f"{field_name} 仅支持 provide 或 continue_without"
-        )
-    return value
-
-
-def source_input_state_for_context(run_context, mapping_summary=None):
-    context = dict(run_context or {})
-    summary = dict(mapping_summary or {})
-    mode = str(infer_step1_mode_fields(context).get("analysis_mode") or "")
-    provision_choice = normalize_source_provision_choice(
-        context.get("source_provision_choice"),
-        "source_provision_choice",
-        allow_empty=True,
-    )
-    business_available = bool(
-        summary.get("source_dirs")
-        or context.get("source_dirs")
-        or context.get("source_overlay_business_provided")
-    )
-    dependency_available = bool(
-        summary.get("dependency_source_dirs")
-        or summary.get("confirmed_target_mappings")
-        or context.get("dependency_source_dirs")
-        or context.get("dependency_source_mappings")
-        or context.get("source_repo_hints")
-        or context.get("source_overlay_dependency_provided")
-    )
-    if business_available:
-        business_status = (
-            "available_from_build" if mode == "checkout_build" else "provided"
-        )
-    else:
-        business_status = "not_provided"
-    if dependency_available:
-        dependency_status = "provided"
-    else:
-        dependency_status = "not_provided"
-    unclassified = list(
-        summary.get("unclassified_source_locations")
-        or context.get("unclassified_source_locations")
-        or []
-    )
-    has_supplemental_input = bool(
-        context.get("source_locations")
-        or dependency_available
-        or context.get("source_repo_hints")
-        or (
-            business_available
-            and mode == "artifact_inputs"
-        )
-        or context.get("source_overlay_config_provided")
-    )
-    if unclassified:
-        provision_status = "awaiting_mapping"
-    elif provision_choice == "continue_without":
-        provision_status = "complete"
-    elif provision_choice == "provide":
-        provision_status = "complete" if has_supplemental_input else "awaiting_input"
-    else:
-        provision_status = "complete" if has_supplemental_input else "awaiting_choice"
-    return {
-        "analysis_mode": mode,
-        "source_provision_choice": provision_choice,
-        "source_provision_status": provision_status,
-        "business_source_status": business_status,
-        "dependency_source_status": dependency_status,
-        "business_source_available": business_available,
-        "dependency_source_available": dependency_available,
-        "purpose_version": SOURCE_INPUT_PURPOSE_VERSION,
-    }
-
-
-def apply_explicit_step1_mode_selection(run_context):
-    updated = dict(run_context or {})
-    explicit_mode = normalize_analysis_mode(updated.get("analysis_mode"), allow_empty=True)
-    if explicit_mode == "checkout_build":
-        for key in (
-            "base_artifact_path",
-            "current_artifact_path",
-            "base_source_project_dir",
-            "current_source_project_dir",
-        ):
-            updated[key] = ""
-    return updated
 
 
 def detect_source_dirs_by_modules(project_dir, modules):
@@ -3552,148 +3492,6 @@ def normalize_dependency_source_dirs(raw_value, project_dir, config_key="depende
     return normalized
 
 
-def normalize_source_location_mappings(raw_value, project_dir):
-    if raw_value in (None, ""):
-        return None
-    if isinstance(raw_value, dict):
-        iterable = [
-            {"location": location, "owner_type": owner}
-            if isinstance(owner, str)
-            else {"location": location, **dict(owner or {})}
-            for location, owner in raw_value.items()
-        ]
-    elif isinstance(raw_value, list):
-        iterable = raw_value
-    else:
-        raise StepError("source_location_mappings 仅支持对象或对象列表")
-    normalized = []
-    for item in iterable:
-        if not isinstance(item, dict):
-            raise StepError("source_location_mappings 的每一项都必须是对象")
-        location = str(
-            item.get("location")
-            or item.get("path")
-            or item.get("url")
-            or ""
-        ).strip()
-        owner_type = str(item.get("owner_type") or "").strip()
-        if not location or owner_type not in {"business", "dependency"}:
-            raise StepError(
-                "source_location_mappings 每项必须包含 location，以及 business 或 dependency 类型的 owner_type"
-            )
-        normalized_location = (
-            location
-            if is_dependency_source_git_url(location, project_dir)
-            else resolve_repo_input_path(absolutize_path(location, project_dir))
-        )
-        normalized.append({
-            "location": normalized_location,
-            "owner_type": owner_type,
-            "owner_coord": str(item.get("owner_coord") or item.get("coord") or "").strip(),
-        })
-    return normalized
-
-
-def _path_is_within(path, root):
-    try:
-        Path(path).expanduser().resolve().relative_to(
-            Path(root).expanduser().resolve()
-        )
-        return True
-    except (OSError, RuntimeError, ValueError):
-        return False
-
-
-def classify_source_locations(locations, run_context, project_dir, *, mappings=None):
-    """Classify one user-facing source list without exposing ownership choices."""
-    context = dict(run_context or {})
-    manual = {
-        str(item.get("location") or "").strip(): dict(item)
-        for item in (mappings or [])
-        if str((item or {}).get("location") or "").strip()
-    }
-    report_dir = str(context.get("report_dir") or "").strip()
-    relevant_coords = _collect_relevant_dependency_coords(report_dir) if report_dir else []
-    relevant_ga = {artifact_ga(coord) for coord in relevant_coords if artifact_ga(coord)}
-    business_roots = _dedupe_strings(
-        [str(project_dir)]
-        + [
-            str(context.get(key) or "").strip()
-            for key in ("base_source_project_dir", "current_source_project_dir")
-            if str(context.get(key) or "").strip()
-        ]
-    )
-    business_source_dirs = []
-    dependency_source_dirs = []
-    unclassified = []
-    classifications = []
-    for raw_location in locations or []:
-        location = str(raw_location or "").strip()
-        if not location:
-            continue
-        mapping = manual.get(location)
-        is_git = is_dependency_source_git_url(location, project_dir)
-        if mapping:
-            owner_type = mapping["owner_type"]
-            reason = "user_resolved_ambiguous_location"
-        elif is_git:
-            repo_name = Path(location.rstrip("/").rsplit("/", 1)[-1]).stem.lower()
-            matching_ga = [ga for ga in relevant_ga if ga.rsplit(":", 1)[-1].lower() == repo_name]
-            owner_type = "dependency" if matching_ga else ""
-            reason = "git_repository_name_matches_dependency" if owner_type else ""
-        else:
-            local_path = resolve_repo_input_path(absolutize_path(location, project_dir))
-            location = local_path
-            plan = _build_dependency_source_plan(
-                [local_path], relevant_coords=relevant_coords
-            )
-            candidate_ga = {
-                artifact_ga(str(item.get("coord") or ""))
-                for item in (plan.get("candidates") or [])
-                if artifact_ga(str(item.get("coord") or ""))
-            }
-            if relevant_ga and candidate_ga.intersection(relevant_ga):
-                owner_type = "dependency"
-                reason = "maven_coordinate_matches_changed_dependency"
-            elif any(_path_is_within(local_path, root) for root in business_roots):
-                owner_type = "business"
-                reason = "inside_analyzed_project"
-            else:
-                owner_type = ""
-                reason = ""
-        if owner_type == "dependency":
-            dependency_source_dirs.append(location)
-        elif owner_type == "business":
-            if is_git:
-                unclassified.append({
-                    "location": location,
-                    "reason": "business_git_repository_requires_local_checkout",
-                })
-                continue
-            source_plan = _resolve_source_dirs_plan(Path(location))
-            resolved_dirs = list(source_plan.get("source_dirs") or [])
-            if not resolved_dirs and Path(location).is_dir():
-                resolved_dirs = [location]
-            business_source_dirs.extend(resolved_dirs)
-        else:
-            unclassified.append({
-                "location": location,
-                "reason": "source_owner_cannot_be_inferred_reliably",
-            })
-            continue
-        classifications.append({
-            "location": location,
-            "owner_type": owner_type,
-            "reason": reason,
-        })
-    return {
-        "business_source_dirs": _dedupe_strings(business_source_dirs),
-        "dependency_source_dirs": _dedupe_strings(dependency_source_dirs),
-        "unclassified": unclassified,
-        "classifications": classifications,
-    }
-
-
 def normalize_dependency_repo_mappings(raw_value, project_dir, config_key="dependency_repo_mappings"):
     if raw_value in (None, ""):
         return None
@@ -3808,71 +3606,6 @@ def normalize_dependency_source_mappings(raw_value, project_dir, config_key="dep
     return normalized
 
 
-
-
-def normalize_source_repo_hints(raw_value, project_dir, config_key):
-    if raw_value in (None, ""):
-        return None
-    if isinstance(raw_value, dict):
-        iterable = [raw_value]
-    elif isinstance(raw_value, list):
-        iterable = raw_value
-    elif isinstance(raw_value, str):
-        iterable = [raw_value]
-    else:
-        raise StepError(f"当前步骤输入中的 {config_key} 仅支持字符串、对象或列表")
-
-    normalized = []
-    seen = set()
-    for item in iterable:
-        coord_hint = ""
-        notes = ""
-        if isinstance(item, str):
-            raw = item.strip()
-            if not raw:
-                continue
-            if "=" in raw:
-                coord_hint, path_value = raw.split("=", 1)
-                coord_hint = coord_hint.strip()
-                path_value = path_value.strip()
-            else:
-                path_value = raw
-        elif isinstance(item, dict):
-            coord_hint = str(item.get("coord_hint") or item.get("coord") or item.get("owner_coord") or "").strip()
-            path_value = str(
-                item.get("path")
-                or item.get("root")
-                or item.get("repo_path")
-                or item.get("git_path")
-                or item.get("repo")
-                or item.get("local_path")
-                or ""
-            ).strip()
-            notes = str(item.get("notes") or item.get("hint") or "").strip()
-            if not path_value:
-                raise StepError(f"当前步骤输入中的 {config_key} 的对象项需包含 path/repo_path/git_path")
-        else:
-            raise StepError(f"当前步骤输入中的 {config_key} 存在不支持的项类型")
-
-        if looks_like_remote_repo(path_value) and not Path(path_value).expanduser().exists():
-            raise StepError(
-                f"当前步骤输入中的 {config_key} 当前仅支持本地已检出的源码仓库，暂不支持直接传远程地址：{path_value}"
-            )
-        normalized_path = resolve_repo_input_path(absolutize_path(path_value, project_dir))
-        inferred_coords = [item for item in infer_maven_coords(normalized_path) if item]
-        key = (coord_hint, normalized_path)
-        if key in seen:
-            continue
-        seen.add(key)
-        normalized.append(
-            {
-                "coord_hint": coord_hint,
-                "repo_path": normalized_path,
-                "repo_inferred_coords": inferred_coords,
-                "notes": notes,
-            }
-        )
-    return normalized
 
 
 def _dedupe_strings(items):
@@ -4317,40 +4050,30 @@ def infer_non_pending_target_step_from_payload(user_response):
         return "step5"
     step_hints = (
         (
-            "step1",
+            "step0",
             {
-                "analysis_mode",
                 "active_maven_profiles",
+                "application_source",
                 "base_artifact_path",
                 "base_branch",
+                "base_tool",
                 "base_jdk_home",
-                "base_source_project_dir",
                 "current_artifact_path",
                 "current_branch",
+                "current_tool",
                 "current_jdk_home",
-                "current_source_project_dir",
-                "manual_coord_overrides",
-                "manual_artifact_identities",
-                "modules",
-                "primary_module",
                 "target_module",
-                "tool",
+                "dependency_source_dirs",
             },
         ),
         (
-            "step2",
+            "step1",
             {
-                "jdk_base",
-                "jdk_current",
-                "springboot_base",
-                "springboot_current",
-                "source_dirs",
-                "source_provision_choice",
-                "source_locations",
-                "source_location_mappings",
-                "dependency_source_dirs",
-                "source_repo_hints",
-                "accept_suggested_mappings",
+                "manual_coord_overrides",
+                "manual_artifact_identities",
+                "dependency_source_ref_selections",
+                "dependency_source_ref_bindings",
+                "skip_dependency_source_coords",
             },
         ),
         (
@@ -4764,455 +4487,6 @@ def _filter_inferred_coords_by_hint(inferred_coords, coord_hint, normalized_path
     return combined if len(combined) == 1 else []
 
 
-def _current_dependency_repo_mapping_map(run_context):
-    mapping = {}
-    for item in (run_context or {}).get("dependency_repo_mappings", []) or []:
-        value = str(item or "").strip()
-        if "=" not in value:
-            continue
-        coord, repo_path = value.split("=", 1)
-        coord = coord.strip()
-        repo_path = repo_path.strip()
-        if coord and repo_path:
-            mapping[coord] = repo_path
-    return mapping
-
-
-def build_dependency_repo_mapping_suggestions(run_context, ctx):
-    hints = list((run_context or {}).get("source_repo_hints") or [])
-    current_mapping = _current_dependency_repo_mapping_map(run_context)
-    target_coords = _collect_focus_dependency_coords(
-        (run_context or {}).get("report_dir") or "",
-        ctx=ctx,
-    )
-
-    result = {
-        "targets": target_coords,
-        "confirmed": [],
-        "proposed": [],
-        "ambiguous": [],
-        "unmatched": [],
-        "hints": hints,
-    }
-    if not target_coords:
-        return result
-
-    for coord in target_coords:
-        if current_mapping.get(coord):
-            result["confirmed"].append(
-                {
-                    "coord": coord,
-                    "repo_path": current_mapping[coord],
-                    "confidence": "confirmed",
-                    "reason": "已存在于当前自动识别结果",
-                }
-            )
-            continue
-
-        candidates = []
-        for hint in hints:
-            repo_path = str(hint.get("repo_path") or "").strip()
-            inferred_coords = [item for item in (hint.get("repo_inferred_coords") or []) if item]
-            if coord in inferred_coords:
-                candidates.append(
-                    {
-                        "coord": coord,
-                        "repo_path": repo_path,
-                        "confidence": "high",
-                        "reason": "仓库模块与升级依赖坐标准确命中",
-                        "hint_coord": str(hint.get("coord_hint") or "").strip(),
-                    }
-                )
-                continue
-
-            matched_from_hint = _filter_inferred_coords_by_hint(
-                inferred_coords,
-                hint.get("coord_hint") or coord,
-                repo_path,
-            )
-            if coord in matched_from_hint:
-                candidates.append(
-                    {
-                        "coord": coord,
-                        "repo_path": repo_path,
-                        "confidence": "medium",
-                        "reason": "仓库模块经坐标提示收敛后命中升级依赖",
-                        "hint_coord": str(hint.get("coord_hint") or "").strip(),
-                    }
-                )
-
-        unique_candidates = []
-        seen_pairs = set()
-        for item in candidates:
-            pair = (item["coord"], item["repo_path"])
-            if pair in seen_pairs:
-                continue
-            seen_pairs.add(pair)
-            unique_candidates.append(item)
-
-        if len(unique_candidates) == 1:
-            result["proposed"].append(unique_candidates[0])
-        elif len(unique_candidates) > 1:
-            result["ambiguous"].append(
-                {
-                    "coord": coord,
-                    "candidates": unique_candidates,
-                }
-            )
-        else:
-            result["unmatched"].append(coord)
-    return result
-
-
-def suggested_dependency_repo_mappings(suggestions):
-    values = []
-    for item in (suggestions or {}).get("proposed", []) or []:
-        coord = str(item.get("coord") or "").strip()
-        repo_path = str(item.get("repo_path") or "").strip()
-        if coord and repo_path:
-            values.append(f"{coord}={repo_path}")
-    return _dedupe_strings(values)
-
-
-def suggested_dependency_source_dirs(suggestions):
-    dirs = []
-    for bucket in ("confirmed", "proposed"):
-        for item in (suggestions or {}).get(bucket, []) or []:
-            repo_path = str(item.get("repo_path") or "").strip()
-            if repo_path:
-                dirs.append(resolve_repo_input_path(os.path.expanduser(repo_path)))
-    return _dedupe_strings(dirs)
-
-
-def _normalized_repo_key(repo_path):
-    value = str(repo_path or "").strip()
-    if not value:
-        return ""
-    try:
-        return str(Path(value).expanduser().resolve())
-    except Exception:
-        return value
-
-
-def build_step2_source_mapping_summary(run_context, ctx):
-    runtime_view = dict(run_context or {})
-    source_dirs = _dedupe_strings(
-        runtime_view.get("source_dirs") or (ctx or {}).get("source_dirs") or []
-    )
-    source_dirs_status = str(runtime_view.get("source_dirs_status") or "").strip()
-    if not source_dirs_status:
-        source_dirs_status = "context_detected" if source_dirs else "unknown"
-    dependency_source_dirs = _dedupe_strings(runtime_view.get("dependency_source_dirs") or [])
-    target_coords = _collect_focus_dependency_coords(runtime_view.get("report_dir") or "", ctx=ctx)
-    relevant_coords = _collect_relevant_dependency_coords(runtime_view.get("report_dir") or "", ctx=ctx)
-    plan = _build_dependency_source_plan(
-        dependency_source_dirs,
-        relevant_coords=relevant_coords or target_coords,
-    )
-    discovered_candidates = list(plan.get("candidates") or [])
-
-    current_mapping = _current_dependency_repo_mapping_map(runtime_view)
-    current_mapping_by_repo = {}
-    for coord, repo_path in current_mapping.items():
-        repo_key = _normalized_repo_key(repo_path)
-        current_mapping_by_repo.setdefault(repo_key, []).append(coord)
-
-    detected_dependency_repo_mappings = _dedupe_strings(
-        [
-            f"{item.get('coord')}={item.get('repo_path')}"
-            for item in discovered_candidates
-            if item.get("coord") and item.get("repo_path")
-        ]
-    )
-    detected_dependency_source_mappings = _dedupe_strings(
-        [
-            f"{item.get('coord')}={item.get('source_dir')}"
-            for item in discovered_candidates
-            if item.get("coord") and item.get("source_dir")
-        ]
-    )
-    ambiguous_coords = list(plan.get("ambiguous_coords") or [])
-    repo_scans = []
-    for repo_path in dependency_source_dirs:
-        repo_key = _normalized_repo_key(repo_path)
-        repo_candidates = [
-            item for item in discovered_candidates
-            if _normalized_repo_key(item.get("repo_path")) == repo_key
-        ]
-        inferred_coords = _dedupe_strings([str(item.get("coord") or "").strip() for item in repo_candidates if item.get("coord")])
-        matched_target_coords = [coord for coord in target_coords if coord in inferred_coords]
-        mapped_dependency_coords = [
-            coord for coord in (current_mapping_by_repo.get(repo_key) or [])
-            if coord in target_coords
-        ]
-        other_inferred_coords = [coord for coord in inferred_coords if coord not in target_coords]
-        discovered_modules = []
-        module_seen = set()
-        for item in repo_candidates:
-            module_root = str(item.get("module_root") or "").strip()
-            coord = str(item.get("coord") or "").strip()
-            source_dir = str(item.get("source_dir") or "").strip()
-            if not module_root and not source_dir and not coord:
-                continue
-            key = (module_root, source_dir, coord)
-            if key in module_seen:
-                continue
-            module_seen.add(key)
-            discovered_modules.append(
-                {
-                    "coord": coord,
-                    "module_root": module_root,
-                    "source_dir": source_dir,
-                    "discovery_mode": str(item.get("discovery_mode") or "").strip(),
-                }
-            )
-        if mapped_dependency_coords:
-            status = "mapped_dependency_repo"
-        elif matched_target_coords:
-            status = "matched_target_not_applied"
-        elif inferred_coords:
-            status = "inferred_non_target_only"
-        else:
-            status = "no_coords_inferred"
-        repo_scans.append(
-            {
-                "repo_path": repo_path,
-                "status": status,
-                "inferred_coords": inferred_coords,
-                "matched_target_coords": matched_target_coords,
-                "mapped_dependency_coords": mapped_dependency_coords,
-                "other_inferred_coords": other_inferred_coords,
-                    "discovered_modules": discovered_modules,
-            }
-        )
-
-    confirmed_target_mappings = []
-    unmapped_target_coords = []
-    for coord in target_coords:
-        repo_path = current_mapping.get(coord)
-        if repo_path:
-            confirmed_target_mappings.append({"coord": coord, "repo_path": repo_path})
-        else:
-            unmapped_target_coords.append(coord)
-
-    suggestions = build_dependency_repo_mapping_suggestions(runtime_view, ctx)
-    source_input_state = source_input_state_for_context(
-        runtime_view,
-        {
-            "source_dirs": source_dirs,
-            "dependency_source_dirs": dependency_source_dirs,
-            "confirmed_target_mappings": confirmed_target_mappings,
-        },
-    )
-    return {
-        "business_source_status": source_input_state["business_source_status"],
-        "dependency_source_status": source_input_state["dependency_source_status"],
-        "source_provision_choice": source_input_state["source_provision_choice"],
-        "source_provision_status": source_input_state["source_provision_status"],
-        "source_input_purpose_version": SOURCE_INPUT_PURPOSE_VERSION,
-        "source_dirs": source_dirs,
-        "source_dirs_status": source_dirs_status,
-        "dependency_source_dirs": dependency_source_dirs,
-        "source_locations": list(runtime_view.get("source_locations") or []),
-        "source_location_classifications": list(
-            runtime_view.get("source_location_classifications") or []
-        ),
-        "unclassified_source_locations": list(
-            runtime_view.get("unclassified_source_locations") or []
-        ),
-        "target_dependency_coords": target_coords,
-        "current_confirmed_repo_matches": _dedupe_strings(runtime_view.get("dependency_repo_mappings") or []),
-        "confirmed_target_mappings": confirmed_target_mappings,
-        "unmapped_target_coords": unmapped_target_coords,
-        "detected_repo_matches": detected_dependency_repo_mappings,
-        "detected_source_matches": detected_dependency_source_mappings,
-        "detected_candidates": discovered_candidates,
-        "ambiguous_coords": ambiguous_coords,
-        "unmatched_relevant_coords": list(plan.get("unmatched_relevant_coords") or []),
-        "dependency_repo_scans": repo_scans,
-        "source_repo_hint_suggestions": suggestions,
-        "suggested_repo_matches": suggested_dependency_repo_mappings(suggestions),
-        "counts": {
-            "source_dirs": len(source_dirs),
-            "dependency_source_dirs": len(dependency_source_dirs),
-            "target_dependency_coords": len(target_coords),
-            "current_confirmed_repo_matches": len(_dedupe_strings(runtime_view.get("dependency_repo_mappings") or [])),
-            "confirmed_target_mappings": len(confirmed_target_mappings),
-            "unmapped_target_coords": len(unmapped_target_coords),
-            "detected_repo_matches": len(detected_dependency_repo_mappings),
-            "detected_source_matches": len(detected_dependency_source_mappings),
-            "ambiguous_coords": len(ambiguous_coords),
-        },
-    }
-
-
-def write_step2_source_mapping_summary(report_dir, run_context, ctx):
-    summary = build_step2_source_mapping_summary(run_context, ctx)
-    output_path = step2_source_mapping_summary_path(report_dir)
-    write_json(output_path, summary)
-    return output_path, summary
-
-
-def _source_status_label(status, *, business):
-    value = str(status or "").strip()
-    labels = {
-        "available_from_build": "构建输入已具备，系统直接使用",
-        "provided": "已提供，系统直接使用",
-        "not_provided": "未提供，保留相应源码证据缺口",
-        "awaiting_choice": "等待确认是否能够补充",
-        "awaiting_input": "等待补充源码位置",
-    }
-    if value in labels:
-        return labels[value]
-    return "业务源码状态未记录" if business else "依赖源码状态未记录"
-
-
-def write_step2_review(report_dir, ctx, mapping_summary, runtime_view=None):
-    output_path = evidence_context_dir(report_dir) / "review.md"
-    counts = dict((mapping_summary or {}).get("counts") or {})
-    source_dirs = list((mapping_summary or {}).get("source_dirs") or [])
-    mapped = list((mapping_summary or {}).get("confirmed_target_mappings") or [])
-    unmapped = list((mapping_summary or {}).get("unmapped_target_coords") or [])
-    runtime_view = runtime_view or {}
-    target_module = (
-        runtime_view.get("target_module")
-        or runtime_view.get("primary_module")
-        or ctx.get("target_module")
-        or ctx.get("primary_module")
-        or "未指定"
-    )
-    lines = [
-        "# 升级上下文确认",
-        "",
-        "本文件回答：本次升级分析使用了什么范围和版本信息。",
-        "",
-        "## 分析范围",
-        "",
-        "| 项目 | 当前识别结果 |",
-        "|---|---|",
-        f"| 目标模块 | `{target_module}` |",
-        f"| 比较版本 | `{ctx.get('base_branch') or '未识别'}` → `{ctx.get('current_branch') or '未识别'}` |",
-        f"| JDK | {ctx.get('jdk_base') or '未识别'} → {ctx.get('jdk_current') or '未识别'} |",
-        f"| Spring Boot | {ctx.get('springboot_base') or '未识别'} → {ctx.get('springboot_current') or '未识别'} |",
-        f"| 发生变化的依赖包 | {len(ctx.get('changed_dependencies') or [])} 个 |",
-        f"| 业务源码 | {_source_status_label((mapping_summary or {}).get('business_source_status'), business=True)} |",
-        f"| 依赖源码 | {_source_status_label((mapping_summary or {}).get('dependency_source_status'), business=False)} |",
-        f"| 业务源码目录 | {len(source_dirs)} 个 |",
-        f"| 已匹配依赖源码 | {counts.get('confirmed_target_mappings', len(mapped))} / {counts.get('target_dependency_coords', 0)} 个目标依赖 |",
-    ]
-    if source_dirs:
-        lines.extend(["", "## 业务源码范围", ""])
-        lines.extend(f"- `{item}`" for item in source_dirs)
-    if mapped:
-        lines.extend(["", "## 已匹配的依赖源码", "", "| 依赖包 | 源码目录 |", "|---|---|"])
-        for item in mapped:
-            lines.append(f"| `{item.get('coord') or '-'}` | `{item.get('repo_path') or '-'}` |")
-    if unmapped:
-        lines.extend(["", "## 尚未匹配源码的依赖包", ""])
-        lines.extend(f"- `{item}`" for item in unmapped)
-    lines.extend(
-        [
-            "",
-            "## 源码的作用与边界",
-            "",
-            "提供源码可以增加文件/行号、声明与注解、可读上下文和源码候选关系，"
-            "并在受支持的常量内联场景与字节码共同形成证明；"
-            "正式变化、运行时提供者、方法解析和精确可执行边仍由最终二进制制品决定。",
-            "未补充某类源码时仍执行完整二进制分析，但报告会分别标注对应的源码语义解释覆盖缺失。",
-            "",
-            "完整结构化证据保存在同目录的 `context.json`、`dep_graph.json` 和 `source_mapping_summary.json`。",
-        ]
-    )
-    _write_text_file(output_path, "\n".join(lines))
-    return output_path
-
-
-def build_step2_confirmation_requirements(ctx, mapping_summary, runtime_view=None):
-    """Return only facts that cannot be accepted safely from generated evidence."""
-    ctx = dict(ctx or {})
-    mapping_summary = dict(mapping_summary or {})
-    runtime_view = dict(runtime_view or {})
-    reasons = []
-    required_fields = []
-    source_input_state = source_input_state_for_context(
-        runtime_view, mapping_summary
-    )
-    analysis_mode = source_input_state["analysis_mode"]
-    provision_status = source_input_state["source_provision_status"]
-    if provision_status == "awaiting_choice":
-        reasons.append(
-            "编译模式已经取得并会直接使用被分析系统源码；请说明是否还能补充其他相关源码，主要是依赖源码"
-            if analysis_mode == "checkout_build"
-            else "直接制品模式可补充被分析系统及其依赖的源码；请说明是否能够提供相关源码"
-        )
-        required_fields.append("source_provision_choice")
-    elif provision_status == "awaiting_input":
-        reasons.append("已选择补充源码，但尚未提供源码目录或 Git 地址")
-        required_fields.append("source_locations")
-    elif provision_status == "awaiting_mapping":
-        reasons.append("部分源码位置无法可靠判断归属，需要补充一次归属映射")
-        required_fields.append("source_location_mappings")
-
-    if not str(ctx.get("jdk_base") or "").strip() or str(ctx.get("jdk_base") or "").strip() == "unknown":
-        reasons.append("未能自动识别升级前 JDK 版本")
-        required_fields.append("jdk_base")
-    if not str(ctx.get("jdk_current") or "").strip() or str(ctx.get("jdk_current") or "").strip() == "unknown":
-        reasons.append("未能自动识别升级后 JDK 版本")
-        required_fields.append("jdk_current")
-
-    ambiguous_coords = list(mapping_summary.get("ambiguous_coords") or [])
-    if source_input_state["dependency_source_available"] and ambiguous_coords:
-        preview = "、".join(
-            str((item or {}).get("coord") or "").strip()
-            for item in ambiguous_coords[:5]
-            if str((item or {}).get("coord") or "").strip()
-        )
-        reasons.append(
-            "依赖源码存在坐标歧义" + (f"（{preview}）" if preview else "")
-        )
-        required_fields.append("dependency_repo_mappings")
-
-    suggestions = dict(mapping_summary.get("source_repo_hint_suggestions") or {})
-    suggestion_decision_recorded = "accept_suggested_mappings" in runtime_view
-    proposed_mappings = (
-        []
-        if suggestion_decision_recorded or not source_input_state["dependency_source_available"]
-        else list(suggestions.get("proposed") or [])
-    )
-    if proposed_mappings:
-        reasons.append(
-            f"源码线索生成了 {len(proposed_mappings)} 条尚未确认的依赖源码映射建议"
-        )
-        # Both true and false are meaningful answers: accepting the mapping
-        # improves source-behaviour coverage, while declining keeps the JAR-only
-        # evidence boundary.  Do not silently choose either result for the user.
-        required_fields.append("accept_suggested_mappings")
-
-    return {
-        "required": bool(reasons),
-        "reason_code": (
-            "step2_source_mapping_decision_required"
-            if proposed_mappings and len(reasons) == 1
-            else (
-                "step2_source_inputs_required"
-                if any(field in required_fields for field in (
-                    "source_provision_choice",
-                    "source_locations",
-                    "source_location_mappings",
-                ))
-                and all(
-                    field in {"source_provision_choice", "source_locations", "source_location_mappings"}
-                    for field in required_fields
-                )
-                else ("step2_context_facts_unresolved" if reasons else "")
-            )
-        ),
-        "reasons": reasons,
-        "required_fields": _dedupe_strings(required_fields),
-        "proposed_mappings": proposed_mappings,
-    }
-
-
 def _expand_coord_path_by_repo(coord, normalized_path, config_key, expand_all_inferred=False):
     inferred_coords = [item for item in infer_maven_coords(normalized_path) if item]
     coord = _validate_coord_or_prefix_or_empty(coord, config_key)
@@ -5451,7 +4725,9 @@ def _apply_pinned_source_snapshot(run_context, project_dir):
         _stable_path_from_project_relative(project_root, item)
         for item in snapshot.get("source_roots") or []
     ]
-    updated["tool"] = str(snapshot.get("build_tool") or updated.get("tool") or "")
+    detected_tool = str(snapshot.get("build_tool") or updated.get("current_tool") or updated.get("tool") or "")
+    updated["current_tool"] = detected_tool
+    updated["tool"] = detected_tool
     updated["project_scope"] = _materialize_project_scope_paths(
         snapshot.get("project_scope") or {},
         project_root,
@@ -5486,6 +4762,8 @@ def _discard_unpinned_local_source_discovery(run_context):
         updated["source_dirs_status"] = "missing"
     if not updated.get("tool_explicit"):
         updated["tool"] = ""
+        updated["base_tool"] = ""
+        updated["current_tool"] = ""
     return updated
 
 
@@ -5511,12 +4789,7 @@ def load_seed_json_arg(raw_value, project_dir):
 def build_run_context(args, existing, seed_payload, allow_external_seed=True):
     previous = dict(existing or {})
     seed_input = dict(seed_payload or {}) if allow_external_seed else {}
-    if "analysis_mode" in previous:
-        previous["analysis_mode"] = normalize_analysis_mode(previous.get("analysis_mode"), allow_empty=True)
-    if "analysis_mode" in seed_input:
-        seed_input["analysis_mode"] = normalize_analysis_mode(seed_input.get("analysis_mode"), allow_empty=True)
     merged = {**seed_input, **previous}
-    merged = apply_explicit_step1_mode_selection(merged)
     project_dir = Path(args.project_dir).resolve()
     detected_tool = detect_build_tool(project_dir)
     cli_scalar = (lambda value: value) if allow_external_seed else (lambda _value: None)
@@ -5543,14 +4816,18 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
     confirmed_unresolved_items = list(resolve_value(None, merged, "confirmed_unresolved_items", []) or [])
     base_branch_explicit = _has_explicit_string_value(cli_scalar(args.base_branch), seed_input, previous, "base_branch")
     current_branch_explicit = _has_explicit_string_value(cli_scalar(args.current_branch), seed_input, previous, "current_branch")
+    base_cli_tool = getattr(args, "base_tool", "")
+    current_cli_tool = getattr(args, "current_tool", "")
     tool_explicit = bool(
-        (
-            isinstance(cli_scalar(args.tool), str)
-            and str(cli_scalar(args.tool) or "").strip()
+        str(cli_scalar(base_cli_tool) or "").strip()
+        or str(cli_scalar(current_cli_tool) or "").strip()
+        or (
+            isinstance(seed_input.get("base_tool"), str)
+            and str(seed_input.get("base_tool") or "").strip()
         )
         or (
-            isinstance(seed_input.get("tool"), str)
-            and str(seed_input.get("tool") or "").strip()
+            isinstance(seed_input.get("current_tool"), str)
+            and str(seed_input.get("current_tool") or "").strip()
         )
         or previous.get("tool_explicit")
     )
@@ -5624,37 +4901,16 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
             parse_bool_like(merged.get("current_allow_dirty_local_source"), "current_allow_dirty_local_source")
             if "current_allow_dirty_local_source" in merged else False
         ),
-        "modules": resolve_value(cli_list(args.modules), merged, "modules", []),
+        "modules": resolve_value(None, merged, "modules", []),
         "active_maven_profiles": resolve_value(
             cli_list(getattr(args, "active_maven_profiles", None)),
             merged,
             "active_maven_profiles",
             [],
         ),
-        "source_dirs": resolve_value(cli_list(args.source_dirs), merged, "source_dirs"),
+        "source_dirs": resolve_value(None, merged, "source_dirs"),
         "source_dirs_status": resolve_value(
             None, merged, "source_dirs_status", ""
-        ),
-        "source_provision_choice": normalize_source_provision_choice(
-            resolve_value(None, merged, "source_provision_choice", ""),
-            "source_provision_choice",
-            allow_empty=True,
-        ),
-        "source_input_purpose_version": SOURCE_INPUT_PURPOSE_VERSION,
-        "source_locations": resolve_value(
-            cli_list(getattr(args, "source_locations", None)),
-            merged,
-            "source_locations",
-            [],
-        ),
-        "source_location_mappings": resolve_value(
-            None, merged, "source_location_mappings", []
-        ),
-        "source_location_classifications": resolve_value(
-            None, merged, "source_location_classifications", []
-        ),
-        "unclassified_source_locations": resolve_value(
-            None, merged, "unclassified_source_locations", []
         ),
         "dependency_source_dirs": resolve_value(cli_list(args.dependency_source_dirs), merged, "dependency_source_dirs", []),
         "dependency_source_git_urls": resolve_value(
@@ -5664,13 +4920,24 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
             [],
         ),
         "dependency_source_mappings": resolve_value(
-            cli_list(args.dependency_source_mappings),
+            None,
             merged,
             "dependency_source_mappings",
             [],
         ),
-        "source_repo_hints": resolve_value(cli_list(args.source_repo_hints), merged, "source_repo_hints", []),
-        "dependency_repo_mappings": resolve_value(cli_list(args.dependency_repo_mappings), merged, "dependency_repo_mappings", []),
+        "dependency_source_ref_bindings": [
+            dict(item)
+            for item in (resolve_value(
+                None, merged, "dependency_source_ref_bindings", []
+            ) or [])
+            if isinstance(item, dict)
+        ],
+        "skip_dependency_source_coords": _dedupe_strings(
+            resolve_value(
+                None, merged, "skip_dependency_source_coords", []
+            ) or []
+        ),
+        "dependency_repo_mappings": resolve_value(None, merged, "dependency_repo_mappings", []),
         "step5_selected_coords": resolve_value(None, merged, "step5_selected_coords", []),
         "step5_selected_names": resolve_value(None, merged, "step5_selected_names", []),
         "step5_scope_mode": resolve_value(None, merged, "step5_scope_mode", ""),
@@ -5679,7 +4946,18 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
             if "include_test_scope" in merged
             else bool(args.include_test_scope if allow_external_seed else False)
         ),
-        "tool": resolve_value(cli_scalar(args.tool), merged, "tool", detected_tool),
+        "base_tool": resolve_value(
+            cli_scalar(base_cli_tool),
+            merged,
+            "base_tool",
+            detected_tool,
+        ),
+        "current_tool": resolve_value(
+            cli_scalar(current_cli_tool),
+            merged,
+            "current_tool",
+            detected_tool,
+        ),
         "tool_explicit": tool_explicit,
         "strict_risk_gate": (
             parse_bool_like(merged.get("strict_risk_gate"), "strict_risk_gate")
@@ -5692,7 +4970,7 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
             "dependency_source_clone_timeout",
             None,
         ),
-        "analysis_mode": normalize_analysis_mode(merged.get("analysis_mode"), allow_empty=True),
+        "analysis_mode": "",
         "binary_pipeline_config": resolve_value(
             cli_scalar(getattr(args, "binary_pipeline_config", "")),
             merged,
@@ -5701,30 +4979,65 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
         ),
         "base_artifact_path": resolve_value(cli_scalar(args.base_artifact_path), merged, "base_artifact_path", ""),
         "current_artifact_path": resolve_value(cli_scalar(args.current_artifact_path), merged, "current_artifact_path", ""),
-        "base_source_project_dir": resolve_value(cli_scalar(args.base_source_project_dir), merged, "base_source_project_dir", ""),
-        "current_source_project_dir": resolve_value(
-            cli_scalar(args.current_source_project_dir),
+        "application_source": resolve_value(
+            cli_scalar(getattr(args, "application_source", "")),
             merged,
-            "current_source_project_dir",
+            "application_source",
             "",
         ),
+        "application_source_display": resolve_value(
+            None, merged, "application_source_display", ""
+        ),
+        "application_source_repo_path": resolve_value(
+            None, merged, "application_source_repo_path", ""
+        ),
+        "base_source_project_dir": resolve_value(None, merged, "base_source_project_dir", ""),
+        "current_source_project_dir": resolve_value(None, merged, "current_source_project_dir", ""),
         "base_jdk_home": resolve_value(cli_scalar(args.base_jdk_home), merged, "base_jdk_home", ""),
         "current_jdk_home": resolve_value(cli_scalar(args.current_jdk_home), merged, "current_jdk_home", ""),
         "target_module": resolve_value(
             cli_scalar(getattr(args, "target_module", "")),
             merged,
             "target_module",
-            resolve_value(cli_scalar(args.primary_module), merged, "primary_module", ""),
+            "",
         ),
-        "primary_module": resolve_value(cli_scalar(args.primary_module), merged, "primary_module", ""),
+        "primary_module": "",
         "manual_coord_overrides": manual_coord_overrides,
         "manual_artifact_identities": manual_artifact_identities,
         "allow_unresolved": allow_unresolved,
         "confirmed_unresolved_items": confirmed_unresolved_items,
         "artifact_input_mode": artifact_input_mode,
+        "step0_confirmation_acknowledged": bool(
+            previous.get("step0_confirmation_acknowledged")
+        ),
+        "step0_confirmed": bool(previous.get("step0_confirmed")),
         "base_branch_explicit": base_branch_explicit,
         "current_branch_explicit": current_branch_explicit,
     }
+    target_module = str(result.get("target_module") or "").strip()
+    result["primary_module"] = target_module
+    result["modules"] = [target_module] if target_module else []
+    result["input_origins"] = dict(merged.get("input_origins") or {})
+    for field, cli_value in (
+        ("base_artifact_path", getattr(args, "base_artifact_path", "")),
+        ("current_artifact_path", getattr(args, "current_artifact_path", "")),
+        ("application_source", getattr(args, "application_source", "")),
+        ("base_branch", getattr(args, "base_branch", "")),
+        ("current_branch", getattr(args, "current_branch", "")),
+        ("target_module", getattr(args, "target_module", "")),
+        ("base_tool", base_cli_tool),
+        ("current_tool", current_cli_tool),
+        ("base_jdk_home", getattr(args, "base_jdk_home", "")),
+        ("current_jdk_home", getattr(args, "current_jdk_home", "")),
+    ):
+        if allow_external_seed and str(cli_value or "").strip():
+            result["input_origins"][field] = "user"
+        elif field in seed_input and seed_input.get(field) not in (None, "", [], {}):
+            result["input_origins"][field] = "user"
+    for field in ("base_tool", "current_tool"):
+        if result.get(field) and field not in result["input_origins"]:
+            result["input_origins"][field] = "detected"
+    result["tool"] = str(result.get("current_tool") or "")
     for side, incoming_branch in explicit_cli_branches.items():
         branch_field = f"{side}_branch"
         restored_branch = str(merged.get(branch_field) or "").strip()
@@ -5736,11 +5049,6 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
         result = _clear_step1_ref_state(result, side)
         result[branch_field] = incoming_branch
         result[f"{branch_field}_explicit"] = True
-    if "accept_suggested_mappings" in merged:
-        result["accept_suggested_mappings"] = parse_bool_like(
-            merged.get("accept_suggested_mappings"),
-            "accept_suggested_mappings",
-        )
     result.update(infer_step1_mode_fields(result))
     for path_key in (
         "base_artifact_path",
@@ -5754,37 +5062,51 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
         path_value = result.get(path_key)
         if isinstance(path_value, str) and path_value.strip():
             result[path_key] = absolutize_path(path_value.strip(), project_dir)
-    normalized_source_locations = normalize_dependency_source_dirs(
-        result.get("source_locations"), project_dir, "source_locations"
-    ) or []
-    normalized_source_location_mappings = normalize_source_location_mappings(
-        result.get("source_location_mappings"), project_dir
-    ) or []
-    result["source_locations"] = normalized_source_locations
-    result["source_location_mappings"] = normalized_source_location_mappings
-    if normalized_source_locations:
-        classified = classify_source_locations(
-            normalized_source_locations,
-            result,
-            project_dir,
-            mappings=normalized_source_location_mappings,
-        )
-        result["source_location_classifications"] = list(
-            classified.get("classifications") or []
-        )
-        result["unclassified_source_locations"] = list(
-            classified.get("unclassified") or []
-        )
-        classified_business = list(classified.get("business_source_dirs") or [])
-        if classified_business:
-            result["source_dirs"] = _dedupe_strings(
-                list(result.get("source_dirs") or []) + classified_business
+    application_source = str(result.get("application_source") or "").strip()
+    remembered_application_repo = str(
+        result.get("application_source_repo_path") or ""
+    ).strip()
+    if not application_source:
+        auto_source = detect_application_source(project_dir)
+        if auto_source:
+            result["application_source"] = auto_source["display"]
+            result["application_source_display"] = auto_source["display"]
+            result["application_source_repo_path"] = str(auto_source["repo_path"])
+            result["base_source_project_dir"] = str(
+                result.get("base_source_project_dir") or auto_source["repo_path"]
             )
-            result["source_dirs_status"] = "explicit"
-        result["dependency_source_dirs"] = _dedupe_strings(
-            list(result.get("dependency_source_dirs") or [])
-            + list(classified.get("dependency_source_dirs") or [])
+            result["current_source_project_dir"] = str(
+                result.get("current_source_project_dir") or auto_source["repo_path"]
+            )
+            result["input_origins"].setdefault("application_source", "detected")
+    else:
+        reusable_repo = (
+            Path(remembered_application_repo).expanduser()
+            if remembered_application_repo
+            else None
         )
+        if reusable_repo is not None and reusable_repo.is_dir() and _git_repository_root(reusable_repo):
+            materialized_source = {
+                "repo_path": str(reusable_repo.resolve()),
+                "display": str(
+                    result.get("application_source_display") or application_source
+                ),
+                "origin": "remembered",
+            }
+        else:
+            materialized_source = materialize_application_source(
+                application_source,
+                project_dir,
+                result["report_dir"],
+                clone_timeout=(result.get("dependency_source_clone_timeout") or 300),
+            )
+        result["application_source"] = materialized_source["display"]
+        result["application_source_display"] = materialized_source["display"]
+        result["application_source_repo_path"] = materialized_source["repo_path"]
+        result["base_source_project_dir"] = materialized_source["repo_path"]
+        result["current_source_project_dir"] = materialized_source["repo_path"]
+        result["application_source_materialization"] = materialized_source
+        result["input_origins"].setdefault("application_source", "user")
     dependency_source_inputs = normalize_dependency_source_dirs(
         result.get("dependency_source_dirs"),
         project_dir,
@@ -5795,16 +5117,6 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
         project_dir,
         "dependency_source_git_urls",
     ) or []
-    # New checkpoints keep Git URLs for display only and resume from the local
-    # materialized repository.  The fallback is solely for legacy checkpoints
-    # that stored a raw URL without a local path; a redacted address is never
-    # sent back to ``git clone``.
-    if not dependency_source_inputs:
-        dependency_source_inputs = [
-            value
-            for value in remembered_git_urls
-            if not _is_redacted_git_display_url(value)
-        ]
     dependency_source_inputs = _dedupe_strings(dependency_source_inputs)
     clone_timeout_value = result.get("dependency_source_clone_timeout")
     clone_timeout = (
@@ -5835,49 +5147,6 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
         dependency_source_materialization.get("dependency_source_dirs") or []
     )
     result.update(dependency_source_materialization)
-    manual_dependency_repo_mappings = []
-    manual_dependency_source_mappings = []
-    materializations = list(
-        dependency_source_materialization.get(
-            "dependency_source_git_materializations"
-        ) or []
-    )
-    for mapping in result.get("source_location_mappings") or []:
-        if str((mapping or {}).get("owner_type") or "") != "dependency":
-            continue
-        coord = str((mapping or {}).get("owner_coord") or "").strip()
-        location = str((mapping or {}).get("location") or "").strip()
-        if not coord or not location:
-            continue
-        repo_path = location
-        if is_dependency_source_git_url(location, project_dir):
-            endpoint = _canonical_git_endpoint(location)
-            repo_path = next(
-                (
-                    str(item.get("repo_path") or "").strip()
-                    for item in materializations
-                    if _canonical_git_endpoint(item.get("git_endpoint") or item.get("git_url"))
-                    == endpoint
-                ),
-                "",
-            )
-        if not repo_path:
-            continue
-        repo_path = resolve_repo_input_path(absolutize_path(repo_path, project_dir))
-        manual_dependency_repo_mappings.append(f"{coord}={repo_path}")
-        source_plan = _resolve_source_dirs_plan(Path(repo_path))
-        for source_dir in source_plan.get("source_dirs") or []:
-            manual_dependency_source_mappings.append(f"{coord}={source_dir}")
-    if manual_dependency_repo_mappings:
-        result["dependency_repo_mappings"] = _dedupe_strings(
-            list(result.get("dependency_repo_mappings") or [])
-            + manual_dependency_repo_mappings
-        )
-    if manual_dependency_source_mappings:
-        result["dependency_source_mappings"] = _dedupe_strings(
-            list(result.get("dependency_source_mappings") or [])
-            + manual_dependency_source_mappings
-        )
     result["dependency_repo_mappings"] = normalize_dependency_repo_mappings(
         result.get("dependency_repo_mappings"),
         project_dir,
@@ -5906,23 +5175,9 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
     result["active_maven_profiles"] = _dedupe_strings(
         result.get("active_maven_profiles") or []
     )
-    # CLI/seed values may use the convenient string form while checkpoint
-    # replies already carry structured hint objects.  Keep one invariant for
-    # all downstream mapping logic so an internal representation mismatch can
-    # never escape as an AttributeError to the user.
-    result["source_repo_hints"] = normalize_source_repo_hints(
-        result.get("source_repo_hints"),
-        project_dir,
-        "source_repo_hints",
-    ) or []
     if result.get("target_module"):
         result["primary_module"] = result["target_module"]
         result["modules"] = [result["target_module"]]
-    if not result.get("primary_module") and len(modules_value) == 1:
-        result["primary_module"] = modules_value[0]
-        result["target_module"] = modules_value[0]
-    if result.get("primary_module") and not result.get("target_module"):
-        result["target_module"] = result["primary_module"]
     pinned_result = _apply_pinned_source_snapshot(result, project_dir)
     if pinned_result is not None:
         result = pinned_result
@@ -5949,14 +5204,9 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
                 "source_roots": [],
                 "resource_roots": [],
             }
-        explicit_source_dirs = bool(
-            str(result.get("source_dirs_status") or "").strip() == "explicit"
-            or cli_list(args.source_dirs)
-            or seed_input.get("source_dirs")
-        )
         source_dir_plan = _resolve_source_dirs_plan(
             project_dir,
-            source_dirs=(result.get("source_dirs") if explicit_source_dirs else None),
+            source_dirs=None,
             modules=result.get("modules"),
             project_scope=result.get("project_scope"),
         )
@@ -6044,60 +5294,33 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
                 for item in binary_config_business_dirs
             ]
             result["source_dirs_status"] = "explicit"
-    supplemental_source_provided = bool(
-        result.get("dependency_source_dirs")
-        or result.get("dependency_source_mappings")
-        or result.get("source_repo_hints")
-        or binary_config_dependency_source
-        or result.get("source_locations")
-        or (
-            result.get("source_dirs")
-            and result.get("analysis_mode") == "artifact_inputs"
-        )
-        or result.get("source_overlay_config_provided")
-    )
-    if supplemental_source_provided and not result.get("source_provision_choice"):
-        result["source_provision_choice"] = "provide"
     result["source_input_purpose_version"] = SOURCE_INPUT_PURPOSE_VERSION
     return result
 
 
 def validate_run_context_for_step(step_id, run_context):
     source_dirs = list(run_context.get("source_dirs") or [])
-    source_input_state = source_input_state_for_context(run_context)
     if (
         step_id in {"step3", "step4", "step5", "step6"}
-        and source_input_state["source_provision_status"] != "complete"
+        and not run_context.get("step0_confirmed")
     ):
         raise StepError(
-            "源码补充环节尚未完成。请回到 Step2 一次提交可提供的源码位置，"
-            "或明确暂不补充；系统会自动区分业务源码和依赖源码。"
+            "缺少 Step0 统一确认记录，必须从 Step0 重新确认正式分析信息。",
+            reason_codes=["STEP0_CONFIRMATION_REQUIRED"],
         )
     if (
-        step_id == "step3"
-        and source_input_state["analysis_mode"] == "checkout_build"
+        step_id in {"step3", "step4", "step5", "step6"}
         and not source_dirs
     ):
         raise StepError(
-            "编译模式已经取得被分析系统源码，但系统没有定位到业务源码目录。"
-            "请回到 Step2 修正模块或 source_dirs；不能静默退化成无业务源码分析。"
+            "已确认应用源码，但系统没有在固定 Current commit 中定位到目标模块源码目录。"
+            "请回到 Step0 修正目标模块；不能静默退化成无应用源码分析。"
         )
 
 
 def ensure_exists(path, message):
     if not Path(path).exists():
         raise StepError(message)
-
-
-def resolve_source_dirs(args, run_context, project_dir):
-    source_dirs = resolve_value(args.source_dirs, run_context, "source_dirs")
-    if not source_dirs:
-        modules = run_context.get("modules") or []
-        detected = detect_source_dirs_by_modules(project_dir, modules) if modules else []
-        source_dirs = detected or detect_source_dirs(project_dir)
-    if not source_dirs:
-        raise StepError("未找到业务源码目录，请通过 --source-dirs 显式传入")
-    return [str(Path(item).resolve()) for item in source_dirs]
 
 
 def run_gate(gate_name, report_dir, cwd, strict_risk_gate=False):
@@ -6125,6 +5348,7 @@ def run_gate(gate_name, report_dir, cwd, strict_risk_gate=False):
 
 
 def detect_build_tool(project_dir):
+    project_dir = Path(project_dir)
     if (project_dir / "pom.xml").is_file():
         return "maven"
     if (project_dir / "build.gradle").is_file() or (project_dir / "build.gradle.kts").is_file():
@@ -6133,36 +5357,258 @@ def detect_build_tool(project_dir):
         return "gradle"
     if (project_dir / "gradlew").is_file() or (project_dir / "gradlew.bat").is_file():
         return "gradle"
-    return "maven"
+    return ""
+
+
+def _git_repository_root(path):
+    candidate = Path(path).expanduser().resolve()
+    stdout, _stderr, rc = run_cmd(
+        git_cmd() + ["-C", str(candidate), "rev-parse", "--show-toplevel"],
+        timeout=15,
+    )
+    root = str(stdout or "").strip()
+    return Path(root).resolve() if rc == 0 and root else None
+
+
+def _git_repository_display(repo_path):
+    repo_path = Path(repo_path).resolve()
+    stdout, _stderr, rc = run_cmd(
+        git_cmd() + ["-C", str(repo_path), "config", "--get", "remote.origin.url"],
+        timeout=15,
+    )
+    origin = str(stdout or "").strip()
+    if rc == 0 and origin:
+        return _canonical_git_endpoint(origin)
+    return str(repo_path)
+
+
+def detect_application_source(project_dir):
+    """Detect the current application Git repository without confirming it."""
+    root = _git_repository_root(project_dir)
+    if root is None:
+        return None
+    return {
+        "repo_path": str(root),
+        "display": _git_repository_display(root),
+        "origin": "detected",
+    }
+
+
+def materialize_application_source(value, project_dir, report_dir, clone_timeout=300):
+    """Resolve one required application-source input to a local Git repository."""
+    text = str(value or "").strip()
+    if not text:
+        raise StepError("应用源码不能为空。")
+    if is_dependency_source_git_url(text, project_dir):
+        materialized = materialize_dependency_source_git_url(
+            text,
+            report_dir,
+            clone_timeout=clone_timeout,
+        )
+        return {
+            "repo_path": materialized["repo_path"],
+            "display": materialized["git_endpoint"],
+            "resolved_commit": materialized.get("resolved_commit", ""),
+            "metadata_path": materialized.get("metadata_path", ""),
+            "origin": "user_git",
+        }
+    local_path = Path(absolutize_path(text, project_dir)).resolve()
+    if not local_path.is_dir():
+        raise StepError(f"应用源码目录不存在：{local_path}")
+    root = _git_repository_root(local_path)
+    if root is None:
+        raise StepError(
+            f"应用源码必须是可固定版本的 Git 仓库：{local_path}",
+            reason_codes=["APPLICATION_SOURCE_GIT_REQUIRED"],
+        )
+    return {
+        "repo_path": str(local_path),
+        "git_root": str(root),
+        "display": _git_repository_display(root),
+        "origin": "user_path",
+    }
+
+
+def detect_current_git_branch(repo_path):
+    stdout, _stderr, rc = run_cmd(
+        git_cmd() + ["-C", str(Path(repo_path).resolve()), "symbolic-ref", "--quiet", "--short", "HEAD"],
+        timeout=15,
+    )
+    return str(stdout or "").strip() if rc == 0 else ""
+
+
+def detect_artifact_application_version(artifact_path):
+    """Read the outer application's Maven identity without inspecting nested libs."""
+    path = Path(str(artifact_path or "")).expanduser()
+    result = {
+        "status": "not_found",
+        "artifact_path": str(path),
+        "version": "",
+        "identities": [],
+    }
+    if not path.is_file():
+        result["status"] = "artifact_missing"
+        return result
+    identities = []
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = [
+                name for name in archive.namelist()
+                if re.fullmatch(r"META-INF/maven/[^/]+/[^/]+/pom\.properties", name)
+            ]
+            for name in names:
+                try:
+                    content = archive.read(name).decode("utf-8", errors="replace")
+                except (KeyError, OSError, RuntimeError):
+                    continue
+                values = {}
+                for line in content.splitlines():
+                    if not line or line.lstrip().startswith(("#", "!")) or "=" not in line:
+                        continue
+                    key, raw_value = line.split("=", 1)
+                    values[key.strip()] = raw_value.strip()
+                version = str(values.get("version") or "").strip()
+                artifact_id = str(values.get("artifactId") or "").strip()
+                group_id = str(values.get("groupId") or "").strip()
+                if version:
+                    identities.append({
+                        "group_id": group_id,
+                        "artifact_id": artifact_id,
+                        "version": version,
+                        "entry": name,
+                    })
+    except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile):
+        result["status"] = "invalid_archive"
+        return result
+    unique = {}
+    for item in identities:
+        unique[(item["group_id"], item["artifact_id"], item["version"])] = item
+    result["identities"] = list(unique.values())
+    versions = sorted({item["version"] for item in unique.values()})
+    if len(versions) == 1:
+        result.update({"status": "detected", "version": versions[0]})
+    elif len(versions) > 1:
+        result["status"] = "ambiguous"
+    return result
+
+
+def _jdk_major_from_home(jdk_home):
+    home = Path(str(jdk_home or "")).expanduser()
+    release_file = home / "release"
+    if not release_file.is_file():
+        return ""
+    try:
+        content = release_file.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    match = re.search(r'^JAVA_VERSION="?([^"\r\n]+)', content, re.MULTILINE)
+    if not match:
+        return ""
+    raw = match.group(1).strip()
+    legacy = re.match(r"1\.(\d+)", raw)
+    if legacy:
+        return legacy.group(1)
+    modern = re.match(r"(\d+)", raw)
+    return modern.group(1) if modern else ""
+
+
+def _java_home_from_executable(java_executable):
+    """Ask the selected JVM for its home so launcher wrappers remain detectable."""
+    executable = str(java_executable or "").strip()
+    if not executable:
+        return None
+    stdout, stderr, rc = run_cmd(
+        [executable, "-XshowSettings:properties", "-version"],
+        timeout=15,
+    )
+    if rc != 0:
+        return None
+    settings = "\n".join((str(stdout or ""), str(stderr or "")))
+    match = re.search(r"^\s*java\.home\s*=\s*(.+?)\s*$", settings, re.MULTILINE)
+    if not match:
+        return None
+    candidate = Path(match.group(1).strip()).expanduser()
+    if not candidate.is_dir():
+        return None
+    # JDK 8 reports the embedded runtime directory as java.home. Step0 needs
+    # the enclosing full JDK because later stages also require release/javac.
+    parent = candidate.parent
+    if (
+        candidate.name.lower() == "jre"
+        and (parent / "release").is_file()
+        and any(
+            (parent / "bin" / name).is_file()
+            for name in ("javac", "javac.exe")
+        )
+    ):
+        return parent
+    return candidate
+
+
+def discover_jdk_homes():
+    """Return installed JDK homes keyed by major, preferring JAVA_HOME."""
+    candidates = []
+    java_home = str(os.environ.get("JAVA_HOME") or "").strip()
+    if java_home:
+        candidates.append(Path(java_home).expanduser())
+    java_executable = shutil.which("java")
+    if java_executable:
+        executable = Path(java_executable).resolve()
+        if executable.parent.name.lower() == "bin":
+            candidates.append(executable.parent.parent)
+        reported_home = _java_home_from_executable(java_executable)
+        if reported_home is not None:
+            candidates.append(reported_home)
+    # pathlib cannot glob an absolute pattern portably; enumerate the known roots.
+    for root, suffix in (
+        (Path("/Library/Java/JavaVirtualMachines"), "Contents/Home"),
+        (Path("/usr/lib/jvm"), ""),
+        (Path("C:/Program Files/Java"), ""),
+        (Path("C:/Program Files/Eclipse Adoptium"), ""),
+        (Path.home() / ".pkgx" / "openjdk.org", ""),
+        (Path.home() / ".local" / "pkgs" / "openjdk.org", ""),
+    ):
+        if not root.is_dir():
+            continue
+        for child in sorted(root.iterdir()):
+            candidates.append(child / suffix if suffix else child)
+    by_major = {}
+    seen = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        identity = os.path.normcase(str(resolved))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        major = _jdk_major_from_home(resolved)
+        if major and (resolved / "bin" / ("java.exe" if os.name == "nt" else "java")).exists():
+            by_major.setdefault(major, str(resolved))
+    return by_major
 
 
 def _response_example_value(field, meta=None):
     """Return a schema-valid, user-recognizable sample for one response field."""
     meta = dict(meta or {})
     samples = {
+        "application_source": "/abs/path/to/application-repo",
         "target_module": "app-module",
-        "primary_module": "app-module",
-        "modules": ["app-module"],
         "base_branch": "origin/main",
         "current_branch": "feature/upgrade",
+        "base_tool": "maven",
+        "current_tool": "maven",
+        "base_jdk_home": "/abs/path/to/jdk-8",
+        "current_jdk_home": "/abs/path/to/jdk-17",
         "base_artifact_path": "/abs/path/to/base.jar",
         "current_artifact_path": "/abs/path/to/current.jar",
-        "jdk_base": "8",
-        "jdk_current": "17",
-        "springboot_base": "2.7.18",
-        "springboot_current": "3.3.2",
-        "source_dirs": ["src/main/java"],
         "dependency_source_dirs": ["/abs/path/to/dependency-repo"],
-        "source_repo_hints": ["/abs/path/to/dependency-repo"],
-        "dependency_repo_mappings": [
-            "com.example:demo-lib=/abs/path/to/dependency-repo"
-        ],
         "selected_targets": ["com.example:demo-lib"],
         "scope_mode": "full",
         "step5_selected_coords": ["com.example:demo-lib"],
         "step5_selected_names": ["demo-lib"],
         "strict_risk_gate": True,
-        "accept_suggested_mappings": True,
         "notes": "用户补充说明",
     }
     if field in samples:
@@ -6263,12 +5709,7 @@ def build_resume_command_examples(options, required_fields, properties, project_
         if not action_id:
             continue
         variants = [(option.get("label") or action_id, {})]
-        if action_id == "continue" and "accept_suggested_mappings" in set(required_fields or []):
-            variants = [
-                ("采用建议映射后继续", {"accept_suggested_mappings": True}),
-                ("不采用建议映射，按最终制品证据继续", {"accept_suggested_mappings": False}),
-            ]
-        elif action_id == "continue" and "scope_mode" in properties:
+        if action_id == "continue" and "scope_mode" in properties:
             variants = [
                 ("全量分析", {"scope_mode": "full"}),
                 (
@@ -6405,63 +5846,58 @@ def _build_user_reply_examples(action_id, properties):
     return [f"执行 {action_id}。"]
 
 
-def build_step1_response_properties():
+def build_step0_response_properties():
     return {
-        "analysis_mode": {
-            "type": "string",
-            "enum": ["artifact_inputs", "checkout_build"],
-            "description": "可选。显式声明 Step1 输入模式；当需要从旧上下文切换模式时必须提供。",
-        },
         "base_artifact_path": {
             "type": "string",
-            "description": "可选。基准侧已编译产物绝对路径；与 current_artifact_path 一起使用时，将跳过隔离分支构建。",
+            "description": "Artifact 模式必填。Base 最终制品路径。",
         },
         "current_artifact_path": {
             "type": "string",
-            "description": "可选。当前侧已编译产物绝对路径；与 base_artifact_path 一起使用时，将跳过隔离分支构建。",
+            "description": "Artifact 模式必填。Current 最终制品路径。",
         },
         "base_branch": {
             "type": "string",
-            "description": "可选。基准侧分支名；artifact 模式下若嵌套依赖缺少 pom.properties，会优先用该分支生成 Maven/Gradle runtime 依赖报告补全坐标。",
+            "description": "必填。Base 源码分支、tag 或 commit；确认后固定到不可变 commit。",
         },
         "current_branch": {
             "type": "string",
-            "description": "可选。当前侧分支名；artifact 模式下若嵌套依赖缺少 pom.properties，会优先用该分支生成 Maven/Gradle runtime 依赖报告补全坐标。",
+            "description": "必填。Current 源码分支、tag 或 commit；确认后固定到不可变 commit。",
         },
-        "base_source_project_dir": {
+        "application_source": {
             "type": "string",
-            "description": "可选。基准侧源码工程目录；仅在不是同仓库双分支场景时，作为 artifact 模式的兜底补全来源。",
-        },
-        "current_source_project_dir": {
-            "type": "string",
-            "description": "可选。当前侧源码工程目录；仅在不是同仓库双分支场景时，作为 artifact 模式的兜底补全来源。",
+            "description": (
+                "必填。被分析应用的 Git 仓库目录或 Git 地址；同一仓库中的 base/current "
+                "版本分别由版本分支固定到不可变 commit。"
+            ),
         },
         "base_jdk_home": {
             "type": "string",
-            "description": "可选。基准侧专用 JDK Home；未提供时默认回落主机 JAVA_HOME。",
+            "description": "必填。Base 对应的本机 JDK Home。",
         },
         "current_jdk_home": {
             "type": "string",
-            "description": "可选。当前侧专用 JDK Home；未提供时默认回落主机 JAVA_HOME。",
+            "description": "必填。Current 对应的本机 JDK Home。",
+        },
+        "base_tool": {
+            "type": "string",
+            "enum": ["maven", "gradle"],
+            "description": "必填。Base 版本实际使用的构建工具。",
+        },
+        "current_tool": {
+            "type": "string",
+            "enum": ["maven", "gradle"],
+            "description": "必填。Current 版本实际使用的构建工具。",
         },
         "target_module": {
             "type": "string",
-            "description": "必填。本次分析唯一的目标部署模块；用户已明确时视为已确认，否则必须在 Step1 前选择。",
+            "description": "必填。本次分析唯一的目标部署模块。",
         },
-        "primary_module": {
-            "type": "string",
-            "description": "兼容字段。等价于 target_module，新交互应优先使用 target_module。",
-        },
-        "modules": {
-            "type": "array",
-            "description": "可选。仅支持单模块；可传单元素数组，与 primary_module 表达同一含义。",
-        },
-        "active_maven_profiles": {
-            "type": "array",
-            "description": (
-                "可选。本次构建显式激活的 Maven profile ID；必须与最终制品的实际构建命令一致。"
-            ),
-        },
+    }
+
+
+def build_step1_identity_response_properties():
+    return {
         "manual_coord_overrides": {
             "type": "array",
             "description": (
@@ -6482,130 +5918,41 @@ def build_step1_response_properties():
                 ],
             },
         },
-        "tool": {
-            "type": "string",
-            "enum": ["maven", "gradle"],
-            "description": "构建工具；通常从项目根目录自动识别 Maven 或 Gradle。",
-        },
     }
 
 
-def build_step1_input_modes():
-    return [
-        {
-            "id": "artifact_inputs",
-            "label": "直接产物模式",
-            "required_fields": ["base_artifact_path", "current_artifact_path"],
-            "recommended_fields": ["base_branch", "current_branch"],
-            "required_confirmation_fields": ["target_module"],
-            "fallback_fields": ["base_source_project_dir", "current_source_project_dir"],
-            "notes": [
-                "适合同一系统、同一仓库、不同分支，且用户已经拿到 base/current 编译产物的场景。",
-                "若嵌套依赖缺少 pom.properties，优先补对应侧 branch；只有特殊场景才补 source_project_dir。",
-            ],
-        },
-        {
-            "id": "checkout_build",
-            "label": "隔离分支构建模式",
-            "required_fields": ["base_branch", "current_branch"],
-            "recommended_fields": [],
-            "required_confirmation_fields": ["target_module"],
-            "fallback_fields": [],
-            "notes": [
-                "适合未提供编译产物，由系统按 base/current 分支执行真实 package 的场景。",
-                "两侧构建均使用固定 commit 的隔离临时 worktree，不切换或修改用户当前工作区。",
-            ],
-        },
-    ]
-
-
-def build_step1_static_contract():
-    properties = build_step1_response_properties()
-    input_modes = build_step1_input_modes()
+def build_step0_static_contract():
     return {
-        "schema": "java-upgrade-analyzer.step1-contract.v1",
-        "step_id": "step1",
-        "title": "Step1 前置输入协议",
-        "goal": "让 agent 在首次调用 Step1 前，就能按默认场景优先抽取可完成分析的关键字段。",
-        "default_user_scenario": {
-            "name": "same_system_same_repo_two_branches",
-            "description": "同一个系统、同一个仓库、不同分支；优先使用两侧编译产物做正式分析，并用 branch 作为坐标补全来源。",
-        },
-        "analysis_mode_selection": [
+        "schema": "java-upgrade-analyzer.step0-contract.v1",
+        "step_id": "step0",
+        "title": "正式分析前统一信息确认协议",
+        "goal": "自动识别可确定的信息，并用一次统一交互完成确认和缺口补齐。",
+        "input_modes": [
             {
-                "analysis_mode": "artifact_inputs",
-                "select_when": "用户已提供 base/current 编译产物路径，或提示词明确表示已有两侧 jar/war。",
-                "result_source": "provided_artifacts",
-                "enrichment_strategy_candidates": ["branch_checkout", "source_project_dir"],
+                "id": "artifact_inputs",
+                "required_fields": [
+                    "base_artifact_path", "current_artifact_path",
+                    "application_source", "base_branch", "current_branch",
+                    "target_module", "base_tool", "current_tool",
+                    "base_jdk_home", "current_jdk_home"
+                ],
             },
             {
-                "analysis_mode": "checkout_build",
-                "select_when": "用户未提供两侧编译产物，但已明确要比较 base/current 分支，并由 Step1 自行构建。",
-                "result_source": "built_artifacts",
-                "enrichment_strategy_candidates": ["none"],
+                "id": "checkout_build",
+                "required_fields": [
+                    "application_source", "base_branch", "current_branch",
+                    "target_module", "base_tool", "current_tool",
+                    "base_jdk_home", "current_jdk_home"
+                ],
             },
         ],
-        "input_modes": input_modes,
-        "fields": properties,
-        "first_turn_collection": {
-            "strategy": "completion_oriented",
-            "default_priority_fields": [
-                "base_artifact_path",
-                "current_artifact_path",
-                "base_branch",
-                "current_branch",
-                "target_module",
-            ],
-            "rules": [
-                "首轮目标不是只让 Step1 能启动，而是尽量一次收齐能完成分析的关键字段。",
-                "若提示词已经明确模块范围，第一次执行 Step1 前必须写入 target_module；否则先展示候选并要求用户确认。",
-                "artifact_inputs 模式下，若用户已给两侧产物，仍应优先继续抽取 base_branch/current_branch，避免运行时反复补参。",
-                "只有在不是同仓库双分支场景时，才把 base_source_project_dir/current_source_project_dir 作为兜底字段。",
-                "checkout_build 模式一旦成立，就天然表示由系统在隔离 worktree 中 package，不需要任何额外布尔许可字段。",
-                "若已知某一侧 Maven/Gradle 需要特定 JDK，可分别显式提供 base_jdk_home/current_jdk_home；未提供时各侧默认回落主机 JAVA_HOME。",
-            ],
-        },
-        "agent_workflow": [
-            "先读取静态前置协议，再从用户提示词中抽取已知字段。",
-            "首轮尽量按 default_priority_fields 组装当前步骤输入或命令行参数。",
-            "若首轮仍不完整，再调用 Step1；此时 run_step.py 只负责返回本次调用的动态缺口。",
-            "收到 interaction.json 后，优先消费 missing_inputs/fallback_inputs/response_schema/input_normalization，再向用户追问。",
-        ],
-        "dynamic_interaction_boundary": {
-            "static_contract_purpose": "说明 agent 在首次调用前就应知道的模式、字段、优先级与规则。",
-            "runtime_interaction_purpose": "说明本次调用还缺哪些字段、缺的是哪一侧、为什么缺、优先补什么、兜底补什么。",
-            "runtime_fields": [
-                "missing_inputs",
-                "fallback_inputs",
-                "input_modes",
-                "response_schema",
-                "input_normalization",
-                "analysis_mode",
-                "result_source",
-                "enrichment_strategy",
-            ],
-        },
-        "examples": {
-            "artifact_inputs_default": {
-                "analysis_mode": "artifact_inputs",
-                "base_artifact_path": "/abs/path/base-app.jar",
-                "current_artifact_path": "/abs/path/current-app.jar",
-                "base_branch": "main",
-                "current_branch": "feature/upgrade",
-                "target_module": "app-module",
-            },
-            "checkout_build_default": {
-                "analysis_mode": "checkout_build",
-                "base_branch": "main",
-                "current_branch": "feature/upgrade",
-                "target_module": "app-module",
-            },
-        },
-        "forbidden": [
-            "不要先执行 Step1 再靠失败结果倒逼用户补参。",
-            "不要在 artifact_inputs 失败后自动切到 checkout_build。",
-            "不要暴露或依赖 allow_checkout 这类布尔许可字段。",
-            "不要把工作区自动探测到的分支冒充用户显式提供的 base_branch/current_branch。",
+        "optional_fields": ["dependency_source_dirs"],
+        "rules": [
+            "应用源码在两种模式下都必须提供；当前 Git 仓库可自动识别，但仍必须在 Step0 确认。",
+            "Base/Current 构建工具和 JDK 目录分别识别、分别确认。",
+            "所有可自动识别值与缺失值放在同一张表中，一次与用户交互。",
+            "Artifact 模式先从用户原始制品识别应用版本，再匹配源码 ref；同一 commit 的多个别名不构成歧义。",
+            "Step1 只负责依赖解析，不再收集正式分析前信息。",
         ],
     }
 
@@ -6653,259 +6000,6 @@ def infer_step1_mode_fields(run_context):
         "branch_pair_ready": branch_pair,
         "has_any_artifact": any_artifact,
         "has_any_branch": any_branch,
-    }
-
-
-def write_step1_module_candidates(report_dir, module_candidates):
-    output_path = evidence_dependencies_dir(report_dir) / "module_candidates.md"
-    lines = [
-        "# 目标模块候选",
-        "",
-        "请选择本次实际部署和升级的一个业务模块。部署线索只用于排序，系统不会据此替你决定分析范围。",
-        "",
-        "| 模块路径 | 依赖坐标 | packaging | 部署线索 |",
-        "|---|---|---|---|",
-    ]
-    for item in module_candidates or []:
-        if isinstance(item, dict):
-            module = str(item.get("module") or item.get("path") or item.get("name") or "").strip()
-            coord = str(item.get("coord") or "-").strip()
-            packaging = str(item.get("packaging") or "-").strip()
-            hints = "、".join(str(value) for value in (item.get("deploy_hints") or []) if str(value).strip()) or "-"
-        else:
-            module = str(item or "").strip()
-            coord = packaging = hints = "-"
-        if module:
-            lines.append(f"| `{module}` | `{coord}` | {packaging} | {hints} |")
-    _write_text_file(output_path, "\n".join(lines))
-    return output_path
-
-
-def build_step1_preflight_interaction(run_context):
-    base_artifact_path = str(run_context.get("base_artifact_path") or "").strip()
-    current_artifact_path = str(run_context.get("current_artifact_path") or "").strip()
-    base_branch = str(run_context.get("base_branch") or "").strip()
-    current_branch = str(run_context.get("current_branch") or "").strip()
-    mode_info = infer_step1_mode_fields(run_context)
-    target_module = str(run_context.get("target_module") or run_context.get("primary_module") or "").strip()
-
-    properties = {
-        "action": {
-            "type": "string",
-            "enum": ["continue", "cancel"],
-        },
-        "notes": {
-            "type": "string",
-            "description": "记录用户确认的输入方式、模块范围或补充说明。",
-        },
-    }
-    properties.update(build_step1_response_properties())
-
-    missing_inputs = []
-    analysis_mode = mode_info.get("analysis_mode") or ""
-    if analysis_mode == "artifact_inputs":
-        if not mode_info.get("artifact_pair_ready"):
-            if not base_artifact_path:
-                missing_inputs.append(
-                    {
-                        "field": "base_artifact_path",
-                        "label": "基准侧编译产物路径",
-                        "side": "base",
-                        "required": True,
-                        "recommended": True,
-                        "reason": "当前看起来选择的是直接产物模式，但尚未提供 base_artifact_path。",
-                        "value_type": "path",
-                    }
-                )
-            if not current_artifact_path:
-                missing_inputs.append(
-                    {
-                        "field": "current_artifact_path",
-                        "label": "当前侧编译产物路径",
-                        "side": "current",
-                        "required": True,
-                        "recommended": True,
-                        "reason": "当前看起来选择的是直接产物模式，但尚未提供 current_artifact_path。",
-                        "value_type": "path",
-                    }
-                )
-    elif analysis_mode == "checkout_build":
-        if not base_branch:
-            missing_inputs.append(
-                {
-                    "field": "base_branch",
-                    "label": "基准侧分支",
-                    "side": "base",
-                    "required": True,
-                    "recommended": True,
-                    "reason": "当前选择的是隔离分支构建模式，但尚未提供基准侧分支。",
-                    "value_type": "branch",
-                }
-            )
-        if not current_branch:
-            missing_inputs.append(
-                {
-                    "field": "current_branch",
-                    "label": "当前侧分支",
-                    "side": "current",
-                    "required": True,
-                    "recommended": True,
-                    "reason": "当前选择的是隔离分支构建模式，但尚未提供当前侧分支。",
-                    "value_type": "branch",
-                }
-            )
-
-    if not target_module:
-        missing_inputs.append(
-            {
-                "field": "target_module",
-                "label": "本次分析的目标模块",
-                "required": True,
-                "recommended": True,
-                "reason": "一次分析只对应一个部署模块，必须在 Step1 构建和依赖提取前由用户确认。",
-                "value_type": "module",
-            }
-        )
-
-    checklist_lines = [
-        "支持 Maven 与 Gradle，且一次分析只对应一个部署模块。",
-        "执行前请先明确一种输入方式；模式一旦进入执行，不允许因为失败自动切到另一种模式。",
-        "主推荐场景：同一系统、同一仓库、不同分支；若已拿到编译产物，优先走直接产物模式。",
-        "直接产物模式先使用两侧最终制品；分支和源码目录只用于后续上下文或坐标补全，不替代制品事实。",
-    ]
-    for mode in build_step1_input_modes():
-        checklist_lines.append(
-            f"输入方式 {mode.get('id')}（{mode.get('label')}）: 必填={', '.join(mode.get('required_fields') or [])}"
-        )
-        if mode.get("recommended_fields"):
-            checklist_lines.append(
-                f"  - 推荐补充: {', '.join(mode.get('recommended_fields') or [])}"
-            )
-        if mode.get("fallback_fields"):
-            checklist_lines.append(
-                f"  - 兜底字段: {', '.join(mode.get('fallback_fields') or [])}"
-            )
-
-    if analysis_mode == "artifact_inputs" and mode_info.get("artifact_pair_ready"):
-        question = "两侧编译产物已经齐全。请补充本次分析真正缺少的信息。"
-    elif analysis_mode == "checkout_build":
-        question = "当前已选择隔离分支构建模式，请补齐缺失的基准侧或当前侧分支。"
-    else:
-        question = (
-            "执行 step1 前，请先明确输入方式："
-            "要么提供 `base_artifact_path/current_artifact_path`；"
-            "要么提供 `base_branch/current_branch` 进入隔离分支构建模式。"
-        )
-    if missing_inputs:
-        missing_text = "、".join(item.get("field") for item in missing_inputs if item.get("field"))
-        question = f"{question} 当前还缺：{missing_text}。"
-    elif analysis_mode:
-        return None
-
-    missing_fields = {item.get("field") for item in missing_inputs}
-    reason_code = (
-        "missing_step1_target_module"
-        if analysis_mode and missing_fields == {"target_module"}
-        else "missing_step1_entry_inputs"
-    )
-    project_scope = dict(run_context.get("project_scope") or {})
-    pinned_snapshot = dict(run_context.get("pinned_source_snapshot") or {})
-    # Module candidates influence the user's scope choice.  Never present
-    # candidates discovered from HEAD/dirty files as if they described the
-    # remote current ref; only the pinned current snapshot is authoritative.
-    module_candidates = (
-        list(
-            project_scope.get("candidate_module_details")
-            or project_scope.get("candidate_modules")
-            or []
-        )
-        if _pinned_snapshot_matches_context(pinned_snapshot, run_context)
-        else []
-    )
-    if module_candidates and all(isinstance(item, dict) for item in module_candidates):
-        module_candidates.sort(
-            key=lambda item: (
-                not bool(item.get("deploy_hints")),
-                str(item.get("packaging") or "").strip() == "pom",
-                str(item.get("module") or ""),
-            )
-        )
-    files_to_review = []
-    if len(module_candidates) > 20 and run_context.get("report_dir"):
-        files_to_review.append(
-            str(
-                write_step1_module_candidates(
-                    run_context.get("report_dir"), module_candidates
-                ).resolve()
-            )
-        )
-    return {
-        "schema": "java-upgrade-analyzer.interaction.v2",
-        "checkpoint": True,
-        "hard_stop": True,
-        "status": "awaiting_user_input",
-        "kind": "input_request",
-        "step_id": "step1",
-        "reason_code": reason_code,
-        "summary": "Step1 需要先明确执行入口和关键字段，agent 应先向用户索取这些输入，再启动实际分析。",
-        "title": "step1 需要先确认输入方式",
-        "analysis_mode": analysis_mode,
-        "result_source": mode_info.get("result_source", ""),
-        "enrichment_strategy": mode_info.get("enrichment_strategy", "none"),
-        "question": question,
-        "files_to_review": files_to_review,
-        "required_fields": [item.get("field") for item in missing_inputs if item.get("field")],
-        "missing_inputs": missing_inputs,
-        "input_modes": build_step1_input_modes(),
-        "module_candidates": module_candidates,
-        "checklist_lines": checklist_lines,
-        "action_requirements": {
-            "continue": {
-                "required_fields": [item.get("field") for item in missing_inputs if item.get("field")],
-                "description": "只有补齐当前缺失输入后，才能继续执行 Step1。",
-            }
-        },
-        "options": [
-            {
-                "id": "continue",
-                "label": "补充输入后继续",
-                "description": "补齐 Step1 所需输入后继续执行。",
-            },
-            {
-                "id": "cancel",
-                "label": "取消",
-                "description": "先停止本次执行，稍后再继续。",
-            },
-        ],
-        "response_schema": {
-            "type": "object",
-            "required": ["action"],
-            "properties": properties,
-        },
-        "input_normalization": {
-            "enabled": True,
-            "mode": "llm_assisted_structuring",
-            "source": "user_free_text",
-            "target": "response_json",
-            "target_schema_ref": "response_schema",
-            "allowed_actions": ["continue", "cancel"],
-            "required_fields": [item.get("field") for item in missing_inputs if item.get("field")],
-            "rules": [
-                "可以将用户自然语言答复整理为符合 response_schema 的 JSON 对象。",
-                "必须忠实保留用户意图，不得脑补未提供的路径、分支名或模块名。",
-                "若用户选择直接产物模式，应优先抽取 base_artifact_path 和 current_artifact_path。",
-                "若用户选择隔离分支构建模式，应抽取 base_branch、current_branch。",
-                "若用户选择直接产物模式，为避免运行时反复补参，应尽量同时抽取 base_branch、current_branch 或对应侧 source_project_dir。",
-                "若用户补充了 primary_module 或 modules，应一并写回，避免 Step1 模块范围漂移。",
-            ],
-        },
-        "resume_hint": "先补齐 Step1 输入方式和关键字段，再继续执行 Step1。",
-        "runtime_rules": [
-            "看到 awaiting_user_input 后，必须先向用户索要 Step1 所需输入，再决定是否继续。",
-            "禁止假设分支名、jar 路径、源码目录或模块名。",
-        ],
-        "next_action_rule": "只能向用户确认 Step1 的输入方式和缺失字段并等待回复，不得继续执行后续步骤。",
-        "must_wait_for_user_reply": True,
     }
 
 
@@ -7069,15 +6163,205 @@ def materialize_pinned_source_workspace(
                     reason_codes=["PINNED_SOURCE_ROOT_MISSING_AT_COMMIT"],
                 )
             mapped_source_dirs.append(str(mapped.resolve()))
+        mapped_resource_dirs = []
+        for relative in snapshot.get("resource_roots") or []:
+            normalized = _normalized_pinned_relative_path(
+                relative, allow_root=True,
+            )
+            if not normalized:
+                raise StepError(
+                    f"固定源码快照包含非法 resource root：{relative}",
+                    reason_codes=["PINNED_SOURCE_PATH_INVALID"],
+                )
+            mapped = (
+                snapshot_project_root
+                if normalized == "."
+                else snapshot_project_root / normalized
+            )
+            if not mapped.is_dir():
+                raise StepError(
+                    "固定 commit 中不存在业务资源目录："
+                    f"{normalized}@{commit}",
+                    reason_codes=["PINNED_SOURCE_ROOT_MISSING_AT_COMMIT"],
+                )
+            mapped_resource_dirs.append(str(mapped.resolve()))
         yield {
             "git_root": git_root,
             "worktree": worktree,
             "project_root": snapshot_project_root.resolve(),
             "source_dirs": mapped_source_dirs,
+            "resource_dirs": mapped_resource_dirs,
             "snapshot": snapshot,
         }
     finally:
         if worktree is not None:
+            remove_detached_worktree(
+                worktree,
+                git_root,
+                runner=run_cmd,
+                git_command=git_cmd(),
+            )
+
+
+@contextmanager
+def materialize_pinned_dependency_source_workspaces(run_context, report_dir):
+    """Expose only dependency source trees fixed to the selected current SHA."""
+    updated = dict(run_context or {})
+    bindings = [
+        dict(item)
+        for item in (updated.get("dependency_source_ref_bindings") or [])
+        if str((item or {}).get("coord") or "").strip()
+    ]
+    skipped = set(updated.get("skip_dependency_source_coords") or [])
+    worktrees = {}
+    snapshots = []
+    failures = []
+    pinned_source_mappings = []
+    pinned_repo_mappings = []
+    clone_timeout = int(updated.get("dependency_source_clone_timeout") or 300)
+
+    try:
+        for binding in sorted(bindings, key=lambda item: str(item.get("coord") or "")):
+            coord = str(binding.get("coord") or "").strip()
+            if not coord or coord in skipped:
+                continue
+            commit = str(binding.get("current_commit") or "").strip().lower()
+            repo_path = str(binding.get("repo_path") or "").strip()
+            if not _FULL_GIT_COMMIT_RE.fullmatch(commit):
+                failures.append({
+                    "coord": coord,
+                    "status": "current_revision_unavailable",
+                    "version": str(binding.get("current_version") or ""),
+                    "match_status": str(binding.get("current_status") or ""),
+                })
+                continue
+            git_root = _git_repository_root(repo_path) if repo_path else None
+            if git_root is None:
+                failures.append({
+                    "coord": coord,
+                    "status": "dependency_source_repository_unavailable",
+                    "repo_path": repo_path,
+                })
+                continue
+
+            candidate = {
+                "ref": str(binding.get("current_ref") or ""),
+                "commit": commit,
+                "remote": str(binding.get("current_remote") or ""),
+                "canonical_ref": str(binding.get("current_canonical_ref") or ""),
+            }
+            materialized = materialize_remote_source_candidate(
+                git_root,
+                candidate,
+                expected_commit=commit,
+                timeout=clone_timeout,
+            )
+            if materialized.get("status") != "remote_source_resolved":
+                failure = dict(materialized.get("failure") or {})
+                failures.append({
+                    "coord": coord,
+                    "status": str(materialized.get("status") or "remote_fetch_failed"),
+                    "repo_path": str(git_root),
+                    "reason_code": str(failure.get("reason_code") or ""),
+                    "reason": _redact_git_sensitive_text(failure.get("reason") or ""),
+                })
+                continue
+
+            key = (str(git_root), commit)
+            worktree = worktrees.get(key)
+            if worktree is None:
+                try:
+                    worktree = create_detached_worktree(
+                        commit,
+                        git_root,
+                        label="s4-depsrc",
+                        runner=run_cmd,
+                        git_command=git_cmd(),
+                    )
+                except RuntimeError as exc:
+                    failures.append({
+                        "coord": coord,
+                        "status": "dependency_source_worktree_failed",
+                        "repo_path": str(git_root),
+                        "reason": _redact_git_sensitive_text(exc),
+                    })
+                    continue
+                worktrees[key] = worktree
+
+            mapped_dirs = []
+            logical_dirs = []
+            for source_dir in binding.get("source_dirs") or []:
+                try:
+                    relative = Path(str(source_dir)).expanduser().resolve().relative_to(
+                        git_root
+                    )
+                except (OSError, ValueError):
+                    continue
+                mapped = (worktree / relative).resolve()
+                if mapped.is_dir():
+                    mapped_dirs.append(str(mapped))
+                    logical_dirs.append(relative.as_posix())
+            if not mapped_dirs:
+                for module_root in binding.get("module_roots") or []:
+                    try:
+                        relative = Path(str(module_root)).expanduser().resolve().relative_to(
+                            git_root
+                        )
+                    except (OSError, ValueError):
+                        continue
+                    mapped_module = (worktree / relative).resolve()
+                    if not mapped_module.is_dir():
+                        continue
+                    source_plan = _resolve_source_dirs_plan(mapped_module)
+                    for source_dir in source_plan.get("source_dirs") or []:
+                        mapped = Path(source_dir).resolve()
+                        mapped_dirs.append(str(mapped))
+                        logical_dirs.append(mapped.relative_to(worktree).as_posix())
+            mapped_dirs = _dedupe_strings(mapped_dirs)
+            if not mapped_dirs:
+                failures.append({
+                    "coord": coord,
+                    "status": "dependency_source_roots_missing_at_commit",
+                    "repo_path": str(git_root),
+                    "commit": commit,
+                })
+                continue
+
+            pinned_repo_mappings.append(f"{coord}={worktree}")
+            pinned_source_mappings.extend(
+                f"{coord}={source_dir}" for source_dir in mapped_dirs
+            )
+            snapshots.append({
+                "coord": coord,
+                "version": str(binding.get("current_version") or ""),
+                "ref": str(binding.get("current_ref") or ""),
+                "commit": commit,
+                "repository": str(git_root),
+                "source_roots": _dedupe_strings(logical_dirs),
+            })
+
+        # Dependency source is optional, but mutable/unbound checkout content is
+        # never a safe fallback. Only successfully pinned mappings reach Step4.
+        updated["dependency_repo_mappings"] = _dedupe_strings(
+            pinned_repo_mappings
+        )
+        updated["dependency_source_mappings"] = _dedupe_strings(
+            pinned_source_mappings
+        )
+        updated["dependency_source_snapshots"] = snapshots
+        updated["dependency_source_snapshot_failures"] = failures
+        write_json(
+            runtime_observability_dir(report_dir)
+            / "dependency_source_snapshots.json",
+            {
+                "schema": "java-upgrade-analyzer.dependency-source-snapshots.v1",
+                "snapshots": snapshots,
+                "unavailable": failures,
+            },
+        )
+        yield updated
+    finally:
+        for (git_root, _commit), worktree in reversed(list(worktrees.items())):
             remove_detached_worktree(
                 worktree,
                 git_root,
@@ -7125,11 +6409,14 @@ def rebuild_current_pinned_source_context(run_context, project_dir):
 
         detected_tool = detect_build_tool(snapshot_project_root)
         configured_tool = (
-            str(updated.get("tool") or "").strip().lower()
-            if updated.get("tool_explicit")
+            str(updated.get("current_tool") or "").strip().lower()
+            if str(
+                (updated.get("input_origins") or {}).get("current_tool") or ""
+            ) == "user"
             else ""
         )
         build_tool = configured_tool or detected_tool
+        updated["current_tool"] = build_tool
         updated["tool"] = build_tool
         target_module = str(updated.get("target_module") or "").strip()
         active_profiles = set(updated.get("active_maven_profiles") or [])
@@ -7559,6 +6846,7 @@ def resolve_step1_refs_for_execution(
     project_dir,
     *,
     on_side_resolved=None,
+    confirm_source_only=True,
 ):
     """Resolve every explicit Step1 ref and pin it before any build starts.
 
@@ -7706,7 +6994,7 @@ def resolve_step1_refs_for_execution(
             if on_side_resolved is not None:
                 on_side_resolved(dict(updated), side, dict(resolution))
             continue
-        if source_dir:
+        if source_dir and confirm_source_only:
             resolution = resolve_step1_ref(repo_dir, "HEAD")
             requests.append(
                 _step1_ref_request(
@@ -7721,6 +7009,1307 @@ def resolve_step1_refs_for_execution(
     if requests:
         return updated, build_step1_ref_confirmation_interaction(updated, requests)
     return updated, None
+
+
+def _detect_build_tool_for_revision(run_context, side):
+    repo_dir = _step1_ref_repository(
+        run_context,
+        side,
+        run_context.get("project_dir") or ".",
+    )
+    revision = str(run_context.get(f"{side}_resolved_commit") or "").strip()
+    if not revision:
+        return ""
+    git_root = _git_repository_root(repo_dir)
+    if git_root is None:
+        return ""
+    stdout, _stderr, rc = run_cmd(
+        git_cmd() + ["-C", str(git_root), "ls-tree", "-r", "--name-only", revision],
+        timeout=30,
+    )
+    if rc != 0:
+        return ""
+    names = {line.strip().replace("\\", "/") for line in str(stdout or "").splitlines() if line.strip()}
+    try:
+        project_prefix = Path(repo_dir).resolve().relative_to(git_root).as_posix()
+    except ValueError:
+        project_prefix = "."
+    target_module = str(run_context.get("target_module") or "").strip().replace("\\", "/")
+    roots = []
+    if target_module and ":" not in target_module:
+        roots.append("/".join(part for part in (project_prefix, target_module) if part not in ("", ".")))
+    roots.append("" if project_prefix == "." else project_prefix)
+    for root in _dedupe_strings(roots):
+        prefix = f"{root}/" if root else ""
+        maven = f"{prefix}pom.xml" in names
+        gradle = any(
+            f"{prefix}{marker}" in names
+            for marker in (
+                "build.gradle",
+                "build.gradle.kts",
+                "settings.gradle",
+                "settings.gradle.kts",
+                "gradlew",
+                "gradlew.bat",
+            )
+        )
+        if maven != gradle:
+            return "maven" if maven else "gradle"
+    return ""
+
+
+def _normalize_jdk_major(value):
+    text = str(value or "").strip()
+    legacy = re.search(r"(?:^|[^0-9])1\.(\d+)(?:[^0-9]|$)", text)
+    if legacy:
+        return legacy.group(1)
+    modern = re.search(r"(?:^|[^0-9])(\d{1,2})(?:[^0-9]|$)", text)
+    return modern.group(1) if modern else ""
+
+
+def _detect_step0_jdk_versions(run_context):
+    versions = {
+        "base": str(run_context.get("jdk_base") or "").strip(),
+        "current": str(run_context.get("jdk_current") or "").strip(),
+    }
+    mode = infer_step1_mode_fields(run_context).get("analysis_mode")
+    if mode == "artifact_inputs":
+        from s2_context_from_deps import detect_jdk_from_artifact
+
+        for side in ("base", "current"):
+            if versions[side]:
+                continue
+            evidence = detect_jdk_from_artifact(
+                run_context.get(f"{side}_artifact_path")
+            )
+            if evidence.get("status") == "detected":
+                versions[side] = str(evidence.get("version") or "")
+    else:
+        from s2_context_from_deps import detect_jdk_versions_from_manifests
+
+        repo_dir = _step1_ref_repository(
+            run_context,
+            "current",
+            run_context.get("project_dir") or ".",
+        )
+        for side in ("base", "current"):
+            if versions[side]:
+                continue
+            revision = str(run_context.get(f"{side}_resolved_commit") or "").strip()
+            build_tool = str(run_context.get(f"{side}_tool") or "").strip()
+            if not revision or build_tool not in {"maven", "gradle"}:
+                continue
+            try:
+                detected_base, _detected_current, _manifest = (
+                    detect_jdk_versions_from_manifests(
+                        revision,
+                        revision,
+                        repo_dir,
+                        build_tool,
+                        strict_git=True,
+                    )
+                )
+            except (OSError, RuntimeError, ValueError):
+                detected_base = None
+            versions[side] = _normalize_jdk_major(detected_base)
+    return versions
+
+
+def _version_ref_request(side, version, match, run_context):
+    candidates = [dict(item) for item in (match.get("candidates") or [])]
+    for candidate in candidates:
+        if not candidate.get("selection_key"):
+            payload = {
+                "side": side,
+                "version": version,
+                "ref": candidate.get("ref"),
+                "commit": candidate.get("commit"),
+            }
+            candidate["selection_key"] = "s0ref:" + hashlib.sha256(
+                json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()[:16]
+    return {
+        "side": side,
+        "field": f"{side}_branch",
+        "status": "ambiguous",
+        "source_status": "artifact_version_ref_ambiguous",
+        "requested_ref": version,
+        "source_project_dir": str(run_context.get(f"{side}_source_project_dir") or ""),
+        "artifact_path": str(run_context.get(f"{side}_artifact_path") or ""),
+        "candidates": candidates,
+        "configured_remotes": list(match.get("configured_remotes") or []),
+        "query_mode": "artifact_version_match",
+        "resolution_trigger": "artifact_application_version",
+    }
+
+
+def prepare_step0_context(
+    run_context,
+    project_dir,
+    *,
+    on_side_resolved=None,
+):
+    """Detect Step0 facts and pin application refs before the confirmation card."""
+    updated = dict(run_context or {})
+    updated.setdefault("input_origins", {})
+    mode_info = infer_step1_mode_fields(updated)
+    if not mode_info.get("analysis_mode") and updated.get("application_source"):
+        updated["analysis_mode"] = "checkout_build"
+        updated.update(infer_step1_mode_fields(updated))
+        mode_info = infer_step1_mode_fields(updated)
+
+    version_requests = []
+    if mode_info.get("analysis_mode") == "artifact_inputs":
+        for side in ("base", "current"):
+            artifact_evidence = detect_artifact_application_version(
+                updated.get(f"{side}_artifact_path")
+            )
+            updated[f"{side}_artifact_application_identity"] = artifact_evidence
+            version = str(artifact_evidence.get("version") or "").strip()
+            if version:
+                updated[f"{side}_artifact_version"] = version
+            if updated.get(f"{side}_branch") or not version:
+                continue
+            repo_dir = _step1_ref_repository(updated, side, project_dir)
+            match = match_remote_refs_by_version(repo_dir, version)
+            updated[f"{side}_artifact_version_ref_match"] = match
+            if match.get("status") == "resolved":
+                candidate = dict((match.get("candidates") or [{}])[0])
+                detected_ref = str(candidate.get("ref") or "").strip()
+                if detected_ref:
+                    updated[f"{side}_branch"] = detected_ref
+                    updated["input_origins"][f"{side}_branch"] = "detected"
+            elif match.get("status") == "ambiguous":
+                version_requests.append(
+                    _version_ref_request(side, version, match, updated)
+                )
+    elif not updated.get("current_branch"):
+        repo_dir = _step1_ref_repository(updated, "current", project_dir)
+        detected_branch = detect_current_git_branch(repo_dir)
+        if detected_branch:
+            updated["current_branch"] = detected_branch
+            updated["input_origins"]["current_branch"] = "detected"
+
+    updated, ref_interaction = resolve_step1_refs_for_execution(
+        updated,
+        project_dir,
+        on_side_resolved=on_side_resolved,
+        confirm_source_only=False,
+    )
+    if version_requests:
+        requests = list((ref_interaction or {}).get("ref_resolution_requests") or [])
+        requests.extend(version_requests)
+        ref_interaction = build_step1_ref_confirmation_interaction(
+            updated,
+            requests,
+        )
+    if ref_interaction:
+        ref_interaction["step_id"] = "step0"
+        ref_interaction["title"] = "Step0 需要确认应用源码版本"
+        ref_interaction["summary"] = "应用源码版本存在多个不同 commit 候选，需要与其余输入一起确认。"
+
+    if re.fullmatch(
+        r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})",
+        str(updated.get("current_resolved_commit") or "").strip(),
+    ):
+        updated = rebuild_current_pinned_source_context(updated, project_dir)
+        if not updated.get("target_module"):
+            candidates = list(
+                ((updated.get("project_scope") or {}).get("candidate_modules") or [])
+            )
+            if len(candidates) == 1:
+                updated["target_module"] = str(candidates[0])
+                updated["primary_module"] = str(candidates[0])
+                updated["modules"] = [str(candidates[0])]
+                updated["input_origins"]["target_module"] = "detected"
+                updated = rebuild_current_pinned_source_context(updated, project_dir)
+
+    for side in ("base", "current"):
+        tool_field = f"{side}_tool"
+        tool_origin = str(updated["input_origins"].get(tool_field) or "")
+        if not updated.get(tool_field) or tool_origin == "detected":
+            detected = _detect_build_tool_for_revision(updated, side)
+            if detected:
+                updated[tool_field] = detected
+                updated["input_origins"][tool_field] = "detected"
+            elif tool_origin == "detected":
+                updated[tool_field] = ""
+    updated["tool"] = str(updated.get("current_tool") or updated.get("base_tool") or "")
+
+    jdk_versions = _detect_step0_jdk_versions(updated)
+    installed_homes = discover_jdk_homes()
+    for side in ("base", "current"):
+        version = _normalize_jdk_major(jdk_versions.get(side))
+        if version:
+            updated[f"jdk_{side}"] = version
+        home_field = f"{side}_jdk_home"
+        if not updated.get(home_field) and version and installed_homes.get(version):
+            updated[home_field] = installed_homes[version]
+            updated["input_origins"][home_field] = "detected"
+    return updated, ref_interaction
+
+
+def _step0_cell(value, origin="", *, missing=False, optional=False):
+    if missing:
+        return "请提供"
+    if optional and not value:
+        return "未提供（可选）"
+    text = str(value or "").strip()
+    if not text:
+        return "请提供"
+    suffix = "自动识别，待确认" if origin == "detected" else "待确认"
+    return f"{text}（{suffix}）"
+
+
+def _step0_dependency_source_values(run_context):
+    git_urls = list(run_context.get("dependency_source_git_urls") or [])
+    materialized_paths = {
+        str((item or {}).get("repo_path") or "")
+        for item in (run_context.get("dependency_source_git_materializations") or [])
+    }
+    local_dirs = [
+        str(item)
+        for item in (run_context.get("dependency_source_dirs") or [])
+        if str(item) not in materialized_paths
+    ]
+    return _dedupe_strings(git_urls + local_dirs)
+
+
+def _step0_dependency_source_display(run_context):
+    return " 或 ".join(_step0_dependency_source_values(run_context))
+
+
+def _dependency_change_versions(report_dir):
+    versions = {}
+    for row in read_csv_rows(step1_dep_changes_path(report_dir)):
+        coord = str(row.get("coord") or "").strip()
+        if not coord or str(row.get("resolution_status") or "").strip() == "unresolved":
+            continue
+        old_version = str(row.get("old_version") or "").strip()
+        new_version = str(row.get("new_version") or "").strip()
+        if old_version in {"", "-"} and new_version in {"", "-"}:
+            continue
+        versions[coord] = {"base": old_version, "current": new_version}
+    return versions
+
+
+def _dependency_repo_mapping_candidates(run_context, report_dir):
+    relevant_coords = list(_dependency_change_versions(report_dir))
+    plan = _build_dependency_source_plan(
+        run_context.get("dependency_source_dirs") or [],
+        relevant_coords=relevant_coords,
+    )
+    by_coord = {}
+    for candidate in plan.get("candidates") or []:
+        coord = str(candidate.get("coord") or "").strip()
+        repo_path = str(candidate.get("repo_path") or "").strip()
+        if coord and repo_path:
+            repo = by_coord.setdefault(coord, {}).setdefault(
+                repo_path,
+                {
+                    "repo_path": repo_path,
+                    "source_dirs": [],
+                    "module_roots": [],
+                },
+            )
+            source_dir = str(candidate.get("source_dir") or "").strip()
+            module_root = str(candidate.get("module_root") or "").strip()
+            if source_dir:
+                repo["source_dirs"] = _dedupe_strings(
+                    list(repo["source_dirs"]) + [source_dir]
+                )
+            if module_root:
+                repo["module_roots"] = _dedupe_strings(
+                    list(repo["module_roots"]) + [module_root]
+                )
+    return plan, by_coord
+
+
+def _version_candidate_groups(repo_path, version):
+    if not version or version == "-":
+        return {"status": "not_applicable", "candidates": []}
+    return match_remote_refs_by_version(repo_path, version)
+
+
+def _dependency_source_side_choices(match):
+    candidates = [dict(item) for item in (match.get("candidates") or [])]
+    return candidates or [{}]
+
+
+def _dependency_source_binding_candidate(
+    coord,
+    repo,
+    versions,
+    side_matches,
+    base_candidate,
+    current_candidate,
+):
+    binding = {
+        "coord": str(coord or "").strip(),
+        "repo_path": str((repo or {}).get("repo_path") or "").strip(),
+        "source_dirs": _dedupe_strings((repo or {}).get("source_dirs") or []),
+        "module_roots": _dedupe_strings((repo or {}).get("module_roots") or []),
+    }
+    for side, candidate in (
+        ("base", dict(base_candidate or {})),
+        ("current", dict(current_candidate or {})),
+    ):
+        match = dict(side_matches.get(side) or {})
+        binding[f"{side}_version"] = str((versions or {}).get(side) or "")
+        binding[f"{side}_status"] = str(match.get("status") or "")
+        binding[f"{side}_ref"] = str(
+            candidate.get("ref") or candidate.get("display_ref") or ""
+        )
+        binding[f"{side}_commit"] = str(candidate.get("commit") or "")
+        binding[f"{side}_remote"] = str(candidate.get("remote") or "")
+        binding[f"{side}_canonical_ref"] = str(
+            candidate.get("canonical_ref") or ""
+        )
+        binding[f"{side}_aliases"] = list(candidate.get("aliases") or [])
+    identity = {
+        key: value
+        for key, value in binding.items()
+        if key not in {"source_dirs", "module_roots", "base_aliases", "current_aliases"}
+    }
+    binding["selection_key"] = "depsrc:" + hashlib.sha256(
+        json.dumps(identity, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:16]
+    return binding
+
+
+def build_step1_dependency_source_interaction(run_context, report_dir):
+    """Resolve optional dependency source revisions after dependency identity exists."""
+    if not run_context.get("dependency_source_dirs"):
+        return None
+    versions = _dependency_change_versions(report_dir)
+    plan, candidates_by_coord = _dependency_repo_mapping_candidates(
+        run_context, report_dir,
+    )
+    skipped = set(run_context.get("skip_dependency_source_coords") or [])
+    confirmed = {
+        str((item or {}).get("coord") or "").strip(): dict(item)
+        for item in (run_context.get("dependency_source_ref_bindings") or [])
+        if str((item or {}).get("coord") or "").strip()
+    }
+    resolved_bindings = []
+    ambiguity_items = []
+    version_match_cache = {}
+
+    for coord, repo_candidates in sorted(candidates_by_coord.items()):
+        if coord in skipped:
+            continue
+        if coord in confirmed:
+            resolved_bindings.append(confirmed[coord])
+            continue
+
+        candidates = []
+        has_revision_ambiguity = False
+        for repo_path, repo in sorted(repo_candidates.items()):
+            side_matches = {}
+            for side in ("base", "current"):
+                version = str((versions.get(coord) or {}).get(side) or "").strip()
+                cache_key = (repo_path, version)
+                if cache_key not in version_match_cache:
+                    version_match_cache[cache_key] = _version_candidate_groups(
+                        repo_path, version
+                    )
+                side_matches[side] = version_match_cache[cache_key]
+                has_revision_ambiguity = bool(
+                    has_revision_ambiguity
+                    or side_matches[side].get("status") == "ambiguous"
+                )
+            for base_candidate in _dependency_source_side_choices(
+                side_matches["base"]
+            ):
+                for current_candidate in _dependency_source_side_choices(
+                    side_matches["current"]
+                ):
+                    candidates.append(
+                        _dependency_source_binding_candidate(
+                            coord,
+                            repo,
+                            versions.get(coord, {}),
+                            side_matches,
+                            base_candidate,
+                            current_candidate,
+                        )
+                    )
+
+        candidate_index = {}
+        for candidate in candidates:
+            candidate_index[candidate["selection_key"]] = candidate
+        candidates = list(candidate_index.values())
+        needs_user = len(repo_candidates) > 1 or has_revision_ambiguity
+        if needs_user:
+            ambiguity_items.append({
+                "kind": "binding",
+                "coord": coord,
+                "versions": versions.get(coord, {}),
+                "candidates": candidates,
+            })
+        elif candidates:
+            resolved_bindings.append(candidates[0])
+
+    run_context["dependency_source_ref_bindings"] = list(
+        {
+            str(item.get("coord") or ""): dict(item)
+            for item in resolved_bindings
+            if str(item.get("coord") or "").strip()
+        }.values()
+    )
+    run_context["dependency_source_unmatched_coords"] = list(
+        plan.get("unmatched_relevant_coords") or []
+    )
+    if not ambiguity_items:
+        return None
+    properties = {
+        "action": {"type": "string", "enum": ["continue", "cancel"]},
+        "dependency_source_ref_selections": {
+            "type": "array",
+            "description": "为每个歧义依赖选择卡片中的一个 selection_key；该选择同时固定仓库及 base/current commit。",
+        },
+        "skip_dependency_source_coords": {
+            "type": "array",
+            "description": "依赖源码可选；不使用某项时显式提交其完整坐标。",
+        },
+        "notes": {"type": "string"},
+    }
+    return {
+        "schema": "java-upgrade-analyzer.interaction.v2",
+        "checkpoint": True,
+        "hard_stop": True,
+        "status": "awaiting_user_input",
+        "kind": "decision",
+        "step_id": "step1",
+        "reason_code": "step1_dependency_source_ambiguity",
+        "title": "Step1 依赖包源码存在歧义",
+        "summary": "依赖身份已经解析完成；仅有下列可选依赖源码需要用户决定版本或明确跳过。",
+        "question": "请一次处理全部依赖包源码歧义：选择候选，或明确跳过对应依赖源码。",
+        "dependency_source_ambiguities": ambiguity_items,
+        "required_fields": [],
+        "missing_inputs": [],
+        "options": [
+            {"id": "continue", "label": "处理后继续", "description": "选择候选或明确跳过每个歧义项。"},
+            {"id": "cancel", "label": "稍后处理", "description": "保留 Step1 结果，稍后决定。"},
+        ],
+        "action_requirements": {
+            "continue": {
+                "at_least_one_of": [
+                    "dependency_source_ref_selections",
+                    "skip_dependency_source_coords",
+                ],
+                "description": "每个歧义项必须选择候选或显式跳过。",
+            }
+        },
+        "response_schema": {
+            "type": "object",
+            "required": ["action"],
+            "properties": properties,
+        },
+        "must_wait_for_user_reply": True,
+    }
+
+
+def build_step0_confirmation_interaction(run_context, ref_interaction=None):
+    ctx = dict(run_context or {})
+    origins = dict(ctx.get("input_origins") or {})
+    mode = infer_step1_mode_fields(ctx).get("analysis_mode") or str(ctx.get("analysis_mode") or "")
+    missing_inputs = []
+
+    def require(field, label, side=""):
+        if ctx.get(field) not in (None, "", [], {}):
+            return
+        missing_inputs.append({
+            "field": field,
+            "label": label,
+            "side": side,
+            "required": True,
+            "reason": "正式分析前必须在本次确认中补齐。",
+        })
+
+    if mode == "artifact_inputs":
+        require("base_artifact_path", "Base 最终制品", "base")
+        require("current_artifact_path", "Current 最终制品", "current")
+    require("application_source", "应用源码")
+    require("base_branch", "Base 版本分支", "base")
+    require("current_branch", "Current 版本分支", "current")
+    require("target_module", "目标模块")
+    require("base_tool", "Base 构建工具", "base")
+    require("current_tool", "Current 构建工具", "current")
+    require("base_jdk_home", "Base JDK 目录", "base")
+    require("current_jdk_home", "Current JDK 目录", "current")
+
+    ref_requests = list((ref_interaction or {}).get("ref_resolution_requests") or [])
+    for request in ref_requests:
+        field = str(request.get("field") or "").strip()
+        if field and field not in {item["field"] for item in missing_inputs}:
+            missing_inputs.append({
+                "field": field,
+                "label": "Base 版本分支" if field == "base_branch" else "Current 版本分支",
+                "side": request.get("side"),
+                "required": True,
+                "reason": "存在多个不同 commit 候选，请选择一个明确版本。",
+            })
+
+    artifact_base = (
+        Path(str(ctx.get("base_artifact_path"))).name
+        if ctx.get("base_artifact_path") else ""
+    )
+    artifact_current = (
+        Path(str(ctx.get("current_artifact_path"))).name
+        if ctx.get("current_artifact_path") else ""
+    )
+    if mode != "artifact_inputs":
+        artifact_base = artifact_current = "由 Step1 从确认源码构建"
+    application_display = str(
+        ctx.get("application_source_display") or ctx.get("application_source") or ""
+    )
+    dependency_display = _step0_dependency_source_display(ctx)
+    target = str(ctx.get("target_module") or "")
+    module_candidates = (
+        _dedupe_strings(
+            (ctx.get("project_scope") or {}).get("candidate_modules") or []
+        )
+        if _pinned_snapshot_matches_context(
+            ctx.get("pinned_source_snapshot"), ctx
+        )
+        else []
+    )
+    target_cell = _step0_cell(
+        target,
+        origins.get("target_module"),
+        missing=not target,
+    )
+    if not target and module_candidates:
+        preview = "、".join(module_candidates[:5])
+        suffix = (
+            f" 等 {len(module_candidates)} 个"
+            if len(module_candidates) > 5
+            else ""
+        )
+        target_cell = f"请提供（候选：{preview}{suffix}）"
+        for item in missing_inputs:
+            if item.get("field") == "target_module":
+                item["candidates"] = module_candidates
+                break
+    rows = [
+        {
+            "label": "最终制品",
+            "base": (
+                artifact_base
+                if mode != "artifact_inputs"
+                else _step0_cell(
+                    artifact_base,
+                    origins.get("base_artifact_path"),
+                    missing=not artifact_base,
+                )
+            ),
+            "current": (
+                artifact_current
+                if mode != "artifact_inputs"
+                else _step0_cell(
+                    artifact_current,
+                    origins.get("current_artifact_path"),
+                    missing=not artifact_current,
+                )
+            ),
+        },
+        {
+            "label": "版本分支",
+            "base": _step0_cell(ctx.get("base_branch"), origins.get("base_branch"), missing=not ctx.get("base_branch")),
+            "current": _step0_cell(ctx.get("current_branch"), origins.get("current_branch"), missing=not ctx.get("current_branch")),
+        },
+        {
+            "label": "目标模块",
+            "base": target_cell,
+            "current": target_cell,
+        },
+        {
+            "label": "构建工具",
+            "base": _step0_cell(ctx.get("base_tool"), origins.get("base_tool"), missing=not ctx.get("base_tool")),
+            "current": _step0_cell(ctx.get("current_tool"), origins.get("current_tool"), missing=not ctx.get("current_tool")),
+        },
+        {
+            "label": "JDK 目录",
+            "base": _step0_cell(ctx.get("base_jdk_home"), origins.get("base_jdk_home"), missing=not ctx.get("base_jdk_home")),
+            "current": _step0_cell(ctx.get("current_jdk_home"), origins.get("current_jdk_home"), missing=not ctx.get("current_jdk_home")),
+        },
+        {
+            "label": "应用源码",
+            "base": _step0_cell(application_display, origins.get("application_source"), missing=not application_display),
+            "current": _step0_cell(application_display, origins.get("application_source"), missing=not application_display),
+        },
+        {
+            "label": "依赖包源码",
+            "base": _step0_cell(dependency_display, origins.get("dependency_source_dirs"), optional=True),
+            "current": _step0_cell(dependency_display, origins.get("dependency_source_dirs"), optional=True),
+        },
+    ]
+    available_properties = build_step0_response_properties()
+    step0_fields = (
+        "base_artifact_path",
+        "current_artifact_path",
+        "application_source",
+        "base_branch",
+        "current_branch",
+        "target_module",
+        "base_tool",
+        "current_tool",
+        "base_jdk_home",
+        "current_jdk_home",
+    )
+    properties = {
+        "action": {"type": "string", "enum": ["continue", "cancel"]},
+        "notes": {"type": "string", "description": "可选。记录本次输入确认说明。"},
+        **{
+            field: available_properties[field]
+            for field in step0_fields
+        },
+        "dependency_source_dirs": {
+            "type": "array",
+            "description": "可选。依赖包源码；每一项可填写 Git 地址或本地 Git 仓库目录。",
+        },
+    }
+    if ref_interaction:
+        properties.update({
+            key: value
+            for key, value in dict(
+                (ref_interaction.get("response_schema") or {}).get(
+                    "properties"
+                ) or {}
+            ).items()
+            if key not in {"action", "notes"}
+        })
+    required_fields = _dedupe_strings(item["field"] for item in missing_inputs)
+    interaction = {
+        "schema": "java-upgrade-analyzer.interaction.v2",
+        "checkpoint": True,
+        "hard_stop": True,
+        "status": "awaiting_user_input",
+        "kind": "input_request",
+        "step_id": "step0",
+        "reason_code": "step0_confirmation_required",
+        "title": "Step0 正式分析信息确认",
+        "summary": "所有可自动识别的信息与缺失项在同一张卡片中一次确认。",
+        "question": "请一次核对以下信息；自动识别项也需要确认，标为“请提供”的项请在同一回复中补齐。",
+        "confirmation_table": {"columns": ["信息", "Base", "Current"], "rows": rows},
+        "missing_inputs": missing_inputs,
+        "required_fields": required_fields,
+        "options": [
+            {"id": "continue", "label": "确认并开始分析", "description": "确认自动识别项并补齐缺失项后开始 Step1。"},
+            {"id": "cancel", "label": "稍后处理", "description": "保留当前输入，稍后继续确认。"},
+        ],
+        "action_requirements": {
+            "continue": {
+                "required_fields": required_fields,
+                "description": "一次补齐所有“请提供”项；已自动识别的值由本次 continue 统一确认。",
+            }
+        },
+        "response_schema": {
+            "type": "object",
+            "required": ["action"],
+            "properties": properties,
+        },
+        "source_ref_decision_items": list((ref_interaction or {}).get("source_ref_decision_items") or []),
+        "ref_resolution_requests": ref_requests,
+        "files_to_review": [],
+        "checklist_lines": [],
+        "runtime_rules": [
+            "Step0 确认前不得执行 Maven/Gradle 或进入依赖解析。",
+            "应用源码必须按 base/current ref 固定到不可变 commit。",
+        ],
+        "next_action_rule": "只能等待用户一次确认或补齐卡片中的必要信息。",
+        "must_wait_for_user_reply": True,
+    }
+    return interaction
+
+
+def _preflight_sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _step0_java_environment(jdk_home):
+    home = Path(str(jdk_home or "")).expanduser().resolve()
+    bin_dir = str(home / "bin")
+    current_path = str(os.environ.get("PATH") or os.defpath)
+    return {
+        "JAVA_HOME": str(home),
+        "PATH": bin_dir + (os.pathsep + current_path if current_path else ""),
+    }
+
+
+def _preflight_artifact_input(path, *, side):
+    artifact = Path(str(path or "")).expanduser().resolve()
+    if not artifact.is_file():
+        raise StepError(
+            f"{side} 最终制品不存在：{artifact}",
+            reason_codes=["STEP0_ARTIFACT_MISSING"],
+        )
+    try:
+        with zipfile.ZipFile(artifact) as archive:
+            entry_count = len(archive.infolist())
+            corrupt_entry = archive.testzip()
+    except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
+        raise StepError(
+            f"{side} 最终制品不是可完整读取的 ZIP/JAR：{artifact}（{exc}）",
+            reason_codes=["STEP0_ARTIFACT_INVALID"],
+        ) from exc
+    if corrupt_entry:
+        raise StepError(
+            f"{side} 最终制品 CRC 校验失败：{artifact}!/{corrupt_entry}",
+            reason_codes=["STEP0_ARTIFACT_CORRUPT"],
+        )
+    stat = artifact.stat()
+    return {
+        "path": str(artifact),
+        "sha256": _preflight_sha256(artifact),
+        "size_bytes": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+        "archive_entry_count": entry_count,
+        "status": "passed",
+    }
+
+
+def _preflight_output_storage(report_dir):
+    report = Path(report_dir).resolve()
+    state = runtime_state_dir(report)
+    state.mkdir(parents=True, exist_ok=True)
+    probe = state / f".step0-write-probe-{os.getpid()}-{time.monotonic_ns()}"
+    try:
+        probe.write_bytes(b"step0-preflight\n")
+        with probe.open("rb") as handle:
+            if handle.read() != b"step0-preflight\n":
+                raise OSError("write probe content mismatch")
+    except OSError as exc:
+        raise StepError(
+            f"分析输出目录不可可靠写入：{state}（{exc}）",
+            reason_codes=["STEP0_OUTPUT_STORAGE_UNAVAILABLE"],
+        ) from exc
+    finally:
+        try:
+            probe.unlink()
+        except FileNotFoundError:
+            pass
+    usage = shutil.disk_usage(state)
+    return {
+        "path": str(state),
+        "free_bytes": int(usage.free),
+        "total_bytes": int(usage.total),
+        "status": "passed",
+    }
+
+
+def _preflight_pinned_build_tool(run_context, project_dir, side):
+    repo_dir = _step1_ref_repository(run_context, side, project_dir)
+    git_root = _pinned_source_git_root(repo_dir)
+    commit = str(run_context.get(f"{side}_resolved_commit") or "").strip().lower()
+    project_path = _relative_path_inside(
+        git_root, repo_dir, label=f"{side} source project",
+    )
+    worktree = None
+    try:
+        worktree = create_detached_worktree(
+            commit,
+            git_root,
+            label=f"s0-{side}",
+            runner=run_cmd,
+            git_command=git_cmd(),
+        )
+        source_root = worktree if project_path == "." else worktree / project_path
+        if not source_root.is_dir():
+            raise StepError(
+                f"{side} 固定 commit 中不存在项目目录：{project_path}@{commit}",
+                reason_codes=["STEP0_SOURCE_PROJECT_MISSING_AT_COMMIT"],
+            )
+        tool = str(run_context.get(f"{side}_tool") or "").strip().lower()
+        if tool == "maven":
+            tool_prefix = mvn_cmd(source_root)
+            commands = [
+                tool_prefix + ["-version"],
+                tool_prefix + [
+                    "-q", "help:evaluate", "-Dexpression=java.version",
+                    "-DforceStdout",
+                ],
+            ]
+        elif tool == "gradle":
+            commands = [
+                gradle_cmd(source_root) + ["--version", "--no-daemon"],
+                gradle_cmd(source_root) + [
+                    "--no-daemon", "--console=plain", "help",
+                ],
+            ]
+        else:
+            raise StepError(
+                f"{side} 构建工具不受支持：{tool or '<empty>'}",
+                reason_codes=["STEP0_BUILD_TOOL_UNSUPPORTED"],
+            )
+        command_results = []
+        for command in commands:
+            stdout, stderr, rc = run_cmd(
+                command,
+                cwd=str(source_root),
+                timeout=180,
+                env=_step0_java_environment(
+                    run_context.get(f"{side}_jdk_home")
+                ),
+            )
+            if rc != 0:
+                detail = _subprocess_failure_detail(stderr, stdout, limit=2000)
+                raise StepError(
+                    f"{side} 固定源码的 {tool} 前置命令失败："
+                    f"{detail or f'exit={rc}'}",
+                    reason_codes=["STEP0_BUILD_TOOL_PREFLIGHT_FAILED"],
+                    diagnostic={
+                        "side": side,
+                        "tool": tool,
+                        "command": [str(item) for item in command],
+                        "exit_code": rc,
+                        "stderr_tail": str(stderr or "")[-4000:],
+                    },
+                )
+            command_results.append({
+                "command": [str(item) for item in command],
+                "output": "\n".join(
+                    value
+                    for value in (
+                        str(stdout or "").strip(),
+                        str(stderr or "").strip(),
+                    )
+                    if value
+                )[-4000:],
+                "status": "passed",
+            })
+        return {
+            "side": side,
+            "repository": str(git_root),
+            "commit": commit,
+            "project_path": project_path,
+            "worktree_create_remove_probe": "passed",
+            "build_tool": tool,
+            "commands": command_results,
+            "jdk_home": str(Path(str(run_context.get(f"{side}_jdk_home"))).expanduser().resolve()),
+            "status": "passed",
+        }
+    except StepError:
+        raise
+    except RuntimeError as exc:
+        raise StepError(
+            f"{side} 固定源码/worktree 前置检查失败：{exc}",
+            reason_codes=["STEP0_WORKTREE_PREFLIGHT_FAILED"],
+        ) from exc
+    finally:
+        if worktree is not None:
+            unwinding = sys.exc_info()[0] is not None
+            try:
+                remove_detached_worktree(
+                    worktree,
+                    git_root,
+                    runner=run_cmd,
+                    git_command=git_cmd(),
+                )
+            except RuntimeError as exc:
+                # Cleanup failure is a blocking Step0 condition. Leaving it for
+                # a later stage would make the next worktree mutation unsafe.
+                if not unwinding:
+                    raise StepError(
+                        f"{side} Step0 worktree 清理失败：{exc}",
+                        reason_codes=["STEP0_WORKTREE_CLEANUP_FAILED"],
+                    ) from exc
+
+
+def _preflight_explicit_binary_config(run_context, project_dir):
+    value = str(run_context.get("binary_pipeline_config") or "").strip()
+    if not value:
+        return {}, None
+    config_path = Path(value).expanduser()
+    if not config_path.is_absolute():
+        config_path = Path(project_dir) / config_path
+    config_path = config_path.resolve()
+    try:
+        config = read_json(config_path)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise StepError(
+            f"Step0 无法读取显式 binary pipeline 配置：{config_path}（{error}）",
+            reason_codes=["STEP0_BINARY_CONFIG_INVALID"],
+        ) from error
+    if config.get("schema") != "java-upgrade-analyzer.binary-pipeline-input.v1":
+        raise StepError(
+            "Step0 显式 binary pipeline 配置 schema 不受支持："
+            f"{config.get('schema')}",
+            reason_codes=["STEP0_BINARY_CONFIG_INVALID"],
+        )
+    artifact_records = []
+    for side_name in ("base", "current"):
+        side = dict(config.get(side_name) or {})
+        configured_home = Path(
+            str(side.get("jdk_home") or "")
+        ).expanduser().resolve()
+        selected_home = Path(
+            str(run_context.get(f"{side_name}_jdk_home") or "")
+        ).expanduser().resolve()
+        if configured_home != selected_home:
+            raise StepError(
+                f"Step0 {side_name} JDK 与显式 binary 配置不一致："
+                f"selected={selected_home}; configured={configured_home}",
+                reason_codes=["STEP0_BINARY_CONFIG_JDK_MISMATCH"],
+            )
+        slots = set()
+        for artifact in side.get("artifacts") or ():
+            artifact_path = Path(str((artifact or {}).get("path") or "")).expanduser()
+            if not artifact_path.is_absolute():
+                artifact_path = Path(project_dir) / artifact_path
+            artifact_record = _preflight_artifact_input(
+                artifact_path.resolve(), side=side_name,
+            )
+            expected = str((artifact or {}).get("content_sha256") or "").lower()
+            if expected and expected != artifact_record["sha256"]:
+                raise StepError(
+                    f"Step0 {side_name} 显式 binary 制品摘要不一致："
+                    f"{artifact_path}",
+                    reason_codes=["STEP0_BINARY_CONFIG_ARTIFACT_DIGEST_MISMATCH"],
+                )
+            slot_key = (
+                str((artifact or {}).get("loader_realm") or ""),
+                (artifact or {}).get("slot"),
+            )
+            if slot_key in slots:
+                raise StepError(
+                    f"Step0 {side_name} 显式 binary 配置存在重复运行时槽位："
+                    f"{slot_key}",
+                    reason_codes=["STEP0_BINARY_CONFIG_RUNTIME_SLOT_DUPLICATE"],
+                )
+            slots.add(slot_key)
+            artifact_records.append({"side": side_name, **artifact_record})
+    policy = dict(config.get("tool_execution_policy") or {})
+    unknown_policy = set(policy) - {
+        "oracle_compile_timeout_seconds",
+        "oracle_runtime_timeout_seconds",
+        "oracle_max_attempts",
+    }
+    try:
+        compile_timeout = float(policy.get("oracle_compile_timeout_seconds", 60))
+        runtime_timeout = float(policy.get("oracle_runtime_timeout_seconds", 300))
+        attempts = int(policy.get("oracle_max_attempts", 2))
+    except (TypeError, ValueError) as error:
+        raise StepError(
+            f"Step0 显式 binary 工具策略无效：{error}",
+            reason_codes=["STEP0_BINARY_CONFIG_TOOL_POLICY_INVALID"],
+        ) from error
+    if (
+        unknown_policy
+        or isinstance(policy.get("oracle_max_attempts"), bool)
+        or not 0.01 <= compile_timeout <= 300
+        or not 0.01 <= runtime_timeout <= 300
+        or not 1 <= attempts <= 3
+    ):
+        raise StepError(
+            "Step0 显式 binary 工具策略字段或取值无效："
+            f"unknown={sorted(unknown_policy)}",
+            reason_codes=["STEP0_BINARY_CONFIG_TOOL_POLICY_INVALID"],
+        )
+    explicit_asm = str(config.get("asm_jar") or "").strip()
+    if explicit_asm:
+        asm_path = Path(explicit_asm).expanduser()
+        if not asm_path.is_absolute():
+            asm_path = Path(project_dir) / asm_path
+        try:
+            resolved_asm = resolve_asm_jar(asm_path.resolve())
+        except BinaryAsmError as error:
+            raise StepError(
+                f"Step0 显式 binary ASM 资源无效：{error}",
+                reason_codes=[
+                    "STEP0_ASM_RESOURCE_PREFLIGHT_FAILED", error.reason_code,
+                ],
+            ) from error
+    else:
+        resolved_asm = None
+    return {
+        "path": str(config_path),
+        "sha256": _preflight_sha256(config_path),
+        "artifact_count": len(artifact_records),
+        "artifacts": artifact_records,
+        "tool_execution_policy": {
+            "oracle_compile_timeout_seconds": compile_timeout,
+            "oracle_runtime_timeout_seconds": runtime_timeout,
+            "oracle_max_attempts": attempts,
+        },
+        "status": "passed",
+    }, resolved_asm
+
+
+def run_step0_preflight(run_context, project_dir, report_dir):
+    """Validate every static prerequisite before Step1 can start."""
+    started = time.perf_counter()
+    sides = {}
+    jdk_by_home = {}
+    for side in ("base", "current"):
+        home = str(Path(str(run_context.get(f"{side}_jdk_home") or "")).expanduser().resolve())
+        try:
+            jdk = jdk_by_home.get(home)
+            if jdk is None:
+                jdk = preflight_jdk_home(home)
+                jdk_by_home[home] = jdk
+        except JdkPreflightError as exc:
+            raise StepError(
+                f"{side} JDK 完整性检查失败：{exc.reason_code}: {exc}",
+                reason_codes=["STEP0_JDK_PREFLIGHT_FAILED", exc.reason_code],
+                diagnostic={
+                    "side": side,
+                    "jdk_home": home,
+                    "reason_code": exc.reason_code,
+                    "tool_diagnostic": exc.diagnostic,
+                },
+            ) from exc
+        sides[side] = {
+            "jdk": dict(jdk),
+            "source_and_build": _preflight_pinned_build_tool(
+                run_context, project_dir, side,
+            ),
+        }
+
+    artifacts = {}
+    if infer_step1_mode_fields(run_context).get("analysis_mode") == "artifact_inputs":
+        artifacts = {
+            side: _preflight_artifact_input(
+                run_context.get(f"{side}_artifact_path"), side=side,
+            )
+            for side in ("base", "current")
+        }
+    explicit_binary_config, explicit_asm = _preflight_explicit_binary_config(
+        run_context, project_dir,
+    )
+    try:
+        asm_jar = explicit_asm or resolve_asm_jar()
+    except BinaryAsmError as exc:
+        raise StepError(
+            f"Step4 ASM 解析器前置资源不可用：{exc}",
+            reason_codes=["STEP0_ASM_RESOURCE_PREFLIGHT_FAILED", exc.reason_code],
+        ) from exc
+    payload = {
+        "schema": "java-upgrade-analyzer.step0-preflight.v1",
+        "status": "passed",
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "elapsed_seconds": round(time.perf_counter() - started, 6),
+        "sides": sides,
+        "artifacts": artifacts,
+        "explicit_binary_config": explicit_binary_config,
+        "asm": {
+            "path": str(asm_jar),
+            "sha256": _preflight_sha256(asm_jar),
+            "status": "passed",
+        },
+        "output_storage": _preflight_output_storage(report_dir),
+        "git_worktree_list_contract": "git worktree list --porcelain",
+    }
+    payload = _sanitize_git_persistence_payload(payload)
+    identity_payload = {
+        key: value for key, value in payload.items()
+        if key not in {"checked_at", "elapsed_seconds"}
+    }
+    payload["step0_preflight_identity"] = hashlib.sha256(
+        json.dumps(
+            identity_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    write_json(step0_preflight_path(report_dir), payload)
+    return payload
+
+
+def validate_step1_runtime_inputs(run_context, report_dir):
+    """Validate dynamic runtime inputs immediately after Step1 discovers them."""
+    try:
+        config = materialize_binary_pipeline_config(
+            report_dir,
+            runtime_overrides={
+                key: run_context.get(key)
+                for key in (
+                    "base_jdk_home",
+                    "current_jdk_home",
+                    "active_profile_identities",
+                    "external_config_snapshot_identities",
+                    "agent_transformer_plugin_profile_identities",
+                    "step0_preflight",
+                )
+                if run_context.get(key) not in (None, "", [], ())
+            },
+        )
+    except BinaryRuntimeMaterializationError as error:
+        raise StepError(
+            "Step1 运行时闭包前置校验失败：" + str(error),
+            reason_codes=[
+                "STEP1_RUNTIME_PREFLIGHT_FAILED",
+                error.reason_code,
+            ],
+        ) from error
+    records = []
+    for side_name in ("base", "current"):
+        artifacts = list((config.get(side_name) or {}).get("artifacts") or ())
+        for index, artifact in enumerate(artifacts, start=1):
+            path = Path(str(artifact.get("path") or "")).expanduser().resolve()
+            expected = str(artifact.get("content_sha256") or "").lower()
+            actual = _preflight_sha256(path) if path.is_file() else "MISSING"
+            if actual != expected:
+                raise StepError(
+                    f"Step1 {side_name} 运行时制品摘要不一致：{path}",
+                    reason_codes=[
+                        "STEP1_RUNTIME_PREFLIGHT_FAILED",
+                        "STEP1_RUNTIME_ARTIFACT_DIGEST_MISMATCH",
+                    ],
+                )
+            try:
+                with zipfile.ZipFile(path) as archive:
+                    entry_count = len(archive.infolist())
+                    corrupt_entry = archive.testzip()
+            except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile) as error:
+                raise StepError(
+                    f"Step1 {side_name} 运行时制品不是可完整读取的 JAR："
+                    f"{path}（{error}）",
+                    reason_codes=[
+                        "STEP1_RUNTIME_PREFLIGHT_FAILED",
+                        "STEP1_RUNTIME_ARTIFACT_INVALID",
+                    ],
+                ) from error
+            if corrupt_entry:
+                raise StepError(
+                    f"Step1 {side_name} 运行时制品 CRC 校验失败："
+                    f"{path}!/{corrupt_entry}",
+                    reason_codes=[
+                        "STEP1_RUNTIME_PREFLIGHT_FAILED",
+                        "STEP1_RUNTIME_ARTIFACT_CORRUPT",
+                    ],
+                )
+            records.append({
+                "side": side_name,
+                "runtime_classpath_index": index - 1,
+                "path": str(path),
+                "sha256": actual,
+                "size_bytes": int(path.stat().st_size),
+                "archive_entry_count": entry_count,
+            })
+    payload = {
+        "schema": "java-upgrade-analyzer.step1-runtime-preflight.v1",
+        "status": "passed",
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "artifact_count": len(records),
+        "artifacts": records,
+    }
+    payload["step1_runtime_preflight_identity"] = hashlib.sha256(
+        json.dumps(
+            {key: value for key, value in payload.items() if key != "checked_at"},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    write_json(step1_runtime_preflight_path(report_dir), payload)
+    return payload
+
+
+def validate_step0_context(run_context):
+    interaction = build_step0_confirmation_interaction(run_context)
+    missing = list(interaction.get("missing_inputs") or [])
+    if missing:
+        raise StepError(
+            "Step0 仍缺少必要信息："
+            + "、".join(str(item.get("label") or item.get("field")) for item in missing)
+        )
+    mode = infer_step1_mode_fields(run_context).get("analysis_mode")
+    if mode == "artifact_inputs":
+        for side in ("base", "current"):
+            artifact = Path(str(run_context.get(f"{side}_artifact_path") or ""))
+            if not artifact.is_file():
+                raise StepError(f"{side} 最终制品不存在：{artifact}")
+    for side in ("base", "current"):
+        commit = str(run_context.get(f"{side}_resolved_commit") or "").strip()
+        if not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", commit):
+            raise StepError(f"{side} 应用源码版本尚未固定到不可变 commit。")
+        home = str(run_context.get(f"{side}_jdk_home") or "").strip()
+        observed_major = _jdk_major_from_home(home)
+        if not observed_major:
+            raise StepError(f"{side} JDK 目录无效或缺少 release 文件：{home}")
+        home_path = Path(home)
+        missing_executables = [
+            name
+            for name in ("java", "javac", "javap")
+            if not any(
+                (home_path / "bin" / candidate).is_file()
+                for candidate in (name, f"{name}.exe")
+            )
+        ]
+        if missing_executables:
+            raise StepError(
+                f"{side} JDK 目录不是完整 JDK Home，缺少："
+                + "、".join(missing_executables),
+                reason_codes=["STEP0_FULL_JDK_REQUIRED"],
+            )
+        if observed_major == "8":
+            platform_ready = (home_path / "jre" / "lib" / "rt.jar").is_file()
+            platform_requirement = "jre/lib/rt.jar"
+        else:
+            platform_ready = (
+                (home_path / "lib" / "modules").is_file()
+                and (home_path / "jmods").is_dir()
+            )
+            platform_requirement = "lib/modules 和 jmods"
+        if not platform_ready:
+            raise StepError(
+                f"{side} JDK 目录缺少目标平台镜像：{platform_requirement}",
+                reason_codes=["STEP0_FULL_JDK_REQUIRED"],
+            )
+        expected_major = _normalize_jdk_major(run_context.get(f"jdk_{side}"))
+        if expected_major and observed_major != expected_major:
+            raise StepError(
+                f"{side} JDK 目录版本不匹配：需要 JDK {expected_major}，实际为 JDK {observed_major}。"
+            )
+
+
+def write_step0_confirmation_record(report_dir, run_context):
+    payload = {
+        "schema": "java-upgrade-analyzer.step0-confirmation.v1",
+        "confirmed_at": datetime.now(timezone.utc).isoformat(),
+        "analysis_mode": infer_step1_mode_fields(run_context).get("analysis_mode"),
+        "artifacts": {
+            side: {
+                "path": str(run_context.get(f"{side}_artifact_path") or ""),
+                "user_filename": (
+                    Path(str(run_context.get(f"{side}_artifact_path"))).name
+                    if run_context.get(f"{side}_artifact_path") else ""
+                ),
+                "application_version": str(run_context.get(f"{side}_artifact_version") or ""),
+            }
+            for side in ("base", "current")
+        },
+        "application_source": str(
+            run_context.get("application_source_display")
+            or run_context.get("application_source")
+            or ""
+        ),
+        "dependency_sources": _step0_dependency_source_values(run_context),
+        "target_module": str(run_context.get("target_module") or ""),
+        "sides": {
+            side: {
+                "requested_ref": str(run_context.get(f"{side}_branch") or ""),
+                "resolved_ref": str(run_context.get(f"{side}_resolved_ref") or ""),
+                "resolved_commit": str(run_context.get(f"{side}_resolved_commit") or ""),
+                "build_tool": str(run_context.get(f"{side}_tool") or ""),
+                "jdk_home": str(run_context.get(f"{side}_jdk_home") or ""),
+                "jdk_major": str(run_context.get(f"jdk_{side}") or ""),
+            }
+            for side in ("base", "current")
+        },
+        "input_origins": dict(run_context.get("input_origins") or {}),
+        "preflight": dict(run_context.get("step0_preflight") or {}),
+    }
+    payload = _sanitize_git_persistence_payload(payload)
+    write_json(step0_confirmation_path(report_dir), payload)
+    return payload
 
 
 def build_input_normalization_contract(options, required_fields, properties):
@@ -7822,7 +8411,7 @@ def apply_interaction_protocol_enhancements(interaction, step_id, project_dir=No
     options = [dict(item) for item in (payload.get("options") or [])]
     response_schema = dict(payload.get("response_schema") or {})
     properties = dict(response_schema.get("properties") or {})
-    if step_id == "step1" and payload.get("ref_resolution_requests"):
+    if step_id in {"step0", "step1"} and payload.get("ref_resolution_requests"):
         requests = [
             dict(item) for item in (payload.get("ref_resolution_requests") or [])
             if isinstance(item, dict)
@@ -8044,26 +8633,18 @@ def _user_field_label(field):
     labels = {
         "action": "动作",
         "target_module": "目标模块",
-        "primary_module": "目标模块",
-        "modules": "模块列表",
         "base_branch": "基准分支",
         "current_branch": "当前分支",
-        "base_source_project_dir": "基准侧源码仓库目录",
-        "current_source_project_dir": "当前侧源码仓库目录",
+        "application_source": "应用源码",
+        "base_tool": "Base 构建工具",
+        "current_tool": "Current 构建工具",
         "base_artifact_path": "升级前构建产物",
         "current_artifact_path": "升级后构建产物",
-        "jdk_base": "升级前 JDK 版本",
-        "jdk_current": "升级后 JDK 版本",
-        "springboot_base": "升级前 Spring Boot 版本",
-        "springboot_current": "升级后 Spring Boot 版本",
-        "source_dirs": "业务源码目录",
-        "source_provision_choice": "是否能够补充相关源码",
-        "source_locations": "源码目录或 Git 地址",
-        "source_location_mappings": "无法自动分类的源码归属",
+        "base_jdk_home": "Base JDK 目录",
+        "current_jdk_home": "Current JDK 目录",
         "dependency_source_dirs": "依赖源码目录或 Git 地址",
-        "source_repo_hints": "源码仓库线索",
-        "dependency_repo_mappings": "依赖源码映射",
-        "accept_suggested_mappings": "是否采用建议的依赖源码映射",
+        "dependency_source_ref_selections": "依赖源码版本方案",
+        "skip_dependency_source_coords": "跳过的依赖源码",
         "source_ref_selections": "主项目源码 ref 方案",
         "retry_remote_fetch": "重试远端 Git 操作",
         "step5_selected_coords": "系统触达证据要分析的依赖坐标",
@@ -8082,24 +8663,18 @@ def _user_field_description(field, meta=None):
     description = str(meta.get("description") or "").strip()
     descriptions = {
         "target_module": "要分析的业务模块。",
-        "primary_module": "要分析的业务模块。",
-        "modules": "一个或多个要分析的业务模块。",
         "base_branch": "升级前代码所在分支。",
         "current_branch": "升级后代码所在分支。",
+        "application_source": "被分析应用的 Git 仓库目录或 Git 地址。",
+        "base_tool": "升级前版本使用 Maven 还是 Gradle。",
+        "current_tool": "升级后版本使用 Maven 还是 Gradle。",
         "base_artifact_path": "升级前构建出的 jar/war 路径。",
         "current_artifact_path": "升级后构建出的 jar/war 路径。",
-        "jdk_base": "升级前实际使用的 JDK 主版本。",
-        "jdk_current": "升级后实际使用的 JDK 主版本。",
-        "springboot_base": "升级前实际使用的 Spring Boot 版本。",
-        "springboot_current": "升级后实际使用的 Spring Boot 版本。",
-        "source_provision_choice": (
-            "说明是否还能提供相关源码输入；这不是对系统已有源码的使用授权。"
-        ),
-        "source_locations": "可混合提交源码目录和 Git 地址，系统自动识别业务源码及依赖源码。",
-        "source_location_mappings": "仅在系统无法可靠分类某个源码位置时补充归属。",
+        "base_jdk_home": "升级前版本对应的本机 JDK Home。",
+        "current_jdk_home": "升级后版本对应的本机 JDK Home。",
         "dependency_source_dirs": "相关依赖源码仓库目录、多模块仓库根目录或 HTTPS/SSH Git 地址。",
-        "dependency_repo_mappings": "存在多个源码候选时，明确依赖坐标对应的源码仓库。",
-        "accept_suggested_mappings": "采用会增加源码行为覆盖；不采用则保留最终制品证据边界。",
+        "dependency_source_ref_selections": "为存在版本歧义的依赖源码选择一个明确的 commit 组合。",
+        "skip_dependency_source_coords": "明确不使用这些可选依赖源码，保留源码证据缺口。",
         "source_ref_selections": "从当前决策卡中按 base/current 侧选择源码 ref 方案。",
         "retry_remote_fetch": "确认远端状态已正常后，显式重新查询 ref 并重试定向 fetch。",
         "selected_targets": "从 changed_dependencies.md 的“依赖包”列复制完整坐标。",
@@ -8124,12 +8699,6 @@ def _humanize_interaction_text(text):
     replacements = {
         "Step5 是全量分析": "系统触达证据是覆盖全部依赖",
         "dependency_source_dirs": "依赖源码目录或 Git 地址",
-        "dependency_repo_mappings": "依赖源码映射",
-        "accept_suggested_mappings": "是否采用建议的依赖源码映射",
-        "source_dirs": "业务源码目录",
-        "source_provision_choice": "是否能够补充相关源码",
-        "source_locations": "源码目录或 Git 地址",
-        "source_location_mappings": "无法自动分类的源码归属",
         "target_module": "目标模块",
         "project_scope": "项目范围",
         "step5_selected_coords": "系统触达证据要分析的依赖坐标",
@@ -8200,40 +8769,6 @@ def _decision_card_reply_examples(interaction, selection_options, options):
     elif "continue" in option_ids and not required_fields:
         examples.append("继续")
 
-    if "accept_suggested_mappings" in required_fields:
-        examples.extend(
-            [
-                "采用建议的依赖源码映射后继续",
-                "不采用建议映射，按最终制品 JAR 证据继续",
-            ]
-        )
-    if "source_provision_choice" in required_fields:
-        examples.extend(
-            [
-                "可以补充源码，位置是 /path/to/source-repo",
-                "暂时无法补充其他源码，按现有制品和源码证据继续",
-            ]
-        )
-    if "source_locations" in required_fields:
-        examples.append("源码位置是 /path/to/project-source 和 /path/to/dependency-source")
-    if "source_location_mappings" in required_fields:
-        examples.append("将无法识别的位置标记为业务源码或对应依赖源码后继续")
-    jdk_fields = {"jdk_base", "jdk_current"} & required_fields
-    if jdk_fields:
-        values = []
-        if "jdk_base" in jdk_fields:
-            values.append("升级前 JDK 是 8")
-        if "jdk_current" in jdk_fields:
-            values.append("升级后 JDK 是 17")
-        examples.append("，".join(values) + "，继续")
-    springboot_fields = {"springboot_base", "springboot_current"} & required_fields
-    if springboot_fields:
-        values = []
-        if "springboot_base" in springboot_fields:
-            values.append("升级前 Spring Boot 是 2.7.18")
-        if "springboot_current" in springboot_fields:
-            values.append("升级后 Spring Boot 是 3.3.2")
-        examples.append("，".join(values) + "，继续")
     if "dependency_repo_mappings" in required_fields:
         examples.append("将 com.example:demo-lib 映射到 /path/to/demo-lib 后继续")
 
@@ -8259,6 +8794,52 @@ def _decision_card_reply_examples(interaction, selection_options, options):
 def build_user_decision_card(interaction):
     lines = []
     interaction = interaction or {}
+    confirmation_table = dict(interaction.get("confirmation_table") or {})
+    if confirmation_table:
+        question = _humanize_interaction_text(
+            interaction.get("question") or "请确认正式分析信息。"
+        ).strip()
+        lines.append(f"当前需要确认：{question}")
+        columns = list(confirmation_table.get("columns") or ["信息", "Base", "Current"])
+
+        def table_cell(value):
+            return str(value or "-").replace("|", "\\|").replace("\n", "<br>")
+
+        lines.append("| " + " | ".join(table_cell(item) for item in columns) + " |")
+        lines.append("|" + "|".join("---" for _item in columns) + "|")
+        for row in confirmation_table.get("rows") or []:
+            lines.append(
+                "| "
+                + " | ".join(
+                    table_cell(value)
+                    for value in (
+                        (row or {}).get("label"),
+                        (row or {}).get("base"),
+                        (row or {}).get("current"),
+                    )
+                )
+                + " |"
+            )
+        source_ref_decision_items = list(
+            interaction.get("source_ref_decision_items") or []
+        )
+        if source_ref_decision_items:
+            lines.append("版本分支候选（同一 commit 的别名已合并）：")
+            for item in source_ref_decision_items:
+                side_label = "Base" if item.get("side") == "base" else "Current"
+                for index, candidate in enumerate((item.get("candidates") or [])[:6], start=1):
+                    aliases = [
+                        str(alias.get("ref") or "")
+                        for alias in (candidate.get("aliases") or [])
+                        if str(alias.get("ref") or "").strip()
+                    ]
+                    alias_text = f"；别名：{'、'.join(aliases)}" if aliases else ""
+                    lines.append(
+                        f"- {side_label} 方案 {index}：`{candidate.get('ref') or '-'}` "
+                        f"(commit {str(candidate.get('commit') or '')[:12] or '?'}){alias_text}"
+                    )
+        lines.append("回复“确认”即可使用表中值；如有“请提供”，请在同一回复中一次补齐。")
+        return lines
     informational = str(interaction.get("status") or "").strip() == "informational"
     question = _humanize_interaction_text(interaction.get("question") or "请确认当前结果，然后继续。").strip()
     lines.append(
@@ -8367,6 +8948,27 @@ def build_user_decision_card(interaction):
                 lines.append(f"  - 方案 {index}：`{ref}`（commit {commit or '?'}）")
             if len(candidates) > 6:
                 lines.append(f"  - 当前展示 6 / {len(candidates)} 个候选。")
+    dependency_source_ambiguities = list(
+        interaction.get("dependency_source_ambiguities") or []
+    )
+    if dependency_source_ambiguities:
+        lines.append("需要处理的依赖包源码歧义：")
+        for item in dependency_source_ambiguities:
+            coord = str(item.get("coord") or "-")
+            versions = dict(item.get("versions") or {})
+            lines.append(
+                f"- `{coord}`（{versions.get('base') or '-'} → {versions.get('current') or '-'}）："
+            )
+            for index, candidate in enumerate((item.get("candidates") or [])[:8], start=1):
+                lines.append(
+                    f"  - 方案 {index}：`{candidate.get('repo_path') or '-'}`；"
+                    f"{candidate.get('base_ref') or '-'} "
+                    f"({str(candidate.get('base_commit') or '')[:12] or '?'}) → "
+                    f"{candidate.get('current_ref') or '-'} "
+                    f"({str(candidate.get('current_commit') or '')[:12] or '?'})；"
+                    f"selection_key={candidate.get('selection_key')}"
+                )
+        lines.append("依赖包源码是可选项；不使用某项时请明确回复跳过其完整坐标。")
     options = list(interaction.get("options") or [])
     selection_options = list(interaction.get("selection_options") or [])
     if selection_options:
@@ -8679,6 +9281,7 @@ def print_interaction_to_streams(interaction, report_dir, event="interaction_req
                     "diagnostic_guidance", {}
                 ),
                 "summary": interaction.get("summary"),
+                "confirmation_table": interaction.get("confirmation_table", {}),
                 "options": interaction.get("options", []),
                 "files_to_review": files_to_review,
                 "required_fields": interaction.get("required_fields", []),
@@ -8695,6 +9298,9 @@ def print_interaction_to_streams(interaction, report_dir, event="interaction_req
                     "recommended_candidate_count", 0
                 ),
                 "selection_resolution": interaction.get("selection_resolution", {}),
+                "dependency_source_ambiguities": interaction.get(
+                    "dependency_source_ambiguities", []
+                ),
                 "scope_preview": interaction.get("scope_preview", {}),
                 "runtime_rules": runtime_rules,
                 "next_action_rule": interaction.get("next_action_rule"),
@@ -8720,6 +9326,10 @@ def print_interaction_to_streams(interaction, report_dir, event="interaction_req
 
 
 def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, run_context=None, main_state=None):
+    # Step0 owns its runtime-generated unified card. Step2 is always internal
+    # and must never regain a fixed checkpoint through a custom manifest.
+    if step_id in {"step0", "step2"}:
+        return None
     step_meta = manifest_steps.get(step_id) or {}
     scope_confirmation_only = bool(step_meta.get("requires_scope_confirmation"))
     if (
@@ -8758,285 +9368,6 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
         checklist_lines.append("建议复核要点：")
         for note in notes:
             checklist_lines.append(f"  - {note}")
-    if step_id == "step1":
-        runtime_view = dict(previous_step_output(main_state or {}, step_id) or {})
-        runtime_view.update((main_state or {}).get(step_id, {}).get("input") or {})
-        runtime_view.update(run_context or {})
-        mode_info = infer_step1_mode_fields(runtime_view)
-        missing_context_fields = []
-        if mode_info.get("analysis_mode") == "artifact_inputs":
-            if not str(runtime_view.get("base_branch") or "").strip():
-                missing_context_fields.append("base_branch")
-            if not str(runtime_view.get("current_branch") or "").strip():
-                missing_context_fields.append("current_branch")
-        if missing_context_fields:
-            interaction_meta["question"] = (
-                "两侧制品和依赖变化范围已经生成。继续推断升级上下文前，"
-                "请补充缺失的基准侧/当前侧分支，并同时确认目标模块和依赖范围是否正确。"
-            )
-            interaction_meta["reason_code"] = "step1_context_refs_required"
-            interaction_meta["required_fields"] = _dedupe_strings(
-                [
-                    field
-                    for field in (interaction_meta.get("required_fields") or [])
-                    if field != "action"
-                ]
-                + missing_context_fields
-            )
-            interaction_meta["missing_inputs"] = [
-                {
-                    "field": field,
-                    "label": "基准侧分支" if field == "base_branch" else "当前侧分支",
-                    "reason": "该分支用于只读推断 JDK、构建上下文和版本差异，不替代最终制品证据。",
-                }
-                for field in missing_context_fields
-            ]
-            action_requirements = dict(interaction_meta.get("action_requirements") or {})
-            continue_requirements = dict(action_requirements.get("continue") or {})
-            continue_requirements["required_fields"] = missing_context_fields
-            continue_requirements["description"] = (
-                "补齐两侧分支后，系统会直接继续生成升级上下文，不再重复确认已确定的模块和依赖范围。"
-            )
-            action_requirements["continue"] = continue_requirements
-            interaction_meta["action_requirements"] = action_requirements
-            checklist_lines.extend([
-                "继续前仍需补齐：" + "、".join(
-                    "基准侧分支" if field == "base_branch" else "当前侧分支"
-                    for field in missing_context_fields
-                ),
-                "这些分支只用于上下文推断；API 事实仍以两侧最终制品为准。",
-            ])
-    if step_id == "step2":
-        context_json = step2_context_path(report_dir)
-        dep_graph_json = step2_dep_graph_path(report_dir)
-        ctx = read_json(context_json) if context_json.exists() else {}
-        runtime_view = dict(previous_step_output(main_state or {}, step_id) or {})
-        runtime_view.update((main_state or {}).get(step_id, {}).get("input") or {})
-        runtime_view.update(run_context or {})
-        suggestions = build_dependency_repo_mapping_suggestions(runtime_view, ctx)
-        proposed_paths = suggested_dependency_repo_mappings(suggestions)
-        mapping_summary_path, mapping_summary = write_step2_source_mapping_summary(report_dir, runtime_view, ctx)
-        mapping_counts = mapping_summary.get("counts") or {}
-        extra_files = [str(context_json.resolve()), str(dep_graph_json.resolve())]
-        extra_files.append(str(mapping_summary_path.resolve()))
-        for item in extra_files:
-            if item not in files_to_review:
-                files_to_review.append(item)
-        checklist_lines.extend(
-            [
-                "关键口径确认（影响后续 Step3/Step4/Step5）：",
-                f"  - base_branch={ctx.get('base_branch')}",
-                f"  - current_branch={ctx.get('current_branch')}",
-                f"  - jdk={ctx.get('jdk_base') or '❓'} -> {ctx.get('jdk_current') or '❓'}",
-                f"  - springboot={ctx.get('springboot_base') or '❓'} -> {ctx.get('springboot_current') or '❓'} (source={ctx.get('springboot_version_source')})",
-                f"  - changed_dependencies={len(ctx.get('changed_dependencies') or [])}",
-                f"  - source_dirs={mapping_counts.get('source_dirs', 0)} status={mapping_summary.get('source_dirs_status')}",
-                f"  - context={context_json}",
-                f"  - dep_graph={dep_graph_json}",
-                f"  - source_mapping_summary={mapping_summary_path}",
-            ]
-        )
-        if mapping_summary.get("source_dirs"):
-            for item in mapping_summary.get("source_dirs", [])[:10]:
-                checklist_lines.append(f"  - 业务源码: {item}")
-        else:
-            checklist_lines.append("  - 业务源码缺失: 继续到 Step3/Step4/Step5 前必须先补 source_dirs")
-        checklist_lines.append("依赖包源码映射确认（影响 Step4 git diff 与 Step5 调用链分析）：")
-        checklist_lines.append(
-            f"  - dependency_source_dirs={mapping_counts.get('dependency_source_dirs', 0)} "
-            f"confirmed_target_mappings={mapping_counts.get('confirmed_target_mappings', 0)}"
-        )
-        checklist_lines.append(
-            f"  - 自动识别结果: matched_target={mapping_counts.get('confirmed_target_mappings', 0)} "
-            f"detected_source_matches={mapping_counts.get('detected_source_matches', 0)}"
-        )
-        if mapping_counts.get("ambiguous_coords", 0):
-            checklist_lines.append(
-                f"  - 存在坐标冲突: {mapping_counts.get('ambiguous_coords', 0)} 个，需要人工确认后再继续"
-            )
-        checklist_lines.append(
-            f"  - 目标依赖映射命中={mapping_counts.get('confirmed_target_mappings', 0)}/"
-            f"{mapping_counts.get('target_dependency_coords', 0)}"
-        )
-        if mapping_summary.get("confirmed_target_mappings"):
-            for item in mapping_summary.get("confirmed_target_mappings", [])[:10]:
-                checklist_lines.append(
-                    f"  - 已映射: {item.get('coord')} -> {item.get('repo_path')}"
-                )
-        if mapping_summary.get("detected_source_matches"):
-            for item in mapping_summary.get("detected_source_matches", [])[:10]:
-                checklist_lines.append(f"  - 自动依赖源码映射: {item}")
-        if mapping_summary.get("ambiguous_coords"):
-            for item in mapping_summary.get("ambiguous_coords", [])[:10]:
-                checklist_lines.append(
-                    f"  - 坐标冲突: {item.get('coord')} 候选仓库={', '.join((item.get('repo_paths') or [])[:3])}"
-                )
-        if mapping_summary.get("unmapped_target_coords"):
-            checklist_lines.append(
-                f"  - 尚未映射目标依赖: {', '.join(mapping_summary.get('unmapped_target_coords')[:10])}"
-            )
-        problematic_repo_scans = [
-            item for item in (mapping_summary.get("dependency_repo_scans") or [])
-            if item.get("status") != "mapped_dependency_repo"
-        ]
-        for item in problematic_repo_scans[:10]:
-            status = item.get("status")
-            if status == "no_coords_inferred":
-                checklist_lines.append(
-                    f"  - 目录未识别出模块坐标: {item.get('repo_path')}"
-                )
-            elif status == "inferred_non_target_only":
-                checklist_lines.append(
-                    f"  - 目录仅识别到非目标模块: {item.get('repo_path')} -> "
-                    f"{', '.join((item.get('other_inferred_coords') or [])[:5])}"
-                )
-            elif status == "matched_target_not_applied":
-                checklist_lines.append(
-                    f"  - 命中目标依赖但尚未写入映射: {item.get('repo_path')} -> "
-                    f"{', '.join((item.get('matched_target_coords') or [])[:5])}"
-                )
-        if runtime_view.get("source_repo_hints"):
-            checklist_lines.append("源码线索解析结果（仅保留当前系统引用的升级依赖映射建议）：")
-            for item in suggestions.get("confirmed", [])[:20]:
-                checklist_lines.append(
-                    f"  - 已确认: {item.get('coord')} -> {item.get('repo_path')} ({item.get('reason')})"
-                )
-            for item in suggestions.get("proposed", [])[:20]:
-                checklist_lines.append(
-                    f"  - 建议映射: {item.get('coord')} -> {item.get('repo_path')} [{item.get('confidence')}]"
-                )
-            for item in suggestions.get("ambiguous", [])[:20]:
-                candidate_paths = ", ".join(
-                    f"{cand.get('repo_path')}" for cand in (item.get("candidates") or [])[:3]
-                )
-                checklist_lines.append(
-                    f"  - 待确认: {item.get('coord')} 候选仓库={candidate_paths or '(无)'}"
-                )
-            if suggestions.get("unmatched"):
-                checklist_lines.append(
-                    f"  - 未匹配目标依赖: {', '.join(suggestions.get('unmatched')[:10])}"
-                )
-            if proposed_paths:
-                checklist_lines.append("继续流程不会自动接受建议映射，避免把流程确认和证据选择混为一体。")
-                checklist_lines.append("请直接说明“采用建议映射”或“不采用建议映射，按最终制品证据继续”。")
-        review_path = write_step2_review(report_dir, ctx, mapping_summary, runtime_view)
-        target_module = (
-            runtime_view.get("target_module")
-            or runtime_view.get("primary_module")
-            or ctx.get("target_module")
-            or ctx.get("primary_module")
-            or "未指定"
-        )
-        files_to_review = [str(review_path.resolve())]
-        checklist_lines = [
-            "请确认以下信息是否符合本次升级范围：",
-            f"  - 目标模块：{target_module}",
-            f"  - 比较版本：{ctx.get('base_branch') or '未识别'} → {ctx.get('current_branch') or '未识别'}",
-            f"  - JDK：{ctx.get('jdk_base') or '未识别'} → {ctx.get('jdk_current') or '未识别'}",
-            f"  - Spring Boot：{ctx.get('springboot_base') or '未识别'} → {ctx.get('springboot_current') or '未识别'}",
-            f"  - 发生变化的依赖包：{len(ctx.get('changed_dependencies') or [])} 个",
-            f"  - 已匹配依赖源码：{mapping_counts.get('confirmed_target_mappings', 0)} / {mapping_counts.get('target_dependency_coords', 0)} 个目标依赖",
-            f"完整确认页：{review_path.resolve()}",
-        ]
-        confirmation = build_step2_confirmation_requirements(
-            ctx, mapping_summary, runtime_view
-        )
-        if step_meta.get("conditional_confirmation") and not confirmation.get("required"):
-            return None
-        if confirmation.get("required"):
-            reason_text = "；".join(confirmation.get("reasons") or [])
-            interaction_meta["type"] = "input_request"
-            interaction_meta["reason_code"] = confirmation.get("reason_code")
-            if confirmation.get("reason_code") == "step2_source_inputs_required":
-                mode = infer_step1_mode_fields(runtime_view).get("analysis_mode")
-                mode_context = (
-                    "当前为编译模式，系统已经取得并会直接使用被分析系统源码，不需要你授权或重复提供。"
-                    if mode == "checkout_build"
-                    else "当前为直接制品模式，你可以同时补充被分析系统源码和相关依赖源码。"
-                )
-                interaction_meta["question"] = (
-                    f"{mode_context}是否还能补充其他相关源码？"
-                    "你只需一次提交可提供的源码目录或 Git 地址，系统会自动识别归属；"
-                    "只有无法可靠分类时才会再请求映射。源码可以补充文件与行号、声明和注解、"
-                    "可读上下文及源码候选关系，并在受支持的常量内联场景与字节码共同形成证明；"
-                    "不会改变由最终制品确定的正式变化、运行时提供者、方法解析或精确可执行边。"
-                    "暂时无法补充也可以继续，报告会分别标注业务源码和依赖源码的证据覆盖。"
-                )
-                interaction_meta["options"] = [
-                    {
-                        "id": "continue",
-                        "label": "补充或跳过后继续",
-                        "description": "提交一个统一源码位置列表，或明确暂不补充其他源码。",
-                    },
-                    {
-                        "id": "cancel",
-                        "label": "稍后决定",
-                        "description": "保留当前现场，决定后再继续。",
-                    },
-                    {
-                        "id": "restart_from_step",
-                        "label": "从指定任务重新分析",
-                        "description": "仅在需要修正更早输入时使用。",
-                    },
-                ]
-            elif confirmation.get("reason_code") == "step2_source_mapping_decision_required":
-                interaction_meta["question"] = (
-                    "现有源码线索生成了会改变源码行为覆盖率的映射建议："
-                    f"{reason_text}。请明确是否采用这些建议后继续。"
-                )
-                interaction_meta["options"] = [
-                    {
-                        "id": "continue",
-                        "label": "说明采用或不采用后继续",
-                        "description": "采用会增加源码行为覆盖；不采用则保留最终制品证据边界。",
-                    },
-                    {
-                        "id": "cancel",
-                        "label": "稍后处理",
-                        "description": "保留当前分析现场，稍后再决定。",
-                    },
-                    {
-                        "id": "restart_from_step",
-                        "label": "从指定任务重新分析",
-                        "description": "仅在需要修正更早输入时使用。",
-                    },
-                ]
-            else:
-                interaction_meta["question"] = (
-                    "自动生成的升级上下文仍有会影响后续分析口径的事项："
-                    f"{reason_text}。请一次处理后继续。"
-                )
-            interaction_meta["required_fields"] = list(
-                confirmation.get("required_fields") or []
-            )
-            action_requirements = dict(interaction_meta.get("action_requirements") or {})
-            continue_requirements = dict(action_requirements.get("continue") or {})
-            continue_requirements["required_fields"] = list(
-                confirmation.get("required_fields") or []
-            )
-            continue_requirements["description"] = (
-                "请补齐无法确定的事实；若存在源码映射建议，必须明确说明采用或不采用。"
-            )
-            action_requirements["continue"] = continue_requirements
-            interaction_meta["action_requirements"] = action_requirements
-            checklist_lines = [
-                "以下事项无法由系统替你决定：",
-                *[f"  - {item}" for item in confirmation.get("reasons") or []],
-                f"  - 目标模块：{target_module}",
-                f"  - 比较版本：{ctx.get('base_branch') or '未识别'} → {ctx.get('current_branch') or '未识别'}",
-                f"  - JDK：{ctx.get('jdk_base') or '未识别'} → {ctx.get('jdk_current') or '未识别'}",
-                f"  - 发生变化的依赖包：{len(ctx.get('changed_dependencies') or [])} 个",
-                f"完整上下文页：{review_path.resolve()}",
-            ]
-            for item in confirmation.get("proposed_mappings") or []:
-                checklist_lines.append(
-                    f"  - 建议映射：{item.get('coord')} -> {item.get('repo_path')}"
-                )
-            if confirmation.get("proposed_mappings"):
-                checklist_lines.append(
-                    "采用会增加对应依赖的源码行为覆盖；不采用则按最终制品 JAR 证据继续，"
-                    "并在报告中保留源码行为覆盖边界。"
-                )
     if step_id == "step4":
         all_changed_apis = step4_api_changes_dir(report_dir) / "all_changed_apis.csv"
         available_rows = read_csv_rows(all_changed_apis)
@@ -9287,37 +9618,6 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
         },
     }
     properties = response_schema.setdefault("properties", {})
-    if step_id == "step2":
-        for internal_field in (
-            "source_dirs",
-            "dependency_source_dirs",
-            "source_repo_hints",
-        ):
-            properties.pop(internal_field, None)
-        properties.setdefault(
-            "source_provision_choice",
-            {
-                "type": "string",
-                "enum": ["provide", "continue_without"],
-                "description": (
-                    "说明是否能够补充其他相关源码输入。这不是对系统已有源码的使用授权。"
-                ),
-            },
-        )
-        properties.setdefault(
-            "source_locations",
-            {
-                "type": "array",
-                "description": "可选。统一提交可提供的源码目录或 Git 地址；不要求用户区分业务源码和依赖源码，系统会自动分类。",
-            },
-        )
-        properties.setdefault(
-            "source_location_mappings",
-            {
-                "type": "array",
-                "description": "仅在系统无法可靠分类某个源码位置时使用；每项包含 location、owner_type，依赖源码可附 owner_coord。",
-            },
-        )
     if step_id == "step4":
         properties.setdefault(
             "selected_targets",
@@ -9329,29 +9629,8 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
                 ),
             },
         )
-    if step_id == "step2":
-        for field_name, label in (
-            ("jdk_base", "升级前 JDK 版本"),
-            ("jdk_current", "升级后 JDK 版本"),
-            ("springboot_base", "升级前 Spring Boot 版本"),
-            ("springboot_current", "升级后 Spring Boot 版本"),
-        ):
-            properties.setdefault(
-                field_name,
-                {
-                    "type": "string",
-                    "description": f"可选。仅当自动识别缺失或不正确时，明确提供{label}。",
-                },
-            )
-        properties.setdefault(
-            "dependency_repo_mappings",
-            {
-                "type": "array",
-                "description": "可选。依赖源码候选存在歧义时，用 groupId:artifactId=/abs/repo/path 明确对应关系。",
-            },
-        )
     if step_id == "step1":
-        for field_name, field_meta in build_step1_response_properties().items():
+        for field_name, field_meta in build_step1_identity_response_properties().items():
             properties.setdefault(field_name, field_meta)
     for field in interaction_meta.get("required_fields", []) or []:
         properties.setdefault(
@@ -9456,14 +9735,6 @@ def resolve_resume_step_id(current_step_id, pending_interaction, action, user_re
     if action == "continue" and pending_step_id:
         if pending_kind == "input_request":
             return pending_step_id
-        if (
-            pending_step_id == "step2"
-            and infer_non_pending_target_step_from_payload(user_response or {}) == "step2"
-        ):
-            # Backward compatibility for Step2 review checkpoints created by
-            # older versions: corrections must rebuild Step2, not leak into a
-            # stale Step3 continuation.
-            return "step2"
     if action == "rerun_current_step":
         if pending_step_id:
             return pending_step_id
@@ -9484,7 +9755,7 @@ def resolve_resume_step_id(current_step_id, pending_interaction, action, user_re
 def expand_step1_ref_selections(pending_interaction, user_response):
     """Bind a Step1 ref choice to the commit shown on the current decision card."""
     response = dict(user_response or {})
-    if str((pending_interaction or {}).get("step_id") or "") != "step1":
+    if str((pending_interaction or {}).get("step_id") or "") not in {"step0", "step1"}:
         return response
     decision_items = {
         str(item.get("side") or "").strip(): dict(item)
@@ -9505,7 +9776,7 @@ def expand_step1_ref_selections(pending_interaction, user_response):
                 raise StepError("source_ref_selections 的每项都必须是对象。")
             side = str(selection.get("side") or "").strip()
             if side not in decision_items:
-                raise StepError(f"Step1 ref 方案中的 side 不存在于当前确认项：{side or '(空)'}")
+                raise StepError(f"源码 ref 方案中的 side 不存在于当前确认项：{side or '(空)'}")
             if side in seen_sides:
                 raise StepError(f"Step1 的 {side} 侧只能选择一个 ref 方案。")
             seen_sides.add(side)
@@ -9608,6 +9879,43 @@ def expand_step1_ref_selections(pending_interaction, user_response):
     return response
 
 
+def expand_dependency_source_ref_selections(pending_interaction, user_response):
+    response = dict(user_response or {})
+    if str((pending_interaction or {}).get("reason_code") or "").lower() != "step1_dependency_source_ambiguity":
+        return response
+    raw = response.get("dependency_source_ref_selections")
+    if raw in (None, "", []):
+        return response
+    selections = [raw] if isinstance(raw, dict) else raw
+    if not isinstance(selections, list):
+        raise StepError("dependency_source_ref_selections 必须是对象数组。")
+    candidate_index = {}
+    for ambiguity in (pending_interaction or {}).get("dependency_source_ambiguities") or []:
+        if ambiguity.get("kind") != "binding":
+            continue
+        for candidate in ambiguity.get("candidates") or []:
+            key = str(candidate.get("selection_key") or "").strip()
+            if key:
+                candidate_index[key] = (dict(ambiguity), dict(candidate))
+    bindings = []
+    seen_coords = set()
+    for selection in selections:
+        if not isinstance(selection, dict):
+            raise StepError("dependency_source_ref_selections 的每项必须是对象。")
+        key = str(selection.get("selection_key") or "").strip()
+        match = candidate_index.get(key)
+        if not match:
+            raise StepError(f"依赖源码版本方案不存在或已过期：{key or '(空)'}")
+        ambiguity, candidate = match
+        coord = str(ambiguity.get("coord") or "").strip()
+        if coord in seen_coords:
+            raise StepError(f"依赖源码 {coord} 只能选择一个版本方案。")
+        seen_coords.add(coord)
+        bindings.append(candidate)
+    response["dependency_source_ref_bindings"] = bindings
+    return response
+
+
 
 
 def _is_step4_scope_confirmation(pending_interaction, action):
@@ -9651,26 +9959,7 @@ def validate_step5_scope_response(pending_interaction, user_response):
         "selected_targets",
     ) or []
     if not scope_mode:
-        # Old persisted checkpoints did not require scope_mode. Keep valid legacy
-        # replies working, but reject notes-only partial choices instead of
-        # silently widening them to full analysis.
-        if selected_targets:
-            scope_mode = "partial"
-        elif _notes_look_like_partial_scope(
-            response.get("notes"),
-            (pending_interaction or {}).get("selection_resolution")
-            or {
-                "options": list(
-                    (pending_interaction or {}).get("selection_options") or []
-                )
-            },
-        ):
-            raise StepError(
-                "检测到 notes 中包含部分分析选择，但 notes 不参与范围控制。"
-                "请将用户点名的依赖归一化为 selected_targets 后再恢复。"
-            )
-        else:
-            scope_mode = "full"
+        raise StepError("Step4 范围确认必须明确提供 scope_mode=full 或 partial。")
     if scope_mode == "partial" and not selected_targets:
         raise StepError(
             "scope_mode=partial 时必须提供非空 selected_targets，"
@@ -9711,14 +10000,14 @@ def validate_pending_interaction_response(pending_interaction, user_response):
     }
     for field in requirement.get("required_fields") or []:
         if (
-            step_id == "step1"
+            step_id in {"step0", "step1"}
             and retry_remote_fetch
             and field in step1_remote_retry_fields
         ):
             continue
         if not _response_value_present(user_response.get(field)):
             raise StepError(f"当前动作 {action} 要求字段 {field} 必填，不能为空。")
-    if step_id == "step1" and action == "confirm_local_source":
+    if step_id in {"step0", "step1"} and action == "confirm_local_source":
         confirmation_fields = [
             str(field or "").strip()
             for field in (requirement.get("required_fields") or [])
@@ -9729,7 +10018,7 @@ def validate_pending_interaction_response(pending_interaction, user_response):
         for field in confirmation_fields:
             if user_response.get(field) is not True:
                 raise StepError(f"当前动作 confirm_local_source 要求 {field}=true，不能隐式确认本地源码。")
-    if step_id == "step1" and action == "continue" and pending_interaction.get("ref_resolution_requests"):
+    if step_id in {"step0", "step1"} and action == "continue" and pending_interaction.get("ref_resolution_requests"):
         remote_retry_sides = {
             str(item.get("side") or "")
             for item in (pending_interaction.get("ref_resolution_requests") or [])
@@ -9741,9 +10030,9 @@ def validate_pending_interaction_response(pending_interaction, user_response):
             if retry_remote_fetch and side in remote_retry_sides:
                 continue
             if field and not str(user_response.get(field) or "").strip():
-                raise StepError(f"Step1 请一次性处理全部待确认侧；本次仍缺少：{field}")
+                raise StepError(f"请一次性处理全部待确认侧；本次仍缺少：{field}")
         if retry_remote_fetch and not remote_retry_sides:
-            raise StepError("当前 Step1 确认项中没有可显式重查的远端 ref 失败侧。")
+            raise StepError("当前确认项中没有可显式重查的远端 ref 失败侧。")
     at_least_one_of = [str(field).strip() for field in (requirement.get("at_least_one_of") or []) if str(field).strip()]
     if (
         at_least_one_of
@@ -9759,7 +10048,40 @@ def validate_pending_interaction_response(pending_interaction, user_response):
         )
     validate_step5_scope_response(pending_interaction, user_response)
 
-    if step_id == "step1" and reason_code in {
+    if (
+        step_id == "step1"
+        and reason_code == "STEP1_DEPENDENCY_SOURCE_AMBIGUITY"
+        and action == "continue"
+    ):
+        ambiguities = list(
+            pending_interaction.get("dependency_source_ambiguities") or []
+        )
+        skipped = set(user_response.get("skip_dependency_source_coords") or [])
+        selections = list(user_response.get("dependency_source_ref_selections") or [])
+        selected_keys = {
+            str((item or {}).get("selection_key") or "").strip()
+            for item in selections
+            if isinstance(item, dict)
+        }
+        unresolved = []
+        for item in ambiguities:
+            coord = str(item.get("coord") or "").strip()
+            if coord in skipped:
+                continue
+            candidate_keys = {
+                str(candidate.get("selection_key") or "").strip()
+                for candidate in (item.get("candidates") or [])
+            }
+            if candidate_keys & selected_keys:
+                continue
+            unresolved.append(coord)
+        if unresolved:
+            raise StepError(
+                "以下依赖包源码歧义尚未选择或明确跳过："
+                + "、".join(unresolved)
+            )
+
+    if step_id in {"step0", "step1"} and reason_code in {
         "AMBIGUOUS_STEP1_SOURCE_REF",
         "STEP1_SOURCE_REF_NOT_FOUND",
         "STEP1_REMOTE_SOURCE_UNAVAILABLE",
@@ -9792,6 +10114,9 @@ def validate_pending_interaction_response(pending_interaction, user_response):
 def apply_user_response_to_main_state(main_state, pending_interaction, user_response, project_dir, target_step_id=""):
     user_response = build_canonical_user_response(user_response)
     user_response = expand_step1_ref_selections(pending_interaction, user_response)
+    user_response = expand_dependency_source_ref_selections(
+        pending_interaction, user_response,
+    )
     if user_response.get("selected_targets") is not None:
         selection_result = resolve_selected_targets(
             (pending_interaction or {}).get("selection_resolution") or {},
@@ -9825,9 +10150,7 @@ def apply_user_response_to_main_state(main_state, pending_interaction, user_resp
     if not scope_mode and response_has_selection:
         scope_mode = "partial"
     elif not scope_mode and is_step4_scope_confirmation:
-        # Backward compatibility for already-persisted checkpoints created
-        # before scope_mode became mandatory. New checkpoints require the field.
-        scope_mode = "full"
+        raise StepError("Step4 范围确认必须明确提供 scope_mode=full 或 partial。")
     if scope_mode == "partial" and not response_has_selection:
         raise StepError(
             "部分分析必须包含至少一个已解析的目标依赖，不能通过 notes 传递选择。"
@@ -9854,6 +10177,8 @@ def apply_user_response_to_main_state(main_state, pending_interaction, user_resp
             merged_base_context.update(restart_fallback_context)
             base_context = merged_base_context
     updated = merge_user_response_into_run_context(base_context, user_response, project_dir)
+    if step_id == "step0" and action == "continue" and pending_step_id == "step0":
+        updated["step0_confirmation_acknowledged"] = True
     for selection_field in ("step5_selected_coords", "step5_selected_names"):
         if selection_field in updated and not updated.get(selection_field):
             updated.pop(selection_field, None)
@@ -9907,64 +10232,6 @@ def build_restore_context(main_state, step_id):
         merged.update(current_input)
         return merged
     return build_step_input_context(main_state, step_id, fallback_existing={})
-
-
-def apply_explicit_cli_step1_branch_overrides(
-    main_state,
-    args,
-    project_dir,
-    report_dir,
-):
-    """Restart Step1 when this invocation changes a persisted branch input."""
-    branch_patch = {
-        f"{side}_branch": str(getattr(args, f"{side}_branch", "") or "").strip()
-        for side in ("base", "current")
-        if str(getattr(args, f"{side}_branch", "") or "").strip()
-    }
-    if not branch_patch:
-        return {"changed": False, "fields": [], "before": {}, "after": {}}
-
-    step1_input = dict((main_state.get("step1") or {}).get("input") or {})
-    pending_interaction = dict(
-        ((main_state.get("state") or {}).get("pending_interaction") or {})
-    )
-    if not step1_input and not pending_interaction:
-        # A brand-new state is handled directly by build_run_context. Avoid
-        # creating a partial Step1 input that would suppress the other initial
-        # CLI/seed fields in this invocation.
-        return {"changed": False, "fields": [], "before": {}, "after": {}}
-
-    changed_fields = [
-        field
-        for field, value in branch_patch.items()
-        if str(step1_input.get(field) or "").strip() != value
-    ]
-    if not changed_fields:
-        return {"changed": False, "fields": [], "before": {}, "after": {}}
-
-    before = {
-        field: str(step1_input.get(field) or "").strip()
-        for field in changed_fields
-    }
-    updated_input = merge_user_response_into_run_context(
-        step1_input,
-        {field: branch_patch[field] for field in changed_fields},
-        project_dir,
-    )
-    reset_step_state_for_restart(
-        main_state,
-        "step1",
-        report_dir,
-        preserve_current_input=updated_input,
-    )
-    clear_interaction_file(report_dir)
-    save_main_state(report_dir, main_state)
-    return {
-        "changed": True,
-        "fields": changed_fields,
-        "before": before,
-        "after": {field: branch_patch[field] for field in changed_fields},
-    }
 
 
 def resolve_non_pending_structured_response_step(args, main_state, user_response):
@@ -10220,7 +10487,7 @@ def pending_interaction_needs_git_recheck(pending_interaction):
     or remote-configuration failure after the condition has recovered.
     """
     interaction = dict(pending_interaction or {})
-    if str(interaction.get("step_id") or "").strip() != "step1":
+    if str(interaction.get("step_id") or "").strip() not in {"step0", "step1"}:
         return False
     reason_code = str(interaction.get("reason_code") or "").strip().lower()
     if reason_code in _STEP1_REVALIDATABLE_GIT_REASONS:
@@ -10246,7 +10513,7 @@ def clear_stale_git_interaction_for_recheck(
         return False
     update_main_state_state(
         main_state,
-        current_step="step1",
+        current_step=str((pending_interaction or {}).get("step_id") or "step0"),
         completed_step=state.get("completed_step"),
         status="ready",
         blocking_reason=None,
@@ -10256,63 +10523,6 @@ def clear_stale_git_interaction_for_recheck(
     save_main_state(report_dir, main_state)
     clear_interaction_file(report_dir)
     return True
-
-
-def handle_step2_resume_followups(
-    main_state,
-    report_dir,
-    resumed_interaction_step_id,
-    resume_target_step_id,
-    response_action,
-    user_response,
-):
-    if (
-        resumed_interaction_step_id != "step2"
-        or resume_target_step_id != "step2"
-        or response_action != "continue"
-    ):
-        return
-    # 不要在 "continue" 时自动接受建议映射。
-    # 建议映射需要用户显式确认，避免“继续流程”和“接受推断值”绑定。
-    # 当前用户主入口是 dependency_source_dirs；accept_suggested_mappings 用于确认是否固化自动推断结果。
-    if user_response.get("accept_suggested_mappings"):
-        ctx = read_json(step2_context_path(report_dir)) if step2_context_path(report_dir).exists() else {}
-        step2_input = dict((main_state.get("step2") or {}).get("input") or {})
-        suggestions = build_dependency_repo_mapping_suggestions(step2_input, ctx)
-        relevant_coords = _collect_relevant_dependency_coords(report_dir)
-        accepted_dirs = _dedupe_strings(
-            list(step2_input.get("dependency_source_dirs") or [])
-            + suggested_dependency_source_dirs(suggestions)
-        )
-        source_plan = _build_dependency_source_plan(
-            accepted_dirs,
-            relevant_coords=relevant_coords,
-        )
-        step2_input["dependency_source_dirs"] = accepted_dirs
-        step2_input.pop("dependency_repo_mappings", None)
-        step2_input.pop("dependency_source_mappings", None)
-        main_state["step2"]["input"] = step2_input
-        if suggested_dependency_source_dirs(suggestions):
-            print("  ✅ 已接受建议的依赖源码目录，并将按自动识别结果继续后续步骤", file=sys.stderr)
-        elif source_plan.get("dependency_source_mappings"):
-            print("  ✅ 已采用你提供的依赖源码目录，并将按自动识别结果继续后续任务", file=sys.stderr)
-        if source_plan.get("ambiguous_coords"):
-            print("  ⚠️ 部分源码目录匹配到多个依赖，系统已跳过这些冲突项并保留覆盖边界", file=sys.stderr)
-    # An input-request reply reruns Step2. Invalidate stale Step2+ outputs now,
-    # preserve the corrected input, and let the normal execution path rebuild
-    # the context exactly once.
-    step2_input = dict((main_state.get("step2") or {}).get("input") or {})
-    reset_step_state_for_restart(
-        main_state,
-        "step2",
-        report_dir,
-        preserve_current_input=step2_input,
-    )
-    save_main_state(report_dir, main_state)
-    print(
-        "已保留分析对象与依赖范围；升级上下文及之后的产物会按本次答复重建。",
-        file=sys.stderr,
-    )
 
 
 def handle_step4_resume_followups(
@@ -10408,36 +10618,41 @@ def prepare_main_state_for_step_execution(args, main_state, step_id, report_dir)
     return step_id
 
 
-def maybe_emit_step1_preflight_interaction(step_id, main_state, report_dir, preflight_interaction):
-    if step_id != "step1" or not preflight_interaction:
+def persist_step0_confirmation_interaction(
+    main_state,
+    report_dir,
+    confirmation_interaction,
+):
+    step_id = "step0"
+    if not confirmation_interaction:
         return None
-    preflight_interaction = apply_interaction_protocol_enhancements(
-        preflight_interaction,
+    confirmation_interaction = apply_interaction_protocol_enhancements(
+        confirmation_interaction,
         step_id,
         project_dir=Path(report_dir).resolve().parent,
         report_dir=report_dir,
     )
-    preflight_interaction = _sanitize_git_persistence_payload(
-        preflight_interaction
+    confirmation_interaction = _sanitize_git_persistence_payload(
+        confirmation_interaction
     )
     update_main_state_state(
         main_state,
         current_step=step_id,
         completed_step=(main_state.get("state") or {}).get("completed_step"),
-        status=normalize_interaction_status(preflight_interaction.get("status")),
-        blocking_reason=preflight_interaction.get("question") or preflight_interaction.get("title") or step_id,
-        pending_interaction=dict(preflight_interaction),
+        status=normalize_interaction_status(confirmation_interaction.get("status")),
+        blocking_reason=confirmation_interaction.get("question") or confirmation_interaction.get("title") or step_id,
+        pending_interaction=dict(confirmation_interaction),
     )
     save_main_state(report_dir, main_state)
-    save_interaction_file(report_dir, preflight_interaction)
+    save_interaction_file(report_dir, confirmation_interaction)
     write_resume_snapshot(
         main_state,
         step_id,
         report_dir,
         event="awaiting_user_input",
-        interaction=preflight_interaction,
+        interaction=confirmation_interaction,
     )
-    print_interaction_to_streams(preflight_interaction, report_dir)
+    print_interaction_to_streams(confirmation_interaction, report_dir)
     print(f"{USER_TASK_NAMES.get(step_id, '当前分析')}需要先补齐上面的信息。", file=sys.stderr)
     return EXIT_AWAITING_USER
 
@@ -10914,7 +11129,12 @@ def cleanup_step3_candidate_outputs(report_dir):
 def step_output_paths_for_cleanup(step_id, report_dir):
     report_dir = Path(report_dir).resolve()
     outputs = {
+        "step0": [
+            step0_confirmation_path(report_dir),
+            step0_preflight_path(report_dir),
+        ],
         "step1": [
+            step1_runtime_preflight_path(report_dir),
             step1_dep_alerts_path(report_dir),
             step1_dep_changes_path(report_dir),
             step1_dep_summary_path(report_dir),
@@ -10929,7 +11149,6 @@ def step_output_paths_for_cleanup(step_id, report_dir):
         "step2": [
             step2_context_path(report_dir),
             step2_dep_graph_path(report_dir),
-            step2_source_mapping_summary_path(report_dir),
         ],
         "step3": [
             evidence_static_scan_dir(report_dir) / "s3_jdk_removed_api.csv",
@@ -10962,7 +11181,14 @@ def step_output_paths_for_cleanup(step_id, report_dir):
             deliverables_dir(report_dir),
         ],
     }
-    return list(outputs.get(str(step_id or "").strip(), []))
+    normalized_step = str(step_id or "").strip()
+    if normalized_step == "step0":
+        return [
+            path
+            for candidate_step in STEP_SEQUENCE
+            for path in outputs.get(candidate_step, [])
+        ]
+    return list(outputs.get(normalized_step, []))
 
 
 def cleanup_step_outputs(step_id, report_dir):
@@ -10989,6 +11215,7 @@ def _binary_pipeline_config_path(run_context, project_dir, report_dir):
                         "active_profile_identities",
                         "external_config_snapshot_identities",
                         "agent_transformer_plugin_profile_identities",
+                        "step0_preflight",
                     )
                     if run_context.get(key) not in (None, "", [], ())
                 },
@@ -11023,13 +11250,19 @@ def _resolved_binary_pipeline_config_path(
         run_context, project_dir, report_dir
     )
     config = read_json(source_path)
-    if config.get("source_overlay"):
+    if config.get("source_overlay") and not _pinned_snapshot_matches_context(
+        (run_context or {}).get("pinned_source_snapshot"),
+        run_context or {},
+    ):
         if not list((config.get("source_overlay") or {}).get("source_sets") or []):
             raise StepError(
                 "BINARY_SOURCE_SETS_REQUIRED: source_overlay 必须按业务系统或依赖包分别提供 source_sets。",
                 reason_codes=["BINARY_SOURCE_SETS_REQUIRED"],
             )
     else:
+        # Orchestrated runs rebuild source overlays from temporary immutable
+        # worktrees. A caller-provided overlay must not reintroduce mutable
+        # application/dependency checkout paths after Step0/Step1 pinning.
         source_sets = []
         source_dirs = [
             absolutize_path(str(item), project_dir)
@@ -11075,12 +11308,22 @@ def _resolved_binary_pipeline_config_path(
             module_root = _guess_module_root_from_source_dir(normalized_dir)
             key = (coord, module_root)
             dependency_sets.setdefault(key, []).append(normalized_dir)
+        dependency_snapshot_by_coord = {
+            str((item or {}).get("coord") or "").strip(): dict(item)
+            for item in ((run_context or {}).get("dependency_source_snapshots") or [])
+            if str((item or {}).get("coord") or "").strip()
+        }
         for (coord, module_root), mapped_dirs in sorted(dependency_sets.items()):
-            snapshot_revision = "content-addressed-only"
+            snapshot_revision = str(
+                (dependency_snapshot_by_coord.get(coord) or {}).get("commit")
+                or ""
+            ).strip().lower() or "content-addressed-only"
             for materialization in (
                 (run_context or {}).get("dependency_source_git_materializations")
                 or []
             ):
+                if snapshot_revision != "content-addressed-only":
+                    break
                 repo_path = Path(
                     str((materialization or {}).get("repo_path") or "")
                 ).expanduser().resolve()
@@ -11137,12 +11380,60 @@ def _resolved_binary_pipeline_config_path(
             "origin": "provided" if has_dependency_source else "not_provided",
         },
     }
+    preflight_sides = (
+        ((run_context or {}).get("step0_preflight") or {}).get("sides") or {}
+    )
+    for side_name in ("base", "current"):
+        expected_identity = str(
+            (((preflight_sides.get(side_name) or {}).get("jdk") or {}).get(
+                "jdk_preflight_identity"
+            ) or "")
+        )
+        if expected_identity:
+            side_config = dict(config.get(side_name) or {})
+            side_config["jdk_preflight_identity"] = expected_identity
+            config[side_name] = side_config
     resolved = runtime_state_dir(report_dir) / "binary_pipeline_config.resolved.json"
     write_json(resolved, config)
     return resolved
 
 
 def _record_binary_failure(report_dir, config_path, exc):
+    report = Path(report_dir).resolve()
+    binary_progress = (
+        report / BINARY_OUTPUT_RELATIVE_PATH
+        / "binary_observability" / "latest_in_progress.json"
+    )
+    last_progress = {}
+    if binary_progress.is_file():
+        try:
+            candidate = read_json(binary_progress)
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            candidate = {}
+        if isinstance(candidate, dict):
+            last_progress = candidate
+    run_log = runtime_background_dir(report) / "run.log"
+    run_log_tail = ""
+    if run_log.is_file():
+        try:
+            with run_log.open("rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                handle.seek(max(0, handle.tell() - 32000), os.SEEK_SET)
+                run_log_tail = handle.read().decode("utf-8", errors="replace")
+        except OSError:
+            run_log_tail = ""
+    diagnostic = dict(getattr(exc, "diagnostic", {}) or {})
+    structured_result = diagnostic.get("structured_result")
+    subprocess_traceback = (
+        str((structured_result or {}).get("traceback") or "")
+        if isinstance(structured_result, dict)
+        else ""
+    )
+    recorded_traceback = (
+        subprocess_traceback
+        or str(diagnostic.get("traceback") or "")
+        or traceback.format_exc()
+    )[-32000:]
     failure = {
         "schema": "java-upgrade-analyzer.binary-generation-failure.v2",
         "authority": "binary_first",
@@ -11150,8 +11441,15 @@ def _record_binary_failure(report_dir, config_path, exc):
         "failure_type": type(exc).__name__,
         "failure_message": str(exc),
         "failure_reason_codes": list(getattr(exc, "reason_codes", []) or []),
+        "failed_phase": str(last_progress.get("current_phase") or ""),
+        "last_progress": last_progress,
+        "diagnostic": diagnostic,
+        "traceback": recorded_traceback,
+        "run_log_tail": run_log_tail,
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
         "fail_closed": True,
     }
+    failure = _sanitize_git_persistence_payload(failure)
     identity = hashlib.sha256(
         json.dumps(failure, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()
@@ -11263,7 +11561,25 @@ def _run_binary_step4(
                 list(getattr(exc, "reason_codes", []) or [])
                 + ["BINARY_GENERATION_FAILED"]
             ),
+            diagnostic=dict(getattr(exc, "diagnostic", {}) or {}),
         ) from exc
+
+
+def step3_business_scan_roots(run_context, workspace=None):
+    """Return every pinned business code/resource root consumed by Step3."""
+    if workspace is not None:
+        return _dedupe_strings(
+            list((workspace or {}).get("source_dirs") or [])
+            + list((workspace or {}).get("resource_dirs") or [])
+        )
+    return _dedupe_strings(
+        list((run_context or {}).get("source_dirs") or [])
+        + list(
+            ((run_context or {}).get("project_scope") or {}).get(
+                "resource_roots"
+            ) or []
+        )
+    )
 
 
 def execute_step(step_id, args, manifest_steps, run_context, main_state=None):
@@ -11279,7 +11595,37 @@ def execute_step(step_id, args, manifest_steps, run_context, main_state=None):
     context_json = step2_context_path(report_dir)
     s4_dir = step4_api_changes_dir(report_dir)
 
-    if step_id == "step1":
+    if step_id == "step0":
+        if not run_context.get("step0_confirmation_acknowledged"):
+            raise StepError("Step0 尚未收到统一确认，不能开始正式分析。")
+        validate_step0_context(run_context)
+        run_context["step0_preflight"] = run_step0_preflight(
+            run_context, project_dir, report_dir,
+        )
+        # Downstream context inference consumes the exact JDK majors proven by
+        # Step0. It must not launch Maven later merely to rediscover a value
+        # already bound to the user-confirmed JDK homes.
+        for side in ("base", "current"):
+            observed_jdk = (
+                ((run_context["step0_preflight"].get("sides") or {}).get(side) or {})
+                .get("jdk") or {}
+            )
+            run_context[f"jdk_{side}"] = str(
+                observed_jdk.get("java_major") or run_context.get(f"jdk_{side}") or ""
+            )
+        record = write_step0_confirmation_record(report_dir, run_context)
+        run_context["step0_confirmed"] = True
+        run_context["step0_confirmed_at"] = record["confirmed_at"]
+        run_context["step0_confirmation_record_path"] = str(
+            step0_confirmation_path(report_dir).resolve()
+        )
+
+    elif step_id == "step1":
+        if not run_context.get("step0_confirmed"):
+            raise StepError(
+                "Step1 只负责依赖解析；必须先完成 Step0 统一信息确认。",
+                reason_codes=["STEP0_CONFIRMATION_REQUIRED"],
+            )
         output = step1_dep_changes_path(report_dir)
         base_artifact_path = run_context.get("base_artifact_path", "")
         current_artifact_path = run_context.get("current_artifact_path", "")
@@ -11305,6 +11651,9 @@ def execute_step(step_id, args, manifest_steps, run_context, main_state=None):
                 "要么提供 base_artifact_path/current_artifact_path 直接读取编译产物，"
                 "要么提供 base_branch/current_branch，在固定 commit 的隔离 worktree 中执行真实 package。"
             )
+        run_context["step1_runtime_preflight"] = validate_step1_runtime_inputs(
+            run_context, report_dir,
+        )
 
     elif step_id == "step2":
         ensure_exists(dep_changes, "Step2 缺少 evidence/dependencies/dep_changes.csv，请先执行 Step1")
@@ -11352,19 +11701,18 @@ def execute_step(step_id, args, manifest_steps, run_context, main_state=None):
     elif step_id == "step3":
         validate_run_context_for_step(step_id, run_context)
         ensure_exists(context_json, "Step3 缺少 evidence/context/context.json，请先执行 Step2")
-        source_input_state = source_input_state_for_context(run_context)
-        business_source_available = source_input_state["business_source_available"]
-        dependency_source_available = source_input_state["dependency_source_available"]
+        business_source_available = bool(run_context.get("source_dirs"))
         cmd = [
             "--all",
             "--output-dir", str(evidence_static_scan_dir(report_dir)),
             "--report-dir", str(report_dir),
             "--coverage-output", str(runtime_coverage_dir(report_dir) / "s3_coverage.json"),
         ]
-        if not business_source_available and not dependency_source_available:
-            cmd.append("--no-source")
-        elif not business_source_available:
-            cmd.append("--no-business-source")
+        current_jdk_home = str(
+            run_context.get("current_jdk_home") or ""
+        ).strip()
+        if current_jdk_home:
+            cmd.extend(["--jdk-home", current_jdk_home])
         if dep_current.exists():
             cmd.extend(["--dep-current", str(dep_current)])
         elif dep_changes.exists():
@@ -11376,9 +11724,12 @@ def execute_step(step_id, args, manifest_steps, run_context, main_state=None):
                 run_context, project_dir, label="s3-src",
             ) as workspace:
                 pinned_cmd = list(cmd)
-                if workspace.get("source_dirs"):
+                scan_roots = step3_business_scan_roots(
+                    run_context, workspace=workspace
+                )
+                if scan_roots:
                     pinned_cmd.extend(
-                        ["--source-dirs", *workspace["source_dirs"]]
+                        ["--source-dirs", *scan_roots]
                     )
                 run_python(
                     "s3_scan.py",
@@ -11387,16 +11738,41 @@ def execute_step(step_id, args, manifest_steps, run_context, main_state=None):
                     report_dir=report_dir,
                 )
         else:
-            run_python("s3_scan.py", cmd, project_dir, report_dir=report_dir)
+            unpinned_cmd = list(cmd)
+            scan_roots = step3_business_scan_roots(run_context)
+            if business_source_available and scan_roots:
+                unpinned_cmd.extend(["--source-dirs", *scan_roots])
+            run_python(
+                "s3_scan.py", unpinned_cmd, project_dir, report_dir=report_dir
+            )
 
     elif step_id == "step4":
         validate_run_context_for_step(step_id, run_context)
-        _run_binary_step4(
-            run_context=run_context,
-            project_dir=project_dir,
-            report_dir=report_dir,
-            s4_dir=s4_dir,
-        )
+        with materialize_pinned_source_workspace(
+            run_context,
+            project_dir,
+            label="s4-app",
+        ) as application_workspace:
+            pinned_context = dict(run_context)
+            pinned_context["source_dirs"] = list(
+                application_workspace.get("source_dirs") or []
+            )
+            pinned_context["project_scope"] = _materialize_project_scope_paths(
+                (run_context.get("pinned_source_snapshot") or {}).get(
+                    "project_scope"
+                ) or {},
+                application_workspace["project_root"],
+            )
+            with materialize_pinned_dependency_source_workspaces(
+                pinned_context,
+                report_dir,
+            ) as fully_pinned_context:
+                _run_binary_step4(
+                    run_context=fully_pinned_context,
+                    project_dir=project_dir,
+                    report_dir=report_dir,
+                    s4_dir=s4_dir,
+                )
 
     elif step_id == "step5":
         validate_run_context_for_step(step_id, run_context)
@@ -11483,6 +11859,18 @@ def execute_step(step_id, args, manifest_steps, run_context, main_state=None):
     refreshed_run_context = build_run_context(args, run_context, {}, allow_external_seed=False)
     gate_name = manifest_steps[step_id].get("gate")
     run_gate(gate_name, report_dir, project_dir, strict_risk_gate=bool(refreshed_run_context.get("strict_risk_gate")))
+    if step_id == "step1":
+        dependency_source_interaction = build_step1_dependency_source_interaction(
+            refreshed_run_context,
+            report_dir,
+        )
+        run_context.clear()
+        run_context.update(refreshed_run_context)
+        if dependency_source_interaction:
+            return dependency_source_interaction
+    else:
+        run_context.clear()
+        run_context.update(refreshed_run_context)
     # Even when a successful step can auto-continue, construct the standardized
     # payload first. The orchestrator can turn it into a non-blocking
     # informational card instead of forcing agents to reconstruct a summary.
@@ -11503,7 +11891,6 @@ _WORKTREE_REPOSITORY_PATH_FIELDS = {
     "base_source_project_dir",
     "current_source_project_dir",
     "source_dirs",
-    "source_locations",
     "dependency_source_dirs",
 }
 
@@ -11537,10 +11924,7 @@ def _startup_worktree_repository_roots(
     payloads = [
         {"project_dir": str(project_dir)},
         {
-            "base_source_project_dir": args.base_source_project_dir,
-            "current_source_project_dir": args.current_source_project_dir,
-            "source_dirs": args.source_dirs or [],
-            "source_locations": args.source_locations or [],
+            "application_source": getattr(args, "application_source", ""),
             "dependency_source_dirs": args.dependency_source_dirs or [],
         },
         seed_payload or {},
@@ -11623,30 +12007,21 @@ def main(argv=None, _skip_environment_contract=False):
     ap.add_argument("--manifest", default=str(DEFAULT_MANIFEST))
     ap.add_argument("--base-branch")
     ap.add_argument("--current-branch")
-    ap.add_argument("--modules", action="append", nargs="+", default=None)
     ap.add_argument(
         "--active-maven-profile",
         dest="active_maven_profiles",
         action="append",
         default=None,
     )
-    ap.add_argument("--source-dirs", action="append", nargs="+")
-    ap.add_argument(
-        "--source-locations",
-        action="append",
-        nargs="+",
-        default=[],
-        help="统一源码入口；可混合传业务源码目录和依赖源码目录或 Git 地址。",
-    )
     ap.add_argument("--dependency-source-dirs", action="append", nargs="+", default=[])
-    ap.add_argument("--dependency-source-mappings", action="append", nargs="+", default=[])
-    ap.add_argument("--source-repo-hints", action="append", nargs="+", default=[])
-    ap.add_argument("--dependency-repo-mappings", action="append", nargs="+", default=[])
     ap.add_argument("--dependency-source-clone-timeout", type=int, default=None)
     ap.add_argument("--base-artifact-path", default="")
     ap.add_argument("--current-artifact-path", default="")
-    ap.add_argument("--base-source-project-dir", default="")
-    ap.add_argument("--current-source-project-dir", default="")
+    ap.add_argument(
+        "--application-source",
+        default="",
+        help="必填。应用源码 Git 仓库目录或 Git 地址；未提供时可自动识别当前项目仓库。",
+    )
     ap.add_argument("--base-jdk-home", default="")
     ap.add_argument("--current-jdk-home", default="")
     ap.add_argument(
@@ -11656,9 +12031,9 @@ def main(argv=None, _skip_environment_contract=False):
     )
     ap.add_argument("--include-test-scope", action="store_true")
     ap.add_argument("--strict-risk-gate", action="store_true")
-    ap.add_argument("--primary-module", default="")
     ap.add_argument("--target-module", default="", help="本次分析唯一的目标部署模块；新流程优先使用")
-    ap.add_argument("--tool", choices=["maven", "gradle"], default="")
+    ap.add_argument("--base-tool", choices=["maven", "gradle"], default="")
+    ap.add_argument("--current-tool", choices=["maven", "gradle"], default="")
     ap.add_argument("--response-json", default="", help="结构化用户答复 JSON，例如 '{\"action\":\"continue\"}'")
     ap.add_argument("--response-file", default="", help="结构化用户答复 JSON 文件路径")
     ap.add_argument(
@@ -11667,27 +12042,21 @@ def main(argv=None, _skip_environment_contract=False):
         help="由调度器跨平台后台运行，并把 PATH 快照、状态和日志写入 .runtime/background/。",
     )
     ap.add_argument(
-        "--describe-step1-contract",
+        "--describe-step0-contract",
         action="store_true",
-        help="输出 Step1 的静态前置输入协议（JSON），供 Agent 在首次调用前读取。",
+        help="输出 Step0 的统一信息确认协议（JSON）。",
     )
     args = ap.parse_args(argv_values)
-    args.modules = _dedupe_strings(flatten_cli_values(args.modules)) if args.modules else None
     args.active_maven_profiles = _dedupe_strings(
         args.active_maven_profiles or []
     ) if args.active_maven_profiles is not None else None
-    args.source_dirs = flatten_cli_values(args.source_dirs)
-    args.source_locations = _dedupe_strings(flatten_cli_values(args.source_locations))
     args.dependency_source_dirs = _dedupe_strings(flatten_cli_values(args.dependency_source_dirs))
-    args.dependency_source_mappings = _dedupe_strings(flatten_cli_values(args.dependency_source_mappings))
-    args.source_repo_hints = _dedupe_strings(flatten_cli_values(args.source_repo_hints))
-    args.dependency_repo_mappings = _dedupe_strings(flatten_cli_values(args.dependency_repo_mappings))
 
-    if args.describe_step1_contract:
-        sys.stdout.write(json.dumps(build_step1_static_contract(), ensure_ascii=False, indent=2) + "\n")
+    if args.describe_step0_contract:
+        sys.stdout.write(json.dumps(build_step0_static_contract(), ensure_ascii=False, indent=2) + "\n")
         return 0
     if not args.step:
-        ap.error("--step 是必填参数；若只想读取前置协议，请改用 --describe-step1-contract")
+        ap.error("--step 是必填参数；若只想读取前置协议，请改用 --describe-step0-contract")
 
     project_dir = Path(args.project_dir).resolve()
     environment = (
@@ -11735,23 +12104,6 @@ def main(argv=None, _skip_environment_contract=False):
             f"启动恢复：已清理 {removed_worktrees} 个上次中断留下的临时 Git 工作区。",
             file=sys.stderr,
         )
-    cli_branch_override = apply_explicit_cli_step1_branch_overrides(
-        main_state,
-        args,
-        project_dir,
-        report_dir,
-    )
-    if cli_branch_override.get("changed"):
-        changed_labels = [
-            "基准侧" if field == "base_branch" else "当前侧"
-            for field in cli_branch_override.get("fields") or []
-        ]
-        print(
-            "检测到本轮显式更新了"
-            + "、".join(changed_labels)
-            + "分支；已清除旧 ref/commit 绑定，并从分析对象与依赖范围重新分析。",
-            file=sys.stderr,
-        )
     manifest_data, manifest_steps = load_manifest(args.manifest)
     pending_interaction = (main_state.get("state") or {}).get("pending_interaction")
     if pending_interaction:
@@ -11776,9 +12128,7 @@ def main(argv=None, _skip_environment_contract=False):
     has_structured_response = bool(args.response_json or args.response_file)
     if has_structured_response:
         structured_user_response = resolve_user_response(args, project_dir)
-    if cli_branch_override.get("changed"):
-        step_id = "step1"
-    elif args.step == "auto" and has_structured_response and not pending_interaction:
+    if args.step == "auto" and has_structured_response and not pending_interaction:
         step_id = ""
     elif (
         args.step == "auto"
@@ -11842,14 +12192,6 @@ def main(argv=None, _skip_environment_contract=False):
     if early_exit is not None:
         return early_exit
 
-    handle_step2_resume_followups(
-        main_state,
-        report_dir,
-        resumed_interaction_step_id,
-        step_id,
-        response_action,
-        user_response,
-    )
     handle_step4_resume_followups(
         main_state,
         report_dir,
@@ -11863,44 +12205,20 @@ def main(argv=None, _skip_environment_contract=False):
         args,
         base_context,
         seed_payload,
-        allow_external_seed=not bool(base_context),
+        allow_external_seed=(step_id == "step0" or not bool(base_context)),
     )
-    if step_id == "step1":
-        run_context = _discard_unpinned_local_source_discovery(run_context)
     store_step_input(main_state, step_id, run_context)
     save_main_state(report_dir, main_state)
-    initial_preflight = build_step1_preflight_interaction(run_context)
-    # If refs are present and only target_module is missing, pin current first
-    # so module candidates come from the remote-selected SHA.  Entry fields
-    # such as branches/artifacts still block before any Git work is attempted.
-    initial_missing_fields = set(
-        (initial_preflight or {}).get("required_fields") or []
-    )
-    should_defer_target_only_preflight = bool(
-        step_id == "step1"
-        and initial_preflight
-        and initial_missing_fields == {"target_module"}
-        and run_context.get("current_branch")
-    )
-    if not should_defer_target_only_preflight:
-        preflight_exit = maybe_emit_step1_preflight_interaction(
-            step_id,
-            main_state,
-            report_dir,
-            initial_preflight,
-        )
-        if preflight_exit is not None:
-            return preflight_exit
-    if step_id == "step1":
-        def persist_ref_snapshot(partial_context, _side, _resolution):
-            store_step_input(main_state, step_id, partial_context)
+    if step_id == "step0":
+        def persist_step0_ref_progress(partial_context, _side, _resolution):
+            store_step_input(main_state, "step0", partial_context)
             save_main_state(report_dir, main_state)
 
         try:
-            run_context, ref_interaction = resolve_step1_refs_for_execution(
+            run_context, ref_interaction = prepare_step0_context(
                 run_context,
                 project_dir,
-                on_side_resolved=persist_ref_snapshot,
+                on_side_resolved=persist_step0_ref_progress,
             )
         except StepError as exc:
             persist_step_error(main_state, step_id, report_dir, exc)
@@ -11911,36 +12229,22 @@ def main(argv=None, _skip_environment_contract=False):
             return 1
         store_step_input(main_state, step_id, run_context)
         save_main_state(report_dir, main_state)
-        ref_preflight_exit = maybe_emit_step1_preflight_interaction(
-            step_id,
-            main_state,
-            report_dir,
-            ref_interaction,
+        confirmation = build_step0_confirmation_interaction(
+            run_context, ref_interaction=ref_interaction,
         )
-        if ref_preflight_exit is not None:
-            return ref_preflight_exit
-        try:
-            run_context = rebuild_current_pinned_source_context(
-                run_context,
-                project_dir,
+        needs_confirmation = not bool(
+            run_context.get("step0_confirmation_acknowledged")
+        )
+        needs_recovery = bool(
+            confirmation.get("required_fields")
+            or confirmation.get("ref_resolution_requests")
+        )
+        if needs_confirmation or needs_recovery:
+            preflight_exit = persist_step0_confirmation_interaction(
+                main_state, report_dir, confirmation,
             )
-        except StepError as exc:
-            persist_step_error(main_state, step_id, report_dir, exc)
-            for line in build_user_runtime_message(
-                "failed", step_id, reason=exc,
-            ):
-                print(line, file=sys.stderr)
-            return 1
-        store_step_input(main_state, step_id, run_context)
-        save_main_state(report_dir, main_state)
-        pinned_scope_preflight_exit = maybe_emit_step1_preflight_interaction(
-            step_id,
-            main_state,
-            report_dir,
-            build_step1_preflight_interaction(run_context),
-        )
-        if pinned_scope_preflight_exit is not None:
-            return pinned_scope_preflight_exit
+            if preflight_exit is not None:
+                return preflight_exit
     elif (
         step_id == "step2"
         and _FULL_GIT_COMMIT_RE.fullmatch(

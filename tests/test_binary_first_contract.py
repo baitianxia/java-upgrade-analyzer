@@ -41,6 +41,7 @@ class BinaryFirstContractTest(unittest.TestCase):
         self.assertEqual(performance["status"], "passed")
         self.assertGreater(performance["thresholds"]["cold_end_to_end_seconds"], 0)
         self.assertGreater(performance["thresholds"]["warm_end_to_end_p95_seconds"], 0)
+        self.assertGreater(performance["thresholds"]["warm_end_to_end_p50_seconds"], 0)
         self.assertGreater(
             performance["thresholds"]["full_pipeline_end_to_end_seconds"], 0
         )
@@ -211,6 +212,44 @@ class BinaryFirstContractTest(unittest.TestCase):
             ),
             expected,
         )
+
+    def test_container_subclass_fallbacks_match_and_reject_invalid_keys(self):
+        class DictSubclass(dict):
+            pass
+
+        class ListSubclass(list):
+            pass
+
+        class SetSubclass(set):
+            pass
+
+        payloads = (
+            ListSubclass(["native", 1, True]),
+            SetSubclass({"beta", "alpha"}),
+        )
+        for payload in payloads:
+            with self.subTest(container=type(payload).__name__):
+                self.assertEqual(
+                    contract.canonical_identity(
+                        "container-subclass", payload, schema_version="1"
+                    ),
+                    contract.canonical_identity_streaming(
+                        "container-subclass", payload, schema_version="1"
+                    ),
+                )
+
+        invalid = DictSubclass({1: "non-string-key"})
+        for identity in (
+            contract.canonical_identity,
+            contract.canonical_identity_streaming,
+        ):
+            with self.subTest(identity=identity.__name__), self.assertRaises(
+                contract.BinaryFirstContractError
+            ) as error:
+                identity("container-subclass", invalid, schema_version="1")
+            self.assertEqual(
+                error.exception.reason_code, "BINARY_IDENTITY_KEY_INVALID"
+            )
 
     def test_streaming_sequence_is_repeatable_and_byte_equivalent(self):
         values = ["first", "运行时", "third"]

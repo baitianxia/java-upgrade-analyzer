@@ -1,0 +1,21 @@
+{
+  "schema": "java-upgrade-analyzer.blackbox-truth.v1",
+  "case_id": "virtual-inherited-dispatch-v1",
+  "dataset_version": 1,
+  "scope": "closed_set",
+  "system_generated": false,
+  "human_review": {"status": "not_claimed", "reviewer": ""},
+  "input_evidence": {"algorithm": "sha256-path-nul-content-nul-v1", "source_tree_sha256": "dab6c9edfd65b6febe3d3cda806d712264c7703ddf367398d73dd5ebfbbcc5b2", "case_algorithm": "sha256-canonical-json-v1", "case_sha256": "0402bd5132bc015ea184d42edc1a78efe3871f1eddaf69edcdf2a5d111374854", "source_files": ["src/base/contract/ChildApi.java", "src/base/contract/ParentApi.java", "src/business/contract/InheritanceApp.java", "src/current/contract/ChildApi.java", "src/current/contract/ParentApi.java", "src/oracle/contract/OracleMain.java"]},
+  "oracle_producers": [
+    {"id": "openjdk-javap-hierarchy-and-callgraph", "organization": "OpenJDK", "mechanism": "independent_bytecode_resolution", "verifies": ["complete_removed_member_set", "child_to_parent_symbol_resolution", "complete_entrypoint_graph"]},
+    {"id": "openjdk-jvm-virtual-linker", "organization": "OpenJDK", "mechanism": "actual_jvm_execution", "verifies": ["base_inherited_dispatch_succeeds", "current_no_such_method_error"]}
+  ],
+  "oracle_implementations": [{"path": "tests/blackbox/oracles/openjdk_oracle.py", "sha256": "6e72442077371b86c943f790b5982144497725200da3e89f22f66ca2bfee38ca"}],
+  "completeness": {"argument": "OpenJDK javap enumerates both classes in the only changed library and independently reads ChildApi's direct superclass. The base member-resolution walk maps symbolic ChildApi calls to the two ParentApi declarations; the sole declared root reaches one. Separate JVM executions prove inherited resolution succeeds on base and fails on current.", "verified_dimensions": ["api_identity", "jvm_descriptor", "closed_result_set", "entrypoint_reachability", "static_linkage"], "known_limits": []},
+  "expected_result_count": 2,
+  "expected_results": [
+    {"owner": "contract/ParentApi", "member": "inheritedReachable", "descriptor": "()Ljava/lang/String;", "member_kind": "method", "dependency_lineages": ["blackbox:inheritance-lib"], "base_dependency_coords": ["blackbox:inheritance-lib:1.0"], "current_dependency_coords": ["blackbox:inheritance-lib:2.0"], "reachability_status": "reachable", "static_linkage_status": "incompatible_if_executed", "impact_conclusion": "probable_impact", "runtime_verification_status": "required_not_executed", "exact_path_exists": true, "possible_path_exists": false, "path_set_complete": true, "paths": [{"certainty": "exact", "text": "contract.InheritanceApp.entry(contract.ChildApi) → contract.ParentApi.inheritedReachable()"}]},
+    {"owner": "contract/ParentApi", "member": "inheritedDormant", "descriptor": "()Ljava/lang/String;", "member_kind": "method", "dependency_lineages": ["blackbox:inheritance-lib"], "base_dependency_coords": ["blackbox:inheritance-lib:1.0"], "current_dependency_coords": ["blackbox:inheritance-lib:2.0"], "reachability_status": "not_found_in_static_analysis", "static_linkage_status": "incompatible_if_executed", "impact_conclusion": "inconclusive", "runtime_verification_status": "undetermined", "exact_path_exists": false, "possible_path_exists": false, "path_set_complete": true, "paths": []}
+  ],
+  "forbidden_results": [{"owner": "contract/ParentApi", "member": "stable", "descriptor": "()Ljava/lang/String;", "member_kind": "method", "oracle_relation": "unchanged_member", "reason": "The inherited stable method remains present with the same descriptor, flags, and bytecode."}]
+}

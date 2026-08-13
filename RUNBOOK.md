@@ -6,9 +6,10 @@
 
 - CPython 3.10 或更高版本；
 - base/current 两侧可复核的最终制品；
+- 必须提供的应用 Git 源码仓库；当前项目仓库可自动识别，但仍需在 Step0 确认；
 - 与两侧运行环境一致的完整目标 JDK；
 - Step1 可留存的 base/current 完整最终制品；系统会自动生成固定制品 SHA、运行路径顺序、loader/resource policy 和业务入口的 `binary_pipeline_config`，仅在特殊部署模型下才需要显式覆盖；
-- Step2 已说明源码用途，并通过统一入口收集用户还能提供的源码位置或记录暂不补充；编译模式已取得的业务源码直接使用；
+- 可选的依赖包源码在 Step0 一次收集，待 Step1 解析出依赖身份后再自动匹配仓库和版本；
 - 可写的 `.upgrade-report/`。
 
 所有 CSV 使用 UTF-8 BOM，适合 Excel 直接打开。JSON 和 Markdown 使用 UTF-8。
@@ -17,10 +18,10 @@ Step4–Step6 只有 binary-first 引擎。没有旧引擎选择、灰度、兼�
 
 ## 推荐入口
 
-首次查看 Step1 输入协议：
+首次查看 Step0 统一确认协议：
 
 ```bash
-python3 scripts/run_step.py --describe-step1-contract
+python3 scripts/run_step.py --describe-step0-contract
 ```
 
 初始化并自动运行到必要确认点：
@@ -34,9 +35,18 @@ python3 scripts/run_step.py --step auto \
 
 `runtime-input.json` 示例见 `runtime_config.example.json`。后续业务参数以
 `.upgrade-report/.runtime/state/main_state.json` 为唯一主状态，不要在每一步重新拼接一套参数。
-若确需在复用同一报告时更换 base/current 分支，可在统一入口显式传入新的
-`--base-branch`/`--current-branch`；新值按完整 canonical ref 精确匹配，并会自动清除旧的
-commit/ref binding、回到 Step1 重建。`--seed-json` 仍只用于首次初始化。
+新流程不兼容旧状态或旧交互记录。报告目录中的状态 schema 不匹配时会重新建立 Step0；
+修改应用源码、base/current 版本、模块、构建工具或 JDK 时也应从 Step0 重新确认。
+`--seed-json` 只用于首次初始化。
+
+确认后，Step0 会在任何正式构建和大规模扫描前执行真实前置检查，并把内容绑定结果写入
+`.upgrade-report/.runtime/state/step0_preflight.json`：两侧 JDK 必须从各自确认的绝对
+`JDK Home/bin` 成功完成 `javac -> javap -> java` 探针，且平台镜像完整；固定 commit 的
+worktree 必须能够创建、验证和精确清理；Maven/Gradle 必须在对应 JDK 环境中启动并加载
+项目模型；ASM、直接输入的 JAR 和输出目录也必须通过完整性检查。Git worktree 清单固定
+使用 `git worktree list --porcelain`，不使用不受支持的 `-z` 组合，也不在命令失败后静默
+切换语义。Step1 才产生的运行时 JAR 无法提前存在，因此在 Step1 产出后立即校验摘要和
+完整 ZIP CRC，校验通过前不进入 Step2。
 
 恢复运行：
 
@@ -117,12 +127,16 @@ python3 scripts/binary_pipeline.py \
 - generation 激活后若 Step4 人工报告发布失败，调度层恢复上一 active pointer；
 - Step4/5 报告目录使用 stage + replace 发布，不能留下半套文件；
 - 失败证据写入 `.runtime/binary_authority/binary_failures/`；不要删除上一份有效输出；
+- 失败证据包含原因码、失败 phase、最后一条结构化进度、子进程结构化结果、traceback 和
+  有界 `run.log` 尾部，不再要求先人工翻完整日志才能定位根因；
 - 每次执行在 ref 解析前恢复带有效所有权租约的分析器临时 worktree，并把结果写入 `.runtime/observability/git_worktree_recovery.json`；禁止用全局 `git worktree prune` 代替精确恢复，避免影响用户 worktree；
 - 输入、目标 JDK、loader policy 或 coverage 缺失会失败关闭，不调用其他引擎补算。
 
 ## 性能与进度
 
 - 长阶段通过统一进度事件和 heartbeat 告知用户仍在运行；
+- 独立验证会分别上报 JDK 复核、制品 inventory、直接边、结构/指令、目标 JVM 批次、
+  跨版本语义、闭世界结果和流式写入进度，而不是只写 heartbeat；
 - `.runtime/observability/step4_timing.csv` 记录事实解析、reconciliation、裁决、trace、generation 写入、独立验证和人读报告发布耗时；
 - `.runtime/observability/step5_timing.csv` 记录范围过滤、索引和报告发布耗时；
 - `.runtime/binary_authority/binary_observability/` 保存 cache 命中和 pipeline 原始计时；这些数据不进入 generation 内容身份。
@@ -139,16 +153,27 @@ python3 scripts/run_step.py --step step4 \
   --report-dir /abs/path/to/project/.upgrade-report
 ```
 
-Step4 重跑会生成或复用内容绑定的 generation；Step5/6 只消费 active generation。范围改变时从 Step4 的范围确认恢复，让调度器清理 Step5 及之后的用户输出；不要手工混合两次 generation 的文件。
+Step4 重跑会生成或复用内容绑定的 generation；若失败发生在不可变 generation 已写完、
+独立验证尚未通过之后，重跑只会在配置、输入制品、JDK、源码 snapshot、实现代码和
+generation 身份全部一致时复用该 generation 并重做验证。任一身份变化都会拒绝断点并
+完整重建，不能用旧 generation 掩盖输入变化。Step5/6 只消费 active generation。范围改变时从 Step4 的范围确认恢复，让调度器清理 Step5 及之后的用户输出；不要手工混合两次 generation 的文件。
 
 ## 开发验证
 
 ```bash
-python3 -m py_compile scripts/*.py tests/*.py
+python3 -m compileall -q scripts tests
+python3 scripts/test_trust_gate.py
+python3 scripts/quality_gate.py --profile blackbox
+python3 scripts/quality_gate.py --profile whitebox
+python3 scripts/quality_gate.py --profile performance
 python3 scripts/quality_gate.py --profile quick
 python3 scripts/quality_gate.py --profile step5
 python3 scripts/quality_gate.py --profile release
 python3 scripts/accuracy_benchmark.py --profile all
+python3 scripts/binary_performance_gate.py --verify-recorded-gate tests/fixtures/binary_first/performance_gate.json
+python3 scripts/binary_real_project_guard.py --manifest tests/fixtures/binary_first/real_projects/mybatis_sample_xml_noop.json --verify-manifest
 ```
 
-release profile 使用 unittest discovery，新增测试不会因未登记而漏跑。对重要引擎改动还必须执行同一真值输入的 `main`/当前分支对比，逐项核对依赖身份、变化对象、路径、漏报、误报、覆盖边界、耗时和内存；只比较总数不构成有效证据。
+`blackbox` 保护公开输入输出，`whitebox` 保护当前内部实现，`performance` 保护小规模性能与正确性守恒；具体原则见 `docs/developer/testing-strategy.md`。release profile 先执行测试可信度门，再使用 unittest discovery 唯一分类并运行全部测试，新增测试不会因未登记而漏跑。对重要引擎改动还必须执行同一真值输入的 `main`/当前分支对比，逐项核对依赖身份、变化对象、路径、漏报、误报、覆盖边界、耗时和内存；只比较总数不构成有效证据。
+
+公开能力盘点位于 `tests/fixtures/system_test_capability_matrix.json`。`python3 scripts/test_trust_gate.py` 会输出 covered/partial/missing 数和具体阻断项；局部测试即使全部通过，只要矩阵未完成，`test_suite_runner.py --suite all` 与 Release 准出仍会以 `PUBLIC_CAPABILITY_MATRIX_INCOMPLETE` 失败，避免把“已测部分通过”误报成“系统全面可靠”。

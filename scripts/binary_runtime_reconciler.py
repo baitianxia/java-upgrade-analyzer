@@ -375,6 +375,8 @@ class RuntimeReconciler:
                 "class_access": fact.get("class_access"),
                 "super_name": fact.get("super_name"),
                 "interfaces": tuple(fact.get("interfaces") or ()),
+                "nest_host": fact.get("nest_host"),
+                "nest_members": tuple(fact.get("nest_members") or ()),
             }
         self.members_by_variant: dict[str, list[dict[str, Any]]] = {}
         self.member_by_identity: dict[str, dict[str, Any]] = {}
@@ -855,19 +857,34 @@ class RuntimeReconciler:
             variant = provider["selected_class_variant_identity"]
             row = self.class_by_variant.get(variant)
             if row and row["parse_status"] == "parsed":
-                selected_by_realm.setdefault(
-                    provider["selected_defining_loader_realm_identity"], {}
-                )[name] = str(variant)
+                # Verify through the initiating realm, not only through the
+                # defining realm. A child loader may link one of its classes
+                # against a provider selected from an explicitly declared
+                # parent realm. The verification input must therefore contain
+                # the complete effective provider view seen by that child.
+                selected_by_realm.setdefault(realm, {})[name] = str(variant)
         verified: dict[tuple[str, str], dict[str, Any]] = {}
         for realm, selected in selected_by_realm.items():
-            realm_config = self.realms.get(realm, {})
-            parent = str(realm_config.get("parent") or self._platform_realm())
-            supported_flat = (
-                realm_config.get("delegation", "parent_first") == "parent_first"
-                and parent == self._platform_realm()
-                and realm_config.get("module_mode", "unnamed") == "unnamed"
-            )
-            if not supported_flat:
+            current = realm
+            seen = set()
+            supported_parent_first = True
+            while current and current != self._platform_realm():
+                if current in seen:
+                    supported_parent_first = False
+                    break
+                seen.add(current)
+                realm_config = self.realms.get(current, {})
+                if (
+                    realm_config.get("delegation", "parent_first")
+                    != "parent_first"
+                    or realm_config.get("module_mode", "unnamed") != "unnamed"
+                ):
+                    supported_parent_first = False
+                    break
+                current = str(
+                    realm_config.get("parent") or self._platform_realm()
+                )
+            if not supported_parent_first or current != self._platform_realm():
                 self.coverage_gaps.add(f"definition_topology_unsupported:{realm}")
                 continue
             try:
@@ -923,8 +940,7 @@ class RuntimeReconciler:
                     definition_status = "unsupported"
                     evidence["reason"] = "transformer_profile_unsupported"
                 else:
-                    defining_realm = provider["selected_defining_loader_realm_identity"]
-                    outcome = verified.get((defining_realm, name))
+                    outcome = verified.get((realm, name))
                     if outcome is None:
                         definition_status = "unsupported"
                         evidence["reason"] = "target_jvm_verification_unavailable"
@@ -1034,6 +1050,8 @@ class RuntimeReconciler:
             "access_flags": int(fact.get("class_access") or 0),
             "super_name": fact.get("super_name"),
             "interfaces": tuple(fact.get("interfaces") or ()),
+            "nest_host": str(fact.get("nest_host") or ""),
+            "nest_members": tuple(str(value) for value in fact.get("nest_members") or ()),
             "module_name": module_name,
             "members": members,
         }
@@ -1185,11 +1203,73 @@ class RuntimeReconciler:
                 return _package(owner) in exports
             return True
         if flags & ACC_PRIVATE:
-            return caller_class == owner and caller_realm == defining
+            return (
+                caller_class == owner and caller_realm == defining
+            ) or self._validated_nestmates(
+                caller_class, caller_realm, owner, defining
+            )
         same_runtime_package = caller_realm == defining and _package(caller_class) == _package(owner)
         if flags & ACC_PROTECTED:
             return same_runtime_package or self._is_subtype(caller_realm, caller_class, owner)
         return same_runtime_package
+
+    def _validated_nestmates(
+        self,
+        caller_class: str,
+        caller_realm: str,
+        owner: str,
+        owner_realm: str,
+    ) -> bool:
+        """Apply JVMS nestmate private-access rules to selected runtime classes.
+
+        A matching ``NestHost`` name alone is insufficient: both classes must
+        be in the same runtime package/loader and the selected host must list
+        every non-host member in its ``NestMembers`` attribute.  This mirrors
+        the JVM's fail-closed validation for malformed or shadowed nest data.
+        """
+        if (
+            not caller_class
+            or not owner
+            or caller_realm != owner_realm
+            or _package(caller_class) != _package(owner)
+        ):
+            return False
+
+        caller_provider = self._provider(caller_realm, caller_class)
+        owner_provider = self._provider(owner_realm, owner)
+        if (
+            caller_provider.get("class_provider_status") != "resolved"
+            or owner_provider.get("class_provider_status") != "resolved"
+        ):
+            return False
+        caller_info = self._class_info(caller_provider)
+        owner_info = self._class_info(owner_provider)
+        if not caller_info or not owner_info:
+            return False
+        caller_host = str(caller_info.get("nest_host") or caller_class)
+        owner_host = str(owner_info.get("nest_host") or owner)
+        if caller_host != owner_host:
+            return False
+
+        host_provider = self._provider(caller_realm, caller_host)
+        host_definition = self.definition_records.get((caller_realm, caller_host))
+        if (
+            host_provider.get("class_provider_status") != "resolved"
+            or not self._class_load_ready(host_definition)
+        ):
+            return False
+        host_info = self._class_info(host_provider)
+        if (
+            not host_info
+            or host_info.get("nest_host")
+            or str(host_info.get("class_name") or "") != caller_host
+        ):
+            return False
+        declared_members = set(host_info.get("nest_members") or ())
+        return all(
+            candidate == caller_host or candidate in declared_members
+            for candidate in (caller_class, owner)
+        )
 
     @staticmethod
     def _opcode_compatible(edge: Mapping[str, Any], member: Mapping[str, Any]) -> bool:

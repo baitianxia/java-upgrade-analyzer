@@ -58,6 +58,7 @@ from s4_contract import (
 MAIN_STATE_FILE_NAME = "main_state.json"
 STEP3_DEPENDENCY_SOURCE_DIRS = []
 STEP3_REPORT_DIR = ""
+STEP3_JDK_HOME = ""
 STEP3_SCAN_DIAGNOSTICS = []
 
 
@@ -1870,7 +1871,11 @@ def scan_dependency_classfile_versions(_source_dir, output_path, dep_changes_pat
 
 def scan_database_contract_changes(_source_dir, output_path, _dep_list_path=None):
     """Compare retained base/current artifacts; source input is not required."""
-    summary = scan_database_contracts(STEP3_REPORT_DIR, Path(output_path).parent)
+    summary = scan_database_contracts(
+        STEP3_REPORT_DIR,
+        Path(output_path).parent,
+        jdk_home=STEP3_JDK_HOME or None,
+    )
     status = str(summary.get('coverage_status') or 'insufficient')
     if status != 'complete':
         record_scan_diagnostic(
@@ -2027,6 +2032,8 @@ def main():
                     help='Spring Boot 大版本升级（激活 sb_* 扫描）')
     ap.add_argument('--target-jdk', default='',
                     help='目标运行 JDK 版本（用于依赖 classfile 兼容性判断，如 17/21）')
+    ap.add_argument('--jdk-home', default='',
+                    help='Step0 已验证的目标 JDK Home；辅助工具只从此目录启动')
     args = ap.parse_args()
     report_dir = args.report_dir or args.output_dir
     orchestrated_input, orchestrated_context = load_orchestrated_step3_input(report_dir)
@@ -2045,6 +2052,12 @@ def main():
     )
     global STEP3_REPORT_DIR
     STEP3_REPORT_DIR = report_dir
+    global STEP3_JDK_HOME
+    STEP3_JDK_HOME = str(
+        args.jdk_home
+        or (orchestrated_input or {}).get("current_jdk_home")
+        or ""
+    ).strip()
     if orchestrated_context:
         if not args.jdk_upgraded and orchestrated_context.get("jdk_upgraded"):
             args.jdk_upgraded = True

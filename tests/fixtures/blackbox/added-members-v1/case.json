@@ -1,0 +1,40 @@
+{
+  "schema": "java-upgrade-analyzer.blackbox-case.v1",
+  "case_id": "added-members-v1",
+  "dataset_version": 1,
+  "public_entrypoint": "scripts/binary_pipeline.py",
+  "truth_file": "truth.json",
+  "oracle_contract": "complete_member_change_closed_set",
+  "capabilities": [
+    "field_addition",
+    "implicit_constructor_implementation_change",
+    "implementation_change",
+    "method_addition",
+    "not_found_negative",
+    "unchanged_member_negative"
+  ],
+  "library_class": "contract.AdditionApi",
+  "business_class": "contract.AdditionApp",
+  "oracle_main_class": "contract.OracleMain",
+  "library_lineage": "blackbox:addition-lib",
+  "base_coordinate": "blackbox:addition-lib:1.0",
+  "current_coordinate": "blackbox:addition-lib:2.0",
+  "entrypoints": [
+    {
+      "class_name": "contract/AdditionApp",
+      "member_name": "entry",
+      "descriptor": "(Lcontract/AdditionApi;)I"
+    }
+  ],
+  "behavior_probes": [
+    {
+      "mode": "constructor",
+      "owner": "contract/AdditionApi",
+      "member": "<init>",
+      "descriptor": "()V",
+      "member_kind": "method",
+      "base_stdout": "absent",
+      "current_stdout": "3"
+    }
+  ]
+}

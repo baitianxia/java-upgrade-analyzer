@@ -971,7 +971,7 @@
       "evidence_tests": [
         "tests.test_step1_packaged_deps.Step1PackagedDepsTest.test_unconfirmed_packaged_version_requires_entry_identity_confirmation",
         "tests.test_step1_packaged_deps.Step1PackagedDepsTest.test_final_artifact_is_authoritative_for_bom_and_exclusion_resolution",
-        "tests.test_run_step_main_state.RunStepMainStateTest.test_step2_uses_one_source_provision_choice_and_keeps_internal_statuses"
+        "tests.test_step0_workflow.Step0WorkflowTest.test_dependency_source_ambiguities_are_combined_into_binding_choices"
       ],
       "blocking_gaps": []
     }

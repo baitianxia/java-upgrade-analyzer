@@ -1,0 +1,20 @@
+{
+  "schema": "java-upgrade-analyzer.blackbox-truth.v1",
+  "case_id": "abstract-method-change-v1",
+  "dataset_version": 1,
+  "scope": "closed_set",
+  "system_generated": false,
+  "human_review": {"status": "not_claimed", "reviewer": ""},
+  "input_evidence": {"algorithm": "sha256-path-nul-content-nul-v1", "source_tree_sha256": "0e2741e0324897a6544a766e4d5125ffd7858f5f792f7380c4d7cbc1480a21bc", "case_algorithm": "sha256-canonical-json-v1", "case_sha256": "7bb17fb74a3c2270b44bca2ebf3ccb8d9c47da1596eaf8aed3643043d2ae2e33", "source_files": ["src/base/contract/AbstractApi.java", "src/business/contract/AbstractApp.java", "src/business/contract/ConcreteClient.java", "src/current/contract/AbstractApi.java", "src/oracle/contract/OracleMain.java"]},
+  "oracle_producers": [
+    {"id": "openjdk-javap-abstract-flags", "organization": "OpenJDK", "mechanism": "independent_bytecode_contract_inventory", "verifies": ["complete_acc_abstract_delta", "complete_direct_call_graph"]},
+    {"id": "openjdk-jvm-abstract-dispatch", "organization": "OpenJDK", "mechanism": "actual_jvm_execution", "verifies": ["base_concrete_dispatch_succeeds", "current_abstract_method_error"]}
+  ],
+  "oracle_implementations": [{"path": "tests/blackbox/oracles/openjdk_oracle.py", "sha256": "6e72442077371b86c943f790b5982144497725200da3e89f22f66ca2bfee38ca"}],
+  "completeness": {"argument": "OpenJDK javap -v inventories every public member and finds exactly one stable identity whose flags add ACC_ABSTRACT. The complete entrypoint graph directly invokes that identity. A concrete client compiled against base executes there and raises AbstractMethodError against current.", "verified_dimensions": ["api_identity", "jvm_descriptor", "closed_result_set", "entrypoint_reachability", "static_linkage"], "known_limits": []},
+  "expected_result_count": 1,
+  "expected_results": [
+    {"owner": "contract/AbstractApi", "member": "changedAbstract", "descriptor": "()Ljava/lang/String;", "member_kind": "method", "dependency_lineages": ["blackbox:abstract-lib"], "base_dependency_coords": ["blackbox:abstract-lib:1.0"], "current_dependency_coords": ["blackbox:abstract-lib:2.0"], "reachability_status": "reachable", "static_linkage_status": "incompatible_if_executed", "impact_conclusion": "probable_impact", "runtime_verification_status": "required_not_executed", "exact_path_exists": true, "possible_path_exists": false, "path_set_complete": true, "paths": [{"certainty": "exact", "text": "contract.AbstractApp.entry(contract.AbstractApi) → contract.AbstractApi.changedAbstract()"}]}
+  ],
+  "forbidden_results": [{"owner": "contract/AbstractApi", "member": "stable", "descriptor": "()Ljava/lang/String;", "member_kind": "method", "oracle_relation": "unchanged_member", "reason": "The stable method has identical flags, descriptor, and instructions."}]
+}

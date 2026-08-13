@@ -5,6 +5,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 from pathlib import Path
 import zipfile
 
@@ -12,6 +14,7 @@ import zipfile
 ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR / "scripts"))
 
+import database_contract_scan  # noqa: E402
 from database_contract_scan import (  # noqa: E402
     ArtifactFacts,
     CSV_NAME,
@@ -35,6 +38,31 @@ def annotation(descriptor, **values):
 
 
 class DatabaseContractScanTest(unittest.TestCase):
+    def test_artifact_parser_uses_the_step0_selected_jdk_not_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "contract.jar"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                archive.writestr(
+                    "demo/Entity.class",
+                    b"fixture-Ljakarta/persistence/Entity;-bytes",
+                )
+            with patch.object(
+                database_contract_scan,
+                "extract_class_facts",
+                return_value=SimpleNamespace(
+                    records=(), coverage_status="complete",
+                ),
+            ) as extract:
+                scan_artifact(
+                    "com.acme:data",
+                    "1",
+                    "current",
+                    jar_path,
+                    jdk_home="/selected/jdk",
+                )
+
+        self.assertEqual(extract.call_args.kwargs["jdk_home"], "/selected/jdk")
+
     def _write_jar(self, path, mapper_xml):
         path.parent.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(path, "w") as archive:

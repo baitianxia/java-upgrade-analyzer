@@ -18,7 +18,8 @@ class BinaryTestHealthGateTest(unittest.TestCase):
     def test_core_branch_alternatives_are_exercised(self):
         result = branch_probe()
         self.assertEqual(result["status"], "passed", result)
-        self.assertGreaterEqual(result["coverage_ratio"], 0.80)
+        self.assertEqual(result["coverage_ratio"], 1.0)
+        self.assertEqual(result["uncovered_lines"], [])
 
     def test_contract_mutants_are_killed(self):
         result = mutation_probe()

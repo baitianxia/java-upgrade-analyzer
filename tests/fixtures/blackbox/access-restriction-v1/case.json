@@ -1,0 +1,60 @@
+{
+  "schema": "java-upgrade-analyzer.blackbox-case.v1",
+  "case_id": "access-restriction-v1",
+  "dataset_version": 1,
+  "public_entrypoint": "scripts/binary_pipeline.py",
+  "truth_file": "truth.json",
+  "oracle_contract": "removed_member_linkage_closed_set",
+  "capabilities": [
+    "access_restriction",
+    "field_removal",
+    "method_removal",
+    "not_found_negative",
+    "reachable_positive",
+    "unchanged_member_negative"
+  ],
+  "library_class": "contract.AccessApi",
+  "business_class": "contract.AccessApp",
+  "oracle_main_class": "contract.OracleMain",
+  "library_lineage": "blackbox:access-fixture-lib",
+  "base_coordinate": "blackbox:access-fixture-lib:1.0",
+  "current_coordinate": "blackbox:access-fixture-lib:2.0",
+  "entrypoints": [
+    {
+      "class_name": "contract/AccessApp",
+      "member_name": "entryMethod",
+      "descriptor": "(Lcontract/AccessApi;)Ljava/lang/String;"
+    },
+    {
+      "class_name": "contract/AccessApp",
+      "member_name": "entryField",
+      "descriptor": "(Lcontract/AccessApi;)Ljava/lang/String;"
+    }
+  ],
+  "linkage_probes": [
+    {
+      "mode": "method",
+      "owner": "contract/AccessApi",
+      "member": "restrictedMethod",
+      "descriptor": "()Ljava/lang/String;",
+      "member_kind": "method",
+      "linkage_error": "IllegalAccessError"
+    },
+    {
+      "mode": "field",
+      "owner": "contract/AccessApi",
+      "member": "restrictedField",
+      "descriptor": "Ljava/lang/String;",
+      "member_kind": "field",
+      "linkage_error": "IllegalAccessError"
+    },
+    {
+      "mode": "unreachable",
+      "owner": "contract/AccessApi",
+      "member": "restrictedUnreachable",
+      "descriptor": "()Ljava/lang/String;",
+      "member_kind": "method",
+      "linkage_error": "IllegalAccessError"
+    }
+  ]
+}

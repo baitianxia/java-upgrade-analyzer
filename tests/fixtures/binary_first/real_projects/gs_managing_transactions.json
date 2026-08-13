@@ -44,10 +44,83 @@
   },
   "expected": {
     "semantic_edge_kind": "spring_transaction_proxy_dispatch",
+    "oracle_provenance": {
+      "system_generated": false,
+      "oracle_kind": "pinned-openjdk-javap-and-jvm-linkage-v1",
+      "oracle_producers": [
+        {
+          "id": "openjdk-javap-member-contracts",
+          "organization": "OpenJDK",
+          "mechanism": "javap -p -s verifies identical access, descriptor and throws contracts for both expected methods in the pinned base/current dependency JARs"
+        },
+        {
+          "id": "openjdk-jvm-old-client-linkage",
+          "organization": "OpenJDK",
+          "mechanism": "compile tests/fixtures/binary_first/real_projects/oracle/SpringTransactionLinkageProbe.java against Spring 6.2.19 and execute the same bytecode on Spring 6.2.19 and 7.0.8; both calls enter the resolved methods without LinkageError"
+        }
+      ],
+      "oracle_implementation": {
+        "path": "tests/fixtures/binary_first/real_projects/oracle/SpringTransactionLinkageProbe.java",
+        "sha256": "4486c9c3f7d23aa433c302c34a632281aec1f3ea897069bd05d6178cb83907ee",
+        "main_class": "oracle.SpringTransactionLinkageProbe",
+        "expected_stdout": [
+          "invokeWithinTransaction=linked:java.lang.IllegalArgumentException",
+          "invoke=linked:java.lang.NullPointerException"
+        ]
+      },
+      "completeness_argument": "The expected subset contains exactly the two declared methods. For each method, javap proves the same JVM linkage contract on both pinned sides and a class compiled only against the base invokes the current implementation without LinkageError."
+    },
     "reachable_changed_methods": [
       "org/springframework/transaction/interceptor/TransactionInterceptor.invoke",
       "org/springframework/transaction/interceptor/TransactionAspectSupport.invokeWithinTransaction"
     ],
+    "formal_result_truth": {
+      "schema": "java-upgrade-analyzer.binary-result-truth.v1",
+      "result_set_policy": "subset",
+      "exact_reachability_statuses": [],
+      "expected_results": [
+        {
+          "owner": "org/springframework/transaction/interceptor/TransactionInterceptor",
+          "member": "invoke",
+          "descriptor": "(Lorg/aopalliance/intercept/MethodInvocation;)Ljava/lang/Object;",
+          "member_kind": "method",
+          "dependency_lineages": ["org.springframework:spring-tx"],
+          "base_dependency_coords": ["org.springframework:spring-tx:6.2.19"],
+          "current_dependency_coords": ["org.springframework:spring-tx:7.0.8"],
+          "reachability_status": "reachable",
+          "static_linkage_status": "compatible_or_not_applicable",
+          "impact_conclusion": "probable_impact",
+          "runtime_verification_status": "required_not_executed",
+          "exact_path_exists": true,
+          "possible_path_exists": true,
+          "minimum_path_count": 1
+        },
+        {
+          "owner": "org/springframework/transaction/interceptor/TransactionAspectSupport",
+          "member": "invokeWithinTransaction",
+          "descriptor": "(Ljava/lang/reflect/Method;Ljava/lang/Class;Lorg/springframework/transaction/interceptor/TransactionAspectSupport$InvocationCallback;)Ljava/lang/Object;",
+          "member_kind": "method",
+          "dependency_lineages": ["org.springframework:spring-tx"],
+          "base_dependency_coords": ["org.springframework:spring-tx:6.2.19"],
+          "current_dependency_coords": ["org.springframework:spring-tx:7.0.8"],
+          "reachability_status": "reachable",
+          "static_linkage_status": "compatible_or_not_applicable",
+          "impact_conclusion": "probable_impact",
+          "runtime_verification_status": "required_not_executed",
+          "exact_path_exists": true,
+          "possible_path_exists": true,
+          "minimum_path_count": 1
+        }
+      ],
+      "forbidden_results": [
+        {
+          "owner": "org/springframework/transaction/TransactionStatus",
+          "member": "isCompleted",
+          "descriptor": "()Z",
+          "member_kind": "method"
+        }
+      ]
+    },
     "required_resources": ["schema.sql"]
   }
 }

@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -45,22 +46,22 @@ class RunStepMainStateTest(unittest.TestCase):
         ).stdout.strip()
         return repository, source.parent.parent, commit
 
-    def test_main_runs_worktree_recovery_before_step1_preflight(self):
+    def test_main_runs_worktree_recovery_before_step0_confirmation(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             project = root / "project"
             report = root / ".upgrade-report"
             project.mkdir()
             events = []
-            original_preflight = run_step.build_step1_preflight_interaction
+            original_prepare = run_step.prepare_step0_context
 
             def recover(*args, **kwargs):
                 events.append("recover")
                 return {"removed_count": 0}
 
-            def preflight(run_context):
-                events.append("preflight")
-                return original_preflight(run_context)
+            def prepare(run_context, project_dir, **kwargs):
+                events.append("step0")
+                return original_prepare(run_context, project_dir, **kwargs)
 
             with patch.object(
                 run_step,
@@ -68,12 +69,12 @@ class RunStepMainStateTest(unittest.TestCase):
                 side_effect=recover,
             ) as recovery, patch.object(
                 run_step,
-                "build_step1_preflight_interaction",
-                side_effect=preflight,
+                "prepare_step0_context",
+                side_effect=prepare,
             ):
                 exit_code = run_step.main(
                     [
-                        "--step", "step1",
+                        "--step", "step0",
                         "--project-dir", str(project),
                         "--report-dir", str(report),
                     ],
@@ -82,7 +83,7 @@ class RunStepMainStateTest(unittest.TestCase):
 
         self.assertEqual(exit_code, run_step.EXIT_AWAITING_USER)
         recovery.assert_called_once()
-        self.assertLess(events.index("recover"), events.index("preflight"))
+        self.assertLess(events.index("recover"), events.index("step0"))
 
     def test_startup_recovery_removes_real_interrupted_worktree_and_writes_audit(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -100,10 +101,7 @@ class RunStepMainStateTest(unittest.TestCase):
             payload.update({"pid": 999_999_999, "process_start_token": "dead"})
             lease.write_text(json.dumps(payload), encoding="utf-8")
             args = SimpleNamespace(
-                base_source_project_dir="",
-                current_source_project_dir="",
-                source_dirs=[],
-                source_locations=[],
+                application_source=str(repository),
                 dependency_source_dirs=[],
             )
 
@@ -152,7 +150,6 @@ class RunStepMainStateTest(unittest.TestCase):
             resolved_path = run_step._resolved_binary_pipeline_config_path(
                 {
                     "binary_pipeline_config": str(config),
-                    "source_provision_choice": "provide",
                     "dependency_source_mappings": [
                         f"com.example:demo={source_root}"
                     ],
@@ -220,7 +217,7 @@ class RunStepMainStateTest(unittest.TestCase):
                 return_value=automatic,
             ) as materialize:
                 resolved_path = run_step._resolved_binary_pipeline_config_path(
-                    {"source_provision_choice": "continue_without"},
+                    {},
                     root,
                     report,
                 )
@@ -258,84 +255,33 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertEqual(
                 resolved["source_inputs"],
                 {
-                    "purpose_version": "source-input-purpose-v2",
+                    "purpose_version": "source-input-purpose-v3",
                     "business": {"status": "not_provided", "origin": "not_provided"},
                     "dependencies": {"status": "not_provided", "origin": "not_provided"},
                 },
             )
 
-    def test_source_provision_choice_never_disables_available_source_sets(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            report = root / ".upgrade-report"
-            source_dir = root / "src" / "main" / "java"
-            source_dir.mkdir(parents=True)
-            dependency_source_dir = root / "dependency" / "src" / "main" / "java"
-            dependency_source_dir.mkdir(parents=True)
-            config = root / "binary.json"
-            config.write_text(
-                json.dumps({
-                    "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
-                    "source_overlay": {
-                        "source_sets": [{
-                            "source_dirs": ["/configured/source"],
-                            "source_root": "/configured",
-                            "owner_type": "business",
-                            "owner_coord": "business",
-                        }],
-                    },
-                }),
-                encoding="utf-8",
+    def test_step2_has_no_fixed_user_interaction(self):
+        manifest = json.loads(
+            (ROOT_DIR / "scripts" / "step_manifest.json").read_text(
+                encoding="utf-8"
             )
+        )
+        step2 = next(item for item in manifest["steps"] if item["id"] == "step2")
+        self.assertIsNone(step2["interaction"])
+        self.assertTrue(step2["auto_continue_on_success"])
 
-            skipped_path = run_step._resolved_binary_pipeline_config_path(
-                {
-                    "binary_pipeline_config": str(config),
-                    "source_provision_choice": "continue_without",
-                },
-                root,
-                report,
-            )
-            skipped = json.loads(skipped_path.read_text())
-            self.assertIn("source_overlay", skipped)
-            self.assertEqual(
-                skipped["source_inputs"]["business"]["status"], "available"
-            )
-
-            config.write_text(
-                json.dumps({
-                    "schema": "java-upgrade-analyzer.binary-pipeline-input.v1"
-                }),
-                encoding="utf-8",
-            )
-            used_path = run_step._resolved_binary_pipeline_config_path(
-                {
-                    "binary_pipeline_config": str(config),
-                    "source_provision_choice": "provide",
-                    "source_dirs": [str(source_dir)],
-                    "target_module": "app",
-                    "dependency_source_mappings": [
-                        f"com.example:library={dependency_source_dir}"
-                    ],
-                },
-                root,
-                report,
-            )
-            used = json.loads(used_path.read_text())
-            self.assertEqual(used["source_inputs"]["business"]["status"], "available")
-            self.assertEqual(used["source_inputs"]["dependencies"]["status"], "available")
-            self.assertEqual(
-                used["source_overlay"]["source_sets"][0]["source_dirs"],
-                [str(source_dir.resolve())],
-            )
-            self.assertEqual(
-                used["source_overlay"]["source_sets"][1]["owner_coord"],
-                "com.example:library",
-            )
-            self.assertEqual(
-                used["source_overlay"]["source_sets"][1]["owner_type"],
-                "dependency",
-            )
+    def test_new_protocol_rejects_old_unified_source_fields(self):
+        with self.assertRaisesRegex(run_step.StepError, "当前不支持"):
+            run_step.normalize_intent_patch({
+                "action": "continue",
+                "set": {"source_locations": ["/old/source"]},
+            })
+        with self.assertRaisesRegex(run_step.StepError, "当前不支持"):
+            run_step.normalize_intent_patch({
+                "action": "continue",
+                "set": {"source_provision_choice": "provide"},
+            })
 
     def test_checkout_build_source_is_automatic_when_no_more_source_is_provided(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -359,7 +305,6 @@ class RunStepMainStateTest(unittest.TestCase):
                     "current_branch": "upgrade",
                     "source_dirs": [str(source_dir)],
                     "source_dirs_status": "auto_detected",
-                    "source_provision_choice": "continue_without",
                     "target_module": "app",
                 },
                 root,
@@ -390,10 +335,26 @@ class RunStepMainStateTest(unittest.TestCase):
             sentinel.write_text("preserve", encoding="utf-8")
             config = root / "binary.json"
             config.write_text("{}", encoding="utf-8")
+            progress = (
+                report / ".runtime" / "binary_authority"
+                / "binary_observability" / "latest_in_progress.json"
+            )
+            progress.parent.mkdir(parents=True)
+            progress.write_text(json.dumps({
+                "current_phase": "independent_validation",
+                "last_completed_phase": "immutable_generation_write",
+            }), encoding="utf-8")
+            log = report / ".runtime" / "background" / "run.log"
+            log.parent.mkdir(parents=True)
+            log.write_text("traceback detail\n", encoding="utf-8")
             with patch.object(
                 run_step,
                 "run_python",
-                side_effect=run_step.StepError("parser failed"),
+                side_effect=run_step.StepError(
+                    "parser failed",
+                    reason_codes=["ORACLE_FAILED"],
+                    diagnostic={"traceback": "line 1"},
+                ),
             ):
                 with self.assertRaisesRegex(
                     run_step.StepError, "BINARY_GENERATION_FAILED"
@@ -401,7 +362,6 @@ class RunStepMainStateTest(unittest.TestCase):
                     run_step._run_binary_step4(
                         run_context={
                             "binary_pipeline_config": str(config),
-                            "source_provision_choice": "continue_without",
                         },
                         project_dir=root,
                         report_dir=report,
@@ -412,7 +372,13 @@ class RunStepMainStateTest(unittest.TestCase):
                 (report / ".runtime" / "binary_authority" / "binary_failures").glob("*.json")
             )
             self.assertEqual(len(failures), 1)
-            self.assertTrue(json.loads(failures[0].read_text())["fail_closed"])
+            failure = json.loads(failures[0].read_text())
+            self.assertTrue(failure["fail_closed"])
+            self.assertEqual(failure["failed_phase"], "independent_validation")
+            self.assertEqual(failure["diagnostic"]["traceback"], "line 1")
+            self.assertEqual(failure["traceback"], "line 1")
+            self.assertIn("traceback detail", failure["run_log_tail"])
+            self.assertIn("ORACLE_FAILED", failure["failure_reason_codes"])
 
     def test_step4_runs_only_binary_pipeline_and_binary_report(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -447,7 +413,6 @@ class RunStepMainStateTest(unittest.TestCase):
                 result = run_step._run_binary_step4(
                     run_context={
                         "binary_pipeline_config": str(config),
-                        "source_provision_choice": "continue_without",
                     },
                     project_dir=root,
                     report_dir=report,
@@ -466,7 +431,7 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertEqual(
                 resolved_config["source_inputs"],
                 {
-                    "purpose_version": "source-input-purpose-v2",
+                    "purpose_version": "source-input-purpose-v3",
                     "business": {"status": "not_provided", "origin": "not_provided"},
                     "dependencies": {"status": "not_provided", "origin": "not_provided"},
                 },
@@ -508,8 +473,8 @@ class RunStepMainStateTest(unittest.TestCase):
                 run_step.read_json(invalid_path)
 
 
-    def test_step1_artifact_preflight_does_not_show_unpinned_local_candidates(self):
-        interaction = run_step.build_step1_preflight_interaction(
+    def test_step0_artifact_card_does_not_show_unpinned_local_candidates(self):
+        interaction = run_step.build_step0_confirmation_interaction(
             {
                 "base_artifact_path": "/artifacts/base.jar",
                 "current_artifact_path": "/artifacts/current.jar",
@@ -521,510 +486,10 @@ class RunStepMainStateTest(unittest.TestCase):
 
         card = "\n".join(run_step.build_user_decision_card(interaction))
 
-        self.assertEqual(interaction["required_fields"], ["target_module"])
-        self.assertIn("两侧编译产物已经齐全", interaction["question"])
-        self.assertNotIn("source_project_dir", interaction["question"])
-        self.assertNotIn("补齐缺失侧的 branch", interaction["question"])
+        self.assertIn("target_module", interaction["required_fields"])
         self.assertNotIn("检测到的目标模块候选", card)
         self.assertNotIn("`app`", card)
         self.assertNotIn("`services/order-service`", card)
-
-    def test_step1_artifact_review_collects_missing_context_refs_in_existing_checkpoint(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            project_dir = Path(tmp)
-            report_dir = project_dir / ".upgrade-report"
-            manifest_steps = {
-                "step1": {
-                    "title": "分析对象与依赖范围",
-                    "interaction": {
-                        "type": "review",
-                        "question": "请确认依赖范围。",
-                        "required_fields": ["action"],
-                        "options": [{"id": "continue", "label": "继续"}],
-                    },
-                    "outputs": [],
-                }
-            }
-
-            payload = run_step.build_interaction_payload(
-                "step1",
-                report_dir,
-                manifest_steps,
-                project_dir,
-                run_context={
-                    "base_artifact_path": "/artifacts/base.jar",
-                    "current_artifact_path": "/artifacts/current.jar",
-                    "target_module": "app",
-                },
-                main_state=run_step.new_main_state(report_dir),
-            )
-
-        self.assertEqual(payload["reason_code"], "STEP1_CONTEXT_REFS_REQUIRED")
-        self.assertEqual(payload["required_fields"], ["base_branch", "current_branch"])
-        self.assertEqual(
-            payload["action_requirements"]["continue"]["required_fields"],
-            ["base_branch", "current_branch"],
-        )
-        self.assertIn("制品和依赖变化范围已经生成", payload["question"])
-
-    def test_step2_skips_repeated_confirmation_when_context_facts_are_complete(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            project_dir = Path(tmp)
-            report_dir = project_dir / ".upgrade-report"
-            context_dir = report_dir / "evidence" / "context"
-            source_dir = project_dir / "src" / "main" / "java"
-            context_dir.mkdir(parents=True)
-            source_dir.mkdir(parents=True)
-            (context_dir / "context.json").write_text(
-                json.dumps(
-                    {
-                        "base_branch": "main",
-                        "current_branch": "upgrade",
-                        "jdk_base": "8",
-                        "jdk_current": "17",
-                        "springboot_base": "2.7.18",
-                        "springboot_current": "3.3.1",
-                        "changed_dependencies": [],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            (context_dir / "dep_graph.json").write_text("{}\n", encoding="utf-8")
-            manifest_steps = {
-                "step2": {
-                    "title": "升级上下文",
-                    "conditional_confirmation": True,
-                    "interaction": {
-                        "type": "decision",
-                        "question": "请确认上下文。",
-                        "options": [{"id": "continue", "label": "继续"}],
-                    },
-                    "outputs": [],
-                }
-            }
-
-            payload = run_step.build_interaction_payload(
-                "step2",
-                report_dir,
-                manifest_steps,
-                project_dir,
-                run_context={
-                    "analysis_mode": "checkout_build",
-                    "target_module": "app",
-                    "source_provision_choice": "continue_without",
-                    "source_dirs": [str(source_dir)],
-                    "source_dirs_status": "explicit",
-                },
-                main_state=run_step.new_main_state(report_dir),
-            )
-            review_exists = (context_dir / "review.md").is_file()
-
-        self.assertIsNone(payload)
-        self.assertTrue(review_exists)
-
-    def test_step2_stops_once_when_material_context_facts_are_missing(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            project_dir = Path(tmp)
-            report_dir = project_dir / ".upgrade-report"
-            context_dir = report_dir / "evidence" / "context"
-            source_dir = project_dir / "src" / "main" / "java"
-            context_dir.mkdir(parents=True)
-            source_dir.mkdir(parents=True)
-            (context_dir / "context.json").write_text(
-                json.dumps(
-                    {
-                        "base_branch": "main",
-                        "current_branch": "upgrade",
-                        "jdk_base": None,
-                        "jdk_current": None,
-                        "changed_dependencies": [],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            (context_dir / "dep_graph.json").write_text("{}\n", encoding="utf-8")
-            manifest_steps = {
-                "step2": {
-                    "title": "升级上下文",
-                    "conditional_confirmation": True,
-                    "interaction": {
-                        "type": "decision",
-                        "question": "请确认上下文。",
-                        "options": [{"id": "continue", "label": "继续"}],
-                    },
-                    "outputs": [],
-                }
-            }
-
-            payload = run_step.build_interaction_payload(
-                "step2",
-                report_dir,
-                manifest_steps,
-                project_dir,
-                run_context={
-                    "analysis_mode": "checkout_build",
-                    "base_branch": "main",
-                    "current_branch": "upgrade",
-                    "target_module": "app",
-                    "source_dirs": [str(source_dir)],
-                    "source_dirs_status": "explicit",
-                },
-                main_state=run_step.new_main_state(report_dir),
-            )
-
-        self.assertEqual(payload["reason_code"], "STEP2_CONTEXT_FACTS_UNRESOLVED")
-        self.assertEqual(
-            payload["required_fields"],
-            ["source_provision_choice", "jdk_base", "jdk_current"],
-        )
-        self.assertIn("升级前 JDK", payload["question"])
-        self.assertIn("升级后 JDK", payload["question"])
-        self.assertIn("是否还能补充其他相关源码", payload["question"])
-        self.assertIn("source_provision_choice", payload["response_schema"]["properties"])
-        self.assertIn("jdk_base", payload["response_schema"]["properties"])
-        self.assertIn("jdk_current", payload["response_schema"]["properties"])
-
-    def test_step2_uses_one_source_provision_choice_and_keeps_internal_statuses(self):
-        confirmation = run_step.build_step2_confirmation_requirements(
-            {"jdk_base": "8", "jdk_current": "17"},
-            {
-                "source_dirs": ["/project/src/main/java"],
-                "source_dirs_status": "context_detected",
-                "source_repo_hint_suggestions": {},
-            },
-            {
-                "analysis_mode": "checkout_build",
-                "base_branch": "main",
-                "current_branch": "upgrade",
-                "source_dirs": ["/project/src/main/java"],
-            },
-        )
-        self.assertTrue(confirmation["required"])
-        self.assertEqual(
-            confirmation["reason_code"],
-            "step2_source_inputs_required",
-        )
-        self.assertEqual(
-            confirmation["required_fields"], ["source_provision_choice"]
-        )
-
-        skipped = run_step.build_step2_confirmation_requirements(
-            {"jdk_base": "8", "jdk_current": "17"},
-            {
-                "source_dirs": [],
-                "source_dirs_status": "missing",
-                "source_repo_hint_suggestions": {},
-            },
-            {
-                "analysis_mode": "artifact_inputs",
-                "base_artifact_path": "/artifacts/base.jar",
-                "current_artifact_path": "/artifacts/current.jar",
-                "source_provision_choice": "continue_without",
-            },
-        )
-        self.assertFalse(skipped["required"])
-
-        dependency_only = run_step.build_step2_confirmation_requirements(
-            {"jdk_base": "8", "jdk_current": "17"},
-            {
-                "source_dirs": [],
-                "source_dirs_status": "missing",
-                "dependency_source_dirs": ["/repos/library"],
-                "source_repo_hint_suggestions": {},
-            },
-            {
-                "analysis_mode": "artifact_inputs",
-                "base_artifact_path": "/artifacts/base.jar",
-                "current_artifact_path": "/artifacts/current.jar",
-                "source_provision_choice": "provide",
-                "dependency_source_dirs": ["/repos/library"],
-            },
-        )
-        self.assertFalse(dependency_only["required"])
-
-        persisted = run_step.merge_user_response_into_run_context(
-            {},
-            {
-                "action": "continue",
-                "source_provision_choice": "continue_without",
-            },
-            Path("/project"),
-        )
-        self.assertEqual(
-            persisted["source_provision_choice"], "continue_without"
-        )
-        self.assertEqual(
-            persisted["source_input_purpose_version"],
-            "source-input-purpose-v2",
-        )
-
-        with tempfile.TemporaryDirectory() as tmp:
-            project_dir = Path(tmp)
-            provided_dir = project_dir / "src" / "main" / "java"
-            provided_dir.mkdir(parents=True)
-            provided = run_step.merge_user_response_into_run_context(
-                {},
-                {
-                    "action": "continue",
-                    "source_locations": [str(provided_dir)],
-                },
-                project_dir,
-            )
-        self.assertEqual(provided["source_provision_choice"], "provide")
-        no_extra_choice = run_step.build_step2_confirmation_requirements(
-            {"jdk_base": "8", "jdk_current": "17"},
-            {
-                "source_dirs": provided["source_dirs"],
-                "source_dirs_status": "explicit",
-                "source_repo_hint_suggestions": {},
-            },
-            provided,
-        )
-        self.assertFalse(no_extra_choice["required"])
-
-        with tempfile.TemporaryDirectory() as tmp:
-            project_dir = Path(tmp)
-            report_dir = project_dir / ".upgrade-report"
-            context_dir = report_dir / "evidence" / "context"
-            source_dir = project_dir / "src" / "main" / "java"
-            context_dir.mkdir(parents=True)
-            source_dir.mkdir(parents=True)
-            (context_dir / "context.json").write_text(
-                json.dumps({
-                    "base_branch": "main",
-                    "current_branch": "upgrade",
-                    "jdk_base": "8",
-                    "jdk_current": "17",
-                    "changed_dependencies": [],
-                }),
-                encoding="utf-8",
-            )
-            (context_dir / "dep_graph.json").write_text("{}\n", encoding="utf-8")
-            payload = run_step.build_interaction_payload(
-                "step2",
-                report_dir,
-                {
-                    "step2": {
-                        "title": "升级上下文",
-                        "conditional_confirmation": True,
-                        "interaction": {
-                            "type": "decision",
-                            "question": "请确认上下文。",
-                            "options": [{"id": "continue", "label": "继续"}],
-                        },
-                        "outputs": [],
-                    }
-                },
-                project_dir,
-                run_context={
-                    "analysis_mode": "checkout_build",
-                    "base_branch": "main",
-                    "current_branch": "upgrade",
-                    "target_module": "app",
-                    "source_dirs": [str(source_dir)],
-                    "source_dirs_status": "context_detected",
-                },
-                main_state=run_step.new_main_state(report_dir),
-            )
-
-        self.assertIn("当前为编译模式", payload["question"])
-        self.assertIn("已经取得并会直接使用被分析系统源码", payload["question"])
-        self.assertIn("一次提交", payload["question"])
-        self.assertIn("文件与行号", payload["question"])
-        self.assertIn("暂时无法补充也可以继续", payload["question"])
-        self.assertEqual(payload["required_fields"], ["source_provision_choice"])
-        self.assertEqual(
-            payload["response_schema"]["properties"]["source_provision_choice"]["enum"],
-            ["provide", "continue_without"],
-        )
-        self.assertIn("source_locations", payload["response_schema"]["properties"])
-        self.assertNotIn("source_dirs", payload["response_schema"]["properties"])
-        self.assertNotIn("dependency_source_dirs", payload["response_schema"]["properties"])
-
-    def test_unified_source_locations_are_classified_internally(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            project = root / "business"
-            business_source = project / "src" / "main" / "java"
-            business_source.mkdir(parents=True)
-            dependency = project / "third-party" / "library"
-            (dependency / "src" / "main" / "java").mkdir(parents=True)
-            (dependency / "pom.xml").write_text(
-                "<project><modelVersion>4.0.0</modelVersion>"
-                "<groupId>com.acme</groupId><artifactId>library</artifactId>"
-                "<version>2.0</version></project>",
-                encoding="utf-8",
-            )
-            report = project / ".upgrade-report"
-            context_path = run_step.step2_context_path(report)
-            context_path.parent.mkdir(parents=True)
-            context_path.write_text(
-                json.dumps({
-                    "changed_dependencies": [{"coord": "com.acme:library"}],
-                }),
-                encoding="utf-8",
-            )
-
-            merged = run_step.merge_user_response_into_run_context(
-                {
-                    "report_dir": str(report),
-                    "analysis_mode": "artifact_inputs",
-                },
-                {
-                    "action": "continue",
-                    "source_locations": [str(business_source), str(dependency)],
-                },
-                project,
-            )
-
-        self.assertEqual(merged["source_provision_choice"], "provide")
-        self.assertIn(str(business_source.resolve()), merged["source_dirs"])
-        self.assertIn(str(dependency.resolve()), merged["dependency_source_dirs"])
-        self.assertEqual(merged["unclassified_source_locations"], [])
-        self.assertEqual(
-            {item["owner_type"] for item in merged["source_location_classifications"]},
-            {"business", "dependency"},
-        )
-
-    def test_ambiguous_unified_source_mapping_feeds_dependency_overlay(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            project = root / "business"
-            project.mkdir()
-            dependency = root / "sources" / "library"
-            dependency_source = dependency / "src" / "main" / "java"
-            dependency_source.mkdir(parents=True)
-            report = project / ".upgrade-report"
-            args = self._make_default_args(project, report)
-
-            context = run_step.build_run_context(
-                args,
-                existing={},
-                seed_payload={
-                    "analysis_mode": "artifact_inputs",
-                    "source_provision_choice": "provide",
-                    "source_locations": [str(dependency)],
-                    "source_location_mappings": [{
-                        "location": str(dependency),
-                        "owner_type": "dependency",
-                        "owner_coord": "com.acme:library",
-                    }],
-                },
-            )
-
-        self.assertIn(
-            f"com.acme:library={dependency.resolve()}",
-            context["dependency_repo_mappings"],
-        )
-        self.assertIn(
-            f"com.acme:library={dependency_source.resolve()}",
-            context["dependency_source_mappings"],
-        )
-        self.assertEqual(context["unclassified_source_locations"], [])
-
-    def test_step2_stops_for_explicit_source_hint_decision_without_forcing_acceptance(self):
-        confirmation = run_step.build_step2_confirmation_requirements(
-            {"jdk_base": "8", "jdk_current": "17"},
-            {
-                "source_dirs": ["/project/src/main/java"],
-                "source_dirs_status": "explicit",
-                "source_repo_hint_suggestions": {
-                    "proposed": [
-                        {
-                            "coord": "com.example:demo-lib",
-                            "repo_path": "/repos/demo-lib",
-                        }
-                    ]
-                },
-            },
-            {
-                "analysis_mode": "artifact_inputs",
-                "source_provision_choice": "provide",
-                "source_dirs": ["/project/src/main/java"],
-                "source_repo_hints": ["/repos/demo-lib"],
-            },
-        )
-        pending = {
-            "step_id": "step2",
-            "reason_code": confirmation["reason_code"],
-            "response_schema": {
-                "required": ["action"],
-                "properties": {
-                    "action": {"type": "string"},
-                    "accept_suggested_mappings": {"type": "boolean"},
-                },
-            },
-            "action_requirements": {
-                "continue": {
-                    "required_fields": confirmation["required_fields"],
-                }
-            },
-        }
-
-        self.assertEqual(
-            confirmation["reason_code"],
-            "step2_source_mapping_decision_required",
-        )
-        self.assertEqual(
-            confirmation["required_fields"], ["accept_suggested_mappings"]
-        )
-        run_step.validate_pending_interaction_response(
-            pending,
-            {"action": "continue", "accept_suggested_mappings": False},
-        )
-        persisted_decline = run_step.merge_user_response_into_run_context(
-            {},
-            {"action": "continue", "accept_suggested_mappings": False},
-            Path("/project"),
-        )
-        self.assertIs(persisted_decline["accept_suggested_mappings"], False)
-        with self.assertRaisesRegex(run_step.StepError, "accept_suggested_mappings"):
-            run_step.validate_pending_interaction_response(
-                pending,
-                {"action": "continue"},
-            )
-        declined = run_step.build_step2_confirmation_requirements(
-            {"jdk_base": "8", "jdk_current": "17"},
-            {
-                "source_dirs": ["/project/src/main/java"],
-                "source_dirs_status": "explicit",
-                "source_repo_hint_suggestions": {
-                    "proposed": confirmation["proposed_mappings"]
-                },
-            },
-            {
-                "analysis_mode": "artifact_inputs",
-                "source_provision_choice": "provide",
-                "source_dirs": ["/project/src/main/java"],
-                "source_repo_hints": ["/repos/demo-lib"],
-                "accept_suggested_mappings": False,
-            },
-        )
-        self.assertFalse(declined["required"])
-
-    def test_step2_version_corrections_work_through_intent_patch(self):
-        canonical = run_step.build_canonical_user_response(
-            {
-                "intent_patch": {
-                    "action": "continue",
-                    "set": {
-                        "jdk_base": "11",
-                        "jdk_current": "21",
-                        "springboot_base": "2.7.18",
-                        "springboot_current": "3.3.2",
-                    },
-                }
-            }
-        )
-        updated = run_step.merge_user_response_into_run_context(
-            {}, canonical, Path("/project")
-        )
-
-        self.assertEqual(updated["jdk_base"], "11")
-        self.assertEqual(updated["jdk_current"], "21")
-        self.assertEqual(updated["springboot_base"], "2.7.18")
-        self.assertEqual(updated["springboot_current"], "3.3.2")
-        self.assertEqual(run_step.infer_non_pending_target_step_from_payload(canonical), "step2")
 
     def test_auto_mode_runs_until_next_material_checkpoint(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1089,110 +554,6 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertEqual(executed, ["step3", "step4"])
         self.assertEqual(saved["state"]["completed_step"], "step4")
         self.assertEqual(saved["state"]["pending_interaction"]["step_id"], "step4")
-
-    def test_step2_input_reply_rebuilds_step2_exactly_once(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            project_dir = Path(tmp) / "project"
-            source_dir = project_dir / "src" / "main" / "java"
-            source_dir.mkdir(parents=True)
-            report_dir = project_dir / ".upgrade-report"
-            pending = {
-                "status": "awaiting_user_input",
-                "kind": "input_request",
-                "step_id": "step2",
-                "options": [{"id": "continue"}],
-                "response_schema": {
-                    "required": ["action"],
-                    "properties": {
-                        "action": {"type": "string"},
-                        "jdk_base": {"type": "string"},
-                        "jdk_current": {"type": "string"},
-                    },
-                },
-                "action_requirements": {
-                    "continue": {"required_fields": ["jdk_base", "jdk_current"]}
-                },
-            }
-            state = run_step.new_main_state(report_dir)
-            state["state"].update(
-                {
-                    "current_step": "step2",
-                    "completed_step": "step1",
-                    "status": "awaiting_user_input",
-                    "pending_interaction": pending,
-                }
-            )
-            state["step2"]["input"] = {
-                "base_branch": "base",
-                "current_branch": "upgrade",
-                "target_module": ".",
-                "source_dirs": [str(source_dir)],
-                "source_dirs_status": "explicit",
-            }
-            state["step2"]["output"] = {"jdk_base": "unknown", "jdk_current": "unknown"}
-            run_step.save_main_state(report_dir, state)
-            executed = []
-
-            def fake_execute(step_id, _args, _steps, run_context, **_kwargs):
-                executed.append((step_id, run_context["jdk_base"], run_context["jdk_current"]))
-                return None
-
-            with patch.object(
-                run_step, "contract_payload", return_value={"status": "passed", "checks": []}
-            ), patch.object(
-                run_step,
-                "load_manifest",
-                return_value=(
-                    {"auto_run_until_checkpoint": False},
-                    {"step2": {"gate": "context", "auto_continue_on_success": True}},
-                ),
-            ), patch.object(
-                run_step, "detect_integrity_repair_step", return_value=None
-            ), patch.object(
-                run_step, "detect_build_tool", return_value="maven"
-            ), patch.object(
-                run_step, "execute_step", side_effect=fake_execute
-            ):
-                exit_code = run_step.main(
-                    [
-                        "--step",
-                        "auto",
-                        "--project-dir",
-                        str(project_dir),
-                        "--report-dir",
-                        str(report_dir),
-                        "--response-json",
-                        json.dumps(
-                            {
-                                "action": "continue",
-                                "jdk_base": "8",
-                                "jdk_current": "17",
-                            }
-                        ),
-                    ]
-                )
-
-        self.assertEqual(exit_code, 0)
-        self.assertEqual(executed, [("step2", "8", "17")])
-
-    def test_legacy_step2_review_only_reruns_when_reply_changes_step2_input(self):
-        pending = {"step_id": "step2", "kind": "review"}
-
-        self.assertEqual(
-            run_step.resolve_resume_step_id(
-                "step3", pending, "continue", {"action": "continue"}
-            ),
-            "step3",
-        )
-        self.assertEqual(
-            run_step.resolve_resume_step_id(
-                "step3",
-                pending,
-                "continue",
-                {"action": "continue", "jdk_current": "21"},
-            ),
-            "step2",
-        )
 
     def test_auto_mode_runs_system_reachability_and_report_without_extra_confirmation(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1507,7 +868,7 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertEqual(saved["state"]["status"], "awaiting_user_input")
         self.assertEqual(saved["state"]["pending_interaction"]["step_id"], "step4")
 
-    def test_user_response_merges_active_maven_profiles_into_step1_context(self):
+    def test_user_response_merges_active_maven_profiles_into_step0_context(self):
         updated = run_step.merge_user_response_into_run_context(
             {
                 "active_maven_profiles": [],
@@ -1525,7 +886,7 @@ class RunStepMainStateTest(unittest.TestCase):
             run_step.infer_non_pending_target_step_from_payload(
                 {"active_maven_profiles": ["boot"]}
             ),
-            "step1",
+            "step0",
         )
 
     def test_run_context_applies_explicit_maven_profiles_to_project_scope(self):
@@ -1652,42 +1013,6 @@ class RunStepMainStateTest(unittest.TestCase):
             loaded = run_step.load_main_state(report_dir)
             self.assertEqual(run_step.resolve_requested_step("auto", loaded), "step4")
 
-    def test_user_response_updates_target_step_input(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            project_dir = Path(tmp)
-            report_dir = project_dir / ".upgrade-report"
-            state = run_step.new_main_state(report_dir)
-            state["step2"]["input"] = {
-                "base_branch": "main",
-                "current_branch": "feature/a",
-                "source_dirs": [],
-            }
-            pending = {
-                "step_id": "step2",
-                "status": "awaiting_user_input",
-                "options": [{"id": "continue"}],
-            }
-            response = {
-                "action": "continue",
-                "base_branch": "release/1.0",
-                "source_dirs": ["src/main/java"],
-            }
-
-            updated_state, updated = run_step.apply_user_response_to_main_state(
-                state,
-                pending,
-                response,
-                project_dir,
-                target_step_id="step2",
-            )
-
-            self.assertEqual(updated["base_branch"], "release/1.0")
-            self.assertEqual(updated_state["step2"]["input"]["base_branch"], "release/1.0")
-            self.assertEqual(
-                updated_state["step2"]["input"]["source_dirs"],
-                [str((project_dir / "src/main/java").resolve())],
-            )
-
     def test_user_response_accumulates_manual_coord_overrides_across_rounds(self):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
@@ -1756,44 +1081,6 @@ class RunStepMainStateTest(unittest.TestCase):
                 updated["manual_artifact_identities"][0]["version"],
                 "2.0",
             )
-
-    def test_user_response_primary_module_overrides_stale_modules(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            project_dir = Path(tmp)
-            report_dir = project_dir / ".upgrade-report"
-            state = run_step.new_main_state(report_dir)
-            state["step1"]["input"] = {
-                "base_branch": "base",
-                "current_branch": "upgrade",
-                "primary_module": "mybatis-example",
-                "modules": ["mybatis-example"],
-                "source_dirs": [str((project_dir / "src/main/java").resolve())],
-                "source_dirs_status": "explicit",
-            }
-            pending = {
-                "step_id": "step1",
-                "status": "awaiting_user_input",
-                "options": [{"id": "continue"}],
-            }
-            response = {
-                "action": "continue",
-                "primary_module": ".",
-            }
-
-            updated_state, updated = run_step.apply_user_response_to_main_state(
-                state,
-                pending,
-                response,
-                project_dir,
-                target_step_id="step1",
-            )
-
-            self.assertEqual(updated["primary_module"], ".")
-            self.assertEqual(updated["modules"], ["."])
-            self.assertNotIn("source_dirs", updated)
-            self.assertEqual(updated_state["step1"]["input"]["primary_module"], ".")
-            self.assertEqual(updated_state["step1"]["input"]["modules"], ["."])
-            self.assertNotIn("source_dirs", updated_state["step1"]["input"])
 
     def test_materialize_step5_input_does_not_promote_step3_candidates_to_targets(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1878,60 +1165,16 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertEqual(scope["included_dependency_count"], 2)
             self.assertEqual(scope["excluded_dependency_coords"], ["com.example:core-lib"])
 
-    def test_step1_review_continue_propagates_confirmed_branches_to_step2_input(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            project_dir = Path(tmp)
-            report_dir = project_dir / ".upgrade-report"
-            artifact_context = {
-                "base_artifact_path": str((project_dir / "base.jar").resolve()),
-                "current_artifact_path": str((project_dir / "current.jar").resolve()),
-                "artifact_input_mode": True,
-            }
-            state = run_step.new_main_state(report_dir)
-            state["step1"]["input"] = dict(artifact_context)
-            state["step1"]["output"] = dict(artifact_context)
-            state["step2"]["input"] = dict(artifact_context)
-            pending = {
-                "step_id": "step1",
-                "kind": "review",
-                "status": "awaiting_user_input",
-                "options": [{"id": "continue"}],
-            }
-
-            updated_state, updated = run_step.apply_user_response_to_main_state(
-                state,
-                pending,
-                {
-                    "action": "continue",
-                    "base_branch": "origin/main",
-                    "current_branch": "feature/upgrade",
-                },
-                project_dir,
-                target_step_id="step1",
-            )
-
-            self.assertEqual(updated["base_branch"], "origin/main")
-            self.assertEqual(updated["current_branch"], "feature/upgrade")
-            self.assertEqual(updated_state["step1"]["input"]["base_branch"], "origin/main")
-            self.assertEqual(updated_state["step1"]["input"]["current_branch"], "feature/upgrade")
-            self.assertEqual(updated_state["step2"]["input"]["base_branch"], "origin/main")
-            self.assertEqual(updated_state["step2"]["input"]["current_branch"], "feature/upgrade")
-            self.assertEqual(
-                updated_state["step2"]["input"]["base_artifact_path"],
-                str((project_dir / "base.jar").resolve()),
-            )
-
     def test_apply_structured_user_response_bridges_response_without_pending_interaction(self):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
             report_dir = project_dir / ".upgrade-report"
             state = run_step.new_main_state(report_dir)
-            state["state"]["current_step"] = "step1"
-            state["step1"]["input"] = {
+            state["state"]["current_step"] = "step0"
+            state["step0"]["input"] = {
                 "base_branch": "base",
                 "current_branch": "upgrade",
-                "primary_module": "mybatis-example",
-                "modules": ["mybatis-example"],
+                "target_module": "mybatis-example",
             }
             args = SimpleNamespace(
                 step="auto",
@@ -1940,8 +1183,7 @@ class RunStepMainStateTest(unittest.TestCase):
                         "intent_patch": {
                             "action": "continue",
                             "set": {
-                                "primary_module": ".",
-                                "modules": ["."],
+                                "target_module": ".",
                             },
                         }
                     },
@@ -1954,15 +1196,16 @@ class RunStepMainStateTest(unittest.TestCase):
                 project_dir,
                 report_dir,
                 state,
-                "step1",
+                "step0",
             )
 
             self.assertIsNone(result["early_exit_code"])
-            self.assertEqual(result["step_id"], "step1")
-            self.assertEqual(state["state"]["current_step"], "step1")
-            self.assertEqual(state["step1"]["input"]["primary_module"], ".")
-            self.assertEqual(state["step1"]["input"]["modules"], ["."])
-            self.assertEqual(state["state"]["last_user_response"]["step_id"], "step1")
+            self.assertEqual(result["step_id"], "step0")
+            self.assertEqual(state["state"]["current_step"], "step0")
+            self.assertEqual(state["step0"]["input"]["target_module"], ".")
+            self.assertEqual(state["step0"]["input"]["primary_module"], ".")
+            self.assertEqual(state["step0"]["input"]["modules"], ["."])
+            self.assertEqual(state["state"]["last_user_response"]["step_id"], "step0")
 
     def test_apply_structured_user_response_infers_target_step_when_current_step_done(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2721,68 +1964,6 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertNotIn("建议", text)
             self.assertNotIn("下一步", text)
 
-    def test_upgrade_context_checkpoint_generates_one_human_review_page(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            project_dir = Path(tmp)
-            report_dir = project_dir / ".upgrade-report"
-            context_dir = report_dir / "evidence" / "context"
-            context_dir.mkdir(parents=True)
-            (context_dir / "context.json").write_text(
-                json.dumps(
-                    {
-                        "base_branch": "release/1.x",
-                        "current_branch": "feature/upgrade",
-                        "jdk_base": "8",
-                        "jdk_current": "17",
-                        "springboot_base": "2.7.18",
-                        "springboot_current": "3.3.1",
-                        "changed_dependencies": [{"coord": "com.acme:demo"}],
-                        "source_dirs": ["src/main/java"],
-                    },
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
-            (context_dir / "dep_graph.json").write_text("{}\n", encoding="utf-8")
-            manifest_steps = {
-                "step2": {
-                    "title": "升级上下文",
-                    "interaction": {
-                        "type": "review",
-                        "question": "请确认升级上下文。",
-                        "options": [{"id": "continue", "label": "确认范围"}],
-                    },
-                    "outputs": ["evidence/context/context.json", "evidence/context/dep_graph.json"],
-                }
-            }
-
-            payload = run_step.build_interaction_payload(
-                "step2",
-                report_dir,
-                manifest_steps,
-                project_dir,
-                run_context={"target_module": "app"},
-                main_state=run_step.new_main_state(report_dir),
-            )
-
-            review_path = context_dir / "review.md"
-            review = review_path.read_text(encoding="utf-8")
-            files = payload.get("files_to_review") or []
-            card = "\n".join(run_step.build_user_decision_card(payload))
-
-        self.assertEqual(files, [str(review_path.resolve())])
-        self.assertIn("本文件回答：本次升级分析使用了什么范围和版本信息。", review)
-        self.assertIn("release/1.x", review)
-        self.assertIn("feature/upgrade", review)
-        self.assertIn("8 → 17", review)
-        self.assertIn("2.7.18 → 3.3.1", review)
-        self.assertIn("app", review)
-        self.assertIn("目标模块：app", card)
-        self.assertNotIn("context.json", card)
-        self.assertNotIn("dep_graph.json", card)
-        self.assertNotIn("source_dirs_status", card)
-        self.assertNotIn("base_branch=", card)
-
     def test_later_action_persists_paused_user_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
@@ -3076,6 +2257,7 @@ class RunStepMainStateTest(unittest.TestCase):
 
     def test_user_task_names_and_manifest_checkpoint_copy_are_human_facing(self):
         expected_names = {
+            "step0": "正式分析信息确认",
             "step1": "分析对象与依赖范围",
             "step2": "升级上下文",
             "step3": "兼容性线索",
@@ -3155,20 +2337,18 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertNotIn("git_ref_matches.txt", review_files)
         self.assertNotIn("all_changed_apis.csv", review_files)
 
-    def test_user_decision_card_covers_step1_missing_input_request(self):
-        interaction = run_step.build_step1_preflight_interaction({})
+    def test_user_decision_card_covers_step0_unified_confirmation(self):
+        interaction = run_step.build_step0_confirmation_interaction({})
 
         lines = run_step.build_user_decision_card(interaction)
         text = "\n".join(lines)
 
-        self.assertIn("需要补充的信息：", text)
-        self.assertIn("可选输入方式：", text)
-        self.assertIn("升级前构建产物", text)
-        self.assertIn("升级后构建产物", text)
-        self.assertIn("基准分支", text)
-        self.assertIn("当前分支", text)
-        self.assertIn("你可以直接回复：", text)
-        self.assertIn("目标模块是 app", text)
+        self.assertIn("| 信息 | Base | Current |", text)
+        self.assertIn("| 最终制品 |", text)
+        self.assertIn("| 版本分支 |", text)
+        self.assertIn("| 应用源码 |", text)
+        self.assertIn("| 依赖包源码 |", text)
+        self.assertIn("同一回复中一次补齐", text)
         self.assertNotIn("response_schema", text)
         self.assertNotIn("input_normalization", text)
         self.assertNotIn("action_requirements", text)
@@ -3399,65 +2579,6 @@ class RunStepMainStateTest(unittest.TestCase):
                 ["new-lib:2.0 -> com.example:new-lib"],
             )
 
-    def test_step2_continue_with_clear_invalidates_outputs_for_one_normal_rerun(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            project_dir = Path(tmp)
-            report_dir = project_dir / ".upgrade-report"
-            report_dir.mkdir(parents=True)
-            source_dir = project_dir / "src" / "main" / "java"
-            source_dir.mkdir(parents=True)
-            dep_repo = project_dir / "dep-repo"
-            dep_repo.mkdir()
-            state = run_step.new_main_state(report_dir)
-            stale_context = {
-                "base_branch": "base",
-                "current_branch": "current",
-                "source_dirs": [str(source_dir.resolve())],
-                "source_dirs_status": "explicit",
-                "dependency_source_dirs": [str(dep_repo.resolve())],
-                "dependency_repo_mappings": [f"com.example:demo={str(dep_repo.resolve())}"],
-                "dependency_source_mappings": [f"com.example:demo={str(dep_repo.resolve())}"],
-            }
-            state["step2"]["input"] = dict(stale_context)
-            state["step2"]["output"] = dict(stale_context)
-            state["step3"]["input"] = dict(stale_context)
-            pending = {
-                "step_id": "step2",
-                "status": "awaiting_user_input",
-                "options": [{"id": "continue"}],
-            }
-            user_response = run_step.build_canonical_user_response(
-                {
-                    "intent_patch": {
-                        "action": "continue",
-                        "clear": ["dependency_source_dirs"],
-                    }
-                }
-            )
-
-            updated_state, _updated = run_step.apply_user_response_to_main_state(
-                state,
-                pending,
-                user_response,
-                project_dir,
-                target_step_id="step2",
-            )
-
-            with patch.object(run_step, "refresh_step2_outputs") as refresh_mock:
-                run_step.handle_step2_resume_followups(
-                    updated_state,
-                    report_dir,
-                    "step2",
-                    "step2",
-                    "continue",
-                    user_response,
-                )
-
-            refresh_mock.assert_not_called()
-            self.assertNotIn("dependency_source_dirs", updated_state["step2"]["input"])
-            self.assertEqual(updated_state["step2"]["output"], {})
-            self.assertEqual(updated_state["step3"], run_step.empty_step_state())
-
     def test_apply_user_response_prefers_current_input_over_current_output(self):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
@@ -3561,38 +2682,34 @@ class RunStepMainStateTest(unittest.TestCase):
     def test_continue_resume_example_fills_every_required_context_field(self):
         examples = run_step.build_resume_command_examples(
             [{"id": "continue", "label": "补齐后继续"}],
-            ["jdk_base", "jdk_current", "source_dirs"],
+            [
+                "application_source",
+                "base_jdk_home",
+                "current_jdk_home",
+                "base_tool",
+                "current_tool",
+                "target_module",
+            ],
             {
                 "action": {"type": "string"},
-                "jdk_base": {"type": "string"},
-                "jdk_current": {"type": "string"},
-                "source_dirs": {"type": "array"},
+                "application_source": {"type": "string"},
+                "base_jdk_home": {"type": "string"},
+                "current_jdk_home": {"type": "string"},
+                "base_tool": {"type": "string", "enum": ["maven", "gradle"]},
+                "current_tool": {"type": "string", "enum": ["maven", "gradle"]},
+                "target_module": {"type": "string"},
             },
             Path("/tmp/project"),
             Path("/tmp/project/.upgrade-report"),
         )
 
         command = examples[0]["command"]
-        self.assertIn('"jdk_base": "8"', command)
-        self.assertIn('"jdk_current": "17"', command)
-        self.assertIn('"source_dirs"', command)
-
-    def test_source_mapping_resume_examples_cover_accept_and_decline(self):
-        examples = run_step.build_resume_command_examples(
-            [{"id": "continue", "label": "说明后继续"}],
-            ["accept_suggested_mappings"],
-            {
-                "action": {"type": "string"},
-                "accept_suggested_mappings": {"type": "boolean"},
-            },
-            Path("/tmp/project"),
-            Path("/tmp/project/.upgrade-report"),
-        )
-
-        decision_examples = [item for item in examples if item["action"] == "continue"]
-        self.assertEqual(len(decision_examples), 2)
-        self.assertIn('"accept_suggested_mappings": true', decision_examples[0]["command"])
-        self.assertIn('"accept_suggested_mappings": false', decision_examples[1]["command"])
+        self.assertIn('"application_source": "/abs/path/to/application-repo"', command)
+        self.assertIn('"base_jdk_home": "/abs/path/to/jdk-8"', command)
+        self.assertIn('"current_jdk_home": "/abs/path/to/jdk-17"', command)
+        self.assertIn('"base_tool": "maven"', command)
+        self.assertIn('"current_tool": "maven"', command)
+        self.assertIn('"target_module": "app-module"', command)
 
     def test_build_input_normalization_contract_uses_intent_patch_examples(self):
         contract = run_step.build_input_normalization_contract(
@@ -3783,7 +2900,7 @@ class RunStepMainStateTest(unittest.TestCase):
             ),
         }
 
-        with self.assertRaisesRegex(run_step.StepError, "notes 不参与范围控制"):
+        with self.assertRaisesRegex(run_step.StepError, "必须明确提供 scope_mode"):
             run_step.validate_pending_interaction_response(
                 interaction,
                 {
@@ -4003,81 +3120,6 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertNotIn("当前无法确认=", checklist_text)
         self.assertNotIn("当前无法确认示例", checklist_text)
 
-    def test_build_run_context_keeps_dependency_source_mappings(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            project_dir = Path(tmp)
-            report_dir = project_dir / ".upgrade-report"
-            expected_mapping = f"com.example:demo={str((project_dir / 'src/dependency/java').resolve())}"
-            args = SimpleNamespace(
-                project_dir=str(project_dir),
-                report_dir=str(report_dir),
-                base_branch=None,
-                current_branch=None,
-                modules=None,
-                source_dirs=None,
-                dependency_source_dirs=[],
-                dependency_source_mappings=["com.example:demo=src/dependency/java"],
-                source_repo_hints=[],
-                dependency_repo_mappings=[],
-                dependency_git_ref_overrides_json="",
-                base_artifact_path="",
-                current_artifact_path="",
-                base_source_project_dir="",
-                current_source_project_dir="",
-                base_jdk_home="",
-                current_jdk_home="",
-                primary_module="",
-                manual_coord_overrides=[],
-                include_test_scope=False,
-                max_depth=None,
-                tool="maven",
-                strict_risk_gate=False,
-            )
-
-            run_context = run_step.build_run_context(args, {}, {})
-
-        self.assertEqual(run_context["dependency_source_mappings"], [expected_mapping])
-
-    def test_build_run_context_does_not_collapse_dependency_source_mapping_to_repo_root(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            project_dir = Path(tmp)
-            report_dir = project_dir / ".upgrade-report"
-            source_dir = project_dir / "dependency-sources" / "demo" / "src" / "main" / "java"
-            source_dir.mkdir(parents=True)
-            (project_dir / ".git").mkdir()
-            args = SimpleNamespace(
-                project_dir=str(project_dir),
-                report_dir=str(report_dir),
-                base_branch=None,
-                current_branch=None,
-                modules=None,
-                source_dirs=None,
-                dependency_source_dirs=[],
-                dependency_source_mappings=[f"com.example:demo={source_dir}"],
-                source_repo_hints=[],
-                dependency_repo_mappings=[],
-                dependency_git_ref_overrides_json="",
-                base_artifact_path="",
-                current_artifact_path="",
-                base_source_project_dir="",
-                current_source_project_dir="",
-                base_jdk_home="",
-                current_jdk_home="",
-                primary_module="",
-                manual_coord_overrides=[],
-                include_test_scope=False,
-                max_depth=None,
-                tool="maven",
-                strict_risk_gate=False,
-            )
-
-            run_context = run_step.build_run_context(args, {}, {})
-
-        self.assertEqual(
-            run_context["dependency_source_mappings"],
-            [f"com.example:demo={source_dir.resolve()}"],
-        )
-
     def test_build_step_input_context_prefers_current_input_over_previous_output(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp) / ".upgrade-report"
@@ -4130,34 +3172,11 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertEqual(run_context["base_branch"], "")
         self.assertEqual(run_context["current_branch"], "")
 
-    def test_build_run_context_normalizes_string_source_repo_hints(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            project_dir = Path(tmp)
-            repo_dir = project_dir / "dependency-repo"
-            repo_dir.mkdir()
-            (repo_dir / "pom.xml").write_text(
-                "<project><modelVersion>4.0.0</modelVersion>"
-                "<groupId>com.example</groupId><artifactId>demo-lib</artifactId>"
-                "<version>1.0</version></project>",
-                encoding="utf-8",
-            )
-            args = self._make_default_args(project_dir, project_dir / ".upgrade-report")
-            args.source_repo_hints = [str(repo_dir)]
-
-            run_context = run_step.build_run_context(args, {}, {})
-
-        self.assertEqual(len(run_context["source_repo_hints"]), 1)
-        self.assertEqual(run_context["source_repo_hints"][0]["repo_path"], str(repo_dir.resolve()))
-        self.assertEqual(
-            run_context["source_repo_hints"][0]["repo_inferred_coords"],
-            ["com.example:demo-lib"],
-        )
-
-    def test_step1_preflight_triggers_when_entry_mode_is_still_unknown(self):
-        interaction = run_step.build_step1_preflight_interaction({})
+    def test_step0_confirmation_triggers_when_entry_mode_is_still_unknown(self):
+        interaction = run_step.build_step0_confirmation_interaction({})
 
         self.assertIsNotNone(interaction)
-        self.assertEqual(interaction["reason_code"], "missing_step1_entry_inputs")
+        self.assertEqual(interaction["reason_code"], "step0_confirmation_required")
         self.assertEqual(interaction["kind"], "input_request")
 
     def test_review_interaction_continue_advances_to_next_step(self):
@@ -4390,6 +3409,7 @@ class RunStepMainStateTest(unittest.TestCase):
             report_dir.mkdir(parents=True)
             args = self._make_default_args(project_dir, report_dir)
             run_context = {
+                "step0_confirmed": True,
                 "base_branch": "main",
                 "current_branch": "feature/demo",
                 "primary_module": "app",
@@ -4406,6 +3426,7 @@ class RunStepMainStateTest(unittest.TestCase):
             with patch.object(run_step, "validate_run_context_for_step"), \
                  patch.object(run_step, "ensure_exists"), \
                  patch.object(run_step, "run_python", side_effect=fake_run_python), \
+                 patch.object(run_step, "validate_step1_runtime_inputs", return_value={"status": "passed"}), \
                  patch.object(run_step, "run_gate"), \
                  patch.object(run_step, "build_interaction_payload", return_value={}), \
                  patch.object(run_step, "build_run_context", return_value=run_context):
@@ -4430,6 +3451,7 @@ class RunStepMainStateTest(unittest.TestCase):
             (project_dir / "app/src/main/java").mkdir(parents=True)
             args = self._make_default_args(project_dir, report_dir)
             run_context = {
+                "step0_confirmed": True,
                 "tool": "gradle",
                 "base_branch": "main",
                 "current_branch": "feature/demo",
@@ -4437,6 +3459,7 @@ class RunStepMainStateTest(unittest.TestCase):
             }
             captured = []
             with patch.object(run_step, "run_python", side_effect=lambda name, *_args, **_kwargs: captured.append(name)), \
+                    patch.object(run_step, "validate_step1_runtime_inputs", return_value={"status": "passed"}), \
                     patch.object(run_step, "ensure_exists"), \
                     patch.object(run_step, "run_gate"), \
                     patch.object(run_step, "build_interaction_payload", return_value={}):
@@ -4575,7 +3598,7 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertNotIn("--current", captured["script_args"])
         self.assertNotIn("--source-dirs", captured["script_args"])
 
-    def test_execute_step3_does_not_pass_business_inputs_via_cli(self):
+    def test_execute_step3_passes_only_business_scan_roots_via_cli(self):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
             report_dir = project_dir / ".upgrade-report"
@@ -4584,10 +3607,10 @@ class RunStepMainStateTest(unittest.TestCase):
             self._write_text(run_step.step1_current_resolved_path(report_dir), "coord\n", encoding="utf-8")
             args = self._make_default_args(project_dir, report_dir)
             run_context = {
+                "step0_confirmed": True,
                 "analysis_mode": "checkout_build",
                 "source_dirs": [str((project_dir / "src/main/java").resolve())],
                 "source_dirs_status": "provided",
-                "source_provision_choice": "provide",
                 "include_test_scope": True,
             }
             manifest_steps = {"step3": {"gate": "scan"}}
@@ -4606,7 +3629,11 @@ class RunStepMainStateTest(unittest.TestCase):
                 run_step.execute_step("step3", args, manifest_steps, run_context)
 
         self.assertEqual(captured["script_name"], "s3_scan.py")
-        self.assertNotIn("--source-dirs", captured["script_args"])
+        source_index = captured["script_args"].index("--source-dirs")
+        self.assertEqual(
+            captured["script_args"][source_index + 1:],
+            [str((project_dir / "src/main/java").resolve())],
+        )
         self.assertNotIn("--include-test-scope", captured["script_args"])
         self.assertNotIn("--jdk-upgraded", captured["script_args"])
         self.assertNotIn("--sb-major-upgrade", captured["script_args"])
@@ -4621,12 +3648,12 @@ class RunStepMainStateTest(unittest.TestCase):
             self._write_text(run_step.step2_context_path(report_dir), "{}", encoding="utf-8")
             args = self._make_default_args(project_dir, report_dir)
             run_context = {
+                "step0_confirmed": True,
                 "analysis_mode": "checkout_build",
                 "base_branch": "main",
                 "current_branch": "upgrade",
                 "source_dirs": [str((project_dir / "src/main/java").resolve())],
                 "source_dirs_status": "auto_detected",
-                "source_provision_choice": "continue_without",
             }
             manifest_steps = {"step3": {"gate": "scan"}}
             captured = {}
@@ -4642,7 +3669,11 @@ class RunStepMainStateTest(unittest.TestCase):
 
         self.assertEqual(captured["script_name"], "s3_scan.py")
         self.assertNotIn("--no-source", captured["script_args"])
-        self.assertNotIn("--source-dirs", captured["script_args"])
+        source_index = captured["script_args"].index("--source-dirs")
+        self.assertEqual(
+            captured["script_args"][source_index + 1:],
+            [str((project_dir / "src/main/java").resolve())],
+        )
 
     def test_execute_step4_does_not_pass_business_inputs_via_cli(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -4681,7 +3712,6 @@ class RunStepMainStateTest(unittest.TestCase):
             config = project_dir / "binary.json"
             config.write_text("{}", encoding="utf-8")
             run_context["binary_pipeline_config"] = str(config)
-            run_context["source_provision_choice"] = "provide"
             manifest_steps = {"step4": {"gate": "binary_diff"}}
             captured = []
 
@@ -4697,6 +3727,19 @@ class RunStepMainStateTest(unittest.TestCase):
 
             with patch.object(run_step, "validate_run_context_for_step"), \
                  patch.object(run_step, "ensure_exists"), \
+                 patch.object(
+                     run_step,
+                     "materialize_pinned_source_workspace",
+                     return_value=nullcontext({
+                         "source_dirs": list(run_context.get("source_dirs") or []),
+                         "project_root": project_dir,
+                     }),
+                 ), \
+                 patch.object(
+                     run_step,
+                     "materialize_pinned_dependency_source_workspaces",
+                     side_effect=lambda context, _report: nullcontext(context),
+                 ), \
                  patch.object(run_step, "run_python", side_effect=fake_run_python), \
                  patch.object(run_step, "run_gate"), \
                  patch.object(run_step, "build_interaction_payload", return_value={}):
@@ -4725,6 +3768,37 @@ class RunStepMainStateTest(unittest.TestCase):
 
         self.assertIsNone(captured["timeout"])
         self.assertEqual(captured["cwd"], tmp)
+
+    def test_run_python_preserves_structured_pipeline_failure_diagnostics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result_path = root / "pipeline-result.json"
+
+            def fail(_cmd, **_kwargs):
+                result_path.write_text(json.dumps({
+                    "status": "failed",
+                    "reason_code": "BINARY_JDK_PREFLIGHT_FAILED",
+                    "failed_phase": "static_preflight",
+                    "traceback": "preflight traceback",
+                }), encoding="utf-8")
+                return "", "pipeline failed", 1
+
+            with patch.object(run_step, "run_cmd", side_effect=fail):
+                with self.assertRaises(run_step.StepError) as raised:
+                    run_step.run_python(
+                        "binary_pipeline.py",
+                        ["--result-json", str(result_path)],
+                        root,
+                        report_dir=root,
+                    )
+
+        self.assertIn(
+            "BINARY_JDK_PREFLIGHT_FAILED", raised.exception.reason_codes
+        )
+        self.assertEqual(
+            raised.exception.diagnostic["structured_result"]["failed_phase"],
+            "static_preflight",
+        )
 
     def test_run_python_emits_heartbeat_during_silent_long_phase(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -4901,7 +3975,10 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertNotIn("step5_selected_names", state["step5"]["input"])
 
     def test_full_continue_clears_previous_step4_and_step5_target_selection(self):
-        for response_set in ({}, {"selected_targets": []}):
+        for response_set in (
+            {"scope_mode": "full"},
+            {"scope_mode": "full", "selected_targets": []},
+        ):
             with self.subTest(response_set=response_set), tempfile.TemporaryDirectory() as tmp:
                 project_dir = Path(tmp)
                 report_dir = project_dir / ".upgrade-report"
@@ -5767,18 +4844,30 @@ class RunStepMainStateTest(unittest.TestCase):
                     })
                 return None
 
-            with patch.object(run_step, "run_python", side_effect=fake_run_python):
+            with patch.object(run_step, "validate_run_context_for_step"), \
+                    patch.object(
+                        run_step,
+                        "materialize_pinned_source_workspace",
+                        return_value=nullcontext({
+                            "source_dirs": [str(source_dir.resolve())],
+                            "project_root": project_dir,
+                        }),
+                    ), patch.object(
+                        run_step,
+                        "materialize_pinned_dependency_source_workspaces",
+                        side_effect=lambda context, _report: nullcontext(context),
+                    ), patch.object(run_step, "run_python", side_effect=fake_run_python):
                 run_step.execute_step(
                     "step4",
                     args,
                     {"step4": {"gate": "binary_generation"}},
                     {
+                        "step0_confirmed": True,
                         "base_branch": "main",
                         "current_branch": "feature/upgrade",
                         "source_dirs": [str(source_dir.resolve())],
                         "source_dirs_status": "provided",
                         "binary_pipeline_config": str(config),
-                        "source_provision_choice": "continue_without",
                         "dependency_git_ref_overrides": [
                             {
                                 "coord": "com.example:demo-lib",
@@ -5799,13 +4888,11 @@ class RunStepMainStateTest(unittest.TestCase):
             report_dir = Path(tmp)
             step2_context = run_step.step2_context_path(report_dir)
             step2_graph = run_step.step2_dep_graph_path(report_dir)
-            step2_summary = run_step.step2_source_mapping_summary_path(report_dir)
             step1_output = run_step.step1_dep_changes_path(report_dir)
             main_state = run_step.main_state_path(report_dir)
             interaction = self._runtime_state_dir(report_dir) / "interaction.json"
             self._write_text(step2_context, "{}", encoding="utf-8")
             self._write_text(step2_graph, "{}", encoding="utf-8")
-            self._write_text(step2_summary, "{}", encoding="utf-8")
             self._write_text(step1_output, "coord", encoding="utf-8")
             self._write_text(main_state, "{}", encoding="utf-8")
             self._write_text(interaction, "{}", encoding="utf-8")
@@ -5814,7 +4901,6 @@ class RunStepMainStateTest(unittest.TestCase):
 
             self.assertFalse(step2_context.exists())
             self.assertFalse(step2_graph.exists())
-            self.assertFalse(step2_summary.exists())
             self.assertTrue(step1_output.exists())
             self.assertTrue(main_state.exists())
             self.assertTrue(interaction.exists())
@@ -6604,7 +5690,13 @@ class RunStepMainStateTest(unittest.TestCase):
                 "target_module": ".",
             }
 
-            def fail_after_base(run_context, _project, *, on_side_resolved):
+            def fail_after_base(
+                run_context,
+                _project,
+                *,
+                on_side_resolved,
+                **_kwargs,
+            ):
                 partial = dict(run_context)
                 partial["base_resolved_commit"] = "a" * 40
                 partial["base_expected_commit"] = "a" * 40
@@ -6619,22 +5711,18 @@ class RunStepMainStateTest(unittest.TestCase):
                 "argv",
                 [
                     "run_step.py",
-                    "--step", "step1",
+                    "--step", "step0",
                     "--project-dir", str(project_dir),
                     "--report-dir", str(report_dir),
                 ],
             ), patch.object(
                 run_step,
                 "load_manifest",
-                return_value=({}, {"step1": {}}),
+                return_value=({}, {"step0": {"gate": None}}),
             ), patch.object(
                 run_step,
                 "build_run_context",
                 return_value=context,
-            ), patch.object(
-                run_step,
-                "build_step1_preflight_interaction",
-                return_value=None,
             ), patch.object(
                 run_step,
                 "resolve_step1_refs_for_execution",
@@ -6646,7 +5734,7 @@ class RunStepMainStateTest(unittest.TestCase):
 
         self.assertEqual(exit_code, 1)
         self.assertEqual(
-            saved["step1"]["input"]["base_resolved_commit"],
+            saved["step0"]["input"]["base_resolved_commit"],
             "a" * 40,
         )
         self.assertEqual(saved["state"]["status"], "blocked_by_system")
@@ -6736,134 +5824,6 @@ class RunStepMainStateTest(unittest.TestCase):
             "pinned_source_snapshot",
         ):
             self.assertNotIn(stale_field, context)
-
-    def test_existing_report_cli_branch_change_restarts_step1_with_clean_identity(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            project_dir = Path(tmp) / "project"
-            report_dir = project_dir / ".upgrade-report"
-            project_dir.mkdir()
-            args = self._make_default_args(project_dir, report_dir)
-            args.current_branch = "release"
-            main_state = run_step.new_main_state(report_dir)
-            main_state["step1"]["input"] = {
-                "analysis_mode": "checkout_build",
-                "base_branch": "base",
-                "current_branch": "release.DEV",
-                "current_expected_commit": "d" * 40,
-                "current_resolved_commit": "d" * 40,
-                "current_ref_remote_ref": "refs/heads/release.DEV",
-                "current_ref_binding": {
-                    "schema": "java-upgrade-analyzer.remote-ref-binding.v1",
-                    "repo_dir": str(project_dir.resolve()),
-                    "requested_ref": "release.DEV",
-                    "remote": "origin",
-                    "canonical_ref": "refs/heads/release.DEV",
-                    "expected_commit": "d" * 40,
-                    "artifact_path": "",
-                },
-                "pinned_source_snapshot": {"commit": "d" * 40},
-            }
-            main_state["step2"]["input"] = {"marker": "stale-step2"}
-            main_state["state"].update({
-                "current_step": "step4",
-                "completed_step": "step3",
-                "status": "awaiting_user_input",
-                "pending_interaction": {
-                    "step_id": "step4",
-                    "status": "awaiting_user_input",
-                },
-            })
-
-            result = run_step.apply_explicit_cli_step1_branch_overrides(
-                main_state,
-                args,
-                project_dir,
-                report_dir,
-            )
-            saved = run_step.load_main_state(report_dir)
-
-        self.assertTrue(result["changed"])
-        self.assertEqual(result["before"], {"current_branch": "release.DEV"})
-        self.assertEqual(result["after"], {"current_branch": "release"})
-        self.assertEqual(saved["state"]["current_step"], "step1")
-        self.assertIsNone(saved["state"]["pending_interaction"])
-        self.assertEqual(saved["step1"]["input"]["current_branch"], "release")
-        self.assertEqual(saved["step2"]["input"], {})
-        for stale_field in (
-            "current_expected_commit",
-            "current_resolved_commit",
-            "current_ref_remote_ref",
-            "current_ref_binding",
-            "pinned_source_snapshot",
-        ):
-            self.assertNotIn(stale_field, saved["step1"]["input"])
-
-    def test_main_branch_override_bypasses_stale_pending_and_executes_step1(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            project_dir = Path(tmp) / "project"
-            report_dir = project_dir / ".upgrade-report"
-            project_dir.mkdir()
-            main_state = run_step.new_main_state(report_dir)
-            main_state["step1"]["input"] = {
-                "analysis_mode": "checkout_build",
-                "base_branch": "base",
-                "current_branch": "release.DEV",
-                "target_module": ".",
-                "current_expected_commit": "d" * 40,
-                "current_ref_remote_ref": "refs/heads/release.DEV",
-            }
-            main_state["step4"]["input"] = {"marker": "stale-step4"}
-            main_state["state"].update({
-                "current_step": "step4",
-                "completed_step": "step3",
-                "status": "awaiting_user_input",
-                "pending_interaction": {
-                    "step_id": "step4",
-                    "status": "awaiting_user_input",
-                    "options": [{"id": "continue"}],
-                },
-            })
-            run_step.save_main_state(report_dir, main_state)
-            captured = {}
-
-            def execute(step_id, _args, _manifest_steps, run_context, **_kwargs):
-                captured["step_id"] = step_id
-                captured["run_context"] = dict(run_context)
-                raise run_step.StepError("stop after observing routed input")
-
-            with patch.object(
-                run_step,
-                "load_manifest",
-                return_value=({}, {"step1": {}}),
-            ), patch.object(
-                run_step,
-                "build_step1_preflight_interaction",
-                return_value=None,
-            ), patch.object(
-                run_step,
-                "resolve_step1_refs_for_execution",
-                side_effect=lambda context, _project, **_kwargs: (context, None),
-            ), patch.object(
-                run_step,
-                "execute_step",
-                side_effect=execute,
-            ):
-                exit_code = run_step.main(
-                    [
-                        "--step", "auto",
-                        "--project-dir", str(project_dir),
-                        "--report-dir", str(report_dir),
-                        "--current-branch", "release",
-                    ],
-                    _skip_environment_contract=True,
-                )
-
-        self.assertEqual(exit_code, 1)
-        self.assertEqual(captured["step_id"], "step1")
-        self.assertEqual(captured["run_context"]["current_branch"], "release")
-        self.assertFalse(captured["run_context"].get("current_expected_commit"))
-        self.assertFalse(captured["run_context"].get("current_ref_remote_ref"))
-        self.assertFalse(captured["run_context"].get("current_ref_binding"))
 
     def test_step1_ref_preflight_resolves_both_branches_from_project_remote(self):
         with tempfile.TemporaryDirectory() as tmp:

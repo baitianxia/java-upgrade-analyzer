@@ -15,9 +15,184 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR / "scripts"))
 
 import binary_validation_oracle as oracle  # noqa: E402
+from binary_tool_execution import BinaryToolFailure, BinaryToolResult  # noqa: E402
 
 
 class BinaryValidationPerformanceSafetyTest(unittest.TestCase):
+    def test_cross_version_oracle_covers_fields_but_not_owner_definition_failures(self):
+        field_edge = (
+            "demo.Caller", "field", "()V", "demo.Api", "value", "I",
+            "getfield", 4,
+        )
+        inherited_edge = (
+            "demo.Caller", "inherited", "()V", "demo.Child", "gone", "()V",
+            "invokevirtual", 7,
+        )
+        removed_class_edge = (
+            "demo.Caller", "removedClass", "()V", "demo.Gone", "call", "()V",
+            "invokevirtual", 10,
+        )
+        failed_definition_edge = (
+            "demo.Caller", "broken", "()V", "demo.Broken", "call", "()V",
+            "invokevirtual", 13,
+        )
+
+        def ready(*members, super_name="java/lang/Object"):
+            return {
+                "status": "definition_ready",
+                "super_name": super_name,
+                "interfaces": [],
+                "members": list(members),
+            }
+
+        observations = {
+            "base": {
+                "demo/Api": ready("field|value|I|1"),
+                "demo/Child": ready(super_name="demo/Parent"),
+                "demo/Parent": ready("method|gone|()V|1"),
+                "demo/Gone": ready("method|call|()V|1"),
+                "demo/Broken": ready("method|call|()V|1"),
+                "java/lang/Object": ready(super_name=""),
+            },
+            "current": {
+                "demo/Api": ready(),
+                "demo/Child": ready(super_name="demo/Parent"),
+                "demo/Parent": ready(),
+                "demo/Gone": {"status": "not_found"},
+                "demo/Broken": {
+                    "status": "definition_failed",
+                    "failure_phase": "superclass_linkage",
+                },
+                "java/lang/Object": ready(super_name=""),
+            },
+        }
+
+        def decision(edge, base_owner):
+            return {
+                "reason_code": "RUNTIME_MEMBER_RESOLUTION_CHANGED",
+                "fact_scope": {
+                    "class_name": base_owner,
+                    "member_name": edge[4],
+                    "descriptor": edge[5],
+                },
+                "evidence": {
+                    "semantic_caller_edge": {
+                        "caller_class": edge[0].replace(".", "/"),
+                        "caller_member": edge[1],
+                        "caller_descriptor": edge[2],
+                        "bytecode_offset": edge[7],
+                    },
+                    "base_resolution": {"resolved_owner": base_owner},
+                    "current_resolution": {},
+                },
+            }
+
+        with tempfile.TemporaryDirectory() as temp_text:
+            generation = Path(temp_text)
+            (generation / "binary_decisions.json").write_text(
+                json.dumps({
+                    "authoritative_change_facts": [
+                        decision(field_edge, "demo/Api"),
+                        decision(inherited_edge, "demo/Parent"),
+                    ]
+                }),
+                encoding="utf-8",
+            )
+            (generation / "binary_formal_results.json").write_text(
+                json.dumps({"resource_activation_results": []}),
+                encoding="utf-8",
+            )
+            edges = [
+                field_edge, inherited_edge, removed_class_edge,
+                failed_definition_edge,
+            ]
+            truth_parts = {
+                "base": {
+                    "direct_edges": edges,
+                    "resource_selections": [],
+                },
+                "current": {
+                    "direct_edges": edges,
+                    "resource_selections": [],
+                    "type_edges": [],
+                },
+            }
+
+            issues, truth = oracle._validate_cross_version_semantics(
+                generation, {"current": {}}, truth_parts, observations
+            )
+
+        self.assertEqual(issues, [])
+        self.assertEqual(len(truth["member_resolution_changes"]), 2)
+        self.assertEqual(
+            {row[4] for row in truth["member_resolution_changes"]},
+            {"demo.Api", "demo.Parent"},
+        )
+
+    def test_parent_first_oracle_artifacts_follow_effective_loader_order(self):
+        artifacts = [
+            {"path": "/fixture/child-2.jar", "loader_realm": "child", "slot": 2},
+            {"path": "/fixture/parent.jar", "loader_realm": "parent", "slot": 0},
+            {"path": "/fixture/child-1.jar", "loader_realm": "child", "slot": 1},
+        ]
+        topology = {
+            "realms": [
+                {"identity": "platform", "kind": "platform"},
+                {
+                    "identity": "parent", "kind": "url",
+                    "parent": "platform", "delegation": "parent_first",
+                    "module_mode": "unnamed",
+                },
+                {
+                    "identity": "child", "kind": "url",
+                    "parent": "parent", "delegation": "parent_first",
+                    "module_mode": "unnamed",
+                },
+            ]
+        }
+
+        selected = oracle._oracle_artifacts_for_entrypoint_realms(
+            artifacts, topology, ["child"]
+        )
+
+        self.assertEqual(
+            [item["path"] for item in selected],
+            [
+                "/fixture/parent.jar",
+                "/fixture/child-1.jar",
+                "/fixture/child-2.jar",
+            ],
+        )
+
+    def test_oracle_loader_flattening_fails_closed_on_ambiguous_realms(self):
+        artifacts = [
+            {"path": "/fixture/a.jar", "loader_realm": "a", "slot": 0},
+            {"path": "/fixture/b.jar", "loader_realm": "b", "slot": 0},
+        ]
+        topology = {
+            "realms": [
+                {"identity": "platform", "kind": "platform"},
+                {
+                    "identity": "a", "kind": "url", "parent": "platform",
+                    "delegation": "parent_first", "module_mode": "unnamed",
+                },
+                {
+                    "identity": "b", "kind": "url", "parent": "platform",
+                    "delegation": "parent_first", "module_mode": "unnamed",
+                },
+            ]
+        }
+
+        with self.assertRaises(oracle.BinaryValidationError) as error:
+            oracle._oracle_artifacts_for_entrypoint_realms(
+                artifacts, topology, ["a", "b"]
+            )
+
+        self.assertEqual(
+            error.exception.reason_code,
+            "BINARY_ORACLE_ENTRYPOINT_REALM_ORDER_AMBIGUOUS",
+        )
+
     @staticmethod
     def edge_connection():
         connection = sqlite3.connect(":memory:")
@@ -69,6 +244,7 @@ class BinaryValidationPerformanceSafetyTest(unittest.TestCase):
 
     def test_runtime_oracle_batches_every_class_without_sampling(self):
         observed_batches = []
+        progress_events = []
 
         def execute(command, **_kwargs):
             names = Path(command[-1]).read_text(encoding="utf-8").splitlines()
@@ -85,6 +261,8 @@ class BinaryValidationPerformanceSafetyTest(unittest.TestCase):
                 Path("/fixture/jdk"),
                 [{"path": "/fixture/app.jar"}],
                 classes,
+                progress_callback=lambda *event: progress_events.append(event),
+                progress_label="current",
             )
 
         self.assertEqual([len(batch) for batch in observed_batches], [2, 2, 1])
@@ -94,9 +272,18 @@ class BinaryValidationPerformanceSafetyTest(unittest.TestCase):
         )
         self.assertEqual(set(observations), set(classes))
         self.assertEqual(helper_identity, "helper-identity")
+        self.assertEqual(
+            [event[2] for event in progress_events], [2, 4, 5]
+        )
+        self.assertTrue(
+            all(event[0] == "validation-runtime" for event in progress_events)
+        )
 
     def test_runtime_oracle_fails_closed_on_incomplete_batch_output(self):
+        calls = []
+
         def incomplete(command, **_kwargs):
+            calls.append(command)
             names = Path(command[-1]).read_text(encoding="utf-8").splitlines()
             return self.completed_for(names[:-1])
 
@@ -111,11 +298,45 @@ class BinaryValidationPerformanceSafetyTest(unittest.TestCase):
                 Path("/fixture/jdk"),
                 [{"path": "/fixture/app.jar"}],
                 ["demo/A", "demo/B"],
+                max_attempts=3,
             )
 
         self.assertEqual(
             error.exception.reason_code, "BINARY_ORACLE_OUTPUT_INCOMPLETE"
         )
+        self.assertEqual(len(calls), 1)
+
+    def test_runtime_oracle_retries_a_transient_timeout_once(self):
+        calls = []
+
+        def execute(command, **_kwargs):
+            calls.append(command)
+            if len(calls) == 1:
+                failure = BinaryToolFailure(
+                    stage="binary_oracle.runtime_observation",
+                    reason_code="BINARY_ORACLE_EXECUTION_TIMEOUT",
+                    failure_kind="timeout",
+                    command=tuple(command),
+                    timeout_seconds=1,
+                    returncode=None,
+                    stderr="timed out",
+                )
+                return BinaryToolResult("", "", -1, failure)
+            names = Path(command[-1]).read_text(encoding="utf-8").splitlines()
+            return self.completed_for(names)
+
+        with patch.object(
+            oracle, "_compile_oracle", return_value="helper-identity"
+        ), patch.object(oracle, "execute_binary_tool", side_effect=execute):
+            observations, _helper = oracle._observe_classes(
+                Path("/fixture/jdk"),
+                [{"path": "/fixture/app.jar"}],
+                ["demo/A"],
+                max_attempts=2,
+            )
+
+        self.assertEqual(len(calls), 2)
+        self.assertIn("demo/A", observations)
 
     def test_compressed_javap_cache_round_trips_all_evidence(self):
         evidence = {
@@ -323,6 +544,7 @@ class BinaryValidationPerformanceSafetyTest(unittest.TestCase):
         entrypoint_gaps=(),
         trace_gaps=(),
         result_overrides=None,
+        reported_overrides=None,
     ):
         generation = Path(generation)
         analysis_context = "analysis-context"
@@ -414,7 +636,7 @@ class BinaryValidationPerformanceSafetyTest(unittest.TestCase):
             "reachability_status": status,
             "is_reachable": False,
             "impact_conclusion": "inconclusive",
-            "runtime_verification_status": "required_not_executed",
+            "runtime_verification_status": "undetermined",
             "runtime_verification_executed_by_system": False,
             "path_set_complete": complete,
             "exact_path_exists": False,
@@ -424,6 +646,7 @@ class BinaryValidationPerformanceSafetyTest(unittest.TestCase):
             "base_dependency_coords": [],
             "current_dependency_coords": [],
         }
+        reported_api.update(reported_overrides or {})
         payloads = {
             "binary_decisions.json": {
                 "analysis_context_identity": analysis_context,
@@ -559,6 +782,25 @@ class BinaryValidationPerformanceSafetyTest(unittest.TestCase):
 
         self.assertIn(
             "ORACLE_FORMAL_STATE_MISMATCH",
+            {item["reason_code"] for item in issues},
+        )
+
+    def test_closed_world_rejects_reachable_runtime_requirement_on_unreachable_api(self):
+        with tempfile.TemporaryDirectory() as temp_text:
+            generation = Path(temp_text)
+            self._write_closed_world_fixture(
+                generation,
+                reported_overrides={
+                    "runtime_verification_status": "required_not_executed"
+                },
+            )
+            issues, _truth = oracle._validate_closed_world_results(
+                generation,
+                entrypoint_truth=self._empty_entrypoint_truth(),
+            )
+
+        self.assertIn(
+            "ORACLE_API_AGGREGATION_MISMATCH",
             {item["reason_code"] for item in issues},
         )
 

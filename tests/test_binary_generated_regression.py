@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import binary_asm_helper  # noqa: E402
 from binary_pipeline import run_pipeline  # noqa: E402
 from binary_fact_store import BinaryFactStore  # noqa: E402
+from binary_result_truth import evaluate_formal_result_truth  # noqa: E402
 from binary_regression_topology import (  # noqa: E402
     expected_changed_reachability,
     generate_topology,
@@ -126,7 +127,7 @@ class BinaryGeneratedRegressionTest(unittest.TestCase):
             },
         }
 
-    def run_topology(self, topology, label, *, include_unrelated=False):
+    def run_topology_payload(self, topology, label, *, include_unrelated=False):
         base = self.compile_jar(
             f"{label}-base",
             java_sources(topology, current=False, include_unrelated=include_unrelated),
@@ -148,9 +149,14 @@ class BinaryGeneratedRegressionTest(unittest.TestCase):
             },
         }
         result = run_pipeline(config, output_root=self.root / f"{label}-report")
-        payload = json.loads(
+        return json.loads(
             (Path(result["generation_directory"]) / "binary_formal_results.json")
             .read_text(encoding="utf-8")
+        )
+
+    def run_topology(self, topology, label, *, include_unrelated=False):
+        payload = self.run_topology_payload(
+            topology, label, include_unrelated=include_unrelated
         )
         return {
             row["display_owner"]: row["reachability_status"]
@@ -169,10 +175,44 @@ class BinaryGeneratedRegressionTest(unittest.TestCase):
 
     def test_generated_binary_graph_matches_independent_reachability_oracle(self):
         topology = generate_topology(43, node_count=18)
+        payload = self.run_topology_payload(topology, "generated")
+        observed_statuses = {
+            row["display_owner"]: row["reachability_status"]
+            for row in payload["by_api"]
+            if row["display_owner"] in expected_changed_reachability(topology)
+            and row["display_member"] == "call"
+        }
         self.assertEqual(
-            self.run_topology(topology, "generated"),
+            observed_statuses,
             expected_changed_reachability(topology),
         )
+        truth = json.loads((
+            ROOT / "tests" / "fixtures" / "binary_first" / "golden_truth"
+            / "generated_topology_seed_43.json"
+        ).read_text(encoding="utf-8"))
+        declared_statuses = {
+            row["owner"]: row["reachability_status"]
+            for row in truth["expected_results"]
+        }
+
+        self.assertEqual(truth["input"]["topology_identity"], topology.identity)
+        self.assertEqual(
+            declared_statuses,
+            expected_changed_reachability(topology),
+            "golden truth must agree with the generator's independent graph oracle",
+        )
+        evaluation = evaluate_formal_result_truth(payload, truth)
+
+        self.assertEqual(evaluation["status"], "passed", evaluation["issues"])
+        self.assertEqual(evaluation["metrics"], {
+            "expected_result_count": 2,
+            "actual_result_count": 2,
+            "true_positive_count": 2,
+            "false_negative_count": 0,
+            "false_positive_count": 0,
+            "state_mismatch_count": 0,
+            "path_mismatch_count": 0,
+        })
 
     def test_unrelated_binary_addition_is_metamorphically_invariant(self):
         topology = generate_topology(19, node_count=14)

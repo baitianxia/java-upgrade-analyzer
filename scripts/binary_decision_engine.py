@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from typing import Any, Iterable, Mapping
+import zlib
 
 from binary_artifact_diff import _mr_class_scope
 from binary_fact_store import BinaryFactStore
@@ -134,6 +136,11 @@ class BinaryDecisionEngine:
         self._current_resources = self._resource_records_by_key(
             current_reconciliation.resource_selections
         )
+        self._paired_semantic_member_edges_cache = None
+        self._removed_member_consumer_edges_cache = None
+        self._current_hierarchy_parent_cache: dict[
+            tuple[str, str], tuple[str, ...]
+        ] = {}
 
     @staticmethod
     def _semantic_member_edges(
@@ -173,7 +180,7 @@ class BinaryDecisionEngine:
             JOIN artifact_instances AS artifact
               ON artifact.artifact_instance_identity=
                  edge.caller_artifact_instance_identity
-            WHERE edge.edge_kind='method'
+            WHERE edge.edge_kind IN ('method', 'field')
             ORDER BY edge.rowid
             """
         ):
@@ -242,6 +249,72 @@ class BinaryDecisionEngine:
                 )
             output[key] = (edge, resolution, artifact)
         return output
+
+    def _paired_semantic_member_edges(self):
+        cached = self._paired_semantic_member_edges_cache
+        if cached is not None:
+            return cached
+        cached = (
+            self._semantic_member_edges(
+                self.base_store,
+                self.base_runtime,
+                self._base_artifact_lineages,
+            ),
+            self._semantic_member_edges(
+                self.current_store,
+                self.current_runtime,
+                self._current_artifact_lineages,
+            ),
+        )
+        self._paired_semantic_member_edges_cache = cached
+        return cached
+
+    def _removed_member_consumer_edges(self) -> Mapping[tuple[str, ...], tuple[str, ...]]:
+        """Bind current unresolved edges to the member resolved on the base side.
+
+        A JVM reference may name a child while member resolution selects a
+        declaration inherited from a parent.  Once that parent declaration is
+        removed, the current-side edge has only the child symbolic owner and a
+        ``no_such_member`` status.  Preserve the paired base resolution here so
+        tracing can attribute the failing edge to the declaration that changed.
+        """
+
+        cached = self._removed_member_consumer_edges_cache
+        if cached is not None:
+            return cached
+        base_edges, current_edges = self._paired_semantic_member_edges()
+        grouped: dict[tuple[str, ...], set[str]] = {}
+        for semantic_key in set(base_edges).intersection(current_edges):
+            base_edge, base_resolution, _ = base_edges[semantic_key]
+            current_edge, current_resolution, _ = current_edges[semantic_key]
+            if (
+                base_resolution.get("member_resolution_status") != "resolved"
+                or current_resolution.get("member_resolution_status")
+                != "no_such_member"
+            ):
+                continue
+            owner = str(base_resolution.get("resolved_owner") or "")
+            realm = str(
+                current_resolution.get("initiating_loader_realm_identity")
+                or base_resolution.get("initiating_loader_realm_identity")
+                or ""
+            )
+            kind = "field" if base_edge.get("edge_kind") == "field" else "method"
+            target = (
+                realm,
+                owner,
+                kind,
+                str(base_edge.get("symbolic_name") or ""),
+                str(base_edge.get("symbolic_descriptor") or ""),
+            )
+            grouped.setdefault(target, set()).add(
+                str(current_edge["direct_edge_identity"])
+            )
+        cached = {
+            key: tuple(sorted(edge_ids)) for key, edge_ids in grouped.items()
+        }
+        self._removed_member_consumer_edges_cache = cached
+        return cached
 
     def _artifact_lineages(self, identity_field: str) -> dict[str, str]:
         output = {}
@@ -357,6 +430,7 @@ class BinaryDecisionEngine:
         self,
         store: BinaryFactStore,
         record: Mapping[str, Any] | None,
+        artifact_lineages: Mapping[str, str],
     ) -> str:
         if not record:
             return "ABSENT"
@@ -379,6 +453,19 @@ class BinaryDecisionEngine:
                 parameters=(record.get("selected_artifact_instance_identity"),),
             )
             artifact = artifact_rows[0] if artifact_rows else {}
+            artifact_identity = str(
+                record.get("selected_artifact_instance_identity") or ""
+            )
+            lineage = str(artifact_lineages.get(artifact_identity) or "")
+            if not lineage:
+                # A content-addressed extraction path is provenance, not JVM
+                # provider topology.  When no explicit cross-version lineage
+                # exists, the stable runtime slot is the only safe comparable
+                # provider identity.
+                lineage = (
+                    f"runtime-slot:{artifact.get('runtime_path_kind')}:"
+                    f"{artifact.get('runtime_classpath_index')}"
+                )
             payload = {
                 "status": "resolved",
                 "class_name": class_row["class_name"],
@@ -386,7 +473,7 @@ class BinaryDecisionEngine:
                 "defining_loader_realm_identity": record.get("selected_defining_loader_realm_identity"),
                 "runtime_path_kind": artifact.get("runtime_path_kind"),
                 "runtime_classpath_index": artifact.get("runtime_classpath_index"),
-                "runtime_code_source_origin_identity": artifact.get("runtime_code_source_origin_identity"),
+                "logical_dependency_lineage": lineage,
             }
         else:
             payload = {
@@ -787,6 +874,29 @@ class BinaryDecisionEngine:
                         )
                         if base_selected != current_selected and not counterpart_is_definitive_absence:
                             gaps.append("artifact_delta_provider_correspondence_changed")
+                        evidence = {
+                            "upstream_artifact_observed_delta_identity": (
+                                upstream_observed
+                            ),
+                            "base_provider_binding_identity": (base_provider or {}).get("provider_binding_identity"),
+                            "current_provider_binding_identity": (current_provider or {}).get("provider_binding_identity"),
+                            "base_member_fingerprint": member_delta.get("base_member_fingerprint"),
+                            "current_member_fingerprint": member_delta.get("current_member_fingerprint"),
+                            "base_contract": member_delta.get("base_contract"),
+                            "current_contract": member_delta.get("current_contract"),
+                        }
+                        if change_kind == "removed" and fact_kind in {"method", "field"}:
+                            unresolved_edges = self._removed_member_consumer_edges().get((
+                                realm,
+                                class_name,
+                                fact_kind,
+                                str(scope.get("member_name") or ""),
+                                str(scope.get("descriptor") or ""),
+                            ), ())
+                            if unresolved_edges:
+                                evidence["current_unresolved_direct_edge_identities"] = list(
+                                    unresolved_edges
+                                )
                         self._decision(
                             observed_identity=observed,
                             channel="diagnostic" if gaps else "authoritative",
@@ -798,17 +908,7 @@ class BinaryDecisionEngine:
                             fact_scope=scope,
                             target_identity=target,
                             coverage_gaps=gaps,
-                            evidence={
-                                "upstream_artifact_observed_delta_identity": (
-                                    upstream_observed
-                                ),
-                                "base_provider_binding_identity": (base_provider or {}).get("provider_binding_identity"),
-                                "current_provider_binding_identity": (current_provider or {}).get("provider_binding_identity"),
-                                "base_member_fingerprint": member_delta.get("base_member_fingerprint"),
-                                "current_member_fingerprint": member_delta.get("current_member_fingerprint"),
-                                "base_contract": member_delta.get("base_contract"),
-                                "current_contract": member_delta.get("current_contract"),
-                            },
+                            evidence=evidence,
                             dependency_artifacts=dependency_artifacts,
                         )
 
@@ -907,8 +1007,12 @@ class BinaryDecisionEngine:
         for realm, class_name in all_keys:
             base = self._base_providers.get((realm, class_name))
             current = self._current_providers.get((realm, class_name))
-            old_fp = self._provider_fingerprint(self.base_store, base)
-            new_fp = self._provider_fingerprint(self.current_store, current)
+            old_fp = self._provider_fingerprint(
+                self.base_store, base, self._base_artifact_lineages
+            )
+            new_fp = self._provider_fingerprint(
+                self.current_store, current, self._current_artifact_lineages
+            )
             scope = {
                 "initiating_loader_realm_identity": realm,
                 "class_name": class_name,
@@ -930,6 +1034,23 @@ class BinaryDecisionEngine:
                 "class_name": class_name,
             })
             if old_fp != new_fp:
+                base_identity = str(
+                    (base or {}).get("selected_artifact_instance_identity") or ""
+                )
+                current_identity = str(
+                    (current or {}).get("selected_artifact_instance_identity") or ""
+                )
+                base_lineage = str(
+                    self._base_artifact_lineages.get(base_identity) or ""
+                )
+                current_lineage = str(
+                    self._current_artifact_lineages.get(current_identity) or ""
+                )
+                lineage = (
+                    base_lineage
+                    if base_lineage and base_lineage == current_lineage
+                    else ""
+                )
                 observed = observed_delta_identity(
                     delta_source_kind="provider_topology",
                     comparison_or_runtime_scope={"runtime_comparison_identity": self.runtime_comparison_identity},
@@ -947,8 +1068,9 @@ class BinaryDecisionEngine:
                     coverage_gaps=gaps,
                     evidence={"base_provider": base, "current_provider": current},
                     dependency_artifacts=self._dependency_artifacts(
-                        str((base or {}).get("selected_artifact_instance_identity") or ""),
-                        str((current or {}).get("selected_artifact_instance_identity") or ""),
+                        base_identity,
+                        current_identity,
+                        lineage=lineage,
                     ),
                 )
 
@@ -987,24 +1109,16 @@ class BinaryDecisionEngine:
         self._process_resource_outcome_deltas()
 
     def _process_member_resolution_deltas(self) -> None:
-        base_edges = self._semantic_member_edges(
-            self.base_store,
-            self.base_runtime,
-            self._base_artifact_lineages,
-        )
-        current_edges = self._semantic_member_edges(
-            self.current_store,
-            self.current_runtime,
-            self._current_artifact_lineages,
-        )
+        base_edges, current_edges = self._paired_semantic_member_edges()
         for key in sorted(set(base_edges).intersection(current_edges)):
             base_edge, base_resolution, _base_caller_artifact = base_edges[key]
             current_edge, current_resolution, _current_caller_artifact = current_edges[key]
-            if (
-                base_resolution.get("member_resolution_status") != "resolved"
-                or current_resolution.get("member_resolution_status") != "resolved"
-            ):
-                continue
+            base_status = str(
+                base_resolution.get("member_resolution_status") or ""
+            )
+            current_status = str(
+                current_resolution.get("member_resolution_status") or ""
+            )
             base_owner = str(base_resolution.get("resolved_owner") or "")
             current_owner = str(current_resolution.get("resolved_owner") or "")
             base_realm = str(
@@ -1013,18 +1127,40 @@ class BinaryDecisionEngine:
             current_realm = str(
                 current_resolution.get("resolved_defining_loader_realm_identity") or ""
             )
-            if (base_owner, base_realm) == (current_owner, current_realm):
+            base_outcome = (base_status, base_owner, base_realm)
+            current_outcome = (current_status, current_owner, current_realm)
+            if base_outcome == current_outcome:
                 continue
             realm = str(
                 current_resolution.get("initiating_loader_realm_identity")
                 or base_resolution.get("initiating_loader_realm_identity")
                 or ""
             )
-            owner = str(current_edge.get("symbolic_owner") or "")
+            symbolic_owner = str(current_edge.get("symbolic_owner") or "")
+            # A reference may name Child.m while JVM resolution selected the
+            # declaration Parent.m on the base side.  If that declaration is
+            # removed, the public changed-API identity is Parent.m; emitting a
+            # second synthetic Child.m change creates a false positive and
+            # breaks path continuity between the artifact delta and runtime
+            # resolution evidence.
+            owner = (
+                base_owner
+                if (
+                    base_status == "resolved"
+                    and current_status == "no_such_member"
+                    and base_owner
+                    and self._current_hierarchy_contains(
+                        realm, symbolic_owner, base_owner
+                    )
+                )
+                else symbolic_owner
+            )
             scope = {
                 "initiating_loader_realm_identity": realm,
                 "class_name": owner,
-                "member_kind": "method",
+                "member_kind": (
+                    "field" if current_edge.get("edge_kind") == "field" else "method"
+                ),
                 "member_name": str(current_edge.get("symbolic_name") or ""),
                 "descriptor": str(current_edge.get("symbolic_descriptor") or ""),
                 "member_change_kind": "resolution_changed",
@@ -1045,23 +1181,36 @@ class BinaryDecisionEngine:
                     "instruction_index": key[5],
                 },
                 base_fingerprint=_identity("member_resolution_outcome", {
-                    "status": "resolved", "owner": base_owner, "realm": base_realm,
+                    "status": base_status, "owner": base_owner,
+                    "realm": base_realm,
                 }),
                 current_fingerprint=_identity("member_resolution_outcome", {
-                    "status": "resolved", "owner": current_owner, "realm": current_realm,
+                    "status": current_status, "owner": current_owner,
+                    "realm": current_realm,
                 }),
             )
             base_provider = self._base_providers.get((realm, owner))
             current_provider = self._current_providers.get((realm, owner))
             target = self._member_target(realm, owner, scope)
+            definite = {base_status, current_status}.issubset({
+                "resolved", "no_such_member",
+            })
             self._decision(
                 observed_identity=observed,
-                channel="authoritative",
-                reason_code="RUNTIME_MEMBER_RESOLUTION_CHANGED",
+                channel="authoritative" if definite else "diagnostic",
+                reason_code=(
+                    "RUNTIME_MEMBER_RESOLUTION_CHANGED"
+                    if definite else
+                    "RUNTIME_MEMBER_RESOLUTION_CHANGE_INCOMPLETE"
+                ),
                 fact_kind="member_resolution",
                 fact_scope=scope,
                 target_identity=target,
+                coverage_gaps=(
+                    () if definite else ("member_resolution_outcome_not_definite",)
+                ),
                 evidence={
+                    "symbolic_owner": symbolic_owner,
                     "semantic_caller_edge": {
                         "logical_dependency_lineage": key[0],
                         "caller_class": key[2],
@@ -1080,6 +1229,89 @@ class BinaryDecisionEngine:
                     str((current_provider or {}).get("selected_artifact_instance_identity") or ""),
                 ),
             )
+
+    def _current_hierarchy_contains(
+        self, realm: str, child: str, ancestor: str,
+    ) -> bool:
+        """Whether the selected current runtime hierarchy still contains ancestor."""
+        if not child or not ancestor:
+            return False
+        if child == ancestor:
+            return True
+        pending = [child]
+        visited = set()
+        while pending:
+            candidate = pending.pop()
+            if candidate in visited:
+                continue
+            visited.add(candidate)
+            for parent in self._current_class_parents(realm, candidate):
+                if not parent:
+                    continue
+                if parent == ancestor:
+                    return True
+                if parent not in visited:
+                    pending.append(parent)
+        return False
+
+    def _current_class_parents(
+        self, realm: str, class_name: str,
+    ) -> tuple[str, ...]:
+        """Read parents from the exact class variant selected for this realm.
+
+        Target-JVM verification proves that definition succeeds, but its public
+        observation intentionally does not duplicate the parsed hierarchy.  The
+        selected variant's immutable ASM fact is therefore the authoritative
+        source for superclass and interface traversal.
+        """
+        cache = getattr(self, "_current_hierarchy_parent_cache", None)
+        if cache is None:
+            cache = {}
+            self._current_hierarchy_parent_cache = cache
+        key = (realm, class_name)
+        if key in cache:
+            return cache[key]
+
+        parents: tuple[str, ...] = ()
+        provider = self._current_providers.get(key) or {}
+        variant = str(provider.get("selected_class_variant_identity") or "")
+        if variant:
+            row = self.current_store.connection.execute(
+                "SELECT fact_zlib FROM classes WHERE class_variant_identity=?",
+                (variant,),
+            ).fetchone()
+            if row is not None:
+                compressed = row["fact_zlib"] if hasattr(row, "keys") else row[0]
+                fact = json.loads(zlib.decompress(compressed).decode("utf-8"))
+                parents = tuple(
+                    str(value)
+                    for value in (
+                        fact.get("super_name"),
+                        *(fact.get("interfaces") or ()),
+                    )
+                    if value
+                )
+
+        # Keep compatibility with richer verifier implementations without
+        # relying on hierarchy fields that are absent from today's protocol.
+        if not parents:
+            definition = self._current_definitions.get(key) or {}
+            observation = (
+                (definition.get("evidence") or {}).get(
+                    "target_jvm_verification"
+                )
+                or {}
+            )
+            parents = tuple(
+                str(value)
+                for value in (
+                    observation.get("super_name"),
+                    *(observation.get("interfaces") or ()),
+                )
+                if value
+            )
+        cache[key] = parents
+        return parents
 
     def build(self) -> BinaryDecisionBundle:
         self._process_artifact_diffs()

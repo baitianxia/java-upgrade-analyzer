@@ -1,0 +1,89 @@
+{
+  "schema": "java-upgrade-analyzer.blackbox-truth.v1",
+  "case_id": "descriptor-change-v1",
+  "dataset_version": 1,
+  "scope": "closed_set",
+  "system_generated": false,
+  "human_review": {"status": "not_claimed", "reviewer": ""},
+  "input_evidence": {
+    "algorithm": "sha256-path-nul-content-nul-v1",
+    "source_tree_sha256": "665e6d0bf2cd190971218d9559a27fb11039a03627280aed65f35ec74c94ce7b",
+    "case_algorithm": "sha256-canonical-json-v1",
+    "case_sha256": "902eebb22334ad967619ef29d1f9ae8694c2170a086e9d72065359085f5045fa",
+    "source_files": [
+      "src/base/contract/SignatureApi.java",
+      "src/business/contract/SignatureApp.java",
+      "src/current/contract/SignatureApi.java",
+      "src/oracle/contract/OracleMain.java"
+    ]
+  },
+  "oracle_producers": [
+    {"id": "openjdk-javap-signature-inventory", "organization": "OpenJDK", "mechanism": "independent_bytecode_inventory", "verifies": ["complete_old_and_new_descriptor_set", "complete_direct_call_graph"]},
+    {"id": "openjdk-jvm-symbol-linker", "organization": "OpenJDK", "mechanism": "actual_jvm_execution", "verifies": ["base_execution_succeeds", "current_no_such_member_error"]}
+  ],
+  "oracle_implementations": [
+    {"path": "tests/blackbox/oracles/openjdk_oracle.py", "sha256": "6e72442077371b86c943f790b5982144497725200da3e89f22f66ca2bfee38ca"}
+  ],
+  "completeness": {
+    "argument": "OpenJDK javap enumerates every public member of the only changed class on both sides. The symmetric difference contains exactly four removed and four added descriptors; unchanged members and normalized bodies are excluded. The three declared roots form the complete reachable graph. A separately packaged JVM runner proves each old symbolic reference succeeds on base and fails with the specified linkage error on current.",
+    "verified_dimensions": ["api_identity", "jvm_descriptor", "closed_result_set", "entrypoint_reachability", "static_linkage"],
+    "known_limits": []
+  },
+  "expected_result_count": 8,
+  "expected_results": [
+    {
+      "owner": "contract/SignatureApi", "member": "changedReturn", "descriptor": "()Ljava/lang/String;", "member_kind": "method",
+      "dependency_lineages": ["blackbox:signature-lib"], "base_dependency_coords": ["blackbox:signature-lib:1.0"], "current_dependency_coords": ["blackbox:signature-lib:2.0"],
+      "reachability_status": "reachable", "static_linkage_status": "incompatible_if_executed", "impact_conclusion": "probable_impact", "runtime_verification_status": "required_not_executed",
+      "exact_path_exists": true, "possible_path_exists": false, "path_set_complete": true,
+      "paths": [{"certainty": "exact", "text": "contract.SignatureApp.entryReturn(contract.SignatureApi) → contract.SignatureApi.changedReturn()"}]
+    },
+    {
+      "owner": "contract/SignatureApi", "member": "changedParameter", "descriptor": "(Ljava/lang/String;)Ljava/lang/String;", "member_kind": "method",
+      "dependency_lineages": ["blackbox:signature-lib"], "base_dependency_coords": ["blackbox:signature-lib:1.0"], "current_dependency_coords": ["blackbox:signature-lib:2.0"],
+      "reachability_status": "reachable", "static_linkage_status": "incompatible_if_executed", "impact_conclusion": "probable_impact", "runtime_verification_status": "required_not_executed",
+      "exact_path_exists": true, "possible_path_exists": false, "path_set_complete": true,
+      "paths": [{"certainty": "exact", "text": "contract.SignatureApp.entryParameter(contract.SignatureApi) → contract.SignatureApi.changedParameter(java.lang.String)"}]
+    },
+    {
+      "owner": "contract/SignatureApi", "member": "changedField", "descriptor": "Ljava/lang/String;", "member_kind": "field",
+      "dependency_lineages": ["blackbox:signature-lib"], "base_dependency_coords": ["blackbox:signature-lib:1.0"], "current_dependency_coords": ["blackbox:signature-lib:2.0"],
+      "reachability_status": "reachable", "static_linkage_status": "incompatible_if_executed", "impact_conclusion": "probable_impact", "runtime_verification_status": "required_not_executed",
+      "exact_path_exists": true, "possible_path_exists": false, "path_set_complete": true,
+      "paths": [{"certainty": "exact", "text": "contract.SignatureApp.entryField(contract.SignatureApi) → contract.SignatureApi.changedField"}]
+    },
+    {
+      "owner": "contract/SignatureApi", "member": "unreachableChanged", "descriptor": "(I)Ljava/lang/String;", "member_kind": "method",
+      "dependency_lineages": ["blackbox:signature-lib"], "base_dependency_coords": ["blackbox:signature-lib:1.0"], "current_dependency_coords": ["blackbox:signature-lib:2.0"],
+      "reachability_status": "not_found_in_static_analysis", "static_linkage_status": "incompatible_if_executed", "impact_conclusion": "inconclusive", "runtime_verification_status": "undetermined",
+      "exact_path_exists": false, "possible_path_exists": false, "path_set_complete": true, "paths": []
+    },
+    {
+      "owner": "contract/SignatureApi", "member": "changedReturn", "descriptor": "()Ljava/lang/Object;", "member_kind": "method", "oracle_relation": "added_member",
+      "dependency_lineages": ["blackbox:signature-lib"], "base_dependency_coords": ["blackbox:signature-lib:1.0"], "current_dependency_coords": ["blackbox:signature-lib:2.0"],
+      "reachability_status": "not_found_in_static_analysis", "static_linkage_status": "compatible_or_not_applicable", "impact_conclusion": "inconclusive", "runtime_verification_status": "undetermined",
+      "exact_path_exists": false, "possible_path_exists": false, "path_set_complete": true, "paths": []
+    },
+    {
+      "owner": "contract/SignatureApi", "member": "changedParameter", "descriptor": "(Ljava/lang/Object;)Ljava/lang/String;", "member_kind": "method", "oracle_relation": "added_member",
+      "dependency_lineages": ["blackbox:signature-lib"], "base_dependency_coords": ["blackbox:signature-lib:1.0"], "current_dependency_coords": ["blackbox:signature-lib:2.0"],
+      "reachability_status": "not_found_in_static_analysis", "static_linkage_status": "compatible_or_not_applicable", "impact_conclusion": "inconclusive", "runtime_verification_status": "undetermined",
+      "exact_path_exists": false, "possible_path_exists": false, "path_set_complete": true, "paths": []
+    },
+    {
+      "owner": "contract/SignatureApi", "member": "changedField", "descriptor": "Ljava/lang/Object;", "member_kind": "field", "oracle_relation": "added_member",
+      "dependency_lineages": ["blackbox:signature-lib"], "base_dependency_coords": ["blackbox:signature-lib:1.0"], "current_dependency_coords": ["blackbox:signature-lib:2.0"],
+      "reachability_status": "not_found_in_static_analysis", "static_linkage_status": "compatible_or_not_applicable", "impact_conclusion": "inconclusive", "runtime_verification_status": "undetermined",
+      "exact_path_exists": false, "possible_path_exists": false, "path_set_complete": true, "paths": []
+    },
+    {
+      "owner": "contract/SignatureApi", "member": "unreachableChanged", "descriptor": "(J)Ljava/lang/String;", "member_kind": "method", "oracle_relation": "added_member",
+      "dependency_lineages": ["blackbox:signature-lib"], "base_dependency_coords": ["blackbox:signature-lib:1.0"], "current_dependency_coords": ["blackbox:signature-lib:2.0"],
+      "reachability_status": "not_found_in_static_analysis", "static_linkage_status": "compatible_or_not_applicable", "impact_conclusion": "inconclusive", "runtime_verification_status": "undetermined",
+      "exact_path_exists": false, "possible_path_exists": false, "path_set_complete": true, "paths": []
+    }
+  ],
+  "forbidden_results": [
+    {"owner": "contract/SignatureApi", "member": "stable", "descriptor": "(Ljava/lang/String;)Ljava/lang/String;", "member_kind": "method", "oracle_relation": "unchanged_member", "reason": "The method contract and implementation are byte-for-byte stable across both inputs."}
+  ]
+}

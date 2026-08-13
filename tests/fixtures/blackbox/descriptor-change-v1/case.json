@@ -1,0 +1,33 @@
+{
+  "schema": "java-upgrade-analyzer.blackbox-case.v1",
+  "case_id": "descriptor-change-v1",
+  "dataset_version": 1,
+  "public_entrypoint": "scripts/binary_pipeline.py",
+  "truth_file": "truth.json",
+  "oracle_contract": "complete_member_change_closed_set",
+  "capabilities": [
+    "field_descriptor_change",
+    "method_parameter_descriptor_change",
+    "method_return_descriptor_change",
+    "not_found_negative",
+    "reachable_positive",
+    "unchanged_member_negative"
+  ],
+  "library_class": "contract.SignatureApi",
+  "business_class": "contract.SignatureApp",
+  "oracle_main_class": "contract.OracleMain",
+  "library_lineage": "blackbox:signature-lib",
+  "base_coordinate": "blackbox:signature-lib:1.0",
+  "current_coordinate": "blackbox:signature-lib:2.0",
+  "entrypoints": [
+    {"class_name": "contract/SignatureApp", "member_name": "entryReturn", "descriptor": "(Lcontract/SignatureApi;)Ljava/lang/String;"},
+    {"class_name": "contract/SignatureApp", "member_name": "entryParameter", "descriptor": "(Lcontract/SignatureApi;)Ljava/lang/String;"},
+    {"class_name": "contract/SignatureApp", "member_name": "entryField", "descriptor": "(Lcontract/SignatureApi;)Ljava/lang/String;"}
+  ],
+  "linkage_probes": [
+    {"mode": "return", "owner": "contract/SignatureApi", "member": "changedReturn", "descriptor": "()Ljava/lang/String;", "member_kind": "method", "linkage_error": "NoSuchMethodError"},
+    {"mode": "parameter", "owner": "contract/SignatureApi", "member": "changedParameter", "descriptor": "(Ljava/lang/String;)Ljava/lang/String;", "member_kind": "method", "linkage_error": "NoSuchMethodError"},
+    {"mode": "field", "owner": "contract/SignatureApi", "member": "changedField", "descriptor": "Ljava/lang/String;", "member_kind": "field", "linkage_error": "NoSuchFieldError"},
+    {"mode": "unreachable", "owner": "contract/SignatureApi", "member": "unreachableChanged", "descriptor": "(I)Ljava/lang/String;", "member_kind": "method", "linkage_error": "NoSuchMethodError"}
+  ]
+}

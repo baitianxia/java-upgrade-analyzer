@@ -1,0 +1,46 @@
+{
+  "schema": "java-upgrade-analyzer.blackbox-case.v1",
+  "case_id": "interface-dispatch-v1",
+  "dataset_version": 1,
+  "public_entrypoint": "scripts/binary_pipeline.py",
+  "truth_file": "truth.json",
+  "oracle_contract": "removed_member_linkage_closed_set",
+  "capabilities": [
+    "interface_default_dispatch",
+    "method_removal",
+    "not_found_negative",
+    "reachable_positive",
+    "unchanged_member_negative"
+  ],
+  "library_class": "contract.DefaultService",
+  "business_class": "contract.DispatchApp",
+  "oracle_main_class": "contract.OracleMain",
+  "library_lineage": "blackbox:interface-dispatch-lib",
+  "base_coordinate": "blackbox:interface-dispatch-lib:1.0",
+  "current_coordinate": "blackbox:interface-dispatch-lib:2.0",
+  "entrypoints": [
+    {
+      "class_name": "contract/DispatchApp",
+      "member_name": "entryDefault",
+      "descriptor": "(Lcontract/DefaultService;)Ljava/lang/String;"
+    }
+  ],
+  "linkage_probes": [
+    {
+      "mode": "reachableDefault",
+      "owner": "contract/DefaultService",
+      "member": "removedReachableDefault",
+      "descriptor": "()Ljava/lang/String;",
+      "member_kind": "method",
+      "linkage_error": "NoSuchMethodError"
+    },
+    {
+      "mode": "unreachableDefault",
+      "owner": "contract/DefaultService",
+      "member": "removedUnreachableDefault",
+      "descriptor": "()Ljava/lang/String;",
+      "member_kind": "method",
+      "linkage_error": "NoSuchMethodError"
+    }
+  ]
+}

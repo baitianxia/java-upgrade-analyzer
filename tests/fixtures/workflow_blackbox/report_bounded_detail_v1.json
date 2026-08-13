@@ -1,0 +1,30 @@
+{
+  "schema": "java-upgrade-analyzer.workflow-blackbox-truth.v1",
+  "case_id": "report-bounded-detail-v1",
+  "system_generated": false,
+  "oracle_producers": [
+    {
+      "id": "openjdk-javap-member-inventory",
+      "organization": "OpenJDK",
+      "mechanism": "enumerate authored base/current public method descriptors",
+      "verifies": ["thirteen removed methods", "thirteen retained client references"]
+    },
+    {
+      "id": "stdlib-csv-and-zip-inventory",
+      "organization": "Python Software Foundation",
+      "mechanism": "independent archive, UTF-8 BOM, and CSV row accounting",
+      "verifies": ["complete machine-readable detail", "bounded Markdown display"]
+    }
+  ],
+  "removed_method_count": 13,
+  "expected_changed_api_row_count": 26,
+  "expected_formal_api_count": 13,
+  "expected_main_display_count": 12,
+  "expected_main_result_count": 26,
+  "expected_impact_csv_row_count": 26,
+  "required_main_report_markers": [
+    "正文展示 12/26 个",
+    "all-impact-details.md",
+    "all-impact-details.csv"
+  ]
+}

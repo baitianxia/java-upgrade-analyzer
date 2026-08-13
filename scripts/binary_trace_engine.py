@@ -19,12 +19,107 @@ from binary_first_model import RuntimeProfile
 from binary_runtime_reconciler import RuntimeReconciliationResult
 
 
+ACC_PUBLIC = 0x0001
+ACC_PRIVATE = 0x0002
+ACC_PROTECTED = 0x0004
+ACC_STATIC = 0x0008
+ACC_FINAL = 0x0010
+ACC_ABSTRACT = 0x0400
+
+
 def _identity(namespace: str, payload: Any) -> str:
     return canonical_identity(namespace, payload, schema_version="1")
 
 
 def _loads(value: str) -> Any:
     return json.loads(value or "{}")
+
+
+def _visibility_rank(access: Any) -> int:
+    flags = int(access or 0)
+    if flags & ACC_PUBLIC:
+        return 3
+    if flags & ACC_PROTECTED:
+        return 2
+    if flags & ACC_PRIVATE:
+        return 0
+    return 1
+
+
+def _contract_change_linkage_reasons(
+    decision: Mapping[str, Any],
+) -> frozenset[str]:
+    scope = decision.get("fact_scope") or {}
+    if scope.get("member_change_kind") != "contract_changed":
+        return frozenset()
+    evidence = decision.get("evidence") or {}
+    base = evidence.get("base_contract")
+    current = evidence.get("current_contract")
+    if not isinstance(base, Mapping) or not isinstance(current, Mapping):
+        return frozenset()
+    base_access = int(base.get("access") or 0)
+    current_access = int(current.get("access") or 0)
+    reasons = set()
+    if _visibility_rank(current_access) < _visibility_rank(base_access):
+        reasons.add("access_reduced")
+    if bool(base_access & ACC_STATIC) != bool(current_access & ACC_STATIC):
+        reasons.add("static_instance_changed")
+    if (
+        not bool(base_access & ACC_ABSTRACT)
+        and bool(current_access & ACC_ABSTRACT)
+    ):
+        reasons.add("became_abstract")
+    if (
+        scope.get("member_kind") == "method"
+        and not bool(base_access & ACC_FINAL)
+        and bool(current_access & ACC_FINAL)
+    ):
+        reasons.add("became_final")
+    return frozenset(reasons)
+
+
+def _contract_change_breaks_linkage(decision: Mapping[str, Any]) -> bool:
+    return bool(_contract_change_linkage_reasons(decision))
+
+
+def _access_reduction_is_legal_on_observed_paths(
+    decision: Mapping[str, Any],
+    *,
+    has_path: bool,
+    resolution_statuses: set[str],
+    linkage_statuses: set[str],
+    caller_definition_statuses: set[str],
+) -> bool:
+    """Allow the target-runtime access check to refine a visibility delta.
+
+    A public member becoming protected is not universally incompatible: a
+    selected call from a valid subclass (or from the same runtime package) is
+    still legal.  Artifact-local visibility rank cannot decide that question;
+    only the reconciled caller/provider path can.  Other contract changes such
+    as static/instance, abstract, or final transitions are never discharged by
+    this refinement.
+    """
+    return (
+        _contract_change_linkage_reasons(decision) == {"access_reduced"}
+        and has_path
+        and resolution_statuses == {"resolved"}
+        and linkage_statuses.issubset({"resolved"})
+        and caller_definition_statuses == {"definition_ready"}
+    )
+
+
+def _unresolved_edge_certainty(
+    status: str, *, paired_artifact_change: bool = False,
+) -> str:
+    return (
+        "exact"
+        if status == "no_such_member"
+        or (
+            paired_artifact_change
+            and status in {"no_class_definition", "class_definition_failed"}
+        )
+        else "possible"
+    )
 
 
 @dataclass(frozen=True)
@@ -83,6 +178,45 @@ class BinaryTraceEngine:
             (item["initiating_loader_realm_identity"], item["class_name"]): item
             for item in reconciliation.provider_bindings
         }
+        self.paired_artifact_missing_targets = {
+            self._symbolic_target(
+                str(scope.get("class_name") or "").replace(".", "/"),
+                str(scope.get("member_name") or ""),
+                str(scope.get("descriptor") or ""),
+                str(scope.get("member_kind") or decision.get("fact_kind") or ""),
+            )
+            for decision in decisions.authoritative_decisions
+            for scope in [decision.get("fact_scope") or {}]
+            if scope.get("member_change_kind") == "removed"
+            and (scope.get("member_kind") or decision.get("fact_kind"))
+            in {"method", "field"}
+            and {"base", "current"}.issubset({
+                str(artifact.get("side") or "")
+                for artifact in decision.get("dependency_artifacts") or ()
+            })
+        }
+        self.unresolved_edge_alias_targets: dict[str, set[str]] = defaultdict(set)
+        for decision in (
+            *decisions.authoritative_decisions,
+            *decisions.diagnostic_decisions,
+        ):
+            scope = decision.get("fact_scope") or {}
+            kind = str(scope.get("member_kind") or decision.get("fact_kind") or "")
+            if kind not in {"method", "field"}:
+                continue
+            target = self._symbolic_target(
+                str(scope.get("class_name") or "").replace(".", "/"),
+                str(scope.get("member_name") or ""),
+                str(scope.get("descriptor") or ""),
+                kind,
+            )
+            for edge_id in (
+                (decision.get("evidence") or {}).get(
+                    "current_unresolved_direct_edge_identities"
+                )
+                or ()
+            ):
+                self.unresolved_edge_alias_targets[str(edge_id)].add(target)
         self.reverse: dict[str, list[dict[str, Any]]] = defaultdict(list)
         self._trace_cache: dict[
             tuple[str, ...], tuple[list[dict[str, Any]], list[str]]
@@ -133,6 +267,13 @@ class BinaryTraceEngine:
                 item["direct_edge_identity"]: item
                 for item in reconciliation.linkage_resolutions
             }
+            self.class_definition_statuses = {
+                (
+                    str(item.get("initiating_loader_realm_identity") or ""),
+                    str(item.get("class_name") or ""),
+                ): str(item.get("class_definition_status") or "")
+                for item in reconciliation.class_definitions
+            }
             self._build_reverse_graph()
             self._prepare_batch_graph()
         else:
@@ -148,6 +289,7 @@ class BinaryTraceEngine:
             self.type_resolutions = {}
             self.class_initializations = {}
             self.linkage_resolutions = {}
+            self.class_definition_statuses = {}
             self.exact_reachable_nodes = set()
             self.possible_reachable_nodes = set()
             self.possible_path_nodes = set()
@@ -197,10 +339,11 @@ class BinaryTraceEngine:
             if not edge:
                 continue
             edge_kind = str(edge.get("edge_kind") or "")
+            dynamic_handle = edge_kind.startswith("invokedynamic_handle_")
             executable_linkage = edge_kind in {
                 "invokedynamic_bootstrap",
                 "ldc_constant_dynamic_bootstrap",
-            }
+            } or dynamic_handle
             if edge_kind not in {"method", "field"} and not executable_linkage:
                 continue
             caller = edge["caller_member_identity"]
@@ -229,13 +372,23 @@ class BinaryTraceEngine:
                     edge["symbolic_owner"], edge["symbolic_name"], edge["symbolic_descriptor"],
                     "field" if edge["edge_kind"] == "field" else "method",
                 )
-                self.reverse[symbolic].append({
-                    "caller_member_identity": caller,
-                    "direct_edge_identity": edge_id,
-                    "certainty": "exact" if status == "no_such_member" else "possible",
-                    "member_resolution_identity": resolution["member_resolution_identity"],
-                    "dispatch_resolution_identity": dispatch.get("dispatch_resolution_identity", ""),
-                })
+                symbolic_targets = {
+                    symbolic,
+                    *self.unresolved_edge_alias_targets.get(edge_id, ()),
+                }
+                for symbolic_target in sorted(symbolic_targets):
+                    self.reverse[symbolic_target].append({
+                        "caller_member_identity": caller,
+                        "direct_edge_identity": edge_id,
+                        "certainty": _unresolved_edge_certainty(
+                            status,
+                            paired_artifact_change=(
+                                symbolic_target in self.paired_artifact_missing_targets
+                            ),
+                        ),
+                        "member_resolution_identity": resolution["member_resolution_identity"],
+                        "dispatch_resolution_identity": dispatch.get("dispatch_resolution_identity", ""),
+                    })
         # Type observations are admitted only after provider/definition
         # resolution; raw shadowed or definition-failed observations never enter
         # the effective graph.
@@ -691,6 +844,18 @@ class BinaryTraceEngine:
         }
         resolution_statuses.discard(None)
         linkage_statuses.discard(None)
+        caller_definition_statuses = {
+            self.class_definition_statuses.get((
+                str((self.member_resolutions.get(
+                    edge["direct_edge_identity"]
+                ) or {}).get("initiating_loader_realm_identity") or ""),
+                str((self.members.get(
+                    edge["caller_member_identity"]
+                ) or {}).get("class_name") or ""),
+            )) or "missing"
+            for path in paths
+            for edge in path["edges"]
+        }
         change_kind = str(
             (decision.get("fact_scope") or {}).get("member_change_kind") or ""
         )
@@ -699,8 +864,36 @@ class BinaryTraceEngine:
             "no_class_definition", "class_definition_failed",
         }
         unresolved_statuses = {"ambiguous", "unresolved", "unsupported"}
+        # Removing a declaration is not necessarily a JVM linkage break.  A
+        # symbolic reference to the old owner may resolve to an inherited
+        # method with the exact same name and descriptor on the current side.
+        # Only a concrete, fully resolved path can override the conservative
+        # artifact-local removal classification.
+        removed_member_rebound = (
+            change_kind == "removed"
+            and resolution_statuses == {"resolved"}
+            and linkage_statuses.issubset({"resolved"})
+        )
+        access_reduction_proven_legal = (
+            _access_reduction_is_legal_on_observed_paths(
+                decision,
+                has_path=bool(paths),
+                resolution_statuses=resolution_statuses,
+                linkage_statuses=linkage_statuses,
+                caller_definition_statuses=caller_definition_statuses,
+            )
+        )
         if (
-            change_kind in {"removed", "descriptor_changed", "access_changed"}
+            (
+                change_kind in {
+                    "removed", "descriptor_changed", "access_changed",
+                }
+                and not removed_member_rebound
+            )
+            or (
+                _contract_change_breaks_linkage(decision)
+                and not access_reduction_proven_legal
+            )
             or resolution_statuses.intersection(incompatible_statuses)
             or linkage_statuses.intersection(incompatible_statuses)
         ):

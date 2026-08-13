@@ -1,4 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import json
 import sys
 import tempfile
 import unittest
@@ -139,6 +141,29 @@ class BinaryPipelineInputPerformanceTest(unittest.TestCase):
         self.assertEqual(recorder[0]["completed_child_peak_rss_bytes"], 0)
         self.assertEqual(recorder[0]["process_tree_cpu_seconds"], 0.0)
         self.assertEqual(recorder[0]["average_cpu_cores"], 0.0)
+
+    def test_parallel_progress_publishers_use_distinct_atomic_temporary_files(self):
+        with tempfile.TemporaryDirectory() as temp_text:
+            root = Path(temp_text)
+            recorders = [_PhaseTimingRecorder(root, 0.0) for _ in range(8)]
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                futures = [
+                    executor.submit(
+                        recorder.append,
+                        {"phase": "input_and_runtime_profile", "elapsed_seconds": 0.1},
+                    )
+                    for recorder in recorders
+                ]
+                for future in futures:
+                    future.result()
+            progress = json.loads((
+                root / "binary_observability" / "latest_in_progress.json"
+            ).read_text(encoding="utf-8"))
+            leftovers = list((root / "binary_observability").glob("*.tmp"))
+
+        self.assertEqual(progress["schema"], "java-upgrade-analyzer.binary-progress.v1")
+        self.assertEqual(progress["last_completed_phase"], "input_and_runtime_profile")
+        self.assertEqual(leftovers, [])
 
 
 if __name__ == "__main__":

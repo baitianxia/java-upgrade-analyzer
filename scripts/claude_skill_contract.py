@@ -16,6 +16,7 @@ import sys
 import zipfile
 
 from compat import git_cmd, run_cmd, subprocess_platform_kwargs
+from binary_result_truth import evaluate_formal_result_truth
 
 
 PUBLIC_SCRIPT_RE = re.compile(r"\$\{CLAUDE_SKILL_DIR\}/(scripts/[A-Za-z0-9_./-]+\.py)")
@@ -24,7 +25,7 @@ PHASE_HEADING_RE = re.compile(
     r"^### Phase\s+\d+\s+\[(?P<mode>AUTO|CHECKPOINT)\].*$",
     re.MULTILINE,
 )
-PHASE_STEP_RE = re.compile(r"^- 对应步骤：`(?P<step>step[1-6])`", re.MULTILINE)
+PHASE_STEP_RE = re.compile(r"^- 对应步骤：`(?P<step>step[0-6])`", re.MULTILINE)
 
 # Public-contract metamorphic variants change only a supported custom Manifest
 # attribute on both sides.  The attribute values alter artifact bytes while
@@ -54,6 +55,11 @@ class SkillContractReport:
     step4_api_count: int = 0
     step5_accounted_api_count: int = 0
     current_artifact_sha256: str = ""
+    step4_truth_status: str = "not_run"
+    step4_false_positive_count: int = -1
+    step4_false_negative_count: int = -1
+    step4_state_mismatch_count: int = -1
+    step4_path_mismatch_count: int = -1
 
 
 def audit_public_contract(root: Path) -> tuple[str, ...]:
@@ -77,7 +83,7 @@ def audit_public_contract(root: Path) -> tuple[str, ...]:
     for required in (
         ".upgrade-report/.runtime/state/main_state.json",
         ".upgrade-report/.runtime/state/interaction.json",
-        "--describe-step1-contract",
+        "--describe-step0-contract",
         "--response-json",
         "Step4 执行方式不是用户决策点",
         "不得要求用户另开 Git Bash/PowerShell/终端",
@@ -116,7 +122,10 @@ def audit_public_contract(root: Path) -> tuple[str, ...]:
                 continue
             step_id = step_match.group("step")
             step_meta = manifest_steps.get(step_id) or {}
-            if not step_meta.get("interaction"):
+            # Step0 is a mandatory runtime-generated confirmation card.  Its
+            # fields come from detection results, so the static manifest does
+            # not carry a fixed interaction payload.
+            if not step_meta.get("interaction") and step_id != "step0":
                 errors.append(
                     f"skill_checkpoint_missing_manifest_interaction:{step_id}"
                 )
@@ -442,7 +451,7 @@ def run_skill_contract(
     clean = not report_dir.exists() and not (skill_root / ".upgrade-report").exists()
     errors = list(audit_public_contract(skill_root))
     describe = _run(
-        [sys.executable, "scripts/run_step.py", "--describe-step1-contract"], skill_root
+        [sys.executable, "scripts/run_step.py", "--describe-step0-contract"], skill_root
     )
     try:
         json.loads(describe.stdout)
@@ -450,18 +459,23 @@ def run_skill_contract(
         errors.append("describe_contract_not_json")
     command = [
         sys.executable, str(skill_root / "scripts" / "run_step.py"),
-        "--step", "step1",
+        "--step", "auto",
         "--project-dir", str(fixture),
         "--report-dir", str(report_dir),
     ]
     if complete_workflow:
+        fixture_jdk_home = _current_jdk_home(fixture)
         command.extend([
             "--base-artifact-path", str(base_artifact),
             "--current-artifact-path", str(current_artifact),
+            "--application-source", str(fixture),
             "--base-branch", "base-artifact",
             "--current-branch", "current-artifact",
-            "--source-dirs", str(source_root),
             "--target-module", ".",
+            "--base-tool", "maven",
+            "--current-tool", "maven",
+            "--base-jdk-home", str(fixture_jdk_home),
+            "--current-jdk-home", str(fixture_jdk_home),
             "--binary-pipeline-config", str(binary_config),
         ])
     first = _run(command, fixture)
@@ -504,10 +518,13 @@ def run_skill_contract(
     step4_api_count = 0
     step5_accounted_api_count = 0
     current_artifact_sha256 = ""
+    step4_truth_status = "not_run"
+    step4_false_positive_count = -1
+    step4_false_negative_count = -1
+    step4_state_mismatch_count = -1
+    step4_path_mismatch_count = -1
     if complete_workflow:
-        javac_probe = _run(["javac", "-version"], fixture)
-        javac_match = re.search(r"(?:javac\s+)?(\d+)(?:\.|\s|$)", f"{javac_probe.stdout}\n{javac_probe.stderr}")
-        fixture_jdk = javac_match.group(1) if javac_match else "17"
+        fixture_jdk_home = _current_jdk_home(fixture)
         for _ in range(10):
             if completed_step == "step6":
                 break
@@ -522,20 +539,20 @@ def run_skill_contract(
             )
             required_fields = list(interaction_payload.get("required_fields") or [])
             known_fixture_values = {
+                "base_artifact_path": str(base_artifact),
+                "current_artifact_path": str(current_artifact),
+                "application_source": str(fixture),
                 "target_module": ".",
-                "primary_module": ".",
                 "base_branch": "base-artifact",
                 "current_branch": "current-artifact",
-                "jdk_base": fixture_jdk,
-                "jdk_current": fixture_jdk,
-                "source_dirs": [str(source_root)],
-                "accept_suggested_mappings": True,
+                "base_tool": "maven",
+                "current_tool": "maven",
+                "base_jdk_home": str(fixture_jdk_home),
+                "current_jdk_home": str(fixture_jdk_home),
             }
             for field in required_fields:
                 if field in response_properties and field in known_fixture_values:
                     response[field] = known_fixture_values[field]
-            if step_id == "step2" and "source_dirs" in response_properties:
-                response["source_dirs"] = [str(source_root)]
             if step_id == "step4":
                 response["scope_mode"] = "full"
             resume_command = [
@@ -592,25 +609,72 @@ def run_skill_contract(
                 f"workflow_step4_step5_scope_mismatch:{step4_api_count}:"
                 f"{step5_accounted_api_count}"
             )
+        truth_path = (
+            repo_root / "tests" / "fixtures" / "binary_first"
+            / "golden_truth" / "public_skill_contract.json"
+        )
+        authority = report_dir / ".runtime" / "binary_authority"
+        active_generation = authority / "active_binary_generation.json"
+        try:
+            truth = json.loads(truth_path.read_text(encoding="utf-8"))
+            pointer = json.loads(active_generation.read_text(encoding="utf-8"))
+            formal_path = (
+                authority / str(pointer["generation_directory"])
+                / "binary_formal_results.json"
+            )
+            formal = json.loads(formal_path.read_text(encoding="utf-8"))
+            truth_evaluation = evaluate_formal_result_truth(formal, truth)
+            truth_metrics = truth_evaluation["metrics"]
+            step4_truth_status = str(truth_evaluation["status"])
+            step4_false_positive_count = int(
+                truth_metrics["false_positive_count"]
+            )
+            step4_false_negative_count = int(
+                truth_metrics["false_negative_count"]
+            )
+            step4_state_mismatch_count = int(
+                truth_metrics["state_mismatch_count"]
+            )
+            step4_path_mismatch_count = int(
+                truth_metrics["path_mismatch_count"]
+            )
+            if step4_truth_status != "passed":
+                reason_codes = sorted({
+                    str(issue.get("reason_code") or "unknown")
+                    for issue in truth_evaluation["issues"]
+                })
+                errors.append(
+                    "workflow_step4_truth_mismatch:" + ",".join(reason_codes)
+                )
+        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+            step4_truth_status = "failed"
+            errors.append(
+                f"workflow_step4_truth_unavailable:{type(error).__name__}:{error}"
+            )
         current_artifact_sha256 = hashlib.sha256(
             Path(current_artifact).read_bytes()
         ).hexdigest()
     return SkillContractReport(
-        "failed" if errors else "passed",
-        tuple(errors),
-        describe.returncode,
-        first.returncode,
-        rerun.returncode,
-        failed_resume.returncode,
-        first_sha,
-        rerun_sha,
-        clean,
-        completed_step,
-        deliverables_verified,
-        successful_rerun_returncode,
-        step4_api_count,
-        step5_accounted_api_count,
-        current_artifact_sha256,
+        status="failed" if errors else "passed",
+        errors=tuple(errors),
+        describe_returncode=describe.returncode,
+        first_returncode=first.returncode,
+        rerun_returncode=rerun.returncode,
+        failed_resume_returncode=failed_resume.returncode,
+        first_state_sha256=first_sha,
+        rerun_state_sha256=rerun_sha,
+        clean_copy_without_report_state=clean,
+        completed_step=completed_step,
+        deliverables_verified=deliverables_verified,
+        successful_rerun_returncode=successful_rerun_returncode,
+        step4_api_count=step4_api_count,
+        step5_accounted_api_count=step5_accounted_api_count,
+        current_artifact_sha256=current_artifact_sha256,
+        step4_truth_status=step4_truth_status,
+        step4_false_positive_count=step4_false_positive_count,
+        step4_false_negative_count=step4_false_negative_count,
+        step4_state_mismatch_count=step4_state_mismatch_count,
+        step4_path_mismatch_count=step4_path_mismatch_count,
     )
 
 

@@ -1,0 +1,205 @@
+{
+  "schema": "java-upgrade-analyzer.blackbox-truth.v1",
+  "case_id": "access-level-matrix-v1",
+  "dataset_version": 1,
+  "scope": "closed_set",
+  "system_generated": false,
+  "human_review": {"status": "not_claimed", "reviewer": ""},
+  "input_evidence": {
+    "algorithm": "sha256-path-nul-content-nul-v1",
+    "source_tree_sha256": "37f860823b82e57a9b4d00f05acc51b92a0dec687dc5a416c2bd9e021a9a264e",
+    "case_algorithm": "sha256-canonical-json-v1",
+    "case_sha256": "021b176c5764988f31341cb4a2d05bb6f564f85a6c69d4f42fa28781c82b3cae",
+    "source_files": [
+      "src/base/lib/AccessApi.java",
+      "src/business/client/AccessApp.java",
+      "src/business/client/Child.java",
+      "src/business/client/ForeignChild.java",
+      "src/business/lib/Peer.java",
+      "src/current/lib/AccessApi.java",
+      "src/oracle/oracle/DefinitionMain.java",
+      "src/oracle/oracle/OracleMain.java"
+    ]
+  },
+  "oracle_producers": [
+    {
+      "id": "openjdk-javap-access-and-callgraph",
+      "organization": "OpenJDK",
+      "mechanism": "independent_bytecode_access_inventory",
+      "verifies": [
+        "complete_public_access_reduction_set",
+        "cross_package_invocation_edges",
+        "subclass_invokespecial_edge"
+      ]
+    },
+    {
+      "id": "openjdk-jvm-access-control",
+      "organization": "OpenJDK",
+      "mechanism": "actual_jvm_access_execution",
+      "verifies": [
+        "protected_subclass_access_succeeds",
+        "protected_foreign_receiver_verification_fails",
+        "same_runtime_package_peer_access_succeeds",
+        "package_outsider_access_fails",
+        "private_outsider_access_fails"
+      ]
+    }
+  ],
+  "oracle_implementations": [
+    {
+      "path": "tests/blackbox/oracles/openjdk_oracle.py",
+      "sha256": "6e72442077371b86c943f790b5982144497725200da3e89f22f66ca2bfee38ca"
+    }
+  ],
+  "completeness": {
+    "argument": "The fixture has one dependency class and five deliberately distinct access reductions. OpenJDK javap proves the exact public-surface changes and the complete call graph. JVM execution proves protected access through a subclass receiver and package-private access from the same runtime package remain legal; package-private/private access from another package fails and a protected call through a superclass-typed foreign receiver fails verification. The unchanged stable() member is an explicit forbidden result.",
+    "verified_dimensions": [
+      "api_identity",
+      "jvm_descriptor",
+      "closed_result_set",
+      "entrypoint_reachability",
+      "static_linkage"
+    ],
+    "known_limits": []
+  },
+  "expected_result_count": 6,
+  "expected_results": [
+    {
+      "owner": "lib/AccessApi",
+      "member": "packageForOutsider",
+      "descriptor": "()Ljava/lang/String;",
+      "member_kind": "method",
+      "dependency_lineages": ["blackbox:access-level-lib"],
+      "base_dependency_coords": ["blackbox:access-level-lib:1.0"],
+      "current_dependency_coords": ["blackbox:access-level-lib:2.0"],
+      "reachability_status": "reachable",
+      "static_linkage_status": "incompatible_if_executed",
+      "impact_conclusion": "probable_impact",
+      "runtime_verification_status": "required_not_executed",
+      "exact_path_exists": true,
+      "possible_path_exists": false,
+      "path_set_complete": true,
+      "paths": [
+        {
+          "certainty": "exact",
+          "text": "client.AccessApp.entryPackage(lib.AccessApi) → lib.AccessApi.packageForOutsider()"
+        }
+      ]
+    },
+    {
+      "owner": "lib/AccessApi",
+      "member": "privateForOutsider",
+      "descriptor": "()Ljava/lang/String;",
+      "member_kind": "method",
+      "dependency_lineages": ["blackbox:access-level-lib"],
+      "base_dependency_coords": ["blackbox:access-level-lib:1.0"],
+      "current_dependency_coords": ["blackbox:access-level-lib:2.0"],
+      "reachability_status": "reachable",
+      "static_linkage_status": "incompatible_if_executed",
+      "impact_conclusion": "probable_impact",
+      "runtime_verification_status": "required_not_executed",
+      "exact_path_exists": true,
+      "possible_path_exists": false,
+      "path_set_complete": true,
+      "paths": [
+        {
+          "certainty": "exact",
+          "text": "client.AccessApp.entryPrivate(lib.AccessApi) → lib.AccessApi.privateForOutsider()"
+        }
+      ]
+    },
+    {
+      "owner": "lib/AccessApi",
+      "member": "protectedForSubclass",
+      "descriptor": "()Ljava/lang/String;",
+      "member_kind": "method",
+      "dependency_lineages": ["blackbox:access-level-lib"],
+      "base_dependency_coords": ["blackbox:access-level-lib:1.0"],
+      "current_dependency_coords": ["blackbox:access-level-lib:2.0"],
+      "reachability_status": "reachable",
+      "static_linkage_status": "compatible_or_not_applicable",
+      "impact_conclusion": "probable_impact",
+      "runtime_verification_status": "required_not_executed",
+      "exact_path_exists": true,
+      "possible_path_exists": false,
+      "path_set_complete": true,
+      "paths": [
+        {
+          "certainty": "exact",
+          "text": "client.Child.entryProtected(client.Child) → client.Child.callProtected() → lib.AccessApi.protectedForSubclass()"
+        }
+      ]
+    },
+    {
+      "owner": "lib/AccessApi",
+      "member": "protectedForForeignReceiver",
+      "descriptor": "()Ljava/lang/String;",
+      "member_kind": "method",
+      "dependency_lineages": ["blackbox:access-level-lib"],
+      "base_dependency_coords": ["blackbox:access-level-lib:1.0"],
+      "current_dependency_coords": ["blackbox:access-level-lib:2.0"],
+      "reachability_status": "reachable",
+      "static_linkage_status": "incompatible_if_executed",
+      "impact_conclusion": "probable_impact",
+      "runtime_verification_status": "required_not_executed",
+      "exact_path_exists": true,
+      "possible_path_exists": false,
+      "path_set_complete": true,
+      "paths": [
+        {
+          "certainty": "exact",
+          "text": "client.ForeignChild.entryProtectedForeign(client.ForeignChild,lib.AccessApi) → client.ForeignChild.callProtectedForeign(lib.AccessApi) → lib.AccessApi.protectedForForeignReceiver()"
+        }
+      ]
+    },
+    {
+      "owner": "lib/AccessApi",
+      "member": "packageForPeer",
+      "descriptor": "()Ljava/lang/String;",
+      "member_kind": "method",
+      "dependency_lineages": ["blackbox:access-level-lib"],
+      "base_dependency_coords": ["blackbox:access-level-lib:1.0"],
+      "current_dependency_coords": ["blackbox:access-level-lib:2.0"],
+      "reachability_status": "reachable",
+      "static_linkage_status": "compatible_or_not_applicable",
+      "impact_conclusion": "probable_impact",
+      "runtime_verification_status": "required_not_executed",
+      "exact_path_exists": true,
+      "possible_path_exists": false,
+      "path_set_complete": true,
+      "paths": [
+        {
+          "certainty": "exact",
+          "text": "lib.Peer.entryPackagePeer(lib.AccessApi) → lib.AccessApi.packageForPeer()"
+        }
+      ]
+    },
+    {
+      "owner": "client/ForeignChild",
+      "member": "",
+      "descriptor": "",
+      "member_kind": "class_definition",
+      "dependency_lineages": [],
+      "base_dependency_coords": ["blackbox:fixture-app:1.0"],
+      "current_dependency_coords": ["blackbox:fixture-app:1.0"],
+      "reachability_status": "not_found_in_static_analysis",
+      "static_linkage_status": "undetermined",
+      "impact_conclusion": "inconclusive",
+      "runtime_verification_status": "undetermined",
+      "exact_path_exists": false,
+      "possible_path_exists": false,
+      "path_set_complete": true,
+      "paths": []
+    }
+  ],
+  "forbidden_results": [
+    {
+      "owner": "lib/AccessApi",
+      "member": "stable",
+      "descriptor": "()Ljava/lang/String;",
+      "member_kind": "method",
+      "oracle_relation": "unchanged_member",
+      "reason": "OpenJDK javap reports the stable method unchanged on both sides."
+    }
+  ]
+}

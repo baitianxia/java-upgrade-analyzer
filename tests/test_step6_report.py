@@ -15,6 +15,16 @@ import s6_report  # noqa: E402
 
 
 class Step6ReportObjectivityTest(unittest.TestCase):
+    def test_count_lines_accepts_path_objects_used_by_collect_findings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "scan.csv"
+            csv_path.write_text("name\nfirst\nsecond\n", encoding="utf-8")
+            text_path = Path(tmp) / "scan.txt"
+            text_path.write_text("# title\nfirst\n\nsecond\n", encoding="utf-8")
+
+            self.assertEqual(s6_report.count_lines(csv_path), 2)
+            self.assertEqual(s6_report.count_lines(text_path), 2)
+
     @staticmethod
     def _human_first_findings():
         return {

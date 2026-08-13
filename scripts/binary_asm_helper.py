@@ -18,6 +18,7 @@ from typing import Any, Callable, Iterable
 
 from binary_first_contract import BinaryFirstContractError, canonical_identity
 from binary_tool_execution import execute_binary_tool
+from jdk_preflight import jdk_tool_path
 from compat import subprocess_platform_kwargs
 from path_runtime import make_short_temp_dir, short_temporary_directory
 
@@ -35,6 +36,7 @@ DEFAULT_MAX_CLASS_BYTES = 16 * 1024 * 1024
 DEFAULT_MAX_FRAME_BYTES = 64 * 1024 * 1024
 DEFAULT_MAX_RECORDS = 100_000
 DEFAULT_TIMEOUT_SECONDS = 300
+DEFAULT_MAX_HEAP_MEGABYTES = 512
 
 
 class BinaryAsmError(BinaryFirstContractError):
@@ -197,10 +199,15 @@ def parser_identity(*, asm_jar: Path | None = None) -> tuple[str, str]:
     return identity, helper_sha
 
 
-@lru_cache(maxsize=4)
-def _compile_helper(asm_jar_text: str, helper_sha: str) -> tuple[Path, str]:
-    javac = shutil.which("javac")
-    java = shutil.which("java")
+@lru_cache(maxsize=8)
+def _compile_helper(
+    asm_jar_text: str,
+    helper_sha: str,
+    javac_text: str = "",
+    java_text: str = "",
+) -> tuple[Path, str]:
+    javac = javac_text or shutil.which("javac")
+    java = java_text or shutil.which("java")
     if not javac or not java:
         raise BinaryAsmError(
             "ASM_JAVA_TOOLCHAIN_MISSING", "both java and javac are required for the ASM helper"
@@ -274,10 +281,12 @@ def extract_class_facts(
     inputs: Iterable[BinaryClassInput],
     *,
     asm_jar: str | Path | None = None,
+    jdk_home: str | Path | None = None,
     max_class_bytes: int = DEFAULT_MAX_CLASS_BYTES,
     max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
     max_records: int = DEFAULT_MAX_RECORDS,
-    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    max_heap_megabytes: int = DEFAULT_MAX_HEAP_MEGABYTES,
     record_consumer: Callable[[dict[str, Any]], None] | None = None,
     retain_records: bool = True,
 ) -> BinaryFactRun:
@@ -286,9 +295,25 @@ def extract_class_facts(
     ``record_consumer`` allows a SQLite writer to consume records incrementally;
     ``retain_records=False`` prevents a second in-memory copy.
     """
+    if not 16 <= int(max_heap_megabytes) <= DEFAULT_MAX_HEAP_MEGABYTES:
+        raise BinaryAsmError(
+            "ASM_HELPER_HEAP_LIMIT_INVALID",
+            f"heap must be within 16..{DEFAULT_MAX_HEAP_MEGABYTES} MiB",
+        )
+    if float(timeout_seconds) <= 0:
+        raise BinaryAsmError(
+            "ASM_HELPER_TIMEOUT_INVALID", "timeout must be positive"
+        )
     asm_path = resolve_asm_jar(asm_jar)
     identity, helper_sha = parser_identity(asm_jar=asm_path)
-    class_dir, java = _compile_helper(str(asm_path), helper_sha)
+    if jdk_home:
+        javac = jdk_tool_path(jdk_home, "javac")
+        java = jdk_tool_path(jdk_home, "java")
+        class_dir, java = _compile_helper(
+            str(asm_path), helper_sha, str(javac), str(java)
+        )
+    else:
+        class_dir, java = _compile_helper(str(asm_path), helper_sha)
     input_digest = hashlib.sha256()
     expected: dict[tuple[str, str], str] = {}
     input_count = 0
@@ -361,7 +386,7 @@ def extract_class_facts(
             process = subprocess.Popen(
                 [
                     java,
-                    "-Xmx512m",
+                    f"-Xmx{int(max_heap_megabytes)}m",
                     "-cp", os.pathsep.join((str(class_dir), str(asm_path))),
                     "BinaryFactExtractor",
                     identity,

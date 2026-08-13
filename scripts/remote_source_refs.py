@@ -581,6 +581,43 @@ def _matching_remote_candidates(inventory, requested_ref):
     return sorted((row for row in scored if row["score"] == highest), key=lambda row: (row["remote"], row["kind"], row["ref"]))
 
 
+def match_remote_refs_by_version(repo_dir, version, query_timeout=30):
+    """Match a released version to immutable remote commits.
+
+    Branch and tag aliases that point to the same commit are one candidate.
+    Only distinct commit identities create a user-facing ambiguity.
+    """
+    requested = str(version or "").strip()
+    if not requested:
+        return {
+            "status": "version_missing",
+            "version": "",
+            "candidates": [],
+            "failures": [],
+        }
+    inventory = query_live_remote_refs(repo_dir, timeout=query_timeout)
+    matches = _matching_remote_candidates(inventory, requested)
+    groups = _group_remote_candidates(matches)
+    candidates = [group[1] for group in groups]
+    failures = list(inventory.get("failures") or [])
+    if len(groups) == 1 and not failures:
+        status = "resolved"
+    elif len(groups) > 1:
+        status = "ambiguous"
+    elif failures:
+        status = "query_failed"
+    else:
+        status = "not_found"
+    return {
+        "status": status,
+        "version": requested,
+        "candidates": candidates,
+        "failures": failures,
+        "queried_at": inventory.get("queried_at", ""),
+        "configured_remotes": list(inventory.get("remotes") or []),
+    }
+
+
 def _base_result(status, requested_ref, candidates=None, failures=None, queried_at=""):
     candidates = list(candidates or [])
     failures = list(failures or [])

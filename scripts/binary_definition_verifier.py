@@ -18,6 +18,7 @@ from binary_asm_helper import _canonical_json, _read_frame, _write_frame
 from binary_first_contract import BinaryFirstContractError, canonical_identity
 from binary_platform_image import JdkPlatformImage
 from binary_tool_execution import execute_binary_tool
+from jdk_preflight import jdk_tool_path
 from path_runtime import make_short_temp_dir, short_temporary_directory
 
 
@@ -66,6 +67,9 @@ def _compile_helper(javac_text: str, source_sha256: str) -> Path:
 
 
 def verifier_identity(platform: JdkPlatformImage) -> str:
+    verification_flags = ["-Xverify:all", "initialize=false", "reflection-member-linkage"]
+    if platform.platform_image_format == "jdk8-classpath":
+        verification_flags.append("isolated-jdk8-extension-directory")
     return canonical_identity(
         "class_definition_verifier_identity",
         {
@@ -73,7 +77,7 @@ def verifier_identity(platform: JdkPlatformImage) -> str:
             "helper_sha256": _sha256_file(JAVA_HELPER),
             "runtime_platform_image_identity": platform.identity,
             "target_java_launcher_sha256": _sha256_file(platform.java_executable),
-            "verification_flags": ["-Xverify:all", "initialize=false", "reflection-member-linkage"],
+            "verification_flags": verification_flags,
         },
         schema_version="1",
     )
@@ -86,7 +90,7 @@ def verify_class_definitions(
     timeout_seconds: int = 300,
 ) -> dict[str, dict[str, Any]]:
     source_sha = _sha256_file(JAVA_HELPER)
-    javac = platform.jdk_home / "bin" / "javac"
+    javac = jdk_tool_path(platform.jdk_home, "javac")
     if not javac.is_file():
         raise ClassDefinitionVerifierError(
             "TARGET_JAVAC_MISSING", "a full target JDK is required to compile the verifier"
@@ -122,10 +126,15 @@ def verify_class_definitions(
                 "class_name_b64": base64.b64encode(name.encode("utf-8")).decode("ascii"),
             }))
         _write_frame(protocol, _canonical_json({"frame_type": "definition_input_footer"}))
+        java_options = ["-Xverify:all"]
+        if platform.platform_image_format == "jdk8-classpath":
+            java_options.append(
+                f"-Djava.ext.dirs={platform.legacy_extension_dir or ''}"
+            )
         completed = execute_binary_tool(
             [
                 str(platform.java_executable),
-                "-Xverify:all",
+                *java_options,
                 "-cp", str(helper_dir),
                 "ClassDefinitionVerifier",
                 str(root),

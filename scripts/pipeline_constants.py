@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Pipeline-level shared constants."""
 
-STEP_SEQUENCE = ["step1", "step2", "step3", "step4", "step5", "step6"]
+STEP_SEQUENCE = ["step0", "step1", "step2", "step3", "step4", "step5", "step6"]
 
 STEP_TO_MAJOR = {
+    "step0": 0,
     "step1": 1,
     "step2": 2,
     "step3": 3,

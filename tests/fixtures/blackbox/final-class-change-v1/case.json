@@ -1,0 +1,22 @@
+{
+  "schema": "java-upgrade-analyzer.blackbox-case.v1",
+  "case_id": "final-class-change-v1",
+  "dataset_version": 1,
+  "public_entrypoint": "scripts/binary_pipeline.py",
+  "truth_file": "truth.json",
+  "oracle_contract": "member_contract_linkage_closed_set",
+  "capabilities": ["final_class_and_hierarchy_contracts", "unchanged_member_negative"],
+  "library_class": "contract.FinalClassParent",
+  "business_class": "contract.FinalClassApp",
+  "business_classes": ["contract.FinalClassApp", "contract.FinalClassChild"],
+  "oracle_main_class": "contract.OracleMain",
+  "definition_oracle_main_class": "contract.DefinitionMain",
+  "business_lineage": "blackbox:fixture-app",
+  "business_coordinate": "blackbox:fixture-app:1.0",
+  "library_lineage": "blackbox:final-class-lib",
+  "base_coordinate": "blackbox:final-class-lib:1.0",
+  "current_coordinate": "blackbox:final-class-lib:2.0",
+  "entrypoints": [{"class_name": "contract/FinalClassApp", "member_name": "entry", "descriptor": "()Ljava/lang/String;"}],
+  "linkage_probes": [],
+  "runtime_outcome_probes": [{"owner": "contract/FinalClassChild", "member_kind": "class_definition", "linkage_error": "IncompatibleClassChangeError", "error_symbol": "cannot inherit from final class"}]
+}

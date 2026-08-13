@@ -88,6 +88,147 @@ class BinaryTraceFastPathTest(unittest.TestCase):
             result.graph_stats["graph_materialization_status"], "not_required"
         )
 
+    def test_contract_access_reduction_is_linkage_incompatible_without_a_path(self):
+        decision = {
+            "fact_scope": {"member_change_kind": "contract_changed"},
+            "evidence": {
+                "base_contract": {"access": 0x0001},
+                "current_contract": {"access": 0x0002},
+            },
+        }
+
+        self.assertTrue(
+            binary_trace_engine._contract_change_breaks_linkage(decision)
+        )
+        decision["evidence"]["current_contract"]["access"] = 0x0001
+        self.assertFalse(
+            binary_trace_engine._contract_change_breaks_linkage(decision)
+        )
+
+    def test_observed_legal_protected_path_refines_access_reduction(self):
+        decision = {
+            "fact_scope": {
+                "member_kind": "method",
+                "member_change_kind": "contract_changed",
+            },
+            "evidence": {
+                "base_contract": {"access": 0x0001},
+                "current_contract": {"access": 0x0004},
+            },
+        }
+
+        self.assertTrue(
+            binary_trace_engine._access_reduction_is_legal_on_observed_paths(
+                decision,
+                has_path=True,
+                resolution_statuses={"resolved"},
+                linkage_statuses={"resolved"},
+                caller_definition_statuses={"definition_ready"},
+            )
+        )
+        for has_path, resolutions, linkages in (
+            (False, {"resolved"}, {"resolved"}),
+            (True, {"illegal_access"}, {"illegal_access"}),
+            (True, {"resolved"}, {"illegal_access"}),
+        ):
+            with self.subTest(
+                has_path=has_path,
+                resolutions=resolutions,
+                linkages=linkages,
+            ):
+                self.assertFalse(
+                    binary_trace_engine._access_reduction_is_legal_on_observed_paths(
+                        decision,
+                        has_path=has_path,
+                        resolution_statuses=resolutions,
+                        linkage_statuses=linkages,
+                        caller_definition_statuses={"definition_ready"},
+                    )
+                )
+
+        decision["evidence"]["current_contract"]["access"] |= 0x0010
+        self.assertFalse(
+            binary_trace_engine._access_reduction_is_legal_on_observed_paths(
+                decision,
+                has_path=True,
+                resolution_statuses={"resolved"},
+                linkage_statuses={"resolved"},
+                caller_definition_statuses={"definition_ready"},
+            )
+        )
+
+        decision["evidence"]["current_contract"]["access"] = 0x0004
+        self.assertFalse(
+            binary_trace_engine._access_reduction_is_legal_on_observed_paths(
+                decision,
+                has_path=True,
+                resolution_statuses={"resolved"},
+                linkage_statuses={"resolved"},
+                caller_definition_statuses={"verification_failed"},
+            )
+        )
+
+    def test_concrete_method_becoming_abstract_breaks_binary_compatibility(self):
+        decision = {
+            "fact_scope": {"member_change_kind": "contract_changed"},
+            "evidence": {
+                "base_contract": {"access": 0x0001},
+                "current_contract": {"access": 0x0001 | 0x0400},
+            },
+        }
+
+        self.assertTrue(
+            binary_trace_engine._contract_change_breaks_linkage(decision)
+        )
+        decision["evidence"]["base_contract"]["access"] |= 0x0400
+        self.assertFalse(
+            binary_trace_engine._contract_change_breaks_linkage(decision)
+        )
+
+    def test_non_final_method_becoming_final_breaks_binary_compatibility(self):
+        decision = {
+            "fact_scope": {
+                "member_kind": "method",
+                "member_change_kind": "contract_changed",
+            },
+            "evidence": {
+                "base_contract": {"access": 0x0001},
+                "current_contract": {"access": 0x0001 | 0x0010},
+            },
+        }
+
+        self.assertTrue(
+            binary_trace_engine._contract_change_breaks_linkage(decision)
+        )
+        decision["fact_scope"]["member_kind"] = "field"
+        self.assertFalse(
+            binary_trace_engine._contract_change_breaks_linkage(decision)
+        )
+
+    def test_definitive_missing_linkage_edges_are_exact(self):
+        self.assertEqual(
+            binary_trace_engine._unresolved_edge_certainty("no_such_member"),
+            "exact",
+        )
+        for status in ("no_class_definition", "class_definition_failed"):
+            with self.subTest(status=status):
+                self.assertEqual(
+                    binary_trace_engine._unresolved_edge_certainty(
+                        status, paired_artifact_change=True,
+                    ),
+                    "exact",
+                )
+                self.assertEqual(
+                    binary_trace_engine._unresolved_edge_certainty(status),
+                    "possible",
+                )
+        for status in ("ambiguous", "unresolved", "unsupported"):
+            with self.subTest(status=status):
+                self.assertEqual(
+                    binary_trace_engine._unresolved_edge_certainty(status),
+                    "possible",
+                )
+
     def test_every_trace_consumer_routes_to_full_graph_builder(self):
         cases = {
             "formal": self.decisions(formal_projections=({"identity": "p"},)),

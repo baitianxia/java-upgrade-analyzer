@@ -1,0 +1,119 @@
+{
+  "schema": "java-upgrade-analyzer.workflow-blackbox-truth.v1",
+  "case_id": "step0-step1-public-contract-v2",
+  "system_generated": false,
+  "oracle_producers": [
+    {
+      "id": "documented-step1-protocol",
+      "organization": "java-upgrade-analyzer maintainers",
+      "mechanism": "authored_public_contract",
+      "sources": ["README.md", "RUNBOOK.md", "CHECKPOINT_RULES.md"],
+      "verifies": ["public interaction states", "resume and cancellation semantics"]
+    },
+    {
+      "id": "maven-archiver-artifact-identity",
+      "organization": "Apache Maven Project",
+      "mechanism": "authored_fixture_from_maven_pom_properties_convention",
+      "sources": ["https://maven.apache.org/shared/maven-archiver/"],
+      "verifies": ["embedded Maven metadata layout", "artifact coordinate discovery"]
+    },
+    {
+      "id": "stdlib-archive-and-hash-oracle",
+      "organization": "Python Software Foundation",
+      "mechanism": "independent_zip_inventory_and_sha256_byte_identity",
+      "sources": ["https://docs.python.org/3/library/zipfile.html", "https://docs.python.org/3/library/hashlib.html"],
+      "verifies": ["ZIP structural validity", "artifact SHA-256 identity"]
+    }
+  ],
+  "describe_contract": {
+    "schema": "java-upgrade-analyzer.step0-contract.v1",
+    "step_id": "step0",
+    "input_modes": {
+      "artifact_inputs": {
+        "required_fields": ["base_artifact_path", "current_artifact_path", "application_source", "base_branch", "current_branch", "target_module", "base_tool", "current_tool", "base_jdk_home", "current_jdk_home"]
+      },
+      "checkout_build": {
+        "required_fields": ["application_source", "base_branch", "current_branch", "target_module", "base_tool", "current_tool", "base_jdk_home", "current_jdk_home"]
+      }
+    },
+    "optional_fields": ["dependency_source_dirs"]
+  },
+  "missing_input_checkpoint": {
+    "exit_code": 4,
+    "confirmation_schema": "java-upgrade-analyzer.confirmation.v1",
+    "schema": "java-upgrade-analyzer.interaction.v2",
+    "status": "awaiting_user_input",
+    "kind": "input_request",
+    "step_id": "step0",
+    "reason_code": "STEP0_CONFIRMATION_REQUIRED",
+    "checkpoint": true,
+    "hard_stop": true,
+    "required_fields": ["application_source", "base_branch", "current_branch", "target_module", "base_tool", "current_tool", "base_jdk_home", "current_jdk_home"],
+    "option_ids": ["cancel", "continue"],
+    "row_labels": ["最终制品", "版本分支", "目标模块", "构建工具", "JDK 目录", "应用源码", "依赖包源码"]
+  },
+  "last_step_summary": {
+    "schema": "java-upgrade-analyzer.last-step-summary.v1",
+    "event": "awaiting_user_input",
+    "workflow_status": "awaiting_user_input",
+    "current_step": "step0",
+    "needs_user_input": true
+  },
+  "cancel": {
+    "exit_code": 0,
+    "workflow_status": "paused_by_user",
+    "current_step": "step0",
+    "blocking_reason": "用户选择稍后处理",
+    "checkpoint_is_preserved": true
+  },
+  "artifact_input_step1_success": {
+    "exit_code": 0,
+    "dependency_change": {
+      "coord": "org.example:demo-lib",
+      "old_version": "1.0.0",
+      "new_version": "2.0.0",
+      "change_type": "大版本升级",
+      "risk": "高",
+      "scope": "packaged",
+      "resolution_status": "resolved",
+      "base_lib_entry": "BOOT-INF/lib/demo-lib-1.0.0.jar",
+      "current_lib_entry": "BOOT-INF/lib/demo-lib-2.0.0.jar"
+    },
+    "current_dependency": {
+      "coord": "org.example:demo-lib",
+      "version": "2.0.0",
+      "scope": "packaged",
+      "resolution_status": "resolved",
+      "lib_entry": "BOOT-INF/lib/demo-lib-2.0.0.jar"
+    },
+    "provenance_source_mode": "provided_artifact",
+    "required_outputs": [
+      "evidence/dependencies/dep_alerts.csv",
+      "evidence/dependencies/dep_changes.csv",
+      "evidence/dependencies/dep_summary.txt",
+      "evidence/dependencies/deps_current_resolved.csv",
+      "evidence/dependencies/build_provenance.json",
+      "evidence/dependencies/s1_artifacts",
+      "evidence/dependencies/dependency_jars.json",
+      "evidence/dependencies/s1_dependency_jars"
+    ]
+  },
+  "thin_artifact_failure": {
+    "exit_code": 1,
+    "workflow_state": {
+      "status": "blocked_by_system",
+      "current_step": "step1",
+      "completed_step": "step0"
+    },
+    "blocking_reason_contains": "未发现可比较的嵌套依赖"
+  },
+  "corrupt_artifact_failure": {
+    "exit_code": 1,
+    "workflow_state": {
+      "status": "blocked_by_system",
+      "current_step": "step1",
+      "completed_step": "step0"
+    },
+    "blocking_reason_contains": "最终制品扫描不完整"
+  }
+}

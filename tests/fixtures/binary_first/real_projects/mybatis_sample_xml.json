@@ -37,10 +37,83 @@
   },
   "expected": {
     "semantic_edge_kind": "mybatis_mapper_proxy_dispatch",
+    "oracle_provenance": {
+      "system_generated": false,
+      "oracle_kind": "pinned-openjdk-javap-and-jvm-linkage-v1",
+      "oracle_producers": [
+        {
+          "id": "openjdk-javap-member-contracts",
+          "organization": "OpenJDK",
+          "mechanism": "javap -p -s verifies identical public access and JVM descriptors for both expected methods in MyBatis 3.5.10 and 3.5.19"
+        },
+        {
+          "id": "openjdk-jvm-old-client-linkage",
+          "organization": "OpenJDK",
+          "mechanism": "compile tests/fixtures/binary_first/real_projects/oracle/MyBatisLinkageProbe.java against MyBatis 3.5.10 and execute the same bytecode on 3.5.10 and 3.5.19; both calls enter the resolved methods without LinkageError"
+        }
+      ],
+      "oracle_implementation": {
+        "path": "tests/fixtures/binary_first/real_projects/oracle/MyBatisLinkageProbe.java",
+        "sha256": "7ce6881a7a71f142f42a72b791fc90f0ef1d52d79ff867aa6b3f2012021a769b",
+        "main_class": "oracle.MyBatisLinkageProbe",
+        "expected_stdout": [
+          "MapperProxy.invoke=linked:java.lang.NullPointerException",
+          "MapperMethod.execute=linked:java.lang.NullPointerException"
+        ]
+      },
+      "completeness_argument": "The expected subset contains exactly the two declared methods. For each method, javap proves the same JVM linkage contract on both pinned sides and a class compiled only against the base invokes the current implementation without LinkageError."
+    },
     "reachable_changed_methods": [
       "org/apache/ibatis/binding/MapperProxy.invoke",
       "org/apache/ibatis/binding/MapperMethod.execute"
     ],
+    "formal_result_truth": {
+      "schema": "java-upgrade-analyzer.binary-result-truth.v1",
+      "result_set_policy": "subset",
+      "exact_reachability_statuses": [],
+      "expected_results": [
+        {
+          "owner": "org/apache/ibatis/binding/MapperProxy",
+          "member": "invoke",
+          "descriptor": "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;",
+          "member_kind": "method",
+          "dependency_lineages": ["org.mybatis:mybatis"],
+          "base_dependency_coords": ["org.mybatis:mybatis:3.5.10"],
+          "current_dependency_coords": ["org.mybatis:mybatis:3.5.19"],
+          "reachability_status": "reachable",
+          "static_linkage_status": "compatible_or_not_applicable",
+          "impact_conclusion": "probable_impact",
+          "runtime_verification_status": "required_not_executed",
+          "exact_path_exists": true,
+          "possible_path_exists": true,
+          "minimum_path_count": 1
+        },
+        {
+          "owner": "org/apache/ibatis/binding/MapperMethod",
+          "member": "execute",
+          "descriptor": "(Lorg/apache/ibatis/session/SqlSession;[Ljava/lang/Object;)Ljava/lang/Object;",
+          "member_kind": "method",
+          "dependency_lineages": ["org.mybatis:mybatis"],
+          "base_dependency_coords": ["org.mybatis:mybatis:3.5.10"],
+          "current_dependency_coords": ["org.mybatis:mybatis:3.5.19"],
+          "reachability_status": "reachable",
+          "static_linkage_status": "compatible_or_not_applicable",
+          "impact_conclusion": "probable_impact",
+          "runtime_verification_status": "required_not_executed",
+          "exact_path_exists": true,
+          "possible_path_exists": true,
+          "minimum_path_count": 1
+        }
+      ],
+      "forbidden_results": [
+        {
+          "owner": "org/apache/ibatis/session/SqlSession",
+          "member": "commit",
+          "descriptor": "()V",
+          "member_kind": "method"
+        }
+      ]
+    },
     "required_resources": [
       "mybatis-config.xml",
       "sample/mybatis/xml/mapper/CityMapper.xml",

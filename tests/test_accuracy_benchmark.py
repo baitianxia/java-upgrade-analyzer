@@ -14,7 +14,8 @@ class AccuracyBenchmarkTest(unittest.TestCase):
     def test_categories_cover_binary_facts_reconciliation_decision_and_trace(self):
         for name in (
             "artifact_facts", "runtime_reconciliation",
-            "decision_projection", "runtime_bytecode_reachability",
+            "decision_projection", "result_truth",
+            "runtime_bytecode_reachability",
         ):
             self.assertIn(name, accuracy_benchmark.CATEGORIES)
             self.assertTrue(accuracy_benchmark.CATEGORIES[name])
@@ -31,6 +32,7 @@ class AccuracyBenchmarkTest(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("tests.test_binary_pipeline", completed.stdout)
+        self.assertIn("tests.test_binary_generated_regression", completed.stdout)
 
 
 if __name__ == "__main__":

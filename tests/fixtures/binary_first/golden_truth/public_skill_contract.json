@@ -1,0 +1,40 @@
+{
+  "schema": "java-upgrade-analyzer.binary-result-truth.v1",
+  "case": "public-skill-step1-to-step6",
+  "result_set_policy": "exact",
+  "exact_reachability_statuses": [
+    "reachable"
+  ],
+  "expected_results": [
+    {
+      "owner": "contract/Target",
+      "member": "removed",
+      "descriptor": "()Ljava/lang/String;",
+      "member_kind": "method",
+      "dependency_lineages": [
+        "contract:demo-lib"
+      ],
+      "base_dependency_coords": [
+        "contract:demo-lib:1.0"
+      ],
+      "current_dependency_coords": [
+        "contract:demo-lib:2.0"
+      ],
+      "reachability_status": "reachable",
+      "static_linkage_status": "incompatible_if_executed",
+      "impact_conclusion": "probable_impact",
+      "runtime_verification_status": "required_not_executed",
+      "exact_path_exists": true,
+      "possible_path_exists": false,
+      "path_set_complete": true,
+      "minimum_path_count": 1,
+      "required_paths": [
+        {
+          "certainty": "exact",
+          "text": "contract.App.run(contract.Target) → contract.Target.removed()"
+        }
+      ]
+    }
+  ],
+  "forbidden_results": []
+}

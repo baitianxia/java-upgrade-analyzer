@@ -233,6 +233,12 @@ def _resource_semantic_facts(name: str, category: str, content: bytes) -> tuple[
             for entry in (item.strip() for item in value.split(","))
             if entry
         )
+    # XML resources can live below META-INF/spring/. They must use the bounded
+    # XML parser before the line-oriented registration-file rule, otherwise a
+    # malformed XML document is silently reinterpreted as an ordered class
+    # name and production disagrees with the independent Oracle.
+    if name.lower().endswith(".xml"):
+        return _xml_runtime_semantic_facts(content)
     if (
         name.startswith("META-INF/services/")
         or name.startswith("META-INF/spring/")
@@ -244,8 +250,6 @@ def _resource_semantic_facts(name: str, category: str, content: bytes) -> tuple[
             if value:
                 facts.append(("ordered_entry", value))
         return tuple(facts)
-    if name.lower().endswith(".xml"):
-        return _xml_runtime_semantic_facts(content)
     return ()
 
 
@@ -498,7 +502,9 @@ def snapshot_archive(
     artifact_instance_identity: str,
     expected_sha256: str,
     asm_jar: str | Path | None = None,
+    jdk_home: str | Path | None = None,
     target_jvm_major: int | None = None,
+    safety_policy: Mapping[str, Any] | None = None,
 ) -> ArtifactSnapshot:
     archive_path = Path(path)
     expected_sha256 = _validate_expected_sha(expected_sha256)
@@ -510,19 +516,26 @@ def snapshot_archive(
             "ARTIFACT_SHA256_MISMATCH",
             f"expected={expected_sha256}; actual={before_sha}",
         )
+    effective_safety = {**_SAFETY, **dict(safety_policy or {})}
     safety = inspect_archive(
         archive_path,
-        max_entries=int(_SAFETY["max_archive_entries"]),
-        max_total_uncompressed_bytes=int(_SAFETY["max_total_uncompressed_bytes"]),
-        max_nested_depth=int(_SAFETY["max_nested_depth"]),
-        max_nested_archive_bytes=int(_SAFETY["max_nested_archive_bytes"]),
-        inspect_nested_archives=False,
+        max_entries=int(effective_safety["max_archive_entries"]),
+        max_total_uncompressed_bytes=int(
+            effective_safety["max_total_uncompressed_bytes"]
+        ),
+        max_expansion_ratio=float(effective_safety["max_expansion_ratio"]),
+        max_nested_depth=int(effective_safety["max_nested_depth"]),
+        max_nested_archive_bytes=int(
+            effective_safety["max_nested_archive_bytes"]
+        ),
+        inspect_nested_archives=True,
         allow_duplicate_maven_metadata=True,
     )
-    blocking_safety = tuple(
-        reason for reason in safety.reason_codes
-        if reason != "ARCHIVE_DUPLICATE_ENTRY"
-    )
+    # ``allow_duplicate_maven_metadata`` already filters the one explicitly
+    # tolerated metadata case inside the safety scanner. Any remaining
+    # duplicate can alter class/resource selection between ZIP readers and the
+    # JVM, so it is blocking rather than merely lowering coverage.
+    blocking_safety = tuple(safety.reason_codes)
     if blocking_safety:
         raise BinaryArtifactDiffError(
             "ARTIFACT_SAFETY_POLICY_BLOCKED",
@@ -635,10 +648,14 @@ def snapshot_archive(
     asm_run: BinaryFactRun = extract_class_facts(
         class_inputs,
         asm_jar=asm_jar,
-        max_class_bytes=int(_SAFETY["max_class_bytes"]),
-        max_frame_bytes=int(_SAFETY["max_protocol_frame_bytes"]),
-        max_records=int(_SAFETY["max_fact_records"]),
-        timeout_seconds=int(_SAFETY["helper_timeout_seconds"]),
+        jdk_home=jdk_home,
+        max_class_bytes=int(effective_safety["max_class_bytes"]),
+        max_frame_bytes=int(effective_safety["max_protocol_frame_bytes"]),
+        max_records=int(effective_safety["max_fact_records"]),
+        timeout_seconds=float(effective_safety["helper_timeout_seconds"]),
+        max_heap_megabytes=int(
+            str(effective_safety["helper_max_heap"]).removesuffix("m")
+        ),
     )
 
     recognized = set(_ATTRIBUTE_POLICY["recognized_by_typed_facts"])

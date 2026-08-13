@@ -1,0 +1,43 @@
+{
+  "schema": "java-upgrade-analyzer.workflow-blackbox-truth.v1",
+  "case_id": "war-public-workflow-v1",
+  "system_generated": false,
+  "oracle_producers": [
+    {
+      "id": "openjdk-linker-extracted-war",
+      "organization": "OpenJDK",
+      "mechanism": "execute standard-library extracted WEB-INF classes and dependency bytes",
+      "verifies": ["base success", "current NoSuchMethodError", "removed descriptor"]
+    },
+    {
+      "id": "stdlib-war-inventory",
+      "organization": "Python Software Foundation",
+      "mechanism": "closed ZIP layout, nested JAR byte identity and SHA-256 inventory",
+      "verifies": ["WEB-INF/classes", "WEB-INF/lib", "nested bytes retained"]
+    }
+  ],
+  "expected_checkpoints": ["step0"],
+  "expected_completion": {
+    "process_exit_code": 0,
+    "workflow_status": "completed_with_limits",
+    "current_step": "done",
+    "completed_step": "step6"
+  },
+  "target": ["demo/Api", "removed", "()Ljava/lang/String;", "method"],
+  "target_state": {
+    "reachability_status": "reachable",
+    "static_linkage_status": "incompatible_if_executed",
+    "impact_conclusion": "probable_impact",
+    "exact_path_exists": true
+  },
+  "required_layout": [
+    "WEB-INF/classes/example/Application.class",
+    "WEB-INF/lib/demo-lib-1.0.0.jar"
+  ],
+  "required_outputs": [
+    "evidence/dependencies/dependency_jars.json",
+    "evidence/api_changes/all_changed_apis.csv",
+    "evidence/call_chain/summary.json",
+    "deliverables/report.md"
+  ]
+}

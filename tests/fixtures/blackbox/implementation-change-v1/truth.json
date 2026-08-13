@@ -1,0 +1,25 @@
+{
+  "schema": "java-upgrade-analyzer.blackbox-truth.v1",
+  "case_id": "implementation-change-v1",
+  "dataset_version": 1,
+  "scope": "closed_set",
+  "system_generated": false,
+  "human_review": {"status": "not_claimed", "reviewer": ""},
+  "input_evidence": {"algorithm": "sha256-path-nul-content-nul-v1", "source_tree_sha256": "080a2ef4a2aeb4d88b8b60a92dfbc2052d4993001d7ae342967f4a160e6857c1", "case_algorithm": "sha256-canonical-json-v1", "case_sha256": "5e0bba02a7f980697d2451e7c7a20e9e21438e2b868f51b010145d81ebb24b4f", "source_files": ["src/base/contract/BehaviorApi.java", "src/business/contract/BehaviorApp.java", "src/current/contract/BehaviorApi.java", "src/oracle/contract/OracleMain.java"]},
+  "oracle_producers": [
+    {"id": "openjdk-javap-normalized-code", "organization": "OpenJDK", "mechanism": "independent_bytecode_implementation_inventory", "verifies": ["complete_changed_method_body_set", "complete_direct_call_graph"]},
+    {"id": "openjdk-jvm-behavior-probe", "organization": "OpenJDK", "mechanism": "actual_jvm_execution", "verifies": ["base_and_current_execute", "observable_return_value_changed"]}
+  ],
+  "oracle_implementations": [{"path": "tests/blackbox/oracles/openjdk_oracle.py", "sha256": "6e72442077371b86c943f790b5982144497725200da3e89f22f66ca2bfee38ca"}],
+  "completeness": {
+    "argument": "OpenJDK javap independently compares normalized instructions for every public method of the only changed class and finds exactly two changed bodies while all public flags and descriptors remain identical. The sole declared entrypoint reaches exactly one changed method; separate JVM executions verify both authored base/current return values.",
+    "verified_dimensions": ["api_identity", "jvm_descriptor", "closed_result_set", "entrypoint_reachability", "static_linkage"],
+    "known_limits": []
+  },
+  "expected_result_count": 2,
+  "expected_results": [
+    {"owner": "contract/BehaviorApi", "member": "reachableBehavior", "descriptor": "()I", "member_kind": "method", "dependency_lineages": ["blackbox:behavior-lib"], "base_dependency_coords": ["blackbox:behavior-lib:1.0"], "current_dependency_coords": ["blackbox:behavior-lib:2.0"], "reachability_status": "reachable", "static_linkage_status": "compatible_or_not_applicable", "impact_conclusion": "probable_impact", "runtime_verification_status": "required_not_executed", "exact_path_exists": true, "possible_path_exists": false, "path_set_complete": true, "paths": [{"certainty": "exact", "text": "contract.BehaviorApp.entry(contract.BehaviorApi) → contract.BehaviorApi.reachableBehavior()"}]},
+    {"owner": "contract/BehaviorApi", "member": "unreachableBehavior", "descriptor": "()I", "member_kind": "method", "dependency_lineages": ["blackbox:behavior-lib"], "base_dependency_coords": ["blackbox:behavior-lib:1.0"], "current_dependency_coords": ["blackbox:behavior-lib:2.0"], "reachability_status": "not_found_in_static_analysis", "static_linkage_status": "compatible_or_not_applicable", "impact_conclusion": "inconclusive", "runtime_verification_status": "undetermined", "exact_path_exists": false, "possible_path_exists": false, "path_set_complete": true, "paths": []}
+  ],
+  "forbidden_results": [{"owner": "contract/BehaviorApi", "member": "stable", "descriptor": "()I", "member_kind": "method", "oracle_relation": "unchanged_member", "reason": "OpenJDK javap reports identical flags, descriptor, and normalized instructions on both sides."}]
+}

@@ -1,0 +1,195 @@
+{
+  "schema": "java-upgrade-analyzer.runtime-blackbox-truth.v1",
+  "case_id": "runtime-dispatch-v1",
+  "system_generated": false,
+  "oracle_producers": [
+    {
+      "id": "openjdk-jvm-execution",
+      "organization": "OpenJDK",
+      "mechanism": "execute_reflection_method_handle_and_proxy_paths",
+      "verifies": ["base_returns_1", "current_returns_2"]
+    },
+    {
+      "id": "openjdk-javap-bytecode",
+      "organization": "OpenJDK",
+      "mechanism": "independent_invocation_and_literal_inventory",
+      "verifies": ["runtime_dispatch_registration", "changed_method_descriptor"]
+    }
+  ],
+  "cases": {
+    "reflection": {
+      "semantic_edge_kind": "reflection_method_invocation",
+      "target": ["lib/Target", "changed", "()I", "method"],
+      "expected_base_stdout": "1",
+      "expected_current_stdout": "2"
+    },
+    "method_handle": {
+      "semantic_edge_kind": "method_handle_invocation",
+      "target": ["lib/Target", "changed", "()I", "method"],
+      "expected_base_stdout": "1",
+      "expected_current_stdout": "2"
+    },
+    "dynamic_proxy": {
+      "semantic_edge_kind": "dynamic_proxy_callback",
+      "target": ["api/Api", "value", "()I", "method"],
+      "expected_base_stdout": "1",
+      "expected_current_stdout": "2"
+    },
+    "invokedynamic_lambda": {
+      "target": ["lib/Target", "changed", "()I", "method"],
+      "expected_base_stdout": "1",
+      "expected_current_stdout": "2",
+      "javap_tokens": [
+        "InvokeDynamic",
+        "LambdaMetafactory.metafactory",
+        "REF_invokeVirtual lib/Target.changed:()I",
+        "IntSupplier.getAsInt"
+      ],
+      "expected_state": {
+        "reachability_status": "uncertain",
+        "impact_conclusion": "inconclusive",
+        "static_linkage_status": "compatible_or_not_applicable",
+        "runtime_verification_status": "undetermined",
+        "exact_path_exists": false,
+        "possible_path_exists": true,
+        "path_set_complete": true
+      },
+      "expected_paths": [
+        ["possible", "biz.Entry.main(java.lang.String[]) → biz.Entry.run() → lib.Target.changed()"],
+        ["possible", "biz.Entry.run() → lib.Target.changed()"]
+      ]
+    },
+    "not_analyzed_incomplete_entrypoints": {
+      "expected_stdout": "0",
+      "expected_state": {
+        "reachability_status": "not_analyzed",
+        "impact_conclusion": "inconclusive",
+        "static_linkage_status": "compatible_or_not_applicable",
+        "runtime_verification_status": "undetermined",
+        "exact_path_exists": false,
+        "possible_path_exists": false,
+        "path_set_complete": false
+      }
+    },
+    "path_enumeration_limit": {
+      "expected_base_stdout": "11",
+      "expected_current_stdout": "22",
+      "expected_state": {
+        "reachability_status": "reachable",
+        "impact_conclusion": "probable_impact",
+        "static_linkage_status": "compatible_or_not_applicable",
+        "runtime_verification_status": "required_not_executed",
+        "exact_path_exists": true,
+        "possible_path_exists": false,
+        "path_set_complete": false
+      },
+      "allowed_single_paths": [
+        ["exact", "biz.RootA.run() → lib.Target.changed()"],
+        ["exact", "biz.RootB.run() → lib.Target.changed()"]
+      ]
+    },
+    "javac_constant_inline": {
+      "target": ["vendor/Constants", "VALUE", "I", "field"],
+      "expected_base_stdout": "11",
+      "expected_rebuilt_current_stdout": "29",
+      "expected_retained_current_stdout": "11",
+      "rebuilt_expected_state": {
+        "reachability_status": "reachable",
+        "impact_conclusion": "probable_impact",
+        "static_linkage_status": "compatible_or_not_applicable",
+        "runtime_verification_status": "required_not_executed",
+        "exact_path_exists": true,
+        "possible_path_exists": true,
+        "path_set_complete": true
+      },
+      "retained_expected_state": {
+        "reachability_status": "not_found_in_static_analysis",
+        "impact_conclusion": "inconclusive",
+        "static_linkage_status": "compatible_or_not_applicable",
+        "runtime_verification_status": "undetermined",
+        "exact_path_exists": false,
+        "possible_path_exists": false,
+        "path_set_complete": true
+      }
+    },
+    "bridge_covariant": {
+      "expected_base_stdout": "base",
+      "current_error_symbols": {
+        "direct": "java.lang.String lib.Provider.value()",
+        "bridge": "java.lang.Object lib.Provider.value()"
+      },
+      "expected_results": [
+        {
+          "identity": ["lib/Provider", "value", "()Ljava/lang/Object;", "method"],
+          "state": {
+            "reachability_status": "reachable",
+            "impact_conclusion": "probable_impact",
+            "static_linkage_status": "incompatible_if_executed",
+            "runtime_verification_status": "required_not_executed",
+            "exact_path_exists": true,
+            "possible_path_exists": false,
+            "path_set_complete": true
+          },
+          "paths": [["exact", "biz.BridgeEntry.run() → lib.Provider.value()"]]
+        },
+        {
+          "identity": ["lib/Provider", "value", "()Ljava/lang/String;", "method"],
+          "state": {
+            "reachability_status": "reachable",
+            "impact_conclusion": "probable_impact",
+            "static_linkage_status": "incompatible_if_executed",
+            "runtime_verification_status": "required_not_executed",
+            "exact_path_exists": true,
+            "possible_path_exists": false,
+            "path_set_complete": true
+          },
+          "paths": [["exact", "biz.DirectEntry.run() → lib.Provider.value()"]]
+        }
+      ]
+    },
+    "override_removal_inherited_rebind": {
+      "expected_base_stdout": "child",
+      "expected_current_stdout": "parent",
+      "target": ["lib/Child", "value", "()Ljava/lang/String;", "method"],
+      "expected_state": {
+        "reachability_status": "reachable",
+        "impact_conclusion": "probable_impact",
+        "static_linkage_status": "compatible_or_not_applicable",
+        "runtime_verification_status": "required_not_executed",
+        "exact_path_exists": true,
+        "possible_path_exists": true,
+        "path_set_complete": true
+      },
+      "expected_paths": [
+        ["exact", "biz.Entry.run() → lib.Child.value()"],
+        ["possible", "biz.Entry.main(java.lang.String[]) → biz.Entry.run() → lib.Child.value()"]
+      ],
+      "forbidden_parent_result": ["lib/Parent", "value", "()Ljava/lang/String;", "method"]
+    },
+    "superclass_replacement": {
+      "expected_base_stdout": "legacy",
+      "target": ["lib/Child", "legacy", "()Ljava/lang/String;", "method"],
+      "expected_state": {
+        "reachability_status": "reachable",
+        "impact_conclusion": "probable_impact",
+        "static_linkage_status": "incompatible_if_executed",
+        "runtime_verification_status": "required_not_executed",
+        "exact_path_exists": true,
+        "possible_path_exists": true,
+        "path_set_complete": true
+      },
+      "expected_paths": [
+        ["exact", "biz.Entry.run() → lib.Child.legacy()"],
+        ["possible", "biz.Entry.main(java.lang.String[]) → biz.Entry.run() → lib.Child.legacy()"]
+      ]
+    }
+  },
+  "expected_state": {
+    "reachability_status": "reachable",
+    "impact_conclusion": "probable_impact",
+    "static_linkage_status": "compatible_or_not_applicable",
+    "exact_path_exists": true,
+    "possible_path_exists": true,
+    "path_set_complete": true
+  }
+}

@@ -20,7 +20,7 @@ from binary_first_contract import BinaryFirstContractError, canonical_identity
 
 
 CACHE_SCHEMA = "java-upgrade-analyzer.binary-snapshot-cache.v2"
-CACHE_POLICY_VERSION = "artifact-content-parser-target-release-rebind-v2"
+CACHE_POLICY_VERSION = "artifact-content-parser-target-release-safety-rebind-v3"
 
 
 class BinarySnapshotCacheError(BinaryFirstContractError):
@@ -87,12 +87,16 @@ def _sha256_file(path: Path) -> str:
 
 
 def _cache_key(
-    content_sha256: str, parser_id: str, target_jvm_major: int | None,
+    content_sha256: str,
+    parser_id: str,
+    target_jvm_major: int | None,
+    safety_policy_identity: str,
 ) -> str:
     return _identity("binary_snapshot_cache_key", {
         "artifact_content_sha256": content_sha256,
         "parser_identity": parser_id,
         "target_jvm_major": target_jvm_major,
+        "artifact_safety_policy_identity": safety_policy_identity,
         "cache_policy_version": CACHE_POLICY_VERSION,
     })
 
@@ -241,8 +245,10 @@ def cached_snapshot_archive(
     expected_sha256: str,
     cache_root: str | Path,
     asm_jar: str | Path | None = None,
+    jdk_home: str | Path | None = None,
     target_jvm_major: int | None = None,
     template_memo: SnapshotTemplateMemo | None = None,
+    safety_policy: dict[str, Any] | None = None,
 ) -> SnapshotCacheOutcome:
     archive = Path(path)
     expected_sha = str(expected_sha256 or "").strip().lower()
@@ -258,7 +264,12 @@ def cached_snapshot_archive(
     # A hit is still independently verified against the current artifact bytes.
     # On a miss, snapshot_archive performs both its before and after hashes, so
     # hashing here as well was a third full read with no additional evidence.
-    key = _cache_key(expected_sha, parser_id, target_jvm_major)
+    safety_policy_identity = _identity(
+        "artifact_safety_policy_identity", dict(safety_policy or {})
+    )
+    key = _cache_key(
+        expected_sha, parser_id, target_jvm_major, safety_policy_identity
+    )
     cache_path = Path(cache_root) / "artifact_snapshots" / parser_id / f"{key}.json.zlib"
     cache_status = "miss"
     cache_tier = "parsed"
@@ -297,7 +308,9 @@ def cached_snapshot_archive(
             artifact_instance_identity=f"CACHE-TEMPLATE:{key}",
             expected_sha256=expected_sha,
             asm_jar=asm_path,
+            jdk_home=jdk_home,
             target_jvm_major=target_jvm_major,
+            safety_policy=safety_policy,
         )
         parser_invocations = 1
         payload = _template_payload(parsed_snapshot)

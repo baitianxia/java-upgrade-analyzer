@@ -71,6 +71,27 @@ def _rss_bytes() -> int:
     return int(max(value, child) * multiplier)
 
 
+def _cpu_seconds() -> float:
+    """Return cumulative CPU time for this process and completed children."""
+    if _resource is None:
+        return float(time.process_time())
+    own = _resource.getrusage(_resource.RUSAGE_SELF)
+    children = _resource.getrusage(_resource.RUSAGE_CHILDREN)
+    return float(
+        own.ru_utime + own.ru_stime + children.ru_utime + children.ru_stime
+    )
+
+
+def _timing_metrics(*, started: float, cpu_started: float) -> dict[str, float]:
+    elapsed = max(time.perf_counter() - started, 0.0)
+    cpu = max(_cpu_seconds() - cpu_started, 0.0)
+    return {
+        "end_to_end_seconds": elapsed,
+        "cpu_seconds": cpu,
+        "average_cpu_cores": cpu / elapsed if elapsed else 0.0,
+    }
+
+
 def _command_version(command: list[str]) -> str:
     completed = subprocess.run(
         command, capture_output=True, text=True, encoding="utf-8",
@@ -304,11 +325,13 @@ def _analyze_once(
 ) -> dict[str, Any]:
     if not warm and cache_root.exists():
         shutil.rmtree(cache_root)
-    profile = _runtime_profile(artifacts, _java_major(_jdk_home()))
+    selected_jdk_home = _jdk_home()
+    profile = _runtime_profile(artifacts, _java_major(selected_jdk_home))
     db = root / ("warm.sqlite" if warm else "cold.sqlite")
     if db.exists():
         db.unlink()
     started = time.perf_counter()
+    cpu_started = _cpu_seconds()
     inventory_started = time.perf_counter()
     inventory = _inventory(artifacts)
     inventory_seconds = time.perf_counter() - inventory_started
@@ -330,6 +353,7 @@ def _analyze_once(
                 expected_sha256=artifact["sha256"],
                 cache_root=cache_root,
                 asm_jar=asm_jar,
+                jdk_home=selected_jdk_home,
                 target_jvm_major=int(profile.payload["target_jvm"]["major"]),
             )
             parse_seconds += time.perf_counter() - parse_started
@@ -376,9 +400,9 @@ def _analyze_once(
         report_seconds = time.perf_counter() - report_started
     finally:
         store.close()
-    elapsed = time.perf_counter() - started
+    timing = _timing_metrics(started=started, cpu_started=cpu_started)
     return {
-        "end_to_end_seconds": elapsed,
+        **timing,
         "stage_seconds": {
             "inventory": inventory_seconds,
             "parse_and_cache": parse_seconds,
@@ -403,6 +427,7 @@ def _analyze_once(
 
 def _legacy_javap(artifacts: list[dict[str, Any]], classes_per_jar: int) -> dict[str, Any]:
     started = time.perf_counter()
+    cpu_started = _cpu_seconds()
     class_count = 0
     for artifact in artifacts:
         first = int(artifact["first_class_index"])
@@ -420,7 +445,7 @@ def _legacy_javap(artifacts: list[dict[str, Any]], classes_per_jar: int) -> dict
             )
         class_count += len(names)
     return {
-        "end_to_end_seconds": time.perf_counter() - started,
+        **_timing_metrics(started=started, cpu_started=cpu_started),
         "class_count": class_count,
         "peak_rss_bytes": _rss_bytes(),
         "implementation": "legacy-javap-c-s-p-batched-per-artifact",
@@ -509,6 +534,8 @@ def _full_pipeline_probe(
         "resource_selection_coverage_status": "complete",
     }
     jdk_home = str(_jdk_home())
+    started = time.perf_counter()
+    cpu_started = _cpu_seconds()
     result = run_pipeline(
         {
             "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
@@ -534,6 +561,7 @@ def _full_pipeline_probe(
         },
         output_root=output_root,
     )
+    timing = _timing_metrics(started=started, cpu_started=cpu_started)
     evidence = _full_pipeline_evidence(result)
     comparison = (
         "identical-base-current-cold-output"
@@ -547,7 +575,15 @@ def _full_pipeline_probe(
         "jar_count": len(selected_base),
         "current_jar_count": len(selected_current),
         "expected_class_count": len(selected_base) * classes_per_jar,
+        # Preserve the pipeline's own wall clock while measuring CPU across
+        # this process and its completed Java helper children over the same
+        # invocation.
         "end_to_end_seconds": float(result["total_elapsed_seconds"]),
+        "cpu_seconds": timing["cpu_seconds"],
+        "average_cpu_cores": (
+            timing["cpu_seconds"] / float(result["total_elapsed_seconds"])
+            if float(result["total_elapsed_seconds"]) > 0 else 0.0
+        ),
         "phase_seconds": {
             str(item["phase"]): float(item["elapsed_seconds"])
             for item in result["phase_timings"]
@@ -626,11 +662,21 @@ def _full_pipeline_evidence(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _p95(values: list[float]) -> float:
+def _percentile(values: list[float], percentile: float) -> float:
     if not values:
-        raise PerformanceGateError("p95 requires samples")
+        raise PerformanceGateError("percentile requires samples")
+    if not 0 < percentile <= 1:
+        raise PerformanceGateError("percentile must be in (0, 1]")
     ordered = sorted(values)
-    return ordered[max(0, math.ceil(0.95 * len(ordered)) - 1)]
+    return ordered[max(0, math.ceil(percentile * len(ordered)) - 1)]
+
+
+def _p50(values: list[float]) -> float:
+    return _percentile(values, 0.50)
+
+
+def _p95(values: list[float]) -> float:
+    return _percentile(values, 0.95)
 
 
 def run_benchmark(
@@ -683,7 +729,20 @@ def run_benchmark(
         },
         schema_version="1",
     )
-    warm_p95 = _p95([item["end_to_end_seconds"] for item in warm_runs])
+    warm_seconds = [item["end_to_end_seconds"] for item in warm_runs]
+    warm_p50 = _p50(warm_seconds)
+    warm_p95 = _p95(warm_seconds)
+    measured_runs = [
+        cold,
+        *warm_runs,
+        *([legacy] if legacy else []),
+        full_pipeline_probe,
+        changed_full_pipeline_probe,
+    ]
+    total_measured_wall = sum(
+        float(item["end_to_end_seconds"]) for item in measured_runs
+    )
+    total_measured_cpu = sum(float(item["cpu_seconds"]) for item in measured_runs)
     relative = (
         cold["end_to_end_seconds"] / legacy["end_to_end_seconds"]
         if legacy and legacy["end_to_end_seconds"] else None
@@ -759,6 +818,12 @@ def run_benchmark(
                 "full_pipeline": 1,
                 "changed_full_pipeline": 1,
             },
+            "cpu_time_source": (
+                "resource.getrusage(self+completed_children)"
+                if _resource is not None
+                else "time.process_time(self_only_fallback)"
+            ),
+            "p50_method": "nearest-rank",
             "p95_method": "nearest-rank",
             "cold_cleanup_rule": "delete binary snapshot cache and SQLite before run",
             "warm_cache_rule": "all content+parser cache entries must pass digest validation; parser_invocations=0",
@@ -766,6 +831,7 @@ def run_benchmark(
         "measurements": {
             "cold": cold,
             "warm_runs": warm_runs,
+            "warm_end_to_end_p50_seconds": warm_p50,
             "warm_end_to_end_p95_seconds": warm_p95,
             "legacy": legacy,
             "full_pipeline_probe": full_pipeline_probe,
@@ -781,6 +847,12 @@ def run_benchmark(
                 ]
             ),
             "disk_bytes": cold["db_bytes"] + cold["cache_bytes"],
+            "total_measured_wall_seconds": total_measured_wall,
+            "total_measured_cpu_seconds": total_measured_cpu,
+            "average_cpu_cores": (
+                total_measured_cpu / total_measured_wall
+                if total_measured_wall else 0.0
+            ),
         },
     }
 
@@ -836,6 +908,68 @@ def evaluate_gate(result: dict[str, Any], gate: dict[str, Any]) -> dict[str, Any
     cold = measurements.get("cold") or {}
     warm_runs = list(measurements.get("warm_runs") or ())
 
+    if warm_runs:
+        warm_seconds = [float(item["end_to_end_seconds"]) for item in warm_runs]
+        for metric, expected in (
+            ("warm_end_to_end_p50_seconds", _p50(warm_seconds)),
+            ("warm_end_to_end_p95_seconds", _p95(warm_seconds)),
+        ):
+            actual = measurements.get(metric)
+            if actual is None or not math.isclose(
+                float(actual), expected, rel_tol=1e-12, abs_tol=1e-12
+            ):
+                issues.append({
+                    "reason_code": "BINARY_PERFORMANCE_DERIVATION_INVALID",
+                    "metric": metric,
+                    "expected": expected,
+                    "actual": actual,
+                })
+
+    if protocol.get("cpu_time_source"):
+        cpu_runs = {
+            "cold": cold,
+            **{
+                f"warm[{index}]": item
+                for index, item in enumerate(warm_runs)
+            },
+            "full_pipeline_probe": measurements.get("full_pipeline_probe") or {},
+            "changed_full_pipeline_probe": (
+                measurements.get("changed_full_pipeline_probe") or {}
+            ),
+        }
+        if measurements.get("legacy"):
+            cpu_runs["legacy"] = measurements["legacy"]
+        for label, measured in cpu_runs.items():
+            wall = measured.get("end_to_end_seconds")
+            cpu = measured.get("cpu_seconds")
+            average = measured.get("average_cpu_cores")
+            valid = False
+            try:
+                wall_value = float(wall)
+                cpu_value = float(cpu)
+                average_value = float(average)
+                valid = (
+                    wall_value > 0
+                    and cpu_value >= 0
+                    and average_value >= 0
+                    and math.isclose(
+                        average_value,
+                        cpu_value / wall_value,
+                        rel_tol=1e-9,
+                        abs_tol=1e-12,
+                    )
+                )
+            except (TypeError, ValueError):
+                pass
+            if not valid:
+                issues.append({
+                    "reason_code": "BINARY_PERFORMANCE_CPU_MEASUREMENT_INVALID",
+                    "run": label,
+                    "wall_seconds": wall,
+                    "cpu_seconds": cpu,
+                    "average_cpu_cores": average,
+                })
+
     def upper(metric: str, actual: float | int | None, limit: float | int | None):
         if actual is None or limit is None or float(actual) > float(limit):
             issues.append({
@@ -844,6 +978,11 @@ def evaluate_gate(result: dict[str, Any], gate: dict[str, Any]) -> dict[str, Any
             })
 
     upper("cold_end_to_end_seconds", cold.get("end_to_end_seconds"), thresholds.get("cold_end_to_end_seconds"))
+    upper(
+        "warm_end_to_end_p50_seconds",
+        measurements.get("warm_end_to_end_p50_seconds"),
+        thresholds.get("warm_end_to_end_p50_seconds"),
+    )
     upper(
         "warm_end_to_end_p95_seconds",
         measurements.get("warm_end_to_end_p95_seconds"),
@@ -1122,16 +1261,392 @@ def evaluate_gate(result: dict[str, Any], gate: dict[str, Any]) -> dict[str, Any
     }
 
 
+def evaluate_recorded_gate(gate: dict[str, Any]) -> dict[str, Any]:
+    """Re-evaluate checked-in scale evidence instead of trusting its status."""
+    issues: list[dict[str, Any]] = []
+    protocol = dict(gate.get("measurement_protocol") or {})
+    recorded = dict(gate.get("recorded_measurements") or {})
+    sample_runs = dict(protocol.get("sample_runs") or {})
+    warm_samples = list(
+        recorded.get("warm_end_to_end_samples_seconds") or ()
+    )
+    warm_cpu_samples = list(recorded.get("warm_cpu_seconds_samples") or ())
+    warm_core_samples = list(
+        recorded.get("warm_average_cpu_cores_samples") or ()
+    )
+    stage = dict(recorded.get("stage_seconds") or {})
+
+    def structural(reason_code: str, field: str, expected: Any, actual: Any):
+        if actual != expected:
+            issues.append({
+                "reason_code": reason_code,
+                "field": field,
+                "expected": expected,
+                "actual": actual,
+            })
+
+    structural(
+        "BINARY_PERFORMANCE_RECORDED_SCHEMA_INVALID", "schema",
+        "java-upgrade-analyzer.binary-first-performance-gate.v1",
+        gate.get("schema"),
+    )
+    structural(
+        "BINARY_PERFORMANCE_RECORDED_SCALE_INVALID", "jar_count",
+        400, protocol.get("jar_count"),
+    )
+    structural(
+        "BINARY_PERFORMANCE_RECORDED_SCALE_INVALID", "class_count",
+        100_000, protocol.get("class_count"),
+    )
+    structural(
+        "BINARY_PERFORMANCE_RECORDED_SCALE_INVALID", "classes_per_jar",
+        250, protocol.get("classes_per_jar"),
+    )
+    try:
+        product = int(protocol.get("jar_count")) * int(
+            protocol.get("classes_per_jar")
+        )
+    except (TypeError, ValueError):
+        product = None
+    structural(
+        "BINARY_PERFORMANCE_RECORDED_SCALE_INVALID", "scale_product",
+        protocol.get("class_count"), product,
+    )
+    structural(
+        "BINARY_PERFORMANCE_RECORDED_SAMPLE_COUNT_INVALID", "warm_samples",
+        sample_runs.get("warm"), len(warm_samples),
+    )
+    structural(
+        "BINARY_PERFORMANCE_RECORDED_SAMPLE_COUNT_INVALID",
+        "warm_cpu_samples", len(warm_samples), len(warm_cpu_samples),
+    )
+    structural(
+        "BINARY_PERFORMANCE_RECORDED_SAMPLE_COUNT_INVALID",
+        "warm_average_cpu_cores_samples", len(warm_samples),
+        len(warm_core_samples),
+    )
+    structural(
+        "BINARY_PERFORMANCE_RECORDED_CONSERVATION_INVALID", "class_count",
+        protocol.get("class_count"), recorded.get("class_count"),
+    )
+    structural(
+        "BINARY_PERFORMANCE_RECORDED_CACHE_INVALID",
+        "cold_parser_invocations", protocol.get("jar_count"),
+        recorded.get("cold_parser_invocations"),
+    )
+    structural(
+        "BINARY_PERFORMANCE_RECORDED_CACHE_INVALID",
+        "warm_parser_invocations", 0,
+        recorded.get("warm_parser_invocations"),
+    )
+    structural(
+        "BINARY_PERFORMANCE_RECORDED_CACHE_INVALID",
+        "warm_cache_hits", protocol.get("jar_count"),
+        recorded.get("warm_cache_hits"),
+    )
+    try:
+        disk_sum = int(recorded.get("sqlite_bytes")) + int(
+            recorded.get("cache_bytes")
+        )
+    except (TypeError, ValueError):
+        disk_sum = None
+    structural(
+        "BINARY_PERFORMANCE_RECORDED_DERIVATION_INVALID", "disk_bytes",
+        recorded.get("disk_bytes"), disk_sum,
+    )
+    if warm_samples:
+        structural(
+            "BINARY_PERFORMANCE_RECORDED_DERIVATION_INVALID", "warm_p50",
+            recorded.get("warm_end_to_end_p50_seconds"),
+            _p50([float(value) for value in warm_samples]),
+        )
+        structural(
+            "BINARY_PERFORMANCE_RECORDED_DERIVATION_INVALID", "warm_p95",
+            recorded.get("warm_end_to_end_p95_seconds"),
+            _p95([float(value) for value in warm_samples]),
+        )
+
+    cpu_runs = [
+        (
+            "cold",
+            recorded.get("cold_end_to_end_seconds"),
+            recorded.get("cold_cpu_seconds"),
+            recorded.get("cold_average_cpu_cores"),
+        ),
+        *[
+            (
+                f"warm[{index}]", wall,
+                warm_cpu_samples[index] if index < len(warm_cpu_samples) else None,
+                warm_core_samples[index] if index < len(warm_core_samples) else None,
+            )
+            for index, wall in enumerate(warm_samples)
+        ],
+        (
+            "legacy",
+            recorded.get("legacy_end_to_end_seconds"),
+            recorded.get("legacy_cpu_seconds"),
+            recorded.get("legacy_average_cpu_cores"),
+        ),
+        (
+            "full_pipeline_probe",
+            (recorded.get("full_pipeline_probe") or {}).get(
+                "end_to_end_seconds"
+            ),
+            (recorded.get("full_pipeline_probe") or {}).get("cpu_seconds"),
+            (recorded.get("full_pipeline_probe") or {}).get(
+                "average_cpu_cores"
+            ),
+        ),
+        (
+            "changed_full_pipeline_probe",
+            (recorded.get("changed_full_pipeline_probe") or {}).get(
+                "end_to_end_seconds"
+            ),
+            (recorded.get("changed_full_pipeline_probe") or {}).get(
+                "cpu_seconds"
+            ),
+            (recorded.get("changed_full_pipeline_probe") or {}).get(
+                "average_cpu_cores"
+            ),
+        ),
+    ]
+    if not protocol.get("cpu_time_source") or recorded.get(
+        "cpu_measurement_status"
+    ) != "recorded":
+        issues.append({
+            "reason_code": "BINARY_PERFORMANCE_RECORDED_CPU_INVALID",
+            "field": "cpu_measurement_status",
+            "actual": recorded.get("cpu_measurement_status"),
+        })
+    for label, wall, cpu, average in cpu_runs:
+        try:
+            wall_value = float(wall)
+            cpu_value = float(cpu)
+            average_value = float(average)
+            valid = (
+                wall_value > 0
+                and cpu_value >= 0
+                and average_value >= 0
+                and math.isclose(
+                    average_value, cpu_value / wall_value,
+                    rel_tol=1e-9, abs_tol=1e-12,
+                )
+            )
+        except (TypeError, ValueError):
+            valid = False
+        if not valid:
+            issues.append({
+                "reason_code": "BINARY_PERFORMANCE_RECORDED_CPU_INVALID",
+                "field": label,
+                "wall_seconds": wall,
+                "cpu_seconds": cpu,
+                "average_cpu_cores": average,
+            })
+    try:
+        derived_wall = sum(float(item[1]) for item in cpu_runs)
+        derived_cpu = sum(float(item[2]) for item in cpu_runs)
+        total_wall = float(recorded.get("total_measured_wall_seconds"))
+        total_cpu = float(recorded.get("total_measured_cpu_seconds"))
+        total_average = float(recorded.get("average_cpu_cores"))
+        total_valid = (
+            math.isclose(total_wall, derived_wall, rel_tol=1e-12, abs_tol=1e-9)
+            and math.isclose(total_cpu, derived_cpu, rel_tol=1e-12, abs_tol=1e-9)
+            and math.isclose(
+                total_average, total_cpu / total_wall,
+                rel_tol=1e-9, abs_tol=1e-12,
+            )
+        )
+    except (TypeError, ValueError, ZeroDivisionError):
+        total_valid = False
+        derived_wall = None
+        derived_cpu = None
+    if not total_valid:
+        issues.append({
+            "reason_code": "BINARY_PERFORMANCE_RECORDED_CPU_INVALID",
+            "field": "total_measured_cpu",
+            "expected_wall_seconds": derived_wall,
+            "expected_cpu_seconds": derived_cpu,
+            "actual_wall_seconds": recorded.get("total_measured_wall_seconds"),
+            "actual_cpu_seconds": recorded.get("total_measured_cpu_seconds"),
+            "actual_average_cpu_cores": recorded.get("average_cpu_cores"),
+        })
+    try:
+        cold_ratio = float(recorded.get("cold_end_to_end_seconds")) / float(
+            recorded.get("legacy_end_to_end_seconds")
+        )
+        ratio_matches = math.isclose(
+            cold_ratio, float(recorded.get("cold_relative_legacy_ratio")),
+            rel_tol=1e-6, abs_tol=1e-9,
+        )
+    except (TypeError, ValueError, ZeroDivisionError):
+        ratio_matches = False
+        cold_ratio = None
+    if not ratio_matches:
+        issues.append({
+            "reason_code": "BINARY_PERFORMANCE_RECORDED_DERIVATION_INVALID",
+            "field": "cold_relative_legacy_ratio",
+            "expected": cold_ratio,
+            "actual": recorded.get("cold_relative_legacy_ratio"),
+        })
+
+    warm_runs = [
+        {
+            "end_to_end_seconds": value,
+            "cpu_seconds": (
+                warm_cpu_samples[index]
+                if index < len(warm_cpu_samples) else None
+            ),
+            "average_cpu_cores": (
+                warm_core_samples[index]
+                if index < len(warm_core_samples) else None
+            ),
+            "parser_invocations": recorded.get("warm_parser_invocations"),
+            "cache_hits": recorded.get("warm_cache_hits"),
+            "peak_rss_bytes": recorded.get("peak_rss_bytes"),
+            "stage_seconds": {
+                "batch_query_10000": stage.get("batch_query_10000_p95"),
+                "report_10000": stage.get("report_10000_p95"),
+            },
+        }
+        for index, value in enumerate(warm_samples)
+    ]
+    # Keep evaluation total on malformed evidence: an empty synthetic sample
+    # creates explicit threshold issues rather than crashing the verifier.
+    if not warm_runs:
+        warm_runs = [{
+            "end_to_end_seconds": None,
+            "parser_invocations": None,
+            "cache_hits": None,
+            "peak_rss_bytes": None,
+            "stage_seconds": {},
+        }]
+    replay = {
+        "schema": SCHEMA,
+        "status": "measured",
+        "measurement_protocol": protocol,
+        "measurements": {
+            "cold": {
+                "end_to_end_seconds": recorded.get("cold_end_to_end_seconds"),
+                "cpu_seconds": recorded.get("cold_cpu_seconds"),
+                "average_cpu_cores": recorded.get(
+                    "cold_average_cpu_cores"
+                ),
+                "stage_seconds": {
+                    "inventory": stage.get("cold_inventory"),
+                    "parse_and_cache": stage.get("cold_parse_and_cache"),
+                    "db_write_and_index": stage.get("cold_db_write_and_index"),
+                },
+                "parser_invocations": recorded.get("cold_parser_invocations"),
+                "counts": {
+                    "classes": recorded.get("class_count"),
+                    "members": recorded.get("member_count"),
+                    "edges": recorded.get("edge_count"),
+                },
+                "bytes_per_class": recorded.get("bytes_per_class"),
+                "bytes_per_edge": recorded.get("bytes_per_edge"),
+                "peak_rss_bytes": recorded.get("cold_peak_rss_bytes"),
+            },
+            "warm_runs": warm_runs,
+            "warm_end_to_end_p50_seconds": recorded.get(
+                "warm_end_to_end_p50_seconds"
+            ),
+            "warm_end_to_end_p95_seconds": recorded.get(
+                "warm_end_to_end_p95_seconds"
+            ),
+            "legacy": {
+                "end_to_end_seconds": recorded.get("legacy_end_to_end_seconds"),
+                "cpu_seconds": recorded.get("legacy_cpu_seconds"),
+                "average_cpu_cores": recorded.get(
+                    "legacy_average_cpu_cores"
+                ),
+                "peak_rss_bytes": 0,
+            },
+            "full_pipeline_probe": dict(
+                recorded.get("full_pipeline_probe") or {}
+            ),
+            "changed_full_pipeline_probe": dict(
+                recorded.get("changed_full_pipeline_probe") or {}
+            ),
+            "cold_relative_legacy_ratio": recorded.get(
+                "cold_relative_legacy_ratio"
+            ),
+            "peak_rss_bytes": recorded.get("peak_rss_bytes"),
+            "disk_bytes": recorded.get("disk_bytes"),
+        },
+    }
+    try:
+        replay_evaluation = evaluate_gate(replay, gate)
+    except (KeyError, TypeError, ValueError, PerformanceGateError) as error:
+        replay_evaluation = {
+            "status": "failed",
+            "issues": [{
+                "reason_code": "BINARY_PERFORMANCE_RECORDED_REPLAY_INVALID",
+                "detail": f"{type(error).__name__}: {error}",
+            }],
+        }
+    issues.extend(replay_evaluation.get("issues") or ())
+    if gate.get("status") != "passed" or gate.get(
+        "blocks_binary_authority_switch"
+    ) is not False:
+        issues.append({
+            "reason_code": "BINARY_PERFORMANCE_RECORDED_AUTHORITY_STATE_INVALID",
+            "status": gate.get("status"),
+            "blocks_binary_authority_switch": gate.get(
+                "blocks_binary_authority_switch"
+            ),
+        })
+    return {
+        "schema": "java-upgrade-analyzer.recorded-performance-gate-verification.v1",
+        "status": "passed" if not issues else "failed",
+        "issue_count": len(issues),
+        "issues": issues,
+        "jar_count": protocol.get("jar_count"),
+        "class_count": protocol.get("class_count"),
+        "changed_class_count": (
+            protocol.get("changed_full_pipeline_probe") or {}
+        ).get("changed_class_count"),
+        "recorded_measurements_replayed": True,
+    }
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Measure binary-first scale performance")
     parser.add_argument("--work-root", default="")
-    parser.add_argument("--output", required=True)
+    parser.add_argument("--output", default="")
     parser.add_argument("--jar-count", type=int, default=400)
     parser.add_argument("--classes-per-jar", type=int, default=250)
     parser.add_argument("--warm-samples", type=int, default=3)
     parser.add_argument("--skip-legacy", action="store_true")
     parser.add_argument("--gate", default="")
+    parser.add_argument("--verify-recorded-gate", default="")
     args = parser.parse_args(argv)
+    if args.verify_recorded_gate:
+        gate_path = Path(args.verify_recorded_gate).expanduser().resolve()
+        try:
+            verification = evaluate_recorded_gate(
+                json.loads(gate_path.read_text(encoding="utf-8"))
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            verification = {
+                "schema": "java-upgrade-analyzer.recorded-performance-gate-verification.v1",
+                "status": "failed",
+                "issue_count": 1,
+                "issues": [{
+                    "reason_code": "BINARY_PERFORMANCE_RECORDED_GATE_UNREADABLE",
+                    "detail": f"{type(error).__name__}: {error}",
+                }],
+            }
+        if args.output:
+            output = Path(args.output).expanduser().resolve()
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(
+                json.dumps(verification, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        print(json.dumps(verification, ensure_ascii=False, sort_keys=True))
+        return 0 if verification["status"] == "passed" else 1
+    if not args.output:
+        parser.error("--output is required unless --verify-recorded-gate is used")
     if args.jar_count <= 0 or args.classes_per_jar <= 0 or args.warm_samples <= 0:
         parser.error("scale and sample counts must be positive")
     temporary = None
@@ -1164,6 +1679,9 @@ def main(argv=None) -> int:
             "dataset_identity": result["measurement_protocol"]["dataset_identity"],
             "cold_seconds": result["measurements"]["cold"]["end_to_end_seconds"],
             "warm_p95_seconds": result["measurements"]["warm_end_to_end_p95_seconds"],
+            "warm_p50_seconds": result["measurements"]["warm_end_to_end_p50_seconds"],
+            "cpu_seconds": result["measurements"]["total_measured_cpu_seconds"],
+            "average_cpu_cores": result["measurements"]["average_cpu_cores"],
             "legacy_seconds": (result["measurements"]["legacy"] or {}).get("end_to_end_seconds"),
             "full_pipeline_seconds": (
                 result["measurements"]["full_pipeline_probe"]

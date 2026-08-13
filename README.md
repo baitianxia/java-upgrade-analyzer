@@ -47,10 +47,11 @@
 
 ```text
 使用 java-upgrade-analyzer 分析当前工程升级影响：
+- 应用源码：https://git.example.com/team/order-service.git
 - base 分支：main
 - current 分支：feature/upgrade
 - 目标模块：app-module
-- 可补充的源码位置：/abs/path/to/source-repo 或 https://git.example.com/team/dependency-source-repo.git
+- 依赖包源码（可选）：/abs/path/to/dependency-source-repo 或 https://git.example.com/team/dependency-source-repo.git
 ```
 
 如果你已经有升级前后的构建产物，可以这样说：
@@ -59,6 +60,7 @@
 使用 java-upgrade-analyzer 分析已有产物：
 - base 产物：/abs/path/to/base-app.jar
 - current 产物：/abs/path/to/current-app.jar
+- 应用源码：https://git.example.com/team/order-service.git
 - base 分支：main
 - current 分支：feature/upgrade
 - 目标模块：app-module
@@ -77,18 +79,20 @@ Claude Code 会负责：
 
 | 信息 | 是否必需 | 说明 |
 |---|---:|---|
-| 待分析工程 | 通常已知 | Claude Code 当前打开的工程；如果不是目标工程，请明确路径 |
-| 目标模块 | 必需 | 本次唯一分析的可部署模块；多模块项目必须明确 |
-| 升级前后来源 | 必需 | 通常是 base/current 分支，也可以是已有 base/current JAR/WAR |
-| 是否还能补充相关源码 | 必需确认一次 | 这是收集可选输入，不是源码使用授权；编译模式已取得的业务源码会直接使用。可以一次提交多个源码目录或 Git 地址，也可以暂不补充 |
-| 源码目录或 Git 地址 | 选择补充时可选 | 不要求预先区分业务源码和依赖源码；系统按项目范围与依赖坐标自动分类，只有无法可靠分类时才询问映射 |
-| 特殊 JDK | 可选 | 如果 base/current 需要不同 JDK 构建，请说明 |
+| 应用源码 | 必需 | 应用 Git 地址或本地 Git 仓库；当前工程仓库可以自动识别，但仍需在 Step0 确认 |
+| 升级前后版本 | 必需 | base/current 分支、tag 或 commit；Artifact 模式会先用制品内应用版本尝试自动匹配 |
+| 最终制品 | Artifact 模式必需 | 用户原始 base/current JAR/WAR；源码模式由 Step1 从确认版本构建 |
+| 目标模块 | 必需 | 本次唯一分析的可部署模块；唯一候选自动识别，多候选在 Step0 选择 |
+| Base/Current 构建工具 | 必需确认 | 分别自动识别 Maven 或 Gradle；无法识别时在 Step0 补充 |
+| Base/Current JDK 目录 | 必需确认 | 分别识别目标 JDK，并映射到当前环境中的 JDK 目录；无法映射时在 Step0 补充 |
+| 依赖包源码 | 可选 | 可一次提交多个本地 Git 仓库或 Git 地址；不提供也可继续，但报告会记录源码解释覆盖缺口 |
 | Binary runtime 快照 | 系统自动生成 | Step1 从两侧最终制品、完整运行依赖和目标 JDK 自动生成；特殊 loader/容器部署可用 `binary_pipeline_config.example.json` 显式覆盖。无法证明闭包完整时系统会列出缺口并停止，不要求普通用户手写内部配置 |
 
 说明：
 
-- 编译模式已经取得被分析系统源码，标准 Maven / Gradle 结构下会从 reactor 或 Gradle project graph 推断业务源码范围并直接使用；Step2 询问的是是否还能补充其他相关源码，主要是依赖源码。
-- 直接制品模式通过同一个入口接收被分析系统源码和依赖源码。用户无需判断源码类型；系统自动分类并分别记录覆盖，无法可靠分类时才请求一次归属映射。
+- 正式分析前先执行 Step0。系统把自动识别值和缺失项放在同一张 Base/Current 表中；自动识别值也只确认这一次，缺失项在同一回复中补齐。
+- 源码模式与 Artifact 模式使用相同表格行：最终制品、版本分支、目标模块、构建工具、JDK 目录、应用源码、依赖包源码。应用源码必填，依赖包源码可选。
+- Step1 只解析或构建最终制品并确认依赖身份。没有歧义时自动进入内部 Step2；依赖身份或已提供依赖源码的仓库/版本出现真实歧义时，才在 Step1 后汇总成一张卡片请用户决定。
 - Maven 项目优先使用对应 base/current revision 内的 `mvnw` / `mvnw.cmd`，没有 Wrapper 时才使用系统 `mvn`；分析器不规定 Maven 最低版本。
 - Gradle 项目同时支持 Groovy DSL 与 Kotlin DSL；优先使用仓库内 `gradlew` / `gradlew.bat`，没有 Wrapper 时才使用系统 `gradle`。多模块选择既可写 `app`，也可写 `:app`。
 - JDK、Maven、Gradle 均以用户工程为准。base/current 可分别使用不同 JDK；实际工具链不兼容时按真实构建命令失败原因阻塞，不会因分析器预设版本白名单提前拒绝。
@@ -99,11 +103,11 @@ Claude Code 会负责：
 - Git 克隆复用当前环境已有的 SSH key 或 Git 凭据配置，并禁用交互式密码提示；地址不可达或无权限时会明确停止，不会把失败仓库当成有效源码继续分析。
 - 每次正式执行前，系统会按仓库身份和进程租约自动清理上次中断留下的分析器临时 worktree；不会运行全局 `git worktree prune`，也不会删除用户自行创建的 worktree。恢复记录位于 `.upgrade-report/.runtime/observability/git_worktree_recovery.json`，清理无法安全完成时会在任何分析步骤开始前停止。
 - base/current 可以使用同一个工程目录；两侧身份由各自确认后的远程分支、tag 或 commit 决定。Skill 会查询远端最新 ref、定向 fetch 并固定到具体 commit，在隔离快照中分析，不会切换或拉取你的当前分支。
-- 直接产物模式会先解析 JAR；只有依赖坐标仍缺失时才使用对应侧源码补全。Step4 的依赖源码默认只取远端：唯一 ref pair 或多个名称指向同一 commit pair 时自动采用；只有两个以上不同 commit pair、且选择会改变源码对比范围时，才把全部歧义依赖及方案编号汇总到一张决策卡中，用户可一次答全。
+- 直接产物模式会先解析 JAR，再用 Step0 已确认并固定的应用源码版本补全依赖身份。依赖源码在 Step1 得到依赖坐标后再匹配：仓库归属和 Base/Current 版本 ref 合成同一个候选；多个名称指向同一 commit 不构成歧义，只有不同 commit 或不同候选仓库才汇总请用户一次决定。
 - Step1 先从 fat JAR/WAR 解析坐标；坐标确认后通过一次留存遍历固化 Step4 所需的变化 JAR、Step5 所需的全部 current 运行时 JAR和业务内容。Step4、Step5 直接读取这份清单，不会再次解包 fat JAR、递归查询嵌套 JAR、读取本地 Maven 仓库或下载替代 JAR。Step4 使用的依赖源码只增强 Step1 已确定的 GAV，不会重新发现同坐标依赖。
 - Step5 的 JAR 类型元数据 `javap` 单次超时为 30 秒；超时后对同一命令最多尝试 3 次，按 1 秒、3 秒退避。非超时错误不盲目重试；重试耗尽后只限制对应类型及相关调用路径，不会把一个类的失败提升为全部 API 的全局“未分析”。
-- 分支名只用于定位和展示，确认卡选择会同时绑定 repo、remote、canonical ref、artifact 与当时的 commit SHA。Step1 首次选定的 SHA 是固定快照；后续查询为空或 ref 已移动只触发受控重试和按原 SHA 物化，不会改用新 SHA，也不会要求用户重新确认。Step4 的依赖源码 ref 移动或不可用时不要求用户修复，而是从升级前后最终 JAR 比较同签名方法的规范化字节码，继续识别实现变化。
-- Step1 分支按完整 canonical ref 精确匹配，不使用前缀、后缀或版本近似规则；例如输入 `release` 不会命中 `release.DEV`，输入 `release.DEV` 则会正常命中该完整名称。复用已有报告时，本轮显式 `--base-branch`/`--current-branch` 若与旧输入不同，会清除旧 commit/ref 绑定并从 Step1 重建受影响结果。
+- 分支名只用于定位和展示。Step0 对应用源码、Step1 对依赖包源码的选择都会绑定 repo、remote、canonical ref 与当时的 commit SHA；后续只物化该 SHA，不读取用户工作区 HEAD。
+- 已有报告若不是当前 Step0 状态 schema，会直接建立新的 Step0 状态，不兼容或复用旧 Step1/Step2 交互记录。
 - 远端 `ls-remote`/`fetch` 对超时、连接重置、临时 DNS/HTTP 5xx 等瞬时错误最多尝试 3 次，重试间隔为 1 秒、3 秒；已选定 SHA 后，定向查询中的 ref 空结果或新 commit 观测也会重试，但不会替换该 SHA。认证失败等确定性错误不重试。Step4 自动重试耗尽后会记录 `DEPENDENCY_SOURCE_REF_UNAVAILABLE`，不会生成要求用户处理网络、权限或 ref 的确认卡，也不会静默使用本地对象；只有运行前已经明确提供 `allow_local_source=true` 时才允许采用本地兜底。若最终 JAR 方法字节码兜底也无法完成，行为变化覆盖会成为关键缺口，报告不得输出“完整”或“不受影响”结论。
 - 可用源码用于增加文件/行号、声明与注解、可读上下文和候选关系，并在受支持的常量内联场景与字节码共同形成证明；未提供的业务或依赖源码会分别记录解释覆盖缺口。无论如何，依赖范围、版本、JAR 内容和精确字节码调用边始终以 base/current 最终制品为准。
 - 源码映射不会混进 API 变化目录或变成无归属的路径列表：`evidence/source_analysis/review.md` 和 `method_mappings.csv` 同时展示源码归属依赖、实际二进制制品、方法、文件/行号、声明与注解；`candidate_relationships.csv` 另列源码候选调用关系并明确它不是可执行边。人工复核时可以直接判断是哪一个依赖提供的源码解释。
@@ -134,18 +138,13 @@ binary 输出使用 `reachability_status`、`static_linkage_status`、`impact_co
 
 常见确认点：
 
-- 目标模块不明确；
-- 输入方式不完整；
-- 两侧最终制品已经提供，但后续上下文仍缺少基准侧或当前侧分支；该信息会合并到已有的依赖范围确认中，不新增一次确认；
-- JDK 版本或业务源码范围无法从制品、构建文件和项目结构可靠确定；
-- 是否还能补充其他相关源码；编译模式已取得的业务源码直接使用，用户只需通过统一入口补充更多源码或明确暂不补充；
-- 用户提供了源码仓库线索，并产生了会改变源码行为覆盖率的映射建议；系统会要求明确采用或拒绝，拒绝后不会重复询问；
-- 依赖坐标或版本无法安全补齐；
-- 依赖源码存在两个以上不同 commit pair，且选择会改变源码差异范围；
+- Step0 始终显示一次统一表格：自动识别值需要确认，缺失的制品、版本分支、目标模块、构建工具、JDK 目录或应用源码在同一回复补齐；
+- Step1 扫描两侧制品后，依赖身份无法唯一确定；
+- 已提供的依赖包源码存在多个候选仓库或多个不同 commit；仓库与 Base/Current commit 组合成一个方案，全部歧义一次答全，也可明确跳过某项可选依赖源码；
 - Step4 识别出至少两个可分析依赖后，选择 Step5 的全量或部分分析范围；0 个或 1 个候选不存在实际范围取舍，系统会直接继续；
 - 是否从某项任务重新分析。
 
-正常流程中的确认顺序是：先确认分析对象与实际依赖范围；随后说明源码作用，并用一个入口收集所有可补充源码或记录暂不补充。编译模式已取得的业务源码不需要授权或重复提交；用户提交的位置由系统自动分类。依赖 API 变化完成后确认全量或部分系统触达范围。兼容性线索扫描、系统触达分析和最终报告会自动衔接。
+正常流程中的确认顺序是：Step0 一次确认全部正式分析输入；Step1 仅在解析后出现真实歧义时再确认；Step2 与兼容性线索扫描自动执行；依赖 API 变化完成后确认全量或部分系统触达范围；系统触达分析和最终报告自动衔接。
 
 Step4 识别出至少两个可分析依赖后会让你选择 Step5 的分析范围：全量分析覆盖更完整，部分分析可以降低耗时，但最终结论只适用于所选范围。范围卡会展示依赖数、变化 API 数，以及按业务最终制品直接字节码引用证据排序的 Top 10 依赖和理由。删除或签名变化不会获得额外权重，依赖源码是否可用只作为解释条件展示。0 个或 1 个候选不存在实际范围取舍，系统会直接继续。确认范围后，系统会连续执行 Step5 和 Step6，不再要求点击“继续”；Step5 会把 binary-first 的四态摘要写成非阻塞 `user_decision_card`，供 Agent 直接转述。内部证据故障由系统自动重试或失败关闭，不会混入范围选择要求用户批准降级。
 
@@ -156,11 +155,11 @@ Step4 识别出至少两个可分析依赖后会让你选择 Step5 的分析范�
 ```
 
 ```text
-可以补充源码，位置是 /abs/path/to/business-source 和 /abs/path/to/dependency-source-repo。
+表中信息确认；应用源码是 /abs/path/to/application-repo，依赖包源码是 /abs/path/to/dependency-source-repo。
 ```
 
 ```text
-暂时无法补充其他源码，按现有制品和源码证据继续。
+表中信息确认；本次不提供依赖包源码。
 ```
 
 ```text
@@ -254,7 +253,7 @@ Claude Code 会把你的答复整理成 Skill 需要的结构化输入，并恢�
 或者：
 
 ```text
-Step6 已经生成了，但我想补充依赖源码后，从 Step5 重新分析。
+Step6 已经生成了，但我想补充依赖源码后，从 Step0 重新确认并分析。
 ```
 
 重跑时，Skill 会清理目标步骤及后续步骤的旧状态和旧产物，避免新旧结果混用。
@@ -263,8 +262,9 @@ Step6 已经生成了，但我想补充依赖源码后，从 Step5 重新分析�
 
 | Step | 含义 |
 |---|---|
+| Step0 | 重新识别并统一确认正式分析输入；清理本轮旧分析结果 |
 | Step1 | 重新比较 base/current 最终依赖差异 |
-| Step2 | 重新建立升级上下文、源码和依赖映射 |
+| Step2 | 基于 Step0/Step1 已固定的输入重新建立升级上下文和依赖映射 |
 | Step3 | 重新扫描运行平台、应用框架及规范/命名空间迁移风险 |
 | Step4 | 重新比较变更依赖 JAR 的 API 变化 |
 | Step5 | 重新追踪变化 API 是否触达业务代码 |
@@ -325,12 +325,13 @@ Step6 已经生成了，但我想补充依赖源码后，从 Step5 重新分析�
 
 ---
 
-## 六个步骤分别做什么
+## 七个步骤分别做什么
 
 | Step | 作用 | 关键产物 |
 |---|---|---|
+| Step0 | 自动识别并统一确认 Base/Current 正式分析输入，固定应用源码 commit | `.runtime/state/step0_confirmation.json` |
 | Step1 | 比较 base/current 最终依赖差异 | `evidence/dependencies/dep_changes.csv` |
-| Step2 | 建立升级上下文、源码和依赖映射 | `evidence/context/context.json` |
+| Step2 | 内部建立升级上下文，无固定用户确认 | `evidence/context/context.json` |
 | Step3 | 分析运行平台、应用框架、规范/命名空间迁移风险，并比较双侧制品中的 MyBatis/ORM 数据库契约变化 | `evidence/static_scan/*.csv`、`evidence/static_scan/s3_database_contract_changes.md` |
 | Step4 | 比较变更依赖 JAR 的 API 变化 | `evidence/api_changes/changed_dependencies.md`、`evidence/api_changes/all_changed_apis.csv` |
 | Step5 | 追踪变化 API 是否触达业务代码 | `evidence/call_chain/alerts.csv` |
@@ -348,23 +349,23 @@ Step6 已经生成了，但我想补充依赖源码后，从 Step5 重新分析�
 
 ### 源码路径或 Git 地址应该填什么？
 
-可以一次填写被分析系统或依赖包的源码目录，例如：
+应用源码必须提供 Git 地址或本地 Git 仓库，例如：
 
 ```text
-/Users/me/source/dependency-project
+https://git.example.com/team/order-service.git
 ```
 
-也可以在统一的 `source_locations` 中填写依赖源码 Git 地址，例如：
+依赖包源码可选，可填写一个或多个本地 Git 仓库或 Git 地址，例如：
 
 ```json
-{"source_locations":["https://git.example.com/team/dependency-project.git"]}
+{"dependency_source_dirs":["/data/sources/common-utils"]}
 ```
 
-不需要自行标注源码类型。编译模式的业务源码通常已由 Maven reactor 或 Gradle project graph 自动推断；直接制品模式可以在同一列表中补充业务源码。
+两类源码分开填写。应用源码用于固定被分析系统的 Base/Current 版本；依赖包源码要等 Step1 得到依赖坐标后才能匹配仓库和版本。
 
 ### 没有依赖源码还能分析吗？
 
-可以。系统会先说明缺少源码的影响并记录你的选择。正式变化和精确调用图来自 base/current 最终制品、运行时依赖与目标 JDK 字节码，不依赖源码才能成立；不提供源码会减少文件/行号、声明与注解、可读上下文、候选关系和受支持常量内联证明的覆盖，但不会被解释成“没有影响”。
+应用源码不可以缺少；依赖包源码可以不提供。正式变化和精确调用图来自 base/current 最终制品、运行时依赖与目标 JDK 字节码；缺少依赖包源码会减少文件/行号、声明与注解、可读上下文、候选关系和受支持常量内联证明的覆盖，但不会被解释成“没有影响”。
 
 ### Step4 / Step5 很慢怎么办？
 
@@ -395,7 +396,7 @@ Step5 慢时，让 Claude Code 查看：
 
 ### Binary-first 需要哪些分析工具？
 
-生产事实解析使用版本和 SHA 固定的 ASM helper；独立 Oracle 使用目标 JDK 中的 `java`、`javac`、`javap`、`jmods` 和 `lib/modules` 做交叉验证。缺失完整目标 JDK、helper 完整性不符或 Oracle 无法完成时，generation 失败关闭，不会安装或调用 JApiCmp 旧引擎补算。
+生产事实解析使用版本和 SHA 固定的 ASM helper；独立 Oracle 使用目标 JDK 中的 `java`、`javac`、`javap` 和平台类镜像做交叉验证：JDK 8 绑定内置 JRE 的 bootstrap/extension JAR（含 `rt.jar`），JDK 9+ 绑定 `jmods` 与 `lib/modules`。JDK 8 校验会排除机器全局扩展目录，防止本机环境污染结果。缺失完整目标 JDK、helper 完整性不符或 Oracle 无法完成时，generation 失败关闭，不会安装或调用 JApiCmp 旧引擎补算。
 
 tree-sitter 只服务可选 source overlay 的源码解释，不是 executable edge 或二进制变化的权威来源。覆盖层不可用会留下明确解释缺口；它不能改变二进制 fact、依赖身份或静态触达路径。
 
