@@ -17,6 +17,7 @@ from binary_pipeline import (  # noqa: E402
     _ArtifactDigestSession,
     _PhaseTimingRecorder,
     _artifact_descriptors,
+    _artifact_hash_worker_count,
     _artifact_instances,
 )
 
@@ -92,6 +93,52 @@ class BinaryPipelineInputPerformanceTest(unittest.TestCase):
             instance.outer_artifact_sha256 == outer_sha
             for _raw, instance in (*base_instances, *current_instances)
         ))
+
+    def test_parallel_digest_prime_preserves_full_hash_and_stability_checks(self):
+        with tempfile.TemporaryDirectory() as temp_text:
+            root = Path(temp_text)
+            paths = []
+            requests = []
+            for index in range(6):
+                path = root / f"artifact-{index}.jar"
+                path.write_bytes((f"artifact-{index}" * 1000).encode("utf-8"))
+                paths.append(path)
+                requests.append((path, self._sha256(path)))
+            session = _ArtifactDigestSession()
+            session.prime(requests, configured_workers=4)
+            observed = [
+                session.digest(path, expected_sha256=expected)
+                for path, expected in requests
+            ]
+
+        metrics = session.metrics()
+        self.assertEqual(metrics["artifact_hash_workers"], 4)
+        self.assertEqual(metrics["artifact_parallel_hash_file_count"], 6)
+        self.assertEqual(metrics["artifact_hash_execution_count"], 6)
+        self.assertEqual(metrics["artifact_hash_reuse_count"], 6)
+        self.assertEqual(
+            [item.content_sha256 for item in observed],
+            [expected for _path, expected in requests],
+        )
+
+    def test_digest_prime_rejects_invalid_worker_count_and_content_mismatch(self):
+        with self.assertRaises(BinaryPipelineError) as invalid:
+            _artifact_hash_worker_count(True, 1)
+        self.assertEqual(
+            invalid.exception.reason_code,
+            "BINARY_ARTIFACT_HASH_WORKER_COUNT_INVALID",
+        )
+        with tempfile.TemporaryDirectory() as temp_text:
+            path = Path(temp_text) / "artifact.jar"
+            path.write_bytes(b"observed")
+            with self.assertRaises(BinaryPipelineError) as mismatch:
+                _ArtifactDigestSession().prime(
+                    [(path, "0" * 64)], configured_workers=2
+                )
+        self.assertEqual(
+            mismatch.exception.reason_code,
+            "BINARY_PIPELINE_ARTIFACT_SHA256_MISMATCH",
+        )
 
     def test_declared_outer_digest_mismatch_fails_closed(self):
         with tempfile.TemporaryDirectory() as temp_text:

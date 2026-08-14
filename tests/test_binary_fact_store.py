@@ -253,6 +253,38 @@ class BinaryFactStoreTest(unittest.TestCase):
             {row["index"] for row in dispatch_payloads}, set(range(2_501, 4_100))
         )
 
+    def test_specialized_reconciliation_writer_is_byte_identical(self):
+        ordinary_path = self.root / "ordinary.sqlite"
+        specialized_path = self.root / "specialized.sqlite"
+        records = [
+            {
+                "analysis_context_identity": "context-汉字",
+                "record_kind": "member_resolution",
+                "status": f"resolved-{index % 3}\n",
+                "subject_identity": f"subject-{index:04d}",
+                "payload": {
+                    "index": index,
+                    "nested": [True, None, -0.0, 'é\n"'],
+                    "value": "共享" * 10,
+                },
+            }
+            for index in range(2_005)
+        ]
+        with BinaryFactStore(ordinary_path) as ordinary:
+            ordinary_identities = ordinary.add_reconciliation_records(records)
+        with BinaryFactStore(specialized_path) as specialized:
+            specialized_identities = specialized.add_reconciliation_payloads(
+                analysis_context_identity="context-汉字",
+                record_kind="member_resolution",
+                records=(
+                    (row["status"], row["subject_identity"], row["payload"])
+                    for row in records
+                ),
+            )
+
+        self.assertEqual(specialized_identities, ordinary_identities)
+        self.assertEqual(specialized_path.read_bytes(), ordinary_path.read_bytes())
+
     def test_secondary_indexes_can_be_deferred_until_bulk_load_finishes(self):
         artifact = self.make_jar("deferred-indexes.jar")
         instance = self.instance(artifact, 0)

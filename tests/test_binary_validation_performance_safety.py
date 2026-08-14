@@ -410,6 +410,61 @@ class BinaryValidationPerformanceSafetyTest(unittest.TestCase):
         self.assertIsInstance(packed, bytes)
         self.assertEqual(oracle._unpack_oracle_scan(packed), evidence)
 
+    def test_normalized_javap_evidence_preserves_both_validator_views(self):
+        evidence = {
+            "complete": True,
+            "artifact_sha256": "a" * 64,
+            "edges": [{
+                "caller_owner": "demo.A",
+                "caller_member": "run",
+                "caller_descriptor": "()V",
+                "callee_owner": "demo.B",
+                "callee_member": "value",
+                "callee_descriptor": "()I",
+                "opcode_family": "invokevirtual",
+                "instruction_offset": 7,
+            }],
+            "structural_facts": {
+                "class_names": ["demo/A"],
+                "type_edges": [["demo/A", "run", "()V", 7, "demo/B", "new"]],
+                "class_init_edges": [],
+                "clinit_classes": [],
+                "semantic_instructions": [[
+                    "demo/A", "run", "()V", 7, "new", "class demo/B"
+                ]],
+                "declared_members": [["demo/A", "method", "run", "()V", 1]],
+            },
+            "failures": [],
+        }
+
+        normalized = oracle._normalize_oracle_scan(
+            oracle._pack_oracle_scan(evidence), {}
+        )
+
+        self.assertEqual(normalized.artifact_sha256, "a" * 64)
+        self.assertEqual(normalized.structural_class_names, {"demo/A"})
+        self.assertIn(
+            ("demo.A", "run", "()V", "demo.B", "value", "()I", "invokevirtual", 7),
+            normalized.direct_truth.direct_edges,
+        )
+        self.assertIn(
+            ("demo/A", "run", "()V", 7, "demo/B", "new"),
+            normalized.structural_truth.type_edges,
+        )
+        self.assertIs(oracle._normalize_oracle_scan(normalized, {}), normalized)
+
+    def test_incomplete_javap_evidence_is_rejected_before_row_projection(self):
+        normalized = oracle._normalize_oracle_scan({
+            "complete": False,
+            "artifact_sha256": "b" * 64,
+            "edges": [{"malformed": "partial row must not be consumed"}],
+            "failures": ["oracle_parse_incomplete"],
+        })
+
+        self.assertFalse(normalized.complete)
+        self.assertEqual(normalized.failures, ("oracle_parse_incomplete",))
+        self.assertEqual(normalized.direct_truth.direct_edges, frozenset())
+
     def test_equal_observation_sharing_preserves_type_exact_json_evidence(self):
         reference = {
             "demo/A": {

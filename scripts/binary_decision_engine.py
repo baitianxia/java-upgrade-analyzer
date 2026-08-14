@@ -34,6 +34,24 @@ def _identity(namespace: str, payload: Any) -> str:
     )
 
 
+def _same_json_value(left: Any, right: Any) -> bool:
+    """Compare canonical JSON values without Python's bool/int coercion."""
+    if isinstance(left, Mapping) and isinstance(right, Mapping):
+        return (
+            left.keys() == right.keys()
+            and all(
+                _same_json_value(value, right[key])
+                for key, value in left.items()
+            )
+        )
+    if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
+        return len(left) == len(right) and all(
+            _same_json_value(left_item, right_item)
+            for left_item, right_item in zip(left, right)
+        )
+    return type(left) is type(right) and left == right
+
+
 _MISSING_DECISION_VALUE = object()
 _COMPACT_DECISION_INDEXES: dict[tuple[str, ...], dict[str, int]] = {}
 _TEMP_TABLE_IDS = count()
@@ -259,6 +277,12 @@ class BinaryDecisionEngine:
         self._current_full_definitions = None
         self._paired_semantic_member_outcome_deltas_cache = None
         self._removed_member_consumer_edges_cache = None
+        # Provider comparison touches every runtime class, while artifact
+        # placement has only one row per classpath slot.  Cache that tiny table
+        # so the hot loop does not issue the same artifact query per class.
+        self._provider_artifact_metadata: dict[
+            BinaryFactStore, dict[str, tuple[str, int]]
+        ] = {}
         self._current_hierarchy_parent_cache: dict[
             tuple[str, str], tuple[str, ...]
         ] = {}
@@ -917,35 +941,56 @@ class BinaryDecisionEngine:
         logical, _version = _mr_class_scope(entry_name)
         return logical.removesuffix(".class")
 
-    def _provider_fingerprint(
+    def _artifact_runtime_metadata(
+        self, store: BinaryFactStore
+    ) -> dict[str, tuple[str, int]]:
+        cached = self._provider_artifact_metadata.get(store)
+        if cached is None:
+            cached = {
+                str(row[0]): (str(row[1]), int(row[2]))
+                for row in store.connection.execute(
+                    """
+                    SELECT artifact_instance_identity,runtime_path_kind,
+                           runtime_classpath_index
+                    FROM artifact_instances
+                    """
+                )
+            }
+            self._provider_artifact_metadata[store] = cached
+        return cached
+
+    def _provider_outcome_payload(
         self,
         store: BinaryFactStore,
         record: Mapping[str, Any] | None,
         artifact_lineages: Mapping[str, str],
-    ) -> str:
+    ) -> dict[str, Any] | None:
         if not record:
-            return "ABSENT"
+            return None
         status = record.get("class_provider_status")
         if status != "resolved":
-            return _identity("provider_outcome_fingerprint", {
+            return {
                 "status": status,
                 "evidence": record.get("selection_evidence") or {},
-            })
+            }
         variant = record.get("selected_class_variant_identity")
-        rows = store.rows(
-            "classes", where="class_variant_identity=?", parameters=(variant,),
-            include_class_bytes=False, include_class_facts=False,
-        )
-        if rows:
-            class_row = rows[0]
-            artifact_rows = store.rows(
-                "artifact_instances",
-                where="artifact_instance_identity=?",
-                parameters=(record.get("selected_artifact_instance_identity"),),
-            )
-            artifact = artifact_rows[0] if artifact_rows else {}
+        class_row = store.connection.execute(
+            """
+            SELECT class_name,multi_release_version
+            FROM classes WHERE class_variant_identity=?
+            """,
+            (variant,),
+        ).fetchone()
+        if class_row is not None:
             artifact_identity = str(
                 record.get("selected_artifact_instance_identity") or ""
+            )
+            artifact = self._artifact_runtime_metadata(store).get(
+                artifact_identity
+            )
+            runtime_path_kind = artifact[0] if artifact is not None else None
+            runtime_classpath_index = (
+                artifact[1] if artifact is not None else None
             )
             lineage = str(artifact_lineages.get(artifact_identity) or "")
             if not lineage:
@@ -954,16 +999,16 @@ class BinaryDecisionEngine:
                 # exists, the stable runtime slot is the only safe comparable
                 # provider identity.
                 lineage = (
-                    f"runtime-slot:{artifact.get('runtime_path_kind')}:"
-                    f"{artifact.get('runtime_classpath_index')}"
+                    f"runtime-slot:{runtime_path_kind}:"
+                    f"{runtime_classpath_index}"
                 )
             payload = {
                 "status": "resolved",
-                "class_name": class_row["class_name"],
-                "multi_release_version": class_row["multi_release_version"],
+                "class_name": class_row[0],
+                "multi_release_version": class_row[1],
                 "defining_loader_realm_identity": record.get("selected_defining_loader_realm_identity"),
-                "runtime_path_kind": artifact.get("runtime_path_kind"),
-                "runtime_classpath_index": artifact.get("runtime_classpath_index"),
+                "runtime_path_kind": runtime_path_kind,
+                "runtime_classpath_index": runtime_classpath_index,
                 "logical_dependency_lineage": lineage,
             }
         else:
@@ -973,7 +1018,22 @@ class BinaryDecisionEngine:
                 "selected_artifact_instance_identity": record.get("selected_artifact_instance_identity"),
                 "defining_loader_realm_identity": record.get("selected_defining_loader_realm_identity"),
             }
-        return _identity("provider_outcome_fingerprint", payload)
+        return payload
+
+    def _provider_fingerprint(
+        self,
+        store: BinaryFactStore,
+        record: Mapping[str, Any] | None,
+        artifact_lineages: Mapping[str, str],
+    ) -> str:
+        payload = self._provider_outcome_payload(
+            store, record, artifact_lineages
+        )
+        return (
+            "ABSENT"
+            if payload is None
+            else _identity("provider_outcome_fingerprint", payload)
+        )
 
     def _decision(
         self,
@@ -1502,12 +1562,26 @@ class BinaryDecisionEngine:
         for realm, class_name in all_keys:
             base = self._base_providers.get((realm, class_name))
             current = self._current_providers.get((realm, class_name))
-            old_fp = self._provider_fingerprint(
+            base_provider_payload = self._provider_outcome_payload(
                 self.base_store, base, self._base_artifact_lineages
             )
-            new_fp = self._provider_fingerprint(
+            current_provider_payload = self._provider_outcome_payload(
                 self.current_store, current, self._current_artifact_lineages
             )
+            provider_changed = not _same_json_value(
+                base_provider_payload, current_provider_payload
+            )
+            base_definition = self._base_definitions.get((realm, class_name))
+            current_definition = self._current_definitions.get((realm, class_name))
+            old_status = (base_definition or {}).get(
+                "class_definition_status", "ABSENT"
+            )
+            new_status = (current_definition or {}).get(
+                "class_definition_status", "ABSENT"
+            )
+            definition_changed = old_status != new_status
+            if not provider_changed and not definition_changed:
+                continue
             scope = {
                 "initiating_loader_realm_identity": realm,
                 "class_name": class_name,
@@ -1528,7 +1602,21 @@ class BinaryDecisionEngine:
                 "initiating_loader_realm_identity": realm,
                 "class_name": class_name,
             })
-            if old_fp != new_fp:
+            if provider_changed:
+                old_fp = (
+                    "ABSENT"
+                    if base_provider_payload is None
+                    else _identity(
+                        "provider_outcome_fingerprint", base_provider_payload
+                    )
+                )
+                new_fp = (
+                    "ABSENT"
+                    if current_provider_payload is None
+                    else _identity(
+                        "provider_outcome_fingerprint", current_provider_payload
+                    )
+                )
                 base_identity = str(
                     (base or {}).get("selected_artifact_instance_identity") or ""
                 )
@@ -1572,11 +1660,7 @@ class BinaryDecisionEngine:
                     ),
                 )
 
-            base_definition = self._base_definitions.get((realm, class_name))
-            current_definition = self._current_definitions.get((realm, class_name))
-            old_status = (base_definition or {}).get("class_definition_status", "ABSENT")
-            new_status = (current_definition or {}).get("class_definition_status", "ABSENT")
-            if old_status == new_status:
+            if not definition_changed:
                 continue
             definition_scope = {**scope, "mechanism": "class_definition"}
             definition_observed = observed_delta_identity(

@@ -16,7 +16,7 @@ import re
 import sys
 import time
 import traceback
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 try:
     import resource
@@ -102,6 +102,30 @@ def _artifact_snapshot_worker_count(configured: Any, lineage_count: int) -> int:
             "BINARY_ARTIFACT_WORKER_COUNT_INVALID", str(configured)
         )
     return min(workers, lineage_count)
+
+
+def _artifact_hash_worker_count(configured: Any, file_count: int) -> int:
+    """Return a bounded digest worker count for independent artifact files."""
+    file_count = max(0, int(file_count))
+    if configured in (None, ""):
+        if file_count == 0:
+            return 0
+        return min(4, max(1, (os.cpu_count() or 1) // 2), file_count)
+    if isinstance(configured, bool) or isinstance(configured, float):
+        raise BinaryPipelineError(
+            "BINARY_ARTIFACT_HASH_WORKER_COUNT_INVALID", str(configured)
+        )
+    try:
+        workers = int(configured)
+    except (TypeError, ValueError) as error:
+        raise BinaryPipelineError(
+            "BINARY_ARTIFACT_HASH_WORKER_COUNT_INVALID", str(configured)
+        ) from error
+    if not 1 <= workers <= 8:
+        raise BinaryPipelineError(
+            "BINARY_ARTIFACT_HASH_WORKER_COUNT_INVALID", str(configured)
+        )
+    return min(workers, file_count)
 
 
 class _PhaseTimingRecorder(list):
@@ -612,6 +636,8 @@ class _ArtifactDigestSession:
         self.hash_reuse_count = 0
         self.hash_bytes = 0
         self.final_verification_hash_count = 0
+        self.hash_worker_count = 0
+        self.parallel_hash_file_count = 0
 
     @staticmethod
     def _file_identity(stat_result) -> tuple[int, int, int, int, int]:
@@ -636,7 +662,8 @@ class _ArtifactDigestSession:
             )
         return expected
 
-    def _hash_stable(self, path: Path) -> _ArtifactDigestRecord:
+    @classmethod
+    def _hash_stable_record(cls, path: Path) -> _ArtifactDigestRecord:
         try:
             before = path.stat()
             if not path.is_file():
@@ -647,19 +674,88 @@ class _ArtifactDigestSession:
             raise BinaryPipelineError(
                 "BINARY_PIPELINE_ARTIFACT_MISSING", f"{path}: {error}"
             ) from error
-        before_identity = self._file_identity(before)
-        after_identity = self._file_identity(after)
+        before_identity = cls._file_identity(before)
+        after_identity = cls._file_identity(after)
         if before_identity != after_identity:
             raise BinaryPipelineError(
                 "BINARY_PIPELINE_ARTIFACT_CHANGED_DURING_HASH", str(path)
             )
-        self.hash_execution_count += 1
-        self.hash_bytes += int(after.st_size)
         return _ArtifactDigestRecord(
             content_sha256=content_sha256,
             byte_length=int(after.st_size),
             file_identity=after_identity,
         )
+
+    def _record_hash_execution(
+        self, record: _ArtifactDigestRecord
+    ) -> _ArtifactDigestRecord:
+        self.hash_execution_count += 1
+        self.hash_bytes += record.byte_length
+        return record
+
+    def _hash_stable(self, path: Path) -> _ArtifactDigestRecord:
+        return self._record_hash_execution(self._hash_stable_record(path))
+
+    def prime(
+        self,
+        requests: Iterable[tuple[str | Path, Any]],
+        *,
+        configured_workers: Any = None,
+    ) -> None:
+        """Hash independent files concurrently, then publish results in order.
+
+        Every ordinary ``digest`` call still performs its stable stat check and
+        validates its declared SHA-256.  Priming only moves the unavoidable
+        full-file reads ahead of those calls and overlaps them; it does not
+        allow a timestamp, size, cache entry, or caller-supplied digest to stand
+        in for observed content bytes.
+        """
+        expected_by_path: dict[Path, list[str]] = {}
+        for raw_path, raw_expected in requests:
+            path = Path(raw_path).expanduser().resolve()
+            expected = self._expected_sha256(raw_expected, path=path)
+            expected_by_path.setdefault(path, []).append(expected)
+        paths = sorted(expected_by_path, key=str)
+        workers = _artifact_hash_worker_count(configured_workers, len(paths))
+        self.hash_worker_count = max(self.hash_worker_count, workers)
+        if not paths:
+            return
+
+        if workers == 1:
+            observed = [(path, self._hash_stable_record(path)) for path in paths]
+        else:
+            with ThreadPoolExecutor(
+                max_workers=workers,
+                thread_name_prefix="binary-artifact-digest",
+            ) as executor:
+                futures = {
+                    path: executor.submit(self._hash_stable_record, path)
+                    for path in paths
+                }
+                # Resolve futures in canonical path order. This keeps failure
+                # selection deterministic even though the reads run in parallel.
+                observed = [(path, futures[path].result()) for path in paths]
+            self.parallel_hash_file_count += len(paths)
+
+        for path, record in observed:
+            previous = self._records.get(path)
+            if previous is not None and (
+                previous.content_sha256 != record.content_sha256
+            ):
+                raise BinaryPipelineError(
+                    "BINARY_PIPELINE_ARTIFACT_CHANGED_DURING_PROFILE",
+                    str(path),
+                )
+            self._records[path] = self._record_hash_execution(record)
+            for expected in expected_by_path[path]:
+                if expected and record.content_sha256 != expected:
+                    raise BinaryPipelineError(
+                        "BINARY_PIPELINE_ARTIFACT_SHA256_MISMATCH",
+                        (
+                            f"{path}: expected={expected}; "
+                            f"actual={record.content_sha256}"
+                        ),
+                    )
 
     def digest(
         self,
@@ -722,6 +818,8 @@ class _ArtifactDigestSession:
             "outer_artifact_final_verification_hash_count": (
                 self.final_verification_hash_count
             ),
+            "artifact_hash_workers": self.hash_worker_count,
+            "artifact_parallel_hash_file_count": self.parallel_hash_file_count,
         }
 
 
@@ -1522,14 +1620,51 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
     )
     if resumed_result is not None:
         return resumed_result
-    base_platform = JdkPlatformImage(base_config.get("jdk_home", ""), asm_jar=asm_jar)
-    current_platform = JdkPlatformImage(current_config.get("jdk_home", ""), asm_jar=asm_jar)
-    if current_platform.identity == base_platform.identity:
-        # Platform facts are immutable and content-addressed. Sharing one
-        # instance avoids parsing the same target JDK twice for an ordinary
-        # dependency upgrade while preserving the same platform identity.
+    input_profile_started = time.perf_counter()
+    platform_started = input_profile_started
+    base_jdk_home = Path(
+        str(base_config.get("jdk_home") or "")
+    ).expanduser().resolve()
+    current_jdk_home = Path(
+        str(current_config.get("jdk_home") or "")
+    ).expanduser().resolve()
+    base_platform = JdkPlatformImage(base_jdk_home, asm_jar=asm_jar)
+    if current_jdk_home == base_jdk_home:
+        # One canonical JDK path denotes one target platform snapshot. Avoid
+        # rehashing its module image, launcher and release file for the second
+        # side; validation independently rechecks the same bound toolchain.
         current_platform = base_platform
+    else:
+        current_platform = JdkPlatformImage(current_jdk_home, asm_jar=asm_jar)
+        if current_platform.identity == base_platform.identity:
+            # Distinct paths can still be byte-identical immutable images.
+            current_platform = base_platform
+    platform_seconds = time.perf_counter() - platform_started
     digest_session = _ArtifactDigestSession()
+    artifact_digest_requests = []
+    for raw in (
+        *(base_config.get("artifacts") or ()),
+        *(current_config.get("artifacts") or ()),
+    ):
+        artifact_path = Path(str(raw.get("path") or "")).expanduser().resolve()
+        artifact_digest_requests.append((
+            artifact_path,
+            raw.get("content_sha256"),
+        ))
+        artifact_digest_requests.append((
+            Path(
+                str(raw.get("outer_artifact_path") or artifact_path)
+            ).expanduser().resolve(),
+            raw.get("outer_artifact_sha256"),
+        ))
+    digest_prime_started = time.perf_counter()
+    digest_session.prime(
+        artifact_digest_requests,
+        configured_workers=config.get("artifact_hash_workers"),
+    )
+    digest_prime_seconds = time.perf_counter() - digest_prime_started
+    del artifact_digest_requests
+    profile_build_started = time.perf_counter()
     base_artifacts, base_paths = _artifact_descriptors(
         list(base_config.get("artifacts") or ()),
         digest_session=digest_session,
@@ -1616,11 +1751,18 @@ def run_pipeline(config: Mapping[str, Any], *, output_root: str | Path) -> dict[
     context = AnalysisContext(runtime_comparison, analysis_scope)
     phase_timings.append({
         "phase": "input_and_runtime_profile",
-        "elapsed_seconds": round(time.perf_counter() - pipeline_started, 6),
+        "elapsed_seconds": round(time.perf_counter() - input_profile_started, 6),
+        "pipeline_elapsed_seconds": round(
+            time.perf_counter() - pipeline_started, 6
+        ),
+        "platform_image_seconds": round(platform_seconds, 6),
+        "artifact_digest_prime_seconds": round(digest_prime_seconds, 6),
+        "runtime_profile_build_seconds": round(
+            time.perf_counter() - profile_build_started, 6
+        ),
         "artifact_count": len(base_artifacts) + len(current_artifacts),
         **digest_session.metrics(),
     })
-
     with short_temporary_directory(prefix="binary-pipeline") as temp_text:
         temp = Path(temp_text)
         base_store = BinaryFactStore(

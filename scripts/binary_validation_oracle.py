@@ -146,6 +146,24 @@ class _StructuralTruth:
     failures: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class _OracleScanEvidence:
+    """One compact, normalized view shared by direct and structural checks.
+
+    The javap scanner produces a large JSON-shaped object.  Retaining a
+    compressed copy and decoding it independently in both validators spends
+    CPU on serialization and temporarily materializes the full graph again.
+    These immutable sets contain exactly the fields those validators consume.
+    """
+
+    artifact_sha256: str
+    complete: bool
+    failures: tuple[str, ...]
+    direct_truth: _DirectEdgeTruth
+    structural_truth: _StructuralTruth
+    structural_class_names: frozenset[str]
+
+
 _OBSERVATION_FIELDS = (
     "class_name",
     "provider_resource_url",
@@ -1300,7 +1318,9 @@ def _validate_structural_edges(
     *,
     javap: str,
     scan_cache: dict[tuple[Any, ...], _StructuralTruth] | None = None,
-    direct_scan_cache: dict[tuple[str, str], bytes | Mapping[str, Any]] | None = None,
+    direct_scan_cache: dict[
+        tuple[str, str], bytes | Mapping[str, Any] | _OracleScanEvidence
+    ] | None = None,
     string_pool: dict[str, str] | None = None,
     progress_callback: ValidationProgressCallback | None = None,
     progress_label: str = "",
@@ -1349,11 +1369,6 @@ def _validate_structural_edges(
     semantic_instructions = []
     clinit_classes = set()
     declared_members = set()
-    opcode_to_type_use = {
-        "new": "new", "anewarray": "anewarray", "checkcast": "checkcast",
-        "instanceof": "instanceof", "multianewarray": "multianewarray",
-        "class_literal": "class_literal",
-    }
     artifact_count = len(artifacts)
     _notify_progress(
         progress_callback,
@@ -1388,19 +1403,25 @@ def _validate_structural_edges(
         )
         scanned = scan_cache.get(scan_key) if scan_cache is not None else None
         if scanned is None:
+            direct_scan_key = (str(artifact["sha256"]), str(javap))
             direct_scan_payload = (
-                direct_scan_cache.get((str(artifact["sha256"]), str(javap)))
+                direct_scan_cache.get(direct_scan_key)
                 if direct_scan_cache is not None else None
             )
             direct_scan = (
-                _unpack_oracle_scan(direct_scan_payload)
+                _normalize_oracle_scan(direct_scan_payload, string_pool)
                 if direct_scan_payload is not None else None
             )
-            structural = (direct_scan or {}).get("structural_facts") or {}
+            if (
+                direct_scan_cache is not None
+                and direct_scan is not None
+                and direct_scan is not direct_scan_payload
+            ):
+                direct_scan_cache[direct_scan_key] = direct_scan
             if (
                 direct_scan
-                and direct_scan.get("complete")
-                and set(structural.get("class_names") or ())
+                and direct_scan.complete
+                and direct_scan.structural_class_names
                 == {
                     name for name in inventory["classes"]
                     if name != "module-info"
@@ -1411,66 +1432,57 @@ def _validate_structural_edges(
                 # universe is exactly the independent archive inventory;
                 # fat/nested layouts or any partial scan automatically take
                 # the original fallback path.
-                raw_scanned = {
-                    "type_edges": structural.get("type_edges") or (),
-                    "class_init_edges": structural.get("class_init_edges") or (),
-                    "clinit_classes": structural.get("clinit_classes") or (),
-                    "semantic_instructions": (
-                        structural.get("semantic_instructions") or ()
-                    ),
-                    "declared_members": structural.get("declared_members") or (),
-                    "failures": (),
-                }
+                scanned = direct_scan.structural_truth
             else:
                 raw_scanned = _scan_structural_edges(
                     artifact_path, inventory, javap
                 )
-            failures = tuple(str(item) for item in raw_scanned["failures"])
-            if failures:
-                # Preserve the fail-closed behavior: partial structural output
-                # is never normalized or compared as authoritative truth.
-                scanned = _StructuralTruth(
-                    type_edges=frozenset(),
-                    class_init_edges=frozenset(),
-                    clinit_classes=frozenset(),
-                    semantic_instructions=frozenset(),
-                    declared_members=frozenset(),
-                    failures=failures,
-                )
-            else:
-                def compact_tuple(value):
-                    normalized = tuple(value)
-                    return (
-                        _compact_json_values(normalized, string_pool)
-                        if string_pool is not None else normalized
+                failures = tuple(str(item) for item in raw_scanned["failures"])
+                if failures:
+                    # Preserve the fail-closed behavior: partial structural
+                    # output is never compared as authoritative truth.
+                    scanned = _StructuralTruth(
+                        type_edges=frozenset(),
+                        class_init_edges=frozenset(),
+                        clinit_classes=frozenset(),
+                        semantic_instructions=frozenset(),
+                        declared_members=frozenset(),
+                        failures=failures,
                     )
-
-                scanned = _StructuralTruth(
-                    type_edges=frozenset(
-                        compact_tuple(
-                            (*item[:5], opcode_to_type_use[item[5]])
+                else:
+                    def compact_tuple(value):
+                        normalized = tuple(value)
+                        return (
+                            _compact_json_values(normalized, string_pool)
+                            if string_pool is not None else normalized
                         )
-                        for item in raw_scanned["type_edges"]
-                    ),
-                    class_init_edges=frozenset(
-                        compact_tuple(item)
-                        for item in raw_scanned["class_init_edges"]
-                    ),
-                    clinit_classes=frozenset(
-                        _pooled_string(str(item), string_pool)
-                        if string_pool is not None else str(item)
-                        for item in raw_scanned["clinit_classes"]
-                    ),
-                    semantic_instructions=frozenset(
-                        compact_tuple(item)
-                        for item in raw_scanned["semantic_instructions"]
-                    ),
-                    declared_members=frozenset(
-                        compact_tuple(item)
-                        for item in raw_scanned["declared_members"]
-                    ),
-                    failures=(),
-                )
+
+                    scanned = _StructuralTruth(
+                        type_edges=frozenset(
+                            compact_tuple(
+                                (*item[:5], _OPCODE_TO_TYPE_USE[item[5]])
+                            )
+                            for item in raw_scanned["type_edges"]
+                        ),
+                        class_init_edges=frozenset(
+                            compact_tuple(item)
+                            for item in raw_scanned["class_init_edges"]
+                        ),
+                        clinit_classes=frozenset(
+                            _pooled_string(str(item), string_pool)
+                            if string_pool is not None else str(item)
+                            for item in raw_scanned["clinit_classes"]
+                        ),
+                        semantic_instructions=frozenset(
+                            compact_tuple(item)
+                            for item in raw_scanned["semantic_instructions"]
+                        ),
+                        declared_members=frozenset(
+                            compact_tuple(item)
+                            for item in raw_scanned["declared_members"]
+                        ),
+                        failures=(),
+                    )
             if scan_cache is not None:
                 scan_cache[scan_key] = scanned
         if scanned.failures:
@@ -1543,6 +1555,144 @@ def _unpack_oracle_scan(result: Mapping[str, Any] | bytes) -> dict[str, Any]:
     if isinstance(result, bytes):
         return json.loads(zlib.decompress(result).decode("utf-8"))
     return dict(result)
+
+
+_OPCODE_TO_TYPE_USE = {
+    "new": "new",
+    "anewarray": "anewarray",
+    "checkcast": "checkcast",
+    "instanceof": "instanceof",
+    "multianewarray": "multianewarray",
+    "class_literal": "class_literal",
+}
+
+
+def _normalize_oracle_scan(
+    result: Mapping[str, Any] | bytes | _OracleScanEvidence,
+    string_pool: dict[str, str] | None = None,
+) -> _OracleScanEvidence:
+    """Project a scanner result once into all facts consumed by validation."""
+    if isinstance(result, _OracleScanEvidence):
+        return result
+    unpacked = _unpack_oracle_scan(result)
+    artifact_sha256 = str(unpacked.get("artifact_sha256") or "")
+    complete = bool(unpacked.get("complete"))
+    failures = tuple(str(item) for item in (unpacked.get("failures") or ()))
+    if not complete:
+        # Partial rows are not authoritative and historically were rejected
+        # before normalization. Keep that fail-closed order, and do not spend
+        # time or memory projecting evidence that no validator may consume.
+        return _OracleScanEvidence(
+            artifact_sha256=artifact_sha256,
+            complete=False,
+            failures=failures,
+            direct_truth=_DirectEdgeTruth(
+                artifact_sha256=artifact_sha256,
+                direct_edges=frozenset(),
+                dynamic_handle_edges=frozenset(),
+                discovery_classes=frozenset(),
+            ),
+            structural_truth=_StructuralTruth(
+                type_edges=frozenset(),
+                class_init_edges=frozenset(),
+                clinit_classes=frozenset(),
+                semantic_instructions=frozenset(),
+                declared_members=frozenset(),
+                failures=failures,
+            ),
+            structural_class_names=frozenset(),
+        )
+    rows = unpacked.get("edges") or ()
+
+    def compact_tuple(value: Iterable[Any]) -> tuple[Any, ...]:
+        normalized = tuple(value)
+        if string_pool is None:
+            return normalized
+        # Oracle edge/structural tuples are overwhelmingly flat scalars. Pool
+        # those directly and retain the generic lossless path for any future
+        # nested value without recursively dispatching on every scalar today.
+        return tuple(
+            _pooled_string(item, string_pool)
+            if type(item) is str
+            else (
+                _compact_json_values(item, string_pool)
+                if type(item) in (list, tuple, dict)
+                else item
+            )
+            for item in normalized
+        )
+
+    direct_truth = _DirectEdgeTruth(
+        artifact_sha256=artifact_sha256,
+        direct_edges=frozenset(
+            compact_tuple((
+                row["caller_owner"], row["caller_member"],
+                row["caller_descriptor"], row["callee_owner"],
+                row["callee_member"], row["callee_descriptor"],
+                row["opcode_family"], int(row["instruction_offset"]),
+            ))
+            for row in rows
+            if row.get("opcode_family") != "invokedynamic"
+        ),
+        dynamic_handle_edges=frozenset(
+            compact_tuple((
+                row["caller_owner"], row["caller_member"],
+                row["caller_descriptor"], row["callee_owner"],
+                row["callee_member"], row["callee_descriptor"],
+                int(row["instruction_offset"]),
+            ))
+            for row in rows
+            if row.get("opcode_family") == "invokedynamic"
+        ),
+        discovery_classes=frozenset(
+            (
+                _pooled_string(
+                    str(row.get("callee_owner") or "").replace(".", "/"),
+                    string_pool,
+                )
+                if string_pool is not None
+                else str(row.get("callee_owner") or "").replace(".", "/")
+            )
+            for row in rows if row.get("callee_owner")
+        ),
+    )
+    structural = unpacked.get("structural_facts") or {}
+    structural_truth = _StructuralTruth(
+        type_edges=frozenset(
+            compact_tuple((*item[:5], _OPCODE_TO_TYPE_USE[item[5]]))
+            for item in (structural.get("type_edges") or ())
+        ),
+        class_init_edges=frozenset(
+            compact_tuple(item)
+            for item in (structural.get("class_init_edges") or ())
+        ),
+        clinit_classes=frozenset(
+            _pooled_string(str(item), string_pool)
+            if string_pool is not None else str(item)
+            for item in (structural.get("clinit_classes") or ())
+        ),
+        semantic_instructions=frozenset(
+            compact_tuple(item)
+            for item in (structural.get("semantic_instructions") or ())
+        ),
+        declared_members=frozenset(
+            compact_tuple(item)
+            for item in (structural.get("declared_members") or ())
+        ),
+        failures=(),
+    )
+    return _OracleScanEvidence(
+        artifact_sha256=direct_truth.artifact_sha256,
+        complete=True,
+        failures=failures,
+        direct_truth=direct_truth,
+        structural_truth=structural_truth,
+        structural_class_names=frozenset(
+            _pooled_string(str(item), string_pool)
+            if string_pool is not None else str(item)
+            for item in (structural.get("class_names") or ())
+        ),
+    )
 
 
 def _same_json_value(left: Any, right: Any) -> bool:
@@ -2657,7 +2807,7 @@ def _validate_direct_edges(
     *,
     javap: str,
     scan_cache: dict[
-        tuple[str, str], bytes | Mapping[str, Any]
+        tuple[str, str], bytes | Mapping[str, Any] | _OracleScanEvidence
     ] | None = None,
     truth_cache: dict[tuple[str, str], _DirectEdgeTruth] | None = None,
     string_pool: dict[str, str] | None = None,
@@ -2728,15 +2878,16 @@ def _validate_direct_edges(
     # shape scanned JARs serially while starting up to eight JVMs for tiny
     # 32-class groups inside each JAR; at 400+ dependencies JVM startup became
     # the dominant validation cost.
-    scan_results: dict[tuple[str, str], bytes] = {}
+    scan_results: dict[tuple[str, str], _OracleScanEvidence] = {}
     scan_requests: dict[tuple[str, str], Path] = {}
     for artifact in artifacts:
         scan_key = (str(artifact["sha256"]), str(javap))
         cached = scan_cache.get(scan_key) if scan_cache is not None else None
         if cached is not None:
-            scan_results[scan_key] = (
-                cached if isinstance(cached, bytes) else _pack_oracle_scan(cached)
-            )
+            normalized = _normalize_oracle_scan(cached, string_pool)
+            scan_results[scan_key] = normalized
+            if scan_cache is not None and normalized is not cached:
+                scan_cache[scan_key] = normalized
         else:
             scan_requests.setdefault(scan_key, Path(artifact["path"]))
 
@@ -2756,6 +2907,10 @@ def _validate_direct_edges(
             javap=javap,
             max_workers=1,
             include_structural_facts=True,
+            # This validator immediately stores one compact zlib copy for the
+            # base/current and structural passes. Avoid building the oracle's
+            # separate JSON-string cache for the same result first.
+            cache_result=False,
         )
 
     requests = iter(scan_requests.items())
@@ -2779,10 +2934,10 @@ def _validate_direct_edges(
                 for future in completed:
                     active.pop(future)
                     scan_key, result = future.result()
-                    packed = _pack_oracle_scan(result)
-                    scan_results[scan_key] = packed
+                    normalized = _normalize_oracle_scan(result, string_pool)
+                    scan_results[scan_key] = normalized
                     if scan_cache is not None and result.get("complete"):
-                        scan_cache[scan_key] = packed
+                        scan_cache[scan_key] = normalized
                     _notify_progress(
                         progress_callback,
                         "validation-direct-edges",
@@ -2823,73 +2978,28 @@ def _validate_direct_edges(
         normalized_truth = (
             truth_cache.get(scan_key) if truth_cache is not None else None
         )
-        result = (
-            _unpack_oracle_scan(scan_results[scan_key])
-            if normalized_truth is None else None
-        )
+        scan_evidence = scan_results[scan_key]
         if (
-            result is not None
-            and result.get("artifact_sha256")
-            and result["artifact_sha256"] != artifact["sha256"]
+            normalized_truth is None
+            and scan_evidence.artifact_sha256
+            and scan_evidence.artifact_sha256 != artifact["sha256"]
         ):
             issues.append(_validation_issue(
                 "direct_edge",
                 "ORACLE_ARTIFACT_CHANGED_DURING_DIRECT_EDGE_VALIDATION",
                 artifact=artifact["path"],
                 expected_sha256=artifact["sha256"],
-                actual_sha256=result.get("artifact_sha256"),
+                actual_sha256=scan_evidence.artifact_sha256,
             ))
             continue
-        if result is not None and not result.get("complete"):
+        if normalized_truth is None and not scan_evidence.complete:
             issues.append(_validation_issue(
                 "direct_edge", "ORACLE_JAVAP_INVENTORY_INCOMPLETE",
-                artifact=artifact["path"], failures=result.get("failures") or (),
+                artifact=artifact["path"], failures=scan_evidence.failures,
             ))
             continue
         if normalized_truth is None:
-            rows = result.get("edges") or ()
-
-            def compact_tuple(value):
-                normalized = tuple(value)
-                return (
-                    _compact_json_values(normalized, string_pool)
-                    if string_pool is not None else normalized
-                )
-
-            normalized_truth = _DirectEdgeTruth(
-                artifact_sha256=str(result.get("artifact_sha256") or ""),
-                direct_edges=frozenset(
-                    compact_tuple((
-                        row["caller_owner"], row["caller_member"],
-                        row["caller_descriptor"], row["callee_owner"],
-                        row["callee_member"], row["callee_descriptor"],
-                        row["opcode_family"], int(row["instruction_offset"]),
-                    ))
-                    for row in rows
-                    if row.get("opcode_family") != "invokedynamic"
-                ),
-                dynamic_handle_edges=frozenset(
-                    compact_tuple((
-                        row["caller_owner"], row["caller_member"],
-                        row["caller_descriptor"], row["callee_owner"],
-                        row["callee_member"], row["callee_descriptor"],
-                        int(row["instruction_offset"]),
-                    ))
-                    for row in rows
-                    if row.get("opcode_family") == "invokedynamic"
-                ),
-                discovery_classes=frozenset(
-                    (
-                        _pooled_string(
-                            str(row.get("callee_owner") or "").replace(".", "/"),
-                            string_pool,
-                        )
-                        if string_pool is not None
-                        else str(row.get("callee_owner") or "").replace(".", "/")
-                    )
-                    for row in rows if row.get("callee_owner")
-                ),
-            )
+            normalized_truth = scan_evidence.direct_truth
             if truth_cache is not None:
                 truth_cache[scan_key] = normalized_truth
         if (
@@ -5629,7 +5739,7 @@ def validate_generation(
     validation_string_pool: dict[str, str] = {}
     structural_scan_cache: dict[tuple[Any, ...], _StructuralTruth] = {}
     direct_scan_cache: dict[
-        tuple[str, str], bytes | Mapping[str, Any]
+        tuple[str, str], bytes | Mapping[str, Any] | _OracleScanEvidence
     ] = {}
     direct_truth_cache: dict[tuple[str, str], _DirectEdgeTruth] = {}
     side_validation_cache: dict[

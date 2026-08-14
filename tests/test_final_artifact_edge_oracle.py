@@ -156,6 +156,36 @@ class FinalArtifactEdgeOraclePerformanceTest(unittest.TestCase):
         self.assertEqual(cached["cached_class_count"], 3)
         self.assertEqual(cached["cache_hits"], 1)
 
+    def test_cache_can_be_disabled_without_changing_scan_evidence(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifact = _fake_artifact(
+                Path(temp_dir) / "fixture.jar", ["fixture/A.class"]
+            )
+
+            def parse_group(entries, artifact_sha256, *_args, **_kwargs):
+                return [
+                    _fake_parse_result(entry, artifact_sha256)
+                    for entry in entries
+                ]
+
+            with patch.object(
+                oracle, "_javap_version", return_value="21.0.1"
+            ), patch.object(
+                oracle, "_parse_entry_group_with_javap", side_effect=parse_group
+            ) as parse:
+                first = oracle.scan_final_artifact(
+                    artifact, max_workers=1, cache_result=False
+                )
+                second = oracle.scan_final_artifact(
+                    artifact, max_workers=1, cache_result=False
+                )
+
+        self.assertEqual(first["edges"], second["edges"])
+        self.assertEqual(first["failures"], second["failures"])
+        self.assertEqual(first["cache_hits"], 0)
+        self.assertEqual(second["cache_hits"], 0)
+        self.assertEqual(parse.call_count, 2)
+
     def test_full_scan_batches_classes_into_bounded_javap_invocations(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             class_count = oracle.MAX_CLASSES_PER_JAVAP_BATCH * 2 + 5
@@ -819,6 +849,22 @@ class FinalArtifactEdgeOracleTest(unittest.TestCase):
 
         self.assertFalse(oracle._entry_requires_verbose_javap(plain_entry))
         self.assertTrue(oracle._entry_requires_verbose_javap(dynamic_entry))
+
+    def test_cached_bootstrap_marker_avoids_rereading_extracted_class(self):
+        missing = Path("/fixture/not-materialized.class")
+        plain = oracle.PackagedClass(
+            "fixture/Plain.class", missing, None, False
+        )
+        dynamic = oracle.PackagedClass(
+            "fixture/Lambda.class", missing, None, True
+        )
+        with patch.object(
+            Path, "read_bytes", side_effect=AssertionError("unexpected read")
+        ) as read_bytes:
+            self.assertFalse(oracle._entry_requires_verbose_javap(plain))
+            self.assertTrue(oracle._entry_requires_verbose_javap(dynamic))
+
+        read_bytes.assert_not_called()
 
     def test_scans_each_jvm_instruction_family_from_final_artifact(self):
         with tempfile.TemporaryDirectory() as temp_dir:

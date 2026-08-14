@@ -9,7 +9,7 @@ import hashlib
 import json
 from pathlib import Path
 import sqlite3
-from typing import Any, Iterable, Iterator
+from typing import Any, Iterable, Iterator, Mapping
 import zlib
 
 from binary_artifact_diff import ArtifactSnapshot
@@ -766,6 +766,142 @@ class BinaryFactStore:
         self, records: Iterable[dict[str, Any]], *,
         collect_identities: bool = True,
     ) -> list[str]:
+        def normalized_records():
+            for raw in records:
+                yield (
+                    str(raw["analysis_context_identity"]),
+                    str(raw["record_kind"]),
+                    str(raw["status"]),
+                    str(raw["subject_identity"]),
+                    dict(raw["payload"]),
+                )
+
+        return self._add_normalized_reconciliation_records(
+            normalized_records(), collect_identities=collect_identities
+        )
+
+    def add_reconciliation_payloads(
+        self,
+        *,
+        analysis_context_identity: str,
+        record_kind: str,
+        records: Iterable[tuple[str, str, Mapping[str, Any]]],
+        collect_identities: bool = True,
+    ) -> list[str]:
+        """Persist one internal record family without redundant envelopes.
+
+        The reconciler already owns native dict payloads and one fixed context
+        and kind per bounded chunk.  Keeping those values out of a temporary
+        wrapper avoids a payload copy and two short-lived dictionaries for
+        every runtime record; the stored envelope and identities remain byte
+        identical to :meth:`add_reconciliation_records`.
+        """
+        context = str(analysis_context_identity)
+        kind = str(record_kind)
+        if kind not in RECONCILIATION_KIND_CODES:
+            raise BinaryFactStoreError(
+                "FACT_STORE_RECONCILIATION_KIND_INVALID", kind
+            )
+        identities = []
+        pending_identities: list[str] = []
+        serialized = bytearray(b"[")
+        context_json = _json(context).encode("utf-8")
+        identity_prefix = (
+            '{"namespace":' + _json(f"{kind}_record_identity")
+            + ',"payload":'
+        ).encode("utf-8")
+        identity_suffix = b',"schema_version":"1"}'
+
+        def flush() -> None:
+            nonlocal serialized
+            if not pending_identities:
+                return
+            serialized.extend(b"]")
+            chunk_identity = _identity(
+                "reconciliation_record_chunk_identity",
+                {
+                    "analysis_context_identity": context,
+                    "record_kind": kind,
+                    "record_identities": pending_identities,
+                },
+            )
+            self.connection.execute(
+                "INSERT INTO reconciliation_records VALUES(?,?,?,?)",
+                (
+                    sqlite3.Binary(bytes.fromhex(chunk_identity)),
+                    RECONCILIATION_KIND_CODES[kind],
+                    len(pending_identities),
+                    sqlite3.Binary(zlib.compress(serialized, level=1)),
+                ),
+            )
+            pending_identities.clear()
+            serialized = bytearray(b"[")
+
+        try:
+            with self.connection:
+                existing = self.connection.execute(
+                    "SELECT value FROM metadata WHERE key=?",
+                    ("reconciliation_analysis_context_identity",),
+                ).fetchone()
+                if existing and existing[0] != context:
+                    raise BinaryFactStoreError(
+                        "FACT_STORE_RECONCILIATION_CONTEXT_CONFLICT",
+                        f"{existing[0]} != {context}",
+                    )
+                self.connection.execute(
+                    "INSERT OR IGNORE INTO metadata(key,value) VALUES(?,?)",
+                    ("reconciliation_analysis_context_identity", context),
+                )
+                for status, subject_identity, raw_payload in records:
+                    status = str(status)
+                    subject_identity = str(subject_identity)
+                    payload = (
+                        raw_payload
+                        if type(raw_payload) is dict
+                        else dict(raw_payload)
+                    )
+                    payload_json = _json(payload).encode("utf-8")
+                    status_json = _json(status).encode("utf-8")
+                    subject_json = _json(subject_identity).encode("utf-8")
+                    record_payload = (
+                        b'{"analysis_context_identity":' + context_json
+                        + b',"payload":' + payload_json
+                        + b',"status":' + status_json
+                        + b',"subject_identity":' + subject_json + b"}"
+                    )
+                    digest = hashlib.sha256(identity_prefix)
+                    digest.update(record_payload)
+                    digest.update(identity_suffix)
+                    record_identity = digest.hexdigest()
+                    if collect_identities:
+                        identities.append(record_identity)
+                    if pending_identities:
+                        serialized.extend(b",")
+                    serialized.extend(b'{"payload":')
+                    serialized.extend(payload_json)
+                    serialized.extend(b',"record_identity":"')
+                    serialized.extend(record_identity.encode("ascii"))
+                    serialized.extend(b'","status":')
+                    serialized.extend(status_json)
+                    serialized.extend(b',"subject_identity":')
+                    serialized.extend(subject_json)
+                    serialized.extend(b"}")
+                    pending_identities.append(record_identity)
+                    if len(pending_identities) >= 2_000:
+                        flush()
+                flush()
+        except sqlite3.IntegrityError as error:
+            raise BinaryFactStoreError(
+                "FACT_STORE_RECONCILIATION_CONFLICT", str(error)
+            ) from error
+        return identities
+
+    def _add_normalized_reconciliation_records(
+        self,
+        records: Iterable[tuple[str, str, str, str, Mapping[str, Any]]],
+        *,
+        collect_identities: bool,
+    ) -> list[str]:
         identities = []
         context_identity = ""
         try:
@@ -801,11 +937,13 @@ class BinaryFactStore:
                     pending_kind = ""
                     pending = []
 
-                for raw in records:
-                    analysis_context_identity = str(
-                        raw["analysis_context_identity"]
-                    )
-                    record_kind = str(raw["record_kind"])
+                for (
+                    analysis_context_identity,
+                    record_kind,
+                    status,
+                    subject_identity,
+                    payload,
+                ) in records:
                     if record_kind not in RECONCILIATION_KIND_CODES:
                         raise BinaryFactStoreError(
                             "FACT_STORE_RECONCILIATION_KIND_INVALID", record_kind
@@ -830,9 +968,6 @@ class BinaryFactStore:
                             "FACT_STORE_RECONCILIATION_CONTEXT_CONFLICT",
                             f"{context_identity} != {analysis_context_identity}",
                         )
-                    status = str(raw["status"])
-                    subject_identity = str(raw["subject_identity"])
-                    payload = dict(raw["payload"])
                     record_identity = _identity(
                         f"{record_kind}_record_identity",
                         {

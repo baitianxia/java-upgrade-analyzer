@@ -81,6 +81,7 @@ class PackagedClass:
     artifact_entry: str
     extracted_path: Path
     content: bytes | None = None
+    requires_verbose_javap: bool | None = None
 
 
 def clear_immutable_oracle_cache() -> None:
@@ -305,7 +306,10 @@ def _extract_packaged_classes(
                     if not defer_writes:
                         path = _write_extracted_class(destination, len(entries), content)
                     entries.append(PackagedClass(
-                        info.filename, path, content if defer_writes else None
+                        info.filename,
+                        path,
+                        content if defer_writes else None,
+                        b"BootstrapMethods" in content,
                     ))
                 except (OSError, zipfile.BadZipFile) as error:
                     failures.append(f"{info.filename}: extract failed: {error}")
@@ -337,6 +341,7 @@ def _extract_packaged_classes(
                                 f"{nested_name}!/{class_info.filename}",
                                 path,
                                 content if defer_writes else None,
+                                b"BootstrapMethods" in content,
                             ))
                 except (OSError, zipfile.BadZipFile) as error:
                     failures.append(f"{nested_name}: nested JAR read failed: {error}")
@@ -739,6 +744,8 @@ def _materialize_packaged_class(entry: PackagedClass) -> str:
 
 
 def _entry_requires_verbose_javap(entry: PackagedClass) -> bool:
+    if entry.requires_verbose_javap is not None:
+        return entry.requires_verbose_javap
     content = entry.content
     if content is None:
         try:
@@ -746,6 +753,11 @@ def _entry_requires_verbose_javap(entry: PackagedClass) -> bool:
         except OSError:
             return True
     return b"BootstrapMethods" in content
+
+
+def _javap_path_key(path: str | Path) -> str:
+    """Normalize a javap path lexically without restatting every class file."""
+    return os.path.normcase(os.path.abspath(os.fspath(path)))
 
 
 def _parse_entry_with_javap(
@@ -956,12 +968,14 @@ def _parse_entry_group_with_javap(
     if process.returncode != 0:
         return parse_separately(entries)
 
-    sections: dict[Path, str] = {}
+    sections: dict[str, str] = {}
     if force_verbose:
         markers = list(re.finditer(r"(?m)^Classfile (?P<path>.+)\n", stdout))
         for index, marker in enumerate(markers):
             end = markers[index + 1].start() if index + 1 < len(markers) else len(stdout)
-            sections[Path(marker.group("path").strip()).resolve()] = stdout[marker.start():end]
+            sections[_javap_path_key(marker.group("path").strip())] = (
+                stdout[marker.start():end]
+            )
     else:
         declaration_markers = list(re.finditer(
             r"(?m)^(?:[\w$]+\s+)*(?:class|interface|enum|record)\s+[\w.$]+[^\n]*\{\s*$",
@@ -973,10 +987,10 @@ def _parse_entry_group_with_javap(
                 if start < 0 or (index and start < declaration_markers[index - 1].start()):
                     start = marker.start()
                 end = declaration_markers[index + 1].start() if index + 1 < len(declaration_markers) else len(stdout)
-                sections[entry.extracted_path.resolve()] = stdout[start:end]
+                sections[_javap_path_key(entry.extracted_path)] = stdout[start:end]
     results = []
     for entry in entries:
-        section = sections.get(entry.extracted_path.resolve())
+        section = sections.get(_javap_path_key(entry.extracted_path))
         if section is None:
             results.extend(parse_separately([entry]))
             continue
@@ -1150,6 +1164,7 @@ def scan_final_artifact(
     selected_targets: list[dict] | None = None,
     excluded_nested_jars: set[str] | None = None,
     include_structural_facts: bool = False,
+    cache_result: bool = True,
 ) -> dict:
     """Return every executable edge found in the final artifact and nested runtime JARs."""
     artifact = Path(artifact)
@@ -1245,7 +1260,9 @@ def scan_final_artifact(
         include_structural_facts,
     )
     with _IMMUTABLE_ORACLE_CACHE_LOCK:
-        cached_serialized = _IMMUTABLE_ORACLE_CACHE.get(cache_key)
+        cached_serialized = (
+            _IMMUTABLE_ORACLE_CACHE.get(cache_key) if cache_result else None
+        )
     if cached_serialized is not None:
         cached = json.loads(cached_serialized)
         return _base_result(
@@ -1422,7 +1439,13 @@ def scan_final_artifact(
         failures=failures,
         complete=complete,
     )
-    if complete and not timed_out and not interrupted and completed_class_count == len(entries):
+    if (
+        cache_result
+        and complete
+        and not timed_out
+        and not interrupted
+        and completed_class_count == len(entries)
+    ):
         serialized = json.dumps(
             {
                 "class_count": len(entries),

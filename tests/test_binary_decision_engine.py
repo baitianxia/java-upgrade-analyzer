@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT_DIR / "scripts"))
 
 import binary_asm_helper  # noqa: E402
 import binary_artifact_diff  # noqa: E402
+import binary_decision_engine  # noqa: E402
 from binary_decision_engine import BinaryDecisionEngine  # noqa: E402
 from binary_fact_store import BinaryFactStore  # noqa: E402
 from binary_first_contract import observed_delta_identity  # noqa: E402
@@ -124,6 +125,16 @@ class BinaryDecisionIdentityRegressionTest(unittest.TestCase):
             row["disposition_obligation_identity"]
             for row in bundle.excluded_decisions
         }), 2)
+
+    def test_provider_fast_path_preserves_type_exact_json_comparison(self):
+        self.assertTrue(binary_decision_engine._same_json_value(
+            {"status": "resolved", "slot": 1},
+            {"status": "resolved", "slot": 1},
+        ))
+        self.assertFalse(binary_decision_engine._same_json_value(
+            {"status": "unresolved", "evidence": [True]},
+            {"status": "unresolved", "evidence": [1]},
+        ))
 
     def test_same_member_delta_in_selected_and_shadowed_pairings_is_distinct(self):
         realm = "application-loader"

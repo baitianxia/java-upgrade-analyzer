@@ -422,13 +422,11 @@ class _ReconciliationAccumulator:
         if kind in self.retained_kinds:
             self.records[kind].append(record)
         pending = self.pending[kind]
-        pending.append({
-            "analysis_context_identity": self.analysis_context_identity,
-            "record_kind": kind,
-            "status": record[status_key],
-            "subject_identity": record[identity_key],
-            "payload": record,
-        })
+        pending.append((
+            record[status_key],
+            record[identity_key],
+            record,
+        ))
         if len(pending) >= self.CHUNK_SIZE:
             self._flush_kind(kind)
 
@@ -436,8 +434,10 @@ class _ReconciliationAccumulator:
         pending = self.pending[kind]
         if not pending:
             return
-        self.store.add_reconciliation_records(
-            pending,
+        self.store.add_reconciliation_payloads(
+            analysis_context_identity=self.analysis_context_identity,
+            record_kind=kind,
+            records=pending,
             collect_identities=False,
         )
         pending.clear()
