@@ -48,6 +48,50 @@ class Step0WorkflowTest(unittest.TestCase):
 
         self.assertEqual(detected, home)
 
+    def test_scp_git_url_without_user_uses_explicit_git_service_account(self):
+        self.assertEqual(
+            run_step._git_clone_transport_url(
+                "code.weoa.com:cnc/nbs-ibs.git"
+            ),
+            "git@code.weoa.com:cnc/nbs-ibs.git",
+        )
+        self.assertEqual(
+            run_step._git_clone_transport_url(
+                "deploy@code.weoa.com:cnc/nbs-ibs.git"
+            ),
+            "deploy@code.weoa.com:cnc/nbs-ibs.git",
+        )
+        self.assertEqual(
+            run_step._git_clone_transport_url(
+                "https://code.weoa.com/cnc/nbs-ibs.git"
+            ),
+            "https://code.weoa.com/cnc/nbs-ibs.git",
+        )
+
+    def test_dependency_source_clone_uses_normalized_scp_transport(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            run_step, "git_with_long_paths", return_value=["git"],
+        ), mock.patch.object(
+            run_step,
+            "run_cmd",
+            return_value=("", "Permission denied (publickey)", 128),
+        ) as runner, self.assertRaises(run_step.StepError):
+            run_step.materialize_dependency_source_git_url(
+                "code.weoa.com:cnc/nbs-ibs.git",
+                Path(tmp) / ".upgrade-report",
+                clone_timeout=30,
+            )
+
+        clone_commands = [
+            call.args[0] for call in runner.call_args_list
+            if "clone" in call.args[0]
+        ]
+        self.assertEqual(len(clone_commands), 1)
+        self.assertEqual(
+            clone_commands[0][-2],
+            "git@code.weoa.com:cnc/nbs-ibs.git",
+        )
+
     def test_java8_reported_jre_home_is_normalized_to_the_full_jdk(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "jdk8"

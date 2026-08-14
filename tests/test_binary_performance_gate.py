@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -19,6 +20,25 @@ from binary_performance_gate import (  # noqa: E402
     evaluate_recorded_gate,
     run_benchmark,
 )
+
+
+class PerformanceProcessMetricsTest(unittest.TestCase):
+    def test_windows_fallback_uses_native_cpu_and_peak_memory(self):
+        usage = SimpleNamespace(
+            user_seconds=1.25,
+            system_seconds=0.5,
+            peak_rss_bytes=16 * 1024 * 1024,
+        )
+        with patch.object(binary_performance_gate, "_resource", None), patch.object(
+            binary_performance_gate,
+            "windows_current_process_usage",
+            return_value=usage,
+        ):
+            cpu_seconds = binary_performance_gate._cpu_seconds()
+            peak_rss_bytes = binary_performance_gate._rss_bytes()
+
+        self.assertEqual(cpu_seconds, 1.75)
+        self.assertEqual(peak_rss_bytes, 16 * 1024 * 1024)
 
 
 class BinaryPerformanceGateTest(unittest.TestCase):

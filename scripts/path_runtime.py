@@ -34,6 +34,10 @@ _WORKTREE_LEASE_PREFIX = ".jua-worktree-lease-"
 _WORKTREE_LEASE_VERSION = 2
 _SUPPORTED_WORKTREE_LEASE_VERSIONS = {1, _WORKTREE_LEASE_VERSION}
 _MAX_WORKTREE_LEASES_PER_ROOT = 256
+_LEGACY_RESERVED_WORKTREE_NAMES = frozenset({
+    "jua-base-build",
+    "jua-current-build",
+})
 DEFAULT_WORKTREE_TIMEOUT = 300
 WORKTREE_CLEANUP_MARGIN_SECONDS = 30
 _WORKTREE_LOCK_ERROR_MARKERS = (
@@ -523,6 +527,11 @@ def _remaining_timeout(deadline):
     return remaining
 
 
+def _git_read_command(git, repository, *arguments):
+    """Run read-only Git queries via ``-C`` instead of process-level ``cwd``."""
+    return list(git) + ["-C", str(Path(repository).resolve()), *arguments]
+
+
 def _run_worktree_mutation(command, *, repo_dir, runner, timeout, deadline=None):
     """Retry only Git's explicit lock-contention failures, on the same target."""
     deadline = (
@@ -599,8 +608,11 @@ def _worktree_registration_state(
     if timeout <= 0:
         return None, "worktree registration check deadline exceeded", -1
     stdout, stderr, rc = runner(
-        git + ["-c", "core.quotepath=false", "worktree", "list", "--porcelain"],
-        cwd=str(Path(repo_dir).resolve()),
+        _git_read_command(
+            git, repo_dir,
+            "-c", "core.quotepath=false", "worktree", "list", "--porcelain",
+        ),
+        cwd=None,
         timeout=timeout,
     )
     target = os.path.normcase(os.path.realpath(os.path.abspath(str(worktree))))
@@ -630,8 +642,8 @@ def _resolve_worktree_commit(git, repo_dir, ref, runner, *, deadline):
     if timeout <= 0:
         raise RuntimeError("git worktree revision resolution deadline exceeded")
     stdout, stderr, rc = runner(
-        git + ["rev-parse", "--verify", f"{ref}^{{commit}}"],
-        cwd=str(repo_dir),
+        _git_read_command(git, repo_dir, "rev-parse", "--verify", f"{ref}^{{commit}}"),
+        cwd=None,
         timeout=timeout,
     )
     commit = str(stdout or "").strip().splitlines()
@@ -649,8 +661,11 @@ def _longest_tracked_path(git, repo_dir, ref, runner, *, deadline):
     if timeout <= 0:
         raise RuntimeError("git ls-tree deadline exceeded before worktree creation")
     stdout, stderr, rc = runner(
-        git + ["-c", "core.quotepath=false", "ls-tree", "-rz", "--name-only", ref],
-        cwd=str(repo_dir),
+        _git_read_command(
+            git, repo_dir,
+            "-c", "core.quotepath=false", "ls-tree", "-rz", "--name-only", ref,
+        ),
+        cwd=None,
         timeout=timeout,
     )
     if rc != 0:
@@ -796,6 +811,58 @@ def _raise_worktree_recovery_errors(result):
     )
 
 
+def _legacy_worktree_name_is_reserved(path):
+    name = Path(path).name.casefold()
+    return name in _LEGACY_RESERVED_WORKTREE_NAMES
+
+
+def _recover_registered_legacy_worktrees(
+    git, repo_dir, registered, trusted_roots, runner, *, deadline,
+):
+    """Recover only product-reserved legacy worktrees under trusted temp roots."""
+    trusted = {
+        os.path.normcase(os.path.realpath(os.path.abspath(str(Path(root).resolve()))))
+        for root in trusted_roots or ()
+    }
+    result = {
+        "checked": [],
+        "removed": [],
+        "ignored_untrusted": [],
+        "errors": [],
+    }
+    repository_identity = os.path.normcase(
+        os.path.realpath(os.path.abspath(str(Path(repo_dir).resolve())))
+    )
+    for raw_target in registered or ():
+        target = Path(raw_target).resolve()
+        target_identity = os.path.normcase(
+            os.path.realpath(os.path.abspath(str(target)))
+        )
+        if target_identity == repository_identity or not _legacy_worktree_name_is_reserved(target):
+            continue
+        parent_identity = os.path.normcase(
+            os.path.realpath(os.path.abspath(str(target.parent)))
+        )
+        if parent_identity not in trusted:
+            result["ignored_untrusted"].append(str(target))
+            continue
+        # Current-format worktrees always have a lease. Their process ownership
+        # must remain governed by the lease recovery path above.
+        if _worktree_lease_path(target).exists():
+            continue
+        result["checked"].append(str(target))
+        cleanup_error = _cleanup_failed_worktree(
+            git, repo_dir, target, runner, deadline=deadline,
+        )
+        if cleanup_error:
+            result["errors"].append(
+                f"legacy_path={target}:cleanup_failed:{cleanup_error}"
+            )
+            continue
+        result["removed"].append(str(target))
+    return result
+
+
 def recover_owned_stale_worktrees(
     repo_dir,
     *,
@@ -815,6 +882,7 @@ def recover_owned_stale_worktrees(
         if roots is not None
         else short_temp_root_candidates(workspace=repo_dir)
     )
+    trusted_legacy_roots = list(candidate_roots)
 
     with _worktree_repository_lock(repo_dir):
         remaining = _remaining_timeout(deadline)
@@ -822,8 +890,11 @@ def recover_owned_stale_worktrees(
             result = {"errors": ["worktree_recovery_deadline_exceeded"]}
             _raise_worktree_recovery_errors(result)
         stdout, stderr, rc = runner(
-            git + ["-c", "core.quotepath=false", "worktree", "list", "--porcelain"],
-            cwd=str(repo_dir),
+            _git_read_command(
+                git, repo_dir,
+                "-c", "core.quotepath=false", "worktree", "list", "--porcelain",
+            ),
+            cwd=None,
             timeout=remaining,
         )
         registered = _registered_worktree_path_values(stdout) if rc == 0 else []
@@ -851,6 +922,27 @@ def recover_owned_stale_worktrees(
             runner,
             deadline=deadline,
         )
+        already_removed = {
+            os.path.normcase(os.path.realpath(os.path.abspath(str(path))))
+            for path in result.get("removed") or ()
+        }
+        legacy = _recover_registered_legacy_worktrees(
+            git,
+            repo_dir,
+            [
+                path for path in registered
+                if os.path.normcase(os.path.realpath(os.path.abspath(str(path))))
+                not in already_removed
+            ],
+            trusted_legacy_roots,
+            runner,
+            deadline=deadline,
+        )
+        result["legacy_checked"] = legacy["checked"]
+        result["legacy_removed"] = legacy["removed"]
+        result["legacy_ignored_untrusted"] = legacy["ignored_untrusted"]
+        result["removed"].extend(legacy["removed"])
+        result["errors"].extend(legacy["errors"])
         result["registered_worktrees"] = [str(path) for path in registered]
         _raise_worktree_recovery_errors(result)
         return result
@@ -958,8 +1050,10 @@ def create_detached_worktree(
                 verify_timeout = _remaining_timeout(deadline)
                 if verify_timeout > 0:
                     actual_stdout, verify_stderr, verify_rc = runner(
-                        git + ["rev-parse", "--verify", "HEAD^{commit}"],
-                        cwd=str(worktree),
+                        _git_read_command(
+                            git, worktree, "rev-parse", "--verify", "HEAD^{commit}",
+                        ),
+                        cwd=None,
                         timeout=verify_timeout,
                     )
                     actual_lines = str(actual_stdout or "").strip().splitlines()

@@ -96,7 +96,6 @@
       "tests/test_canonical_evidence_identity.py",
       "tests/test_capability_family_closure.py",
       "tests/test_capability_test_catalog.py",
-      "tests/test_ci_quality_contract.py",
       "tests/test_complexity_gate.py",
       "tests/test_constant_evidence_extraction.py",
       "tests/test_constant_impact.py",

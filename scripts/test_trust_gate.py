@@ -1781,6 +1781,74 @@ def run_trust_gate(
                 "PERFORMANCE_SELECTOR_MODULE_MISSING", str(policy_file), selector,
             ))
 
+    raw_windows_selectors = policy.get("windows_test_selectors")
+    if (
+        not isinstance(raw_windows_selectors, list)
+        or not raw_windows_selectors
+        or any(
+            not isinstance(value, str) or not value.strip()
+            for value in raw_windows_selectors
+        )
+    ):
+        issues.append(_issue(
+            "WINDOWS_SELECTOR_SET_INVALID", str(policy_file),
+        ))
+        raw_windows_selectors = []
+    windows_selectors = [str(value).strip() for value in raw_windows_selectors]
+    if len(windows_selectors) != len(set(windows_selectors)):
+        issues.append(_issue(
+            "WINDOWS_SELECTOR_DUPLICATE", str(policy_file),
+        ))
+    raw_required_windows = policy.get("required_windows_test_selectors")
+    if (
+        not isinstance(raw_required_windows, list)
+        or not raw_required_windows
+        or any(
+            not isinstance(value, str) or not value.strip()
+            for value in raw_required_windows
+        )
+    ):
+        issues.append(_issue(
+            "WINDOWS_REQUIRED_SELECTOR_SET_INVALID", str(policy_file),
+        ))
+        raw_required_windows = []
+    if len(raw_required_windows) != len(set(raw_required_windows)):
+        issues.append(_issue(
+            "WINDOWS_REQUIRED_SELECTOR_DUPLICATE", str(policy_file),
+        ))
+    required_windows = {
+        str(value).strip() for value in raw_required_windows
+    }
+    missing_windows = sorted(required_windows - set(windows_selectors))
+    undeclared_windows = sorted(set(windows_selectors) - required_windows)
+    if missing_windows:
+        issues.append(_issue(
+            "WINDOWS_REQUIRED_SELECTOR_MISSING", str(policy_file),
+            ",".join(missing_windows),
+        ))
+    if undeclared_windows:
+        issues.append(_issue(
+            "WINDOWS_SELECTOR_NOT_REQUIRED_BY_POLICY", str(policy_file),
+            ",".join(undeclared_windows),
+        ))
+    for selector in windows_selectors:
+        module = _selector_module(selector)
+        module_path = root / (module.replace(".", "/") + ".py")
+        package_path = root / module.replace(".", "/") / "__init__.py"
+        if not module_path.is_file() and not package_path.is_file():
+            issues.append(_issue(
+                "WINDOWS_SELECTOR_MODULE_MISSING", str(policy_file), selector,
+            ))
+    minimum_windows_test_count = policy.get("minimum_windows_test_count")
+    if (
+        not isinstance(minimum_windows_test_count, int)
+        or isinstance(minimum_windows_test_count, bool)
+        or minimum_windows_test_count <= 0
+    ):
+        issues.append(_issue(
+            "WINDOWS_TEST_COUNT_FLOOR_INVALID", str(policy_file),
+        ))
+
     unique_issues = sorted(
         {json.dumps(issue, ensure_ascii=False, sort_keys=True) for issue in issues}
     )
@@ -1811,6 +1879,7 @@ def run_trust_gate(
                 "missing", 0
             ),
             "performance_selectors": len(selectors),
+            "windows_selectors": len(windows_selectors),
             "public_scenario_contracts": capability_readiness.get(
                 "scenario_contracts", 0
             ),
@@ -1825,6 +1894,7 @@ def run_trust_gate(
         "classification": {
             "blackbox": list(policy.get("blackbox_test_roots") or ()),
             "performance": selectors,
+            "windows_native": windows_selectors,
             "whitebox": "all discovered tests not selected above",
         },
         "issues": normalized_issues,

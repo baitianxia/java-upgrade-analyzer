@@ -41,6 +41,14 @@ python3 scripts/quality_gate.py --profile release
 - `step5`：在 quick 上增加 ASM/fact store/cache/source overlay、端到端 pipeline、查询、调度和用户输出契约；
 - `release`：先由 `test_suite_runner.py --suite all` 做可信度审计、全量 discovery 和唯一分类，再运行全部当前测试；随后运行能力/拓扑迁移审计、分支/变异/重复健康门、目录内全部 pinned 真实项目 manifest，以及 400 JAR/10 万 class 性能与范围守恒门。任一阶段失败即阻断。
 
+Windows 不是由 mock 平台分支代替的兼容性声明。平台 CI 的 Windows × JDK 11/17/21 cell 在 `quick` 后必须额外运行：
+
+```powershell
+python scripts/test_suite_runner.py --suite windows
+```
+
+该原生套件当前固定 80 项（52 黑盒、25 Windows 敏感白盒/原生集成、3 性能/指标合同），覆盖 `pythonw`/无控制台 stdout、Unicode/空格路径、真实 Git/worktree、进程树清理、`.exe`/wrapper、Git longpaths、并发原子 JSON，以及通过 Win32 API 采集 CPU/峰值内存的 2 JAR/6 class 冷热性能守恒。非 Windows 环境调用、任何 skip、selector 缺失、用例数回退或结构化证据缺失都必须失败；未取得对应 Windows runner 结果时不得声明 Windows 通过。
+
 系统级准出还受 `tests/fixtures/system_test_capability_matrix.json` 和 `tests/fixtures/system_test_scenario_contracts.json` 约束。矩阵从所有登记的公开 CLI、Step0~Step6 和 binary support manifest 反向盘点能力，并区分 `covered`、`partial`、`missing`。当前基线为 89/89 covered、260 个风险场景维度和 22/22 个细粒度框架机制声明；critical 能力至少需要 nominal 加两个不同逆向维度，high 至少需要 nominal 加一个逆向维度，且每一维必须指向非空第三方真值并由该能力登记的具体黑盒证据实际读取。白盒测试存在不等于公开语义已验证，任何新增能力若没有独立黑盒证据和足够场景都会阻断 `--suite all` 的“全面质量通过”声明。局部 profile 通过只说明对应已执行范围没有回归。
 
 准确性定向门：

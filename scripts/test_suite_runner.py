@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -17,7 +18,7 @@ from test_trust_gate import run_trust_gate
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_POLICY = ROOT / "tests" / "fixtures" / "test_suite_policy.json"
-SUITES = ("blackbox", "whitebox", "performance", "all")
+SUITES = ("blackbox", "whitebox", "performance", "windows", "all")
 
 
 def load_policy(path: str | Path = DEFAULT_POLICY) -> dict[str, Any]:
@@ -93,6 +94,58 @@ def load_performance_tests(
     return list(unique.values())
 
 
+def load_selector_tests(
+    policy: Mapping[str, Any],
+    selector_field: str,
+    repository_root: str | Path = ROOT,
+) -> tuple[list[unittest.TestCase], list[str]]:
+    """Load one orthogonal governed suite from discovery and exact selectors.
+
+    Package selectors such as ``tests.blackbox`` are matched against normal
+    discovery. Exact modules, classes, or methods outside the ``test*.py``
+    pattern are loaded explicitly, which keeps native-only tests from becoming
+    misleading skips in non-native release runs.
+    """
+    root = Path(repository_root).resolve()
+    root_text = str(root)
+    if root_text not in sys.path:
+        sys.path.insert(0, root_text)
+    selectors = [
+        str(value).strip().rstrip(".")
+        for value in policy.get(selector_field) or ()
+        if str(value).strip()
+    ]
+    selected: dict[str, unittest.TestCase] = {}
+    gaps: list[str] = []
+    for selector in selectors:
+        package = root / selector.replace(".", "/")
+        if package.is_dir() and (package / "__init__.py").is_file():
+            matches = [
+                test for test in discover_tests(root, start_directory=package)
+                if _matches(test.id(), selector)
+            ]
+        else:
+            loaded = unittest.defaultTestLoader.loadTestsFromName(selector)
+            matches = list(iter_tests(loaded))
+            if any(
+                test.__class__.__name__ == "_FailedTest" for test in matches
+            ):
+                matches = []
+        if not matches:
+            gaps.append(selector)
+            continue
+        for test in matches:
+            selected.setdefault(test.id(), test)
+    return list(selected.values()), gaps
+
+
+def windows_suite_precondition(platform_name: str | None = None) -> str:
+    """Return a stable failure reason outside a native Windows runtime."""
+    return "" if str(platform_name or os.name).lower() == "nt" else (
+        "WINDOWS_SUITE_REQUIRES_NATIVE_WINDOWS"
+    )
+
+
 def partition_tests(
     tests: Iterable[unittest.TestCase], policy: Mapping[str, Any],
 ) -> dict[str, list[unittest.TestCase]]:
@@ -116,7 +169,7 @@ def _selector_gaps(
 
 
 def skips_are_forbidden(suite_name: str) -> bool:
-    return suite_name in {"blackbox", "performance"}
+    return suite_name in {"blackbox", "performance", "windows"}
 
 
 def skipped_test_is_forbidden(
@@ -133,9 +186,9 @@ def skipped_test_is_forbidden(
 def public_capability_readiness_blocks(
     suite_name: str, trust_result: Mapping[str, Any],
 ) -> bool:
-    """Only a full/release run may claim system-wide readiness."""
+    """Block release and supported-platform claims on known capability gaps."""
     return (
-        suite_name == "all"
+        suite_name in {"all", "windows"}
         and (trust_result.get("capability_readiness") or {}).get("status")
         != "complete"
     )
@@ -156,6 +209,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     started_at = datetime.now(timezone.utc)
     started = time.monotonic()
+    platform_failure = (
+        windows_suite_precondition() if args.suite == "windows" else ""
+    )
+    if platform_failure:
+        payload = {
+            "schema": "java-upgrade-analyzer.test-suite-run.v1",
+            "suite": args.suite,
+            "status": "failed",
+            "reason_code": platform_failure,
+            "started_at": started_at.isoformat(),
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        print(json.dumps(payload, ensure_ascii=False))
+        return 2
     trust = run_trust_gate(root, policy_path)
     if trust.get("status") != "passed":
         payload = {
@@ -172,10 +239,15 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         policy = load_policy(policy_path)
+        selector_gaps: list[str] = []
         if args.suite == "blackbox":
             discovered = discover_tests(root, start_directory="tests/blackbox")
         elif args.suite == "performance":
             discovered = load_performance_tests(policy, root)
+        elif args.suite == "windows":
+            discovered, selector_gaps = load_selector_tests(
+                policy, "windows_test_selectors", root,
+            )
         else:
             discovered = discover_tests(root)
         partitions = partition_tests(discovered, policy)
@@ -194,19 +266,38 @@ def main(argv: list[str] | None = None) -> int:
     selector_gaps = (
         _selector_gaps(discovered, policy)
         if args.suite in {"performance", "all"}
-        else []
+        else selector_gaps
     )
-    selected = discovered if args.suite == "all" else partitions[args.suite]
-    if not selected or selector_gaps:
+    selected = (
+        discovered
+        if args.suite in {"all", "windows"}
+        else partitions[args.suite]
+    )
+    minimum_windows_tests = policy.get("minimum_windows_test_count")
+    windows_floor_unmet = (
+        args.suite == "windows"
+        and (
+            not isinstance(minimum_windows_tests, int)
+            or isinstance(minimum_windows_tests, bool)
+            or minimum_windows_tests <= 0
+            or len(selected) < minimum_windows_tests
+        )
+    )
+    if not selected or selector_gaps or windows_floor_unmet:
         payload = {
             "schema": "java-upgrade-analyzer.test-suite-run.v1",
             "suite": args.suite,
             "status": "failed",
             "reason_code": (
                 "TEST_SUITE_EMPTY" if not selected
+                else "WINDOWS_SELECTOR_MATCHES_NO_TEST"
+                if args.suite == "windows" and selector_gaps
+                else "WINDOWS_TEST_COUNT_FLOOR_NOT_MET"
+                if windows_floor_unmet
                 else "PERFORMANCE_SELECTOR_MATCHES_NO_TEST"
             ),
             "selector_gaps": selector_gaps,
+            "minimum_windows_test_count": minimum_windows_tests,
             "counts": {key: len(value) for key, value in partitions.items()},
             "trust": trust,
         }
@@ -265,6 +356,7 @@ def main(argv: list[str] | None = None) -> int:
         "discovery_scope": (
             "tests/blackbox" if args.suite == "blackbox"
             else "performance_selectors" if args.suite == "performance"
+            else "windows_test_selectors" if args.suite == "windows"
             else "tests"
         ),
         "skip_policy": (

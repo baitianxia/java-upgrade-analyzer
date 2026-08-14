@@ -29,7 +29,7 @@ class BinaryCapabilityMigrationAuditTest(unittest.TestCase):
         self.assertEqual(result["baseline_mechanism_count"], 36)
         self.assertEqual(result["accounted_mechanism_count"], 36)
         self.assertEqual(result["monitored_deleted_production_path_count"], 48)
-        self.assertEqual(result["monitored_deleted_test_path_count"], 72)
+        self.assertEqual(result["monitored_deleted_test_path_count"], 71)
         self.assertEqual(result["monitored_deleted_test_asset_count"], 18)
         self.assertEqual(
             result["accounted_deleted_test_asset_replacement_count"], 18

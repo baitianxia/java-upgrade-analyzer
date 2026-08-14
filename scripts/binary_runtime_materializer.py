@@ -236,6 +236,7 @@ def _side_config(
     module = str(side_provenance.get("target_module") or "application").strip()
     artifacts = [{
         "path": str(business_path),
+        "content_sha256": str(business.get("sha256") or ""),
         "outer_artifact_path": str(outer_path),
         "outer_artifact_sha256": str(business.get("outer_artifact_sha256") or ""),
         "container_entry": "BOOT-INF/classes/"
@@ -276,6 +277,7 @@ def _side_config(
         coord, lineage = _coord_with_version(item)
         artifacts.append({
             "path": str(path),
+            "content_sha256": str(item.get("nested_jar_sha256") or ""),
             "outer_artifact_path": str(outer_path),
             "outer_artifact_sha256": str(item.get("outer_artifact_sha256") or ""),
             "container_entry": str(item.get("lib_entry") or ""),

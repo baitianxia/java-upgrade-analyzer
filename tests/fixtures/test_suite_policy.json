@@ -98,5 +98,46 @@
     "tests.test_binary_pipeline_input_performance",
     "tests.test_binary_validation_performance_safety",
     "tests.test_final_artifact_edge_oracle.FinalArtifactEdgeOraclePerformanceTest"
-  ]
+  ],
+  "windows_test_selectors": [
+    "tests.blackbox",
+    "tests.windows_native_contract.WindowsNativeContractTest.test_required_native_toolchain_is_available",
+    "tests.windows_native_contract.WindowsNativeContractTest.test_native_process_metrics_report_cpu_and_peak_memory",
+    "tests.windows_native_contract.WindowsNativeContractTest.test_pythonw_parent_captures_unicode_and_metacharacter_argument",
+    "tests.windows_native_contract.WindowsNativeContractTest.test_real_git_queries_keep_stdout_in_unicode_space_repository",
+    "tests.windows_native_contract.WindowsNativeContractTest.test_windows_process_tree_cleanup_terminates_descendant",
+    "tests.windows_native_contract.WindowsNativeContractTest.test_atomic_json_concurrency_never_exposes_partial_document",
+    "tests.test_platform_contract.PlatformContractTest.test_pythonw_parent_repeatedly_captures_real_git_stdout",
+    "tests.test_path_runtime_worktree_reliability.PathRuntimeWorktreeReliabilityTest.test_real_startup_recovery_removes_legacy_reserved_worktree",
+    "tests.test_path_runtime_worktree_reliability.PathRuntimeWorktreeReliabilityTest.test_real_worktree_round_trip_ignores_inherited_git_dir",
+    "tests.test_run_step_background",
+    "tests.test_build_tool_selection",
+    "tests.test_jdk_preflight",
+    "tests.test_process_metrics",
+    "tests.test_step1_packaged_deps.Step1PackagedDepsTest.test_windows_step1_git_command_enables_long_paths_without_global_config",
+    "tests.test_binary_performance_gate.PerformanceProcessMetricsTest.test_windows_fallback_uses_native_cpu_and_peak_memory",
+    "tests.test_binary_pipeline_input_performance.BinaryPipelineInputPerformanceTest.test_windows_native_usage_populates_pipeline_phase_metrics",
+    "tests.test_binary_performance_gate.BinaryPerformanceGateTest.test_small_fixture_enforces_class_conservation_and_zero_warm_parse"
+  ],
+  "required_windows_test_selectors": [
+    "tests.blackbox",
+    "tests.windows_native_contract.WindowsNativeContractTest.test_required_native_toolchain_is_available",
+    "tests.windows_native_contract.WindowsNativeContractTest.test_native_process_metrics_report_cpu_and_peak_memory",
+    "tests.windows_native_contract.WindowsNativeContractTest.test_pythonw_parent_captures_unicode_and_metacharacter_argument",
+    "tests.windows_native_contract.WindowsNativeContractTest.test_real_git_queries_keep_stdout_in_unicode_space_repository",
+    "tests.windows_native_contract.WindowsNativeContractTest.test_windows_process_tree_cleanup_terminates_descendant",
+    "tests.windows_native_contract.WindowsNativeContractTest.test_atomic_json_concurrency_never_exposes_partial_document",
+    "tests.test_platform_contract.PlatformContractTest.test_pythonw_parent_repeatedly_captures_real_git_stdout",
+    "tests.test_path_runtime_worktree_reliability.PathRuntimeWorktreeReliabilityTest.test_real_startup_recovery_removes_legacy_reserved_worktree",
+    "tests.test_path_runtime_worktree_reliability.PathRuntimeWorktreeReliabilityTest.test_real_worktree_round_trip_ignores_inherited_git_dir",
+    "tests.test_run_step_background",
+    "tests.test_build_tool_selection",
+    "tests.test_jdk_preflight",
+    "tests.test_process_metrics",
+    "tests.test_step1_packaged_deps.Step1PackagedDepsTest.test_windows_step1_git_command_enables_long_paths_without_global_config",
+    "tests.test_binary_performance_gate.PerformanceProcessMetricsTest.test_windows_fallback_uses_native_cpu_and_peak_memory",
+    "tests.test_binary_pipeline_input_performance.BinaryPipelineInputPerformanceTest.test_windows_native_usage_populates_pipeline_phase_metrics",
+    "tests.test_binary_performance_gate.BinaryPerformanceGateTest.test_small_fixture_enforces_class_conservation_and_zero_warm_parse"
+  ],
+  "minimum_windows_test_count": 80
 }

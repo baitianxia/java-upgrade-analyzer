@@ -59,6 +59,7 @@ class Step1PackagedDepsTest(unittest.TestCase):
                 raise AssertionError(f"unexpected command: {command}")
 
             with patch.object(path_runtime, "IS_WINDOWS", True), \
+                    patch.object(path_runtime, "WINDOWS_SAFE_PATH_LENGTH", 4096), \
                     patch.object(path_runtime, "git_cmd", return_value=["git"]), \
                     patch.object(
                         path_runtime,

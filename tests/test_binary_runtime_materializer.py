@@ -10,6 +10,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import run_step  # noqa: E402
 from binary_runtime_materializer import (  # noqa: E402
     BinaryRuntimeMaterializationError,
     materialize_binary_pipeline_config,
@@ -20,8 +21,9 @@ class BinaryRuntimeMaterializerTest(unittest.TestCase):
     @staticmethod
     def write_artifact(path, content):
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(content)
-        return hashlib.sha256(content).hexdigest()
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("fixture/payload.bin", content)
+        return hashlib.sha256(path.read_bytes()).hexdigest()
 
     def fixture(self, root):
         report = root / ".upgrade-report"
@@ -104,6 +106,11 @@ class BinaryRuntimeMaterializerTest(unittest.TestCase):
                 len({item["outer_artifact_sha256"] for item in artifacts}),
                 1,
             )
+            self.assertTrue(all(
+                len(item["content_sha256"]) == 64
+                and set(item["content_sha256"]) <= set("0123456789abcdef")
+                for item in artifacts
+            ))
             self.assertRegex(
                 artifacts[0]["outer_artifact_sha256"], r"^[0-9a-f]{64}$"
             )
@@ -118,6 +125,15 @@ class BinaryRuntimeMaterializerTest(unittest.TestCase):
                 ],
                 "complete",
             )
+
+    def test_real_materializer_and_step1_preflight_share_digest_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self.fixture(Path(tmp))
+
+            result = run_step.validate_step1_runtime_inputs({}, report)
+
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(result["artifact_count"], 4)
 
     def test_materialized_config_carries_step0_jdk_preflight_identity(self):
         with tempfile.TemporaryDirectory() as tmp:

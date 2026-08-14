@@ -6,6 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release-regression.yml"
+PLATFORM_WORKFLOW = ROOT / ".github" / "workflows" / "platform-contract.yml"
 TEST_MODULE_PATTERN = re.compile(r"\btests\.(test_[A-Za-z0-9_]+)\b")
 
 
@@ -38,6 +39,14 @@ class CiQualityContractTest(unittest.TestCase):
         text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
 
         self.assertIn("quality_gate.py --profile blackbox", text)
+
+    def test_windows_matrix_runs_strict_native_blackbox_and_performance_contract(self):
+        text = PLATFORM_WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertIn("windows-latest", text)
+        self.assertIn("test_suite_runner.py --suite windows", text)
+        self.assertIn("windows-native-suite.json", text)
+        self.assertNotIn("continue-on-error", text)
 
 
 if __name__ == "__main__":

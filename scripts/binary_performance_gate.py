@@ -33,6 +33,7 @@ from binary_first_model import ArtifactInstance, RuntimeProfile
 from binary_snapshot_cache import cached_snapshot_archive
 from compat import subprocess_platform_kwargs
 from path_runtime import short_temporary_directory
+from process_metrics import windows_current_process_usage
 
 try:
     import resource as _resource
@@ -62,9 +63,17 @@ def _directory_bytes(path: Path) -> int:
 
 def _rss_bytes() -> int:
     if _resource is None:
-        raise PerformanceGateError(
-            "peak RSS measurement is unavailable on this platform"
-        )
+        try:
+            usage = windows_current_process_usage()
+        except OSError as error:
+            raise PerformanceGateError(
+                f"Windows peak RSS measurement failed: {error}"
+            ) from error
+        if usage is None:
+            raise PerformanceGateError(
+                "peak RSS measurement is unavailable on this platform"
+            )
+        return usage.peak_rss_bytes
     value = _resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss
     child = _resource.getrusage(_resource.RUSAGE_CHILDREN).ru_maxrss
     multiplier = 1 if sys.platform == "darwin" else 1024
@@ -74,6 +83,12 @@ def _rss_bytes() -> int:
 def _cpu_seconds() -> float:
     """Return cumulative CPU time for this process and completed children."""
     if _resource is None:
+        try:
+            usage = windows_current_process_usage()
+        except OSError:
+            usage = None
+        if usage is not None:
+            return usage.user_seconds + usage.system_seconds
         return float(time.process_time())
     own = _resource.getrusage(_resource.RUSAGE_SELF)
     children = _resource.getrusage(_resource.RUSAGE_CHILDREN)
@@ -821,7 +836,16 @@ def run_benchmark(
             "cpu_time_source": (
                 "resource.getrusage(self+completed_children)"
                 if _resource is not None
+                else "win32.GetProcessTimes(self_only)"
+                if sys.platform == "win32"
                 else "time.process_time(self_only_fallback)"
+            ),
+            "peak_rss_source": (
+                "resource.getrusage(self+completed_children)"
+                if _resource is not None
+                else "win32.GetProcessMemoryInfo(self_peak_working_set)"
+                if sys.platform == "win32"
+                else "unavailable"
             ),
             "p50_method": "nearest-rank",
             "p95_method": "nearest-rank",

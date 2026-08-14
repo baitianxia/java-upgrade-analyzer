@@ -22,6 +22,7 @@ import re
 import shlex
 import signal
 import shutil
+import tempfile
 import threading
 import safe_xml as ET
 from pathlib import Path
@@ -450,6 +451,67 @@ def _git_process_group_kwargs(is_git):
     return subprocess_platform_kwargs(new_process_group=True)
 
 
+def _git_command_requires_stdout(command):
+    """Return whether a successful Git command must produce semantic output."""
+    arguments = [str(item or '') for item in (command or ())]
+    if 'rev-parse' in arguments or 'symbolic-ref' in arguments:
+        return True
+    for parent, child in (
+        ('worktree', 'list'),
+        ('remote', 'get-url'),
+    ):
+        try:
+            index = arguments.index(parent)
+        except ValueError:
+            continue
+        if child in arguments[index + 1:]:
+            return True
+    return False
+
+
+def _run_git_file_capture(
+    cmd, *, cwd, timeout, input_bytes, env, process_group_kwargs,
+):
+    """Retry one read-only Git query without relying on a stdout pipe.
+
+    Some Windows GUI-parent process configurations have returned exit code zero
+    while losing Git's piped stdout. A temporary file uses an independent
+    standard-handle path and lets callers distinguish a capture failure from a
+    genuinely empty Git result.
+    """
+    with tempfile.TemporaryFile(mode='w+b') as stdout_file:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            stdout=stdout_file,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
+            env=env,
+            close_fds=True,
+            **process_group_kwargs,
+        )
+        try:
+            _ignored_stdout, stderr_bytes = proc.communicate(
+                input=input_bytes,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            _terminate_subprocess(proc, process_group=True)
+            _close_subprocess_pipes(proc)
+            return '', f'Git 文件捕获重试超时（{timeout}秒）', -1
+        except KeyboardInterrupt:
+            _terminate_subprocess(proc, process_group=True)
+            _close_subprocess_pipes(proc)
+            raise
+        stdout_file.seek(0)
+        stdout_bytes = stdout_file.read()
+    return (
+        _decode_subprocess_output(stdout_bytes),
+        _decode_subprocess_output(stderr_bytes),
+        proc.returncode,
+    )
+
+
 def _terminate_subprocess(proc, *, process_group=False):
     """Best-effort process-tree cleanup for Git and detached child tasks."""
     if process_group and IS_WINDOWS:
@@ -652,6 +714,28 @@ def run_cmd(
                 raise
             stdout = _decode_subprocess_output(stdout_bytes)
             stderr = _decode_subprocess_output(stderr_bytes)
+            if (
+                proc.returncode == 0
+                and not stdout.strip()
+                and _git_command_requires_stdout(cmd)
+            ):
+                retry_stdout, retry_stderr, retry_rc = _run_git_file_capture(
+                    cmd,
+                    cwd=cwd,
+                    timeout=timeout,
+                    input_bytes=input_bytes,
+                    env=proc_env,
+                    process_group_kwargs=process_group_kwargs,
+                )
+                if retry_rc == 0 and retry_stdout.strip():
+                    return finish((retry_stdout, retry_stderr, retry_rc))
+                if retry_rc == 0:
+                    detail = "GIT_REQUIRED_STDOUT_EMPTY: " \
+                        "Git 两种捕获方式均返回成功但没有必要输出"
+                    if stderr or retry_stderr:
+                        detail += f"；stderr={retry_stderr or stderr}"
+                    return finish(('', detail, -1))
+                return finish((retry_stdout, retry_stderr or stderr, retry_rc))
             return finish((stdout, stderr, proc.returncode))
 
         proc = subprocess.run(

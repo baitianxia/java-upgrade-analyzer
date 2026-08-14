@@ -1,4 +1,5 @@
 import ast
+import json
 import os
 import re
 import shutil
@@ -119,6 +120,60 @@ class PlatformContractTest(unittest.TestCase):
         self.assertEqual(popen.call_args.kwargs["creationflags"], 0x08000000)
         self.assertEqual(popen.call_args.kwargs["stdin"], subprocess.DEVNULL)
         self.assertTrue(popen.call_args.kwargs["close_fds"])
+
+    def test_git_required_stdout_retries_with_file_capture(self):
+        primary = SimpleNamespace(returncode=0)
+        primary.communicate = lambda input=None, timeout=None: (b"", b"")
+        fallback = ("a" * 40 + "\n", "", 0)
+        with patch.object(compat, "IS_WINDOWS", True), patch.object(
+            compat, "find_executable", return_value=r"C:\Git\git.exe",
+        ), patch.object(
+            compat.subprocess, "Popen", return_value=primary,
+        ), patch.object(
+            compat, "_run_git_file_capture", return_value=fallback,
+        ) as file_capture:
+            stdout, stderr, returncode = compat.run_cmd(
+                ["git", "rev-parse", "--verify", "HEAD^{commit}"],
+                cwd=r"C:\worktree",
+                timeout=10,
+            )
+
+        self.assertEqual((stdout.strip(), stderr, returncode), ("a" * 40, "", 0))
+        file_capture.assert_called_once()
+
+    def test_git_required_stdout_fails_closed_after_empty_file_capture(self):
+        primary = SimpleNamespace(returncode=0)
+        primary.communicate = lambda input=None, timeout=None: (b"", b"")
+        with patch.object(compat, "IS_WINDOWS", True), patch.object(
+            compat, "find_executable", return_value=r"C:\Git\git.exe",
+        ), patch.object(
+            compat.subprocess, "Popen", return_value=primary,
+        ), patch.object(
+            compat, "_run_git_file_capture", return_value=("", "", 0),
+        ):
+            stdout, stderr, returncode = compat.run_cmd(
+                ["git", "worktree", "list", "--porcelain"],
+                cwd=r"C:\repository",
+                timeout=10,
+            )
+
+        self.assertEqual(stdout, "")
+        self.assertEqual(returncode, -1)
+        self.assertIn("GIT_REQUIRED_STDOUT_EMPTY", stderr)
+
+    def test_git_file_capture_helper_reads_real_child_stdout(self):
+        stdout, stderr, returncode = compat._run_git_file_capture(
+            [sys.executable, "-c", "print('file-captured')"],
+            cwd=None,
+            timeout=10,
+            input_bytes=None,
+            env=os.environ.copy(),
+            process_group_kwargs=compat.subprocess_platform_kwargs(),
+        )
+
+        self.assertEqual(returncode, 0, stderr)
+        self.assertEqual(stdout.strip(), "file-captured")
+        self.assertEqual(stderr, "")
 
     @unittest.skipUnless(os.name == "nt", "requires a real Windows GUI parent")
     def test_pythonw_parent_repeatedly_captures_real_git_stdout(self):
@@ -988,6 +1043,11 @@ time.sleep(60)
         self.assertIn("timeout-minutes:", text)
         self.assertIn("actions/upload-artifact@v4", text)
         self.assertIn("platform-contract.json", text)
+        self.assertIn("test_suite_runner.py --suite windows", text)
+        self.assertIn("windows-native-suite.json", text)
+        self.assertIn("steps.windows_suite.outcome", text)
+        self.assertIn("gate|windows-native-suite-report|missing", text)
+        self.assertIn("gate|windows-native-suite|", text)
         self.assertIn("push:", text)
         self.assertIn('- "main"', text)
         self.assertIn('- "codex/**"', text)
@@ -1005,6 +1065,7 @@ time.sleep(60)
         self.assertIn("platform-contract-gate-${GATE_STATUS}-${GATE_NAME}-${MATRIX_OS}-jdk${MATRIX_JAVA}-${GITHUB_SHA}", text)
         self.assertIn("platform-contract-benchmark-${BENCHMARK_STATUS}-${BENCHMARK_NAME}-${MATRIX_OS}-jdk${MATRIX_JAVA}-${GITHUB_SHA}", text)
         self.assertIn("steps.quality_gate.outcome == 'failure'", text)
+        self.assertIn("steps.windows_suite.outcome == 'failure'", text)
         for diagnostic in (
             "steps.diag_artifact_facts.outcome",
             "steps.diag_runtime_bytecode.outcome",

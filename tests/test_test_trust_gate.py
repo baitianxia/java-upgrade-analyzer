@@ -46,6 +46,38 @@ class TestTrustGateTest(unittest.TestCase):
         self.assertEqual(result["counts"]["public_scenario_contracts"], 89)
         self.assertEqual(result["counts"]["public_scenario_dimensions"], 260)
         self.assertEqual(result["counts"]["public_support_claims"], 22)
+        self.assertEqual(result["counts"]["windows_selectors"], 18)
+
+    def test_required_windows_selector_cannot_be_silently_removed(self):
+        policy = json.loads(POLICY_PATH.read_text(encoding="utf-8"))
+        removed = policy["windows_test_selectors"].pop()
+        with tempfile.TemporaryDirectory() as temporary:
+            policy_path = Path(temporary) / "policy.json"
+            policy_path.write_text(
+                json.dumps(policy, ensure_ascii=False), encoding="utf-8",
+            )
+            result = run_trust_gate(ROOT, policy_path)
+
+        issue = next(
+            item for item in result["issues"]
+            if item["code"] == "WINDOWS_REQUIRED_SELECTOR_MISSING"
+        )
+        self.assertIn(removed, issue["detail"])
+
+    def test_windows_test_count_floor_must_be_positive(self):
+        policy = json.loads(POLICY_PATH.read_text(encoding="utf-8"))
+        policy["minimum_windows_test_count"] = 0
+        with tempfile.TemporaryDirectory() as temporary:
+            policy_path = Path(temporary) / "policy.json"
+            policy_path.write_text(
+                json.dumps(policy, ensure_ascii=False), encoding="utf-8",
+            )
+            result = run_trust_gate(ROOT, policy_path)
+
+        self.assertIn(
+            "WINDOWS_TEST_COUNT_FLOOR_INVALID",
+            {item["code"] for item in result["issues"]},
+        )
 
     def test_capability_matrix_cannot_claim_coverage_without_blackbox_evidence(self):
         policy = json.loads(POLICY_PATH.read_text(encoding="utf-8"))

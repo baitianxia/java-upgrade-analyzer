@@ -2920,6 +2920,19 @@ def is_dependency_source_git_url(path_value, project_dir=None):
     return not local_path.exists()
 
 
+def _git_clone_transport_url(value):
+    """Make ambiguous SCP-style Git inputs use the conventional Git account."""
+    text = str(value or "").strip()
+    if not text or re.match(r"(?i)^[a-z][a-z0-9+.-]*://", text):
+        return text
+    if re.fullmatch(r"[^/@\s]+@[^:\s]+:.+", text):
+        return text
+    match = re.fullmatch(r"(?![A-Za-z]:[\\/])([^/:@\s]+):(.+)", text)
+    if match:
+        return f"git@{match.group(1)}:{match.group(2)}"
+    return text
+
+
 def _redact_git_url(value):
     text = str(value or "")
     text = re.sub(
@@ -3001,6 +3014,33 @@ def _canonical_git_endpoint(value):
     return text
 
 
+def _persistable_git_transport_url(value):
+    """Return a credential-free origin URL that preserves an SSH username."""
+    text = _git_clone_transport_url(value)
+    if not re.match(r"(?i)^[a-z][a-z0-9+.-]*://", text):
+        return text
+    parts = urlsplit(text)
+    host = parts.netloc.rsplit("@", 1)[-1]
+    netloc = host
+    if parts.scheme.lower() == "ssh" and "@" in parts.netloc:
+        userinfo = parts.netloc.rsplit("@", 1)[0]
+        username = userinfo.split(":", 1)[0]
+        if username:
+            netloc = f"{username}@{host}"
+    query_items = sorted(
+        (key, item_value)
+        for key, item_value in parse_qsl(parts.query, keep_blank_values=True)
+        if not _is_sensitive_git_query_key(key)
+    )
+    return urlunsplit((
+        parts.scheme.lower(),
+        netloc,
+        parts.path,
+        urlencode(query_items, doseq=True),
+        "",
+    ))
+
+
 def _dependency_source_remaining_timeout(deadline, cap=10):
     if deadline is None:
         return float(cap)
@@ -3077,8 +3117,8 @@ def _is_materialized_dependency_source_repo(repo_path, git_url, *, deadline=None
 
 def _scrub_materialized_dependency_source_origin(repo_path, git_url, *, deadline=None):
     """Ensure clone credentials are not retained in the local Git config."""
-    endpoint = _canonical_git_endpoint(git_url)
-    if endpoint == str(git_url or "").strip():
+    transport_url = _persistable_git_transport_url(git_url)
+    if transport_url == str(git_url or "").strip():
         return True, ""
     timeout = _dependency_source_remaining_timeout(deadline)
     if timeout <= 0:
@@ -3086,7 +3126,7 @@ def _scrub_materialized_dependency_source_origin(repo_path, git_url, *, deadline
     stdout, stderr, rc = run_cmd(
         git_cmd() + [
             "-C", str(repo_path), "config", "--local",
-            "remote.origin.url", endpoint,
+            "remote.origin.url", transport_url,
         ],
         timeout=timeout,
         env={"GIT_TERMINAL_PROMPT": "0"},
@@ -3167,6 +3207,7 @@ def materialize_dependency_source_git_url(git_url, report_dir, clone_timeout=300
     )
 
     git_endpoint = _canonical_git_endpoint(git_url)
+    clone_transport_url = _git_clone_transport_url(git_url)
     git_endpoint_sha256 = hashlib.sha256(
         git_endpoint.encode("utf-8")
     ).hexdigest()
@@ -3207,6 +3248,14 @@ def materialize_dependency_source_git_url(git_url, report_dir, clone_timeout=300
         if _is_materialized_dependency_source_repo(
             repo_path, git_url, deadline=deadline,
         ):
+            scrubbed, scrub_reason = _scrub_materialized_dependency_source_origin(
+                repo_path, git_url, deadline=deadline,
+            )
+            if not scrubbed:
+                raise StepError(
+                    f"依赖源码缓存无法安全更新远程地址：{display_url}：{scrub_reason}",
+                    reason_codes=["DEPENDENCY_SOURCE_GIT_ORIGIN_SCRUB_FAILED"],
+                )
             resolved_commit = _dependency_source_git_head(
                 repo_path, deadline=deadline
             )
@@ -3278,7 +3327,7 @@ def materialize_dependency_source_git_url(git_url, report_dir, clone_timeout=300
                     "clone",
                     "--origin",
                     "origin",
-                    git_url,
+                    clone_transport_url,
                     str(temp_repo),
                 ],
                 cwd=str(cache_entry),
@@ -3316,7 +3365,9 @@ def materialize_dependency_source_git_url(git_url, report_dir, clone_timeout=300
                 "attempt": attempt_number,
                 "status": failure_type,
                 "reason": _redact_git_sensitive_text(
-                    last_reason.replace(git_url, display_url)
+                    last_reason.replace(clone_transport_url, display_url).replace(
+                        git_url, display_url
+                    )
                 )[:1000],
                 "retryable": bool(retryable),
             })
@@ -3342,7 +3393,9 @@ def materialize_dependency_source_git_url(git_url, report_dir, clone_timeout=300
                 },
             )
             reason = _redact_git_sensitive_text(
-                last_reason.replace(git_url, display_url)
+                last_reason.replace(clone_transport_url, display_url).replace(
+                    git_url, display_url
+                )
             )
             raise StepError(
                 f"无法克隆依赖源码 Git 地址 {display_url}：{reason[:1000]}。"
@@ -8154,6 +8207,14 @@ def validate_step1_runtime_inputs(run_context, report_dir):
         for index, artifact in enumerate(artifacts, start=1):
             path = Path(str(artifact.get("path") or "")).expanduser().resolve()
             expected = str(artifact.get("content_sha256") or "").lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", expected):
+                raise StepError(
+                    f"Step1 {side_name} 运行时制品缺少有效摘要身份：{path}",
+                    reason_codes=[
+                        "STEP1_RUNTIME_PREFLIGHT_FAILED",
+                        "STEP1_RUNTIME_ARTIFACT_IDENTITY_INVALID",
+                    ],
+                )
             actual = _preflight_sha256(path) if path.is_file() else "MISSING"
             if actual != expected:
                 raise StepError(

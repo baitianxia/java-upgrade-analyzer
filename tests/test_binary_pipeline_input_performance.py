@@ -12,6 +12,7 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import binary_pipeline  # noqa: E402
 from binary_pipeline import (  # noqa: E402
     BinaryPipelineError,
     _ArtifactDigestSession,
@@ -188,6 +189,31 @@ class BinaryPipelineInputPerformanceTest(unittest.TestCase):
         self.assertEqual(recorder[0]["completed_child_peak_rss_bytes"], 0)
         self.assertEqual(recorder[0]["process_tree_cpu_seconds"], 0.0)
         self.assertEqual(recorder[0]["average_cpu_cores"], 0.0)
+
+    def test_windows_native_usage_populates_pipeline_phase_metrics(self):
+        first = SimpleNamespace(
+            user_seconds=1.0,
+            system_seconds=0.5,
+            peak_rss_bytes=32 * 1024 * 1024,
+        )
+        second = SimpleNamespace(
+            user_seconds=1.4,
+            system_seconds=0.7,
+            peak_rss_bytes=40 * 1024 * 1024,
+        )
+        with patch.object(binary_pipeline, "resource", None), patch.object(
+            binary_pipeline,
+            "windows_current_process_usage",
+            side_effect=[first, second],
+        ), tempfile.TemporaryDirectory() as temp_text:
+            recorder = _PhaseTimingRecorder(Path(temp_text), 0.0)
+            recorder.append({"phase": "windows", "elapsed_seconds": 1.0})
+
+        self.assertEqual(recorder[0]["peak_rss_bytes"], 40 * 1024 * 1024)
+        self.assertEqual(recorder[0]["completed_child_peak_rss_bytes"], 0)
+        self.assertAlmostEqual(recorder[0]["self_cpu_seconds"], 0.6)
+        self.assertAlmostEqual(recorder[0]["process_tree_cpu_seconds"], 0.6)
+        self.assertAlmostEqual(recorder[0]["average_cpu_cores"], 0.6)
 
     def test_parallel_progress_publishers_use_distinct_atomic_temporary_files(self):
         with tempfile.TemporaryDirectory() as temp_text:

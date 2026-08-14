@@ -42,6 +42,10 @@ QUICK_MODULES = (
     "tests.blackbox.test_public_binary_cli",
     "tests.test_ci_quality_contract",
     "tests.test_platform_contract",
+    "tests.test_process_metrics",
+    "tests.test_path_runtime_worktree_reliability",
+    "tests.test_binary_runtime_materializer",
+    "tests.test_step0_workflow",
 )
 
 STEP5_MODULES = QUICK_MODULES + (
@@ -50,7 +54,6 @@ STEP5_MODULES = QUICK_MODULES + (
     "tests.test_binary_pipeline",
     "tests.test_binary_snapshot_cache",
     "tests.test_binary_source_overlay",
-    "tests.test_binary_runtime_materializer",
     "tests.test_binary_generated_regression",
     "tests.test_binary_test_health_gate",
     "tests.test_binary_real_project_guard",

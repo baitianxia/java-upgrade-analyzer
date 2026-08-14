@@ -1,5 +1,6 @@
 import os
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -31,11 +32,48 @@ class PathRuntimeWorktreeReliabilityTest(unittest.TestCase):
         self.assertEqual(
             commands,
             [[
-                "git", "-c", "core.quotepath=false", "worktree", "list",
-                "--porcelain",
+                "git", "-C", str(Path("/repo").resolve()), "-c",
+                "core.quotepath=false", "worktree", "list", "--porcelain",
             ]],
         )
         self.assertNotIn("-z", commands[0])
+
+    def test_worktree_head_verification_uses_git_c_not_worktree_cwd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree_root = root / "worktrees"
+            expected = "a" * 40
+            verification_calls = []
+
+            def runner(command, cwd=None, timeout=None):
+                if "rev-parse" in command:
+                    if "HEAD^{commit}" in command:
+                        verification_calls.append((list(command), cwd))
+                    return expected, "", 0
+                if "ls-tree" in command:
+                    return "tracked.txt\0", "", 0
+                if "add" in command:
+                    return "", "", 0
+                raise AssertionError(f"unexpected command: {command}")
+
+            with patch.object(
+                path_runtime,
+                "short_temp_root_candidates",
+                return_value=[worktree_root],
+            ):
+                worktree = path_runtime.create_detached_worktree(
+                    expected,
+                    root,
+                    runner=runner,
+                    git_command=["git"],
+                )
+
+        worktree_call = next(
+            item for item in verification_calls
+            if str(worktree.resolve()) in item[0]
+        )
+        self.assertIn("-C", worktree_call[0])
+        self.assertNotEqual(str(worktree.resolve()), worktree_call[1])
 
     def test_newline_porcelain_preserves_unicode_and_space_in_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -570,6 +608,140 @@ class PathRuntimeWorktreeReliabilityTest(unittest.TestCase):
 
             self.assertEqual(result["removed"], [])
             self.assertTrue(user_worktree.is_dir())
+
+    def test_startup_recovery_removes_registered_legacy_reserved_worktree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repository = root / "repository"
+            repository.mkdir()
+            legacy = root / "jua-base-build"
+            legacy.mkdir()
+            removed = []
+
+            def runner(command, cwd=None, timeout=None):
+                if "list" in command:
+                    return (
+                        f"worktree {repository}\nHEAD {'a' * 40}\n\n"
+                        f"worktree {legacy}\nHEAD {'b' * 40}\n\n",
+                        "",
+                        0,
+                    )
+                if "remove" in command:
+                    removed.append(Path(command[-1]).resolve())
+                    return "", "", 0
+                raise AssertionError(f"unexpected command: {command}")
+
+            result = path_runtime.recover_owned_stale_worktrees(
+                repository,
+                roots=[root],
+                runner=runner,
+                git_command=["git"],
+            )
+
+            self.assertEqual(removed, [legacy.resolve()])
+            self.assertEqual(result["legacy_removed"], [str(legacy.resolve())])
+            self.assertIn(str(legacy.resolve()), result["removed"])
+            self.assertFalse(legacy.exists())
+
+    @unittest.skipUnless(shutil.which("git"), "Git is required")
+    def test_real_startup_recovery_removes_legacy_reserved_worktree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repository = root / "repository"
+            repository.mkdir()
+            legacy = root / "jua-base-build"
+
+            def git(*arguments):
+                return subprocess.run(
+                    ["git", *arguments],
+                    cwd=repository,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=True,
+                ).stdout
+
+            git("init", "-q")
+            git("config", "user.email", "legacy@example.invalid")
+            git("config", "user.name", "Legacy Recovery")
+            (repository / "tracked.txt").write_text("legacy\n", encoding="utf-8")
+            git("add", "tracked.txt")
+            git("commit", "-qm", "fixture")
+            git("worktree", "add", "--detach", str(legacy), "HEAD")
+
+            result = path_runtime.recover_owned_stale_worktrees(
+                repository,
+                roots=[root],
+            )
+
+            registered = git("worktree", "list", "--porcelain")
+            self.assertIn(str(legacy.resolve()), result["legacy_removed"])
+            self.assertFalse(legacy.exists())
+            self.assertNotIn(str(legacy.resolve()), registered)
+
+    def test_legacy_reserved_name_outside_trusted_temp_root_is_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repository = root / "repository"
+            repository.mkdir()
+            trusted = root / "trusted"
+            trusted.mkdir()
+            user_root = root / "user"
+            user_root.mkdir()
+            worktree = user_root / "jua-base-build"
+            worktree.mkdir()
+
+            def runner(command, cwd=None, timeout=None):
+                if "list" in command:
+                    return (
+                        f"worktree {repository}\nHEAD {'a' * 40}\n\n"
+                        f"worktree {worktree}\nHEAD {'b' * 40}\n\n",
+                        "",
+                        0,
+                    )
+                if "remove" in command:
+                    raise AssertionError("untrusted legacy path must be preserved")
+                raise AssertionError(f"unexpected command: {command}")
+
+            result = path_runtime.recover_owned_stale_worktrees(
+                repository,
+                roots=[trusted],
+                runner=runner,
+                git_command=["git"],
+            )
+
+            self.assertEqual(result["legacy_removed"], [])
+            self.assertTrue(worktree.is_dir())
+
+    def test_unverified_legacy_prefix_inside_trusted_root_is_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repository = root / "repository"
+            repository.mkdir()
+            worktree = root / "jua-step1-user-worktree"
+            worktree.mkdir()
+
+            def runner(command, cwd=None, timeout=None):
+                if "list" in command:
+                    return (
+                        f"worktree {repository}\nHEAD {'a' * 40}\n\n"
+                        f"worktree {worktree}\nHEAD {'b' * 40}\n\n",
+                        "",
+                        0,
+                    )
+                if "remove" in command:
+                    raise AssertionError("unverified legacy prefix must be preserved")
+                raise AssertionError(f"unexpected command: {command}")
+
+            result = path_runtime.recover_owned_stale_worktrees(
+                repository,
+                roots=[root],
+                runner=runner,
+                git_command=["git"],
+            )
+
+            self.assertEqual(result["legacy_removed"], [])
+            self.assertTrue(worktree.is_dir())
 
     def test_real_worktree_round_trip_ignores_inherited_git_dir(self):
         with tempfile.TemporaryDirectory() as tmp:

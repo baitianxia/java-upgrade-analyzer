@@ -60,6 +60,7 @@ from binary_validation_oracle import validate_generation
 from enhanced_source_analyzer import analyze_file, extract_call_edges_enhanced
 from path_runtime import short_temporary_directory
 from jdk_preflight import JdkPreflightError, preflight_jdk_home
+from process_metrics import windows_current_process_usage
 
 
 SUPPORT_MANIFEST_PATH = Path(__file__).with_name("binary_first_support_manifest.json")
@@ -840,7 +841,20 @@ def _rss_bytes_from_rusage(value: int | float) -> int:
 
 def _resource_usage_snapshot() -> _ResourceUsageSnapshot | None:
     if resource is None:
-        return None
+        try:
+            windows_usage = windows_current_process_usage()
+        except OSError:
+            return None
+        if windows_usage is None:
+            return None
+        return _ResourceUsageSnapshot(
+            self_user_seconds=windows_usage.user_seconds,
+            self_system_seconds=windows_usage.system_seconds,
+            child_user_seconds=0.0,
+            child_system_seconds=0.0,
+            self_peak_rss_bytes=windows_usage.peak_rss_bytes,
+            completed_child_peak_rss_bytes=0,
+        )
     own = resource.getrusage(resource.RUSAGE_SELF)
     children = resource.getrusage(resource.RUSAGE_CHILDREN)
     return _ResourceUsageSnapshot(
