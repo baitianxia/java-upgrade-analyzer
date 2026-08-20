@@ -8,6 +8,7 @@ binary-first pipeline.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import re
@@ -44,6 +45,7 @@ _CANONICAL_JSON_ENCODER = json.JSONEncoder(
     allow_nan=False,
 )
 _STREAMING_DIGEST_BUFFER_CHARS = 64 * 1024
+_JVM_TEXT_TRANSPORT_PREFIX = "~jua-utf16-v1~"
 
 
 class BinaryFirstContractError(ValueError):
@@ -52,6 +54,152 @@ class BinaryFirstContractError(ValueError):
     def __init__(self, reason_code, message):
         super().__init__(message)
         self.reason_code = str(reason_code or "BINARY_FIRST_CONTRACT_VIOLATION")
+
+
+def _escape_json_surrogates(value: str) -> str:
+    """Escape surrogate code units in text already encoded as JSON.
+
+    ``json.dumps(..., ensure_ascii=False)`` correctly quotes backslashes and
+    control characters but deliberately leaves UTF-16 surrogate code units in
+    the returned Python string.  Escaping only those remaining code units
+    makes the JSON UTF-8 encodable without changing the frozen bytes for any
+    ordinary Unicode payload.  A literal ``\\ud800`` remains distinct because
+    its backslash was already JSON-escaped.
+    """
+
+    if not any(0xD800 <= ord(character) <= 0xDFFF for character in value):
+        return value
+    return "".join(
+        f"\\u{ord(character):04x}"
+        if 0xD800 <= ord(character) <= 0xDFFF
+        else character
+        for character in value
+    )
+
+
+def _surrogate_safe_text(value: str) -> str:
+    """Return UTF-8-safe text without scanning ordinary JSON in Python.
+
+    UTF-8 encoding is implemented in C and is substantially cheaper than a
+    Python character walk for the overwhelmingly common surrogate-free case.
+    Only the exceptional JVM string containing a surrogate pays for the
+    lossless escaping pass.
+    """
+
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return _escape_json_surrogates(value)
+    return value
+
+
+def _surrogate_safe_utf8(value: str) -> bytes:
+    try:
+        return value.encode("utf-8")
+    except UnicodeEncodeError:
+        return _escape_json_surrogates(value).encode("utf-8")
+
+
+def surrogate_safe_json_dumps(value, **kwargs) -> str:
+    """Return lossless JSON text that is always strict-UTF-8 encodable."""
+
+    return _surrogate_safe_text(json.dumps(value, **kwargs))
+
+
+def surrogate_safe_json_bytes(value, **kwargs) -> bytes:
+    return _surrogate_safe_utf8(json.dumps(value, **kwargs))
+
+
+def _encode_basestring_surrogate_safe(value: str) -> str:
+    return _surrogate_safe_text(encode_basestring(value))
+
+
+def _jvm_text_requires_transport(value: str) -> bool:
+    if value.startswith(_JVM_TEXT_TRANSPORT_PREFIX):
+        return True
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return True
+    return False
+
+
+def transport_jvm_text(value: str) -> str:
+    """Encode one raw JVM UTF-16 string for safe internal text storage.
+
+    The reserved prefix is escaped as well, making the mapping injective: a
+    genuine lone surrogate can never collide with a legal JVM string that
+    merely looks like its transport representation.
+    """
+
+    if not _jvm_text_requires_transport(value):
+        return value
+    encoded = base64.urlsafe_b64encode(
+        value.encode("utf-16-be", errors="surrogatepass")
+    ).decode("ascii")
+    return _JVM_TEXT_TRANSPORT_PREFIX + encoded
+
+
+def restore_jvm_text(value: str) -> str:
+    """Reverse :func:`transport_jvm_text` for JVM protocol boundaries."""
+
+    if not value.startswith(_JVM_TEXT_TRANSPORT_PREFIX):
+        return value
+    payload = value[len(_JVM_TEXT_TRANSPORT_PREFIX):]
+    try:
+        raw = base64.b64decode(
+            payload.encode("ascii"), altchars=b"-_", validate=True
+        )
+        if len(raw) % 2:
+            raise ValueError("UTF-16 transport byte length must be even")
+        return raw.decode("utf-16-be", errors="surrogatepass")
+    except (UnicodeEncodeError, ValueError) as error:
+        raise BinaryFirstContractError(
+            "BINARY_JVM_TEXT_TRANSPORT_INVALID",
+            "invalid JVM UTF-16 transport value",
+        ) from error
+
+
+def _jvm_value_requires_transport(value) -> bool:
+    value_type = type(value)
+    if value_type is str:
+        return _jvm_text_requires_transport(value)
+    if value_type is dict:
+        return any(
+            (type(key) is str and _jvm_text_requires_transport(key))
+            or _jvm_value_requires_transport(item)
+            for key, item in value.items()
+        )
+    if value_type in (list, tuple):
+        return any(_jvm_value_requires_transport(item) for item in value)
+    return False
+
+
+def transport_jvm_value(value):
+    """Copy a raw JSON tree only when JVM text needs transport encoding."""
+
+    if not _jvm_value_requires_transport(value):
+        return value
+
+    def convert(item):
+        item_type = type(item)
+        if item_type is str:
+            return transport_jvm_text(item)
+        if item_type is dict:
+            return {
+                (
+                    transport_jvm_text(key)
+                    if type(key) is str else key
+                ): convert(child)
+                for key, child in item.items()
+            }
+        if item_type is list:
+            return [convert(child) for child in item]
+        if item_type is tuple:
+            return tuple(convert(child) for child in item)
+        return item
+
+    return convert(value)
 
 
 class StreamingCanonicalSequence:
@@ -112,7 +260,7 @@ def _canonical_value(value):
         canonical_items = [_canonical_value(item) for item in value]
         return sorted(
             canonical_items,
-            key=lambda item: json.dumps(
+            key=lambda item: surrogate_safe_json_dumps(
                 item, ensure_ascii=False, sort_keys=True, separators=(",", ":")
             ),
         )
@@ -134,7 +282,7 @@ def _canonical_value(value):
         canonical_items = [_canonical_value(item) for item in value]
         return sorted(
             canonical_items,
-            key=lambda item: json.dumps(
+            key=lambda item: surrogate_safe_json_dumps(
                 item, ensure_ascii=False, sort_keys=True, separators=(",", ":")
             ),
         )
@@ -148,13 +296,13 @@ def _canonical_value(value):
 
 def canonical_payload_bytes(payload):
     canonical = _canonical_value(payload)
-    return json.dumps(
+    return surrogate_safe_json_bytes(
         canonical,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
         allow_nan=False,
-    ).encode("utf-8")
+    )
 
 
 def canonical_identity(namespace, payload, *, schema_version):
@@ -197,7 +345,7 @@ def canonical_identity_native_json(namespace, payload, *, schema_version):
         )
     prefix, suffix = _native_identity_envelope_bytes(namespace, schema_version)
     digest = hashlib.sha256(prefix)
-    digest.update(_CANONICAL_JSON_ENCODER.encode(payload).encode("utf-8"))
+    digest.update(_surrogate_safe_utf8(_CANONICAL_JSON_ENCODER.encode(payload)))
     digest.update(suffix)
     return digest.hexdigest()
 
@@ -209,10 +357,12 @@ def _native_identity_envelope_bytes(
     # Object keys are sorted as namespace, payload, schema_version.
     return (
         (
-            '{"namespace":' + encode_basestring(namespace) + ',"payload":'
+            '{"namespace":' + _encode_basestring_surrogate_safe(namespace)
+            + ',"payload":'
         ).encode("utf-8"),
         (
-            ',"schema_version":' + encode_basestring(schema_version) + "}"
+            ',"schema_version":'
+            + _encode_basestring_surrogate_safe(schema_version) + "}"
         ).encode("utf-8"),
     )
 
@@ -224,9 +374,7 @@ def _iter_canonical_json(value):
         yield "null"
         return
     if value_type is str:
-        # ``JSONEncoder.encode`` constructs a fresh iterator for every scalar.
-        # This is the exact ensure_ascii=False primitive used by that encoder.
-        yield encode_basestring(value)
+        yield _encode_basestring_surrogate_safe(value)
         return
     if value_type is bool:
         yield "true" if value else "false"
@@ -248,7 +396,7 @@ def _iter_canonical_json(value):
         for index, key in enumerate(sorted(value)):
             if index:
                 yield ","
-            yield encode_basestring(key)
+            yield _encode_basestring_surrogate_safe(key)
             yield ":"
             yield from _iter_canonical_json(value[key])
         yield "}"
@@ -280,7 +428,7 @@ def _iter_canonical_json(value):
         for index, key in enumerate(sorted(value)):
             if index:
                 yield ","
-            yield encode_basestring(key)
+            yield _encode_basestring_surrogate_safe(key)
             yield ":"
             yield from _iter_canonical_json(value[key])
         yield "}"
@@ -300,7 +448,7 @@ def _iter_canonical_json(value):
         yield "]"
         return
     if value is None or isinstance(value, (str, int, float, bool)):
-        yield _CANONICAL_JSON_ENCODER.encode(value)
+        yield _surrogate_safe_text(_CANONICAL_JSON_ENCODER.encode(value))
         return
     raise BinaryFirstContractError(
         "BINARY_IDENTITY_VALUE_UNSUPPORTED",
@@ -352,7 +500,7 @@ def _update_canonical_digest(digest, value):
             append("null")
             return
         if item_type is str:
-            append(encode_basestring(item))
+            append(_encode_basestring_surrogate_safe(item))
             return
         if item_type is bool:
             append("true" if item else "false")
@@ -373,7 +521,7 @@ def _update_canonical_digest(digest, value):
             for index, key in enumerate(sorted(item)):
                 if index:
                     append(",")
-                append(encode_basestring(key))
+                append(_encode_basestring_surrogate_safe(key))
                 append(":")
                 write(item[key])
             append("}")
@@ -402,7 +550,7 @@ def _update_canonical_digest(digest, value):
             for index, key in enumerate(sorted(item)):
                 if index:
                     append(",")
-                append(encode_basestring(key))
+                append(_encode_basestring_surrogate_safe(key))
                 append(":")
                 write(item[key])
             append("}")
@@ -422,7 +570,7 @@ def _update_canonical_digest(digest, value):
             append("]")
             return
         if item is None or isinstance(item, (str, int, float, bool)):
-            append(_CANONICAL_JSON_ENCODER.encode(item))
+            append(_surrogate_safe_text(_CANONICAL_JSON_ENCODER.encode(item)))
             return
         raise BinaryFirstContractError(
             "BINARY_IDENTITY_VALUE_UNSUPPORTED",

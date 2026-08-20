@@ -15,7 +15,7 @@ import json
 import re
 from typing import Any, Iterable, Mapping
 
-from binary_first_contract import canonical_identity
+from binary_first_contract import BinaryFirstContractError, canonical_identity
 from binary_runtime_reconciler import (
     class_load_is_ready,
     hydrate_runtime_reconciliation,
@@ -1190,19 +1190,30 @@ def semantic_overlay_requires_runtime_selection(
         LIMIT 1
         """
     ).fetchone() is not None
+    hierarchy_types = {
+        str(value or "") for value in summary["hierarchy_types"]
+    }
+    # Calls to a user repository interface retain that user type as the
+    # symbolic owner.  Spring Data ancestry is therefore visible in class
+    # hierarchy facts, not necessarily in the direct-edge owner index.
+    has_spring_data_repository_hierarchy = any(
+        name.startswith("org/springframework/data/repository/")
+        or name == "org/springframework/data/jpa/repository/JpaRepository"
+        for name in hierarchy_types
+    )
     has_relevant_direct_edge = store.connection.execute(
         """
         SELECT 1 FROM direct_edges
         WHERE symbolic_owner='java/lang/Class'
-           OR symbolic_owner LIKE 'java/lang/reflect/%'
-           OR symbolic_owner LIKE 'java/lang/invoke/%'
-           OR symbolic_owner LIKE 'org/springframework/%'
-           OR symbolic_owner LIKE 'org/apache/ibatis/%'
-           OR symbolic_owner LIKE 'org/apache/dubbo/%'
-           OR symbolic_owner LIKE 'com/fasterxml/jackson/%'
-           OR symbolic_owner LIKE 'jakarta/persistence/%'
-           OR symbolic_owner LIKE 'javax/persistence/%'
-           OR symbolic_owner LIKE 'feign/%'
+           OR symbolic_owner GLOB 'java/lang/reflect/*'
+           OR symbolic_owner GLOB 'java/lang/invoke/*'
+           OR symbolic_owner GLOB 'org/springframework/*'
+           OR symbolic_owner GLOB 'org/apache/ibatis/*'
+           OR symbolic_owner GLOB 'org/apache/dubbo/*'
+           OR symbolic_owner GLOB 'com/fasterxml/jackson/*'
+           OR symbolic_owner GLOB 'jakarta/persistence/*'
+           OR symbolic_owner GLOB 'javax/persistence/*'
+           OR symbolic_owner GLOB 'feign/*'
         LIMIT 1
         """
     ).fetchone() is not None
@@ -1210,13 +1221,32 @@ def semantic_overlay_requires_runtime_selection(
         summary["has_runtime_annotations"]
         or has_relevant_decision
         or has_relevant_resource
+        or has_spring_data_repository_hierarchy
         or has_relevant_direct_edge
     )
 
 
-def build_binary_semantic_overlay(store: Any, runtime_profile: Any,
-                                  reconciliation: Any, decisions: Any = None) -> BinarySemanticOverlay:
-    if not semantic_overlay_requires_runtime_selection(store, decisions):
+def build_binary_semantic_overlay(
+    store: Any,
+    runtime_profile: Any,
+    reconciliation: Any,
+    decisions: Any = None,
+    *,
+    runtime_selection_required: bool | None = None,
+) -> BinarySemanticOverlay:
+    if (
+        runtime_selection_required is not None
+        and type(runtime_selection_required) is not bool
+    ):
+        raise BinaryFirstContractError(
+            "BINARY_SEMANTIC_RUNTIME_SELECTION_PRECHECK_INVALID",
+            repr(runtime_selection_required),
+        )
+    if runtime_selection_required is None:
+        runtime_selection_required = (
+            semantic_overlay_requires_runtime_selection(store, decisions)
+        )
+    if not runtime_selection_required:
         payload = {
             "policy_version": POLICY_VERSION,
             "runtime_profile_identity": runtime_profile.identity,

@@ -1848,6 +1848,98 @@ def run_trust_gate(
         issues.append(_issue(
             "WINDOWS_TEST_COUNT_FLOOR_INVALID", str(policy_file),
         ))
+    raw_windows_exclusions = policy.get("windows_excluded_test_selectors")
+    if (
+        not isinstance(raw_windows_exclusions, list)
+        or any(
+            not isinstance(value, str) or not value.strip()
+            for value in raw_windows_exclusions
+        )
+    ):
+        issues.append(_issue(
+            "WINDOWS_EXCLUSION_SET_INVALID", str(policy_file),
+        ))
+        raw_windows_exclusions = []
+    windows_exclusions = [
+        str(value).strip() for value in raw_windows_exclusions
+    ]
+    if len(windows_exclusions) != len(set(windows_exclusions)):
+        issues.append(_issue(
+            "WINDOWS_EXCLUSION_DUPLICATE", str(policy_file),
+        ))
+    raw_required_exclusions = policy.get(
+        "required_windows_excluded_test_selectors"
+    )
+    if (
+        not isinstance(raw_required_exclusions, list)
+        or any(
+            not isinstance(value, str) or not value.strip()
+            for value in raw_required_exclusions
+        )
+    ):
+        issues.append(_issue(
+            "WINDOWS_REQUIRED_EXCLUSION_SET_INVALID", str(policy_file),
+        ))
+        raw_required_exclusions = []
+    if len(raw_required_exclusions) != len(set(raw_required_exclusions)):
+        issues.append(_issue(
+            "WINDOWS_REQUIRED_EXCLUSION_DUPLICATE", str(policy_file),
+        ))
+    required_exclusions = {
+        str(value).strip() for value in raw_required_exclusions
+    }
+    if set(windows_exclusions) != required_exclusions:
+        issues.append(_issue(
+            "WINDOWS_EXCLUSION_POLICY_MISMATCH", str(policy_file),
+            "missing=" + ",".join(sorted(
+                required_exclusions - set(windows_exclusions)
+            )) + ";undeclared=" + ",".join(sorted(
+                set(windows_exclusions) - required_exclusions
+            )),
+        ))
+    for selector in windows_exclusions:
+        if not selector.startswith("tests.blackbox."):
+            issues.append(_issue(
+                "WINDOWS_EXCLUSION_NOT_BLACKBOX", str(policy_file), selector,
+            ))
+        module = _selector_module(selector)
+        module_path = root / (module.replace(".", "/") + ".py")
+        package_path = root / module.replace(".", "/") / "__init__.py"
+        if not module_path.is_file() and not package_path.is_file():
+            issues.append(_issue(
+                "WINDOWS_EXCLUSION_MODULE_MISSING", str(policy_file), selector,
+            ))
+    raw_replacements = policy.get("windows_exclusion_replacements")
+    replacements = (
+        raw_replacements if isinstance(raw_replacements, Mapping) else {}
+    )
+    if not isinstance(raw_replacements, Mapping):
+        issues.append(_issue(
+            "WINDOWS_EXCLUSION_REPLACEMENTS_INVALID", str(policy_file),
+        ))
+    if set(str(value) for value in replacements) != set(windows_exclusions):
+        issues.append(_issue(
+            "WINDOWS_EXCLUSION_REPLACEMENT_SET_MISMATCH", str(policy_file),
+        ))
+    for selector, raw_replacement in replacements.items():
+        replacement = (
+            raw_replacement if isinstance(raw_replacement, Mapping) else {}
+        )
+        replacement_selectors = replacement.get("replacement_selectors")
+        if (
+            not isinstance(raw_replacement, Mapping)
+            or not str(replacement.get("reason") or "").strip()
+            or not isinstance(replacement_selectors, list)
+            or not replacement_selectors
+            or any(
+                not isinstance(value, str) or value not in windows_selectors
+                for value in (replacement_selectors or ())
+            )
+        ):
+            issues.append(_issue(
+                "WINDOWS_EXCLUSION_REPLACEMENT_INVALID",
+                str(policy_file), str(selector),
+            ))
 
     unique_issues = sorted(
         {json.dumps(issue, ensure_ascii=False, sort_keys=True) for issue in issues}
@@ -1880,6 +1972,7 @@ def run_trust_gate(
             ),
             "performance_selectors": len(selectors),
             "windows_selectors": len(windows_selectors),
+            "windows_excluded_selectors": len(windows_exclusions),
             "public_scenario_contracts": capability_readiness.get(
                 "scenario_contracts", 0
             ),

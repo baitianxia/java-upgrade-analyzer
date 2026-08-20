@@ -12,6 +12,7 @@ import os
 from pathlib import Path, PurePosixPath
 import shutil
 import subprocess
+import weakref
 from typing import Any, Mapping
 
 from binary_asm_helper import _canonical_json, _read_frame, _write_frame
@@ -30,6 +31,40 @@ class ClassDefinitionVerifierError(BinaryFirstContractError):
     pass
 
 
+def _remove_owned_helper_directory(
+    path: Path,
+    owner_pid: int,
+    getpid=os.getpid,
+    rmtree=shutil.rmtree,
+) -> None:
+    if getpid() == owner_pid:
+        rmtree(path, ignore_errors=True)
+
+
+class _OwnedHelperDirectory:
+    def __init__(self, prefix: str) -> None:
+        self.path = make_short_temp_dir(prefix=prefix)
+        self._finalizer = weakref.finalize(
+            self,
+            _remove_owned_helper_directory,
+            self.path,
+            os.getpid(),
+        )
+
+    def cleanup(self) -> None:
+        self._finalizer()
+
+
+class _CompiledDefinitionHelper:
+    def __init__(
+        self,
+        output: Path,
+        temporary_directory: _OwnedHelperDirectory,
+    ) -> None:
+        self.output = output
+        self._temporary_directory = temporary_directory
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -39,31 +74,43 @@ def _sha256_file(path: Path) -> str:
 
 
 @lru_cache(maxsize=8)
-def _compile_helper(javac_text: str, source_sha256: str) -> Path:
-    output = make_short_temp_dir(prefix="definition-verifier")
-    completed = execute_binary_tool(
-        [
-            javac_text,
-            "-encoding", "UTF-8",
-            "-source", "8",
-            "-target", "8",
-            "-d", str(output),
-            str(JAVA_HELPER),
-        ],
-        stage="binary_definition.compile_helper",
-        reason_prefix="CLASS_DEFINITION_HELPER_COMPILE",
-        timeout_seconds=60,
-    )
-    if not completed.succeeded:
-        raise ClassDefinitionVerifierError(
-            "CLASS_DEFINITION_HELPER_COMPILE_FAILED",
-            json.dumps(completed.failure.to_mapping(), ensure_ascii=False),
+def _compile_helper(
+    javac_text: str,
+    source_sha256: str,
+) -> _CompiledDefinitionHelper:
+    temporary = _OwnedHelperDirectory("definition-verifier")
+    output = temporary.path
+    try:
+        completed = execute_binary_tool(
+            [
+                javac_text,
+                "-encoding", "UTF-8",
+                "-source", "8",
+                "-target", "8",
+                "-d", str(output),
+                str(JAVA_HELPER),
+            ],
+            stage="binary_definition.compile_helper",
+            reason_prefix="CLASS_DEFINITION_HELPER_COMPILE",
+            timeout_seconds=60,
         )
-    if not (output / "ClassDefinitionVerifier.class").is_file():
-        raise ClassDefinitionVerifierError(
-            "CLASS_DEFINITION_HELPER_COMPILE_INCOMPLETE", "helper class missing"
-        )
-    return output
+        if not completed.succeeded:
+            raise ClassDefinitionVerifierError(
+                "CLASS_DEFINITION_HELPER_COMPILE_FAILED",
+                json.dumps(completed.failure.to_mapping(), ensure_ascii=False),
+            )
+        if not (output / "ClassDefinitionVerifier.class").is_file():
+            raise ClassDefinitionVerifierError(
+                "CLASS_DEFINITION_HELPER_COMPILE_INCOMPLETE", "helper class missing"
+            )
+        return _CompiledDefinitionHelper(output, temporary)
+    except BaseException:
+        temporary.cleanup()
+        raise
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_compile_helper.cache_clear)
 
 
 def verifier_identity(platform: JdkPlatformImage) -> str:
@@ -95,7 +142,8 @@ def verify_class_definitions(
         raise ClassDefinitionVerifierError(
             "TARGET_JAVAC_MISSING", "a full target JDK is required to compile the verifier"
         )
-    helper_dir = _compile_helper(str(javac), source_sha)
+    compiled_helper = _compile_helper(str(javac), source_sha)
+    helper_dir = compiled_helper.output
     names = sorted(selected_class_bytes)
     if len(names) != len(set(names)):
         raise ClassDefinitionVerifierError(

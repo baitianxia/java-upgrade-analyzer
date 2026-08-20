@@ -1,3 +1,4 @@
+import hashlib
 import json
 import shutil
 import subprocess
@@ -5,12 +6,14 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import binary_asm_helper  # noqa: E402
+import binary_pipeline  # noqa: E402
 from binary_pipeline import run_pipeline  # noqa: E402
 from binary_fact_store import BinaryFactStore  # noqa: E402
 from binary_result_truth import evaluate_formal_result_truth  # noqa: E402
@@ -44,6 +47,48 @@ class BinaryGeneratedRegressionTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
+        # These tests exercise generated graph, reachability, and runtime
+        # topology behavior.  They require a structurally valid publication
+        # capability, but must not depend on the mutable multi-hour release
+        # performance capture while that evidence is being refreshed.
+        label = f"generated-regression:{self._testMethodName}"
+        binding = {
+            "schema": (
+                "java-upgrade-analyzer.performance-authority-binding.v2"
+            ),
+            "authority_mode": "release_evidence",
+            "support_contract_identity": hashlib.sha256(
+                f"support:{label}".encode("utf-8")
+            ).hexdigest(),
+            "evidence_sha256": hashlib.sha256(
+                f"evidence:{label}".encode("utf-8")
+            ).hexdigest(),
+            "source_implementation_identity": hashlib.sha256(
+                f"source:{label}".encode("utf-8")
+            ).hexdigest(),
+        }
+        binding["binding_identity"] = binary_pipeline._identity(
+            "binary_performance_authority_binding_identity",
+            {
+                key: binding[key]
+                for key in (
+                    "support_contract_identity",
+                    "evidence_sha256",
+                    "source_implementation_identity",
+                    "authority_mode",
+                )
+            },
+        )
+        self.assertTrue(
+            binary_pipeline._performance_authority_binding_is_valid(binding)
+        )
+        authority_patch = patch.object(
+            binary_pipeline,
+            "_performance_authority_gate_binding",
+            return_value=binding,
+        )
+        authority_patch.start()
+        self.addCleanup(authority_patch.stop)
 
     def tearDown(self):
         self.temp.cleanup()

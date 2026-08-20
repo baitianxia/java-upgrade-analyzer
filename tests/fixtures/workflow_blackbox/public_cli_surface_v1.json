@@ -32,7 +32,8 @@
         "--config",
         "--help",
         "--output-root",
-        "--result-json"
+        "--result-json",
+        "--retain-validation-checkpoint"
       ],
       "invalid_option_prefix": [
         "--config",
@@ -104,11 +105,15 @@
       "id": "binary_performance_gate",
       "path": "scripts/binary_performance_gate.py",
       "expected_options": [
+        "--build-final-from-result",
+        "--build-provisional-from-result",
+        "--captured-at",
         "--classes-per-jar",
         "--gate",
         "--help",
         "--jar-count",
         "--output",
+        "--provisional-gate",
         "--skip-legacy",
         "--verify-recorded-gate",
         "--warm-samples",
@@ -126,7 +131,8 @@
         "--jdk-home",
         "--json-out",
         "--profile",
-        "--real-project-cache"
+        "--real-project-cache",
+        "--release-performance-mode"
       ],
       "required_help_markers": [
         "Binary-first quality gate",

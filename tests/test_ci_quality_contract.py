@@ -43,7 +43,8 @@ class CiQualityContractTest(unittest.TestCase):
     def test_windows_matrix_runs_strict_native_blackbox_and_performance_contract(self):
         text = PLATFORM_WORKFLOW.read_text(encoding="utf-8")
 
-        self.assertIn("windows-latest", text)
+        self.assertIn("windows-2022", text)
+        self.assertIn("windows-2025", text)
         self.assertIn("test_suite_runner.py --suite windows", text)
         self.assertIn("windows-native-suite.json", text)
         self.assertNotIn("continue-on-error", text)

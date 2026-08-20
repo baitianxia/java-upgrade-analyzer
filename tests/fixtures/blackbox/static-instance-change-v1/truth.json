@@ -10,7 +10,7 @@
     {"id": "openjdk-javap-member-flags", "organization": "OpenJDK", "mechanism": "independent_bytecode_contract_inventory", "verifies": ["complete_static_instance_flag_delta", "complete_direct_call_graph"]},
     {"id": "openjdk-jvm-invocation-mode-linker", "organization": "OpenJDK", "mechanism": "actual_jvm_execution", "verifies": ["base_execution_succeeds", "current_incompatible_class_change_error"]}
   ],
-  "oracle_implementations": [{"path": "tests/blackbox/oracles/openjdk_oracle.py", "sha256": "6e72442077371b86c943f790b5982144497725200da3e89f22f66ca2bfee38ca"}],
+  "oracle_implementations": [{"path": "tests/blackbox/oracles/openjdk_oracle.py", "sha256": "6413dec752291d5bf7068a94c249e096d26490c64ddb5f7d3c278887ca9eae72"}],
   "completeness": {
     "argument": "OpenJDK javap -v enumerates the public flags of every member in the only changed class; exactly four identities switch ACC_STATIC while descriptor and visibility remain stable. All four are directly invoked by the complete entrypoint set, and an isolated JVM runner proves invocation-kind mismatch raises IncompatibleClassChangeError only on current.",
     "verified_dimensions": ["api_identity", "jvm_descriptor", "closed_result_set", "entrypoint_reachability", "static_linkage"],

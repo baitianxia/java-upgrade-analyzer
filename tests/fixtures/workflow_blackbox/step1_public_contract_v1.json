@@ -111,9 +111,10 @@
     "exit_code": 1,
     "workflow_state": {
       "status": "blocked_by_system",
-      "current_step": "step1",
-      "completed_step": "step0"
+      "current_step": "step0",
+      "completed_step": ""
     },
-    "blocking_reason_contains": "最终制品扫描不完整"
+    "blocking_reason_contains": "最终制品不是可完整读取的 ZIP/JAR",
+    "blocking_reason_code": "STEP0_ARTIFACT_INVALID"
   }
 }

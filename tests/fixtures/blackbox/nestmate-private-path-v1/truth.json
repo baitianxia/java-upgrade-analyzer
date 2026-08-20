@@ -32,7 +32,7 @@
     }
   ],
   "oracle_implementations": [
-    {"path": "tests/blackbox/oracles/openjdk_oracle.py", "sha256": "6e72442077371b86c943f790b5982144497725200da3e89f22f66ca2bfee38ca"}
+    {"path": "tests/blackbox/oracles/openjdk_oracle.py", "sha256": "6413dec752291d5bf7068a94c249e096d26490c64ddb5f7d3c278887ca9eae72"}
   ],
   "completeness": {
     "argument": "OpenJDK javap compares every public member and normalized public method body of the only changed library class, proves exactly one changed body, and independently enumerates the complete business bytecode path through a private Java nestmate call. JVM executions compiled against the base library and run against both pinned variants prove the nestmate edge links and the authored outputs are 1 and 2.",

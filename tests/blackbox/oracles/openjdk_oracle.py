@@ -16,6 +16,8 @@ import subprocess
 from typing import Iterable, Mapping
 import zipfile
 
+from tests.blackbox.managed_process import managed_run
+
 
 IDENTITY_FIELDS = ("owner", "member", "descriptor", "member_kind")
 _METHOD_HEADING = re.compile(
@@ -49,7 +51,7 @@ class OpenJdkOracleError(RuntimeError):
 
 
 def _run(command: list[str], *, expected_returncode: int | None = 0) -> subprocess.CompletedProcess:
-    completed = subprocess.run(
+    completed = managed_run(
         command,
         capture_output=True,
         text=True,

@@ -643,9 +643,39 @@ def discover_binary_entrypoints(
 ) -> BinaryEntrypointDiscoveryResult:
     """Discover exact and possible callback roots in the selected runtime view."""
 
-    profile = runtime_profile.payload.get("business_entrypoint_profile") or {}
+    raw_profile = runtime_profile.payload.get("business_entrypoint_profile")
+    if raw_profile is None:
+        raw_profile = {}
+    profile_valid = isinstance(raw_profile, Mapping)
+    profile = raw_profile if profile_valid else {}
+    declared_coverage_gaps: set[str] = set()
+
+    def import_declared_gaps(raw: Any, *, invalid_gap: str) -> None:
+        if raw is None:
+            return
+        if not isinstance(raw, (list, tuple)):
+            declared_coverage_gaps.add(invalid_gap)
+            return
+        for value in raw:
+            normalized = str(value or "").strip()
+            if normalized:
+                declared_coverage_gaps.add(normalized)
+
+    import_declared_gaps(
+        runtime_profile.payload.get("entrypoint_discovery_coverage_gaps"),
+        invalid_gap="entrypoint_discovery_coverage_gaps_invalid",
+    )
+    import_declared_gaps(
+        profile.get("coverage_gaps"),
+        invalid_gap="declared_entrypoint_coverage_gaps_invalid",
+    )
+    if not profile_valid:
+        declared_coverage_gaps.add("entrypoint_profile_invalid")
+    if profile.get("coverage_status") not in {None, "complete"}:
+        declared_coverage_gaps.add("declared_entrypoint_coverage_incomplete")
+
     summary_reader = getattr(store, "runtime_trigger_summary", None)
-    if callable(summary_reader) and isinstance(profile, Mapping):
+    if callable(summary_reader):
         summary = summary_reader()
         relevant_resources = any(
             str(selection.get("resource_name") or "").lower().endswith(".xml")
@@ -678,7 +708,7 @@ def discover_binary_entrypoints(
             or relevant_resources
             or manifest_can_activate_main
             or adapter_registration
-        ) and profile.get("coverage_status") in {None, "complete"}:
+        ) and not declared_coverage_gaps:
             payload = {
                 "runtime_profile_identity": runtime_profile.identity,
                 "runtime_reconciliation_identity": str(
@@ -760,12 +790,7 @@ def discover_binary_entrypoints(
         for row, _fact in selected_classes.values()
     }
 
-    coverage_gaps = set()
-    if not isinstance(profile, Mapping):
-        profile = {}
-        coverage_gaps.add("entrypoint_profile_invalid")
-    if profile.get("coverage_status") not in {None, "complete"}:
-        coverage_gaps.add("declared_entrypoint_coverage_incomplete")
+    coverage_gaps = set(declared_coverage_gaps)
 
     registered_auto_configurations = _selected_auto_configuration_classes(reconciliation)
     spring_factories_callbacks = _selected_spring_factories_callbacks(reconciliation)

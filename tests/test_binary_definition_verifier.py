@@ -1,15 +1,20 @@
+import gc
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from binary_asm_helper import resolve_asm_jar  # noqa: E402
+import binary_definition_verifier as verifier  # noqa: E402
 from binary_definition_verifier import verify_class_definitions  # noqa: E402
 from binary_platform_image import JdkPlatformImage  # noqa: E402
 
@@ -26,6 +31,149 @@ def jdk_home():
 
 
 class BinaryDefinitionVerifierTest(unittest.TestCase):
+    @staticmethod
+    def _successful_helper_compile(command, **_kwargs):
+        output = Path(command[command.index("-d") + 1])
+        (output / "ClassDefinitionVerifier.class").write_bytes(b"compiled")
+        return SimpleNamespace(succeeded=True)
+
+    def test_compiled_helper_directory_follows_cache_and_owner_lifetime(self):
+        verifier._compile_helper.cache_clear()
+        self.addCleanup(verifier._compile_helper.cache_clear)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            verifier,
+            "make_short_temp_dir",
+            side_effect=lambda prefix: Path(
+                tempfile.mkdtemp(prefix=f"{prefix}-", dir=tmp)
+            ),
+        ), patch.object(
+            verifier,
+            "execute_binary_tool",
+            side_effect=self._successful_helper_compile,
+        ):
+            compiled = verifier._compile_helper("javac-cache-test", "a" * 64)
+            output = compiled.output
+            cached = verifier._compile_helper("javac-cache-test", "a" * 64)
+            self.assertIs(cached, compiled)
+            self.assertTrue(output.is_dir())
+
+            del cached, compiled
+            gc.collect()
+            self.assertTrue(output.is_dir())
+            verifier._compile_helper.cache_clear()
+            gc.collect()
+            self.assertFalse(output.exists())
+
+    def test_lru_eviction_removes_only_the_evicted_helper_directory(self):
+        verifier._compile_helper.cache_clear()
+        self.addCleanup(verifier._compile_helper.cache_clear)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            verifier,
+            "make_short_temp_dir",
+            side_effect=lambda prefix: Path(
+                tempfile.mkdtemp(prefix=f"{prefix}-", dir=tmp)
+            ),
+        ), patch.object(
+            verifier,
+            "execute_binary_tool",
+            side_effect=self._successful_helper_compile,
+        ):
+            outputs = []
+            for index in range(9):
+                compiled = verifier._compile_helper(
+                    f"javac-eviction-{index}", f"{index:064x}"
+                )
+                outputs.append(compiled.output)
+                del compiled
+            gc.collect()
+
+            self.assertFalse(outputs[0].exists())
+            self.assertTrue(all(path.is_dir() for path in outputs[1:]))
+            verifier._compile_helper.cache_clear()
+            gc.collect()
+            self.assertTrue(all(not path.exists() for path in outputs))
+
+    def test_compile_failure_and_incomplete_output_clean_owned_directory(self):
+        verifier._compile_helper.cache_clear()
+        self.addCleanup(verifier._compile_helper.cache_clear)
+        failed = SimpleNamespace(
+            succeeded=False,
+            failure=SimpleNamespace(
+                to_mapping=lambda: {"failure_kind": "exit", "returncode": 1}
+            ),
+        )
+        cases = (
+            (failed, "CLASS_DEFINITION_HELPER_COMPILE_FAILED"),
+            (
+                SimpleNamespace(succeeded=True),
+                "CLASS_DEFINITION_HELPER_COMPILE_INCOMPLETE",
+            ),
+        )
+        for index, (completed, expected_reason) in enumerate(cases):
+            with (
+                self.subTest(expected_reason=expected_reason),
+                tempfile.TemporaryDirectory() as tmp,
+                patch.object(
+                    verifier,
+                    "make_short_temp_dir",
+                    side_effect=lambda prefix: Path(
+                        tempfile.mkdtemp(prefix=f"{prefix}-", dir=tmp)
+                    ),
+                ),
+                patch.object(
+                    verifier, "execute_binary_tool", return_value=completed
+                ),
+            ):
+                with self.assertRaises(
+                    verifier.ClassDefinitionVerifierError
+                ) as raised:
+                    verifier._compile_helper(
+                        f"javac-failure-{index}", str(index) * 64
+                    )
+                self.assertEqual(raised.exception.reason_code, expected_reason)
+                self.assertEqual(list(Path(tmp).iterdir()), [])
+
+    @unittest.skipUnless(hasattr(os, "fork"), "fork is unavailable")
+    def test_forked_child_cache_clear_does_not_remove_parent_helper(self):
+        verifier._compile_helper.cache_clear()
+        self.addCleanup(verifier._compile_helper.cache_clear)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            verifier,
+            "make_short_temp_dir",
+            side_effect=lambda prefix: Path(
+                tempfile.mkdtemp(prefix=f"{prefix}-", dir=tmp)
+            ),
+        ), patch.object(
+            verifier,
+            "execute_binary_tool",
+            side_effect=self._successful_helper_compile,
+        ):
+            compiled = verifier._compile_helper("javac-fork-test", "f" * 64)
+            output = compiled.output
+            child_pid = os.fork()
+            if child_pid == 0:
+                try:
+                    verifier._compile_helper.cache_clear()
+                    del compiled
+                    gc.collect()
+                    os._exit(0 if output.is_dir() else 2)
+                except BaseException:
+                    os._exit(1)
+
+            waited_pid, status = os.waitpid(child_pid, 0)
+            self.assertEqual(waited_pid, child_pid)
+            self.assertEqual(os.waitstatus_to_exitcode(status), 0)
+            self.assertTrue(
+                (output / "ClassDefinitionVerifier.class").is_file()
+            )
+            cached = verifier._compile_helper("javac-fork-test", "f" * 64)
+            self.assertIs(cached, compiled)
+
+            del cached, compiled
+            verifier._compile_helper.cache_clear()
+            gc.collect()
+            self.assertFalse(output.exists())
+
     def test_legal_package_info_class_does_not_abort_definition_batch(self):
         home = jdk_home()
         if not home or not shutil.which("javac"):

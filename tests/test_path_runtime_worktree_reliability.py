@@ -16,6 +16,93 @@ import path_runtime  # noqa: E402
 
 
 class PathRuntimeWorktreeReliabilityTest(unittest.TestCase):
+    def test_short_temporary_directory_retries_transient_cleanup_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            owned = Path(tmp) / "owned"
+            owned.mkdir()
+            real_rmtree = shutil.rmtree
+            attempts = []
+
+            def remove(path):
+                attempts.append(Path(path))
+                if len(attempts) < 3:
+                    raise PermissionError("transient cleanup owner")
+                real_rmtree(path)
+
+            with patch.object(
+                path_runtime, "make_short_temp_dir", return_value=owned
+            ), patch.object(
+                path_runtime.shutil, "rmtree", side_effect=remove
+            ), patch.object(path_runtime.time, "sleep") as sleep:
+                with path_runtime.short_temporary_directory() as path:
+                    self.assertEqual(Path(path), owned)
+            self.assertFalse(owned.exists())
+            self.assertEqual(len(attempts), 3)
+            self.assertEqual(
+                [call.args[0] for call in sleep.call_args_list],
+                [0.05, 0.15],
+            )
+
+    def test_short_temporary_directory_surfaces_cleanup_failure_after_retries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            owned = Path(tmp) / "owned"
+            owned.mkdir()
+            with patch.object(
+                path_runtime, "make_short_temp_dir", return_value=owned
+            ), patch.object(
+                path_runtime.shutil,
+                "rmtree",
+                side_effect=PermissionError("cleanup denied"),
+            ) as remove, patch.object(
+                path_runtime.time, "sleep"
+            ):
+                with self.assertRaisesRegex(PermissionError, "cleanup denied"):
+                    with path_runtime.short_temporary_directory():
+                        pass
+            self.assertEqual(remove.call_count, 5)
+
+    def test_short_temporary_directory_cleanup_does_not_mask_body_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            owned = Path(tmp) / "owned"
+            owned.mkdir()
+            primary = RuntimeError("body failed")
+            with patch.object(
+                path_runtime, "make_short_temp_dir", return_value=owned
+            ), patch.object(
+                path_runtime.shutil,
+                "rmtree",
+                side_effect=PermissionError("cleanup denied"),
+            ), patch.object(
+                path_runtime.time, "sleep"
+            ):
+                with self.assertRaises(RuntimeError) as raised:
+                    with path_runtime.short_temporary_directory():
+                        raise primary
+            self.assertIs(raised.exception, primary)
+            self.assertTrue(any(
+                "short temporary directory cleanup failed" in note
+                and "cleanup denied" in note
+                for note in getattr(primary, "__notes__", ())
+            ))
+
+    def test_short_temp_root_does_not_cache_root_when_probe_cleanup_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            probe = Path(tmp) / "probe"
+            probe.mkdir()
+            path_runtime._SHORT_TEMP_ROOT_CACHE.clear()
+            with patch.object(
+                path_runtime, "make_short_temp_dir", return_value=probe
+            ), patch.object(
+                path_runtime,
+                "_remove_short_temp_dir",
+                side_effect=PermissionError("probe cleanup denied"),
+            ):
+                with self.assertRaisesRegex(
+                    PermissionError, "probe cleanup denied"
+                ):
+                    path_runtime.short_temp_root()
+            self.assertEqual(path_runtime._SHORT_TEMP_ROOT_CACHE, {})
+
     def test_registration_uses_stable_porcelain_command_without_z(self):
         commands = []
 

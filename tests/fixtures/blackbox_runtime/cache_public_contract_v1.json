@@ -12,13 +12,16 @@
     {
       "id": "independent-process-and-json-observation",
       "organization": "Python Software Foundation",
-      "mechanism": "cold, warm, corrupted-cache, and concurrent public subprocess execution",
-      "verifies": ["disk cache reuse", "corruption rebuild", "concurrent deterministic publication"]
+      "mechanism": "cold, warm, corrupted-cache, and contending public subprocess execution",
+      "verifies": ["disk cache reuse", "corruption rebuild", "exclusive writer publication", "typed contention rejection", "deterministic post-contention retry"]
     }
   ],
   "expected_first_status": "miss",
   "expected_warm_status": "hit",
   "expected_corrupt_status": "corrupt_rebuilt",
   "expected_validation_status": "passed",
+  "expected_concurrent_success_count": 1,
+  "expected_concurrent_failure_count": 1,
+  "expected_concurrent_failure_reason_code": "BINARY_PIPELINE_RUN_ALREADY_ACTIVE",
   "expected_concurrent_result_identity_count": 1
 }

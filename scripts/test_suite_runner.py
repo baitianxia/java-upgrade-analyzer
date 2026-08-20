@@ -98,6 +98,8 @@ def load_selector_tests(
     policy: Mapping[str, Any],
     selector_field: str,
     repository_root: str | Path = ROOT,
+    *,
+    exclusion_field: str = "",
 ) -> tuple[list[unittest.TestCase], list[str]]:
     """Load one orthogonal governed suite from discovery and exact selectors.
 
@@ -136,6 +138,20 @@ def load_selector_tests(
             continue
         for test in matches:
             selected.setdefault(test.id(), test)
+    exclusions = [
+        str(value).strip().rstrip(".")
+        for value in policy.get(exclusion_field) or ()
+        if exclusion_field and str(value).strip()
+    ]
+    for selector in exclusions:
+        matched_ids = [
+            test_id for test_id in selected if _matches(test_id, selector)
+        ]
+        if not matched_ids:
+            gaps.append(f"exclude:{selector}")
+            continue
+        for test_id in matched_ids:
+            selected.pop(test_id, None)
     return list(selected.values()), gaps
 
 
@@ -143,6 +159,18 @@ def windows_suite_precondition(platform_name: str | None = None) -> str:
     """Return a stable failure reason outside a native Windows runtime."""
     return "" if str(platform_name or os.name).lower() == "nt" else (
         "WINDOWS_SUITE_REQUIRES_NATIVE_WINDOWS"
+    )
+
+
+def load_windows_tests(
+    policy: Mapping[str, Any],
+    repository_root: str | Path = ROOT,
+) -> tuple[list[unittest.TestCase], list[str]]:
+    return load_selector_tests(
+        policy,
+        "windows_test_selectors",
+        repository_root,
+        exclusion_field="windows_excluded_test_selectors",
     )
 
 
@@ -245,9 +273,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.suite == "performance":
             discovered = load_performance_tests(policy, root)
         elif args.suite == "windows":
-            discovered, selector_gaps = load_selector_tests(
-                policy, "windows_test_selectors", root,
-            )
+            discovered, selector_gaps = load_windows_tests(policy, root)
         else:
             discovered = discover_tests(root)
         partitions = partition_tests(discovered, policy)

@@ -14,7 +14,10 @@ from binary_definition_verifier import (
     verifier_identity,
     verify_class_definitions,
 )
-from binary_fact_store import BinaryFactStore
+from binary_fact_store import (
+    BinaryFactStore,
+    LOADING_CONSTRAINT_TYPE_OWNERS_KEY,
+)
 from binary_first_contract import (
     BinaryFirstContractError,
     StreamingCanonicalSequence,
@@ -38,6 +41,8 @@ ACC_STATIC = 0x0008
 ACC_FINAL = 0x0010
 ACC_INTERFACE = 0x0200
 ACC_ABSTRACT = 0x0400
+MIN_MULTI_RELEASE_VERSION = 8
+MIN_MULTI_RELEASE_RUNTIME_MAJOR = 9
 
 
 class RuntimeReconciliationError(BinaryFirstContractError):
@@ -218,6 +223,28 @@ def _loads(value: str) -> Any:
     return json.loads(value or "{}")
 
 
+def _loading_constraint_type_owners(
+    payload: Mapping[str, Any],
+) -> tuple[str, ...]:
+    value = payload.get(LOADING_CONSTRAINT_TYPE_OWNERS_KEY)
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not value or any(
+        not isinstance(item, str) or not item for item in value
+    ):
+        raise RuntimeReconciliationError(
+            "RUNTIME_LOADING_CONSTRAINT_FACT_INVALID",
+            f"{LOADING_CONSTRAINT_TYPE_OWNERS_KEY} must be a non-empty string list",
+        )
+    normalized = tuple(value)
+    if normalized != tuple(sorted(set(normalized))):
+        raise RuntimeReconciliationError(
+            "RUNTIME_LOADING_CONSTRAINT_FACT_INVALID",
+            f"{LOADING_CONSTRAINT_TYPE_OWNERS_KEY} must be sorted and unique",
+        )
+    return normalized
+
+
 def _package(class_name: str) -> str:
     return class_name.rpartition("/")[0]
 
@@ -234,7 +261,7 @@ class RuntimeCapabilityPolicy:
     signed_artifacts_supported: bool = False
     sealed_packages_supported: bool = False
     closed_world_dispatch: bool = True
-    policy_version: str = "binary-runtime-capability-v1"
+    policy_version: str = "binary-runtime-capability-v2"
     identity: str = field(init=False)
 
     def __post_init__(self):
@@ -721,7 +748,13 @@ class RuntimeReconciler:
                 applicable = [
                     row for row in variants
                     if row["multi_release_version"] == 0
-                    or (mr_enabled and row["multi_release_version"] <= self.target_java_major)
+                    or (
+                        mr_enabled
+                        and self.target_java_major >= MIN_MULTI_RELEASE_RUNTIME_MAJOR
+                        and MIN_MULTI_RELEASE_VERSION
+                        <= row["multi_release_version"]
+                        <= self.target_java_major
+                    )
                 ]
                 if not applicable:
                     continue
@@ -988,6 +1021,29 @@ class RuntimeReconciler:
             for owner in (_type_provider_owner(row["symbolic_owner"]),)
             if owner
         )
+        loading_constraint_classes: set[str] = set()
+        for row in self.store.connection.execute(
+            """
+            SELECT edge.edge_json
+            FROM direct_edges AS edge
+            JOIN artifact_instances AS artifact
+              ON artifact.artifact_instance_identity =
+                 edge.caller_artifact_instance_identity
+            WHERE artifact.runtime_profile_identity=?
+              AND (
+                edge.edge_kind IN (
+                'method','field','invokedynamic_bootstrap',
+                'ldc_constant_dynamic_bootstrap','ldc_handle'
+                )
+                OR edge.edge_kind LIKE 'invokedynamic_handle_%'
+                OR edge.edge_kind LIKE 'ldc_bootstrap_handle_%'
+              )
+            """,
+            (self.profile.identity,),
+        ):
+            loading_constraint_classes.update(
+                _loading_constraint_type_owners(_loads(row["edge_json"]))
+            )
         initial_classes.update(
             name for name in self.additional_initial_classes if name != "module-info"
         )
@@ -996,7 +1052,21 @@ class RuntimeReconciler:
         # launching a helper process once per previously unseen JDK class.
         self.platform.ensure_classes(initial_classes)
         contexts = set()
-        pending = [(realm, name) for realm in self.entrypoint_realms for name in initial_classes]
+        pending = [
+            (realm, name)
+            for realm in self.entrypoint_realms
+            for name in initial_classes
+        ]
+        # A loading constraint compares the class identity selected by both
+        # the caller's defining loader and the actual declaration's defining
+        # loader. Materialize the finite provider matrix once so edge
+        # reconciliation remains dictionary-only and cannot create untracked
+        # provider records after the universe has been persisted.
+        pending.extend(
+            (realm, name)
+            for realm in self.realms
+            for name in loading_constraint_classes
+        )
         while pending:
             realm, name = pending.pop()
             if (realm, name) in contexts:
@@ -1683,6 +1753,135 @@ class RuntimeReconciler:
         )
         return payload
 
+    def _member_loading_constraints(
+        self,
+        caller_defining_loader_realm: str,
+        declaration_loader_realm: str,
+        descriptor_type_names: Iterable[str],
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """Compare prospective JVMS descriptor providers for one member.
+
+        Field/method/interface-method resolution imposes ``N^L1 = N^L2``
+        for each descriptor class name, where L1 defines the actual declaring
+        class and L2 defines the caller. The fact store has already parsed and
+        deduplicated those names, so this hot path performs cache-only provider
+        comparisons and no descriptor parsing or SQLite lookup.
+
+        A provider mismatch is *not* by itself proof that the JVM has already
+        violated the constraint. JVMS 5.3.4 permits the constraint to be
+        recorded before either (or both) initiating loaders has loaded N; the
+        incompatible definition can fail only later. The per-realm definition
+        verifier also runs realms in separate JVMs, so it cannot prove the two
+        initiating-load events. Consequently this static path reports a
+        deferred conflict, reserving a definite violation for future evidence
+        produced by a same-JVM topology probe.
+        """
+        constraints: list[dict[str, Any]] = []
+        aggregate = "not_applicable"
+        for class_name in sorted(set(descriptor_type_names)):
+            if caller_defining_loader_realm == declaration_loader_realm:
+                item = {
+                    "class_name": class_name,
+                    "caller_defining_loader_realm_identity": (
+                        caller_defining_loader_realm
+                    ),
+                    "declaration_defining_loader_realm_identity": (
+                        declaration_loader_realm
+                    ),
+                    "caller_class_identity": (
+                        f"{class_name}@{caller_defining_loader_realm}"
+                    ),
+                    "declaration_class_identity": (
+                        f"{class_name}@{declaration_loader_realm}"
+                    ),
+                    "provider_equivalent": True,
+                    "constraint_status": "satisfied",
+                    "evidence_kind": "same_defining_loader",
+                    "runtime_load_evidence_status": "not_required",
+                }
+            else:
+                caller_provider = self._provider(
+                    caller_defining_loader_realm, class_name
+                )
+                declaration_provider = self._provider(
+                    declaration_loader_realm, class_name
+                )
+                caller_status = str(
+                    caller_provider.get("class_provider_status") or "missing"
+                )
+                declaration_status = str(
+                    declaration_provider.get("class_provider_status")
+                    or "missing"
+                )
+                caller_defining = str(
+                    caller_provider.get(
+                        "selected_defining_loader_realm_identity"
+                    ) or ""
+                )
+                declaration_defining = str(
+                    declaration_provider.get(
+                        "selected_defining_loader_realm_identity"
+                    ) or ""
+                )
+                both_resolved = (
+                    caller_status == "resolved"
+                    and declaration_status == "resolved"
+                )
+                equivalent = bool(
+                    both_resolved
+                    and caller_defining
+                    and caller_defining == declaration_defining
+                )
+                constraint_status = (
+                    "satisfied"
+                    if equivalent else (
+                        "deferred_conflict" if both_resolved else "unresolved"
+                    )
+                )
+                item = {
+                    "class_name": class_name,
+                    "caller_defining_loader_realm_identity": (
+                        caller_defining_loader_realm
+                    ),
+                    "declaration_defining_loader_realm_identity": (
+                        declaration_loader_realm
+                    ),
+                    "caller_provider_binding_identity": str(
+                        caller_provider.get("provider_binding_identity") or ""
+                    ),
+                    "declaration_provider_binding_identity": str(
+                        declaration_provider.get("provider_binding_identity")
+                        or ""
+                    ),
+                    "caller_provider_status": caller_status,
+                    "declaration_provider_status": declaration_status,
+                    "caller_class_identity": (
+                        f"{class_name}@{caller_defining}"
+                        if caller_defining else ""
+                    ),
+                    "declaration_class_identity": (
+                        f"{class_name}@{declaration_defining}"
+                        if declaration_defining else ""
+                    ),
+                    "provider_equivalent": equivalent,
+                    "constraint_status": constraint_status,
+                    "evidence_kind": (
+                        "prospective_selected_defining_loader_identity"
+                    ),
+                    "runtime_load_evidence_status": "unavailable",
+                }
+            constraints.append(item)
+            if item["constraint_status"] == "deferred_conflict":
+                aggregate = "deferred_conflict"
+            elif (
+                item["constraint_status"] == "unresolved"
+                and aggregate != "deferred_conflict"
+            ):
+                aggregate = "unresolved"
+            elif aggregate == "not_applicable":
+                aggregate = "satisfied"
+        return aggregate, constraints
+
     def _resolve_edges(
         self,
         universe: tuple[tuple[str, str], ...],
@@ -1701,7 +1900,8 @@ class RuntimeReconciler:
         for raw_edge in self.store.connection.execute(
             """
             SELECT direct_edge_identity,caller_member_identity,
-                   caller_artifact_instance_identity,edge_kind,opcode,
+                   caller_artifact_instance_identity,instruction_index,
+                   bytecode_offset,edge_kind,opcode,
                    symbolic_owner,symbolic_name,symbolic_descriptor,edge_json
             FROM direct_edges
             ORDER BY direct_edge_identity
@@ -1712,7 +1912,25 @@ class RuntimeReconciler:
             if caller_artifact not in artifact_realm:
                 continue
             caller = member_by_identity.get(edge["caller_member_identity"])
-            caller_realm = artifact_realm[caller_artifact]
+            if caller is None:
+                continue
+            artifact_loader_realm = artifact_realm[caller_artifact]
+            caller_provider = self._provider(
+                artifact_loader_realm, str(caller["class_name"])
+            )
+            if (
+                caller_provider.get("class_provider_status") != "resolved"
+                or caller_provider.get("selected_class_variant_identity")
+                != caller["class_variant_identity"]
+            ):
+                # A shadowed physical caller variant is not D in any target
+                # runtime constant pool and therefore imposes no constraints.
+                continue
+            caller_realm = str(
+                caller_provider[
+                    "selected_defining_loader_realm_identity"
+                ]
+            )
             if edge["edge_kind"] == "type":
                 accumulator.add(
                     "type_resolution",
@@ -1745,7 +1963,24 @@ class RuntimeReconciler:
                 continue
             owner = edge["symbolic_owner"]
             edge_payload = _loads(edge.get("edge_json") or "{}")
-            handle_tag = int(edge_payload.get("tag") or 0)
+            descriptor_type_names = _loading_constraint_type_owners(
+                edge_payload
+            )
+            # Ordinary MethodHandle edges store the handle directly, while an
+            # invokedynamic bootstrap edge wraps it in ``payload.bootstrap``.
+            # Preserve the JVMS reference kind in both shapes: tags 1..4 are
+            # field references and therefore use a field descriptor/loading
+            # constraint, even though the graph edge itself is not named
+            # ``field``.
+            bootstrap_payload = edge_payload.get("bootstrap") or {}
+            handle_tag = int(
+                edge_payload.get("tag")
+                or (
+                    bootstrap_payload.get("tag")
+                    if isinstance(bootstrap_payload, Mapping) else 0
+                )
+                or 0
+            )
             kind = (
                 "field"
                 if edge["edge_kind"] == "field" or handle_tag in {1, 2, 3, 4}
@@ -1807,9 +2042,7 @@ class RuntimeReconciler:
                     ]
                     if array_clone:
                         payload["jvm_array_member_semantics"] = "public_clone"
-                    if not self._opcode_compatible(edge, member):
-                        linkage_status = "incompatible_class_change"
-                    elif not array_clone and not self._member_accessible(
+                    if not array_clone and not self._member_accessible(
                         str((caller or {}).get("class_name") or ""),
                         caller_realm,
                         member,
@@ -1817,7 +2050,35 @@ class RuntimeReconciler:
                     ):
                         linkage_status = "illegal_access"
                     else:
-                        linkage_status = "resolved"
+                        constraint_status, constraints = (
+                            self._member_loading_constraints(
+                                caller_realm,
+                                str(member_provider[
+                                    "selected_defining_loader_realm_identity"
+                                ]),
+                                descriptor_type_names,
+                            )
+                        )
+                        payload["loading_constraint_status"] = (
+                            constraint_status
+                        )
+                        payload["loading_constraints"] = constraints
+                        if constraint_status == "deferred_conflict":
+                            linkage_status = (
+                                "loading_constraint_deferred_conflict"
+                            )
+                            payload["linkage_failure_reason"] = (
+                                "prospective_descriptor_type_provider_mismatch"
+                            )
+                        elif constraint_status == "unresolved":
+                            linkage_status = "loading_constraint_unresolved"
+                            payload["linkage_failure_reason"] = (
+                                "descriptor_type_provider_unresolved"
+                            )
+                        elif not self._opcode_compatible(edge, member):
+                            linkage_status = "incompatible_class_change"
+                        else:
+                            linkage_status = "resolved"
             resolution_identity = _member_resolution_identity_native(
                 {"member_resolution_status": status, **payload}
             )
@@ -1831,13 +2092,23 @@ class RuntimeReconciler:
             executable_dispatch = edge["edge_kind"] == "method" and kind == "method"
             dispatch_fixed_by_final_declaration = False
             dispatch_fixed_by_closed_world_single_target = False
-            if not executable_dispatch or status != "resolved":
+            if (
+                executable_dispatch
+                and linkage_status in {
+                    "loader_constraint_violation",
+                    "loading_constraint_deferred_conflict",
+                    "loading_constraint_unresolved",
+                }
+            ):
+                dispatch_status = "unresolved"
+                targets = ()
+                coverage = "partial"
+            elif not executable_dispatch or status != "resolved":
                 dispatch_status = "not_applicable" if not executable_dispatch else "unresolved"
                 targets = ()
                 coverage = "complete" if dispatch_status == "not_applicable" else "partial"
             else:
                 opcode = int(edge.get("opcode") or 0)
-                handle_tag = int(edge_payload.get("tag") or 0)
                 virtual = opcode in {182, 185} or handle_tag in {5, 9}
                 if array_clone:
                     dispatch_fixed_by_final_declaration = True
@@ -1910,11 +2181,21 @@ class RuntimeReconciler:
                 "linkage_status": linkage_status,
                 "coverage_status": (
                     "partial"
-                    if linkage_status in {"ambiguous", "unresolved", "unsupported"}
+                    if linkage_status in {
+                        "ambiguous", "unresolved", "unsupported",
+                        "loading_constraint_deferred_conflict",
+                        "loading_constraint_unresolved",
+                    }
                     else "complete"
                 ),
                 "member_resolution_identity": resolution_identity,
             }
+            for field in (
+                "loading_constraint_status", "loading_constraints",
+                "linkage_failure_reason",
+            ):
+                if field in payload:
+                    linkage[field] = payload[field]
             linkage["linkage_resolution_identity"] = _identity(
                 "linkage_resolution_identity", linkage
             )

@@ -11,8 +11,10 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import contextmanager
 import csv
 from dataclasses import dataclass
+import errno
 from functools import lru_cache
 import gc
 import hashlib
@@ -20,7 +22,9 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import sqlite3
+import stat
 import sys
 import time
 from typing import Any, Callable, Iterable, Mapping
@@ -33,22 +37,39 @@ from binary_first_contract import (
     BinaryFirstContractError,
     canonical_identity,
     canonical_identity_streaming,
+    surrogate_safe_json_dumps,
+    transport_jvm_value,
+)
+from binary_validation_contract import (
+    VALIDATION_POLICY_VERSION,
+    oracle_support_manifest_identity,
+    validator_implementation_identity,
 )
 from binary_tool_execution import execute_binary_tool, tool_failure_is_retryable
 from jdk_preflight import JdkPreflightError, jdk_tool_path, preflight_jdk_home
 from progress_logging import emit_progress
-from streaming_json import stream_json, write_json_streaming_atomic
+from streaming_json import (
+    files_equal,
+    fsync_directory,
+    stream_json,
+    write_json_streaming_atomic,
+)
 from path_runtime import short_temporary_directory
 from final_artifact_edge_oracle import (
     LINKER_BOOTSTRAP_OWNERS,
+    METHOD_HANDLE_REFERENCE_KIND_BY_TAG,
+    METHOD_HANDLE_REFERENCE_KINDS,
     clear_immutable_oracle_cache,
+    parse_structural_javap,
     scan_final_artifact,
 )
 
 
 ORACLE_SOURCE = Path(__file__).with_name("java") / "RuntimeOutcomeOracle.java"
-SUPPORT_MANIFEST = Path(__file__).with_name("binary_first_support_manifest.json")
-POLICY_VERSION = "binary-independent-validation-v2"
+MIN_MULTI_RELEASE_VERSION = 8
+ACC_MODULE = 0x8000
+POLICY_VERSION = VALIDATION_POLICY_VERSION
+LOADING_CONSTRAINT_TYPE_OWNERS_KEY = "loading_constraint_type_owners"
 # A single target-JVM process retains every Class object it defines until its
 # URLClassLoader and process exit.  Loading a 100k-class application in one
 # invocation therefore makes validation memory scale with the entire runtime
@@ -344,6 +365,163 @@ def _identity(namespace: str, payload: Any) -> str:
     return canonical_identity(namespace, payload, schema_version="1")
 
 
+_RESULT_GENERATION_SNAPSHOT_LAYERS = frozenset({
+    "decision", "assessment", "formal_projection", "candidate_projection",
+})
+_REQUIRED_PIPELINE_GENERATION_SIDECARS = frozenset({
+    "binary_decisions.json",
+    "binary_projections.json",
+    "binary_formal_results.json",
+    "binary_candidate_results.json",
+    "binary_entrypoints.json",
+    "binary_coverage.json",
+    "binary_summary.json",
+    "binary_formal_results.csv",
+    "base_binary_facts.sqlite",
+    "current_binary_facts.sqlite",
+    "binary_runtime_semantic_overlay.json",
+    "binary_definition_verification.json",
+    "binary_pairings.json",
+    "binary_phase_manifest.json",
+    "binary_build_identities.json",
+})
+_RESERVED_OPTIONAL_GENERATION_SIDECARS = frozenset({
+    "binary_inline_overlay.json",
+    "binary_source_attestation.json",
+    "binary_source_explanations.json",
+})
+_AUTHORITATIVE_SQLITE_SIDECARS = (
+    "base_binary_facts.sqlite",
+    "current_binary_facts.sqlite",
+)
+_SQLITE_TRANSIENT_SUFFIXES = ("-journal", "-wal", "-shm")
+
+
+def _expected_result_generation_identity(
+    manifest: Mapping[str, Any],
+) -> str | None:
+    snapshots = manifest.get("active_snapshot_identities")
+    sidecars = manifest.get("sidecar_content_identities")
+    policies = manifest.get("policy_identities")
+    if (
+        manifest.get("schema")
+        != "java-upgrade-analyzer.binary-result-generation.v1"
+        or manifest.get("authority") != "binary_first"
+        or not isinstance(snapshots, Mapping)
+        or set(snapshots) != _RESULT_GENERATION_SNAPSHOT_LAYERS
+        or not all(isinstance(value, str) and value for value in snapshots.values())
+        or not isinstance(sidecars, Mapping)
+        or not _REQUIRED_PIPELINE_GENERATION_SIDECARS.issubset(sidecars)
+        or not isinstance(policies, Mapping)
+        or not isinstance(manifest.get("analysis_context_identity"), str)
+        or not manifest.get("analysis_context_identity")
+        or not isinstance(manifest.get("trace_result_set_digest"), str)
+        or not manifest.get("trace_result_set_digest")
+    ):
+        return None
+    return _identity("result_generation_identity", {
+        "analysis_context_identity": manifest["analysis_context_identity"],
+        "authority": "binary_first",
+        "snapshot_identities": {
+            str(layer): str(identity)
+            for layer, identity in sorted(snapshots.items())
+        },
+        "trace_result_set_digest": manifest["trace_result_set_digest"],
+        "sidecar_content_identities": dict(sidecars),
+        "policy_identities": dict(policies),
+    })
+
+
+def _safe_generation_sidecar_name(value: Any) -> bool:
+    return bool(
+        isinstance(value, str)
+        and value not in {"", ".", ".."}
+        and "/" not in value
+        and "\\" not in value
+        and "\x00" not in value
+        and Path(value).name == value
+    )
+
+
+def _generation_sidecar_declaration_issues(
+    config: Mapping[str, Any],
+    generation: Path,
+    sidecar_identities: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Reject fixed-name inputs that are absent from the generation identity."""
+    issues = [
+        _validation_issue(
+            "generation_integrity",
+            "ORACLE_GENERATION_REQUIRED_SIDECAR_UNDECLARED",
+            sidecar=name,
+        )
+        for name in sorted(
+            _REQUIRED_PIPELINE_GENERATION_SIDECARS - set(sidecar_identities)
+        )
+    ]
+    source_sidecars_required = bool(config.get("source_overlay"))
+    for name in sorted(_RESERVED_OPTIONAL_GENERATION_SIDECARS):
+        sidecar = generation / name
+        if source_sidecars_required and name not in sidecar_identities:
+            issues.append(_validation_issue(
+                "generation_integrity",
+                "ORACLE_GENERATION_REQUIRED_SOURCE_SIDECAR_UNDECLARED",
+                sidecar=name,
+            ))
+        elif not source_sidecars_required and name in sidecar_identities:
+            issues.append(_validation_issue(
+                "generation_integrity",
+                "ORACLE_GENERATION_UNEXPECTED_SOURCE_SIDECAR_DECLARED",
+                sidecar=name,
+            ))
+        if name not in sidecar_identities and (
+            sidecar.is_symlink() or sidecar.exists()
+        ):
+            issues.append(_validation_issue(
+                "generation_integrity",
+                "ORACLE_GENERATION_UNDECLARED_RESERVED_SIDECAR",
+                sidecar=name,
+            ))
+    # A committed WAL is visible to an ordinary read-only SQLite connection
+    # even though the manifest binds only the main database bytes.  Never let
+    # unbound journal state participate in authoritative validation.
+    for database_name in _AUTHORITATIVE_SQLITE_SIDECARS:
+        for suffix in _SQLITE_TRANSIENT_SUFFIXES:
+            transient_name = f"{database_name}{suffix}"
+            transient = generation / transient_name
+            if transient.is_symlink() or transient.exists():
+                issues.append(_validation_issue(
+                    "generation_integrity",
+                    "ORACLE_GENERATION_SQLITE_TRANSIENT_SIDECAR_PRESENT",
+                    database=database_name,
+                    sidecar=transient_name,
+                ))
+    return issues
+
+
+def _open_immutable_sqlite(path: Path) -> sqlite3.Connection:
+    """Open only the content-addressed main database image.
+
+    ``immutable=1`` is a second line of defence against a journal file being
+    created after the generation-integrity scan.  It also prevents validation
+    itself from creating lock or shared-memory files beside the generation.
+    """
+
+    connection = sqlite3.connect(
+        f"{path.expanduser().resolve().as_uri()}?mode=ro&immutable=1",
+        uri=True,
+    )
+    try:
+        connection.execute("PRAGMA query_only = ON")
+        return connection
+    except BaseException:
+        # Connection setup is not atomic: connect() may succeed before the
+        # defensive query-only contract fails.  Close the native handle on
+        # every exceptional path rather than relying on GC/ResourceWarning.
+        connection.close()
+        raise
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -385,15 +563,20 @@ def _load_json(path: str | Path) -> dict[str, Any]:
     return value
 
 
-def _release_major(jdk_home: Path) -> int:
+def _release_values(jdk_home: Path) -> dict[str, str]:
     release = {}
     try:
         for line in (jdk_home / "release").read_text(encoding="utf-8").splitlines():
             key, separator, value = line.partition("=")
             if separator:
-                release[key] = value.strip().strip('"')
+                release[key.strip()] = value.strip().strip('"')
     except OSError as error:
         raise BinaryValidationError("BINARY_ORACLE_JDK_RELEASE_MISSING", str(error)) from error
+    return release
+
+
+def _release_major(jdk_home: Path) -> int:
+    release = _release_values(jdk_home)
     version = release.get("JAVA_VERSION", "")
     match = re.match(r"(?:1\.)?(\d+)", version)
     if not match:
@@ -409,48 +592,308 @@ def _manifest_multi_release(archive: zipfile.ZipFile) -> bool:
     if len(matches) != 1:
         return False
     text = archive.read(matches[0]).decode("utf-8", errors="replace")
-    unfolded = []
-    for line in text.splitlines():
-        if line.startswith(" ") and unfolded:
-            unfolded[-1] += line[1:]
-        else:
-            unfolded.append(line)
-    return any(
-        key.strip().lower() == "multi-release" and value.strip().lower() == "true"
-        for line in unfolded
-        for key, separator, value in [line.partition(":")]
-        if separator
+    attributes: dict[str, str] = {}
+    continued: dict[str, bool] = {}
+    physical_header_valid: dict[str, bool] = {}
+    current_key = ""
+    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        # Multi-Release is a main-section attribute.  A same-named attribute
+        # in a per-entry section must not activate versioned class selection.
+        if not line:
+            break
+        if line.startswith(" ") and current_key:
+            attributes[current_key] += line[1:]
+            continued[current_key] = True
+            continue
+        key, separator, value = line.partition(":")
+        current_key = key.strip().lower() if separator else ""
+        if current_key:
+            attributes[current_key] = value.strip()
+            continued[current_key] = False
+            physical_header_valid[current_key] = bool(
+                key.lower() == current_key and value.lower() == " true"
+            )
+    return bool(
+        attributes.get("multi-release", "").strip().lower() == "true"
+        and not continued.get("multi-release", False)
+        and physical_header_valid.get("multi-release", False)
     )
+
+
+def _independent_class_access_flags(content: bytes) -> int | None:
+    """Read class access flags without relying on production ASM or javap.
+
+    A class named ``module-info`` is legal JVM bytecode. Only ACC_MODULE makes
+    it a module descriptor. Returning ``None`` for malformed bytes keeps the
+    entry in the independent universe so the later parser fails closed instead
+    of silently classifying corrupt input as metadata.
+    """
+    data = memoryview(content)
+    cursor = 0
+
+    def skip(size: int) -> None:
+        nonlocal cursor
+        if size < 0 or cursor + size > len(data):
+            raise ValueError("truncated classfile")
+        cursor += size
+
+    def u1() -> int:
+        nonlocal cursor
+        skip(1)
+        return int(data[cursor - 1])
+
+    def u2() -> int:
+        nonlocal cursor
+        skip(2)
+        return int.from_bytes(data[cursor - 2:cursor], "big")
+
+    try:
+        if len(data) < 10 or bytes(data[:4]) != b"\xca\xfe\xba\xbe":
+            raise ValueError("invalid classfile header")
+        cursor = 8
+        constant_pool_count = u2()
+        if constant_pool_count < 1:
+            raise ValueError("invalid constant_pool_count")
+        index = 1
+        while index < constant_pool_count:
+            tag = u1()
+            if tag == 1:
+                skip(u2())
+            elif tag in {3, 4, 9, 10, 11, 12, 17, 18}:
+                skip(4)
+            elif tag in {5, 6}:
+                skip(8)
+                index += 1
+            elif tag in {7, 8, 16, 19, 20}:
+                skip(2)
+            elif tag == 15:
+                skip(3)
+            else:
+                raise ValueError(f"unknown constant-pool tag {tag}")
+            index += 1
+        return u2()
+    except ValueError:
+        return None
+
+
+_INDEPENDENT_MODULE_DESCRIPTOR_ATTRIBUTES = frozenset({
+    b"Module",
+    b"ModulePackages",
+    b"ModuleMainClass",
+    b"InnerClasses",
+    b"SourceFile",
+    b"SourceDebugExtension",
+    b"RuntimeVisibleAnnotations",
+    b"RuntimeInvisibleAnnotations",
+    b"RuntimeVisibleTypeAnnotations",
+    b"RuntimeInvisibleTypeAnnotations",
+})
+
+
+def _independent_is_valid_module_descriptor(content: bytes) -> bool:
+    """Independently enforce the basic JVMS 4.1 module-info shape."""
+    data = memoryview(content)
+    cursor = 0
+
+    def take(size: int) -> bytes:
+        nonlocal cursor
+        if size < 0 or cursor + size > len(data):
+            raise ValueError("truncated classfile")
+        result = bytes(data[cursor:cursor + size])
+        cursor += size
+        return result
+
+    def skip(size: int) -> None:
+        nonlocal cursor
+        if size < 0 or cursor + size > len(data):
+            raise ValueError("truncated classfile")
+        cursor += size
+
+    def u1() -> int:
+        return int.from_bytes(take(1), "big")
+
+    def u2() -> int:
+        return int.from_bytes(take(2), "big")
+
+    def u4() -> int:
+        return int.from_bytes(take(4), "big")
+
+    try:
+        if take(4) != b"\xca\xfe\xba\xbe":
+            raise ValueError("invalid classfile magic")
+        take(2)  # minor_version
+        major_version = u2()
+        constant_pool_count = u2()
+        if constant_pool_count < 1:
+            raise ValueError("invalid constant_pool_count")
+        utf8: dict[int, bytes] = {}
+        class_name_indexes: dict[int, int] = {}
+        index = 1
+        while index < constant_pool_count:
+            tag = u1()
+            if tag == 1:
+                utf8[index] = take(u2())
+            elif tag in {3, 4, 9, 10, 11, 12, 17, 18}:
+                skip(4)
+            elif tag in {5, 6}:
+                skip(8)
+                index += 1
+            elif tag == 7:
+                class_name_indexes[index] = u2()
+            elif tag in {8, 16, 19, 20}:
+                skip(2)
+            elif tag == 15:
+                skip(3)
+            else:
+                raise ValueError(f"unknown constant-pool tag {tag}")
+            index += 1
+
+        access_flags = u2()
+        this_class = u2()
+        super_class = u2()
+        owner_index = class_name_indexes.get(this_class)
+        owner = utf8.get(owner_index or -1)
+        interface_count = u2()
+        for _ in range(interface_count):
+            u2()
+        field_count = u2()
+        if field_count:
+            return False
+        method_count = u2()
+        if method_count:
+            return False
+        attributes: list[bytes] = []
+        for _ in range(u2()):
+            attribute_name = utf8.get(u2())
+            if attribute_name is None:
+                raise ValueError("invalid attribute name index")
+            attributes.append(attribute_name)
+            skip(u4())
+        if cursor != len(data):
+            raise ValueError("trailing classfile bytes")
+        return bool(
+            access_flags == ACC_MODULE
+            and major_version >= 53
+            and owner == b"module-info"
+            and super_class == 0
+            and interface_count == 0
+            and attributes.count(b"Module") == 1
+            and set(attributes) <= _INDEPENDENT_MODULE_DESCRIPTOR_ATTRIBUTES
+        )
+    except ValueError:
+        return False
 
 
 def _archive_inventory(path: Path, target_major: int) -> dict[str, Any]:
     classes: dict[str, dict[int, list[str]]] = defaultdict(lambda: defaultdict(list))
-    resources: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    valid_module_descriptors: set[str] = set()
+    resource_candidates: dict[
+        str, dict[int, list[dict[str, Any]]]
+    ] = defaultdict(lambda: defaultdict(list))
     with zipfile.ZipFile(path) as archive:
+        manifest_entries = [
+            info for info in archive.infolist()
+            if not info.is_dir()
+            and info.filename.upper() == "META-INF/MANIFEST.MF"
+        ]
+        ambiguous_manifest = bool(
+            len(manifest_entries) > 1
+            and any(
+                not info.is_dir()
+                and info.filename.startswith("META-INF/versions/")
+                for info in archive.infolist()
+            )
+        )
+        failures = (
+            ["ambiguous_multi_release_manifest:"]
+            if ambiguous_manifest
+            else []
+        )
+        if ambiguous_manifest:
+            failures[0] += ",".join(
+                info.filename for info in manifest_entries
+            )
         mr = _manifest_multi_release(archive)
         for ordinal, info in enumerate(archive.infolist()):
             if info.is_dir():
                 continue
             content = archive.read(info)
-            match = re.match(r"META-INF/versions/(\d+)/(.+\.class)$", info.filename)
-            if match:
+            match = re.match(
+                r"META-INF/versions/([1-9][0-9]*)/(.+\.class)$",
+                info.filename,
+                re.ASCII,
+            )
+            if match and int(match.group(1)) >= MIN_MULTI_RELEASE_VERSION:
                 version, logical = int(match.group(1)), match.group(2)
+                if logical.startswith("META-INF/") or any(
+                    part in {"", ".", ".."} for part in logical.split("/")
+                ):
+                    continue
                 classes[logical.removesuffix(".class")][version].append(info.filename)
+                access_flags = _independent_class_access_flags(content)
+                if (
+                    access_flags is not None
+                    and access_flags & ACC_MODULE
+                    and _independent_is_valid_module_descriptor(content)
+                ):
+                    valid_module_descriptors.add(info.filename)
+            elif info.filename.startswith("META-INF/versions/"):
+                # Classes and resources share the canonical numeric MR path
+                # rules, but JEP 238 never overlays resources below META-INF.
+                resource_match = re.fullmatch(
+                    r"META-INF/versions/([1-9][0-9]*)/(.+)",
+                    info.filename,
+                    re.ASCII,
+                )
+                if info.filename.endswith(".class") or not resource_match:
+                    continue
+                version = int(resource_match.group(1))
+                logical = resource_match.group(2)
+                if (
+                    version < MIN_MULTI_RELEASE_VERSION
+                    or logical.startswith("META-INF/")
+                    or any(
+                        part in {"", ".", ".."}
+                        for part in logical.split("/")
+                    )
+                ):
+                    continue
+                resource_candidates[logical][version].append({
+                    "ordinal": ordinal,
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "semantic_digest": _independent_resource_digest(
+                        logical, content
+                    ),
+                    "semantic_facts": _independent_resource_facts(
+                        logical, content
+                    ),
+                })
+                # Malformed, pre-Java-8, and prohibited META-INF overlays are
+                # physical evidence only, never runtime resource candidates.
+                continue
             elif info.filename.endswith(".class") and not info.filename.startswith("META-INF/"):
                 classes[info.filename.removesuffix(".class")][0].append(info.filename)
-            else:
-                resources[info.filename].append({
+                access_flags = _independent_class_access_flags(content)
+                if (
+                    access_flags is not None
+                    and access_flags & ACC_MODULE
+                    and _independent_is_valid_module_descriptor(content)
+                ):
+                    valid_module_descriptors.add(info.filename)
+            elif not info.filename.endswith(".class"):
+                resource_candidates[info.filename][0].append({
                     "ordinal": ordinal,
                     "sha256": hashlib.sha256(content).hexdigest(),
                     "semantic_digest": _independent_resource_digest(info.filename, content),
                     "semantic_facts": _independent_resource_facts(info.filename, content),
                 })
         selected = {}
-        failures = []
         for name, versions in classes.items():
             eligible = [
                 version for version in versions
-                if version == 0 or (mr and version <= target_major)
+                if version == 0 or (
+                    mr and target_major >= 9 and version <= target_major
+                )
             ]
             if not eligible:
                 continue
@@ -458,10 +901,28 @@ def _archive_inventory(path: Path, target_major: int) -> dict[str, Any]:
             if len(versions[version]) != 1:
                 failures.append(f"duplicate_class:{name}:{version}")
                 continue
-            selected[name] = versions[version][0]
+            selected_entry = versions[version][0]
+            if selected_entry in valid_module_descriptors:
+                continue
+            selected[name] = selected_entry
+        resources: dict[str, list[dict[str, Any]]] = {}
+        for name, versions in resource_candidates.items():
+            eligible = [
+                version for version in versions
+                if version == 0 or (
+                    mr and target_major >= 9 and version <= target_major
+                )
+            ]
+            if not eligible:
+                continue
+            version = max(eligible)
+            if len(versions[version]) != 1:
+                failures.append(f"duplicate_resource:{name}:{version}")
+                continue
+            resources[name] = [versions[version][0]]
     return {
         "classes": selected,
-        "resources": dict(resources),
+        "resources": resources,
         "failures": failures,
         "multi_release": mr,
     }
@@ -737,6 +1198,213 @@ def _independent_xml_facts(content: bytes) -> list[list[str]]:
     return result
 
 
+_RUNTIME_PROFILE_REQUIRED_FIELDS = (
+    "target_jvm",
+    "runtime_platform_image_identity",
+    "target_os",
+    "target_arch",
+    "container_and_launcher_kind",
+    "ordered_runtime_path_entry_descriptors",
+    "loader_topology",
+    "runtime_code_source_origin_mapping_identity",
+    "runtime_security_and_package_sealing_policy_identity",
+    "active_profile_identities",
+    "external_config_snapshot_identities",
+    "agent_transformer_plugin_profile_identities",
+    "business_entrypoint_profile",
+    "runtime_class_closure_coverage_status",
+    "resource_selection_coverage_status",
+)
+
+_RUNTIME_PROFILE_SEMANTIC_IDENTITY_FIELDS = (
+    "resolved_configuration_properties",
+    "runtime_configuration_coverage_status",
+    "runtime_configuration_coverage_gaps",
+    "entrypoint_discovery_coverage_gaps",
+)
+
+_RUNTIME_PROFILE_IDENTITY_FIELDS = (
+    _RUNTIME_PROFILE_REQUIRED_FIELDS
+    + _RUNTIME_PROFILE_SEMANTIC_IDENTITY_FIELDS
+)
+
+
+def _expected_runtime_profile_identity(
+    side: Mapping[str, Any],
+    artifacts: list[dict[str, Any]],
+    *,
+    platform_identity: str,
+    jdk_home: Path,
+) -> str:
+    """Independently reconstruct the production RuntimeProfile identity."""
+    raw = dict(side.get("runtime_profile") or {})
+    release = _release_values(jdk_home)
+    java_major = _release_major(jdk_home)
+    raw["runtime_platform_image_identity"] = platform_identity
+    raw["target_jvm"] = raw.get("target_jvm") or {
+        "vendor": release.get("IMPLEMENTOR", "unknown"),
+        "version": release.get("JAVA_VERSION", "unknown"),
+        "major": java_major,
+    }
+    raw["target_os"] = raw.get("target_os") or release.get(
+        "OS_NAME", "unknown"
+    )
+    raw["target_arch"] = raw.get("target_arch") or release.get(
+        "OS_ARCH", "unknown"
+    )
+    path_descriptors = [
+        {
+            "logical_location": str(item.get("logical_location") or ""),
+            "content_sha256": str(item["sha256"]),
+            "path_kind": str(item.get("path_kind") or "classpath"),
+            "slot": int(item["slot"]),
+            "loader_realm": str(item.get("loader_realm") or ""),
+        }
+        for item in artifacts
+    ]
+    path_descriptors.sort(key=lambda item: (
+        item["loader_realm"], item["slot"], item["logical_location"],
+    ))
+    raw["ordered_runtime_path_entry_descriptors"] = path_descriptors
+    if not raw.get("runtime_code_source_origin_mapping_identity"):
+        configured_artifacts = [
+            item for item in (side.get("artifacts") or ())
+            if isinstance(item, Mapping)
+        ]
+        raw["runtime_code_source_origin_mapping_identity"] = _identity(
+            "runtime_code_source_origin_mapping_identity",
+            {
+                "origins": [
+                    {
+                        "logical_location": item["logical_location"],
+                        "origin_identity": next(
+                            str(configured.get(
+                                "runtime_code_source_origin_identity"
+                            ) or "")
+                            for configured in configured_artifacts
+                            if str(configured.get("logical_location") or "")
+                            == item["logical_location"]
+                        ),
+                    }
+                    for item in path_descriptors
+                ]
+            },
+        )
+    supplied_coverage = dict(raw.get("field_coverage") or {})
+    coverage = {
+        key: supplied_coverage.get(key) or (
+            "known" if key in raw else "unknown"
+        )
+        for key in _RUNTIME_PROFILE_REQUIRED_FIELDS
+    }
+    raw["field_coverage"] = coverage
+    policy_payload = {
+        key: raw.get(key)
+        for key in _RUNTIME_PROFILE_IDENTITY_FIELDS
+        if key != "ordered_runtime_path_entry_descriptors"
+    }
+    policy_payload["ordered_runtime_path_roles"] = [
+        {
+            "logical_location": item.get("logical_location"),
+            "path_kind": item.get("path_kind"),
+            "slot": item.get("slot"),
+            "loader_realm": item.get("loader_realm"),
+        }
+        for item in path_descriptors
+    ]
+    policy_payload["field_coverage"] = coverage
+    policy_identity = _identity(
+        "runtime_profile_policy_identity", policy_payload
+    )
+    snapshot_payload = {
+        **{
+            key: raw.get(key) for key in _RUNTIME_PROFILE_IDENTITY_FIELDS
+        },
+        "field_coverage": coverage,
+        "runtime_profile_policy_identity": policy_identity,
+    }
+    return _identity("runtime_profile_identity", snapshot_payload)
+
+
+def _attach_expected_artifact_instances(
+    artifacts: list[dict[str, Any]], runtime_profile_identity: str,
+) -> None:
+    outer_sha_cache: dict[Path, str] = {}
+    for artifact in artifacts:
+        artifact_path = Path(str(artifact["path"])).resolve()
+        outer_path = Path(str(
+            artifact.get("outer_artifact_path") or artifact_path
+        )).expanduser().resolve()
+        if not outer_path.is_file():
+            raise BinaryValidationError(
+                "BINARY_ORACLE_OUTER_ARTIFACT_MISSING", str(outer_path)
+            )
+        outer_sha = outer_sha_cache.get(outer_path)
+        if outer_sha is None:
+            outer_sha = _sha256_file(outer_path)
+            outer_sha_cache[outer_path] = outer_sha
+        payload = {
+            "outer_artifact_sha256": outer_sha,
+            "container_entry": str(
+                artifact.get("container_entry") or "<artifact>"
+            ),
+            "content_sha256": str(artifact["sha256"]),
+            "runtime_profile_identity": runtime_profile_identity,
+            "path_owner_loader_realm_identity": str(
+                artifact.get("loader_realm") or ""
+            ),
+            "runtime_path_kind": str(
+                artifact.get("path_kind") or "classpath"
+            ),
+            "runtime_classpath_index": int(artifact["slot"]),
+            "container_loader_policy_version": str(
+                artifact.get("container_loader_policy_version")
+                or "flat-parent-first-v1"
+            ),
+            "runtime_code_source_origin_identity": str(
+                artifact.get("runtime_code_source_origin_identity") or ""
+            ),
+        }
+        artifact["_expected_artifact_instance_payload"] = payload
+        artifact["_expected_artifact_instance_identity"] = _identity(
+            "artifact_instance_identity", payload
+        )
+
+
+def _final_artifact_stability(
+    artifacts_by_side: Iterable[
+        tuple[str, Iterable[Mapping[str, Any]]]
+    ],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    truth = []
+    issues = []
+    for side_name, artifacts in artifacts_by_side:
+        for artifact in artifacts:
+            path = Path(str(artifact["path"]))
+            try:
+                actual_sha256 = _sha256_file(path)
+            except OSError:
+                actual_sha256 = "MISSING_OR_UNREADABLE"
+            expected_sha256 = str(artifact["sha256"])
+            truth.append({
+                "side": side_name,
+                "loader_realm": str(artifact.get("loader_realm") or ""),
+                "slot": int(artifact["slot"]),
+                "expected_sha256": expected_sha256,
+                "actual_sha256": actual_sha256,
+            })
+            if actual_sha256 != expected_sha256:
+                issues.append(_validation_issue(
+                    "artifact_inventory",
+                    "ORACLE_ARTIFACT_CHANGED_DURING_VALIDATION",
+                    side=side_name,
+                    path=str(path),
+                    expected_sha256=expected_sha256,
+                    actual_sha256=actual_sha256,
+                ))
+    return issues, truth
+
+
 def _artifact_configs(side: Mapping[str, Any]) -> list[dict[str, Any]]:
     result = []
     seen_slots = set()
@@ -755,21 +1423,14 @@ def _artifact_configs(side: Mapping[str, Any]) -> list[dict[str, Any]]:
     return sorted(result, key=lambda item: (str(item.get("loader_realm")), int(item.get("slot"))))
 
 
-def _oracle_artifacts_for_entrypoint_realms(
+def _ordered_artifacts_for_realm(
     artifacts: Iterable[Mapping[str, Any]],
     topology: Mapping[str, Any],
-    entrypoint_realms: Iterable[str],
+    entrypoint_realm: str,
+    *,
+    require_parent_first_unnamed: bool = False,
 ) -> list[dict[str, Any]]:
-    """Flatten an equivalent parent-first URL search order for the JVM Oracle.
-
-    The helper runs in a fresh process and therefore cannot reuse production
-    loader objects. For the supported finite unnamed parent-first topology,
-    parent artifacts followed by child artifacts are observationally
-    equivalent for provider and public linkage checks. Multiple entrypoint
-    realms are accepted only when their effective artifact order is identical;
-    otherwise a single flat Oracle view would be ambiguous and must fail
-    closed rather than select one silently.
-    """
+    """Return the exact artifact-instance search order for one loader realm."""
     items = [dict(item) for item in artifacts]
     by_realm: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for item in items:
@@ -786,52 +1447,91 @@ def _oracle_artifacts_for_entrypoint_realms(
         if item.get("kind") == "platform"
     }
 
-    def effective(realm: str) -> tuple[str, ...]:
-        ordered_realms = []
+    def effective(realm: str, stack: tuple[str, ...] = ()) -> list[dict[str, Any]]:
         current = str(realm)
-        seen = set()
-        while current and current not in platform:
-            if current in seen:
-                raise BinaryValidationError(
-                    "BINARY_ORACLE_LOADER_TOPOLOGY_CYCLE", current
-                )
-            seen.add(current)
-            config = realms.get(current)
-            if not config:
-                raise BinaryValidationError(
-                    "BINARY_ORACLE_LOADER_REALM_MISSING", current
-                )
-            if (
-                config.get("delegation", "parent_first") != "parent_first"
-                or config.get("module_mode", "unnamed") != "unnamed"
-            ):
-                raise BinaryValidationError(
-                    "BINARY_ORACLE_LOADER_TOPOLOGY_UNSUPPORTED", current
-                )
-            ordered_realms.append(current)
-            current = str(config.get("parent") or "")
-        if current not in platform:
+        if current in platform:
+            return []
+        if current in stack:
+            raise BinaryValidationError(
+                "BINARY_ORACLE_LOADER_TOPOLOGY_CYCLE", current
+            )
+        config = realms.get(current)
+        if not config:
+            raise BinaryValidationError(
+                "BINARY_ORACLE_LOADER_REALM_MISSING", current
+            )
+        delegation = str(config.get("delegation") or "parent_first")
+        module_mode = str(config.get("module_mode") or "unnamed")
+        if module_mode != "unnamed" or delegation not in {
+            "parent_first", "child_first",
+        }:
+            raise BinaryValidationError(
+                "BINARY_ORACLE_LOADER_TOPOLOGY_UNSUPPORTED", current
+            )
+        if require_parent_first_unnamed and delegation != "parent_first":
+            raise BinaryValidationError(
+                "BINARY_ORACLE_LOADER_TOPOLOGY_UNSUPPORTED", current
+            )
+        parent = str(config.get("parent") or "")
+        if not parent:
             raise BinaryValidationError(
                 "BINARY_ORACLE_PLATFORM_REALM_UNREACHABLE", str(realm)
             )
-        ordered_realms.reverse()
-        return tuple(
-            item["path"]
-            for identity in ordered_realms
-            for item in by_realm.get(identity, ())
+        parent_items = effective(parent, (*stack, current))
+        own_items = list(by_realm.get(current, ()))
+        return (
+            [*parent_items, *own_items]
+            if delegation == "parent_first"
+            else [*own_items, *parent_items]
         )
 
+    return effective(str(entrypoint_realm))
+
+
+def _oracle_artifacts_for_entrypoint_realms(
+    artifacts: Iterable[Mapping[str, Any]],
+    topology: Mapping[str, Any],
+    entrypoint_realms: Iterable[str],
+) -> list[dict[str, Any]]:
+    """Flatten an equivalent parent-first URL search order for the JVM Oracle.
+
+    Multiple entrypoint realms are accepted only when their exact artifact
+    instance order is identical. Paths alone are insufficient because the
+    same file may be mounted in more than one loader realm.
+    """
+    items = [dict(item) for item in artifacts]
+
+    def location(item: Mapping[str, Any]) -> tuple[str, int]:
+        return (
+            str(item.get("loader_realm") or ""),
+            int(item.get("slot") or 0),
+        )
+
+    by_location = {location(item): item for item in items}
+    if len(by_location) != len(items):
+        raise BinaryValidationError(
+            "BINARY_ORACLE_RUNTIME_SLOT_DUPLICATE",
+            "duplicate loader realm/runtime slot",
+        )
     effective_orders = {
-        effective(str(realm)) for realm in entrypoint_realms if str(realm)
+        tuple(location(item) for item in _ordered_artifacts_for_realm(
+            items,
+            topology,
+            str(realm),
+            require_parent_first_unnamed=True,
+        ))
+        for realm in entrypoint_realms if str(realm)
     }
     if len(effective_orders) != 1:
         raise BinaryValidationError(
             "BINARY_ORACLE_ENTRYPOINT_REALM_ORDER_AMBIGUOUS",
-            json.dumps(sorted(map(list, effective_orders)), ensure_ascii=False),
+            json.dumps(
+                [list(map(list, order)) for order in sorted(effective_orders)],
+                ensure_ascii=False,
+            ),
         )
     order = next(iter(effective_orders))
-    by_path = {item["path"]: item for item in items}
-    return [by_path[path] for path in order]
+    return [by_location[item] for item in order]
 
 
 def _compile_oracle(
@@ -840,6 +1540,7 @@ def _compile_oracle(
     *,
     timeout_seconds: float = 60,
     max_attempts: int = 1,
+    phase_deadline: float | None = None,
 ) -> str:
     destination.mkdir(parents=True, exist_ok=True)
     javac = jdk_tool_path(jdk_home, "javac")
@@ -847,12 +1548,24 @@ def _compile_oracle(
     attempt_limit = max(int(max_attempts), 1)
     attempts_made = 0
     for attempt in range(1, attempt_limit + 1):
+        remaining = (
+            phase_deadline - time.perf_counter()
+            if phase_deadline is not None else None
+        )
+        if remaining is not None and remaining <= 0.01:
+            raise BinaryValidationError(
+                "BINARY_ORACLE_RUNTIME_PHASE_TIME_BUDGET_EXCEEDED",
+                "runtime Oracle phase budget exhausted during helper compilation",
+            )
         attempts_made = attempt
         completed = execute_binary_tool(
             [str(javac), "-encoding", "UTF-8", "-source", "8", "-target", "8", "-d", str(destination), str(ORACLE_SOURCE)],
             stage="binary_oracle.compile",
             reason_prefix="BINARY_ORACLE_COMPILE",
-            timeout_seconds=timeout_seconds,
+            timeout_seconds=(
+                min(timeout_seconds, remaining)
+                if remaining is not None else timeout_seconds
+            ),
         )
         if completed.succeeded:
             break
@@ -892,11 +1605,18 @@ def _observe_classes(
     *,
     compile_timeout_seconds: float = 60,
     runtime_timeout_seconds: float = 300,
+    phase_time_budget_seconds: float | None = None,
     max_attempts: int = 1,
     progress_callback: ValidationProgressCallback | None = None,
     progress_label: str = "",
     string_pool: dict[str, str] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], str]:
+    phase_deadline = (
+        time.perf_counter() + float(phase_time_budget_seconds)
+        if phase_time_budget_seconds is not None
+        and float(phase_time_budget_seconds) > 0
+        else None
+    )
     with short_temporary_directory(prefix="runtime-oracle") as temp_text:
         temp = Path(temp_text)
         helper_identity = _compile_oracle(
@@ -904,6 +1624,7 @@ def _observe_classes(
             temp / "helper",
             timeout_seconds=compile_timeout_seconds,
             max_attempts=max_attempts,
+            phase_deadline=phase_deadline,
         )
         classpath_file = temp / "classpath.txt"
         classpath_file.write_text(
@@ -928,6 +1649,22 @@ def _observe_classes(
             attempts_made = 0
             retryable = False
             for attempt in range(1, attempt_limit + 1):
+                remaining = (
+                    phase_deadline - time.perf_counter()
+                    if phase_deadline is not None else None
+                )
+                if remaining is not None and remaining <= 0.01:
+                    raise BinaryValidationError(
+                        "BINARY_ORACLE_RUNTIME_PHASE_TIME_BUDGET_EXCEEDED",
+                        json.dumps({
+                            "completed_observation_count": len(observations),
+                            "pending_observation_count": len(pending),
+                            "batch_first_class": batch[0] if batch else "",
+                            "phase_time_budget_seconds": (
+                                phase_time_budget_seconds
+                            ),
+                        }, ensure_ascii=False),
+                    )
                 attempts_made = attempt
                 completed = execute_binary_tool(
                     [
@@ -937,7 +1674,10 @@ def _observe_classes(
                     ],
                     stage="binary_oracle.runtime_observation",
                     reason_prefix="BINARY_ORACLE_EXECUTION",
-                    timeout_seconds=runtime_timeout_seconds,
+                    timeout_seconds=(
+                        min(runtime_timeout_seconds, remaining)
+                        if remaining is not None else runtime_timeout_seconds
+                    ),
                     require_stdout=True,
                 )
                 if not completed.succeeded:
@@ -1162,152 +1902,53 @@ def _opcode_name(value: int) -> str:
     }.get(int(value), f"opcode-{value}")
 
 
-_ORACLE_CLASS_DECLARATION = re.compile(
-    r"^(?:[\w$]+\s+)*(?:class|interface|enum|record)\s+([\w.$]+)"
-)
-_ORACLE_MEMBER_HEADER = re.compile(r"^ {2}(?! )(.+);\s*$")
-_ORACLE_INSTRUCTION = re.compile(r"^\s*(\d+):\s+([a-z][a-z0-9_]*)\b(.*)$")
-
-
 def _parse_javap_structural(output: str) -> dict[str, Any]:
-    owner = ""
-    member_name = ""
-    descriptor = ""
-    pending_member: tuple[str, str, int] | None = None
-    type_edges = set()
-    init_edges = set()
-    clinit_classes = set()
-    semantic_instructions = set()
-    declared_members = set()
-
-    def access_flags(header: str) -> int:
-        tokens = set(header.replace("(", " ").split())
-        flags = 0
-        for token, value in (
-            ("public", 0x0001), ("private", 0x0002),
-            ("protected", 0x0004), ("static", 0x0008),
-            ("final", 0x0010), ("abstract", 0x0400),
-        ):
-            if token in tokens:
-                flags |= value
-        return flags
-    for line in output.splitlines():
-        declaration = _ORACLE_CLASS_DECLARATION.match(line)
-        if declaration:
-            owner = declaration.group(1).replace(".", "/")
-            continue
-        header = _ORACLE_MEMBER_HEADER.match(line)
-        if header and owner:
-            value = header.group(1).strip()
-            if value == "static {}":
-                member_name = "<clinit>"
-                descriptor = "()V"
-                clinit_classes.add(owner)
-                declared_members.add((owner, "method", member_name, descriptor, 0x0008))
-                pending_member = None
-            elif "(" in value:
-                before = value.split("(", 1)[0].split()[-1].strip('"')
-                simple = owner.rsplit("/", 1)[-1]
-                member_name = "<init>" if before in {simple, owner.replace("/", ".")} else before
-                descriptor = ""
-                pending_member = ("method", member_name, access_flags(value))
-            else:
-                field_name = value.split("=", 1)[0].split()[-1].strip('"')
-                pending_member = ("field", field_name, access_flags(value))
-            continue
-        stripped = line.strip()
-        if stripped.startswith("descriptor:") and pending_member:
-            descriptor = stripped.split(":", 1)[1].strip()
-            member_kind, member_name, member_flags = pending_member
-            declared_members.add(
-                (owner, member_kind, member_name, descriptor, member_flags)
-            )
-            pending_member = None
-            continue
-        instruction = _ORACLE_INSTRUCTION.match(line)
-        if not instruction or not owner or not member_name or not descriptor:
-            continue
-        bci = int(instruction.group(1))
-        opcode = instruction.group(2)
-        rest = instruction.group(3)
-        comment = rest.split("//", 1)[1].strip() if "//" in rest else ""
-        semantic_instructions.add((
-            owner, member_name, descriptor, bci, opcode, comment,
-        ))
-        target = ""
-        class_match = re.match(r"class\s+\"?([^\"\s]+)\"?", comment)
-        if class_match:
-            target = class_match.group(1)
-            # Keep the constant-pool class name exactly as javap renders it.
-            # CHECKCAST and MULTIANEWARRAY may target an array descriptor (for
-            # example ``[Ljava/lang/String;``). ASM exposes that same value to
-            # the production extractor, so reducing it to the element type
-            # would make this independent oracle validate the wrong JVM fact.
-        if opcode in {"new", "anewarray", "checkcast", "instanceof", "multianewarray"}:
-            if target:
-                type_edges.add((owner, member_name, descriptor, bci, target, opcode))
-        elif opcode in {"ldc", "ldc_w"} and target:
-            type_edges.add((owner, member_name, descriptor, bci, target, "class_literal"))
-        if opcode in {"invokestatic", "getstatic", "putstatic"}:
-            reference = re.match(
-                r"(?:InterfaceMethod|Method|Field)\s+(?:(?P<owner>[\w/$]+)\.)?",
-                comment,
-            )
-            target_owner = (reference.group("owner") if reference else None) or owner
-            init_edges.add((owner, member_name, descriptor, bci, target_owner, opcode))
-        elif opcode == "new" and target:
-            init_edges.add((owner, member_name, descriptor, bci, target, "new"))
-    return {
-        "type_edges": type_edges,
-        "class_init_edges": init_edges,
-        "clinit_classes": clinit_classes,
-        "semantic_instructions": semantic_instructions,
-        "declared_members": declared_members,
-    }
+    """Compatibility entry point for focused parser tests/integrations."""
+    return parse_structural_javap(output)
 
 
 def _scan_structural_edges(
     artifact: Path, inventory: Mapping[str, Any], javap: str
 ) -> dict[str, Any]:
+    """Run the same stable/raw-bound javap observation as the direct oracle.
+
+    This path is a fallback only when no shared direct scan was supplied.  It
+    must not silently regress to locale-dependent javap text or a header-only
+    parser, because legal JVM owner/member/descriptor characters are exactly
+    where that older path diverged from production facts.
+    """
     combined = {
         "type_edges": set(), "class_init_edges": set(),
         "clinit_classes": set(), "semantic_instructions": set(),
         "declared_members": set(),
     }
-    failures = []
-    with short_temporary_directory(prefix="structural-oracle") as temp_text:
-        temp = Path(temp_text)
-        try:
-            archive = zipfile.ZipFile(artifact)
-        except (OSError, zipfile.BadZipFile) as error:
-            return {**combined, "failures": [str(error)]}
-        with archive:
-            pending = []
-            for index, (class_name, entry) in enumerate(sorted(inventory["classes"].items())):
-                class_path = temp / f"class-{index:06d}.class"
-                class_path.write_bytes(archive.read(entry))
-                pending.append((entry, class_path))
-            for offset in range(0, len(pending), 256):
-                batch = pending[offset:offset + 256]
-                completed = execute_binary_tool(
-                    [
-                        javap, "-c", "-p", "-s",
-                        *[str(class_path) for _entry, class_path in batch],
-                    ],
-                    stage="binary_oracle.structural_javap",
-                    reason_prefix="BINARY_ORACLE_JAVAP",
-                    timeout_seconds=120,
-                    require_stdout=True,
-                )
-                if not completed.succeeded:
-                    failures.append(
-                        f"{batch[0][0]}..{batch[-1][0]}:"
-                        f"{json.dumps(completed.failure.to_mapping(), ensure_ascii=False)}"
-                    )
-                    continue
-                parsed = _parse_javap_structural(completed.stdout)
-                for key in combined:
-                    combined[key].update(parsed[key])
+    scanned = scan_final_artifact(
+        artifact,
+        javap=javap,
+        max_workers=1,
+        include_nested_runtime_jars=False,
+        include_structural_facts=True,
+        cache_result=False,
+    )
+    failures = [str(item) for item in scanned.get("failures") or ()]
+    if not scanned.get("complete") and not failures:
+        failures.append("structural_fallback_scan_incomplete")
+    structural = scanned.get("structural_facts") or {}
+    observed_classes = set(structural.get("class_names") or ())
+    expected_classes = {
+        str(name) for name in inventory.get("classes", {})
+    }
+    if observed_classes != expected_classes:
+        failures.append(
+            "structural_fallback_class_universe_mismatch:"
+            f"expected={sorted(expected_classes)!r}:"
+            f"observed={sorted(observed_classes)!r}"
+        )
+    for key in combined:
+        for value in structural.get(key) or ():
+            combined[key].add(
+                tuple(value) if isinstance(value, list) else value
+            )
     return {**combined, "failures": failures}
 
 
@@ -1326,49 +1967,126 @@ def _validate_structural_edges(
     progress_label: str = "",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     issues = []
-    instance_by_sha_slot = {
-        (row["content_sha256"], int(row["runtime_classpath_index"])):
-            row["artifact_instance_identity"]
-        for row in connection.execute(
-            """
-            SELECT artifact_instance_identity,content_sha256,runtime_classpath_index
-            FROM artifact_instances
-            """
-        )
-    }
+    instance_by_location, binding_issues = _artifact_instance_bindings(
+        connection, artifacts, domain="structural_edge"
+    )
+    issues.extend(binding_issues)
     production_type = defaultdict(set)
     production_init = defaultdict(set)
     for edge in connection.execute(
         """
         SELECT e.caller_artifact_instance_identity,e.bytecode_offset,
-               e.symbolic_owner,e.edge_kind,e.edge_json,
+               e.symbolic_owner,e.symbolic_name,e.symbolic_descriptor,
+               e.edge_kind,e.opcode,e.edge_json,
                m.class_name AS caller_class_name,
                m.member_name AS caller_member_name,
                m.descriptor AS caller_descriptor
         FROM direct_edges AS e
         JOIN members AS m ON m.member_identity=e.caller_member_identity
-        WHERE e.edge_kind IN ('type','class_init')
+        WHERE e.edge_kind IN (
+            'type','class_init','method','field','invokedynamic_bootstrap',
+            'ldc_constant_dynamic_bootstrap','ldc_handle'
+        )
+           OR e.edge_kind LIKE 'invokedynamic_handle_%'
+           OR e.edge_kind LIKE 'ldc_bootstrap_handle_%'
         """
     ):
-        common = (
+        caller = (
             edge["caller_class_name"], edge["caller_member_name"],
             edge["caller_descriptor"],
-            int(edge["bytecode_offset"]), edge["symbolic_owner"],
+            int(edge["bytecode_offset"]),
         )
         payload = json.loads(edge["edge_json"])
         if edge["edge_kind"] == "type":
-            production_type[edge["caller_artifact_instance_identity"]].add(
-                (*common, str(payload.get("type_use_kind") or "type_instruction"))
-            )
+            production_type[
+                edge["caller_artifact_instance_identity"]
+            ].add((
+                *caller, edge["symbolic_owner"],
+                str(payload.get("type_use_kind") or "type_instruction"),
+            ))
         elif edge["edge_kind"] == "class_init":
             production_init[edge["caller_artifact_instance_identity"]].add(
-                (*common, str(payload.get("trigger_kind") or ""))
+                (
+                    *caller, edge["symbolic_owner"],
+                    str(payload.get("trigger_kind") or ""),
+                )
             )
+        else:
+            declared_owners = payload.get(
+                LOADING_CONSTRAINT_TYPE_OWNERS_KEY
+            )
+            if declared_owners is None:
+                continue
+            if (
+                not isinstance(declared_owners, list)
+                or not declared_owners
+                or any(
+                    not isinstance(item, str) or not item
+                    for item in declared_owners
+                )
+                or tuple(declared_owners)
+                != tuple(sorted(set(declared_owners)))
+            ):
+                issues.append(_validation_issue(
+                    "structural_edge",
+                    "ORACLE_LOADING_CONSTRAINT_DECLARATION_INVALID",
+                    artifact_instance_identity=edge[
+                        "caller_artifact_instance_identity"
+                    ],
+                    caller=caller,
+                    edge_kind=edge["edge_kind"],
+                ))
+                continue
+            if edge["edge_kind"] == "method":
+                reference_kind = (
+                    "interface_method"
+                    if bool(payload.get("interface")) else "method"
+                )
+            elif edge["edge_kind"] == "field":
+                reference_kind = "field"
+            else:
+                handle = (
+                    payload.get("bootstrap") or {}
+                    if edge["edge_kind"] == "invokedynamic_bootstrap"
+                    else payload
+                )
+                try:
+                    tag = int(handle.get("tag") or 0)
+                except (AttributeError, TypeError, ValueError):
+                    tag = 0
+                reference_kind = (
+                    METHOD_HANDLE_REFERENCE_KIND_BY_TAG.get(tag) or ""
+                )
+                if not reference_kind:
+                    issues.append(_validation_issue(
+                        "structural_edge",
+                        "ORACLE_LOADING_CONSTRAINT_REFERENCE_KIND_INVALID",
+                        artifact_instance_identity=edge[
+                            "caller_artifact_instance_identity"
+                        ],
+                        caller=caller,
+                        edge_kind=edge["edge_kind"],
+                        tag=tag,
+                    ))
+                    continue
+            production = production_type[
+                edge["caller_artifact_instance_identity"]
+            ]
+            for referenced_owner in declared_owners:
+                production.add((
+                    *caller, referenced_owner,
+                    "member_reference_descriptor",
+                    str(edge["symbolic_owner"]),
+                    str(edge["symbolic_name"]),
+                    str(edge["symbolic_descriptor"]),
+                    reference_kind,
+                ))
     truth_type = []
     truth_init = []
     semantic_instructions = []
     clinit_classes = set()
     declared_members = set()
+    declared_members_by_artifact = []
     artifact_count = len(artifacts)
     _notify_progress(
         progress_callback,
@@ -1380,8 +2098,11 @@ def _validate_structural_edges(
     for artifact_index, (artifact, inventory) in enumerate(
         zip(artifacts, inventories), start=1,
     ):
-        instance_identity = instance_by_sha_slot.get(
-            (artifact["sha256"], int(artifact["slot"]))
+        instance_identity = instance_by_location.get(
+            (
+                str(artifact.get("loader_realm") or ""),
+                int(artifact["slot"]),
+            )
         )
         if not instance_identity:
             continue
@@ -1418,21 +2139,43 @@ def _validate_structural_edges(
                 and direct_scan is not direct_scan_payload
             ):
                 direct_scan_cache[direct_scan_key] = direct_scan
-            if (
+            if direct_scan is not None and not direct_scan.complete:
+                # The shared javap observation already failed closed (most
+                # often because the phase-wide deadline expired). Starting an
+                # unbudgeted structural fallback here would multiply Step4
+                # runtime after activation is already impossible.
+                scanned = _StructuralTruth(
+                    type_edges=frozenset(),
+                    class_init_edges=frozenset(),
+                    clinit_classes=frozenset(),
+                    semantic_instructions=frozenset(),
+                    declared_members=frozenset(),
+                    failures=direct_scan.failures or (
+                        "shared_direct_oracle_scan_incomplete",
+                    ),
+                )
+            elif (
                 direct_scan
                 and direct_scan.complete
                 and direct_scan.structural_class_names
-                == {
-                    name for name in inventory["classes"]
-                    if name != "module-info"
-                }
+                == set(inventory["classes"])
             ):
                 # Both validators parse the same immutable javap observation
                 # with separate parsers. Reuse only when the observed class
                 # universe is exactly the independent archive inventory;
-                # fat/nested layouts or any partial scan automatically take
-                # the original fallback path.
+                # any disagreement is itself incomplete independent truth.
                 scanned = direct_scan.structural_truth
+            elif direct_scan is not None:
+                scanned = _StructuralTruth(
+                    type_edges=frozenset(),
+                    class_init_edges=frozenset(),
+                    clinit_classes=frozenset(),
+                    semantic_instructions=frozenset(),
+                    declared_members=frozenset(),
+                    failures=(
+                        "shared_direct_oracle_class_universe_mismatch",
+                    ),
+                )
             else:
                 raw_scanned = _scan_structural_edges(
                     artifact_path, inventory, javap
@@ -1460,7 +2203,11 @@ def _validate_structural_edges(
                     scanned = _StructuralTruth(
                         type_edges=frozenset(
                             compact_tuple(
-                                (*item[:5], _OPCODE_TO_TYPE_USE[item[5]])
+                                (
+                                    *item[:5],
+                                    _OPCODE_TO_TYPE_USE[item[5]],
+                                    *item[6:],
+                                )
                             )
                             for item in raw_scanned["type_edges"]
                         ),
@@ -1495,6 +2242,10 @@ def _validate_structural_edges(
         truth_i = scanned.class_init_edges
         semantic_instructions.extend(sorted(scanned.semantic_instructions))
         declared_members.update(scanned.declared_members)
+        declared_members_by_artifact.append({
+            "artifact_instance_identity": instance_identity,
+            "members": [list(item) for item in sorted(scanned.declared_members)],
+        })
         # Production names the trigger, not the opcode mnemonic, identically for
         # the supported active-use opcodes.
         actual_t = production_type.get(instance_identity, set())
@@ -1531,6 +2282,7 @@ def _validate_structural_edges(
         "clinit_classes": sorted(clinit_classes),
         "semantic_instructions": sorted(semantic_instructions),
         "declared_members": sorted(declared_members),
+        "declared_members_by_artifact": declared_members_by_artifact,
     }
 
 
@@ -1541,7 +2293,7 @@ def _rows(connection: sqlite3.Connection, table: str) -> list[dict[str, Any]]:
 def _pack_oracle_scan(result: Mapping[str, Any]) -> bytes:
     """Keep reusable javap evidence compact between independent validators."""
     return zlib.compress(
-        json.dumps(
+        surrogate_safe_json_dumps(
             result,
             ensure_ascii=False,
             sort_keys=True,
@@ -1564,7 +2316,61 @@ _OPCODE_TO_TYPE_USE = {
     "instanceof": "instanceof",
     "multianewarray": "multianewarray",
     "class_literal": "class_literal",
+    "method_type_descriptor": "method_type_descriptor",
+    "bootstrap_class_constant": "bootstrap_class_constant",
+    "invokedynamic_callsite_descriptor": "invokedynamic_callsite_descriptor",
+    "constant_dynamic_descriptor": "constant_dynamic_descriptor",
+    "method_handle_descriptor": "method_handle_descriptor",
+    "member_reference_descriptor": "member_reference_descriptor",
 }
+
+_ORACLE_LINKAGE_EDGE_FAMILIES = frozenset({
+    "invokedynamic",
+    "ldc_constant_dynamic_bootstrap",
+    "ldc_bootstrap_handle",
+    "ldc_handle",
+})
+_ORACLE_DIRECT_REFERENCE_KINDS_BY_OPCODE = {
+    "getstatic": frozenset({"field"}),
+    "putstatic": frozenset({"field"}),
+    "getfield": frozenset({"field"}),
+    "putfield": frozenset({"field"}),
+    "invokevirtual": frozenset({"method"}),
+    "invokespecial": frozenset({"method", "interface_method"}),
+    "invokestatic": frozenset({"method", "interface_method"}),
+    "invokeinterface": frozenset({"interface_method"}),
+}
+_ORACLE_DIRECT_METHOD_REFERENCE_KINDS = frozenset({
+    "method", "interface_method",
+})
+_ORACLE_DIRECT_EDGE_TUPLE_SIZE = 9
+
+
+def _incomplete_oracle_scan_evidence(
+    artifact_sha256: str,
+    failures: Iterable[str],
+) -> _OracleScanEvidence:
+    normalized_failures = tuple(str(item) for item in failures)
+    return _OracleScanEvidence(
+        artifact_sha256=artifact_sha256,
+        complete=False,
+        failures=normalized_failures,
+        direct_truth=_DirectEdgeTruth(
+            artifact_sha256=artifact_sha256,
+            direct_edges=frozenset(),
+            dynamic_handle_edges=frozenset(),
+            discovery_classes=frozenset(),
+        ),
+        structural_truth=_StructuralTruth(
+            type_edges=frozenset(),
+            class_init_edges=frozenset(),
+            clinit_classes=frozenset(),
+            semantic_instructions=frozenset(),
+            declared_members=frozenset(),
+            failures=normalized_failures,
+        ),
+        structural_class_names=frozenset(),
+    )
 
 
 def _normalize_oracle_scan(
@@ -1574,7 +2380,7 @@ def _normalize_oracle_scan(
     """Project a scanner result once into all facts consumed by validation."""
     if isinstance(result, _OracleScanEvidence):
         return result
-    unpacked = _unpack_oracle_scan(result)
+    unpacked = transport_jvm_value(_unpack_oracle_scan(result))
     artifact_sha256 = str(unpacked.get("artifact_sha256") or "")
     complete = bool(unpacked.get("complete"))
     failures = tuple(str(item) for item in (unpacked.get("failures") or ()))
@@ -1582,27 +2388,43 @@ def _normalize_oracle_scan(
         # Partial rows are not authoritative and historically were rejected
         # before normalization. Keep that fail-closed order, and do not spend
         # time or memory projecting evidence that no validator may consume.
-        return _OracleScanEvidence(
-            artifact_sha256=artifact_sha256,
-            complete=False,
-            failures=failures,
-            direct_truth=_DirectEdgeTruth(
-                artifact_sha256=artifact_sha256,
-                direct_edges=frozenset(),
-                dynamic_handle_edges=frozenset(),
-                discovery_classes=frozenset(),
-            ),
-            structural_truth=_StructuralTruth(
-                type_edges=frozenset(),
-                class_init_edges=frozenset(),
-                clinit_classes=frozenset(),
-                semantic_instructions=frozenset(),
-                declared_members=frozenset(),
-                failures=failures,
-            ),
-            structural_class_names=frozenset(),
-        )
+        return _incomplete_oracle_scan_evidence(artifact_sha256, failures)
     rows = unpacked.get("edges") or ()
+    invalid_linkage_rows = [
+        row
+        for row in rows
+        if row.get("opcode_family") in _ORACLE_LINKAGE_EDGE_FAMILIES
+        and (
+            row.get("reference_kind") not in METHOD_HANDLE_REFERENCE_KINDS
+            or type(row.get("reference_interface")) is not bool
+        )
+    ]
+    if invalid_linkage_rows:
+        return _incomplete_oracle_scan_evidence(
+            artifact_sha256,
+            (*failures, "oracle_dynamic_reference_kind_missing_or_invalid"),
+        )
+    invalid_direct_rows = []
+    for row in rows:
+        opcode = row.get("opcode_family")
+        if opcode in _ORACLE_LINKAGE_EDGE_FAMILIES:
+            continue
+        reference_kind = row.get("reference_kind")
+        allowed_kinds = _ORACLE_DIRECT_REFERENCE_KINDS_BY_OPCODE.get(opcode)
+        invalid = allowed_kinds is None or reference_kind not in allowed_kinds
+        if allowed_kinds and "field" not in allowed_kinds:
+            invalid = invalid or (
+                type(row.get("reference_interface")) is not bool
+                or row.get("reference_interface")
+                is not (reference_kind == "interface_method")
+            )
+        if invalid:
+            invalid_direct_rows.append(row)
+    if invalid_direct_rows:
+        return _incomplete_oracle_scan_evidence(
+            artifact_sha256,
+            (*failures, "oracle_direct_reference_kind_missing_or_invalid"),
+        )
 
     def compact_tuple(value: Iterable[Any]) -> tuple[Any, ...]:
         normalized = tuple(value)
@@ -1630,19 +2452,23 @@ def _normalize_oracle_scan(
                 row["caller_descriptor"], row["callee_owner"],
                 row["callee_member"], row["callee_descriptor"],
                 row["opcode_family"], int(row["instruction_offset"]),
+                row["reference_kind"],
             ))
             for row in rows
-            if row.get("opcode_family") != "invokedynamic"
+            if row.get("opcode_family") not in _ORACLE_LINKAGE_EDGE_FAMILIES
         ),
         dynamic_handle_edges=frozenset(
             compact_tuple((
                 row["caller_owner"], row["caller_member"],
                 row["caller_descriptor"], row["callee_owner"],
                 row["callee_member"], row["callee_descriptor"],
+                row["reference_kind"],
+                row["reference_interface"],
+                row["opcode_family"],
                 int(row["instruction_offset"]),
             ))
             for row in rows
-            if row.get("opcode_family") == "invokedynamic"
+            if row.get("opcode_family") in _ORACLE_LINKAGE_EDGE_FAMILIES
         ),
         discovery_classes=frozenset(
             (
@@ -1659,7 +2485,9 @@ def _normalize_oracle_scan(
     structural = unpacked.get("structural_facts") or {}
     structural_truth = _StructuralTruth(
         type_edges=frozenset(
-            compact_tuple((*item[:5], _OPCODE_TO_TYPE_USE[item[5]]))
+            compact_tuple((
+                *item[:5], _OPCODE_TO_TYPE_USE[item[5]], *item[6:],
+            ))
             for item in (structural.get("type_edges") or ())
         ),
         class_init_edges=frozenset(
@@ -1754,6 +2582,70 @@ def _compact_observations(
                 payload
             )
     return compacted
+
+
+def _attach_provider_declared_members(
+    artifacts: Iterable[Mapping[str, Any]],
+    edge_truth: Mapping[str, Any],
+    observations: Mapping[str, dict[str, Any]],
+    string_pool: dict[str, str],
+) -> None:
+    """Attach javap fallback members only from the JVM-selected provider."""
+    artifact_path_by_identity = {
+        str(item.get("_expected_artifact_instance_identity") or ""):
+        Path(str(item["path"])).resolve()
+        for item in artifacts
+    }
+    javap_members_by_path: dict[
+        Path, dict[str, list[str]]
+    ] = defaultdict(lambda: defaultdict(list))
+    for artifact_members in (
+        edge_truth.get("declared_members_by_artifact") or ()
+    ):
+        artifact_path = artifact_path_by_identity.get(str(
+            artifact_members.get("artifact_instance_identity") or ""
+        ))
+        if artifact_path is None:
+            continue
+        for owner, kind, member_name, descriptor, flags in (
+            artifact_members.get("members") or ()
+        ):
+            javap_members_by_path[artifact_path][str(owner)].append(
+                f"{kind}|{member_name}|{descriptor}|{int(flags)}"
+            )
+    if not javap_members_by_path:
+        # Compatibility for isolated unit fixtures that construct pre-v3
+        # truth directly. Production validation always carries exact
+        # artifact-instance provenance from the structural pass.
+        fallback_members: dict[str, list[str]] = defaultdict(list)
+        for owner, kind, member_name, descriptor, flags in (
+            edge_truth.get("declared_members") or ()
+        ):
+            fallback_members[str(owner)].append(
+                f"{kind}|{member_name}|{descriptor}|{int(flags)}"
+            )
+        for class_name, values in fallback_members.items():
+            observation = observations.get(class_name)
+            if observation is not None:
+                observation["javap_declared_members"] = tuple(
+                    _pooled_string(value, string_pool)
+                    for value in sorted(set(values))
+                )
+        return
+    for class_name, observation in observations.items():
+        provider_path = _provider_resource_path(
+            _oracle_provider_location(observation)
+        )
+        if provider_path is None:
+            continue
+        values = javap_members_by_path.get(
+            provider_path.resolve(), {}
+        ).get(class_name, ())
+        if values:
+            observation["javap_declared_members"] = tuple(
+                _pooled_string(value, string_pool)
+                for value in sorted(set(values))
+            )
 
 
 def _share_equal_observation_values(
@@ -2160,10 +3052,41 @@ def _validate_entrypoint_discovery(
     issues = []
     candidate_activation_gaps = set()
     sidecar = _load_json(generation / "binary_entrypoints.json")
-    profile = (current_side.get("runtime_profile") or {}).get(
-        "business_entrypoint_profile"
-    ) or {}
-    topology = (current_side.get("runtime_profile") or {}).get("loader_topology") or {}
+    runtime_profile = current_side.get("runtime_profile") or {}
+    profile = runtime_profile.get("business_entrypoint_profile")
+    if profile is None:
+        profile = {}
+    declared_coverage_gaps: set[str] = set()
+
+    def import_declared_gaps(raw: Any, *, invalid_gap: str) -> None:
+        if raw is None:
+            return
+        if not isinstance(raw, (list, tuple)):
+            declared_coverage_gaps.add(invalid_gap)
+            return
+        declared_coverage_gaps.update(
+            str(value or "").strip()
+            for value in raw
+            if str(value or "").strip()
+        )
+
+    import_declared_gaps(
+        runtime_profile.get("entrypoint_discovery_coverage_gaps"),
+        invalid_gap="entrypoint_discovery_coverage_gaps_invalid",
+    )
+    if isinstance(profile, Mapping):
+        import_declared_gaps(
+            profile.get("coverage_gaps"),
+            invalid_gap="declared_entrypoint_coverage_gaps_invalid",
+        )
+        if profile.get("coverage_status") not in {None, "complete"}:
+            declared_coverage_gaps.add(
+                "declared_entrypoint_coverage_incomplete"
+            )
+    else:
+        profile = {}
+        declared_coverage_gaps.add("entrypoint_profile_invalid")
+    topology = runtime_profile.get("loader_topology") or {}
     non_platform_realms = sorted({
         str(item.get("identity") or "")
         for item in topology.get("realms") or ()
@@ -2264,7 +3187,9 @@ def _validate_entrypoint_discovery(
             "spring-boot-executable-jar",
         }
         or any(
-            str(edge[3]).replace("/", ".")
+            len(edge) == _ORACLE_DIRECT_EDGE_TUPLE_SIZE
+            and str(edge[8]) in _ORACLE_DIRECT_METHOD_REFERENCE_KINDS
+            and str(edge[3]).replace("/", ".")
             == "org.springframework.boot.SpringApplication"
             and str(edge[4]) == "run"
             and business_owned(observations.get(str(edge[0]).replace(".", "/")) or {})
@@ -2740,6 +3665,34 @@ def _validate_entrypoint_discovery(
             missing=sorted(expected_exact - actual_exact),
             extra=sorted(actual_exact - expected_exact),
         ))
+    attested_coverage_gaps = {
+        str(value or "").strip()
+        for value in sidecar.get("coverage_gaps") or ()
+        if str(value or "").strip()
+    }
+    missing_declared_gaps = sorted(
+        declared_coverage_gaps - attested_coverage_gaps
+    )
+    if missing_declared_gaps:
+        issues.append(_validation_issue(
+            "entrypoint_discovery",
+            "ORACLE_ENTRYPOINT_DECLARED_COVERAGE_GAP_MISSING",
+            missing=missing_declared_gaps,
+        ))
+    attested_coverage_status = str(
+        sidecar.get("coverage_status")
+        or ("partial" if attested_coverage_gaps else "complete")
+    )
+    expected_attested_status = (
+        "partial" if attested_coverage_gaps else "complete"
+    )
+    if attested_coverage_status != expected_attested_status:
+        issues.append(_validation_issue(
+            "entrypoint_discovery",
+            "ORACLE_ENTRYPOINT_COVERAGE_ATTESTATION_INVALID",
+            expected=expected_attested_status,
+            actual=attested_coverage_status,
+        ))
     return issues, {
         "exact_entrypoints": [list(item) for item in sorted(expected_exact)],
         "exact_entrypoint_count": len(expected_exact),
@@ -2801,6 +3754,196 @@ def _validation_issue(domain: str, code: str, **evidence: Any) -> dict[str, Any]
     return {"domain": domain, "reason_code": code, "evidence": evidence}
 
 
+def _artifact_instance_bindings(
+    connection: sqlite3.Connection,
+    artifacts: Iterable[Mapping[str, Any]],
+    *,
+    domain: str,
+) -> tuple[dict[tuple[str, int], str], list[dict[str, Any]]]:
+    """Bind config artifacts to exact runtime locations, not content aliases."""
+    artifact_rows = list(artifacts)
+    strict_identity_binding = any(
+        "_expected_artifact_instance_payload" in artifact
+        for artifact in artifact_rows
+    )
+    rows_by_location: dict[tuple[str, int], sqlite3.Row] = {}
+    ambiguous_locations: set[tuple[str, int]] = set()
+    issues = []
+    selected_columns = (
+        "artifact_instance_identity,coord,outer_artifact_sha256,"
+        "container_entry,content_sha256,runtime_profile_identity,"
+        "loader_realm_identity,runtime_path_kind,"
+        "runtime_classpath_index,container_loader_policy_version,"
+        "runtime_code_source_origin_identity"
+        if strict_identity_binding
+        else "artifact_instance_identity,content_sha256,"
+        "loader_realm_identity,runtime_classpath_index"
+    )
+    for row in connection.execute(
+        f"SELECT {selected_columns} FROM artifact_instances"
+    ):
+        location = (
+            str(row["loader_realm_identity"] or ""),
+            int(row["runtime_classpath_index"]),
+        )
+        if location in rows_by_location:
+            ambiguous_locations.add(location)
+        else:
+            rows_by_location[location] = row
+
+    bindings: dict[tuple[str, int], str] = {}
+    expected_locations: set[tuple[str, int]] = set()
+    for artifact in artifact_rows:
+        location = (
+            str(artifact.get("loader_realm") or ""),
+            int(artifact.get("slot")),
+        )
+        if location in expected_locations:
+            issues.append(_validation_issue(
+                domain,
+                "ORACLE_ARTIFACT_CONFIG_LOCATION_DUPLICATE",
+                loader_realm=location[0],
+                slot=location[1],
+                path=str(artifact.get("path") or ""),
+            ))
+            continue
+        expected_locations.add(location)
+        if location in ambiguous_locations:
+            issues.append(_validation_issue(
+                domain,
+                "ORACLE_ARTIFACT_INSTANCE_AMBIGUOUS",
+                loader_realm=location[0],
+                slot=location[1],
+                path=str(artifact.get("path") or ""),
+            ))
+            continue
+        row = rows_by_location.get(location)
+        if row is None:
+            issues.append(_validation_issue(
+                domain,
+                "ORACLE_ARTIFACT_INSTANCE_UNBOUND",
+                loader_realm=location[0],
+                slot=location[1],
+                path=str(artifact.get("path") or ""),
+            ))
+            continue
+        expected_sha = str(artifact.get("sha256") or "")
+        actual_sha = str(row["content_sha256"] or "")
+        if actual_sha != expected_sha:
+            issues.append(_validation_issue(
+                domain,
+                "ORACLE_ARTIFACT_INSTANCE_CONTENT_MISMATCH",
+                loader_realm=location[0],
+                slot=location[1],
+                path=str(artifact.get("path") or ""),
+                expected_sha256=expected_sha,
+                actual_sha256=actual_sha,
+            ))
+            continue
+        instance_identity = str(row["artifact_instance_identity"] or "")
+        if not instance_identity:
+            issues.append(_validation_issue(
+                domain,
+                "ORACLE_ARTIFACT_INSTANCE_IDENTITY_MISSING",
+                loader_realm=location[0],
+                slot=location[1],
+                path=str(artifact.get("path") or ""),
+            ))
+            continue
+        expected_payload = artifact.get(
+            "_expected_artifact_instance_payload"
+        )
+        expected_identity = str(artifact.get(
+            "_expected_artifact_instance_identity"
+        ) or "")
+        if strict_identity_binding:
+            if not isinstance(expected_payload, Mapping) or not expected_identity:
+                issues.append(_validation_issue(
+                    domain,
+                    "ORACLE_ARTIFACT_INSTANCE_EXPECTATION_MISSING",
+                    loader_realm=location[0],
+                    slot=location[1],
+                    path=str(artifact.get("path") or ""),
+                ))
+                continue
+            actual_payload = {
+                "outer_artifact_sha256": str(
+                    row["outer_artifact_sha256"] or ""
+                ),
+                "container_entry": str(row["container_entry"] or ""),
+                "content_sha256": actual_sha,
+                "runtime_profile_identity": str(
+                    row["runtime_profile_identity"] or ""
+                ),
+                "path_owner_loader_realm_identity": str(
+                    row["loader_realm_identity"] or ""
+                ),
+                "runtime_path_kind": str(
+                    row["runtime_path_kind"] or ""
+                ),
+                "runtime_classpath_index": int(
+                    row["runtime_classpath_index"]
+                ),
+                "container_loader_policy_version": str(
+                    row["container_loader_policy_version"] or ""
+                ),
+                "runtime_code_source_origin_identity": str(
+                    row["runtime_code_source_origin_identity"] or ""
+                ),
+            }
+            actual_recomputed_identity = _identity(
+                "artifact_instance_identity", actual_payload
+            )
+            field_mismatches = {
+                key: {
+                    "expected": expected_payload.get(key),
+                    "actual": actual_payload.get(key),
+                }
+                for key in expected_payload
+                if actual_payload.get(key) != expected_payload.get(key)
+            }
+            expected_coord = str(artifact.get("coord") or "")
+            actual_coord = str(row["coord"] or "")
+            if actual_coord != expected_coord:
+                field_mismatches["coord"] = {
+                    "expected": expected_coord,
+                    "actual": actual_coord,
+                }
+            if (
+                actual_recomputed_identity != instance_identity
+                or expected_identity != instance_identity
+                or field_mismatches
+            ):
+                issues.append(_validation_issue(
+                    domain,
+                    "ORACLE_ARTIFACT_INSTANCE_IDENTITY_MISMATCH",
+                    loader_realm=location[0],
+                    slot=location[1],
+                    path=str(artifact.get("path") or ""),
+                    expected_artifact_instance_identity=expected_identity,
+                    actual_artifact_instance_identity=instance_identity,
+                    recomputed_artifact_instance_identity=(
+                        actual_recomputed_identity
+                    ),
+                    field_mismatches=field_mismatches,
+                ))
+                continue
+        bindings[location] = instance_identity
+    for loader_realm, slot in sorted(set(rows_by_location) - expected_locations):
+        row = rows_by_location[(loader_realm, slot)]
+        issues.append(_validation_issue(
+            domain,
+            "ORACLE_ARTIFACT_INSTANCE_UNEXPECTED",
+            loader_realm=loader_realm,
+            slot=slot,
+            artifact_instance_identity=str(
+                row["artifact_instance_identity"] or ""
+            ),
+            content_sha256=str(row["content_sha256"] or ""),
+        ))
+    return bindings, issues
+
+
 def _validate_direct_edges(
     connection: sqlite3.Connection,
     artifacts: list[dict[str, Any]],
@@ -2813,28 +3956,23 @@ def _validate_direct_edges(
     string_pool: dict[str, str] | None = None,
     progress_callback: ValidationProgressCallback | None = None,
     progress_label: str = "",
+    time_budget_seconds: float | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     issues = []
     truth_rows = []
     dynamic_rows = []
     discovery_classes = set()
-    instance_by_sha_slot = {
-        (row["content_sha256"], int(row["runtime_classpath_index"])):
-            row["artifact_instance_identity"]
-        for row in connection.execute(
-            """
-            SELECT artifact_instance_identity,content_sha256,runtime_classpath_index
-            FROM artifact_instances
-            """
-        )
-    }
+    instance_by_location, binding_issues = _artifact_instance_bindings(
+        connection, artifacts, domain="direct_edge"
+    )
+    issues.extend(binding_issues)
     production_by_artifact: dict[str, set[tuple[Any, ...]]] = defaultdict(set)
     production_dynamic_by_artifact: dict[str, set[tuple[Any, ...]]] = defaultdict(set)
     for edge in connection.execute(
         """
         SELECT e.caller_artifact_instance_identity,e.edge_kind,
                e.symbolic_owner,e.symbolic_name,e.symbolic_descriptor,
-               e.opcode,e.bytecode_offset,
+               e.opcode,e.bytecode_offset,e.edge_json,
                m.class_name AS caller_class_name,
                m.member_name AS caller_member_name,
                m.descriptor AS caller_descriptor
@@ -2842,8 +3980,10 @@ def _validate_direct_edges(
         JOIN members AS m ON m.member_identity=e.caller_member_identity
         WHERE e.edge_kind IN (
             'method','field','invokedynamic_bootstrap',
-            'invokedynamic_handle_method','invokedynamic_handle_field'
+            'invokedynamic_handle_method','invokedynamic_handle_field',
+            'ldc_constant_dynamic_bootstrap','ldc_handle'
         ) OR e.edge_kind LIKE 'invokedynamic_handle_%'
+          OR e.edge_kind LIKE 'ldc_bootstrap_handle_%'
         """
     ):
         edge_kind = str(edge["edge_kind"] or "")
@@ -2852,26 +3992,105 @@ def _validate_direct_edges(
             and str(edge["symbolic_owner"] or "").replace("/", ".")
             not in LINKER_BOOTSTRAP_OWNERS
         )
-        if edge_kind.startswith("invokedynamic_handle_") or dynamic_bootstrap:
-            if str(edge["symbolic_descriptor"]).startswith("("):
-                production_dynamic_by_artifact[
-                    edge["caller_artifact_instance_identity"]
-                ].add((
-                    edge["caller_class_name"].replace("/", "."),
-                    edge["caller_member_name"], edge["caller_descriptor"],
-                    edge["symbolic_owner"].replace("/", "."),
-                    edge["symbolic_name"], edge["symbolic_descriptor"],
-                    int(edge["bytecode_offset"]),
+        ldc_linkage = (
+            edge_kind == "ldc_constant_dynamic_bootstrap"
+            or edge_kind == "ldc_handle"
+            or edge_kind.startswith("ldc_bootstrap_handle_")
+        )
+        if (
+            edge_kind.startswith("invokedynamic_handle_")
+            or dynamic_bootstrap
+            or ldc_linkage
+        ):
+            try:
+                edge_payload = json.loads(str(edge["edge_json"] or ""))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                edge_payload = None
+            handle_payload = edge_payload
+            if (
+                edge_kind == "invokedynamic_bootstrap"
+                and isinstance(edge_payload, Mapping)
+            ):
+                handle_payload = edge_payload.get("bootstrap")
+            reference_tag = (
+                handle_payload.get("tag")
+                if isinstance(handle_payload, Mapping) else None
+            )
+            reference_kind = (
+                METHOD_HANDLE_REFERENCE_KIND_BY_TAG.get(reference_tag)
+                if type(reference_tag) is int else None
+            )
+            reference_interface = (
+                handle_payload.get("interface")
+                if isinstance(handle_payload, Mapping) else None
+            )
+            if (
+                reference_kind is None
+                or type(reference_interface) is not bool
+            ):
+                issues.append(_validation_issue(
+                    "dynamic_bootstrap",
+                    "ORACLE_PRODUCTION_DYNAMIC_REFERENCE_KIND_INVALID",
+                    edge_kind=edge_kind,
+                    caller_class=str(edge["caller_class_name"] or ""),
+                    caller_member=str(edge["caller_member_name"] or ""),
+                    caller_descriptor=str(edge["caller_descriptor"] or ""),
+                    bytecode_offset=int(edge["bytecode_offset"]),
                 ))
+                continue
+            if edge_kind.startswith("invokedynamic_handle_") or dynamic_bootstrap:
+                linkage_family = "invokedynamic"
+            elif edge_kind.startswith("ldc_bootstrap_handle_"):
+                linkage_family = "ldc_bootstrap_handle"
+            else:
+                linkage_family = edge_kind
+            production_dynamic_by_artifact[
+                edge["caller_artifact_instance_identity"]
+            ].add((
+                edge["caller_class_name"].replace("/", "."),
+                edge["caller_member_name"], edge["caller_descriptor"],
+                edge["symbolic_owner"].replace("/", "."),
+                edge["symbolic_name"], edge["symbolic_descriptor"],
+                reference_kind,
+                reference_interface,
+                linkage_family,
+                int(edge["bytecode_offset"]),
+            ))
             continue
         if edge_kind not in {"method", "field"}:
             continue
+        if edge_kind == "method":
+            try:
+                edge_payload = json.loads(str(edge["edge_json"] or ""))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                edge_payload = None
+            reference_interface = (
+                edge_payload.get("interface")
+                if isinstance(edge_payload, Mapping) else None
+            )
+            if type(reference_interface) is not bool:
+                issues.append(_validation_issue(
+                    "direct_edge",
+                    "ORACLE_PRODUCTION_DIRECT_REFERENCE_KIND_INVALID",
+                    edge_kind=edge_kind,
+                    caller_class=str(edge["caller_class_name"] or ""),
+                    caller_member=str(edge["caller_member_name"] or ""),
+                    caller_descriptor=str(edge["caller_descriptor"] or ""),
+                    bytecode_offset=int(edge["bytecode_offset"]),
+                ))
+                continue
+            reference_kind = (
+                "interface_method" if reference_interface else "method"
+            )
+        else:
+            reference_kind = "field"
         production_by_artifact[edge["caller_artifact_instance_identity"]].add((
             edge["caller_class_name"].replace("/", "."),
             edge["caller_member_name"], edge["caller_descriptor"],
             edge["symbolic_owner"].replace("/", "."),
             edge["symbolic_name"], edge["symbolic_descriptor"],
             _opcode_name(edge["opcode"]), int(edge["bytecode_offset"]),
+            reference_kind,
         ))
     # Scan independent artifacts concurrently, but keep one javap worker per
     # artifact so the global process count remains bounded. The previous nested
@@ -2899,13 +4118,37 @@ def _validate_direct_edges(
         len(scan_results),
         scan_total,
     )
+    phase_deadline = (
+        time.perf_counter() + float(time_budget_seconds)
+        if time_budget_seconds is not None and float(time_budget_seconds) > 0
+        else None
+    )
 
     def scan_request(item: tuple[tuple[str, str], Path]):
         key, path = item
+        remaining_budget = (
+            phase_deadline - time.perf_counter()
+            if phase_deadline is not None else None
+        )
+        if remaining_budget is not None and remaining_budget <= 0:
+            return key, {
+                "artifact_sha256": key[0],
+                "complete": False,
+                "edges": [],
+                "failures": ["oracle_javap_phase_time_budget_exceeded"],
+            }
         return key, scan_final_artifact(
             path,
             javap=javap,
             max_workers=1,
+            # Every request receives only the time remaining on the shared
+            # per-side phase deadline. A large dependency set therefore
+            # cannot multiply the configured budget by its artifact count.
+            time_budget_seconds=remaining_budget,
+            # Each config entry is already one materialized runtime
+            # classpath artifact. Recursing into BOOT-INF/lib here would add
+            # classes that production did not snapshot for this instance.
+            include_nested_runtime_jars=False,
             include_structural_facts=True,
             # This validator immediately stores one compact zlib copy for the
             # base/current and structural passes. Avoid building the oracle's
@@ -2922,15 +4165,39 @@ def _validate_direct_edges(
         ) as executor:
             active = {}
             for _ in range(worker_count):
+                if (
+                    phase_deadline is not None
+                    and time.perf_counter() >= phase_deadline
+                ):
+                    break
                 try:
                     request = next(requests)
                 except StopIteration:
                     break
                 active[executor.submit(scan_request, request)] = request[0]
             while active:
-                completed, _pending = wait(
-                    active, return_when=FIRST_COMPLETED
+                remaining_wait = (
+                    phase_deadline - time.perf_counter()
+                    if phase_deadline is not None else None
                 )
+                wait_timeout = (
+                    None
+                    if remaining_wait is None
+                    else remaining_wait
+                    if remaining_wait > 0
+                    else 0.1
+                )
+                completed, _pending = wait(
+                    active,
+                    timeout=wait_timeout,
+                    return_when=FIRST_COMPLETED,
+                )
+                if not completed:
+                    # Running scans own the same absolute phase deadline and
+                    # cooperatively stop snapshot copying, archive CRC reads,
+                    # and javap. Poll only those active tasks; never enqueue a
+                    # fresh artifact after the shared phase budget expires.
+                    continue
                 for future in completed:
                     active.pop(future)
                     scan_key, result = future.result()
@@ -2947,11 +4214,26 @@ def _validate_direct_edges(
                         str(scan_requests.get(scan_key) or ""),
                     )
                     del result
+                    if (
+                        phase_deadline is not None
+                        and time.perf_counter() >= phase_deadline
+                    ):
+                        continue
                     try:
                         request = next(requests)
                     except StopIteration:
                         continue
                     active[executor.submit(scan_request, request)] = request[0]
+    for scan_key in scan_requests:
+        if scan_key in scan_results:
+            continue
+        result = {
+            "artifact_sha256": scan_key[0],
+            "complete": False,
+            "edges": [],
+            "failures": ["oracle_javap_phase_time_budget_exceeded"],
+        }
+        scan_results[scan_key] = _normalize_oracle_scan(result, string_pool)
     # scan_final_artifact keeps immutable serialized results for reuse by
     # callers.  This validator now owns compact copies, so retaining both
     # representations would only inflate its validation peak.
@@ -2965,14 +4247,13 @@ def _validate_direct_edges(
     )
 
     for artifact in artifacts:
-        instance_identity = instance_by_sha_slot.get(
-            (artifact["sha256"], int(artifact["slot"]))
+        instance_identity = instance_by_location.get(
+            (
+                str(artifact.get("loader_realm") or ""),
+                int(artifact["slot"]),
+            )
         )
         if not instance_identity:
-            issues.append(_validation_issue(
-                "direct_edge", "ORACLE_ARTIFACT_INSTANCE_UNBOUND",
-                path=artifact["path"], slot=artifact["slot"],
-            ))
             continue
         scan_key = (str(artifact["sha256"]), str(javap))
         normalized_truth = (
@@ -3045,6 +4326,7 @@ def _validate_direct_edges(
 def _validate_runtime_outcomes(
     connection: sqlite3.Connection,
     artifacts: list[dict[str, Any]],
+    oracle_artifacts: list[dict[str, Any]],
     inventories: list[dict[str, Any]],
     observations: Mapping[str, Mapping[str, Any]],
     entrypoint_realms: Iterable[str],
@@ -3053,6 +4335,10 @@ def _validate_runtime_outcomes(
     jdk_home: Path,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     issues = []
+    instance_by_location, binding_issues = _artifact_instance_bindings(
+        connection, artifacts, domain="provider"
+    )
+    issues.extend(binding_issues)
     target_jdk_major = _release_major(jdk_home)
     application_classes = {
         class_name
@@ -3142,16 +4428,20 @@ def _validate_runtime_outcomes(
         cached = tuple(sorted(result))
         nontrivial_concrete_subtypes[owner] = cached
         return cached
-    artifact_content_by_identity = {
-        row["artifact_instance_identity"]: row["content_sha256"]
-        for row in connection.execute(
-            """
-            SELECT artifact_instance_identity,content_sha256
-            FROM artifact_instances
-            """
+    # URLClassLoader exposes the physical provider URL, not the loader realm.
+    # Resolve that URL through the exact parent-first Oracle classpath order;
+    # the first mount of a byte-identical path is the selected instance.
+    expected_instance_by_path: dict[Path, str] = {}
+    for artifact in oracle_artifacts:
+        location = (
+            str(artifact.get("loader_realm") or ""),
+            int(artifact.get("slot") or 0),
         )
-    }
-    artifacts_by_path = {Path(item["path"]).resolve(): item for item in artifacts}
+        instance_identity = instance_by_location.get(location)
+        if instance_identity:
+            expected_instance_by_path.setdefault(
+                Path(str(artifact["path"])).resolve(), instance_identity
+            )
     # These indexes are consulted only for four scalar values. Retaining the
     # full decoded reconciliation payloads (especially definition evidence)
     # made the Oracle keep a second copy of a large part of the graph alive.
@@ -3211,16 +4501,13 @@ def _validate_runtime_outcomes(
                     realm=realm, class_name=name, selected=selected,
                 ))
         else:
-            selected_content = artifact_content_by_identity.get(str(selected))
-            expected_artifact = artifacts_by_path.get(provider_path)
-            if (
-                not selected_content or not expected_artifact
-                or selected_content != expected_artifact["sha256"]
-            ):
+            expected_instance = expected_instance_by_path.get(provider_path)
+            if not expected_instance or str(selected) != expected_instance:
                 issues.append(_validation_issue(
                     "provider", "ORACLE_ARTIFACT_PROVIDER_MISMATCH",
                     realm=realm, class_name=name, oracle_provider_url=provider_location,
                     selected=selected,
+                    expected_artifact_instance_identity=expected_instance,
                 ))
         definition = definitions.get((realm, name))
         production_definition_status = definition[0] if definition else None
@@ -3254,8 +4541,8 @@ def _validate_runtime_outcomes(
     del (
         definitions,
         provider_by_key,
-        artifact_content_by_identity,
-        artifacts_by_path,
+        expected_instance_by_path,
+        instance_by_location,
     )
 
     member_symbols = {
@@ -3394,7 +4681,12 @@ def _validate_runtime_outcomes(
             ))
 
     return issues, {
-        "runtime_observations": observations,
+        "runtime_observation_set_identity": canonical_identity_streaming(
+            "binary_runtime_observation_set_identity",
+            observations,
+            schema_version="1",
+        ),
+        "runtime_observation_count": len(observations),
         "provider_count": provider_count,
         "member_resolution_count": member_resolution_count,
         "dispatch_count": dispatch_count,
@@ -3406,6 +4698,7 @@ def _validate_resource_selections(
     artifacts: list[dict[str, Any]],
     inventories: list[dict[str, Any]],
     entrypoint_realms: Iterable[str],
+    topology: Mapping[str, Any],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     issues = []
     production = {
@@ -3413,15 +4706,35 @@ def _validate_resource_selections(
         for row in _reconciliation(connection, "resource_selection")
     }
     truth = {}
+    inventory_by_location = {
+        (
+            str(artifact.get("loader_realm") or ""),
+            int(artifact.get("slot") or 0),
+        ): inventory
+        for artifact, inventory in zip(artifacts, inventories)
+    }
     all_names = sorted({name for inventory in inventories for name in inventory["resources"]})
     for realm in entrypoint_realms:
+        ordered_artifacts = _ordered_artifacts_for_realm(
+            artifacts, topology, str(realm)
+        )
         for name in all_names:
             category = _independent_resource_category(name)
-            mechanism = "ordered_all" if category == "runtime_topology" else "classloader_first"
+            mechanism = (
+                "ordered_all"
+                if category == "runtime_topology"
+                or name.startswith("META-INF/services/")
+                else "classloader_first"
+            )
             candidates = []
-            for artifact, inventory in zip(artifacts, inventories):
-                if str(artifact.get("loader_realm") or "") != realm:
-                    continue
+            for artifact in ordered_artifacts:
+                location = (
+                    str(artifact.get("loader_realm") or ""),
+                    int(artifact.get("slot") or 0),
+                )
+                inventory = inventory_by_location.get(location) or {
+                    "resources": {}
+                }
                 for item in inventory["resources"].get(name, ()):
                     candidates.append({
                         "slot": int(artifact["slot"]),
@@ -3429,7 +4742,6 @@ def _validate_resource_selections(
                         "digest": item["semantic_digest"] if category == "runtime_topology" else item["sha256"],
                         "semantic_facts": item["semantic_facts"],
                     })
-            candidates.sort(key=lambda item: (item["slot"], item["origin"], item["digest"]))
             selected = candidates if mechanism == "ordered_all" else candidates[:1]
             key = (realm, name, mechanism)
             truth[key] = selected
@@ -3459,6 +4771,19 @@ def _validate_resource_selections(
                     realm=realm, resource_name=name,
                     expected=expected_comparable, actual=actual_comparable,
                 ))
+    # Compare the full key universe as well as values.  Without this check a
+    # production regression that leaks an inactive physical MR resource into
+    # reconciliation would be invisible because independent truth correctly
+    # omits that logical resource name.
+    unexpected_keys = sorted(set(production) - set(truth))
+    for realm, name, mechanism in unexpected_keys:
+        issues.append(_validation_issue(
+            "resource_selection",
+            "ORACLE_RESOURCE_SELECTION_UNEXPECTED",
+            realm=realm,
+            resource_name=name,
+            resource_mechanism=mechanism,
+        ))
     return issues, {
         "resource_selections": [
             {"realm": key[0], "name": key[1], "mechanism": key[2], "selected": value}
@@ -3543,12 +4868,20 @@ def _validate_cross_version_semantics(
         (
             caller_owner, caller_name, caller_descriptor,
             target_owner, target_name, target_descriptor,
-            opcode, bytecode_offset,
+            opcode, bytecode_offset, reference_kind,
         ) = edge
         opcode_text = str(opcode)
-        if opcode_text.startswith("invoke"):
+        if (
+            str(reference_kind) in _ORACLE_DIRECT_METHOD_REFERENCE_KINDS
+            and opcode_text.startswith("invoke")
+        ):
             member_kind = "method"
-        elif opcode_text in {"getfield", "putfield", "getstatic", "putstatic"}:
+        elif (
+            str(reference_kind) == "field"
+            and opcode_text in {
+                "getfield", "putfield", "getstatic", "putstatic",
+            }
+        ):
             member_kind = "field"
         else:
             continue
@@ -3654,7 +4987,11 @@ def _validate_cross_version_semantics(
         for raw_edge in current_edges:
             edge = tuple(raw_edge)
             caller = (str(edge[0]), str(edge[1]), str(edge[2]))
-            if not str(edge[6]).startswith("("):
+            if (
+                len(edge) != _ORACLE_DIRECT_EDGE_TUPLE_SIZE
+                or str(edge[8]) not in _ORACLE_DIRECT_METHOD_REFERENCE_KINDS
+                or not str(edge[5]).startswith("(")
+            ):
                 continue
             target = _resolve_member(
                 observations_by_side["current"],
@@ -3696,7 +5033,9 @@ def _validate_cross_version_semantics(
         load_callers = {
             (str(edge[0]), str(edge[1]), str(edge[2])): int(edge[7])
             for edge in current_edges
-            if str(edge[3]) == "java.util.ServiceLoader"
+            if len(edge) == _ORACLE_DIRECT_EDGE_TUPLE_SIZE
+            and str(edge[8]) in _ORACLE_DIRECT_METHOD_REFERENCE_KINDS
+            and str(edge[3]) == "java.util.ServiceLoader"
             and str(edge[4]) == "load"
             and str(edge[5]).startswith("(Ljava/lang/Class;")
         }
@@ -3893,6 +5232,7 @@ def _validate_runtime_semantic_overlay(
     resource_truth: Iterable[Mapping[str, Any]],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     semantic_instructions = tuple(tuple(item) for item in semantic_instructions)
+    direct_edges = tuple(tuple(item) for item in direct_edges)
     payload = _load_json(generation / "binary_runtime_semantic_overlay.json")
     supported_kinds = {
         "reflection_method_invocation", "reflection_constructor_invocation",
@@ -3941,7 +5281,9 @@ def _validate_runtime_semantic_overlay(
     }
     invoked_owners = {
         str(edge[3]).replace(".", "/") for edge in direct_edges
-        if len(edge) >= 6 and str(edge[5]).startswith("(")
+        if len(edge) == _ORACLE_DIRECT_EDGE_TUPLE_SIZE
+        and str(edge[8]) in _ORACLE_DIRECT_METHOD_REFERENCE_KINDS
+        and str(edge[5]).startswith("(")
     }
     runtime_targets = []
     for owner, name, count in (
@@ -4134,7 +5476,11 @@ def _validate_runtime_semantic_overlay(
 
     bean_wiring_candidate_evidence: dict[tuple[str, ...], dict[str, Any]] = {}
     for edge in direct_edges:
-        if len(edge) < 8 or not str(edge[5]).startswith("("):
+        if (
+            len(edge) != _ORACLE_DIRECT_EDGE_TUPLE_SIZE
+            or str(edge[8]) not in _ORACLE_DIRECT_METHOD_REFERENCE_KINDS
+            or not str(edge[5]).startswith("(")
+        ):
             continue
         caller_class = str(edge[0]).replace(".", "/")
         caller_name, caller_descriptor = str(edge[1]), str(edge[2])
@@ -4421,7 +5767,8 @@ def _validate_runtime_semantic_overlay(
             str(edge[0]).replace(".", "/"), str(edge[1]), str(edge[2])
         )
         for edge in direct_edges
-        if len(edge) >= 6
+        if len(edge) == _ORACLE_DIRECT_EDGE_TUPLE_SIZE
+        and str(edge[8]) in _ORACLE_DIRECT_METHOD_REFERENCE_KINDS
         and str(edge[3]).replace(".", "/")
         == "org/apache/dubbo/common/extension/ExtensionLoader"
         and str(edge[4]) in {
@@ -4626,7 +5973,7 @@ def _load_closed_world_graph(
     """Materialize the independently validated graph for reachable roots."""
 
     database = generation / "current_binary_facts.sqlite"
-    connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+    connection = _open_immutable_sqlite(database)
     connection.row_factory = sqlite3.Row
     try:
         edges = {
@@ -5545,7 +6892,9 @@ def _oracle_tool_execution_policy(config: Mapping[str, Any]) -> dict[str, Any]:
     allowed = {
         "oracle_compile_timeout_seconds",
         "oracle_runtime_timeout_seconds",
+        "oracle_runtime_phase_time_budget_seconds",
         "oracle_max_attempts",
+        "oracle_javap_time_budget_seconds",
     }
     unknown = sorted(set(raw) - allowed)
     if unknown:
@@ -5556,26 +6905,575 @@ def _oracle_tool_execution_policy(config: Mapping[str, Any]) -> dict[str, Any]:
     try:
         compile_timeout = float(raw.get("oracle_compile_timeout_seconds", 60))
         runtime_timeout = float(raw.get("oracle_runtime_timeout_seconds", 300))
+        runtime_phase_time_budget = float(
+            raw.get("oracle_runtime_phase_time_budget_seconds", 1800)
+        )
+        javap_time_budget = float(
+            raw.get("oracle_javap_time_budget_seconds", 300)
+        )
         max_attempts = int(raw.get("oracle_max_attempts", 2))
     except (TypeError, ValueError) as error:
         raise BinaryValidationError(
             "BINARY_ORACLE_TOOL_POLICY_INVALID", str(error)
         ) from error
     if (
-        isinstance(raw.get("oracle_max_attempts"), bool)
+        any(
+            isinstance(raw.get(field), bool)
+            for field in (
+                "oracle_compile_timeout_seconds",
+                "oracle_runtime_timeout_seconds",
+                "oracle_runtime_phase_time_budget_seconds",
+                "oracle_javap_time_budget_seconds",
+                "oracle_max_attempts",
+            )
+        )
+        or isinstance(raw.get("oracle_max_attempts"), float)
         or not 0.01 <= compile_timeout <= 300
         or not 0.01 <= runtime_timeout <= 300
+        or not 1 <= runtime_phase_time_budget <= 7200
+        or not 0.01 <= javap_time_budget <= 1800
         or not 1 <= max_attempts <= 3
     ):
         raise BinaryValidationError(
             "BINARY_ORACLE_TOOL_POLICY_INVALID",
-            "timeouts must be within 0.01..300 seconds and attempts within 1..3",
+            "compile/runtime timeouts must be within 0.01..300 seconds, "
+            "runtime phase budget within 1..7200 seconds, javap budget "
+            "within 0.01..1800 seconds, and attempts within 1..3",
         )
     return {
         "compile_timeout_seconds": compile_timeout,
         "runtime_timeout_seconds": runtime_timeout,
+        "runtime_phase_time_budget_seconds": runtime_phase_time_budget,
+        "javap_time_budget_seconds": javap_time_budget,
         "max_attempts": max_attempts,
     }
+
+
+def validate_oracle_tool_execution_policy(
+    config: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate Oracle limits without starting generation or Oracle work.
+
+    The production pipeline calls this during its static preflight.  Keeping
+    the parser here gives the early check and the independent validator one
+    exact contract instead of two copies that can drift.
+    """
+    return _oracle_tool_execution_policy(config)
+
+
+_DIRECTORY_FSYNC_UNSUPPORTED_ERRNOS = frozenset(
+    value
+    for value in (
+        getattr(errno, "EINVAL", None),
+        getattr(errno, "ENOSYS", None),
+        getattr(errno, "ENOTSUP", None),
+        getattr(errno, "EOPNOTSUPP", None),
+    )
+    if value is not None
+)
+
+
+def _add_validation_cleanup_note(primary: BaseException, note: str) -> None:
+    add_note = getattr(primary, "add_note", None)
+    if callable(add_note):
+        try:
+            add_note(note)
+            return
+        except Exception:
+            pass
+    try:
+        notes = list(getattr(primary, "__notes__", ()) or ())
+        notes.append(note)
+        setattr(primary, "__notes__", notes)
+    except Exception:
+        pass
+
+
+@contextmanager
+def _owned_descriptor(descriptor: int, label: str):
+    try:
+        yield descriptor
+    finally:
+        primary = sys.exc_info()[1]
+        try:
+            os.close(descriptor)
+        except BaseException as error:
+            if primary is None:
+                raise
+            _add_validation_cleanup_note(
+                primary,
+                f"cleanup failed (close {label}): "
+                f"{type(error).__name__}: {error}",
+            )
+
+
+def _directory_open_flags() -> int:
+    return (
+        os.O_RDONLY
+        | int(getattr(os, "O_DIRECTORY", 0) or 0)
+        | int(getattr(os, "O_NOFOLLOW", 0) or 0)
+        | int(getattr(os, "O_BINARY", 0) or 0)
+    )
+
+
+@contextmanager
+def _open_bound_directory(
+    path: str | Path,
+    *,
+    dir_fd: int | None = None,
+):
+    if dir_fd is None:
+        descriptor = os.open(path, _directory_open_flags())
+    else:
+        descriptor = os.open(path, _directory_open_flags(), dir_fd=dir_fd)
+    with _owned_descriptor(descriptor, f"directory {path}") as opened:
+        observed = os.fstat(opened)
+        if not stat.S_ISDIR(observed.st_mode):
+            raise OSError(errno.ENOTDIR, f"not a directory: {path}")
+        yield opened
+
+
+def _descriptor_identity(value: os.stat_result) -> tuple[int, int]:
+    return int(value.st_dev), int(value.st_ino)
+
+
+def _fsync_bound_directory(descriptor: int) -> bool:
+    try:
+        os.fsync(descriptor)
+    except OSError as error:
+        if error.errno in _DIRECTORY_FSYNC_UNSUPPORTED_ERRNOS:
+            return False
+        raise
+    return True
+
+
+def _write_json_descriptor(descriptor: int, value: Any) -> None:
+    payload = surrogate_safe_json_dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    remaining = memoryview(payload)
+    while remaining:
+        written = os.write(descriptor, remaining)
+        if written <= 0:
+            raise OSError(errno.EIO, "validation attachment write made no progress")
+        remaining = remaining[written:]
+    remaining = memoryview(b"\n")
+    while remaining:
+        written = os.write(descriptor, remaining)
+        if written <= 0:
+            raise OSError(errno.EIO, "validation attachment write made no progress")
+        remaining = remaining[written:]
+    os.fsync(descriptor)
+
+
+@contextmanager
+def _open_bound_regular_file(directory_fd: int, name: str):
+    descriptor = os.open(
+        name,
+        os.O_RDONLY
+        | int(getattr(os, "O_NOFOLLOW", 0) or 0)
+        | int(getattr(os, "O_BINARY", 0) or 0),
+        dir_fd=directory_fd,
+    )
+    with _owned_descriptor(
+        descriptor, f"validation attachment {name}"
+    ) as opened_descriptor:
+        opened = os.fstat(opened_descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise OSError(errno.EINVAL, f"not a regular file: {name}")
+        yield opened_descriptor
+
+
+def _bound_files_equal(directory_fd: int, first: str, second: str) -> bool:
+    try:
+        with _open_bound_regular_file(directory_fd, first) as left, \
+                _open_bound_regular_file(directory_fd, second) as right:
+            if os.fstat(left).st_size != os.fstat(right).st_size:
+                return False
+            while True:
+                left_block = os.read(left, 1024 * 1024)
+                right_block = os.read(right, 1024 * 1024)
+                if left_block != right_block:
+                    return False
+                if not left_block:
+                    return True
+    except OSError:
+        return False
+
+
+_SECURE_VALIDATION_DIRFD_SUPPORTED = bool(
+    os.name != "nt"
+    and int(getattr(os, "O_DIRECTORY", 0) or 0)
+    and int(getattr(os, "O_NOFOLLOW", 0) or 0)
+    and all(
+        operation in os.supports_dir_fd
+        for operation in (os.open, os.mkdir, os.stat, os.unlink, os.link)
+    )
+    and os.stat in os.supports_follow_symlinks
+    and os.link in os.supports_follow_symlinks
+)
+
+
+def _secure_validation_dirfd_supported() -> bool:
+    return _SECURE_VALIDATION_DIRFD_SUPPORTED
+
+
+def _validation_attachment_path_error(
+    destination: Path,
+    error: BaseException | str,
+) -> BinaryValidationError:
+    return BinaryValidationError(
+        "BINARY_VALIDATION_ATTACHMENT_PATH_INVALID",
+        f"{destination}: {error}",
+    )
+
+
+def _write_validation_attachment_dirfd(
+    generation: Path,
+    destination_name: str,
+    result: Mapping[str, Any],
+) -> Path:
+    requested_generation = Path(os.path.abspath(generation))
+    destination = requested_generation / "validation" / destination_name
+    try:
+        generation_parent = requested_generation.parent.resolve(strict=True)
+        generation = generation_parent / requested_generation.name
+        destination = generation / "validation" / destination_name
+        with _open_bound_directory(generation_parent) as generation_parent_fd:
+            parent_identity = _descriptor_identity(
+                os.fstat(generation_parent_fd)
+            )
+            with _open_bound_directory(
+                requested_generation.name,
+                dir_fd=generation_parent_fd,
+            ) as generation_fd:
+                generation_identity = _descriptor_identity(
+                    os.fstat(generation_fd)
+                )
+                try:
+                    os.mkdir("validation", mode=0o700, dir_fd=generation_fd)
+                except FileExistsError:
+                    pass
+                with _open_bound_directory(
+                    "validation", dir_fd=generation_fd
+                ) as validation_fd:
+                    validation_identity = _descriptor_identity(
+                        os.fstat(validation_fd)
+                    )
+                    # Commit the validation directory entry in the generation
+                    # before publishing an attachment within that directory.
+                    _fsync_bound_directory(generation_fd)
+                    temporary_name = (
+                        f".{destination_name}.{os.getpid()}."
+                        f"{secrets.token_hex(12)}.tmp"
+                    )
+                    temporary_fd = os.open(
+                        temporary_name,
+                        os.O_WRONLY
+                        | os.O_CREAT
+                        | os.O_EXCL
+                        | int(getattr(os, "O_NOFOLLOW", 0) or 0)
+                        | int(getattr(os, "O_BINARY", 0) or 0),
+                        0o600,
+                        dir_fd=validation_fd,
+                    )
+                    try:
+                        with _owned_descriptor(
+                            temporary_fd,
+                            f"temporary validation attachment {temporary_name}",
+                        ) as opened_temporary:
+                            _write_json_descriptor(opened_temporary, result)
+                        try:
+                            # A hard link is the portable POSIX no-replace
+                            # publish primitive exposed by Python. EEXIST is
+                            # atomic, unlike exists() followed by os.replace().
+                            os.link(
+                                temporary_name,
+                                destination_name,
+                                src_dir_fd=validation_fd,
+                                dst_dir_fd=validation_fd,
+                                follow_symlinks=False,
+                            )
+                        except FileExistsError:
+                            if not _bound_files_equal(
+                                validation_fd,
+                                destination_name,
+                                temporary_name,
+                            ):
+                                raise BinaryValidationError(
+                                    "BINARY_VALIDATION_IDENTITY_COLLISION",
+                                    str(destination),
+                                ) from None
+                    finally:
+                        primary = sys.exc_info()[1]
+                        try:
+                            os.unlink(temporary_name, dir_fd=validation_fd)
+                        except FileNotFoundError:
+                            pass
+                        except BaseException as error:
+                            if primary is None:
+                                raise
+                            _add_validation_cleanup_note(
+                                primary,
+                                "cleanup failed (unlink temporary validation "
+                                f"attachment {temporary_name}): "
+                                f"{type(error).__name__}: {error}",
+                            )
+                    _fsync_bound_directory(validation_fd)
+
+                    current_parent = os.stat(
+                        generation_parent, follow_symlinks=False
+                    )
+                    current_generation = os.stat(
+                        requested_generation.name,
+                        dir_fd=generation_parent_fd,
+                        follow_symlinks=False,
+                    )
+                    current_validation = os.stat(
+                        "validation",
+                        dir_fd=generation_fd,
+                        follow_symlinks=False,
+                    )
+                    if (
+                        not stat.S_ISDIR(current_parent.st_mode)
+                        or _descriptor_identity(current_parent)
+                        != parent_identity
+                        or not stat.S_ISDIR(current_generation.st_mode)
+                        or _descriptor_identity(current_generation)
+                        != generation_identity
+                        or not stat.S_ISDIR(current_validation.st_mode)
+                        or _descriptor_identity(current_validation)
+                        != validation_identity
+                    ):
+                        raise _validation_attachment_path_error(
+                            destination,
+                            "generation or validation directory changed during publication",
+                        )
+        return destination
+    except BinaryValidationError:
+        raise
+    except (OSError, RuntimeError) as error:
+        raise _validation_attachment_path_error(destination, error) from error
+
+
+def _write_validation_attachment_portable(
+    generation: Path,
+    destination_name: str,
+    result: Mapping[str, Any],
+) -> Path:
+    """Strict fallback where Python cannot bind filesystem operations by dirfd.
+
+    The pre/post checks reject pre-existing links. They cannot close a hostile
+    same-privilege rename race on platforms without no-follow dirfd support;
+    activation therefore still re-reads and byte-compares the attachment.
+    """
+
+    requested_generation = Path(os.path.abspath(generation))
+    destination = requested_generation / "validation" / destination_name
+    try:
+        if requested_generation.is_symlink():
+            raise _validation_attachment_path_error(
+                destination, "generation path is a symbolic link"
+            )
+        generation = requested_generation.resolve(strict=True)
+        validation_dir = generation / "validation"
+        destination = validation_dir / destination_name
+        if generation.resolve(strict=True) != generation:
+            raise _validation_attachment_path_error(
+                destination, "generation path contains a symbolic link"
+            )
+        validation_dir.mkdir(exist_ok=True)
+        if (
+            validation_dir.is_symlink()
+            or validation_dir.resolve(strict=True) != validation_dir
+            or validation_dir.resolve(strict=True).parent != generation
+        ):
+            raise _validation_attachment_path_error(
+                destination, "validation directory is not bound to generation"
+            )
+        fsync_directory(generation)
+        temporary = validation_dir / (
+            f".{destination_name}.{os.getpid()}.{secrets.token_hex(12)}.tmp"
+        )
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | int(getattr(os, "O_NOFOLLOW", 0) or 0)
+            | int(getattr(os, "O_BINARY", 0) or 0),
+            0o600,
+        )
+        try:
+            with _owned_descriptor(
+                descriptor, f"temporary validation attachment {temporary}"
+            ) as opened_temporary:
+                _write_json_descriptor(opened_temporary, result)
+            try:
+                link_kwargs = (
+                    {"follow_symlinks": False}
+                    if os.link in os.supports_follow_symlinks
+                    else {}
+                )
+                os.link(temporary, destination, **link_kwargs)
+            except FileExistsError:
+                if not files_equal(destination, temporary):
+                    raise BinaryValidationError(
+                        "BINARY_VALIDATION_IDENTITY_COLLISION",
+                        str(destination),
+                    ) from None
+        finally:
+            primary = sys.exc_info()[1]
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            except BaseException as error:
+                if primary is None:
+                    raise
+                _add_validation_cleanup_note(
+                    primary,
+                    "cleanup failed (unlink temporary validation attachment "
+                    f"{temporary}): {type(error).__name__}: {error}",
+                )
+        fsync_directory(validation_dir)
+        if (
+            validation_dir.is_symlink()
+            or validation_dir.resolve(strict=True).parent != generation
+            or destination.is_symlink()
+            or not destination.is_file()
+        ):
+            raise _validation_attachment_path_error(
+                destination, "validation attachment path changed during publication"
+            )
+        return destination
+    except BinaryValidationError:
+        raise
+    except (OSError, RuntimeError) as error:
+        raise _validation_attachment_path_error(destination, error) from error
+
+
+def _write_validation_attachment(
+    generation: Path,
+    validation_run_identity: str,
+    result: Mapping[str, Any],
+) -> Path:
+    destination_name = f"{validation_run_identity}.json"
+    if _secure_validation_dirfd_supported():
+        return _write_validation_attachment_dirfd(
+            generation, destination_name, result
+        )
+    return _write_validation_attachment_portable(
+        generation, destination_name, result
+    )
+
+
+def _finalize_validation_result(
+    generation: Path,
+    manifest: Mapping[str, Any],
+    truth_parts: Mapping[str, Any],
+    helper_identities: Mapping[str, Any],
+    issues: list[dict[str, Any]],
+    progress_callback: ValidationProgressCallback | None,
+) -> dict[str, Any]:
+    """Bind and persist one complete pass/fail validation attachment."""
+    result_generation_identity = str(
+        manifest.get("result_generation_identity") or ""
+    )
+    active_snapshot_identities = manifest.get("active_snapshot_identities")
+    if not isinstance(active_snapshot_identities, Mapping):
+        active_snapshot_identities = {}
+    skipped_domains = []
+    for domain, truth in truth_parts.items():
+        if isinstance(truth, Mapping) and truth.get("status") == "not_run":
+            skipped_domains.append({
+                "domain": str(domain),
+                "reason_code": str(truth.get("reason_code") or ""),
+            })
+        if domain in {"base", "current"} and isinstance(truth, Mapping):
+            for nested_domain, nested_truth in truth.items():
+                if (
+                    isinstance(nested_truth, Mapping)
+                    and nested_truth.get("status") == "not_run"
+                ):
+                    skipped_domains.append({
+                        "domain": f"{domain}.{nested_domain}",
+                        "reason_code": str(
+                            nested_truth.get("reason_code") or ""
+                        ),
+                    })
+    truth_set_identity = canonical_identity_streaming(
+        "binary_oracle_truth_set_identity",
+        truth_parts,
+        schema_version="1",
+    )
+    oracle_manifest_identity = oracle_support_manifest_identity()
+    implementation_identity = validator_implementation_identity()
+    issue_set_identity = canonical_identity_streaming(
+        "binary_validation_issue_set_identity",
+        issues,
+        schema_version="1",
+    )
+    validation_run_identity = _identity("binary_validation_run_identity", {
+        "result_generation_identity": result_generation_identity,
+        "active_snapshot_identities": dict(active_snapshot_identities),
+        "oracle_support_manifest_identity": oracle_manifest_identity,
+        "truth_set_identity": truth_set_identity,
+        "issue_set_identity": issue_set_identity,
+        "validation_policy_version": POLICY_VERSION,
+        "validator_implementation_identity": implementation_identity,
+        "helper_identities": dict(helper_identities),
+    })
+    domain_counts = defaultdict(lambda: {"issues": 0})
+    for issue in issues:
+        domain_counts[issue["domain"]]["issues"] += 1
+    result = {
+        "schema": "java-upgrade-analyzer.binary-validation-result.v1",
+        "validation_run_identity": validation_run_identity,
+        "result_generation_identity": result_generation_identity,
+        "oracle_support_manifest_identity": oracle_manifest_identity,
+        "truth_set_identity": truth_set_identity,
+        "issue_set_identity": issue_set_identity,
+        "validation_policy_version": POLICY_VERSION,
+        "validator_implementation_identity": implementation_identity,
+        "status": "passed" if not issues else "failed",
+        "issue_count": len(issues),
+        "issues": issues,
+        "domain_summary": dict(domain_counts),
+        "helper_identities": dict(helper_identities),
+        "skipped_domains": sorted(
+            skipped_domains,
+            key=lambda item: (item["domain"], item["reason_code"]),
+        ),
+        "production_identity_influence": "none_validation_attachment_only",
+    }
+    destination = generation / "validation" / f"{validation_run_identity}.json"
+    _notify_progress(
+        progress_callback,
+        "validation-write",
+        "开始流式写入独立验证结果",
+        0,
+        1,
+        str(destination),
+    )
+    destination = _write_validation_attachment(
+        generation,
+        validation_run_identity,
+        result,
+    )
+    _notify_progress(
+        progress_callback,
+        "validation-write",
+        "独立验证结果已写入",
+        1,
+        1,
+        str(destination),
+    )
+    return {**result, "validation_result_path": str(destination)}
 
 
 def validate_generation(
@@ -5589,8 +7487,14 @@ def validate_generation(
     # later run cannot inherit stale filesystem/symlink state.
     _file_url_path.cache_clear()
     progress_callback = progress_callback or _environment_progress_callback()
-    tool_policy = _oracle_tool_execution_policy(config)
-    generation = Path(generation_directory).resolve()
+    tool_policy = validate_oracle_tool_execution_policy(config)
+    requested_generation = Path(generation_directory).expanduser()
+    if requested_generation.is_symlink():
+        raise BinaryValidationError(
+            "BINARY_VALIDATION_ATTACHMENT_PATH_INVALID",
+            f"generation path is a symbolic link: {requested_generation}",
+        )
+    generation = requested_generation.resolve()
     base_side = dict(config.get("base") or {})
     current_side = dict(config.get("current") or {})
     _notify_progress(
@@ -5601,6 +7505,7 @@ def validate_generation(
         2,
     )
     checked_jdks: dict[str, dict[str, Any]] = {}
+    observed_jdk_identities: dict[str, str] = {}
     for side_index, (side_name, side) in enumerate(
         (("base", base_side), ("current", current_side)), start=1,
     ):
@@ -5645,6 +7550,9 @@ def validate_generation(
                     sort_keys=True,
                 ),
             )
+        observed_jdk_identities[side_name] = str(
+            observed["jdk_preflight_identity"]
+        )
         _notify_progress(
             progress_callback,
             "validation-preflight",
@@ -5653,20 +7561,187 @@ def validate_generation(
             2,
             str(jdk_home),
         )
-    manifest = _load_json(generation / "result_generation.json")
+    loaded_manifest = _load_json(generation / "result_generation.json")
     integrity_issues = []
-    for name, expected in (manifest.get("sidecar_content_identities") or {}).items():
+    if not isinstance(loaded_manifest, Mapping):
+        integrity_issues.append(_validation_issue(
+            "generation_integrity",
+            "ORACLE_GENERATION_MANIFEST_SCHEMA_INVALID",
+            actual_type=type(loaded_manifest).__name__,
+        ))
+        manifest: Mapping[str, Any] = {}
+    else:
+        manifest = loaded_manifest
+    policy_identities = manifest.get("policy_identities")
+    if not isinstance(policy_identities, Mapping):
+        policy_identities = {}
+    for side_name in ("base", "current"):
+        policy_field = f"{side_name}_jdk_preflight_identity"
+        expected_identity = str(policy_identities.get(policy_field) or "")
+        actual_identity = observed_jdk_identities.get(side_name, "")
+        if (
+            re.fullmatch(r"[0-9a-f]{64}", expected_identity) is None
+            or expected_identity != actual_identity
+        ):
+            integrity_issues.append(_validation_issue(
+                "generation_integrity",
+                "ORACLE_GENERATION_JDK_PREFLIGHT_IDENTITY_MISMATCH",
+                side=side_name,
+                expected_jdk_preflight_identity=expected_identity,
+                actual_jdk_preflight_identity=actual_identity,
+            ))
+    generation_identity = str(manifest.get("result_generation_identity") or "")
+    expected_generation_identity = _expected_result_generation_identity(manifest)
+    if (
+        expected_generation_identity is None
+        or expected_generation_identity != generation_identity
+    ):
+        integrity_issues.append(_validation_issue(
+            "generation_integrity",
+            "ORACLE_GENERATION_IDENTITY_MISMATCH",
+            declared_result_generation_identity=generation_identity,
+            expected_result_generation_identity=expected_generation_identity,
+        ))
+    if generation.name != generation_identity:
+        integrity_issues.append(_validation_issue(
+            "generation_integrity",
+            "ORACLE_GENERATION_DIRECTORY_IDENTITY_MISMATCH",
+            generation_directory=str(generation),
+            declared_result_generation_identity=generation_identity,
+        ))
+    sidecar_identities = manifest.get("sidecar_content_identities")
+    if not isinstance(sidecar_identities, Mapping):
+        integrity_issues.append(_validation_issue(
+            "generation_integrity",
+            "ORACLE_GENERATION_SIDECAR_MANIFEST_INVALID",
+            actual_type=type(sidecar_identities).__name__,
+        ))
+        sidecar_identities = {}
+    integrity_issues.extend(_generation_sidecar_declaration_issues(
+        config, generation, sidecar_identities
+    ))
+    for name, expected in sidecar_identities.items():
+        if (
+            not _safe_generation_sidecar_name(name)
+            or not isinstance(expected, str)
+            or re.fullmatch(r"[0-9a-f]{64}", expected) is None
+        ):
+            integrity_issues.append(_validation_issue(
+                "generation_integrity",
+                "ORACLE_GENERATION_SIDECAR_DECLARATION_INVALID",
+                sidecar=str(name),
+                expected_sha256=expected,
+            ))
+            continue
         sidecar = generation / str(name)
-        actual = _sha256_file(sidecar) if sidecar.is_file() else "MISSING"
+        actual = (
+            _sha256_file(sidecar)
+            if not sidecar.is_symlink() and sidecar.is_file()
+            else "MISSING_OR_SYMLINK"
+        )
         if actual != expected:
             integrity_issues.append(_validation_issue(
                 "generation_integrity", "ORACLE_GENERATION_SIDECAR_TAMPERED",
                 sidecar=name, expected_sha256=expected, actual_sha256=actual,
             ))
+    if integrity_issues:
+        not_run = {
+            "status": "not_run",
+            "reason_code": "GENERATION_INTEGRITY_VALIDATION_FAILED",
+        }
+        truth_parts = {
+            "generation_integrity": [
+                issue["evidence"] for issue in integrity_issues
+            ],
+            "pairings": dict(not_run),
+            "source_attestation": dict(not_run),
+            "base": dict(not_run),
+            "current": dict(not_run),
+            "cross_version_semantics": dict(not_run),
+            "entrypoint_discovery": dict(not_run),
+            "runtime_semantic_overlay": dict(not_run),
+            "closed_world_results": dict(not_run),
+        }
+        return _finalize_validation_result(
+            generation,
+            manifest,
+            truth_parts,
+            {},
+            integrity_issues,
+            progress_callback,
+        )
     base_artifacts = _artifact_configs(base_side)
     current_artifacts = _artifact_configs(current_side)
     base_jdk = Path(str(base_side.get("jdk_home") or "")).expanduser().resolve()
     current_jdk = Path(str(current_side.get("jdk_home") or "")).expanduser().resolve()
+    policy_identities = manifest.get("policy_identities")
+    profile_binding_issues = []
+    if not isinstance(policy_identities, Mapping):
+        policy_identities = {}
+    for side_name, side, artifacts, jdk_home in (
+        ("base", base_side, base_artifacts, base_jdk),
+        ("current", current_side, current_artifacts, current_jdk),
+    ):
+        platform_identity = str(
+            policy_identities.get(f"{side_name}_platform_image") or ""
+        )
+        if re.fullmatch(r"[0-9a-f]{64}", platform_identity) is None:
+            profile_binding_issues.append(_validation_issue(
+                "artifact_instance",
+                "ORACLE_RUNTIME_PLATFORM_IDENTITY_MISSING",
+                side=side_name,
+                actual_runtime_platform_identity=platform_identity,
+            ))
+            continue
+        try:
+            runtime_profile_identity = _expected_runtime_profile_identity(
+                side,
+                artifacts,
+                platform_identity=platform_identity,
+                jdk_home=jdk_home,
+            )
+            _attach_expected_artifact_instances(
+                artifacts, runtime_profile_identity
+            )
+        except (
+            BinaryFirstContractError,
+            KeyError,
+            OSError,
+            StopIteration,
+            TypeError,
+            ValueError,
+        ) as error:
+            profile_binding_issues.append(_validation_issue(
+                "artifact_instance",
+                "ORACLE_ARTIFACT_INSTANCE_EXPECTATION_FAILED",
+                side=side_name,
+                error_type=type(error).__name__,
+                detail=str(error),
+            ))
+    if profile_binding_issues:
+        not_run = {
+            "status": "not_run",
+            "reason_code": "ARTIFACT_INSTANCE_EXPECTATION_FAILED",
+        }
+        truth_parts = {
+            "generation_integrity": [{"status": "intact"}],
+            "pairings": dict(not_run),
+            "source_attestation": dict(not_run),
+            "base": dict(not_run),
+            "current": dict(not_run),
+            "cross_version_semantics": dict(not_run),
+            "entrypoint_discovery": dict(not_run),
+            "runtime_semantic_overlay": dict(not_run),
+            "closed_world_results": dict(not_run),
+        }
+        return _finalize_validation_result(
+            generation,
+            manifest,
+            truth_parts,
+            {},
+            profile_binding_issues,
+            progress_callback,
+        )
     inventory_cache: dict[tuple[str, int], dict[str, Any]] = {}
 
     def inventories_for(
@@ -5715,15 +7790,13 @@ def validate_generation(
     current_inventories = inventories_for(
         current_artifacts, current_jdk, side_name="current",
     )
-    issues = list(integrity_issues)
+    issues = []
     for side, inventories in (("base", base_inventories), ("current", current_inventories)):
         for inventory in inventories:
             for failure in inventory["failures"]:
                 issues.append(_validation_issue("artifact_inventory", "ORACLE_INVENTORY_FAILURE", side=side, failure=failure))
     truth_parts = {
-        "generation_integrity": [
-            issue["evidence"] for issue in integrity_issues
-        ] or [{"status": "intact"}],
+        "generation_integrity": [{"status": "intact"}],
     }
     pairing_issues, pairing_truth = _validate_pairings(
         generation, base_artifacts, current_artifacts
@@ -5733,6 +7806,30 @@ def validate_generation(
     source_issues, source_truth = _validate_source_attestation(generation, config)
     issues.extend(source_issues)
     truth_parts["source_attestation"] = source_truth
+
+    if issues:
+        not_run = {
+            "status": "not_run",
+            "reason_code": "PREREQUISITE_VALIDATION_FAILED",
+        }
+        truth_parts.update({
+            "base": dict(not_run),
+            "current": dict(not_run),
+            "cross_version_semantics": dict(not_run),
+            "entrypoint_discovery": dict(not_run),
+            "runtime_semantic_overlay": dict(not_run),
+            "closed_world_results": dict(not_run),
+        })
+        inventory_cache.clear()
+        gc.collect()
+        return _finalize_validation_result(
+            generation,
+            manifest,
+            truth_parts,
+            {},
+            issues,
+            progress_callback,
+        )
 
     helper_identities = {}
     observations_by_side = {}
@@ -5778,21 +7875,15 @@ def validate_generation(
         for side_name, side, artifacts, _inventories, db_name, jdk_home
         in side_specs
     }
-    duplicated_side_keys = {
-        key for key in side_validation_keys.values()
-        if list(side_validation_keys.values()).count(key) > 1
-    }
+    foundational_truth_by_side: dict[str, dict[str, Any]] = {}
+
+    # Pass 1 proves every immutable/artifact/bytecode fact for both sides.
+    # Do not start target-JVM reflection or graph semantics until this cheaper
+    # layer is clean: a deterministic direct-edge mismatch must not consume
+    # hours in phases that cannot make the generation activatable.
     for side_name, side, artifacts, inventories, db_name, jdk_home in side_specs:
         db_path = generation / db_name
-        side_validation_key = side_validation_keys[side_name]
-        cached_side = side_validation_cache.get(side_validation_key)
-        if cached_side is not None:
-            observations, helper_identity, side_truth = cached_side
-            helper_identities[side_name] = helper_identity
-            observations_by_side[side_name] = observations
-            truth_parts[side_name] = side_truth
-            continue
-        connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        connection = _open_immutable_sqlite(db_path)
         connection.row_factory = sqlite3.Row
         try:
             javap = str(jdk_tool_path(jdk_home, "javap"))
@@ -5805,6 +7896,9 @@ def validate_generation(
                 string_pool=validation_string_pool,
                 progress_callback=progress_callback,
                 progress_label=side_name,
+                time_budget_seconds=tool_policy[
+                    "javap_time_budget_seconds"
+                ],
             )
             structural_issues, structural_truth = _validate_structural_edges(
                 connection,
@@ -5817,27 +7911,70 @@ def validate_generation(
                 progress_callback=progress_callback,
                 progress_label=side_name,
             )
-            if (
-                side_name == "current"
-                or side_validation_key in duplicated_side_keys
-            ):
-                # The other side will reuse the independently proven logical
-                # database/input identity, or both sides have now completed
-                # structural comparison. Release javap evidence and normalized
-                # lookup tables before runtime-outcome indexes are built.
-                direct_scan_cache.clear()
-                direct_truth_cache.clear()
-                structural_scan_cache.clear()
-                clear_immutable_oracle_cache()
             issues.extend(edge_issues)
             issues.extend(structural_issues)
+            foundational_truth = {**edge_truth, **structural_truth}
+            foundational_truth_by_side[side_name] = foundational_truth
+            truth_parts[side_name] = foundational_truth
+        finally:
+            connection.close()
+
+    direct_scan_cache.clear()
+    direct_truth_cache.clear()
+    structural_scan_cache.clear()
+    clear_immutable_oracle_cache()
+
+    if issues:
+        not_run = {
+            "status": "not_run",
+            "reason_code": "FOUNDATIONAL_VALIDATION_FAILED",
+        }
+        for side_name in ("base", "current"):
+            truth_parts[side_name] = {
+                **foundational_truth_by_side.get(side_name, {}),
+                "runtime_outcomes": dict(not_run),
+                "resource_selection_validation": dict(not_run),
+            }
+        truth_parts.update({
+            "cross_version_semantics": dict(not_run),
+            "entrypoint_discovery": dict(not_run),
+            "runtime_semantic_overlay": dict(not_run),
+            "closed_world_results": dict(not_run),
+        })
+        inventory_cache.clear()
+        validation_string_pool.clear()
+        gc.collect()
+        return _finalize_validation_result(
+            generation,
+            manifest,
+            truth_parts,
+            helper_identities,
+            issues,
+            progress_callback,
+        )
+
+    # Pass 2 performs target-JVM and runtime-outcome validation only after the
+    # entire foundational layer is proven clean.
+    issue_count_before_runtime = len(issues)
+    for side_name, side, artifacts, inventories, db_name, jdk_home in side_specs:
+        db_path = generation / db_name
+        side_validation_key = side_validation_keys[side_name]
+        cached_side = side_validation_cache.get(side_validation_key)
+        if cached_side is not None:
+            observations, helper_identity, side_truth = cached_side
+            helper_identities[side_name] = helper_identity
+            observations_by_side[side_name] = observations
+            truth_parts[side_name] = side_truth
+            continue
+        connection = _open_immutable_sqlite(db_path)
+        connection.row_factory = sqlite3.Row
+        try:
+            edge_truth = foundational_truth_by_side[side_name]
             independent_classes = {
                 name for inventory in inventories for name in inventory["classes"]
-                if name != "module-info"
             }
             independent_classes.update(
                 name for name in edge_truth["discovery_classes"]
-                if name != "module-info"
             )
             topology = (
                 (side.get("runtime_profile") or {}).get("loader_topology") or {}
@@ -5867,25 +8004,26 @@ def validate_generation(
                 jdk_home,
                 oracle_artifacts,
                 independent_classes,
-                **tool_policy,
+                compile_timeout_seconds=tool_policy[
+                    "compile_timeout_seconds"
+                ],
+                runtime_timeout_seconds=tool_policy[
+                    "runtime_timeout_seconds"
+                ],
+                phase_time_budget_seconds=tool_policy[
+                    "runtime_phase_time_budget_seconds"
+                ],
+                max_attempts=tool_policy["max_attempts"],
                 progress_callback=progress_callback,
                 progress_label=side_name,
                 string_pool=validation_string_pool,
             )
-            javap_members: dict[str, list[str]] = defaultdict(list)
-            for owner, kind, member_name, descriptor, flags in (
-                structural_truth.get("declared_members") or ()
-            ):
-                javap_members[str(owner)].append(
-                    f"{kind}|{member_name}|{descriptor}|{int(flags)}"
-                )
-            for class_name, values in javap_members.items():
-                observation = observations.get(class_name)
-                if observation is not None:
-                    observation["javap_declared_members"] = tuple(
-                        _pooled_string(value, validation_string_pool)
-                        for value in sorted(set(values))
-                    )
+            _attach_provider_declared_members(
+                artifacts,
+                edge_truth,
+                observations,
+                validation_string_pool,
+            )
             reference_observations = observations_by_side.get("base")
             if reference_observations is not None:
                 _share_equal_observation_values(
@@ -5901,6 +8039,7 @@ def validate_generation(
             runtime_issues, runtime_truth = _validate_runtime_outcomes(
                 connection,
                 artifacts,
+                oracle_artifacts,
                 inventories,
                 observations,
                 entrypoint_realms,
@@ -5909,12 +8048,16 @@ def validate_generation(
                 jdk_home,
             )
             resource_issues, resource_truth = _validate_resource_selections(
-                connection, artifacts, inventories, entrypoint_realms
+                connection,
+                artifacts,
+                inventories,
+                entrypoint_realms,
+                topology,
             )
             issues.extend(runtime_issues)
             issues.extend(resource_issues)
             side_truth = {
-                **edge_truth, **structural_truth, **runtime_truth, **resource_truth,
+                **edge_truth, **runtime_truth, **resource_truth,
             }
             truth_parts[side_name] = side_truth
             side_validation_cache[side_validation_key] = (
@@ -5932,6 +8075,32 @@ def validate_generation(
         finally:
             connection.close()
 
+    if len(issues) > issue_count_before_runtime:
+        not_run = {
+            "status": "not_run",
+            "reason_code": "RUNTIME_OUTCOME_VALIDATION_FAILED",
+        }
+        truth_parts.update({
+            "cross_version_semantics": dict(not_run),
+            "entrypoint_discovery": dict(not_run),
+            "runtime_semantic_overlay": dict(not_run),
+            "closed_world_results": dict(not_run),
+        })
+        observations_by_side.clear()
+        side_validation_cache.clear()
+        inventory_cache.clear()
+        validation_string_pool.clear()
+        gc.collect()
+        return _finalize_validation_result(
+            generation,
+            manifest,
+            truth_parts,
+            helper_identities,
+            issues,
+            progress_callback,
+        )
+
+    issue_count_before_semantics = len(issues)
     _notify_progress(
         progress_callback,
         "validation-semantics",
@@ -5988,6 +8157,25 @@ def validate_generation(
         3,
         3,
     )
+    if len(issues) > issue_count_before_semantics:
+        truth_parts["closed_world_results"] = {
+            "status": "not_run",
+            "reason_code": "SEMANTIC_VALIDATION_FAILED",
+        }
+        observations_by_side.clear()
+        side_validation_cache.clear()
+        inventory_cache.clear()
+        validation_string_pool.clear()
+        clear_immutable_oracle_cache()
+        gc.collect()
+        return _finalize_validation_result(
+            generation,
+            manifest,
+            truth_parts,
+            helper_identities,
+            issues,
+            progress_callback,
+        )
     # The following closed-world pass and final truth hashing do not consume
     # raw class observations or scan caches. Drop those large, independently
     # reconstructed working sets before any graph materialization so validation
@@ -6029,72 +8217,20 @@ def validate_generation(
         1,
     )
 
-    # ``truth_parts`` can contain millions of independently reconstructed
-    # rows. The ordinary identity helper canonicalizes the full tree twice and
-    # then allocates one equally large JSON byte string. Stream the exact same
-    # canonical bytes into SHA-256 so validation identity construction is
-    # bounded by nesting depth instead of total project size.
-    truth_set_identity = canonical_identity_streaming(
-        "binary_oracle_truth_set_identity",
+    stability_issues, final_artifact_hashes = _final_artifact_stability((
+        ("base", base_artifacts), ("current", current_artifacts),
+    ))
+    issues.extend(stability_issues)
+    truth_parts["final_artifact_stability"] = final_artifact_hashes
+
+    return _finalize_validation_result(
+        generation,
+        manifest,
         truth_parts,
-        schema_version="1",
-    )
-    support = _load_json(SUPPORT_MANIFEST)
-    oracle_manifest_identity = _identity(
-        "oracle_support_manifest_identity", support["oracle_support_manifest"]
-    )
-    validation_run_identity = _identity("binary_validation_run_identity", {
-        "result_generation_identity": manifest["result_generation_identity"],
-        "active_snapshot_identities": manifest["active_snapshot_identities"],
-        "oracle_support_manifest_identity": oracle_manifest_identity,
-        "truth_set_identity": truth_set_identity,
-        "validation_policy_version": POLICY_VERSION,
-        "helper_identities": helper_identities,
-    })
-    domain_counts = defaultdict(lambda: {"issues": 0})
-    for issue in issues:
-        domain_counts[issue["domain"]]["issues"] += 1
-    result = {
-        "schema": "java-upgrade-analyzer.binary-validation-result.v1",
-        "validation_run_identity": validation_run_identity,
-        "result_generation_identity": manifest["result_generation_identity"],
-        "oracle_support_manifest_identity": oracle_manifest_identity,
-        "truth_set_identity": truth_set_identity,
-        "validation_policy_version": POLICY_VERSION,
-        "status": "passed" if not issues else "failed",
-        "issue_count": len(issues),
-        "issues": issues,
-        "domain_summary": dict(domain_counts),
-        "helper_identities": helper_identities,
-        "production_identity_influence": "none_validation_attachment_only",
-    }
-    validation_dir = generation / "validation"
-    validation_dir.mkdir(exist_ok=True)
-    destination = validation_dir / f"{validation_run_identity}.json"
-    _notify_progress(
+        helper_identities,
+        issues,
         progress_callback,
-        "validation-write",
-        "开始流式写入独立验证结果",
-        0,
-        1,
-        str(destination),
     )
-    write_json_streaming_atomic(
-        destination,
-        result,
-        collision_error=BinaryValidationError(
-            "BINARY_VALIDATION_IDENTITY_COLLISION", str(destination)
-        ),
-    )
-    _notify_progress(
-        progress_callback,
-        "validation-write",
-        "独立验证结果已写入",
-        1,
-        1,
-        str(destination),
-    )
-    return {**result, "validation_result_path": str(destination)}
 
 
 def main(argv=None) -> int:

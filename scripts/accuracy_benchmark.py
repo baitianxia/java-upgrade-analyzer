@@ -6,10 +6,9 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-import subprocess
 import sys
 
-from compat import subprocess_platform_kwargs
+from compat import run_managed_subprocess
 
 
 CATEGORIES = {
@@ -52,9 +51,7 @@ def main(argv=None) -> int:
     if args.dry_run:
         print(" ".join(command))
         return 0
-    completed = subprocess.run(
-        command, check=False, **subprocess_platform_kwargs()
-    )
+    completed = run_managed_subprocess(command, check=False)
     payload = {
         "schema": "java-upgrade-analyzer.binary-accuracy-benchmark.v1",
         "status": "passed" if completed.returncode == 0 else "failed",

@@ -237,7 +237,7 @@ public final class BinaryFactExtractor {
             fact.put("class_name", name);
             fact.put("class_signature", signature);
             fact.put("super_name", superName);
-            fact.put("interfaces", interfaces == null ? List.of() : Arrays.asList(interfaces));
+            fact.put("interfaces", interfaces == null ? Collections.emptyList() : Arrays.asList(interfaces));
         }
 
         @Override public void visitSource(String source, String debug) {
@@ -251,12 +251,12 @@ public final class BinaryFactExtractor {
             module.put("directives", directives);
             fact.put("module", module);
             return new ModuleVisitor(Opcodes.ASM9) {
-                @Override public void visitMainClass(String mainClass) { directives.add(List.of("main", mainClass)); }
-                @Override public void visitPackage(String packaze) { directives.add(List.of("package", packaze)); }
+                @Override public void visitMainClass(String mainClass) { directives.add(Arrays.asList("main", mainClass)); }
+                @Override public void visitPackage(String packaze) { directives.add(Arrays.asList("package", packaze)); }
                 @Override public void visitRequire(String module, int flags, String ver) { directives.add(Arrays.asList("requires", module, flags, ver)); }
-                @Override public void visitExport(String packaze, int flags, String... modules) { directives.add(Arrays.asList("exports", packaze, flags, modules == null ? List.of() : Arrays.asList(modules))); }
-                @Override public void visitOpen(String packaze, int flags, String... modules) { directives.add(Arrays.asList("opens", packaze, flags, modules == null ? List.of() : Arrays.asList(modules))); }
-                @Override public void visitUse(String service) { directives.add(List.of("uses", service)); }
+                @Override public void visitExport(String packaze, int flags, String... modules) { directives.add(Arrays.asList("exports", packaze, flags, modules == null ? Collections.emptyList() : Arrays.asList(modules))); }
+                @Override public void visitOpen(String packaze, int flags, String... modules) { directives.add(Arrays.asList("opens", packaze, flags, modules == null ? Collections.emptyList() : Arrays.asList(modules))); }
+                @Override public void visitUse(String service) { directives.add(Arrays.asList("uses", service)); }
                 @Override public void visitProvide(String service, String... providers) { directives.add(Arrays.asList("provides", service, Arrays.asList(providers))); }
             };
         }
@@ -324,13 +324,17 @@ public final class BinaryFactExtractor {
             List<Object> inventory = AttributeInventory.scan(bytes);
             fact.put("attribute_inventory", inventory);
             fact.put("attribute_inventory_digest", sha256(Json.stringify(inventory).getBytes(StandardCharsets.UTF_8)));
+            List<Object> methodContracts = new ArrayList<>();
+            for (Object item : methods) {
+                methodContracts.add(((Map<?, ?>) item).get("contract"));
+            }
             fact.put("class_contract_digest", sha256(Json.stringify(linked(
                 "class_major", fact.get("class_major"), "class_access", fact.get("class_access"),
                 "class_name", fact.get("class_name"),
                 "class_signature", fact.get("class_signature"), "super_name", fact.get("super_name"),
                 "interfaces", fact.get("interfaces"), "annotations", annotations,
                 "fields", fields,
-                "methods", methods.stream().map(item -> ((Map<?, ?>) item).get("contract")).toList(),
+                "methods", methodContracts,
                 "record_components", recordComponents, "permitted_subclasses", permittedSubclasses,
                 "nest_host", fact.get("nest_host"), "nest_members", fact.get("nest_members"),
                 "outer_class", fact.get("outer_class"), "inner_classes", innerClasses,
@@ -355,7 +359,7 @@ public final class BinaryFactExtractor {
                 contract = linked(
                     "access", access, "name", name, "descriptor", descriptor,
                     "signature", signature,
-                    "exceptions", exceptions == null ? List.of() : Arrays.asList(exceptions),
+                    "exceptions", exceptions == null ? Collections.emptyList() : Arrays.asList(exceptions),
                     "annotations", annotations, "parameters", parameters
                 );
                 fact = linked("contract", contract, "instructions", instructions, "try_catch", tryCatch);
@@ -406,29 +410,35 @@ public final class BinaryFactExtractor {
             }
 
             void collectLabelPositions(Object value, Set<Integer> output) throws IOException {
-                if (value instanceof Label label) {
+                if (value instanceof Label) {
+                    Label label = (Label) value;
                     Integer position = labelPositions.get(label);
                     if (position == null) throw new IOException("semantic label has no bytecode position");
                     output.add(position);
-                } else if (value instanceof Object[] array) {
+                } else if (value instanceof Object[]) {
+                    Object[] array = (Object[]) value;
                     for (Object item : array) collectLabelPositions(item, output);
-                } else if (value instanceof Iterable<?> values) {
+                } else if (value instanceof Iterable<?>) {
+                    Iterable<?> values = (Iterable<?>) value;
                     for (Object item : values) collectLabelPositions(item, output);
                 }
             }
 
             Object normalizeLabels(Object value, Map<Integer, Integer> positionIds) throws IOException {
-                if (value instanceof Label label) {
+                if (value instanceof Label) {
+                    Label label = (Label) value;
                     Integer position = labelPositions.get(label);
                     if (position == null || !positionIds.containsKey(position)) throw new IOException("semantic label normalization failed");
                     return positionIds.get(position);
                 }
-                if (value instanceof Object[] array) {
+                if (value instanceof Object[]) {
+                    Object[] array = (Object[]) value;
                     List<Object> output = new ArrayList<>();
                     for (Object item : array) output.add(normalizeLabels(item, positionIds));
                     return output;
                 }
-                if (value instanceof Iterable<?> values) {
+                if (value instanceof Iterable<?>) {
+                    Iterable<?> values = (Iterable<?>) value;
                     List<Object> output = new ArrayList<>();
                     for (Object item : values) output.add(normalizeLabels(item, positionIds));
                     return output;
@@ -457,21 +467,37 @@ public final class BinaryFactExtractor {
     }
 
     private static Object constant(Object value) {
-        if (value instanceof Float number && !Float.isFinite(number)) return linked(
-            "kind", "non_finite_float", "value", floatingValue(number),
-            "raw_bits", String.format(Locale.ROOT, "%08x", Float.floatToRawIntBits(number))
-        );
-        if (value instanceof Double number && !Double.isFinite(number)) return linked(
-            "kind", "non_finite_double", "value", floatingValue(number),
-            "raw_bits", String.format(Locale.ROOT, "%016x", Double.doubleToRawLongBits(number))
-        );
+        if (value instanceof Float) {
+            Float number = (Float) value;
+            if (!Float.isFinite(number.floatValue())) return linked(
+                "kind", "non_finite_float", "value", floatingValue(number),
+                "raw_bits", String.format(Locale.ROOT, "%08x", Float.floatToRawIntBits(number.floatValue()))
+            );
+        }
+        if (value instanceof Double) {
+            Double number = (Double) value;
+            if (!Double.isFinite(number.doubleValue())) return linked(
+                "kind", "non_finite_double", "value", floatingValue(number),
+                "raw_bits", String.format(Locale.ROOT, "%016x", Double.doubleToRawLongBits(number.doubleValue()))
+            );
+        }
         if (value == null || value instanceof String || value instanceof Number || value instanceof Boolean) return value;
-        if (value instanceof Type type) return linked("kind", "type", "descriptor", type.getDescriptor());
-        if (value instanceof Handle handle) return linked(
-            "kind", "handle", "tag", handle.getTag(), "owner", handle.getOwner(),
-            "name", handle.getName(), "descriptor", handle.getDesc(), "interface", handle.isInterface()
-        );
-        if (value instanceof ConstantDynamic dynamic) {
+        if (value instanceof Type) {
+            Type type = (Type) value;
+            return linked(
+                "kind", type.getSort() == Type.METHOD ? "method_type" : "type",
+                "descriptor", type.getDescriptor()
+            );
+        }
+        if (value instanceof Handle) {
+            Handle handle = (Handle) value;
+            return linked(
+                "kind", "handle", "tag", handle.getTag(), "owner", handle.getOwner(),
+                "name", handle.getName(), "descriptor", handle.getDesc(), "interface", handle.isInterface()
+            );
+        }
+        if (value instanceof ConstantDynamic) {
+            ConstantDynamic dynamic = (ConstantDynamic) value;
             List<Object> args = new ArrayList<>();
             for (int index = 0; index < dynamic.getBootstrapMethodArgumentCount(); index++) args.add(constant(dynamic.getBootstrapMethodArgument(index)));
             return linked("kind", "constant_dynamic", "name", dynamic.getName(), "descriptor", dynamic.getDescriptor(),
@@ -505,13 +531,40 @@ public final class BinaryFactExtractor {
             for (int index = 1; index < cpCount; index++) {
                 int tag = u1();
                 switch (tag) {
-                    case 1 -> { int length = u2(); utf8[index] = modifiedUtf8(length); cursor += length; }
-                    case 3, 4 -> cursor += 4;
-                    case 5, 6 -> { cursor += 8; index++; }
-                    case 7, 8, 16, 19, 20 -> cursor += 2;
-                    case 9, 10, 11, 12, 17, 18 -> cursor += 4;
-                    case 15 -> cursor += 3;
-                    default -> throw new IOException("unsupported constant-pool tag " + tag);
+                    case 1:
+                        int length = u2();
+                        utf8[index] = modifiedUtf8(length);
+                        cursor += length;
+                        break;
+                    case 3:
+                    case 4:
+                        cursor += 4;
+                        break;
+                    case 5:
+                    case 6:
+                        cursor += 8;
+                        index++;
+                        break;
+                    case 7:
+                    case 8:
+                    case 16:
+                    case 19:
+                    case 20:
+                        cursor += 2;
+                        break;
+                    case 9:
+                    case 10:
+                    case 11:
+                    case 12:
+                    case 17:
+                    case 18:
+                        cursor += 4;
+                        break;
+                    case 15:
+                        cursor += 3;
+                        break;
+                    default:
+                        throw new IOException("unsupported constant-pool tag " + tag);
                 }
                 require(cursor <= data.length, "constant pool exceeds classfile");
             }
@@ -596,15 +649,17 @@ public final class BinaryFactExtractor {
         }
         static void append(StringBuilder out, Object value) {
             if (value == null) out.append("null");
-            else if (value instanceof String string) quote(out, string);
+            else if (value instanceof String) quote(out, (String) value);
             else if (value instanceof Number || value instanceof Boolean) out.append(value);
-            else if (value instanceof Map<?, ?> map) {
+            else if (value instanceof Map<?, ?>) {
+                Map<?, ?> map = (Map<?, ?>) value;
                 out.append('{'); boolean first = true;
                 for (Map.Entry<?, ?> entry : map.entrySet()) {
                     if (!first) out.append(','); first = false; quote(out, String.valueOf(entry.getKey())); out.append(':'); append(out, entry.getValue());
                 }
                 out.append('}');
-            } else if (value instanceof Iterable<?> values) {
+            } else if (value instanceof Iterable<?>) {
+                Iterable<?> values = (Iterable<?>) value;
                 out.append('['); boolean first = true;
                 for (Object item : values) { if (!first) out.append(','); first = false; append(out, item); }
                 out.append(']');
@@ -619,10 +674,17 @@ public final class BinaryFactExtractor {
             for (int index = 0; index < value.length(); index++) {
                 char ch = value.charAt(index);
                 switch (ch) {
-                    case '"' -> out.append("\\\""); case '\\' -> out.append("\\\\");
-                    case '\b' -> out.append("\\b"); case '\f' -> out.append("\\f");
-                    case '\n' -> out.append("\\n"); case '\r' -> out.append("\\r"); case '\t' -> out.append("\\t");
-                    default -> { if (ch < 0x20) out.append(String.format(Locale.ROOT, "\\u%04x", (int) ch)); else out.append(ch); }
+                    case '"': out.append("\\\""); break;
+                    case '\\': out.append("\\\\"); break;
+                    case '\b': out.append("\\b"); break;
+                    case '\f': out.append("\\f"); break;
+                    case '\n': out.append("\\n"); break;
+                    case '\r': out.append("\\r"); break;
+                    case '\t': out.append("\\t"); break;
+                    default:
+                        if (ch < 0x20 || Character.isSurrogate(ch)) {
+                            out.append(String.format(Locale.ROOT, "\\u%04x", (int) ch));
+                        } else out.append(ch);
                 }
             }
             out.append('"');

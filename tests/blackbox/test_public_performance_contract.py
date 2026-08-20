@@ -9,6 +9,7 @@ import unittest
 import zipfile
 
 from tests.blackbox.harness import required_tools
+from tests.blackbox.managed_process import managed_run
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -37,7 +38,7 @@ class PublicPerformanceContractBlackboxTest(unittest.TestCase):
             root = Path(temporary)
             output = root / "result.json"
             started = time.monotonic()
-            completed = subprocess.run(
+            completed = managed_run(
                 [
                     sys.executable,
                     str(ROOT / "scripts" / "binary_performance_gate.py"),
@@ -79,7 +80,7 @@ class PublicPerformanceContractBlackboxTest(unittest.TestCase):
             for class_index, class_entry in enumerate(independent_classes):
                 owner = class_entry.removesuffix(".class").replace("/", ".")
                 artifact = artifacts[class_index // expected["classes_per_jar"]]
-                javap = subprocess.run(
+                javap = managed_run(
                     [self.tools["javap"], "-classpath", str(artifact), "-c", "-s", "-p", owner],
                     capture_output=True, text=True, encoding="utf-8",
                     errors="replace", check=False, timeout=30,
@@ -262,7 +263,7 @@ class PublicPerformanceContractBlackboxTest(unittest.TestCase):
             expected["class_count"],
         )
 
-        verified = subprocess.run(
+        verified = managed_run(
             [
                 sys.executable,
                 str(ROOT / "scripts" / "binary_performance_gate.py"),
@@ -282,7 +283,8 @@ class PublicPerformanceContractBlackboxTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("schedule:", workflow)
         self.assertIn("quality_gate.py --profile release", workflow)
-        dry_run = subprocess.run(
+        self.assertIn("--release-performance-mode recorded", workflow)
+        dry_run = managed_run(
             [
                 sys.executable, str(ROOT / "scripts" / "quality_gate.py"),
                 "--profile", "release", "--dry-run",
@@ -294,6 +296,18 @@ class PublicPerformanceContractBlackboxTest(unittest.TestCase):
         self.assertIn("binary_performance_gate.py", dry_run.stdout)
         self.assertIn("--gate", dry_run.stdout)
         self.assertIn(str(gate_path), dry_run.stdout)
+
+        recorded_dry_run = managed_run(
+            [
+                sys.executable, str(ROOT / "scripts" / "quality_gate.py"),
+                "--profile", "release", "--release-performance-mode",
+                "recorded", "--dry-run",
+            ],
+            cwd=str(ROOT), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", check=False, timeout=30,
+        )
+        self.assertEqual(recorded_dry_run.returncode, 0, recorded_dry_run.stderr)
+        self.assertIn("--verify-recorded-gate", recorded_dry_run.stdout)
 
 
 if __name__ == "__main__":

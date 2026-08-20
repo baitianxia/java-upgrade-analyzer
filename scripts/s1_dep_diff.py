@@ -148,14 +148,19 @@ def _business_content_entries(archive):
                 (value for value in application_prefixes if name.startswith(value)),
                 '',
             )
-            if not prefix:
+            if prefix:
+                target_name = name[len(prefix):]
+            elif name.upper() == 'META-INF/MANIFEST.MF':
+                # The outer manifest is runtime metadata for MR class/resource
+                # selection.  Dropping it from the retained business view
+                # silently turns a valid MR application into a base-only JAR.
+                target_name = name
+            else:
                 continue
-            target_name = name[len(prefix):]
         else:
             upper_name = name.upper()
             packaging_only = (
-                upper_name == 'META-INF/MANIFEST.MF'
-                or upper_name.startswith('META-INF/MAVEN/')
+                upper_name.startswith('META-INF/MAVEN/')
                 or bool(re.fullmatch(
                     r'META-INF/[^/]+\.(?:SF|RSA|DSA|EC)', upper_name
                 ))

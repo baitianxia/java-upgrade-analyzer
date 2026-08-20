@@ -171,18 +171,21 @@ critical 能力至少覆盖三个不同维度，high 至少两个；所有能力
 
 操作系统是黑盒、白盒和性能三类测试的执行维度，不是用模拟分支即可替代的第四类测试。路径解析、进程句柄、控制台/GUI 父进程、文件共享、原子替换、命令行参数、可执行文件后缀和资源计量都具有真实 OS 语义；在 macOS/Linux 上 patch `os.name` 只能验证分支选择，不能证明 Windows 行为。
 
-Windows 准出采用两层门禁：Ubuntu/macOS/Windows × JDK 11/17/21 的 `quick` 矩阵继续验证共同合同；每个 Windows cell 额外执行 `python scripts/test_suite_runner.py --suite windows`。Windows 套件是三类测试的受治理投影，当前固定 80 项：52 项完整公开黑盒、25 项 Windows 敏感白盒/原生集成和 3 项性能/指标合同（其中 1 项为 2 JAR/6 class 性能守恒 smoke）。它覆盖：
+Windows 准出采用两层门禁：Ubuntu、macOS、Windows Server 2022/2025 × JDK 11/17/21 的 12-cell `quick` 矩阵继续验证共同合同；每个 Windows cell 额外执行 `python scripts/test_suite_runner.py --suite windows`。使用两个显式 Windows 版本，避免 `windows-latest` 漂移掩盖版本差异。Windows 套件是三类测试的受治理投影，当前固定 89 项：51 项可移植公开黑盒、35 项 Windows 敏感白盒/原生集成和 3 项性能/指标合同（其中 1 项为 2 JAR/6 class 性能守恒 smoke）。它覆盖：
 
 - `pythonw.exe` 无控制台父进程下 Git 与普通子进程的 stdout 捕获；
 - 中文、空格和 shell 元字符路径/参数，以及真实 Git 必需输出的重复读取；
 - Git worktree 创建、校验、回收、遗留目录恢复和受污染环境隔离；
 - `CREATE_NO_WINDOW`、后台存活检测、超时后的 Windows 进程树清理；
-- `java.exe`/`javac.exe`、Maven/Gradle wrapper 和 Git longpaths 选择；
+- `java.exe`/`javac.exe`、独立 JDK 8/17、Maven/Gradle 8.10.2、真实 CRLF `.cmd`/`.bat` wrapper 和 Git longpaths 选择；
+- 接近 240 字符安全预算的 Unicode 路径在真实 Git 和原子 JSON 读写中的保持；
 - 多写者/并发读者下 JSON 原子发布不能出现部分文档；
 - 完整黑盒独立真值在 Windows/JDK 组合上的结果集合与状态一致；
 - 通过 Win32 `GetProcessTimes`/`GetProcessMemoryInfo` 取得 CPU、实际耗时和峰值内存，并验证小规模冷/热缓存与结果守恒。
 
 该套件只能在原生 Windows 上运行；非 Windows 调用必须以 `WINDOWS_SUITE_REQUIRES_NATIVE_WINDOWS` 失败，不能把全部用例记为 skip。Windows 套件中任一 skip、selector 丢失、测试数低于版本化下限、公开能力矩阵不完整或证据 JSON 缺失都阻断平台 cell。CI 必须保存每个 Windows/JDK cell 的结构化结果；没有实际 Windows runner 证据时，只能声明跨平台静态合同通过，不能声明 Windows 已验证。
+
+公开工具故障合同中有 1 项 POSIX 专用注入器依赖 shebang、mode bit 和脚本替换 `java`，不得伪装成 Windows 测试。策略显式排除该驱动，并要求由两项不可删证据共同替代：可移植公开黑盒验证 failure JSON/失败关闭，Windows 原生子进程验证 missing/nonzero/timeout/empty 的分类与重试性。排除项、原因和 replacement selectors 必须精确登记；缺少替代项会由可信度门阻断。若未来实现 Windows ACL/PE 级公开故障注入，应删除该排除并恢复完整端到端驱动。
 
 ## 6. 性能测试集
 
@@ -205,6 +208,8 @@ Windows 准出采用两层门禁：Ubuntu/macOS/Windows × JDK 11/17/21 的 `qui
 至少记录：wall time、按版本化 nearest-rank 方法计算的 P50/P95、峰值 RSS、进程及已完成子进程 CPU 时间、平均核数、磁盘字节、缓存命中率、解析调用数和输入规模。门禁会从原始 warm samples 重新计算 P50/P95，并校验 `average_cpu_cores = cpu_seconds / wall_seconds`，不能只信任结果文件里的汇总字段。不得通过抽样、少扫 JAR、减少路径或静默降级获得性能收益。
 
 当前提交的 2026-08-13 规模证据来自一次完整实测，保留三次 warm 原始 wall/CPU 样本、两条完整流水线的 CPU/RSS/阶段数据和总计派生值。所有 smoke、scheduled benchmark 和 release scale 都必须输出 CPU 秒与平均核数，缺失或派生关系错误即失败；历史记录没有 CPU 原始数据时只能明确标记缺口，禁止补造数字。
+
+内容摘要与规范化 identity 的测试目标是证明同一执行链对同一份精确字节达成一致，并对陈旧、替换、读取竞态和结构伪装失败关闭；测试必须包含不同序列化字节、硬链接别名、重复键、非有限数、JSON 类型别名和读写期间变化。该机制不测试、也不得宣称证据来源的真实性或不可伪造性，因为具有工作区或执行环境写权限的主体能够重新生成自洽摘要。文件安全测试覆盖预置叶节点链接与临时文件替换，但同权限恶意并发者可在检查后替换祖先目录，属于必须由独占工作目录、文件权限和 CI 沙箱隔离的 TOCTOU 信任边界，不能由单次路径检查宣称解决。发布者认证属于外部供应链边界，应由受保护 CI、签名和 provenance/attestation 的独立验证承担；缺少这类外部信任根时，测试结论必须限定为内部完整性与一致性。
 
 ## 7. 测试可信度门禁
 
@@ -246,9 +251,9 @@ Windows 准出采用两层门禁：Ubuntu/macOS/Windows × JDK 11/17/21 的 `qui
 
 当前二进制闭集由 16 个案例组成，合计 53 条 expected 和 16 条 forbidden；公开黑盒驱动包含 52 个测试方法，并由 20 份补充真值文档约束工作流、CLI、运行时语义、安全、性能和真实项目。工作流案例覆盖 Step0~Step6、统一输入确认、取消恢复、两侧制品抽取、Maven/Gradle checkout 构建、WAR、Step1 聚合歧义、范围选择和有界人读报告。成功案例逐项比较依赖 GAV 与版本变化、当前依赖清单、两侧制品 SHA-256、抽取后 JAR 的逐字节身份、正式输出和确认点状态；预期值来自版本化人工合同，输入事实由标准 ZIP 读取、SHA-256、OpenJDK 和独立图/查询 Oracle 复核，不调用系统内部分析模块。
 
-本轮受治理 discovery 的当前清单为 1168 项：黑盒 52、白盒 1066、性能 50，三类唯一归属且无重叠；Windows 严格投影从中选择 74 项并显式加载 6 项非 discovery 原生合同，合计 80 项（52/25/3）。测试健康门另要求 70/70 个登记的关键分支 alternative 命中、14/14 个关键变异被杀死，并执行两轮稳定性复跑。数字只用于发现测试被漏选或误分类，不作为覆盖充分性的替代指标。
+本轮受治理 discovery 的当前清单为 1169 项：黑盒 52、白盒 1067、性能 50，三类唯一归属且无重叠；Windows 严格投影从中选择 80 项并显式加载 9 项非 discovery 原生合同，合计 89 项（51/35/3）。Windows 投影只精确选择可在原生 Windows 执行的方法，不得把明确的 Unix-only 测试带入后再用 skip 冒充通过。测试健康门另要求 70/70 个登记的关键分支 alternative 命中、14/14 个关键变异被杀死，并执行两轮稳定性复跑。数字只用于发现测试被漏选或误分类，不作为覆盖充分性的替代指标。
 
-2026-08-13 的最终 `release` 实测完整通过：当时的 1112/1112 项测试为 0 failure、0 error，6/6 个固定版本真实项目通过；400 JAR/100000 class 的 cold 为 124.09 秒，三次 warm 的 P50/P95 为 42.61/44.66 秒，最大端到端 RSS 为 2714075136 字节。相同两侧完整流水线得到严格 0 条正式结果且 validation issue 为 0；仅改变 1 个 JAR 中 250 个 class 后，独立变化事实和正式结果都精确为 250，validation issue 仍为 0。首次 Release 还暴露了本机 Python CA 链导致真实项目下载失败的环境问题及恢复能力缺口；下载器现仅在标准 HTTPS 校验失败时使用系统 `curl` 的 HTTPS-only、证书校验备用路径，最终文件仍必须匹配 manifest 固定 SHA-256 才能发布到缓存，完整 Release 随后从头重跑并通过。该历史结果不冒充当前 1168 项清单或 Windows 原生套件的执行证据；两者必须由新的 Release/Windows CI 结果单独证明。
+2026-08-13 的最终 `release` 实测完整通过：当时的 1112/1112 项测试为 0 failure、0 error，6/6 个固定版本真实项目通过；400 JAR/100000 class 的 cold 为 124.09 秒，三次 warm 的 P50/P95 为 42.61/44.66 秒，最大端到端 RSS 为 2714075136 字节。相同两侧完整流水线得到严格 0 条正式结果且 validation issue 为 0；仅改变 1 个 JAR 中 250 个 class 后，独立变化事实和正式结果都精确为 250，validation issue 仍为 0。首次 Release 还暴露了本机 Python CA 链导致真实项目下载失败的环境问题及恢复能力缺口；下载器现仅在标准 HTTPS 校验失败时使用系统 `curl` 的 HTTPS-only、证书校验备用路径，最终文件仍必须匹配 manifest 固定 SHA-256 才能发布到缓存，完整 Release 随后从头重跑并通过。该历史结果不冒充当前 1169 项清单或 Windows 原生套件的执行证据；两者必须由新的 Release/Windows CI 结果单独证明。
 
 | 案例 | expected | forbidden | 主要外部语义 |
 |---|---:|---:|---|
@@ -308,7 +313,7 @@ python3 scripts/quality_gate.py --profile release
 python scripts/test_suite_runner.py --suite windows  # 仅原生 Windows
 ```
 
-- `quick` 必须包含测试可信度门、闭集黑盒核心案例和跨平台进程合同；平台 CI 在 Ubuntu/macOS/Windows × JDK 11/17/21 上执行，并在每个 Windows cell 追加严格 Windows 原生套件；
+- `quick` 必须包含测试可信度门、闭集黑盒核心案例和跨平台进程合同；平台 CI 在 Ubuntu、macOS、Windows Server 2022/2025 × JDK 11/17/21 的 12 个 cell 上执行，并在每个 Windows cell 预置独立 JDK 8/17 与 Gradle 8.10.2，再追加严格 Windows 原生套件；
 - `step5` 在 quick 基础上运行关键白盒集成与公开工作流；
 - `release` 运行全部测试、真实项目、测试健康门和大规模性能门。
 

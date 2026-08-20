@@ -23,7 +23,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import compat  # noqa: E402
+import path_runtime  # noqa: E402
 import run_step  # noqa: E402
+from binary_tool_execution import (  # noqa: E402
+    execute_binary_tool,
+    tool_failure_is_retryable,
+)
 from process_metrics import windows_current_process_usage  # noqa: E402
 
 
@@ -48,9 +53,41 @@ class WindowsNativeContractTest(unittest.TestCase):
             ("java.exe", shutil.which("java")),
             ("javac.exe", shutil.which("javac")),
             ("mvn.cmd", shutil.which("mvn")),
+            ("gradle.bat", shutil.which("gradle")),
         ):
             if not candidate:
                 missing.append(name)
+
+        for major in (8, 17):
+            variable = f"JAVA{major}_HOME"
+            home_value = os.environ.get(variable, "").strip()
+            if not home_value:
+                missing.append(variable)
+                continue
+            home = Path(home_value)
+            release = home / "release"
+            java = home / "bin" / "java.exe"
+            javac = home / "bin" / "javac.exe"
+            if not release.is_file() or not java.is_file() or not javac.is_file():
+                missing.append(f"{variable}:invalid-jdk")
+                continue
+            version_line = next(
+                (
+                    line for line in release.read_text(
+                        encoding="utf-8", errors="replace",
+                    ).splitlines()
+                    if line.startswith("JAVA_VERSION=")
+                ),
+                "",
+            )
+            version = version_line.split("=", 1)[-1].strip().strip('"')
+            actual_major = (
+                version.split(".", 2)[1]
+                if version.startswith("1.")
+                else version.split(".", 1)[0]
+            )
+            if actual_major != str(major):
+                missing.append(f"{variable}:expected-{major}-got-{actual_major}")
 
         self.assertEqual(missing, [], f"WINDOWS_NATIVE_TOOLCHAIN_MISSING:{missing}")
 
@@ -61,6 +98,58 @@ class WindowsNativeContractTest(unittest.TestCase):
         self.assertGreaterEqual(usage.user_seconds, 0)
         self.assertGreaterEqual(usage.system_seconds, 0)
         self.assertGreater(usage.peak_rss_bytes, 0)
+
+    def test_native_tool_failures_are_typed_without_shell(self):
+        cases = (
+            (
+                "missing",
+                [str(Path(tempfile.gettempdir()) / "jua-missing-tool.exe")],
+                1.0,
+                True,
+                "missing",
+                False,
+            ),
+            (
+                "nonzero",
+                [str(self.python), "-c", "raise SystemExit(17)"],
+                5.0,
+                False,
+                "nonzero_exit",
+                False,
+            ),
+            (
+                "timeout",
+                [str(self.python), "-c", "import time; time.sleep(30)"],
+                0.05,
+                False,
+                "timeout",
+                True,
+            ),
+            (
+                "empty",
+                [str(self.python), "-c", "pass"],
+                5.0,
+                True,
+                "output_empty",
+                False,
+            ),
+        )
+        for name, command, timeout, require_stdout, kind, retryable in cases:
+            with self.subTest(name=name):
+                result = execute_binary_tool(
+                    command,
+                    stage="windows-native",
+                    reason_prefix="WINDOWS_NATIVE_TOOL",
+                    timeout_seconds=timeout,
+                    require_stdout=require_stdout,
+                )
+
+                self.assertFalse(result.succeeded)
+                self.assertIsNotNone(result.failure)
+                self.assertEqual(result.failure.failure_kind, kind)
+                self.assertEqual(
+                    tool_failure_is_retryable(result.failure), retryable
+                )
 
     def test_pythonw_parent_captures_unicode_and_metacharacter_argument(self):
         self.assertTrue(self.python.is_file(), "python.exe is required")
@@ -102,6 +191,89 @@ class WindowsNativeContractTest(unittest.TestCase):
         self.assertEqual(result["returncode"], 0, result["stderr"])
         self.assertEqual(result["stderr"], "")
         self.assertEqual(result["stdout"].rstrip("\r\n"), value)
+
+    def test_cmd_and_bat_wrappers_preserve_unicode_and_metacharacters(self):
+        self.assertTrue(self.python.is_file(), "python.exe is required")
+        value = "中文 path with spaces & | < > ^ ! 100% (literal)"
+        with tempfile.TemporaryDirectory(prefix="jua wrapper 参数 ") as tmp:
+            root = Path(tmp)
+            probe = root / "wrapper_probe.py"
+            probe.write_text(
+                "import json, sys\n"
+                "from pathlib import Path\n"
+                "Path(sys.argv[1]).write_text(json.dumps({"
+                "'value': sys.argv[2]}, ensure_ascii=False), encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            for wrapper_name, command_factory in (
+                ("mvnw.cmd", compat.mvn_cmd),
+                ("gradlew.bat", compat.gradle_cmd),
+            ):
+                with self.subTest(wrapper=wrapper_name):
+                    project = root / wrapper_name.replace(".", "-")
+                    project.mkdir()
+                    wrapper = project / wrapper_name
+                    wrapper.write_text(
+                        "@echo off\r\n"
+                        '"%~1" "%~2" "%~3" "%~4"\r\n'
+                        "exit /b %errorlevel%\r\n",
+                        encoding="utf-8",
+                        newline="",
+                    )
+                    result_path = project / "结果 with spaces.json"
+                    command = command_factory(project) + [
+                        str(self.python), str(probe), str(result_path), value,
+                    ]
+                    stdout, stderr, returncode = compat.run_cmd(
+                        command, cwd=project, timeout=30,
+                    )
+                    self.assertEqual(returncode, 0, stderr or stdout)
+                    self.assertEqual(
+                        json.loads(result_path.read_text(encoding="utf-8")),
+                        {"value": value},
+                    )
+
+    def test_near_limit_unicode_path_survives_git_and_atomic_json(self):
+        self.assertTrue(self.git, "Git for Windows is required")
+        with tempfile.TemporaryDirectory(prefix="jua path budget ") as tmp:
+            repository = Path(tmp) / "仓库 with spaces"
+            repository.mkdir()
+            relative_parts = []
+            target = repository / "状态.json"
+            while len(str(target)) < 220:
+                relative_parts.append(
+                    f"路径-{len(relative_parts):02d}-" + ("x" * 10)
+                )
+                target = repository.joinpath(*relative_parts, "状态.json")
+            self.assertGreaterEqual(len(str(target)), 220)
+            self.assertLessEqual(
+                len(str(target)), path_runtime.WINDOWS_SAFE_PATH_LENGTH,
+            )
+            target.parent.mkdir(parents=True)
+            expected = {"路径": target.relative_to(repository).as_posix()}
+            run_step.write_json(target, expected)
+
+            def git(*arguments, required_stdout=False):
+                stdout, stderr, returncode = compat.run_cmd(
+                    compat.git_cmd() + ["-C", str(repository), *arguments],
+                    timeout=30,
+                )
+                self.assertEqual(returncode, 0, stderr)
+                if required_stdout:
+                    self.assertTrue(stdout, arguments)
+                return stdout
+
+            git("init", "-q")
+            git("config", "user.email", "windows@example.invalid")
+            git("config", "user.name", "Windows Native Contract")
+            relative = target.relative_to(repository).as_posix()
+            git("add", "--", relative)
+            git("commit", "-qm", "near-limit fixture")
+            tracked = git("ls-files", "-z", required_stdout=True).rstrip("\0")
+            actual = run_step.read_json(target)
+
+        self.assertEqual(actual, expected)
+        self.assertEqual(tracked, relative)
 
     def test_real_git_queries_keep_stdout_in_unicode_space_repository(self):
         self.assertTrue(self.git, "Git for Windows is required")
@@ -163,24 +335,24 @@ class WindowsNativeContractTest(unittest.TestCase):
                     "    sys.executable, '-c', 'import time; time.sleep(120)'",
                     "], creationflags=flags)",
                     "Path(sys.argv[1]).write_text(str(child.pid), encoding='utf-8')",
-                    "time.sleep(120)",
+                    # Let managed_popen assign the parent to its Job Object,
+                    # then exit before the timeout while the child retains the
+                    # captured standard handles.
+                    "time.sleep(0.1)",
                 )) + "\n",
                 encoding="utf-8",
-            )
-            parent = subprocess.Popen(
-                [str(self.python), str(helper), str(child_pid_path)],
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
             )
             child_pid = None
             terminated = False
             try:
-                deadline = time.monotonic() + 10
-                while time.monotonic() < deadline and not child_pid_path.is_file():
-                    time.sleep(0.05)
+                _stdout, stderr, returncode = compat.run_cmd(
+                    [str(self.python), str(helper), str(child_pid_path)],
+                    timeout=1,
+                )
+                self.assertEqual(returncode, -1, stderr)
+                self.assertIn("命令超时", stderr)
                 self.assertTrue(child_pid_path.is_file(), "child PID was not published")
                 child_pid = int(child_pid_path.read_text(encoding="utf-8"))
-                self.assertTrue(run_step._windows_pid_is_running(child_pid))
-                compat._terminate_subprocess(parent, process_group=True)
                 deadline = time.monotonic() + 10
                 while time.monotonic() < deadline:
                     if not run_step._windows_pid_is_running(child_pid):
@@ -188,8 +360,6 @@ class WindowsNativeContractTest(unittest.TestCase):
                         break
                     time.sleep(0.05)
             finally:
-                if parent.poll() is None:
-                    compat._terminate_subprocess(parent, process_group=True)
                 if child_pid and run_step._windows_pid_is_running(child_pid):
                     subprocess.run(
                         ["taskkill", "/PID", str(child_pid), "/T", "/F"],

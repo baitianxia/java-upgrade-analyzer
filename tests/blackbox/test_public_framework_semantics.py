@@ -7,6 +7,8 @@ import tempfile
 import unittest
 import zipfile
 
+from tests.blackbox.managed_process import managed_run
+
 from tests.blackbox.test_public_runtime_dispatch import (
     compile_jar,
     jdk_home,
@@ -23,7 +25,7 @@ TRUTH = json.loads((
 
 
 def execute(command: list[str], *, expected: int = 0) -> subprocess.CompletedProcess:
-    completed = subprocess.run(
+    completed = managed_run(
         command,
         capture_output=True,
         text=True,

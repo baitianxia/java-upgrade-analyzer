@@ -3,12 +3,15 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import claude_skill_contract  # noqa: E402
 from claude_skill_contract import (  # noqa: E402
+    _run,
     TRANSFORM_IDS,
     audit_public_contract,
     run_skill_contract,
@@ -17,6 +20,21 @@ from claude_skill_contract import (  # noqa: E402
 
 
 class ClaudeSkillContractTest(unittest.TestCase):
+    def test_contract_worker_uses_managed_command_boundary(self):
+        with patch.object(
+            claude_skill_contract,
+            "run_cmd",
+            return_value=("stdout", "stderr", -1),
+        ) as runner:
+            completed = _run(["worker", "arg"], ROOT, timeout=0.25)
+
+        self.assertEqual(completed.returncode, -1)
+        self.assertEqual(completed.stdout, "stdout")
+        self.assertEqual(completed.stderr, "stderr")
+        runner.assert_called_once_with(
+            ["worker", "arg"], cwd=str(ROOT), timeout=0.25,
+        )
+
     def test_static_audit_rejects_stale_command_and_wrong_output_path(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

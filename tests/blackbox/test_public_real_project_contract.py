@@ -5,6 +5,8 @@ import subprocess
 import sys
 import unittest
 
+from tests.blackbox.managed_process import managed_run
+
 
 ROOT = Path(__file__).resolve().parents[2]
 TRUTH = json.loads((
@@ -64,7 +66,7 @@ class PublicRealProjectContractBlackboxTest(unittest.TestCase):
             TRUTH["minimum_oracle_producer_count"],
         )
 
-        completed = subprocess.run(
+        completed = managed_run(
             [
                 sys.executable,
                 str(ROOT / "scripts" / "binary_real_project_guard.py"),
@@ -90,7 +92,7 @@ class PublicRealProjectContractBlackboxTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("schedule:", workflow)
         self.assertIn("quality_gate.py --profile release", workflow)
-        dry_run = subprocess.run(
+        dry_run = managed_run(
             [
                 sys.executable, str(ROOT / "scripts" / "quality_gate.py"),
                 "--profile", "release", "--dry-run",

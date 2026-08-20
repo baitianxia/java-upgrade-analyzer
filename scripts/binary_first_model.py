@@ -135,9 +135,115 @@ class RuntimeProfile:
         "resource_selection_coverage_status",
     )
 
+    # These values do not describe physical runtime-path entries, but they do
+    # directly influence entrypoint activation and semantic-edge construction.
+    # Keeping them outside the identity used to let two semantically different
+    # deployments share one RuntimeProfile (and therefore one downstream
+    # evidence identity).  They remain optional for backwards-compatible input
+    # parsing; presence/absence and their exact evidence are nevertheless bound.
+    SEMANTIC_IDENTITY_FIELDS = (
+        "resolved_configuration_properties",
+        "runtime_configuration_coverage_status",
+        "runtime_configuration_coverage_gaps",
+        "entrypoint_discovery_coverage_gaps",
+    )
+    IDENTITY_FIELDS = REQUIRED_FIELDS + SEMANTIC_IDENTITY_FIELDS
+
     def __post_init__(self):
         payload = dict(self.payload or {})
         coverage = _coverage(payload, self.REQUIRED_FIELDS)
+
+        def require_string_sequence(field_name: str, value: Any) -> None:
+            if value is None:
+                return
+            if (
+                not isinstance(value, (list, tuple))
+                or not all(
+                    isinstance(item, str) and bool(item.strip())
+                    for item in value
+                )
+            ):
+                raise BinaryFirstContractError(
+                    "RUNTIME_PROFILE_SEQUENCE_INVALID",
+                    f"{field_name} must be a JSON string array",
+                )
+
+        for field_name in (
+            "active_profile_identities",
+            "external_config_snapshot_identities",
+            "agent_transformer_plugin_profile_identities",
+            "runtime_configuration_coverage_gaps",
+            "entrypoint_discovery_coverage_gaps",
+        ):
+            require_string_sequence(field_name, payload.get(field_name))
+
+        properties = payload.get("resolved_configuration_properties")
+        if properties is not None and not isinstance(properties, Mapping):
+            raise BinaryFirstContractError(
+                "RUNTIME_PROFILE_CONFIGURATION_PROPERTIES_INVALID",
+                "resolved_configuration_properties must be an object",
+            )
+        configuration_status = payload.get(
+            "runtime_configuration_coverage_status"
+        )
+        if configuration_status is not None and configuration_status not in {
+            "complete", "partial",
+        }:
+            raise BinaryFirstContractError(
+                "RUNTIME_PROFILE_CONFIGURATION_COVERAGE_STATUS_INVALID",
+                str(configuration_status),
+            )
+        entrypoint_profile = payload.get("business_entrypoint_profile")
+        if entrypoint_profile is not None and not isinstance(
+            entrypoint_profile, Mapping
+        ):
+            raise BinaryFirstContractError(
+                "RUNTIME_PROFILE_ENTRYPOINT_PROFILE_INVALID",
+                "business_entrypoint_profile must be an object",
+            )
+        if isinstance(entrypoint_profile, Mapping):
+            entrypoint_status = entrypoint_profile.get("coverage_status")
+            if entrypoint_status is not None and entrypoint_status not in {
+                "complete", "partial",
+            }:
+                raise BinaryFirstContractError(
+                    "RUNTIME_PROFILE_ENTRYPOINT_COVERAGE_STATUS_INVALID",
+                    str(entrypoint_status),
+                )
+            require_string_sequence(
+                "business_entrypoint_profile.coverage_gaps",
+                entrypoint_profile.get("coverage_gaps"),
+            )
+            for field_name in (
+                "activated_frameworks",
+                "activated_classes",
+                "activated_entity_classes",
+                "activated_resource_names",
+                "activated_component_scan_packages",
+            ):
+                require_string_sequence(
+                    f"business_entrypoint_profile.{field_name}",
+                    entrypoint_profile.get(field_name),
+                )
+            declared_methods = entrypoint_profile.get("methods")
+            if declared_methods is not None and (
+                not isinstance(declared_methods, (list, tuple))
+                or not all(
+                    isinstance(item, Mapping) for item in declared_methods
+                )
+            ):
+                raise BinaryFirstContractError(
+                    "RUNTIME_PROFILE_ENTRYPOINT_METHODS_INVALID",
+                    "business_entrypoint_profile.methods must be a JSON "
+                    "object array",
+                )
+            main_class = entrypoint_profile.get("main_class")
+            if main_class is not None and not isinstance(main_class, str):
+                raise BinaryFirstContractError(
+                    "RUNTIME_PROFILE_ENTRYPOINT_MAIN_CLASS_INVALID",
+                    "business_entrypoint_profile.main_class must be text",
+                )
+
         path_entries = payload.get("ordered_runtime_path_entry_descriptors")
         if not isinstance(path_entries, list):
             raise BinaryFirstContractError(
@@ -163,7 +269,7 @@ class RuntimeProfile:
                 )
         policy_payload = {
             key: payload.get(key)
-            for key in self.REQUIRED_FIELDS
+            for key in self.IDENTITY_FIELDS
             if key != "ordered_runtime_path_entry_descriptors"
         }
         policy_payload["ordered_runtime_path_roles"] = [
@@ -182,7 +288,7 @@ class RuntimeProfile:
             _identity("runtime_profile_policy_identity", policy_payload),
         )
         snapshot_payload = {
-            **{key: payload.get(key) for key in self.REQUIRED_FIELDS},
+            **{key: payload.get(key) for key in self.IDENTITY_FIELDS},
             "field_coverage": coverage,
             "runtime_profile_policy_identity": self.policy_identity,
         }

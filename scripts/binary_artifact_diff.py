@@ -9,13 +9,17 @@ the later loader/provider/definition reconciliation phase.
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 import fnmatch
 import hashlib
 import json
+import os
 from pathlib import Path, PurePosixPath
 import re
-from typing import Any, Iterable, Mapping
+import shutil
+import stat
+from typing import Any, Iterable, Iterator, Mapping
 import xml.etree.ElementTree as ET
 import zipfile
 
@@ -26,6 +30,7 @@ from binary_first_contract import (
     canonical_identity_native_json,
     observed_delta_identity,
 )
+from path_runtime import make_short_temp_dir
 
 
 SUPPORT_MANIFEST_PATH = Path(__file__).with_name("binary_first_support_manifest.json")
@@ -39,6 +44,17 @@ _ALLOWED_MYBATIS_DTDS = (
     b"mybatis.org/dtd/mybatis-3-mapper.dtd",
     b"mybatis.org/dtd/mybatis-3-config.dtd",
 )
+
+# JEP 238 describes versioned-entry directories as ``n > 8``, but the actual
+# OpenJDK JarFile lookup used by class/resource loading accepts version 8 and
+# selects it for configured runtime versions >= 9 (its implementation rejects
+# only values *below* the base feature 8).  Step4 models runtime truth, so 8 is
+# a candidate here.  We retain a diagnostic for this non-standard structure so
+# the deliberate difference from the prose specification is never hidden.
+MIN_MULTI_RELEASE_VERSION = 8
+# Versioned entries become candidates only when the configured runtime feature
+# is 9 or newer.
+MIN_MULTI_RELEASE_RUNTIME_MAJOR = 9
 
 
 class BinaryArtifactDiffError(BinaryFirstContractError):
@@ -57,45 +73,353 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+@dataclass(frozen=True)
+class _ArchiveSourceIdentity:
+    device: int
+    inode: int
+    mode: int
+    link_count: int
+    byte_length: int
+    modified_nanoseconds: int
+
+
+@dataclass(frozen=True)
+class _PrivateArchiveSnapshot:
+    path: Path
+    content_sha256: str
+    byte_length: int
+    source_identity: _ArchiveSourceIdentity
+
+
+def _stat_nanoseconds(metadata: os.stat_result, name: str) -> int:
+    nanosecond_name = f"{name}_ns"
+    if hasattr(metadata, nanosecond_name):
+        return int(getattr(metadata, nanosecond_name))
+    return int(float(getattr(metadata, name)) * 1_000_000_000)
+
+
+def _archive_source_identity(
+    metadata: os.stat_result,
+) -> _ArchiveSourceIdentity:
+    return _ArchiveSourceIdentity(
+        device=int(metadata.st_dev),
+        inode=int(metadata.st_ino),
+        mode=int(metadata.st_mode),
+        link_count=int(metadata.st_nlink),
+        byte_length=int(metadata.st_size),
+        modified_nanoseconds=_stat_nanoseconds(metadata, "st_mtime"),
+    )
+
+
+def _add_snapshot_cleanup_note(primary: BaseException, note: str) -> None:
+    add_note = getattr(primary, "add_note", None)
+    if callable(add_note):
+        try:
+            add_note(note)
+            return
+        except Exception:
+            pass
+    try:
+        notes = list(getattr(primary, "__notes__", ()) or ())
+        notes.append(note)
+        setattr(primary, "__notes__", notes)
+    except Exception:
+        pass
+
+
+def _source_changed_error(source_path: Path) -> BinaryArtifactDiffError:
+    return BinaryArtifactDiffError(
+        "ARTIFACT_CHANGED_DURING_SNAPSHOT", str(source_path)
+    )
+
+
+def _assert_source_path_unchanged(
+    source_path: Path,
+    expected_identity: _ArchiveSourceIdentity,
+) -> None:
+    try:
+        current_identity = _archive_source_identity(source_path.stat())
+    except OSError as error:
+        raise _source_changed_error(source_path) from error
+    if current_identity != expected_identity:
+        raise _source_changed_error(source_path)
+
+
+@contextmanager
+def _private_archive_snapshot(
+    source_path: Path,
+    expected_sha256: str,
+) -> Iterator[_PrivateArchiveSnapshot]:
+    """Capture one immutable, bounded-memory view of an archive.
+
+    The source is opened exactly once.  Every later parser observes the private
+    copy, never the mutable source path.  File identities guard concurrent
+    in-place writes and path replacement; the Step1 digest remains the final
+    byte-level authority.
+    """
+
+    try:
+        temporary_directory = make_short_temp_dir(prefix="artifact-snapshot")
+    except OSError as error:
+        raise BinaryArtifactDiffError(
+            "ARTIFACT_SNAPSHOT_CREATE_FAILED", str(error)
+        ) from error
+    snapshot_path = temporary_directory / "artifact.jar"
+    primary_error: BaseException | None = None
+    try:
+        try:
+            source_handle = source_path.open("rb")
+        except (FileNotFoundError, NotADirectoryError, IsADirectoryError) as error:
+            raise BinaryArtifactDiffError(
+                "ARTIFACT_FILE_MISSING", str(source_path)
+            ) from error
+        except OSError as error:
+            raise BinaryArtifactDiffError(
+                "ARTIFACT_SNAPSHOT_READ_FAILED", f"{source_path}: {error}"
+            ) from error
+
+        digest = hashlib.sha256()
+        byte_length = 0
+        try:
+            with source_handle:
+                before_identity = _archive_source_identity(
+                    os.fstat(source_handle.fileno())
+                )
+                if not stat.S_ISREG(before_identity.mode):
+                    raise BinaryArtifactDiffError(
+                        "ARTIFACT_FILE_MISSING", str(source_path)
+                    )
+                with snapshot_path.open("xb") as snapshot_handle:
+                    while True:
+                        chunk = source_handle.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        snapshot_handle.write(chunk)
+                        digest.update(chunk)
+                        byte_length += len(chunk)
+                after_identity = _archive_source_identity(
+                    os.fstat(source_handle.fileno())
+                )
+        except BinaryArtifactDiffError:
+            raise
+        except OSError as error:
+            raise BinaryArtifactDiffError(
+                "ARTIFACT_SNAPSHOT_READ_FAILED", f"{source_path}: {error}"
+            ) from error
+
+        if before_identity != after_identity:
+            raise _source_changed_error(source_path)
+        _assert_source_path_unchanged(source_path, after_identity)
+
+        actual_sha256 = digest.hexdigest()
+        if actual_sha256 != expected_sha256:
+            raise BinaryArtifactDiffError(
+                "ARTIFACT_SHA256_MISMATCH",
+                f"expected={expected_sha256}; actual={actual_sha256}",
+            )
+        yield _PrivateArchiveSnapshot(
+            path=snapshot_path,
+            content_sha256=actual_sha256,
+            byte_length=byte_length,
+            source_identity=after_identity,
+        )
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        try:
+            shutil.rmtree(temporary_directory)
+        except FileNotFoundError:
+            pass
+        except BaseException as cleanup_error:
+            if primary_error is not None:
+                _add_snapshot_cleanup_note(
+                    primary_error,
+                    "artifact snapshot cleanup failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}",
+                )
+            else:
+                raise BinaryArtifactDiffError(
+                    "ARTIFACT_SNAPSHOT_CLEANUP_FAILED",
+                    f"{temporary_directory}: {cleanup_error}",
+                ) from cleanup_error
+
+
 def _identity(namespace: str, payload: Any) -> str:
     return canonical_identity_native_json(
         namespace, payload, schema_version="1"
     )
 
 
-def _mr_class_scope(name: str) -> tuple[str, int]:
+def _mr_entry_scope(name: str) -> tuple[str, int]:
     path = PurePosixPath(name)
     parts = path.parts
-    if len(parts) >= 4 and parts[:2] == ("META-INF", "versions"):
+    if parts[:2] == ("META-INF", "versions"):
+        if len(parts) < 4:
+            return name, -1
+        version_text = parts[2]
+        if re.fullmatch(r"[1-9][0-9]*", version_text, re.ASCII) is None:
+            return name, -1
         try:
-            version = int(parts[2])
+            version = int(version_text)
         except ValueError:
-            return name, 0
-        return "/".join(parts[3:]), version
+            return name, -1
+        if version < MIN_MULTI_RELEASE_VERSION:
+            return name, -1
+        logical = "/".join(parts[3:])
+        if (
+            name != f"META-INF/versions/{version_text}/{logical}"
+            or any(part in {"", ".", ".."} for part in logical.split("/"))
+        ):
+            return name, -1
+        return logical, version
     return name, 0
 
 
-def _manifest_is_multi_release(archive: zipfile.ZipFile) -> bool:
-    candidates = [
+def _mr_class_scope(name: str) -> tuple[str, int]:
+    logical, version = _mr_entry_scope(name)
+    if (
+        version < 0
+        or logical.startswith("META-INF/")
+        or (version == 0 and name.startswith("META-INF/"))
+    ):
+        return name, -1
+    return logical, version
+
+
+def _mr_resource_scope(name: str) -> tuple[str, int]:
+    """Return the logical runtime resource name and MR version.
+
+    JEP 238 deliberately excludes resources below ``META-INF`` from overlay
+    selection.  Such entries remain in the physical archive inventory, but
+    they must not become resource-selection or semantic-analysis inputs.
+    """
+
+    logical, version = _mr_entry_scope(name)
+    if version > 0 and logical.startswith("META-INF/"):
+        return name, -1
+    return logical, version
+
+
+def _manifest_entries(archive: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
+    return [
         info for info in archive.infolist()
         if not info.is_dir() and info.filename.lower() == "meta-inf/manifest.mf"
     ]
+
+
+def _manifest_is_multi_release(archive: zipfile.ZipFile) -> bool:
+    candidates = _manifest_entries(archive)
     if len(candidates) != 1:
         return False
     text = archive.read(candidates[0]).decode("utf-8", errors="replace")
     attributes: dict[str, str] = {}
+    continued: dict[str, bool] = {}
+    physical_header_valid: dict[str, bool] = {}
     current = ""
     for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
         if not line:
             break
         if line.startswith(" ") and current:
             attributes[current] += line[1:]
+            continued[current] = True
             continue
         key, separator, value = line.partition(":")
         current = key.strip().lower() if separator else ""
         if current:
             attributes[current] = value.strip()
-    return attributes.get("multi-release", "").strip().lower() == "true"
+            continued[current] = False
+            physical_header_valid[current] = bool(
+                key.lower() == current and value.lower() == " true"
+            )
+    return bool(
+        attributes.get("multi-release", "").strip().lower() == "true"
+        and not continued.get("multi-release", False)
+        and physical_header_valid.get("multi-release", False)
+    )
+
+
+def _reject_ambiguous_multi_release_manifest(
+    archive: zipfile.ZipFile,
+) -> None:
+    """Fail closed when case-variant manifests can change MR selection.
+
+    OpenJDK currently uses the last case-insensitive manifest entry in central
+    directory order.  That choice is an implementation detail rather than a
+    portable JAR contract, so a class/resource scanner must not silently pick
+    base or versioned bytes when multiple candidates and versioned entries
+    coexist.
+    """
+
+    if len(_manifest_entries(archive)) <= 1:
+        return
+    if any(
+        not info.is_dir()
+        and info.filename.startswith("META-INF/versions/")
+        for info in archive.infolist()
+    ):
+        raise BinaryArtifactDiffError(
+            "ARTIFACT_MULTI_RELEASE_MANIFEST_AMBIGUOUS",
+            ",".join(info.filename for info in _manifest_entries(archive)),
+        )
+
+
+def select_runtime_resource_entries(
+    archive: zipfile.ZipFile,
+    target_jvm_major: int | None,
+) -> tuple[dict[str, str], bool]:
+    """Select the physical entry backing each logical runtime resource.
+
+    The boolean reports that an MR resource exists but no target feature was
+    supplied.  Callers that establish authoritative runtime facts must then
+    fail closed; earlier materialization stages may instead record a scoped
+    configuration-coverage gap.
+    """
+
+    _reject_ambiguous_multi_release_manifest(archive)
+    candidates: dict[str, dict[int, list[str]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for info in archive.infolist():
+        if info.is_dir() or info.filename.endswith(".class"):
+            continue
+        logical, version = _mr_resource_scope(info.filename)
+        if version < 0:
+            continue
+        candidates[logical][version].append(info.filename)
+    multi_release = _manifest_is_multi_release(archive)
+    target_required = bool(
+        multi_release
+        and target_jvm_major is None
+        and any(
+            version > 0
+            for versions in candidates.values()
+            for version in versions
+        )
+    )
+    selected: dict[str, str] = {}
+    for logical, versions in candidates.items():
+        eligible = [
+            version for version in versions
+            if version == 0 or (
+                multi_release
+                and target_jvm_major is not None
+                and int(target_jvm_major) >= MIN_MULTI_RELEASE_RUNTIME_MAJOR
+                and version <= int(target_jvm_major)
+            )
+        ]
+        if not eligible:
+            continue
+        selected_version = max(eligible)
+        physical_entries = versions[selected_version]
+        if len(physical_entries) != 1:
+            raise BinaryArtifactDiffError(
+                "ARTIFACT_RUNTIME_RESOURCE_DUPLICATE",
+                f"{logical}: version={selected_version}; "
+                f"count={len(physical_entries)}",
+            )
+        selected[logical] = physical_entries[0]
+    return selected, target_required
 
 
 def _classify_resource(name: str) -> str:
@@ -437,6 +761,7 @@ class ArchiveEntryFact:
     external_attributes: int
     extra_sha256: str
     comment_sha256: str
+    logical_resource_entry: str
     logical_class_entry: str = ""
     multi_release_version: int = 0
     runtime_effective: bool = False
@@ -465,6 +790,7 @@ class ArtifactSnapshot:
     inventory_digest: str
     parser_identity: str
     comparison_coverage_status: str
+    runtime_semantics_diagnostic_codes: tuple[str, ...] = ()
 
     @property
     def class_fact_coverage_status(self) -> str:
@@ -508,16 +834,36 @@ def snapshot_archive(
     target_jvm_major: int | None = None,
     safety_policy: Mapping[str, Any] | None = None,
 ) -> ArtifactSnapshot:
-    archive_path = Path(path)
+    source_path = Path(path)
     expected_sha256 = _validate_expected_sha(expected_sha256)
-    if not archive_path.is_file():
-        raise BinaryArtifactDiffError("ARTIFACT_FILE_MISSING", str(archive_path))
-    before_sha = _sha256_file(archive_path)
-    if before_sha != expected_sha256:
-        raise BinaryArtifactDiffError(
-            "ARTIFACT_SHA256_MISMATCH",
-            f"expected={expected_sha256}; actual={before_sha}",
+    with _private_archive_snapshot(source_path, expected_sha256) as captured:
+        result = _snapshot_private_archive(
+            captured.path,
+            source_path=source_path,
+            artifact_instance_identity=artifact_instance_identity,
+            artifact_content_sha256=captured.content_sha256,
+            artifact_byte_length=captured.byte_length,
+            asm_jar=asm_jar,
+            jdk_home=jdk_home,
+            target_jvm_major=target_jvm_major,
+            safety_policy=safety_policy,
         )
+        _assert_source_path_unchanged(source_path, captured.source_identity)
+        return result
+
+
+def _snapshot_private_archive(
+    archive_path: Path,
+    *,
+    source_path: Path,
+    artifact_instance_identity: str,
+    artifact_content_sha256: str,
+    artifact_byte_length: int,
+    asm_jar: str | Path | None = None,
+    jdk_home: str | Path | None = None,
+    target_jvm_major: int | None = None,
+    safety_policy: Mapping[str, Any] | None = None,
+) -> ArtifactSnapshot:
     effective_safety = {**_SAFETY, **dict(safety_policy or {})}
     safety = inspect_archive(
         archive_path,
@@ -541,7 +887,7 @@ def snapshot_archive(
     if blocking_safety:
         raise BinaryArtifactDiffError(
             "ARTIFACT_SAFETY_POLICY_BLOCKED",
-            f"{archive_path}: {', '.join(blocking_safety)}",
+            f"{source_path}: {', '.join(blocking_safety)}",
         )
 
     entries = []
@@ -552,19 +898,40 @@ def snapshot_archive(
         with zipfile.ZipFile(archive_path) as archive:
             archive_infos = archive.infolist()
             multi_release = _manifest_is_multi_release(archive)
+            runtime_semantics_diagnostics: set[str] = set()
+            if multi_release and any(
+                    _mr_entry_scope(info.filename)[1] == 8
+                    for info in archive_infos
+                    if not info.is_dir()
+            ):
+                runtime_semantics_diagnostics.add(
+                    "NONSTANDARD_MULTI_RELEASE_VERSION_8_PRESENT"
+                )
             versioned_classes: dict[str, list[tuple[int, str]]] = defaultdict(list)
             for info in archive_infos:
-                if info.is_dir() or not info.filename.endswith(".class"):
+                if info.is_dir():
                     continue
-                logical, version = _mr_class_scope(info.filename)
-                versioned_classes[logical].append((version, info.filename))
+                if info.filename.endswith(".class"):
+                    logical, version = _mr_class_scope(info.filename)
+                    if version >= 0:
+                        versioned_classes[logical].append(
+                            (version, info.filename)
+                        )
+            selected_resources, resource_target_required = (
+                select_runtime_resource_entries(archive, target_jvm_major)
+            )
             if (
                 multi_release
                 and target_jvm_major is None
-                and any(version > 0 for rows in versioned_classes.values() for version, _ in rows)
+                and any(
+                    version > 0
+                    for rows in versioned_classes.values()
+                    for version, _ in rows
+                )
+                or resource_target_required
             ):
                 raise BinaryArtifactDiffError(
-                    "ARTIFACT_TARGET_JVM_MAJOR_REQUIRED", str(archive_path)
+                    "ARTIFACT_TARGET_JVM_MAJOR_REQUIRED", str(source_path)
                 )
             effective_class_entries = set()
             for logical, candidates in versioned_classes.items():
@@ -572,11 +939,20 @@ def snapshot_archive(
                     (version, name) for version, name in candidates
                     if version == 0 or (
                         multi_release and target_jvm_major is not None
+                        and int(target_jvm_major) >= MIN_MULTI_RELEASE_RUNTIME_MAJOR
                         and version <= int(target_jvm_major)
                     )
                 ]
                 if eligible:
                     effective_class_entries.add(max(eligible)[1])
+            effective_resource_entries = set(selected_resources.values())
+            if any(
+                _mr_entry_scope(name)[1] == 8
+                for name in effective_class_entries | effective_resource_entries
+            ):
+                runtime_semantics_diagnostics.add(
+                    "NONSTANDARD_MULTI_RELEASE_VERSION_8_RUNTIME_SELECTED"
+                )
             archive_comment_sha = _sha256_bytes(archive.comment or b"")
             for archive_ordinal, info in enumerate(archive_infos):
                 name_ordinal = name_counts[info.filename]
@@ -601,7 +977,14 @@ def snapshot_archive(
                 physical_label = f"{info.filename}#occurrence={name_ordinal}"
                 logical_class, mr_version = _mr_class_scope(info.filename)
                 is_class = not info.is_dir() and info.filename.endswith(".class")
-                category = "" if is_class else _classify_resource(info.filename)
+                logical_resource, resource_mr_version = _mr_resource_scope(
+                    info.filename
+                )
+                resource_name = (
+                    logical_resource if resource_mr_version >= 0
+                    else info.filename
+                )
+                category = "" if is_class else _classify_resource(resource_name)
                 entry = ArchiveEntryFact(
                     physical_entry_identity=physical_identity,
                     name=info.filename,
@@ -617,18 +1000,37 @@ def snapshot_archive(
                     external_attributes=int(info.external_attr),
                     extra_sha256=_sha256_bytes(info.extra or b""),
                     comment_sha256=_sha256_bytes(info.comment or b""),
+                    logical_resource_entry=(
+                        logical_resource
+                        if not is_class and not info.is_dir()
+                        and resource_mr_version >= 0
+                        else ""
+                    ),
                     logical_class_entry=logical_class if is_class else "",
-                    multi_release_version=mr_version if is_class else 0,
+                    multi_release_version=(
+                        mr_version
+                        if is_class and mr_version >= 0
+                        else (
+                            resource_mr_version
+                            if not is_class and not info.is_dir()
+                            and resource_mr_version >= 0
+                            else 0
+                        )
+                    ),
                     runtime_effective=(
-                        is_class and info.filename in effective_class_entries
+                        (is_class and info.filename in effective_class_entries)
+                        or (
+                            not is_class and not info.is_dir()
+                            and info.filename in effective_resource_entries
+                        )
                     ),
                     resource_category=category,
                     normalized_resource_digest=(
-                        _normalized_resource_digest(info.filename, category, content)
+                        _normalized_resource_digest(resource_name, category, content)
                         if not is_class and not info.is_dir() else ""
                     ),
                     resource_semantic_facts=(
-                        _resource_semantic_facts(info.filename, category, content)
+                        _resource_semantic_facts(resource_name, category, content)
                         if not is_class and not info.is_dir() else ()
                     ),
                 )
@@ -641,12 +1043,6 @@ def snapshot_archive(
                     ))
     except zipfile.BadZipFile as error:
         raise BinaryArtifactDiffError("ARTIFACT_ARCHIVE_INVALID", str(error)) from error
-
-    after_sha = _sha256_file(archive_path)
-    if after_sha != before_sha:
-        raise BinaryArtifactDiffError(
-            "ARTIFACT_CHANGED_DURING_SNAPSHOT", str(archive_path)
-        )
     asm_run: BinaryFactRun = extract_class_facts(
         class_inputs,
         asm_jar=asm_jar,
@@ -674,18 +1070,22 @@ def snapshot_archive(
                     f"{record.get('class_entry')}:{attribute.get('level')}:{attribute.get('name')}"
                 )
     unknown_resource_scopes = [
-        item.name for item in entries
-        if item.kind == "resource" and item.resource_category == "unknown"
+        item.logical_resource_entry or item.name for item in entries
+        if item.kind == "resource" and item.runtime_effective
+        and item.resource_category == "unknown"
     ]
     inventory_payload = {
         "artifact_instance_identity": artifact_instance_identity,
-        "artifact_content_sha256": before_sha,
+        "artifact_content_sha256": artifact_content_sha256,
         "archive_comment_sha256": archive_comment_sha,
         "entries": [asdict(item) for item in entries],
         "parser_identity": asm_run.parser_identity,
         "class_input_digest": asm_run.class_input_digest,
         "fact_output_digest": asm_run.fact_output_digest,
         "safety_reason_codes": list(safety.reason_codes),
+        "runtime_semantics_diagnostic_codes": list(
+            sorted(runtime_semantics_diagnostics)
+        ),
     }
     incomplete = bool(
         safety.reason_codes
@@ -695,8 +1095,8 @@ def snapshot_archive(
     )
     return ArtifactSnapshot(
         artifact_instance_identity=artifact_instance_identity,
-        artifact_content_sha256=before_sha,
-        artifact_byte_length=archive_path.stat().st_size,
+        artifact_content_sha256=artifact_content_sha256,
+        artifact_byte_length=artifact_byte_length,
         archive_comment_sha256=archive_comment_sha,
         entries=tuple(entries),
         class_records=asm_run.records,
@@ -710,6 +1110,9 @@ def snapshot_archive(
         inventory_digest=_identity("binary_artifact_inventory", inventory_payload),
         parser_identity=asm_run.parser_identity,
         comparison_coverage_status="partial" if incomplete else "complete",
+        runtime_semantics_diagnostic_codes=tuple(
+            sorted(runtime_semantics_diagnostics)
+        ),
     )
 
 
@@ -1111,6 +1514,10 @@ def compare_artifact_snapshots(
             else "complete"
         ),
         "coverage_gaps": sorted(coverage_gaps),
+        "runtime_semantics_diagnostic_codes": sorted(set(
+            base.runtime_semantics_diagnostic_codes
+            + current.runtime_semantics_diagnostic_codes
+        )),
         "entry_deltas": entry_deltas,
         "entry_delta_count": len(entry_deltas),
         "container_metadata_changed": full_container_base != full_container_current,

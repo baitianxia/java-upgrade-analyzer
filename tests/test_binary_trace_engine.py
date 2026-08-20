@@ -4,6 +4,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -254,6 +255,143 @@ class BinaryTraceFastPathTest(unittest.TestCase):
 
             self.assertIs(actual, expected)
             engine.assert_called_once()
+
+    def test_constant_dynamic_handles_participate_in_reverse_linkage(self):
+        engine = object.__new__(BinaryTraceEngine)
+        engine.member_resolutions = {
+            "edge-1": {
+                "member_resolution_status": "resolved",
+                "resolved_member_identity": "target-member",
+                "member_resolution_identity": "resolution-1",
+            }
+        }
+        engine.edges = {
+            "edge-1": {
+                "edge_kind": "ldc_bootstrap_handle_0",
+                "caller_member_identity": "caller-member",
+                "symbolic_owner": "demo/Target",
+                "symbolic_name": "bootstrapTarget",
+                "symbolic_descriptor": "()V",
+            }
+        }
+        engine.dispatch = {}
+        engine.linkage_resolutions = {}
+        engine.reverse = defaultdict(list)
+        engine.unresolved_edge_alias_targets = {}
+        engine.paired_artifact_missing_targets = set()
+        engine.type_resolutions = {}
+        engine.class_initializations = {}
+        engine.inline_overlay = SimpleNamespace(rows=())
+        engine.semantic_edges = {}
+
+        engine._build_reverse_graph()
+
+        self.assertEqual(
+            engine.reverse["target-member"][0]["caller_member_identity"],
+            "caller-member",
+        )
+        self.assertEqual(
+            engine.reverse["target-member"][0]["certainty"], "possible"
+        )
+
+    def test_deferred_loading_constraint_never_becomes_an_exact_path(self):
+        engine = object.__new__(BinaryTraceEngine)
+        engine.member_resolutions = {
+            "edge-1": {
+                "member_resolution_status": "resolved",
+                "resolved_member_identity": "target-member",
+                "member_resolution_identity": "resolution-1",
+            }
+        }
+        engine.linkage_resolutions = {
+            "edge-1": {
+                "linkage_status": "loading_constraint_deferred_conflict",
+            }
+        }
+        engine.edges = {
+            "edge-1": {
+                "edge_kind": "method",
+                "caller_member_identity": "caller-member",
+                "symbolic_owner": "demo/Target",
+                "symbolic_name": "accept",
+                "symbolic_descriptor": "(Lapi/Param;)V",
+            }
+        }
+        engine.dispatch = {
+            "edge-1": {
+                "dispatch_status": "unresolved",
+                "implementation_target_identities": [],
+            }
+        }
+        engine.reverse = defaultdict(list)
+        engine.unresolved_edge_alias_targets = {}
+        engine.paired_artifact_missing_targets = set()
+        engine.type_resolutions = {}
+        engine.class_initializations = {}
+        engine.inline_overlay = SimpleNamespace(rows=())
+        engine.semantic_edges = {}
+
+        engine._build_reverse_graph()
+
+        self.assertEqual(
+            engine.reverse["target-member"][0]["certainty"], "possible"
+        )
+
+    def test_loading_constraint_evidence_controls_static_linkage_conclusion(self):
+        engine = object.__new__(BinaryTraceEngine)
+        engine._target_nodes = lambda _decision: ("target-member",)
+        engine._trace = lambda _targets: ([{
+            "path_certainty": "possible",
+            "entrypoint_member_identity": "entry-member",
+            "edges": [{
+                "direct_edge_identity": "edge-1",
+                "caller_member_identity": "caller-member",
+            }],
+        }], [])
+        engine.entrypoint_gaps = ()
+        engine.runtime = SimpleNamespace(coverage_gaps=())
+        engine.member_resolutions = {
+            "edge-1": {
+                "member_resolution_status": "resolved",
+                "initiating_loader_realm_identity": "caller-loader",
+            }
+        }
+        engine.members = {
+            "caller-member": {"class_name": "caller/Caller"},
+        }
+        engine.class_definition_statuses = {
+            ("caller-loader", "caller/Caller"): "definition_ready",
+        }
+        engine.decisions = SimpleNamespace(
+            analysis_context_identity="analysis-context-1"
+        )
+        engine.profile = SimpleNamespace(identity="runtime-profile-1")
+        engine.batch_graph_identity = "batch-graph-1"
+        decision = {
+            "decision_identity": "decision-1",
+            "fact_kind": "method",
+            "fact_scope": {"member_change_kind": "implementation_changed"},
+            "coverage_gaps": [],
+        }
+
+        expected = {
+            "loading_constraint_deferred_conflict": "undetermined",
+            "loader_constraint_violation": "incompatible_if_executed",
+        }
+        for status, conclusion in expected.items():
+            with self.subTest(status=status):
+                engine.linkage_resolutions = {
+                    "edge-1": {"linkage_status": status},
+                }
+                result = engine._result_for(
+                    projection_identity="projection-1",
+                    decision=decision,
+                    assessment_identity="assessment-1",
+                    diagnostic=False,
+                )
+                self.assertEqual(result["static_linkage_status"], conclusion)
+                self.assertFalse(result["exact_path_exists"])
+                self.assertTrue(result["possible_path_exists"])
 
     def test_formal_results_with_no_entrypoints_route_to_graph_free_builder(self):
         decisions = self.decisions(formal_projections=({"identity": "p"},))

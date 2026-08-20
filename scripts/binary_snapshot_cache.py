@@ -19,11 +19,12 @@ from binary_asm_helper import parser_identity, resolve_asm_jar
 from binary_first_contract import (
     BinaryFirstContractError,
     canonical_identity_native_json,
+    surrogate_safe_json_bytes,
 )
 
 
-CACHE_SCHEMA = "java-upgrade-analyzer.binary-snapshot-cache.v2"
-CACHE_POLICY_VERSION = "artifact-content-parser-target-release-safety-rebind-v3"
+CACHE_SCHEMA = "java-upgrade-analyzer.binary-snapshot-cache.v4"
+CACHE_POLICY_VERSION = "artifact-content-parser-target-release-safety-rebind-v5"
 
 
 class BinarySnapshotCacheError(BinaryFirstContractError):
@@ -78,9 +79,9 @@ def _identity(namespace: str, payload: Any) -> str:
 
 
 def _json_bytes(value: Any) -> bytes:
-    return json.dumps(
+    return surrogate_safe_json_bytes(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
-    ).encode("utf-8")
+    )
 
 
 def _sha256_file(path: Path) -> str:
@@ -123,6 +124,9 @@ def _template_payload(snapshot: ArtifactSnapshot) -> dict[str, Any]:
         "unknown_resource_scopes": list(snapshot.unknown_resource_scopes),
         "parser_identity": snapshot.parser_identity,
         "comparison_coverage_status": snapshot.comparison_coverage_status,
+        "runtime_semantics_diagnostic_codes": list(
+            snapshot.runtime_semantics_diagnostic_codes
+        ),
     }
 
 
@@ -221,6 +225,9 @@ def _rebind(
         "archive_comment_sha256": payload["archive_comment_sha256"],
         "entries": [asdict(item) for item in entries],
         "parser_identity": payload["parser_identity"],
+        "runtime_semantics_diagnostic_codes": payload[
+            "runtime_semantics_diagnostic_codes"
+        ],
         "cache_policy_version": CACHE_POLICY_VERSION,
     })
     return ArtifactSnapshot(
@@ -240,6 +247,9 @@ def _rebind(
         inventory_digest=inventory_digest,
         parser_identity=payload["parser_identity"],
         comparison_coverage_status=payload["comparison_coverage_status"],
+        runtime_semantics_diagnostic_codes=tuple(
+            payload["runtime_semantics_diagnostic_codes"]
+        ),
     )
 
 
@@ -267,8 +277,9 @@ def cached_snapshot_archive(
     parser_id, _helper_sha = parser_identity(asm_jar=asm_path)
     # The Step1-bound digest is sufficient to locate a prospective cache entry.
     # A hit is still independently verified against the current artifact bytes.
-    # On a miss, snapshot_archive performs both its before and after hashes, so
-    # hashing here as well was a third full read with no additional evidence.
+    # On a miss, snapshot_archive streams the source once while hashing it into
+    # a private, identity-bound snapshot; hashing here would add another full
+    # source read without adding evidence.
     safety_policy_identity = _identity(
         "artifact_safety_policy_identity", dict(safety_policy or {})
     )

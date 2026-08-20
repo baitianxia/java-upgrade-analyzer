@@ -34,6 +34,8 @@ ALL_CHANGED_APIS_FIELDS = [
                      # 明确告诉 Step 5 当前变更符号的类型，避免靠命名猜测
     "api_signature", # 参数签名，如 (String) 或 (ClassLoader[])
                      # 仅 method/constructor 使用；空字符串表示无参数或签名未知
+    "change_fact_identity", # binary generation 中唯一的正式变化事实身份
+    "decision_identity", # 产生该事实的正式裁决身份
     "confirmed",     # binary-first 正式投影固定为 "true"
     "severity",      # P0 / P1 / P2
     "source",        # classfile_contract

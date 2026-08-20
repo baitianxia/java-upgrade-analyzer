@@ -14,12 +14,13 @@ import shutil
 import struct
 import subprocess
 import threading
-from typing import Any, Callable, Iterable
+import weakref
+from typing import Any, Callable, Iterable, Mapping
 
 from binary_first_contract import BinaryFirstContractError, canonical_identity
 from binary_tool_execution import execute_binary_tool
 from jdk_preflight import jdk_tool_path
-from compat import subprocess_platform_kwargs
+from compat import managed_popen, release_process_tree, terminate_process_tree
 from path_runtime import make_short_temp_dir, short_temporary_directory
 
 
@@ -28,9 +29,21 @@ ASM_SHA256 = "6f3828a215c920059a5efa2fb55c233d6c54ec5cadca99ce1b1bdd10077c7ddd"
 MAX_SUPPORTED_CLASS_MAJOR = 70  # Java 26, the maximum declared by ASM 9.9.1.
 PROTOCOL_SCHEMA = "binary-fact-frame-v1"
 OUTPUT_SCHEMA = "binary-class-fact-v1"
-VISITOR_POLICY_VERSION = "asm-lossless-facts-v2"
+VISITOR_POLICY_VERSION = "asm-lossless-facts-v3"
 JAVA_HELPER = Path(__file__).resolve().parent / "java" / "BinaryFactExtractor.java"
 SUPPORT_MANIFEST = Path(__file__).resolve().parent / "binary_first_support_manifest.json"
+PARSER_IMPLEMENTATION_SOURCE_PATHS = (
+    "artifact_safety.py",
+    "binary_artifact_diff.py",
+    "binary_asm_helper.py",
+    "binary_first_contract.py",
+    "binary_snapshot_cache.py",
+    "binary_tool_execution.py",
+    "compat.py",
+    "jdk_preflight.py",
+    "java/BinaryFactExtractor.java",
+    "path_runtime.py",
+)
 
 DEFAULT_MAX_CLASS_BYTES = 16 * 1024 * 1024
 DEFAULT_MAX_FRAME_BYTES = 64 * 1024 * 1024
@@ -41,6 +54,37 @@ DEFAULT_MAX_HEAP_MEGABYTES = 512
 
 class BinaryAsmError(BinaryFirstContractError):
     pass
+
+
+def _remove_owned_helper_directory(
+    path: Path,
+    owner_pid: int,
+    getpid: Callable[[], int] = os.getpid,
+    rmtree: Callable[..., None] = shutil.rmtree,
+) -> None:
+    if getpid() == owner_pid:
+        rmtree(path, ignore_errors=True)
+
+
+class _OwnedHelperDirectory:
+    def __init__(self, prefix: str) -> None:
+        self.path = make_short_temp_dir(prefix=prefix)
+        self._finalizer = weakref.finalize(
+            self,
+            _remove_owned_helper_directory,
+            self.path,
+            os.getpid(),
+        )
+
+    def cleanup(self) -> None:
+        self._finalizer()
+
+
+@dataclass(frozen=True)
+class _CompiledAsmHelper:
+    output: Path
+    java: str
+    _temporary_directory: _OwnedHelperDirectory
 
 
 @dataclass(frozen=True)
@@ -83,6 +127,81 @@ def _sha256_file(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _parser_implementation_source_digests() -> dict[str, str]:
+    scripts_dir = Path(__file__).resolve().parent
+    return {
+        relative: _sha256_file(scripts_dir / relative)
+        for relative in PARSER_IMPLEMENTATION_SOURCE_PATHS
+    }
+
+
+def _artifact_diff_support_identity() -> str:
+    try:
+        support = json.loads(SUPPORT_MANIFEST.read_text(encoding="utf-8"))
+        artifact_diff_support = support["artifact_diff_support_manifest"]
+    except (OSError, UnicodeError, json.JSONDecodeError, KeyError) as error:
+        raise BinaryAsmError(
+            "ASM_ARTIFACT_DIFF_SUPPORT_MANIFEST_INVALID", str(error)
+        ) from error
+    if not isinstance(artifact_diff_support, dict):
+        raise BinaryAsmError(
+            "ASM_ARTIFACT_DIFF_SUPPORT_MANIFEST_INVALID",
+            "artifact_diff_support_manifest must be an object",
+        )
+    return canonical_identity(
+        "artifact_diff_support_manifest_identity",
+        artifact_diff_support,
+        schema_version="1",
+    )
+
+
+def _parser_identity_from_inputs(
+    implementation_source_digests: Mapping[str, str],
+    artifact_diff_support_identity: str,
+) -> str:
+    if set(implementation_source_digests) != set(
+        PARSER_IMPLEMENTATION_SOURCE_PATHS
+    ):
+        raise BinaryAsmError(
+            "ASM_IMPLEMENTATION_SOURCE_SET_INVALID",
+            "parser implementation source set is incomplete",
+        )
+    helper_sha = implementation_source_digests[
+        "java/BinaryFactExtractor.java"
+    ]
+    return canonical_identity(
+        "binary_asm_parser_identity",
+        {
+            "protocol_schema": PROTOCOL_SCHEMA,
+            "output_schema": OUTPUT_SCHEMA,
+            "asm_version": ASM_VERSION,
+            "asm_jar_sha256": ASM_SHA256,
+            "helper_sha256": helper_sha,
+            "visitor_policy_version": VISITOR_POLICY_VERSION,
+            "max_supported_class_major": MAX_SUPPORTED_CLASS_MAJOR,
+            "implementation_sources": [
+                {
+                    "path": relative,
+                    "sha256": str(
+                        implementation_source_digests[relative]
+                    ),
+                }
+                for relative in PARSER_IMPLEMENTATION_SOURCE_PATHS
+            ],
+            "artifact_diff_support_manifest_identity": (
+                artifact_diff_support_identity
+            ),
+        },
+        schema_version="1",
+    )
+
+
+_CAPTURED_PARSER_IMPLEMENTATION_SOURCE_DIGESTS = (
+    _parser_implementation_source_digests()
+)
+_CAPTURED_ARTIFACT_DIFF_SUPPORT_IDENTITY = _artifact_diff_support_identity()
 
 
 def _canonical_json(payload: dict[str, Any]) -> bytes:
@@ -163,40 +282,24 @@ def resolve_asm_jar(explicit_path: str | Path | None = None) -> Path:
 
 def parser_identity(*, asm_jar: Path | None = None) -> tuple[str, str]:
     asm_jar = resolve_asm_jar(asm_jar)
-    helper_sha = _sha256_file(JAVA_HELPER)
-    try:
-        support = json.loads(SUPPORT_MANIFEST.read_text(encoding="utf-8"))
-        artifact_diff_support = support["artifact_diff_support_manifest"]
-    except (OSError, UnicodeError, json.JSONDecodeError, KeyError) as error:
+    current_sources = _parser_implementation_source_digests()
+    current_support_identity = _artifact_diff_support_identity()
+    if (
+        current_sources != _CAPTURED_PARSER_IMPLEMENTATION_SOURCE_DIGESTS
+        or current_support_identity
+        != _CAPTURED_ARTIFACT_DIFF_SUPPORT_IDENTITY
+    ):
         raise BinaryAsmError(
-            "ASM_ARTIFACT_DIFF_SUPPORT_MANIFEST_INVALID", str(error)
-        ) from error
-    artifact_diff_support_identity = canonical_identity(
-        "artifact_diff_support_manifest_identity",
-        artifact_diff_support,
-        schema_version="1",
+            "ASM_IMPLEMENTATION_CHANGED_DURING_RUN",
+            "parser source or artifact-diff support changed after process start",
+        )
+    identity = _parser_identity_from_inputs(
+        _CAPTURED_PARSER_IMPLEMENTATION_SOURCE_DIGESTS,
+        _CAPTURED_ARTIFACT_DIFF_SUPPORT_IDENTITY,
     )
-    identity = canonical_identity(
-        "binary_asm_parser_identity",
-        {
-            "protocol_schema": PROTOCOL_SCHEMA,
-            "output_schema": OUTPUT_SCHEMA,
-            "asm_version": ASM_VERSION,
-            "asm_jar_sha256": ASM_SHA256,
-            "helper_sha256": helper_sha,
-            "visitor_policy_version": VISITOR_POLICY_VERSION,
-            "max_supported_class_major": MAX_SUPPORTED_CLASS_MAJOR,
-            # Snapshot facts depend on the artifact-diff parser/resource/safety
-            # contract, not unrelated release-gate measurements in the same
-            # top-level manifest. This preserves fail-closed invalidation while
-            # avoiding a 500-JAR cold parse after documentation/gate updates.
-            "artifact_diff_support_manifest_identity": (
-                artifact_diff_support_identity
-            ),
-        },
-        schema_version="1",
-    )
-    return identity, helper_sha
+    return identity, _CAPTURED_PARSER_IMPLEMENTATION_SOURCE_DIGESTS[
+        "java/BinaryFactExtractor.java"
+    ]
 
 
 @lru_cache(maxsize=8)
@@ -205,35 +308,46 @@ def _compile_helper(
     helper_sha: str,
     javac_text: str = "",
     java_text: str = "",
-) -> tuple[Path, str]:
+) -> _CompiledAsmHelper:
     javac = javac_text or shutil.which("javac")
     java = java_text or shutil.which("java")
     if not javac or not java:
         raise BinaryAsmError(
             "ASM_JAVA_TOOLCHAIN_MISSING", "both java and javac are required for the ASM helper"
         )
-    output = make_short_temp_dir(prefix="binary-asm-helper")
-    completed = execute_binary_tool(
-        [
-            javac,
-            "-encoding", "UTF-8",
-            "-cp", asm_jar_text,
-            "-d", str(output),
-            str(JAVA_HELPER),
-        ],
-        stage="binary_asm.compile_helper",
-        reason_prefix="ASM_HELPER_COMPILE",
-        timeout_seconds=60,
-    )
-    if not completed.succeeded:
-        raise BinaryAsmError(
-            "ASM_HELPER_COMPILE_FAILED",
-            json.dumps(completed.failure.to_mapping(), ensure_ascii=False),
+    temporary = _OwnedHelperDirectory("binary-asm-helper")
+    output = temporary.path
+    try:
+        completed = execute_binary_tool(
+            [
+                javac,
+                "-encoding", "UTF-8",
+                "-cp", asm_jar_text,
+                "-d", str(output),
+                str(JAVA_HELPER),
+            ],
+            stage="binary_asm.compile_helper",
+            reason_prefix="ASM_HELPER_COMPILE",
+            timeout_seconds=60,
         )
-    class_file = output / "BinaryFactExtractor.class"
-    if not class_file.is_file():
-        raise BinaryAsmError("ASM_HELPER_COMPILE_INCOMPLETE", "main helper class is missing")
-    return output, java
+        if not completed.succeeded:
+            raise BinaryAsmError(
+                "ASM_HELPER_COMPILE_FAILED",
+                json.dumps(completed.failure.to_mapping(), ensure_ascii=False),
+            )
+        class_file = output / "BinaryFactExtractor.class"
+        if not class_file.is_file():
+            raise BinaryAsmError(
+                "ASM_HELPER_COMPILE_INCOMPLETE", "main helper class is missing"
+            )
+        return _CompiledAsmHelper(output, java, temporary)
+    except BaseException:
+        temporary.cleanup()
+        raise
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_compile_helper.cache_clear)
 
 
 def _validate_class_record(
@@ -309,11 +423,13 @@ def extract_class_facts(
     if jdk_home:
         javac = jdk_tool_path(jdk_home, "javac")
         java = jdk_tool_path(jdk_home, "java")
-        class_dir, java = _compile_helper(
+        compiled_helper = _compile_helper(
             str(asm_path), helper_sha, str(javac), str(java)
         )
     else:
-        class_dir, java = _compile_helper(str(asm_path), helper_sha)
+        compiled_helper = _compile_helper(str(asm_path), helper_sha)
+    class_dir = compiled_helper.output
+    java = compiled_helper.java
     input_digest = hashlib.sha256()
     expected: dict[tuple[str, str], str] = {}
     input_count = 0
@@ -383,7 +499,7 @@ def extract_class_facts(
         record_digest = hashlib.sha256()
         footer = None
         with protocol_input.open("rb") as stdin, stderr_path.open("wb") as stderr:
-            process = subprocess.Popen(
+            process = managed_popen(
                 [
                     java,
                     f"-Xmx{int(max_heap_megabytes)}m",
@@ -396,19 +512,40 @@ def extract_class_facts(
                 stdin=stdin,
                 stdout=subprocess.PIPE,
                 stderr=stderr,
-                **subprocess_platform_kwargs(),
             )
             timed_out = threading.Event()
+            lifecycle_lock = threading.Lock()
+            helper_completed = False
 
             def terminate_on_deadline():
-                timed_out.set()
-                process.kill()
+                nonlocal helper_completed
+                with lifecycle_lock:
+                    try:
+                        process_running = process.poll() is None
+                    except (AttributeError, OSError):
+                        process_running = False
+                    if helper_completed or not process_running:
+                        return
+                    # The callback owns the still-live process only after the
+                    # liveness check.  This prevents a late timer from turning
+                    # a successfully reaped helper into a timeout or signaling
+                    # a recycled process-group ID.
+                    timed_out.set()
+                try:
+                    terminate_process_tree(process)
+                except BaseException:
+                    pass
 
             deadline = threading.Timer(timeout_seconds, terminate_on_deadline)
-            deadline.daemon = True
-            deadline.start()
-            assert process.stdout is not None
+            timer_started = False
             try:
+                deadline.daemon = True
+                # Timer.start itself can fail.  It belongs inside the same
+                # protection region as every subsequent pipe operation so the
+                # already-started JVM tree is never orphaned.
+                deadline.start()
+                timer_started = True
+                assert process.stdout is not None
                 header_bytes, present = _read_frame(process.stdout, max_frame_bytes=max_frame_bytes)
                 if not present:
                     raise BinaryAsmError("ASM_PROTOCOL_HEADER_MISSING", "helper emitted no output")
@@ -476,17 +613,42 @@ def extract_class_facts(
                         "ASM_PROTOCOL_STRAY_BYTES", "stdout contains bytes after output footer"
                     )
                 returncode = process.wait()
+                with lifecycle_lock:
+                    helper_completed = True
+                    exceeded_deadline = timed_out.is_set()
+                if exceeded_deadline:
+                    raise TimeoutError("ASM helper deadline elapsed")
             except BaseException as error:
-                process.kill()
-                process.wait()
+                if not timed_out.is_set():
+                    try:
+                        terminate_process_tree(process)
+                    except BaseException:
+                        # Preserve the protocol/timer/interrupt exception that
+                        # triggered cleanup; termination remains best effort.
+                        pass
                 if timed_out.is_set():
                     raise BinaryAsmError(
                         "ASM_HELPER_TIMEOUT", f"ASM helper exceeded {timeout_seconds}s"
                     ) from error
                 raise
             finally:
-                deadline.cancel()
-                process.stdout.close()
+                with lifecycle_lock:
+                    helper_completed = True
+                try:
+                    deadline.cancel()
+                except BaseException:
+                    pass
+                if timer_started:
+                    try:
+                        deadline.join()
+                    except BaseException:
+                        pass
+                if process.stdout is not None:
+                    try:
+                        process.stdout.close()
+                    except OSError:
+                        pass
+                release_process_tree(process)
 
         stderr_text = stderr_path.read_text(encoding="utf-8", errors="replace")
         if returncode != 0:

@@ -15,12 +15,16 @@ import java.nio.file.Paths;
 import java.security.CodeSource;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Locale;
 
 /** Independent target-JVM provider/definition/hierarchy observation helper. */
 public final class RuntimeOutcomeOracle {
+    private static final String JVM_TEXT_TRANSPORT_PREFIX = "~jua-utf16-v1~";
+
     private RuntimeOutcomeOracle() {}
 
     public static void main(String[] args) throws Exception {
@@ -36,11 +40,67 @@ public final class RuntimeOutcomeOracle {
         ClassLoader platformParent = helperLoader == null ? null : helperLoader.getParent();
         try (URLClassLoader loader = new URLClassLoader(urls.toArray(new URL[0]), platformParent)) {
             for (String raw : Files.readAllLines(Paths.get(args[1]), StandardCharsets.UTF_8)) {
-                String name = raw.trim();
-                if (name.isEmpty()) continue;
+                if (raw.isEmpty()) continue;
+                String name = decodeTransportText(raw).replace('/', '.');
                 observe(loader, name);
             }
         }
+    }
+
+    private static String decodeTransportText(String value) {
+        if (!value.startsWith(JVM_TEXT_TRANSPORT_PREFIX)) return value;
+        byte[] bytes = Base64.getUrlDecoder().decode(
+            value.substring(JVM_TEXT_TRANSPORT_PREFIX.length())
+        );
+        if ((bytes.length & 1) != 0) {
+            throw new IllegalArgumentException("invalid JVM UTF-16 transport length");
+        }
+        char[] characters = new char[bytes.length / 2];
+        for (int index = 0; index < characters.length; index++) {
+            characters[index] = (char) (
+                ((bytes[index * 2] & 0xff) << 8)
+                | (bytes[index * 2 + 1] & 0xff)
+            );
+        }
+        return new String(characters);
+    }
+
+    private static boolean requiresTransport(String value) {
+        if (value.startsWith(JVM_TEXT_TRANSPORT_PREFIX)) return true;
+        for (int index = 0; index < value.length(); index++) {
+            char character = value.charAt(index);
+            if (Character.isHighSurrogate(character)) {
+                if (index + 1 < value.length()
+                    && Character.isLowSurrogate(value.charAt(index + 1))) {
+                    index++;
+                    continue;
+                }
+                return true;
+            }
+            if (Character.isLowSurrogate(character)) return true;
+        }
+        return false;
+    }
+
+    private static String encodeTransportText(String value) {
+        if (!requiresTransport(value)) return value;
+        byte[] bytes = new byte[value.length() * 2];
+        for (int index = 0; index < value.length(); index++) {
+            char character = value.charAt(index);
+            bytes[index * 2] = (byte) (character >>> 8);
+            bytes[index * 2 + 1] = (byte) character;
+        }
+        return JVM_TEXT_TRANSPORT_PREFIX
+            + Base64.getUrlEncoder().encodeToString(bytes);
+    }
+
+    private static String row(String... values) {
+        StringBuilder result = new StringBuilder();
+        for (int index = 0; index < values.length; index++) {
+            if (index > 0) result.append('|');
+            result.append(encodeTransportText(values[index]));
+        }
+        return result.toString();
     }
 
     private static void observe(ClassLoader loader, String binaryName) {
@@ -86,7 +146,7 @@ public final class RuntimeOutcomeOracle {
                 jsonArray(annotationResources(type))
             );
             out.append(',').append(json("class_annotation_values")).append(':').append(
-                jsonArray(annotationValues(type))
+                jsonTransportedArray(annotationValues(type))
             );
             // Reflection metadata resolution forces member descriptors to link
             // but never executes class initialization.
@@ -98,36 +158,44 @@ public final class RuntimeOutcomeOracle {
             List<String> memberAnnotationRows = new ArrayList<>();
             List<String> memberAnnotationValueRows = new ArrayList<>();
             for (Field field : fields) {
-                memberRows.add("field|" + field.getName() + "|" + descriptor(field.getType())
-                    + "|" + field.getModifiers());
+                memberRows.add(row(
+                    "field", field.getName(), descriptor(field.getType()),
+                    String.valueOf(field.getModifiers())
+                ));
             }
             for (Method method : methods) {
-                memberRows.add("method|" + method.getName() + "|" + methodDescriptor(method)
-                    + "|" + method.getModifiers());
+                memberRows.add(row(
+                    "method", method.getName(), methodDescriptor(method),
+                    String.valueOf(method.getModifiers())
+                ));
                 for (String annotation : annotationDescriptors(method)) {
-                    memberAnnotationRows.add(
-                        method.getName() + "|" + methodDescriptor(method) + "|" + annotation
-                    );
+                    memberAnnotationRows.add(row(
+                        method.getName(), methodDescriptor(method), annotation
+                    ));
                 }
                 for (String value : annotationValues(method)) {
                     memberAnnotationValueRows.add(
-                        method.getName() + "|" + methodDescriptor(method) + "|" + value
+                        row(method.getName(), methodDescriptor(method)) + "|" + value
                     );
                 }
             }
             for (Constructor<?> constructor : constructors) {
-                memberRows.add("method|<init>|" + constructorDescriptor(constructor)
-                    + "|" + constructor.getModifiers());
+                memberRows.add(row(
+                    "method", "<init>", constructorDescriptor(constructor),
+                    String.valueOf(constructor.getModifiers())
+                ));
             }
             Collections.sort(memberRows);
             Collections.sort(memberAnnotationRows);
             Collections.sort(memberAnnotationValueRows);
-            out.append(',').append(json("members")).append(':').append(jsonArray(memberRows));
+            out.append(',').append(json("members")).append(':').append(
+                jsonTransportedArray(memberRows)
+            );
             out.append(',').append(json("member_annotations")).append(':').append(
-                jsonArray(memberAnnotationRows)
+                jsonTransportedArray(memberAnnotationRows)
             );
             out.append(',').append(json("member_annotation_values")).append(':').append(
-                jsonArray(memberAnnotationValueRows)
+                jsonTransportedArray(memberAnnotationValueRows)
             );
         } catch (Throwable error) {
             out.append(',').append(json("status")).append(':').append(json("definition_failed"));
@@ -234,21 +302,30 @@ public final class RuntimeOutcomeOracle {
                         if (value != null && value.getClass().isArray()) {
                             int length = java.lang.reflect.Array.getLength(value);
                             for (int index = 0; index < length; index++) {
-                                result.add(descriptor + "|" + attribute.getName() + "|"
-                                    + annotationValue(java.lang.reflect.Array.get(value, index)));
+                                result.add(row(
+                                    descriptor,
+                                    attribute.getName(),
+                                    annotationValue(java.lang.reflect.Array.get(value, index))
+                                ));
                             }
                         } else {
-                            result.add(descriptor + "|" + attribute.getName() + "|"
-                                + annotationValue(value));
+                            result.add(row(
+                                descriptor, attribute.getName(), annotationValue(value)
+                            ));
                         }
                     } catch (ReflectiveOperationException | RuntimeException error) {
-                        result.add(descriptor + "|" + attribute.getName() + "|<unresolved:"
-                            + error.getClass().getName() + ">");
+                        result.add(row(
+                            descriptor,
+                            attribute.getName(),
+                            "<unresolved:" + error.getClass().getName() + ">"
+                        ));
                     }
                 }
             }
         } catch (RuntimeException | LinkageError error) {
-            result.add("<unresolved>|<unresolved>|" + error.getClass().getName());
+            result.add(row(
+                "<unresolved>", "<unresolved>", error.getClass().getName()
+            ));
         }
         Collections.sort(result);
         return result;
@@ -297,8 +374,21 @@ public final class RuntimeOutcomeOracle {
         return out.append(']').toString();
     }
 
+    private static String jsonTransportedArray(List<String> values) {
+        StringBuilder out = new StringBuilder("[");
+        for (int index = 0; index < values.size(); index++) {
+            if (index > 0) out.append(',');
+            out.append(jsonTransported(values.get(index)));
+        }
+        return out.append(']').toString();
+    }
+
     private static String json(String value) {
         if (value == null) return "null";
+        return jsonTransported(encodeTransportText(value));
+    }
+
+    private static String jsonTransported(String value) {
         StringBuilder out = new StringBuilder("\"");
         for (int index = 0; index < value.length(); index++) {
             char ch = value.charAt(index);
@@ -309,7 +399,9 @@ public final class RuntimeOutcomeOracle {
                 case '\r': out.append("\\r"); break;
                 case '\t': out.append("\\t"); break;
                 default:
-                    if (ch < 0x20) out.append(String.format("\\u%04x", (int) ch));
+                    if (ch < 0x20 || Character.isSurrogate(ch)) {
+                        out.append(String.format(Locale.ROOT, "\\u%04x", (int) ch));
+                    }
                     else out.append(ch);
             }
         }

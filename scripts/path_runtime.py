@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -220,6 +221,25 @@ def make_short_temp_dir(
     raise OSError("无法创建短临时目录：" + "；".join(errors))
 
 
+def _remove_short_temp_dir(path: Path) -> None:
+    cleanup_error = None
+    # Windows virus scanners and recently reaped JVMs can retain a directory
+    # entry briefly after every application handle is closed. Keep the wait
+    # bounded, but give those transient owners enough time to release it.
+    for delay_seconds in (0.0, 0.05, 0.15, 0.4, 1.0):
+        if not os.path.lexists(path):
+            return
+        if delay_seconds:
+            time.sleep(delay_seconds)
+        try:
+            shutil.rmtree(path)
+            return
+        except OSError as error:
+            cleanup_error = error
+    if cleanup_error is not None:
+        raise cleanup_error
+
+
 @contextmanager
 def short_temporary_directory(prefix="jua", *, preferred_root=None, workspace=None):
     path = make_short_temp_dir(
@@ -230,7 +250,29 @@ def short_temporary_directory(prefix="jua", *, preferred_root=None, workspace=No
     try:
         yield str(path)
     finally:
-        shutil.rmtree(path, ignore_errors=True)
+        primary = sys.exc_info()[1]
+        try:
+            _remove_short_temp_dir(path)
+        except OSError as cleanup_error:
+            if primary is None:
+                raise cleanup_error
+            note = (
+                f"short temporary directory cleanup failed ({path}): "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+            add_note = getattr(primary, "add_note", None)
+            if callable(add_note):
+                try:
+                    add_note(note)
+                except Exception:
+                    pass
+            else:
+                try:
+                    notes = list(getattr(primary, "__notes__", ()) or ())
+                    notes.append(note)
+                    setattr(primary, "__notes__", notes)
+                except Exception:
+                    pass
 
 
 def short_temp_root(*, preferred_root=None, workspace=None):
@@ -253,7 +295,7 @@ def short_temp_root(*, preferred_root=None, workspace=None):
             workspace=workspace,
         )
         root = probe.parent
-        shutil.rmtree(probe, ignore_errors=True)
+        _remove_short_temp_dir(probe)
         _SHORT_TEMP_ROOT_CACHE[cache_key] = str(root)
         return root
 

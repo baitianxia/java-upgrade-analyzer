@@ -78,6 +78,7 @@ jobs:
       - name: Run Release Quality Gate
         run: >-
           python scripts/quality_gate.py --profile release
+          --release-performance-mode recorded
           --json-out "${{ runner.temp }}/jua-release-quality-gate.json"
 
       - name: Upload Quality Evidence

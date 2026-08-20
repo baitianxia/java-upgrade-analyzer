@@ -5,6 +5,8 @@ import subprocess
 import sys
 import unittest
 
+from tests.blackbox.managed_process import managed_run
+
 
 ROOT = Path(__file__).resolve().parents[2]
 TRUTH = json.loads((
@@ -22,7 +24,7 @@ class PublicCliSurfaceBlackboxTest(unittest.TestCase):
             with self.subTest(command=command["id"], mode="help"):
                 relative = command["path"]
                 declared_paths.append(relative)
-                completed = subprocess.run(
+                completed = managed_run(
                     [sys.executable, str(ROOT / relative), "--help"],
                     cwd=str(ROOT), capture_output=True, text=True,
                     encoding="utf-8", errors="replace", check=False,
@@ -38,7 +40,7 @@ class PublicCliSurfaceBlackboxTest(unittest.TestCase):
                     self.assertIn(marker, completed.stdout)
 
             with self.subTest(command=command["id"], mode="invalid-option"):
-                completed = subprocess.run(
+                completed = managed_run(
                     [
                         sys.executable,
                         str(ROOT / command["path"]),

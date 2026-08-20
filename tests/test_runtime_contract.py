@@ -184,7 +184,9 @@ class RuntimeContractTest(unittest.TestCase):
 
     def test_formal_runner_preflight_does_not_select_project_build_tools(self):
         source = (ROOT / "scripts" / "run_step.py").read_text(encoding="utf-8")
-        main_source = source[source.index("def main("):]
+        runner_start = source.index("def _main_with_workflow_lock_held(")
+        runner_end = source.index("\ndef main(", runner_start)
+        main_source = source[runner_start:runner_end]
         self.assertIn("contract_payload()", main_source)
         preflight = main_source[:main_source.index("load_main_state(report_dir")]
         self.assertNotIn("require_maven=True", preflight)

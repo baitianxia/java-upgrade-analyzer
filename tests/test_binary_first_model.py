@@ -7,6 +7,9 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR / "scripts"))
 
 from binary_first_contract import BinaryFirstContractError  # noqa: E402
+from binary_validation_oracle import (  # noqa: E402
+    _RUNTIME_PROFILE_IDENTITY_FIELDS,
+)
 from binary_first_model import (  # noqa: E402
     ActiveSnapshot,
     AnalysisContext,
@@ -54,9 +57,13 @@ def runtime_profile_payload(*, content="a" * 64, logical_location="lib/api.jar")
         "runtime_code_source_origin_mapping_identity": "origins-1",
         "runtime_security_and_package_sealing_policy_identity": "security-1",
         "active_profile_identities": ["profile-default"],
+        "resolved_configuration_properties": {},
+        "runtime_configuration_coverage_status": "complete",
+        "runtime_configuration_coverage_gaps": [],
         "external_config_snapshot_identities": [],
         "agent_transformer_plugin_profile_identities": [],
         "business_entrypoint_profile": {"main_class": "com.acme.Main"},
+        "entrypoint_discovery_coverage_gaps": [],
         "runtime_class_closure_coverage_status": "complete",
         "resource_selection_coverage_status": "complete",
         "field_coverage": {key: "known" for key in required},
@@ -90,6 +97,66 @@ class RuntimeAndArtifactIdentityTest(unittest.TestCase):
         self.assertNotEqual(first.identity, changed.identity)
         self.assertTrue(first.complete)
 
+    def test_runtime_semantic_inputs_are_bound_to_policy_and_snapshot_identity(self):
+        base = RuntimeProfile(runtime_profile_payload())
+        mutations = {
+            "resolved_configuration_properties": {"feature.enabled": "true"},
+            "runtime_configuration_coverage_status": "partial",
+            "runtime_configuration_coverage_gaps": ["config-source-unreadable"],
+            "entrypoint_discovery_coverage_gaps": ["main-class-unresolved"],
+        }
+        for field, value in mutations.items():
+            with self.subTest(field=field):
+                payload = runtime_profile_payload()
+                payload[field] = value
+                changed = RuntimeProfile(payload)
+                self.assertNotEqual(base.policy_identity, changed.policy_identity)
+                self.assertNotEqual(base.identity, changed.identity)
+                with self.assertRaises(BinaryFirstContractError) as error:
+                    RuntimeComparison(
+                        base,
+                        changed,
+                        "same_deployment_profile",
+                        "v1",
+                        (field,),
+                        ("dependency-artifacts",),
+                        (),
+                    )
+                self.assertEqual(
+                    error.exception.reason_code,
+                    "RUNTIME_PROFILE_CORRESPONDENCE_INVALID",
+                )
+
+    def test_multi_release_jvm_policy_is_already_bound_via_loader_topology(self):
+        first_payload = runtime_profile_payload()
+        first_payload["loader_topology"] = {
+            "multi_release_jar_runtime_policy": {
+                "policy_identity": "openjdk-jarfile-default-properties-v1",
+                "target_runtime_feature": 21,
+                "jdk.util.jar.enableMultiRelease": "true",
+            }
+        }
+        second_payload = runtime_profile_payload()
+        second_payload["loader_topology"] = {
+            "multi_release_jar_runtime_policy": {
+                "policy_identity": "openjdk-jarfile-default-properties-v1",
+                "target_runtime_feature": 17,
+                "jdk.util.jar.enableMultiRelease": "true",
+            }
+        }
+
+        first = RuntimeProfile(first_payload)
+        second = RuntimeProfile(second_payload)
+
+        self.assertNotEqual(first.policy_identity, second.policy_identity)
+        self.assertNotEqual(first.identity, second.identity)
+
+    def test_independent_oracle_binds_the_same_runtime_profile_fields(self):
+        self.assertEqual(
+            tuple(RuntimeProfile.IDENTITY_FIELDS),
+            tuple(_RUNTIME_PROFILE_IDENTITY_FIELDS),
+        )
+
     def test_runtime_profile_rejects_temporary_absolute_location(self):
         with self.assertRaises(BinaryFirstContractError) as error:
             RuntimeProfile(runtime_profile_payload(logical_location="/tmp/api.jar"))
@@ -104,6 +171,82 @@ class RuntimeAndArtifactIdentityTest(unittest.TestCase):
             RuntimeProfile(payload)
 
         self.assertEqual(error.exception.reason_code, "BINARY_FIELD_COVERAGE_INVALID")
+
+    def test_runtime_profile_rejects_malformed_semantic_inputs_early(self):
+        cases = (
+            (
+                "business_entrypoint_profile", [],
+                "RUNTIME_PROFILE_ENTRYPOINT_PROFILE_INVALID",
+            ),
+            (
+                "resolved_configuration_properties", [],
+                "RUNTIME_PROFILE_CONFIGURATION_PROPERTIES_INVALID",
+            ),
+            (
+                "runtime_configuration_coverage_status", "unknown",
+                "RUNTIME_PROFILE_CONFIGURATION_COVERAGE_STATUS_INVALID",
+            ),
+            (
+                "runtime_configuration_coverage_gaps", {"not-json"},
+                "RUNTIME_PROFILE_SEQUENCE_INVALID",
+            ),
+            (
+                "active_profile_identities", "prod",
+                "RUNTIME_PROFILE_SEQUENCE_INVALID",
+            ),
+        )
+        for field, value, reason_code in cases:
+            with self.subTest(field=field):
+                payload = runtime_profile_payload()
+                payload[field] = value
+                with self.assertRaises(BinaryFirstContractError) as error:
+                    RuntimeProfile(payload)
+                self.assertEqual(error.exception.reason_code, reason_code)
+
+        for nested_field, value, reason_code in (
+            (
+                "coverage_status", "unknown",
+                "RUNTIME_PROFILE_ENTRYPOINT_COVERAGE_STATUS_INVALID",
+            ),
+            (
+                "coverage_gaps", {"not-json"},
+                "RUNTIME_PROFILE_SEQUENCE_INVALID",
+            ),
+            (
+                "activated_classes", "demo.App",
+                "RUNTIME_PROFILE_SEQUENCE_INVALID",
+            ),
+            (
+                "activated_entity_classes", [""],
+                "RUNTIME_PROFILE_SEQUENCE_INVALID",
+            ),
+            (
+                "activated_resource_names", {"application.xml"},
+                "RUNTIME_PROFILE_SEQUENCE_INVALID",
+            ),
+            (
+                "activated_component_scan_packages", "demo",
+                "RUNTIME_PROFILE_SEQUENCE_INVALID",
+            ),
+            (
+                "activated_frameworks", "spring_boot",
+                "RUNTIME_PROFILE_SEQUENCE_INVALID",
+            ),
+            (
+                "methods", "demo.App#main",
+                "RUNTIME_PROFILE_ENTRYPOINT_METHODS_INVALID",
+            ),
+            (
+                "main_class", ["demo.App"],
+                "RUNTIME_PROFILE_ENTRYPOINT_MAIN_CLASS_INVALID",
+            ),
+        ):
+            with self.subTest(nested_field=nested_field):
+                payload = runtime_profile_payload()
+                payload["business_entrypoint_profile"][nested_field] = value
+                with self.assertRaises(BinaryFirstContractError) as error:
+                    RuntimeProfile(payload)
+                self.assertEqual(error.exception.reason_code, reason_code)
 
     def test_same_deployment_comparison_rejects_policy_change(self):
         base = RuntimeProfile(runtime_profile_payload())

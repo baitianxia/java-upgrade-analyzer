@@ -46,7 +46,8 @@ class TestTrustGateTest(unittest.TestCase):
         self.assertEqual(result["counts"]["public_scenario_contracts"], 89)
         self.assertEqual(result["counts"]["public_scenario_dimensions"], 260)
         self.assertEqual(result["counts"]["public_support_claims"], 22)
-        self.assertEqual(result["counts"]["windows_selectors"], 18)
+        self.assertEqual(result["counts"]["windows_selectors"], 32)
+        self.assertEqual(result["counts"]["windows_excluded_selectors"], 1)
 
     def test_required_windows_selector_cannot_be_silently_removed(self):
         policy = json.loads(POLICY_PATH.read_text(encoding="utf-8"))
@@ -76,6 +77,21 @@ class TestTrustGateTest(unittest.TestCase):
 
         self.assertIn(
             "WINDOWS_TEST_COUNT_FLOOR_INVALID",
+            {item["code"] for item in result["issues"]},
+        )
+
+    def test_windows_blackbox_exclusion_requires_a_native_replacement(self):
+        policy = json.loads(POLICY_PATH.read_text(encoding="utf-8"))
+        policy["windows_exclusion_replacements"] = {}
+        with tempfile.TemporaryDirectory() as temporary:
+            policy_path = Path(temporary) / "policy.json"
+            policy_path.write_text(
+                json.dumps(policy, ensure_ascii=False), encoding="utf-8",
+            )
+            result = run_trust_gate(ROOT, policy_path)
+
+        self.assertIn(
+            "WINDOWS_EXCLUSION_REPLACEMENT_SET_MISMATCH",
             {item["code"] for item in result["issues"]},
         )
 

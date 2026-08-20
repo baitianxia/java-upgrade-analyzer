@@ -10,7 +10,7 @@
     {"id": "openjdk-javap-hierarchy-and-callgraph", "organization": "OpenJDK", "mechanism": "independent_bytecode_resolution", "verifies": ["complete_removed_member_set", "child_to_parent_symbol_resolution", "complete_entrypoint_graph"]},
     {"id": "openjdk-jvm-virtual-linker", "organization": "OpenJDK", "mechanism": "actual_jvm_execution", "verifies": ["base_inherited_dispatch_succeeds", "current_no_such_method_error"]}
   ],
-  "oracle_implementations": [{"path": "tests/blackbox/oracles/openjdk_oracle.py", "sha256": "6e72442077371b86c943f790b5982144497725200da3e89f22f66ca2bfee38ca"}],
+  "oracle_implementations": [{"path": "tests/blackbox/oracles/openjdk_oracle.py", "sha256": "6413dec752291d5bf7068a94c249e096d26490c64ddb5f7d3c278887ca9eae72"}],
   "completeness": {"argument": "OpenJDK javap enumerates both classes in the only changed library and independently reads ChildApi's direct superclass. The base member-resolution walk maps symbolic ChildApi calls to the two ParentApi declarations; the sole declared root reaches one. Separate JVM executions prove inherited resolution succeeds on base and fails on current.", "verified_dimensions": ["api_identity", "jvm_descriptor", "closed_result_set", "entrypoint_reachability", "static_linkage"], "known_limits": []},
   "expected_result_count": 2,
   "expected_results": [

@@ -1,4 +1,5 @@
 import io
+from contextlib import closing
 import hashlib
 import json
 import os
@@ -10,6 +11,8 @@ import tempfile
 import unittest
 import zipfile
 import zlib
+
+from tests.blackbox.managed_process import managed_run
 
 from tests.blackbox.test_public_runtime_dispatch import (
     compile_jar,
@@ -27,7 +30,7 @@ TRUTH = json.loads((
 
 
 def execute(command: list[str]) -> subprocess.CompletedProcess:
-    completed = subprocess.run(
+    completed = managed_run(
         command,
         capture_output=True,
         text=True,
@@ -84,7 +87,7 @@ def standard_config(base: dict, current: dict, *, release_snapshot: bool = False
 
 def reconciliation_rows(generation: Path, side_name: str) -> list[dict]:
     database = generation / f"{side_name}_binary_facts.sqlite"
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection:
         connection.row_factory = sqlite3.Row
         columns = {
             row[1] for row in connection.execute(
@@ -120,7 +123,7 @@ def reconciliation_rows(generation: Path, side_name: str) -> list[dict]:
 
 def artifact_origins(generation: Path, side_name: str) -> dict[str, str]:
     database = generation / f"{side_name}_binary_facts.sqlite"
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection:
         return {
             identity: origin
             for identity, origin in connection.execute(
@@ -132,7 +135,7 @@ def artifact_origins(generation: Path, side_name: str) -> dict[str, str]:
 
 def class_entries(generation: Path, side_name: str) -> dict[str, str]:
     database = generation / f"{side_name}_binary_facts.sqlite"
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection:
         return {
             identity: entry
             for identity, entry in connection.execute(

@@ -18,12 +18,34 @@ class QualityGateTest(unittest.TestCase):
             self.assertIn("test_binary_", rendered)
             self.assertIn("tests.test_binary_result_truth", rendered)
             self.assertIn("tests.test_blackbox_harness", rendered)
+            self.assertIn("tests.blackbox.test_managed_process", rendered)
             self.assertIn("tests.test_test_trust_gate", rendered)
             self.assertIn("tests.blackbox.test_public_binary_cli", rendered)
             self.assertIn("tests.test_ci_quality_contract", rendered)
             self.assertIn("tests.test_platform_contract", rendered)
             self.assertNotIn("s4_jar_compare", rendered)
             self.assertNotIn("s5_call_chain_engine_integrated", rendered)
+
+    def test_quick_profile_guards_critical_step4_regressions(self):
+        quick = quality_gate.command_for("quick")
+        step5 = quality_gate.command_for("step5")
+
+        exact_in_both_profiles = (
+            *quality_gate.QUICK_STEP4_ORACLE_REGRESSION_TESTS,
+            *quality_gate.QUICK_STEP4_VALIDATION_REGRESSION_TESTS,
+        )
+        for selector in exact_in_both_profiles:
+            self.assertEqual(quick.count(selector), 1)
+            self.assertEqual(step5.count(selector), 1)
+        covered_by_complete_step5_modules = (
+            *quality_gate.QUICK_STEP4_PIPELINE_REGRESSION_TESTS,
+            *quality_gate.QUICK_STEP4_RUN_STEP_REGRESSION_TESTS,
+        )
+        for selector in covered_by_complete_step5_modules:
+            self.assertEqual(quick.count(selector), 1)
+            self.assertNotIn(selector, step5)
+        self.assertEqual(step5.count("tests.test_binary_pipeline"), 1)
+        self.assertEqual(step5.count("tests.test_run_step_main_state"), 1)
 
     def test_release_discovers_all_current_tests(self):
         command = quality_gate.command_for("release")
@@ -42,6 +64,11 @@ class QualityGateTest(unittest.TestCase):
         performance = quality_gate.performance_command("/tmp/audit")
         self.assertTrue(performance[1].endswith("binary_performance_gate.py"))
         self.assertIn("--gate", performance)
+        recorded = quality_gate.performance_command(
+            "/tmp/audit", evidence_mode="recorded"
+        )
+        self.assertIn("--verify-recorded-gate", recorded)
+        self.assertNotIn("--gate", recorded)
         matrix = quality_gate.real_project_commands(
             "/tmp/audit", cache_root="/tmp/cache", jdk_home="/tmp/jdk"
         )

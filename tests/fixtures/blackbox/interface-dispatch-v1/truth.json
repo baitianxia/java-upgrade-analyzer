@@ -34,7 +34,7 @@
     }
   ],
   "oracle_implementations": [
-    {"path": "tests/blackbox/oracles/openjdk_oracle.py", "sha256": "6e72442077371b86c943f790b5982144497725200da3e89f22f66ca2bfee38ca"}
+    {"path": "tests/blackbox/oracles/openjdk_oracle.py", "sha256": "6413dec752291d5bf7068a94c249e096d26490c64ddb5f7d3c278887ca9eae72"}
   ],
   "completeness": {
     "argument": "javap inventories every public default method on the only changed interface and independently reads every invokeinterface instruction in the complete business class. The isolated JVM runner instantiates an implementation and proves both base default dispatches succeed while the current runtime raises NoSuchMethodError for each removed interface method.",

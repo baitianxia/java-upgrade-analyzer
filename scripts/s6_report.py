@@ -150,10 +150,16 @@ def _call_chain_dir(report_dir):
 
 
 def _coverage_path(report_dir):
+    committed_step5 = _call_chain_dir(report_dir) / "coverage.json"
+    if committed_step5.is_file():
+        return committed_step5
     return _runtime_dir(report_dir, RUNTIME_COVERAGE_DIRNAME) / "coverage.json"
 
 
 def _step5_selection_path(report_dir):
+    committed_step5 = _call_chain_dir(report_dir) / "selection.json"
+    if committed_step5.is_file():
+        return committed_step5
     return _runtime_dir(report_dir, RUNTIME_CACHE_DIRNAME) / "step5_selection.json"
 
 
@@ -2738,46 +2744,43 @@ def write_changed_api_split_artifacts(report_dir):
     if not source_path.is_file():
         return artifacts
 
-    split_dir = source_path.parent
+    split_dir = _deliverables_dir(report_dir) / "changed-api-parts"
+    split_dir.mkdir(parents=True, exist_ok=True)
     for stale_path in split_dir.glob("all_changed_apis_part_*.csv"):
         try:
             stale_path.unlink()
-        except OSError:
-            pass
+        except FileNotFoundError:
+            continue
 
-    try:
-        source = open_csv_read(source_path)
-    except OSError:
-        return artifacts
+    source = open_csv_read(source_path)
 
     part_count = 0
     row_count = 0
-    try:
-        with source:
-            reader = csv.DictReader(source)
-            fieldnames = list(reader.fieldnames or [])
-            if not fieldnames:
-                return artifacts
-            part_rows = []
-            for row in reader:
-                part_rows.append(row)
-                row_count += 1
-                if len(part_rows) == S6_CHANGED_API_SPLIT_ROWS:
-                    part_count += 1
-                    part_path = split_dir / f"all_changed_apis_part_{part_count:03d}.csv"
-                    _write_changed_api_part(part_path, fieldnames, part_rows)
-                    part_rows = []
-            if part_rows:
+    with source:
+        reader = csv.DictReader(source)
+        fieldnames = list(reader.fieldnames or [])
+        if not fieldnames:
+            return artifacts
+        part_rows = []
+        for row in reader:
+            part_rows.append(row)
+            row_count += 1
+            if len(part_rows) == S6_CHANGED_API_SPLIT_ROWS:
                 part_count += 1
                 part_path = split_dir / f"all_changed_apis_part_{part_count:03d}.csv"
                 _write_changed_api_part(part_path, fieldnames, part_rows)
-    except (OSError, csv.Error):
-        return artifacts
+                part_rows = []
+        if part_rows:
+            part_count += 1
+            part_path = split_dir / f"all_changed_apis_part_{part_count:03d}.csv"
+            _write_changed_api_part(part_path, fieldnames, part_rows)
 
     if not row_count:
         return artifacts
 
-    artifacts["changed_apis_split_pattern"] = "evidence/api_changes/all_changed_apis_part_*.csv"
+    artifacts["changed_apis_split_pattern"] = (
+        "deliverables/changed-api-parts/all_changed_apis_part_*.csv"
+    )
     artifacts["changed_apis_split_count"] = part_count
     return artifacts
 
@@ -2849,12 +2852,54 @@ def _canonical_report_identity(payload):
     )
 
 
-def build_api_identity_key(payload):
+def build_logical_api_identity_key(payload):
+    """Return the presentation-level API identity.
+
+    Multiple independently validated change facts can describe the same
+    logical API/change-type tuple.  Human-facing summaries may aggregate those
+    facts, but evidence validation must not use this key because doing so would
+    silently collapse distinct Step5 results.
+    """
+
     return _canonical_report_identity(payload)
+
+
+def build_api_identity_key(payload):
+    """Return the evidence-level identity used by Step4/Step5/Step6 joins.
+
+    Step5's canonical ``api_identity`` is the logical five-part API identity
+    plus ``change_fact_identity``.  Preserve the historical five-part key only
+    for legacy artifacts that predate fact identities; formal binary-first
+    publications always carry the sixth component.
+    """
+
+    logical_identity = build_logical_api_identity_key(payload)
+    fact_identity = str(
+        (payload or {}).get("change_fact_identity") or ""
+    ).strip()
+    return (
+        (*logical_identity, fact_identity)
+        if fact_identity else logical_identity
+    )
 
 
 def _identity_is_complete(identity):
     return bool(identity and identity[0] and identity[1])
+
+
+def _step5_result_identity_fields(payload):
+    """Preserve the immutable Step5 fact binding in Step6 findings."""
+
+    payload = payload or {}
+    return {
+        field: str(payload.get(field) or "").strip()
+        for field in (
+            "api_identity",
+            "reported_api_identity",
+            "change_fact_identity",
+            "decision_identity",
+        )
+    }
 
 
 def _summary_result_identity_rows(summary):
@@ -3025,7 +3070,11 @@ def _validate_cross_artifact_identities(
         if _identity_is_complete(identity):
             changed_rows_by_identity[identity].append(item)
     changed_identities = set(changed_rows_by_identity)
-    overview_items = list((impact_overview or {}).get('apis') or [])
+    overview_items = list(
+        (impact_overview or {}).get("fact_apis")
+        or (impact_overview or {}).get('apis')
+        or []
+    )
     overview_by_identity = {
         build_api_identity_key(item): item
         for item in overview_items
@@ -3251,6 +3300,7 @@ def _impact_sort_key(item):
 def build_impact_overview(alert_rows):
     """Convert Step5 alerts.csv into a human-first "what is affected" view."""
     api_map = {}
+    fact_map = {}
     entry_map = {}
     seen_rows = set()
     occurrence_values = {}
@@ -3273,13 +3323,16 @@ def build_impact_overview(alert_rows):
             continue
         valid_record_count += 1
         bucket = _impact_bucket(row)
-        key = (
-            coord,
-            api,
-            _canonical_identity_signature(row.get("api_signature")),
-            str(row.get("symbol_kind") or "").strip(),
-            str(row.get("change_type") or "").strip(),
-        )
+        identity_payload = {
+            "coord": coord,
+            "api": api,
+            "api_signature": row.get("api_signature"),
+            "symbol_kind": row.get("symbol_kind"),
+            "change_type": row.get("change_type"),
+            "change_fact_identity": row.get("change_fact_identity"),
+        }
+        key = build_logical_api_identity_key(identity_payload)
+        fact_key = build_api_identity_key(identity_payload)
         item = api_map.setdefault(key, {
             "coord": coord,
             "api": api,
@@ -3303,8 +3356,31 @@ def build_impact_overview(alert_rows):
             "old_versions": set(),
             "new_versions": set(),
         })
+        fact_item = fact_map.setdefault(fact_key, {
+            "api_identity": str(row.get("api_identity") or "").strip(),
+            "reported_api_identity": str(
+                row.get("reported_api_identity") or ""
+            ).strip(),
+            "change_fact_identity": str(
+                row.get("change_fact_identity") or ""
+            ).strip(),
+            "decision_identity": str(
+                row.get("decision_identity") or ""
+            ).strip(),
+            "coord": coord,
+            "api": api,
+            "api_signature": key[2],
+            "symbol_kind": key[3],
+            "change_type": key[4],
+            "bucket": bucket,
+            "severities": set(),
+            "old_versions": set(),
+            "new_versions": set(),
+        })
         if _bucket_rank(bucket) < _bucket_rank(item["bucket"]):
             item["bucket"] = bucket
+        if _bucket_rank(bucket) < _bucket_rank(fact_item["bucket"]):
+            fact_item["bucket"] = bucket
         status = str(row.get("path_status") or row.get("api_status") or "unknown").strip() or "unknown"
         try:
             occurrence_count = max(int(str(row.get("path_occurrence_count") or "1")), 1)
@@ -3313,14 +3389,24 @@ def build_impact_overview(alert_rows):
         api_id = str(row.get("api_id") or "").strip()
         if api_id:
             item["api_ids"].add(api_id)
-        for field, target in (
-            ("severity", item["severities"]),
-            ("old_version", item["old_versions"]),
-            ("new_version", item["new_versions"]),
+        for field, target, fact_target in (
+            (
+                "severity", item["severities"],
+                fact_item["severities"],
+            ),
+            (
+                "old_version", item["old_versions"],
+                fact_item["old_versions"],
+            ),
+            (
+                "new_version", item["new_versions"],
+                fact_item["new_versions"],
+            ),
         ):
             value = str(row.get(field) or "").strip()
             if value:
                 target.add(value)
+                fact_target.add(value)
 
         entry = str(row.get("business_entry") or row.get("chain_entry") or "").strip()
         if not entry:
@@ -3495,6 +3581,28 @@ def build_impact_overview(alert_rows):
             "new_version_values": sorted(item["new_versions"]),
         })
 
+    fact_items = sorted(
+        (
+            {
+                **{
+                    key: value
+                    for key, value in item.items()
+                    if key not in {
+                        "severities", "old_versions", "new_versions"
+                    }
+                },
+                "severity_values": sorted(item["severities"]),
+                "old_version_values": sorted(item["old_versions"]),
+                "new_version_values": sorted(item["new_versions"]),
+            }
+            for item in fact_map.values()
+        ),
+        key=lambda item: (
+            _impact_sort_key(item),
+            str(item.get("change_fact_identity") or ""),
+        ),
+    )
+
     entry_items = []
     for item in entry_map.values():
         entry_items.append({
@@ -3526,6 +3634,9 @@ def build_impact_overview(alert_rows):
             if item.get("coord")
         }),
         "business_entry_count": len(all_business_entries),
+        # Evidence-level identities remain one row per validated Step5 change
+        # fact.  ``apis`` below is a separate presentation aggregation.
+        "fact_apis": fact_items,
         "apis": api_items,
         "confirmed_apis": [item for item in api_items if item.get("bucket") == "confirmed"],
         "review_apis": [item for item in api_items if item.get("bucket") == "review"],
@@ -3896,7 +4007,9 @@ def collect_findings(d):
     ):
         findings["impact_overview"] = build_impact_overview([])
     alert_api_count = len(
-        (findings.get('impact_overview') or {}).get('apis') or []
+        (findings.get('impact_overview') or {}).get("fact_apis")
+        or (findings.get('impact_overview') or {}).get('apis')
+        or []
     )
     if (
         target_api_count > 0
@@ -4062,6 +4175,7 @@ def collect_findings(d):
 
         for api_info in call_summary.get('not_impacted_apis', []):
             findings['not_impacted'].append({
+                **_step5_result_identity_fields(api_info),
                 'coord': api_info.get('coord', ''),
                 'old_version': api_info.get('old_version', ''),
                 'new_version': api_info.get('new_version', ''),
@@ -4086,6 +4200,7 @@ def collect_findings(d):
         for api_info in call_summary.get('reachable_apis', []):
             sev   = api_info.get('severity', 'P2')
             entry = {
+                **_step5_result_identity_fields(api_info),
                 'coord':          api_info.get('coord', ''),
                 'old_version':    api_info.get('old_version', ''),
                 'new_version':    api_info.get('new_version', ''),
@@ -4156,6 +4271,7 @@ def collect_findings(d):
             uncertain_reason_counts[reason_code or 'UNKNOWN'] += 1
             uncertainty_kind_counts[uncertainty_kind] += 1
             findings['uncertain'].append({
+                **_step5_result_identity_fields(item),
                 'coord':         coord,
                 'old_version':   item.get('old_version', ''),
                 'new_version':   item.get('new_version', ''),
@@ -4198,6 +4314,7 @@ def collect_findings(d):
             )
             not_analyzed_reason_counts[reason_code or 'UNKNOWN'] += 1
             entry = {
+                **_step5_result_identity_fields(item),
                 'coord':         coord,
                 'old_version':   item.get('old_version', ''),
                 'new_version':   item.get('new_version', ''),
@@ -4236,6 +4353,7 @@ def collect_findings(d):
             )
             not_found_reason_counts[reason_code or 'UNKNOWN'] += 1
             findings['not_found'].append({
+                **_step5_result_identity_fields(item),
                 'coord':         coord,
                 'old_version':   item.get('old_version', ''),
                 'new_version':   item.get('new_version', ''),
@@ -4615,22 +4733,47 @@ def _report_link(path, label=None):
 
 
 def _collect_available_evidence_paths(report_dir, findings):
-    candidates = set()
+    candidates = {}
     for value in ((findings.get('artifacts') or {}).values()):
         normalized = str(value or '').strip().replace('\\', '/')
         if normalized:
-            candidates.add(normalized)
+            candidates[normalized] = normalized
     for component in ((findings.get('coverage') or {}).get('components') or []):
         for value in component.get('evidence') or []:
             normalized = str(value or '').strip().replace('\\', '/')
-            if normalized:
-                candidates.add(normalized)
+            path_text = normalized.split('#', 1)[0]
+            relative = Path(path_text)
+            if (
+                not normalized
+                or not path_text
+                or relative.is_absolute()
+                or '..' in relative.parts
+                or len(relative.parts) < 2
+            ):
+                continue
+            prefix = '/'.join(relative.parts[:2])
+            if prefix not in {
+                'evidence/dependencies',
+                'evidence/context',
+                'evidence/static_scan',
+                'evidence/api_changes',
+                'evidence/call_chain',
+                '.runtime/coverage',
+                '.runtime/state',
+            }:
+                continue
+            candidates[normalized] = path_text
 
     available = []
-    for value in sorted(candidates):
-        candidate_path = Path(value)
+    report_root = Path(report_dir).resolve()
+    for value, path_text in sorted(candidates.items()):
+        candidate_path = Path(path_text)
         if not candidate_path.is_absolute():
-            candidate_path = Path(report_dir) / value
+            candidate_path = report_root / candidate_path
+            try:
+                candidate_path.resolve().relative_to(report_root)
+            except (OSError, RuntimeError, ValueError):
+                continue
         if candidate_path.is_file():
             available.append(value)
     return available
@@ -5101,7 +5244,9 @@ def render_core_conclusion(findings):
 
 
 def _identity_without_severity(item):
-    return _canonical_report_identity(item)
+    # Human report rows intentionally aggregate multiple evidence-level change
+    # facts that describe the same logical API/change tuple.
+    return build_logical_api_identity_key(item)
 
 
 def _change_cell(item, severity='', *, include_item_severity=True):
@@ -7071,7 +7216,7 @@ def _incomplete_api_reason(row, findings):
 
 
 def _inventory_api_row(item):
-    identity = build_api_identity_key(item)
+    identity = build_logical_api_identity_key(item)
     normalized = {
         "coord": identity[0],
         "api": identity[1],
@@ -7104,7 +7249,7 @@ def build_human_api_analysis(findings):
     report_scope_coords = _report_scope_included_coords(findings)
     result_groups = defaultdict(list)
     for row in build_api_result_rows(findings):
-        identity = build_api_identity_key(row)
+        identity = build_logical_api_identity_key(row)
         if (
             _identity_is_complete(identity)
             and (
@@ -7130,7 +7275,7 @@ def build_human_api_analysis(findings):
     inventory_variant_counts = defaultdict(lambda: defaultdict(int))
     complete_inventory_row_count = 0
     for item in raw_inventory:
-        identity = build_api_identity_key(item)
+        identity = build_logical_api_identity_key(item)
         if _identity_is_complete(identity):
             complete_inventory_row_count += 1
             normalized_inventory_row = _inventory_api_row(item)
@@ -9032,7 +9177,7 @@ def _load_full_alert_details(report_dir):
         diagnostics=[],
         required=False,
     ):
-        identity = build_api_identity_key({
+        identity = build_logical_api_identity_key({
             "coord": row.get("target_coord") or row.get("coord"),
             "api": (
                 row.get("changed_symbol")
@@ -9086,7 +9231,7 @@ def _load_full_alert_details(report_dir):
 
 
 def _full_relationship_cell(row, alert_details):
-    identity = build_api_identity_key(row)
+    identity = build_logical_api_identity_key(row)
     detail = alert_details.get(identity) or {}
     paths_by_status = detail.get("paths_by_status") or {}
     conclusion = str(row.get("conclusion") or "")
@@ -10128,53 +10273,17 @@ def main():
     ap.add_argument('--output-report',   required=True)
     args = ap.parse_args()
 
+    # Keep this historical CLI surface, but route every mutation through the
+    # receipt-bound Step6 transaction owned by binary_report.
+    from binary_report import publish_step6
+
     print("\n正在生成最终分析报告…", file=sys.stderr)
-    findings = collect_findings(args.report_dir)
-    findings.setdefault('artifacts', {})
-    cleanup_legacy_s6_detail_artifacts(args.report_dir)
-    findings['artifacts'].update(
-        write_changed_api_split_artifacts(args.report_dir)
+    result = publish_step6(
+        args.report_dir, args.output_findings, args.output_report
     )
-    findings['artifacts']['analysis_scope_md'] = write_analysis_scope_artifact(
-        args.report_dir, findings
-    )
-    diagnostic_detail = write_diagnostic_detail_artifact(
-        args.report_dir, findings
-    )
-    if diagnostic_detail:
-        findings['artifacts']['diagnostic_detail_md'] = diagnostic_detail
-    primary_artifacts, _api_model, _dependency_model = (
-        write_primary_report_artifacts(args.report_dir, findings)
-    )
-    findings['artifacts'].update(primary_artifacts)
-
-    Path(args.output_findings).parent.mkdir(parents=True, exist_ok=True)
-    with open(args.output_findings, 'w', encoding='utf-8', newline='\n') as f:
-        json.dump(findings, f, ensure_ascii=False, indent=2)
-
-    write_text(args.output_report, generate_report(findings))
-
-    p0, p1, p2, unk, nf = (
-        len(findings[k])
-        for k in ('p0', 'p1', 'p2', 'uncertain', 'not_found')
-    )
-    probable = len(findings.get('probable_impact') or [])
-    uncertainty_counts = _uncertainty_counts(findings.get('uncertain') or [])
-    uncertain_candidates = uncertainty_counts.get(
-        UNCERTAINTY_KIND_CANDIDATE_EVIDENCE, 0
-    )
-    uncertain_limitations = uncertainty_counts.get(
-        UNCERTAINTY_KIND_ANALYSIS_LIMITATION, 0
-    )
-    needs_input = len(findings.get('needs_input') or [])
-    not_analyzed = len(_exclusive_not_analyzed(findings))
     print("最终分析报告已生成。", file=sys.stderr)
     print(
-        f"结果：已确认影响 {p0 + p1 + p2}（其中高风险 {p0 + p1}），"
-        f"可能影响 {probable}，结论未确定 {unk}"
-        f"（候选证据 {uncertain_candidates}、静态分析能力边界 {uncertain_limitations}），"
-        f"输入不足且结论未确定 {needs_input}，"
-        f"本次未完成分析 {not_analyzed}，未发现静态路径 {nf}。",
+        f"本轮发布 API 目标 {int(result.get('api_count') or 0)} 个。",
         file=sys.stderr,
     )
     print(f"最终报告：{args.output_report}", file=sys.stderr)

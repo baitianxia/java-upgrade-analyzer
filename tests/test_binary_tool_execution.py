@@ -1,5 +1,8 @@
+import os
 import subprocess
 import sys
+import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -124,6 +127,53 @@ class BinaryToolExecutionTest(unittest.TestCase):
 
         self.assertTrue(result.succeeded)
         self.assertEqual(observed["creationflags"], 0x08000000)
+
+    @unittest.skipIf(os.name == "nt", "POSIX process-group semantics only")
+    def test_default_timeout_terminates_non_git_descendant_tree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            child_pid_path = root / "child.pid"
+            helper = root / "tool_parent.py"
+            helper.write_text(
+                """import subprocess
+import sys
+import time
+from pathlib import Path
+
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+Path(sys.argv[1]).write_text(str(child.pid), encoding="utf-8")
+time.sleep(60)
+""",
+                encoding="utf-8",
+            )
+            result = execute_binary_tool(
+                [sys.executable, str(helper), str(child_pid_path)],
+                stage="binary.test",
+                reason_prefix="BINARY_TOOL",
+                timeout_seconds=0.5,
+            )
+
+            self.assertFalse(result.succeeded)
+            self.assertEqual(result.failure.failure_kind, "timeout")
+            self.assertTrue(child_pid_path.is_file())
+            child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+            deadline = time.monotonic() + 3
+            child_alive = True
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(child_pid, 0)
+                except ProcessLookupError:
+                    child_alive = False
+                    break
+                proc_stat = Path(f"/proc/{child_pid}/stat")
+                if proc_stat.is_file():
+                    fields = proc_stat.read_text(encoding="utf-8").split()
+                    if len(fields) > 2 and fields[2] == "Z":
+                        child_alive = False
+                        break
+                time.sleep(0.05)
+
+        self.assertFalse(child_alive, "timed-out binary tool descendant remained alive")
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ import subprocess
 import sys
 import zipfile
 
-from compat import git_cmd, run_cmd, subprocess_platform_kwargs
+from compat import git_cmd, run_cmd
 from binary_result_truth import evaluate_formal_result_truth
 
 
@@ -152,17 +152,13 @@ def _semantic_state_sha(path: Path) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _run(command, cwd):
-    return subprocess.run(
+def _run(command, cwd, *, timeout=60):
+    stdout, stderr, returncode = run_cmd(
         command,
         cwd=str(cwd),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=60,
-        **subprocess_platform_kwargs(),
+        timeout=timeout,
     )
+    return subprocess.CompletedProcess(command, returncode, stdout, stderr)
 
 
 def _compile_java(source: Path, output: Path, *, classpath: Path | None = None):

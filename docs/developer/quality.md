@@ -15,6 +15,12 @@
 6. `.runtime` 内部制品与 `evidence`/`deliverables` 人读产物严格分开。
 7. 性能优化不得缩小分析范围、降低身份精度或减少证据。
 
+## 运行时校验边界
+
+正常分析只允许以下三类失败阻断：输入或持久化字节不可信、事实/结论无法保证正确、正式结果将指向未通过独立 Oracle 的 generation。性能证据、观测文件、实现指纹、流程版本、重复身份比对以及成功提交后的临时文件清理，不得成为用户任务的前置条件或激活条件；这些检查应放在开发、CI 或 release profile 中。已有内容哈希或 generation/validation 绑定已经覆盖风险时，不得再增加等价校验层。
+
+新增阻断检查必须在评审中同时给出：它会阻止哪一种具体错误结论、现有检查为什么不能覆盖、误阻断对用户和长任务重跑的影响。缺少任一项时不得合入。非权威观测或可恢复清理失败只记录诊断，不得推翻已验证并提交的核心结果。
+
 ## 测试 profiles
 
 按测试类型运行：
@@ -41,13 +47,13 @@ python3 scripts/quality_gate.py --profile release
 - `step5`：在 quick 上增加 ASM/fact store/cache/source overlay、端到端 pipeline、查询、调度和用户输出契约；
 - `release`：先由 `test_suite_runner.py --suite all` 做可信度审计、全量 discovery 和唯一分类，再运行全部当前测试；随后运行能力/拓扑迁移审计、分支/变异/重复健康门、目录内全部 pinned 真实项目 manifest，以及 400 JAR/10 万 class 性能与范围守恒门。任一阶段失败即阻断。
 
-Windows 不是由 mock 平台分支代替的兼容性声明。平台 CI 的 Windows × JDK 11/17/21 cell 在 `quick` 后必须额外运行：
+Windows 不是由 mock 平台分支代替的兼容性声明。平台 CI 显式使用 Windows Server 2022 和 2025（不依赖会漂移的 `windows-latest`），各自的 JDK 11/17/21 cell 在 `quick` 后必须额外运行：
 
 ```powershell
 python scripts/test_suite_runner.py --suite windows
 ```
 
-该原生套件当前固定 80 项（52 黑盒、25 Windows 敏感白盒/原生集成、3 性能/指标合同），覆盖 `pythonw`/无控制台 stdout、Unicode/空格路径、真实 Git/worktree、进程树清理、`.exe`/wrapper、Git longpaths、并发原子 JSON，以及通过 Win32 API 采集 CPU/峰值内存的 2 JAR/6 class 冷热性能守恒。非 Windows 环境调用、任何 skip、selector 缺失、用例数回退或结构化证据缺失都必须失败；未取得对应 Windows runner 结果时不得声明 Windows 通过。
+该原生套件当前固定 89 项（51 可移植黑盒、35 Windows 敏感白盒/原生集成、3 性能/指标合同），覆盖 `pythonw`/无控制台 stdout、Unicode/空格/接近路径预算的路径、真实 Git/worktree、进程树清理、独立 JDK 8/17、真实 CRLF `.cmd`/`.bat` Maven/Gradle wrapper、Git longpaths、并发原子 JSON，以及通过 Win32 API 采集 CPU/峰值内存的 2 JAR/6 class 冷热性能守恒。Windows cell 固定安装 Gradle 8.10.2；1 项依赖 POSIX shebang/mode bit 的公开故障注入器被显式排除，并由“公开失败 JSON/失败关闭 + Windows 原生 missing/nonzero/timeout/empty 分类”组合替代；排除原因或替代 selector 缺失会直接失败。明确的 Unix-only 测试不会被带入 Windows 投影后以 skip 伪装通过。非 Windows 环境调用、任何 skip、selector 缺失、用例数回退或结构化证据缺失都必须失败；未取得对应 Windows runner 结果时不得声明 Windows 通过。
 
 系统级准出还受 `tests/fixtures/system_test_capability_matrix.json` 和 `tests/fixtures/system_test_scenario_contracts.json` 约束。矩阵从所有登记的公开 CLI、Step0~Step6 和 binary support manifest 反向盘点能力，并区分 `covered`、`partial`、`missing`。当前基线为 89/89 covered、260 个风险场景维度和 22/22 个细粒度框架机制声明；critical 能力至少需要 nominal 加两个不同逆向维度，high 至少需要 nominal 加一个逆向维度，且每一维必须指向非空第三方真值并由该能力登记的具体黑盒证据实际读取。白盒测试存在不等于公开语义已验证，任何新增能力若没有独立黑盒证据和足够场景都会阻断 `--suite all` 的“全面质量通过”声明。局部 profile 通过只说明对应已执行范围没有回归。
 
@@ -126,6 +132,8 @@ Oracle 失败或证据不足时 generation 不得激活。
 ## 性能门
 
 性能门必须同时记录输入规模、冷/热 cache、总耗时、阶段耗时、P50/P95、CPU 秒、平均核数和可取得的峰值内存；门禁从原始样本复算分位数与平均核数。固定性能 fixture 位于 `tests/fixtures/binary_first/performance_gate.json`，其内容身份在 support manifest 中固定，当前记录来自 2026-08-13 的实际完整运行并含 CPU 原始证据。大规模 fact-store 门与两条冷启动完整流水线门都覆盖 400 JAR/100000 class：一条比较完全相同的两侧，另一条确定性替换 current 侧的一个 JAR 并校验 250 条实现变化。完整门继续覆盖 runtime reconciliation、trace、generation 和独立 Oracle，从两侧 SQLite 与已落盘 Oracle 结果读取实际类数、变化数量与种类、正式结果状态和问题数，并逐阶段记录累计峰值 RSS、单独限制完整流水线 RSS，避免配置中的理论规模掩盖事实丢失，也避免缩小样本掩盖超线性协调、全表物化、双侧对象重叠或逐 class 子进程退化。任何新结果缺少 CPU 证据或派生关系不一致时失败；历史记录若确实没有 CPU 原始数据只能显式声明，不能补造。
+
+性能证据中的精确字节快照、SHA-256、规范化绑定身份、实现身份和 provisional→recapture 链只建立**内部一致性与失败关闭**：它们用于发现陈旧证据、输入替换、类型别名、读取期间变化和不同执行阶段使用了不同字节。它们不是发布者身份认证，也不提供不可伪造性；拥有证据、源码或执行环境写权限的主体可以重新计算全部摘要，受损的 builder 与被测实现也可能共同产生一致但不可信的结果。叶节点 `lstat`、私有临时文件和原子替换能阻止预置 symlink/hardlink 写穿，但不把同权限恶意并发者纳入安全边界；这类主体仍可能在检查后替换祖先目录或持续改写工作区，因此性能捕获必须独占工作目录，并依赖 CI 文件权限/沙箱隔离并发写者。正式发布若需要抵抗这类主体，必须在本机制之外使用受保护的 CI 身份、隔离执行环境、签名制品和可验证 provenance/attestation，并由独立信任根校验。在外部证明落地前，只能声明“本地内容与实现绑定一致”，不能声明“已由可信发布者进行密码学认证”。
 
 允许：内容寻址缓存、批量事务、有界并行、索引、避免重复解析。禁止：抽样 API、跳过依赖、缩短路径而不报告、降低描述符/loader 精度、用源码替代制品。
 

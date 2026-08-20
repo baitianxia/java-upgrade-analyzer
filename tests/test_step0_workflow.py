@@ -48,6 +48,44 @@ class Step0WorkflowTest(unittest.TestCase):
 
         self.assertEqual(detected, home)
 
+    def test_output_storage_probe_is_durable_and_cleanup_failure_fails_early(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            run_step.os, "fsync", wraps=run_step.os.fsync,
+        ) as synchronize_file, mock.patch.object(
+            run_step, "fsync_directory", wraps=run_step.fsync_directory,
+        ) as synchronize_directory, mock.patch.object(
+            Path, "unlink", side_effect=PermissionError("probe unlink denied"),
+        ):
+            with self.assertRaises(run_step.StepError) as raised:
+                run_step._preflight_output_storage(Path(tmp) / "report")
+
+        self.assertIn(
+            "STEP0_OUTPUT_STORAGE_UNAVAILABLE", raised.exception.reason_codes,
+        )
+        self.assertIn("probe unlink denied", str(raised.exception))
+        synchronize_file.assert_called()
+        synchronize_directory.assert_called()
+
+    def test_output_storage_probe_cleanup_does_not_mask_primary_failure(self):
+        primary = OSError("probe write failed")
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            Path, "open", side_effect=primary,
+        ), mock.patch.object(
+            Path, "unlink", side_effect=PermissionError("probe cleanup failed"),
+        ):
+            with self.assertRaises(run_step.StepError) as raised:
+                run_step._preflight_output_storage(Path(tmp) / "report")
+
+        self.assertIn(
+            "STEP0_OUTPUT_STORAGE_UNAVAILABLE", raised.exception.reason_codes,
+        )
+        self.assertIs(raised.exception.__cause__, primary)
+        self.assertIn("probe write failed", str(raised.exception))
+        self.assertTrue(any(
+            "probe cleanup failed" in note
+            for note in getattr(raised.exception, "__notes__", ())
+        ))
+
     def test_scp_git_url_without_user_uses_explicit_git_service_account(self):
         self.assertEqual(
             run_step._git_clone_transport_url(
@@ -219,6 +257,65 @@ class Step0WorkflowTest(unittest.TestCase):
             result["step0_preflight_identity"],
         )
         self.assertEqual(set(result["artifacts"]), {"base", "current"})
+
+    def test_maven_preflight_parses_pinned_project_without_help_plugin_resolution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repository = root / "repository"
+            worktree = root / "worktree"
+            repository.mkdir()
+            worktree.mkdir()
+            context = {
+                "base_resolved_commit": "a" * 40,
+                "base_tool": "maven",
+                "base_jdk_home": str(root / "jdk"),
+            }
+            command_calls = []
+
+            def run_command(command, **_kwargs):
+                command_calls.append(list(command))
+                return "ok", "", 0
+
+            with mock.patch.object(
+                run_step, "_step1_ref_repository", return_value=repository,
+            ), mock.patch.object(
+                run_step, "_pinned_source_git_root", return_value=repository,
+            ), mock.patch.object(
+                run_step, "create_detached_worktree", return_value=worktree,
+            ), mock.patch.object(
+                run_step, "remove_detached_worktree",
+            ), mock.patch.object(
+                run_step, "mvn_cmd", return_value=["mvn"],
+            ), mock.patch.object(
+                run_step, "run_cmd", side_effect=run_command,
+            ):
+                result = run_step._preflight_pinned_build_tool(
+                    context, repository, "base",
+                )
+
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(command_calls[0], ["mvn", "-version"])
+        self.assertEqual(
+            command_calls[1],
+            ["mvn", "-q", "-N", "-DskipTests", "validate"],
+        )
+        self.assertNotIn("help:evaluate", command_calls[1])
+
+    def test_subprocess_failure_detail_ignores_java_launcher_banner(self):
+        detail = run_step._subprocess_failure_detail(
+            "Picked up JAVA_TOOL_OPTIONS: -Dfile.encoding=UTF-8\n",
+            "\n".join((
+                "[ERROR] java.nio.file.FileSystemException: resolver denied",
+                "[ERROR]",
+                "[ERROR] To see the full stack trace of the errors, re-run Maven with the -e switch.",
+                "[ERROR] Re-run Maven using the -X switch to enable full debug logging.",
+            )),
+        )
+
+        self.assertEqual(
+            detail,
+            "[ERROR] java.nio.file.FileSystemException: resolver denied",
+        )
 
     def test_step1_validates_newly_discovered_runtime_jars_immediately(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -12,6 +12,7 @@ from tests.blackbox.harness import (
     pipeline_config,
     required_tools,
 )
+from tests.blackbox.managed_process import managed_run
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -23,7 +24,7 @@ TRUTH = json.loads((
 
 
 def jdk_home(java: str) -> Path:
-    completed = subprocess.run(
+    completed = managed_run(
         [java, "-XshowSettings:properties", "-version"],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         check=False, timeout=30,
@@ -104,7 +105,7 @@ class PublicFailureContractsBlackboxTest(unittest.TestCase):
                 result_path = run_root / "result.json"
                 output_root = run_root / "output"
                 config_path.write_text(json.dumps(config), encoding="utf-8")
-                completed = subprocess.run(
+                completed = managed_run(
                     [
                         sys.executable,
                         str(ROOT / "scripts" / "binary_pipeline.py"),
@@ -122,26 +123,18 @@ class PublicFailureContractsBlackboxTest(unittest.TestCase):
                 public_failure = json.loads(completed.stderr)
                 self.assertNotIn("traceback", public_failure)
                 failure = json.loads(result_path.read_text(encoding="utf-8"))
-                self.assertEqual(
-                    public_failure,
-                    {
-                        key: value
-                        for key, value in failure.items()
-                        if key != "traceback"
-                    },
-                )
+                self.assertEqual(public_failure, failure)
                 self.assertEqual(failure["schema"], TRUTH["public_failure_schema"])
                 self.assertEqual(failure["reason_code"], expected["reason_code"])
                 self.assertTrue(failure["fail_closed"])
-                self.assertIn("Traceback", failure["traceback"])
+                self.assertNotIn("traceback", failure)
                 cause = failure["cause"]
+                self.assertEqual(failure["failed_phase"], expected["phase"])
                 if expected["phase"] == "static_preflight":
                     self.assertEqual(
                         cause["reason_code"], expected["cause_reason_code"]
                     )
-                    self.assertEqual(failure["failed_phase"], "")
                 else:
-                    self.assertEqual(failure["failed_phase"], "independent_validation")
                     self.assertEqual(cause["failure_kind"], expected["failure_kind"])
                     self.assertEqual(cause["attempt_count"], expected["attempt_count"])
                     self.assertEqual(cause["max_attempts"], TRUTH["max_attempts"])
@@ -153,6 +146,99 @@ class PublicFailureContractsBlackboxTest(unittest.TestCase):
                     (output_root / "active_binary_generation.json").exists(),
                     "a failed Oracle run activated an unvalidated generation",
                 )
+
+    def test_preflight_failure_never_borrows_stale_progress_phase(self):
+        expected = TRUTH["attempt_progress_binding"]
+        run_root = self.root / "stale-progress-contract"
+        run_root.mkdir()
+        config_path = run_root / "config.json"
+        config_path.write_text("{}", encoding="utf-8")
+        result_path = run_root / "result.json"
+        output_root = run_root / "output"
+        progress_path = (
+            output_root / "binary_observability" / "latest_in_progress.json"
+        )
+        progress_path.parent.mkdir(parents=True)
+        progress_path.write_text(json.dumps({
+            "schema": "java-upgrade-analyzer.binary-progress.v1",
+            "attempt_identity": "f" * 64,
+            "status": "running",
+            "current_phase": "validated_generation_activation",
+        }), encoding="utf-8")
+
+        completed = managed_run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "binary_pipeline.py"),
+                "--config", str(config_path),
+                "--output-root", str(output_root),
+                "--result-json", str(result_path),
+            ],
+            cwd=str(ROOT), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", check=False, timeout=30,
+        )
+
+        self.assertEqual(completed.returncode, 1)
+        self.assertEqual(completed.stdout, "")
+        failure = json.loads(completed.stderr)
+        self.assertEqual(failure["failed_phase"], expected["stale_failed_phase"])
+        self.assertEqual(failure["last_progress"], {})
+        self.assertEqual(
+            failure["progress_bound_to_attempt"],
+            expected["progress_bound_to_attempt"],
+        )
+        self.assertEqual(
+            failure["core_transaction_status"],
+            expected["core_transaction_status"],
+        )
+        self.assertEqual(
+            json.loads(result_path.read_text(encoding="utf-8")), failure
+        )
+
+    def test_result_sink_failure_preserves_the_primary_public_failure(self):
+        expected = TRUTH["result_sink_failure"]
+        run_root = self.root / "result-sink-failure-contract"
+        run_root.mkdir()
+        config_path = run_root / "config.json"
+        config_path.write_text("{}", encoding="utf-8")
+        output_root = run_root / "output"
+        invalid_parent = run_root / "result-parent-is-a-file"
+        invalid_parent.write_text("not-a-directory", encoding="utf-8")
+
+        completed = managed_run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "binary_pipeline.py"),
+                "--config", str(config_path),
+                "--output-root", str(output_root),
+                "--result-json", str(invalid_parent / "result.json"),
+            ],
+            cwd=str(ROOT), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", check=False, timeout=30,
+        )
+
+        self.assertEqual(completed.returncode, 1)
+        self.assertEqual(completed.stdout, "")
+        self.assertNotIn("Traceback", completed.stderr)
+        failure = json.loads(completed.stderr)
+        self.assertEqual(failure["reason_code"], expected["reason_code"])
+        self.assertEqual(
+            failure["core_transaction_status"],
+            expected["core_transaction_status"],
+        )
+        self.assertEqual(
+            failure["result_json_persisted"],
+            expected["result_json_persisted"],
+        )
+        self.assertEqual(
+            failure["result_json_persist_error"]["failure_type"],
+            expected["persist_failure_type"],
+        )
+        diagnostic = json.loads((
+            output_root / "binary_observability" / "latest_failure.json"
+        ).read_text(encoding="utf-8"))
+        self.assertEqual(diagnostic["reason_code"], expected["reason_code"])
+        self.assertIn("traceback", diagnostic)
 
 
 if __name__ == "__main__":

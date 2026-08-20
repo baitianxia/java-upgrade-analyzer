@@ -17,6 +17,7 @@ from tests.blackbox.harness import (
     semantic_projection,
     sha256,
 )
+from tests.blackbox.managed_process import managed_process_batch, managed_run
 from tests.blackbox.oracles.openjdk_oracle import evaluate_fixture
 from tests.blackbox.oracles.openjdk_class_oracle import final_class_transition
 
@@ -241,25 +242,49 @@ class PublicBinaryCliBlackboxTest(unittest.TestCase):
             sys.executable, str(ROOT / "scripts" / "binary_pipeline.py"),
             "--config", str(config_path), "--output-root", str(output_root),
         ]
-        processes = [
-            subprocess.Popen(
-                [*command_prefix, "--result-json", str(concurrent / f"result-{index}.json")],
-                cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding="utf-8", errors="replace",
-            )
-            for index in range(2)
-        ]
-        observations = [
-            (process, *process.communicate(timeout=180)) for process in processes
+        with managed_process_batch() as batch:
+            processes = [
+                batch.start(
+                    [
+                        *command_prefix,
+                        "--result-json",
+                        str(concurrent / f"result-{index}.json"),
+                    ],
+                    cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, encoding="utf-8", errors="replace",
+                )
+                for index in range(2)
+            ]
+            observations = [
+                (process, *batch.communicate(process, timeout=180))
+                for process in processes
+            ]
+        successes = [
+            (process, stdout, stderr)
+            for process, stdout, stderr in observations
+            if process.returncode == 0
         ]
         failures = [
-            (process.returncode, stdout[-2000:], stderr[-4000:])
+            (process, stdout, stderr)
             for process, stdout, stderr in observations
             if process.returncode != 0
         ]
-        self.assertEqual(failures, [])
+        self.assertEqual(
+            len(successes), truth["expected_concurrent_success_count"]
+        )
+        self.assertEqual(
+            len(failures), truth["expected_concurrent_failure_count"]
+        )
+        for process, stdout, stderr in failures:
+            self.assertEqual(process.returncode, 1)
+            self.assertEqual(stdout, "")
+            failure = json.loads(stderr)
+            self.assertEqual(
+                failure["reason_code"],
+                truth["expected_concurrent_failure_reason_code"],
+            )
         concurrent_results = [
-            json.loads(stdout) for _process, stdout, _stderr in observations
+            json.loads(stdout) for _process, stdout, _stderr in successes
         ]
         self.assertEqual(
             {row["validation_status"] for row in concurrent_results},
@@ -275,6 +300,22 @@ class PublicBinaryCliBlackboxTest(unittest.TestCase):
             output_root / "active_binary_generation.json"
         ).read_text(encoding="utf-8"))
         self.assertIn(active["result_generation_identity"], identities)
+
+        retry = managed_run(
+            [
+                *command_prefix,
+                "--result-json",
+                str(concurrent / "result-retry.json"),
+            ],
+            cwd=str(ROOT), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", check=False,
+            timeout=180,
+        )
+        self.assertEqual(retry.returncode, 0, retry.stderr[-4000:])
+        retry_result = json.loads(retry.stdout)
+        self.assertEqual(
+            retry_result["result_generation_identity"], next(iter(identities))
+        )
 
     def test_interrupted_generation_never_moves_the_active_pointer(self):
         truth = ATOMIC_TRUTH
@@ -313,24 +354,26 @@ class PublicBinaryCliBlackboxTest(unittest.TestCase):
             "--config", str(config_path), "--output-root", str(output_root),
             "--result-json", str(result_path),
         ]
-        process = subprocess.Popen(
-            command, cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, encoding="utf-8", errors="replace",
-        )
-        interrupted = False
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline and process.poll() is None:
-            generations = {
-                path.name
-                for path in (output_root / "binary_generations").iterdir()
-                if path.is_dir() and len(path.name) == 64
-            }
-            if generations - known_generations:
-                process.kill()
-                interrupted = True
-                break
-            time.sleep(0.005)
-        stdout, stderr = process.communicate(timeout=30)
+        with managed_process_batch() as batch:
+            process = batch.start(
+                command, cwd=str(ROOT), stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                errors="replace",
+            )
+            interrupted = False
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline and process.poll() is None:
+                generations = {
+                    path.name
+                    for path in (output_root / "binary_generations").iterdir()
+                    if path.is_dir() and len(path.name) == 64
+                }
+                if generations - known_generations:
+                    batch.terminate(process)
+                    interrupted = True
+                    break
+                time.sleep(0.005)
+            stdout, stderr = batch.communicate(process, timeout=30)
         self.assertTrue(
             interrupted,
             ("process completed before fault injection", process.returncode, stdout, stderr),
@@ -353,7 +396,7 @@ class PublicBinaryCliBlackboxTest(unittest.TestCase):
             "interruption mutated the prior immutable generation",
         )
 
-        retried = subprocess.run(
+        retried = managed_run(
             command, cwd=str(ROOT), capture_output=True, text=True,
             encoding="utf-8", errors="replace", check=False, timeout=180,
         )

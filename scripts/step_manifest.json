@@ -230,6 +230,7 @@
       "order": 6,
       "title": "分析报告",
       "script": "binary_report.py",
+      "gate": "binary_final_report",
       "interaction": null,
       "depends_on": [
         "step5"

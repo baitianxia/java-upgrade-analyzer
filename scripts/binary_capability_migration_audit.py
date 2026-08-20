@@ -7,11 +7,10 @@ import argparse
 import importlib
 import json
 from pathlib import Path
-import subprocess
 import sys
 from typing import Any, Mapping
 
-from compat import subprocess_platform_kwargs
+from compat import run_managed_subprocess
 
 
 REGISTRY_PATH = (
@@ -101,7 +100,7 @@ def _baseline_deleted_paths(
     in the same change would make the audit pass.
     """
     try:
-        completed = subprocess.run(
+        completed = run_managed_subprocess(
             [
                 "git", "diff", "--diff-filter=D", "--name-only",
                 baseline, "--", *pathspecs,
@@ -112,7 +111,6 @@ def _baseline_deleted_paths(
             encoding="utf-8",
             errors="replace",
             check=False,
-            **subprocess_platform_kwargs(new_process_group=True),
         )
     except OSError as error:
         return set(), f"git_start_failed:{type(error).__name__}"

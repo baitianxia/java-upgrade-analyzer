@@ -11,8 +11,8 @@
     {"id": "openjdk-jvm-final-superclass-verifier", "organization": "OpenJDK", "mechanism": "actual_jvm_class_definition", "verifies": ["base_child_executes", "current_child_rejected_with_incompatible_class_change_error"]}
   ],
   "oracle_implementations": [
-    {"path": "tests/blackbox/oracles/openjdk_oracle.py", "sha256": "6e72442077371b86c943f790b5982144497725200da3e89f22f66ca2bfee38ca"},
-    {"path": "tests/blackbox/oracles/openjdk_class_oracle.py", "sha256": "7ee02b406cf79aa3025f23d903b93a8f96ed56ba758f1fb5a8bdfe33a23ad991"}
+    {"path": "tests/blackbox/oracles/openjdk_oracle.py", "sha256": "6413dec752291d5bf7068a94c249e096d26490c64ddb5f7d3c278887ca9eae72"},
+    {"path": "tests/blackbox/oracles/openjdk_class_oracle.py", "sha256": "6aeb9fcd764982d53edcf2fe9b37cadd3354402c5bfe0d3e28ec52c7fdfda16e"}
   ],
   "completeness": {"argument": "OpenJDK javap inventories the only library class and proves all public member identities and bodies are unchanged while the class flags add ACC_FINAL. The only business subclass executes with the base library and the target JVM rejects its definition with the current library.", "verified_dimensions": ["api_identity", "jvm_descriptor", "closed_result_set", "entrypoint_reachability", "static_linkage"], "known_limits": []},
   "expected_result_count": 2,

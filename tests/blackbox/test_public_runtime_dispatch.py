@@ -8,6 +8,8 @@ import tempfile
 import unittest
 import zipfile
 
+from tests.blackbox.managed_process import managed_run
+
 
 ROOT = Path(__file__).resolve().parents[2]
 TRUTH = json.loads((
@@ -21,7 +23,7 @@ SOURCE_TRUTH = json.loads((
 
 
 def execute(command: list[str], *, cwd: Path | None = None, expected: int = 0):
-    completed = subprocess.run(
+    completed = managed_run(
         command,
         cwd=str(cwd) if cwd else None,
         capture_output=True,
@@ -40,7 +42,7 @@ def execute(command: list[str], *, cwd: Path | None = None, expected: int = 0):
 
 
 def jdk_home(java: str) -> Path:
-    completed = subprocess.run(
+    completed = managed_run(
         [java, "-XshowSettings:properties", "-version"],
         capture_output=True,
         text=True,

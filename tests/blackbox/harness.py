@@ -16,6 +16,8 @@ import sys
 import zipfile
 from typing import Mapping
 
+from tests.blackbox.managed_process import managed_run
+
 
 IDENTITY_FIELDS = ("owner", "member", "descriptor", "member_kind")
 RESULT_FIELDS = (
@@ -41,7 +43,7 @@ def required_tools() -> dict[str, str]:
 
 
 def _run(command: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess:
-    completed = subprocess.run(
+    completed = managed_run(
         command,
         cwd=str(cwd) if cwd else None,
         capture_output=True,
@@ -60,7 +62,7 @@ def _run(command: list[str], *, cwd: Path | None = None) -> subprocess.Completed
 
 
 def _jdk_home(java: str) -> Path:
-    completed = subprocess.run(
+    completed = managed_run(
         [java, "-XshowSettings:properties", "-version"],
         capture_output=True,
         text=True,

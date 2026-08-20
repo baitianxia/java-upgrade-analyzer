@@ -21,6 +21,7 @@ GATE_SEQUENCE = [
     "scan",
     "binary_generation",
     "binary_report",
+    "binary_final_report",
 ]
 
 STEP1_ARTIFACTS_DIRNAME = "s1_artifacts"

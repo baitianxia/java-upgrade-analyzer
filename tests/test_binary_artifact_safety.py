@@ -73,6 +73,26 @@ class BinaryArtifactSafetyTest(unittest.TestCase):
         self.assertFalse(result.safe)
         self.assertIn("ARCHIVE_NESTED_DEPTH_EXCEEDED", result.reason_codes)
 
+    def test_archive_crc_scan_stops_cooperatively_on_cancellation(self):
+        payload = archive_bytes((
+            (f"payload/{index}.bin", b"x" * (2 * 1024 * 1024))
+            for index in range(3)
+        ))
+        checks = 0
+
+        def cancel_after_first_read_chunk():
+            nonlocal checks
+            checks += 1
+            return checks >= 4
+
+        result = artifact_safety.inspect_archive_bytes(
+            payload, cancellation_check=cancel_after_first_read_chunk,
+        )
+
+        self.assertFalse(result.safe)
+        self.assertIn("ARCHIVE_INSPECTION_CANCELLED", result.reason_codes)
+        self.assertLess(result.total_uncompressed_bytes, 6 * 1024 * 1024)
+
     def test_snapshot_blocks_duplicate_class_entries_but_allows_maven_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

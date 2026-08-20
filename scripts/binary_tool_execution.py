@@ -8,7 +8,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from compat import subprocess_platform_kwargs
+from compat import run_managed_subprocess, subprocess_platform_kwargs
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,7 +87,7 @@ def execute_binary_tool(
     require_stdout: bool = False,
     blocking: bool = True,
     cwd: str | Path | None = None,
-    runner: Callable[..., Any] = subprocess.run,
+    runner: Callable[..., Any] | None = None,
 ) -> BinaryToolResult:
     """Run an explicit argv and classify every process failure without guessing."""
     argv = tuple(str(value) for value in command)
@@ -105,8 +105,9 @@ def execute_binary_tool(
     if cwd is not None:
         kwargs["cwd"] = str(Path(cwd).expanduser().resolve())
     kwargs.update(subprocess_platform_kwargs())
+    effective_runner = run_managed_subprocess if runner is None else runner
     try:
-        completed = runner(list(argv), **kwargs)
+        completed = effective_runner(list(argv), **kwargs)
     except subprocess.TimeoutExpired as error:
         failure = _failure(
             stage=stage, prefix=reason_prefix, kind="TIMEOUT", command=argv,

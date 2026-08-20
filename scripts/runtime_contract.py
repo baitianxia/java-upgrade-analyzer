@@ -12,6 +12,7 @@ import re
 import sys
 
 from compat import find_executable, gradle_cmd, mvn_cmd, run_cmd
+from javap_contract import javap_command
 
 
 MINIMUM_PYTHON = (3, 10)
@@ -193,7 +194,7 @@ def validate_runtime_contract(
         commands.update({
             "java": ["java", "-version"],
             "javac": ["javac", "-version"],
-            "javap": ["javap", "-version"],
+            "javap": javap_command("javap", "-version"),
             "jdeps": ["jdeps", "-version"],
         })
     if require_maven:

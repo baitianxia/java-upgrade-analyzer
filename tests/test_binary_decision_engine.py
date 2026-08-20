@@ -6,6 +6,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 import zipfile
 import zlib
@@ -19,7 +20,10 @@ import binary_artifact_diff  # noqa: E402
 import binary_decision_engine  # noqa: E402
 from binary_decision_engine import BinaryDecisionEngine  # noqa: E402
 from binary_fact_store import BinaryFactStore  # noqa: E402
-from binary_first_contract import observed_delta_identity  # noqa: E402
+from binary_first_contract import (  # noqa: E402
+    BinaryFirstContractError,
+    observed_delta_identity,
+)
 from binary_first_model import (  # noqa: E402
     AnalysisContext,
     AnalysisScope,
@@ -62,6 +66,54 @@ class BinaryDecisionIdentityRegressionTest(unittest.TestCase):
             coverage_status="complete",
             coverage_gaps=(),
         )
+
+    def persist_and_backup_compact_runtime_evidence(self):
+        records = (
+            (
+                "provider_binding",
+                "provider",
+                {
+                    "initiating_loader_realm_identity": "application-loader",
+                    "class_name": "demo/Api",
+                    "class_provider_status": "resolved",
+                    "provider_binding_identity": "provider-binding",
+                },
+            ),
+            (
+                "class_definition",
+                "definition",
+                {
+                    "initiating_loader_realm_identity": "application-loader",
+                    "class_name": "demo/Api",
+                    "class_definition_status": "definition_ready",
+                    "class_definition_resolution_identity": "definition",
+                    "evidence": {},
+                },
+            ),
+            (
+                "resource_selection",
+                "resource",
+                {
+                    "initiating_loader_realm_identity": "application-loader",
+                    "resource_name": "META-INF/services/demo.Api",
+                    "resource_mechanism": "service_loader",
+                    "resource_selection_identity": "resource-selection",
+                    "resource_selection_status": "resolved",
+                    "selected_resources": [],
+                },
+            ),
+        )
+        for kind, subject, payload in records:
+            self.base_store.add_reconciliation_record(
+                analysis_context_identity="analysis-context",
+                record_kind=kind,
+                status="resolved",
+                subject_identity=subject,
+                payload=payload,
+            )
+        self.base_store.connection.commit()
+        self.base_store.connection.backup(self.current_store.connection)
+        self.current_store.connection.commit()
 
     @staticmethod
     def artifact_observation(pairing, scope, old, new):
@@ -135,6 +187,126 @@ class BinaryDecisionIdentityRegressionTest(unittest.TestCase):
             {"status": "unresolved", "evidence": [True]},
             {"status": "unresolved", "evidence": [1]},
         ))
+
+    def test_identical_runtime_compact_indexes_are_built_once_and_shared(self):
+        self.persist_and_backup_compact_runtime_evidence()
+        runtime = self.runtime()
+        baseline_engine = BinaryDecisionEngine(
+            analysis_context_identity="analysis-context",
+            runtime_comparison_identity="runtime-comparison",
+            base_store=self.base_store,
+            current_store=self.current_store,
+            base_reconciliation=runtime,
+            current_reconciliation=runtime,
+            artifact_local_diffs=(),
+        )
+        self.assertIsNot(
+            baseline_engine._base_providers,
+            baseline_engine._current_providers,
+        )
+        self.assertIsNot(
+            baseline_engine._base_definitions,
+            baseline_engine._current_definitions,
+        )
+        self.assertIsNot(
+            baseline_engine._base_resources,
+            baseline_engine._current_resources,
+        )
+        baseline = baseline_engine.build()
+
+        with patch.object(
+            self.base_store,
+            "reconciliation_payloads",
+            wraps=self.base_store.reconciliation_payloads,
+        ) as base_payloads, patch.object(
+            self.current_store,
+            "reconciliation_payloads",
+            wraps=self.current_store.reconciliation_payloads,
+        ) as current_payloads:
+            engine = BinaryDecisionEngine(
+                analysis_context_identity="analysis-context",
+                runtime_comparison_identity="runtime-comparison",
+                base_store=self.base_store,
+                current_store=self.current_store,
+                base_reconciliation=runtime,
+                current_reconciliation=runtime,
+                artifact_local_diffs=(),
+                shared_runtime_evidence=True,
+            )
+            shared = engine.build()
+
+        self.assertEqual(
+            [item.args[0] for item in base_payloads.call_args_list],
+            ["provider_binding", "class_definition", "resource_selection"],
+        )
+        current_payloads.assert_not_called()
+        self.assertIs(engine._base_providers, engine._current_providers)
+        self.assertIs(engine._base_definitions, engine._current_definitions)
+        self.assertIs(engine._base_resources, engine._current_resources)
+        self.assertEqual(shared.identity, baseline.identity)
+
+    def test_shared_runtime_compact_indexes_fail_closed_without_proof(self):
+        runtime = self.runtime()
+        cases = (
+            (
+                "BINARY_DECISION_SHARED_RUNTIME_EVIDENCE_FLAG_INVALID",
+                {"shared_runtime_evidence": 1},
+            ),
+            (
+                (
+                    "BINARY_DECISION_SHARED_RUNTIME_"
+                    "RECONCILIATION_NOT_IDENTICAL"
+                ),
+                {
+                    "current_reconciliation": self.runtime(),
+                    "shared_runtime_evidence": True,
+                },
+            ),
+            (
+                "BINARY_DECISION_SHARED_RUNTIME_STORE_ALIAS",
+                {
+                    "current_store": self.base_store,
+                    "shared_runtime_evidence": True,
+                },
+            ),
+        )
+        common = {
+            "analysis_context_identity": "analysis-context",
+            "runtime_comparison_identity": "runtime-comparison",
+            "base_store": self.base_store,
+            "current_store": self.current_store,
+            "base_reconciliation": runtime,
+            "current_reconciliation": runtime,
+            "artifact_local_diffs": (),
+        }
+        for reason_code, overrides in cases:
+            with self.subTest(reason_code=reason_code):
+                arguments = dict(common)
+                arguments.update(overrides)
+                with self.assertRaises(BinaryFirstContractError) as raised:
+                    BinaryDecisionEngine(**arguments)
+                self.assertEqual(raised.exception.reason_code, reason_code)
+
+        self.base_store.add_reconciliation_record(
+            analysis_context_identity="analysis-context",
+            record_kind="provider_binding",
+            status="resolved",
+            subject_identity="provider",
+            payload={
+                "initiating_loader_realm_identity": "application-loader",
+                "class_name": "demo/Api",
+                "provider_binding_identity": "provider-binding",
+            },
+        )
+        self.base_store.connection.commit()
+        with self.assertRaises(BinaryFirstContractError) as raised:
+            BinaryDecisionEngine(
+                **(common | {"shared_runtime_evidence": True})
+            )
+        self.assertEqual(
+            raised.exception.reason_code,
+            "BINARY_DECISION_SHARED_RUNTIME_BACKUP_UNPROVEN",
+        )
 
     def test_same_member_delta_in_selected_and_shadowed_pairings_is_distinct(self):
         realm = "application-loader"

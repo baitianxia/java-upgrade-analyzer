@@ -256,6 +256,53 @@ class BinaryFirstContractTest(unittest.TestCase):
                 "native-json", {"value": {"unsupported"}}, schema_version="1"
             )
 
+    def test_canonical_identity_losslessly_encodes_unpaired_surrogates(self):
+        raw_surrogate = json.loads('"\\ud800"')
+        literal_escape = "\\ud800"
+        payload = {"value": raw_surrogate}
+
+        ordinary = contract.canonical_identity(
+            "surrogate", payload, schema_version="1"
+        )
+        self.assertEqual(
+            ordinary,
+            contract.canonical_identity_native_json(
+                "surrogate", payload, schema_version="1"
+            ),
+        )
+        self.assertEqual(
+            ordinary,
+            contract.canonical_identity_streaming(
+                "surrogate", payload, schema_version="1"
+            ),
+        )
+        self.assertNotEqual(
+            ordinary,
+            contract.canonical_identity(
+                "surrogate", {"value": literal_escape}, schema_version="1"
+            ),
+        )
+        encoded = contract.surrogate_safe_json_bytes(
+            {"value": raw_surrogate}, ensure_ascii=False
+        )
+        self.assertEqual(json.loads(encoded.decode("utf-8")), payload)
+
+    def test_jvm_text_transport_is_reversible_and_collision_free(self):
+        raw_surrogate = json.loads('"\\ud800"')
+        values = (
+            raw_surrogate,
+            "\\ud800",
+            "~jua-utf16-v1~literal",
+            "运行时😀",
+        )
+        transported = [contract.transport_jvm_text(value) for value in values]
+
+        self.assertEqual(len(set(transported)), len(values))
+        self.assertEqual(
+            [contract.restore_jvm_text(value) for value in transported],
+            list(values),
+        )
+
     def test_native_type_fast_paths_preserve_the_frozen_identity(self):
         class DictSubclass(dict):
             pass

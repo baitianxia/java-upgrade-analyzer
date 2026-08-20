@@ -6,6 +6,7 @@ import tempfile
 import unittest
 
 from tests.blackbox.oracles.reference_query_oracle import expected_chains
+from tests.blackbox.managed_process import managed_run
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -153,7 +154,7 @@ class PublicQueryCliBlackboxTest(unittest.TestCase):
                 self.assertEqual(
                     oracle_chains, case["expected"]["chains"], case["id"]
                 )
-                completed = subprocess.run(
+                completed = managed_run(
                     [
                         sys.executable,
                         str(ROOT / "scripts" / "s5_query_call_chain.py"),

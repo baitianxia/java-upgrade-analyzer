@@ -24,8 +24,8 @@
     {
       "id": "scheduled-release-evidence-replay",
       "organization": "GitHub Actions and authored engineering SLO",
-      "mechanism": "scheduled release command reruns the full scale while a separate verifier replays recorded measurements against fixed thresholds and semantic invariants",
-      "verifies": ["400_jar_100000_class_execution", "recorded_metric_derivations", "thresholds", "semantic_conservation"]
+      "mechanism": "scheduled cross-platform release CI replays source-bound reference measurements; the explicit live command reruns the full scale only on the exactly matching reference environment",
+      "verifies": ["current_source_implementation_binding", "400_jar_100000_class_reference_execution", "recorded_metric_derivations", "thresholds", "semantic_conservation"]
     }
   ],
   "smoke": {
@@ -52,7 +52,7 @@
     "class_count": 100000,
     "changed_jar_count": 1,
     "changed_class_count": 250,
-    "recorded_gate_sha256": "1d6488edb441bb925ec8a32491eb10881a10b973a8abee781392fd1c1fd22522",
+    "recorded_gate_sha256": "7ec91b5950219003f90bba9959a4986192d5e1172060fb6b1b94e1f51dd042a0",
     "scheduled_release_workflow": ".github/workflows/release-regression.yml"
   }
 }

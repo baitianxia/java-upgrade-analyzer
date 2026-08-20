@@ -10,7 +10,9 @@
       "output_schema": "binary-class-fact-v1",
       "asm_version": "9.9.1",
       "asm_jar_sha256": "6f3828a215c920059a5efa2fb55c233d6c54ec5cadca99ce1b1bdd10077c7ddd",
-      "visitor_policy_version": "asm-lossless-facts-v2",
+      "visitor_policy_version": "asm-lossless-facts-v3",
+      "method_type_constant_policy": "CONSTANT_MethodType is distinct from a class literal; referenced object and object-array element owners are expanded independently from its method descriptor while primitive-only descriptors produce no type edge",
+      "loadable_descriptor_resolution_policy": "invokedynamic call-site descriptors and ConstantDynamic nominal field descriptors expand into distinguishable resolution facts; every top-level or recursively nested MethodHandle target and ordinary field/method/interface-method reference carries a canonical compact loading_constraint_type_owners declaration on its original edge",
       "supported_classfile_major_min": 45,
       "supported_classfile_major_max": 70,
       "unsupported_classfile_behavior": "scoped_parse_failure_no_fallback"
@@ -69,7 +71,22 @@
       "unknown_behavior": "comparison_scope_incomplete"
     },
     "resource_policy": {
-      "policy_version": "binary-resource-classification-v1",
+      "policy_version": "binary-resource-classification-v2",
+      "multi_release_selection": {
+        "candidate_version_floor": 8,
+        "overlay_runtime_feature_floor": 9,
+        "version_8_policy": "openjdk_runtime_selected_but_jar_spec_nonstandard_diagnostic",
+        "canonical_version_path_required": true,
+        "meta_inf_overlay_allowed": false,
+        "physical_entries_retained": true,
+        "semantic_consumers_use_runtime_effective_logical_resources": true,
+        "jarfile_system_property_policy": {
+          "policy_identity": "openjdk-jarfile-default-properties-v1",
+          "jdk.util.jar.enableMultiRelease": "default_or_true",
+          "jdk.util.jar.version": "unset_uses_target_runtime_feature",
+          "non_default_semantics": "materialization_fail_closed"
+        }
+      },
       "runtime_topology": [
         "META-INF/services/*",
         "META-INF/spring.factories",
@@ -101,7 +118,7 @@
     },
     "method_implementation": {
       "parser": "version-locked ASM framed helper",
-      "normalization": "asm-lossless-facts-v2",
+      "normalization": "asm-lossless-facts-v3",
       "supported": [
         "same-owner same-name same-descriptor executable method comparison",
         "private methods",
@@ -120,7 +137,7 @@
   "runtime_loader_support_manifest": {
     "status": "implemented_supported_scope",
     "authoritative_runtime_effective_decisions_allowed": true,
-    "policy_version": "binary-runtime-capability-v1",
+    "policy_version": "binary-runtime-capability-v2",
     "supported": {
       "container_loader_policy_versions": [
         "flat-parent-first-v1"
@@ -128,6 +145,9 @@
       "loader_realms": "finite explicitly declared topology with platform parent and unnamed application realms",
       "delegation_for_binary_authority": [
         "parent_first"
+      ],
+      "module_modes": [
+        "unnamed"
       ],
       "runtime_path_kinds": [
         "business_classes",
@@ -139,10 +159,14 @@
         "ordered_all"
       ],
       "dispatch": "closed-world exact/proven/possible separation",
+      "loading_constraints": "canonical compact loading_constraint_type_owners declarations on original ordinary-member and MethodHandle edges are compared using the caller and actual declaration defining-loader selections; unequal prospective providers remain a deferred conflict unless a same-JVM topology probe proves both initiating-load events and distinct Class identities",
       "security_policy_identities": [
         "standard-unsealed-unsigned-v1"
       ],
-      "transformer_profile_identities": []
+      "transformer_profile_identities": [],
+      "signed_artifacts_supported": false,
+      "sealed_packages_supported": false,
+      "closed_world_dispatch": true
     },
     "required_coverage": [
       "runtime_class_closure_coverage_status=complete",
@@ -224,15 +248,21 @@
     "unsupported_behavior": "possible path or scoped coverage gap; never a closed negative conclusion"
   },
   "oracle_support_manifest": {
-    "status": "implemented_independent_validation_v2",
+    "status": "implemented_independent_validation_v3",
+    "final_artifact_edge_oracle_procedure_version": "java-upgrade-analyzer.final-artifact-javap.v16",
     "production_binary_authority_switch_allowed": true,
     "production_identity_influence": "none_validation_attachment_only",
     "independent_layers": [
       "archive and multi-release inventory",
+      "independent classfile access-flag and structural module-descriptor classification that retains malformed ACC_MODULE inputs for fail-closed scanning",
       "explicit cross-version lineage pairing",
-      "javap direct method/field instruction and bytecode-offset truth",
+      "UTF-8 English javap direct method/field instruction and bytecode-offset truth with caller owner/name/descriptor bound independently from strict modified-UTF8 raw classfile member_info",
       "independent javap structural type and class-initialization truth",
-      "invokedynamic implementation handles and bootstrap linkage inventory",
+      "direct and recursive-bootstrap CONSTANT_MethodType/Class provider truth with raw constant-pool cross-checks, including CP-tag binding of every rendered BootstrapMethods argument",
+      "invokedynamic call-site, ConstantDynamic nominal-type, and top-level/recursive MethodHandle descriptor provider truth",
+      "ordinary field/method/interface-method descriptor loading-constraint truth, preserving Methodref-vs-InterfaceMethodref identity independently of opcode and matching canonical compact original-edge declarations, including object-array element providers",
+      "invokedynamic implementation handles and bootstrap linkage inventory including REF kind/tag and Methodref-vs-InterfaceMethodref identity",
+      "LDC MethodHandle and ConstantDynamic bootstrap/argument-handle linkage inventory including REF kind/tag and Methodref-vs-InterfaceMethodref identity",
       "actual target-JVM provider and non-initializing definition observations",
       "bound JDK 8 bootstrap/extension provider recognition with machine-global extension isolation",
       "separate provider-resource existence and class-definition readiness checks",
@@ -249,7 +279,7 @@
       "complete explicitly ordered runtime closure",
       "full target JDK",
       "direct method/field/type/class-init facts",
-      "invokedynamic implementation handles; bootstrap execution remains possible rather than exact",
+      "invokedynamic implementation handles with exact reference kind and interface-reference identity; bootstrap execution remains possible rather than exact",
       "Java javac compile-time constant inline binding only with exact source owner+field and base/current bytecode value transition",
       "typed timeout, missing executable, permission, nonzero exit and empty-output failure boundaries"
     ],
@@ -264,7 +294,8 @@
   "performance_gate": {
     "status": "passed",
     "path": "tests/fixtures/binary_first/performance_gate.json",
-    "sha256": "1d6488edb441bb925ec8a32491eb10881a10b973a8abee781392fd1c1fd22522",
+    "sha256": "7ab8336d557770d8b5bc30fc058a55753f0f5d54e8a3d33211eddd5f15298899",
+    "source_implementation_identity": "8dffe0ab8263bd818e4e38e0567f6216281add882b9b6fc039e216b21657ddf6",
     "dataset": "400 JAR / 100000 class store + identical and one-JAR-changed full 400 JAR / 100000 class pipelines",
     "warm_parser_invocations": 0,
     "blocks_binary_authority_switch": false

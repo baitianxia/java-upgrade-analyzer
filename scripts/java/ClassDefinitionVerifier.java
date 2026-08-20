@@ -93,6 +93,6 @@ public final class ClassDefinitionVerifier {
             else if(value instanceof Iterable<?>){Iterable<?> items=(Iterable<?>)value;out.append('[');boolean first=true;for(Object item:items){if(!first)out.append(',');first=false;append(out,item);}out.append(']');}
             else quote(out,String.valueOf(value));
         }
-        static void quote(StringBuilder out,String value){out.append('"');for(int i=0;i<value.length();i++){char c=value.charAt(i);switch(c){case '"':out.append("\\\"");break;case '\\':out.append("\\\\");break;case '\n':out.append("\\n");break;case '\r':out.append("\\r");break;case '\t':out.append("\\t");break;default:if(c<32)out.append(String.format(Locale.ROOT,"\\u%04x",(int)c));else out.append(c);}}out.append('"');}
+        static void quote(StringBuilder out,String value){out.append('"');for(int i=0;i<value.length();i++){char c=value.charAt(i);switch(c){case '"':out.append("\\\"");break;case '\\':out.append("\\\\");break;case '\n':out.append("\\n");break;case '\r':out.append("\\r");break;case '\t':out.append("\\t");break;default:if(c<32||Character.isSurrogate(c))out.append(String.format(Locale.ROOT,"\\u%04x",(int)c));else out.append(c);}}out.append('"');}
     }
 }

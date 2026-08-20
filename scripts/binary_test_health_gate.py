@@ -18,7 +18,7 @@ from binary_capability_migration_audit import (
     REGISTRY_PATH,
     audit_capability_migration,
 )
-from compat import subprocess_platform_kwargs
+from compat import run_managed_subprocess
 from path_runtime import short_temporary_directory
 
 
@@ -229,6 +229,17 @@ MUTATIONS = (
             "test_private_access_between_validated_nestmates_is_linkage_compatible"
         ),
     },
+    {
+        "id": "prospective_loader_mismatch_becomes_definite_violation",
+        "module": "binary_runtime_reconciler",
+        "path": SCRIPTS / "binary_runtime_reconciler.py",
+        "old": '"deferred_conflict" if both_resolved else "unresolved"',
+        "new": '"violated" if both_resolved else "unresolved"',
+        "test": (
+            "tests.test_binary_loading_constraints.BinaryLoadingConstraintTest."
+            "test_reconciler_keeps_provider_conflicts_deferred_without_load_evidence"
+        ),
+    },
 )
 
 
@@ -295,6 +306,31 @@ def branch_probe() -> dict:
     }
 
 
+def _run_gate_command(command, *, cwd, timeout_seconds):
+    """Run one gate worker through the shared managed process-tree boundary."""
+    try:
+        completed = run_managed_subprocess(
+            command,
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=float(timeout_seconds),
+        )
+        return completed, False
+    except subprocess.TimeoutExpired as error:
+        def decoded(value):
+            if isinstance(value, bytes):
+                return value.decode("utf-8", errors="replace")
+            return str(value or "")
+
+        return subprocess.CompletedProcess(
+            command, -1, decoded(error.stdout), decoded(error.stderr)
+        ), True
+
+
 def mutation_probe(mutations=MUTATIONS) -> dict:
     rows = []
     with short_temporary_directory(prefix="binary-mutations") as temp_text:
@@ -312,7 +348,7 @@ def mutation_probe(mutations=MUTATIONS) -> dict:
                 source.replace(mutation["old"], mutation["new"], 1),
                 encoding="utf-8",
             )
-            completed = subprocess.run(
+            completed, timed_out = _run_gate_command(
                 [
                     sys.executable,
                     str(SCRIPTS / "binary_mutation_worker.py"),
@@ -321,17 +357,15 @@ def mutation_probe(mutations=MUTATIONS) -> dict:
                     "--test", str(mutation["test"]),
                 ],
                 cwd=ROOT,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-                timeout=30,
-                **subprocess_platform_kwargs(),
+                timeout_seconds=30,
             )
             rows.append({
                 "mutation_id": mutation["id"],
-                "status": "killed" if completed.returncode != 0 else "survived",
+                "status": (
+                    "timeout"
+                    if timed_out
+                    else ("killed" if completed.returncode != 0 else "survived")
+                ),
                 "test": mutation["test"],
             })
     return {
@@ -350,18 +384,12 @@ def repeat_health_probe(
     rows = []
     for iteration in range(1, repeats + 1):
         started = time.perf_counter()
-        try:
-            completed = subprocess.run(
-                [sys.executable, "-m", "unittest", *modules],
-                cwd=ROOT,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-                timeout=timeout_seconds,
-                **subprocess_platform_kwargs(),
-            )
+        completed, timed_out = _run_gate_command(
+            [sys.executable, "-m", "unittest", *modules],
+            cwd=ROOT,
+            timeout_seconds=timeout_seconds,
+        )
+        if not timed_out:
             output = f"{completed.stdout}\n{completed.stderr}"
             match = re.search(r"Ran (\d+) tests?", output)
             rows.append({
@@ -371,7 +399,7 @@ def repeat_health_probe(
                 "test_count": int(match.group(1)) if match else -1,
                 "elapsed_seconds": round(time.perf_counter() - started, 6),
             })
-        except subprocess.TimeoutExpired:
+        else:
             rows.append({
                 "iteration": iteration,
                 "status": "timeout",

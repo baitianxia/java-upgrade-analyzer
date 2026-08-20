@@ -33,7 +33,7 @@
     }
   ],
   "oracle_implementations": [
-    {"path": "tests/blackbox/oracles/openjdk_oracle.py", "sha256": "6e72442077371b86c943f790b5982144497725200da3e89f22f66ca2bfee38ca"}
+    {"path": "tests/blackbox/oracles/openjdk_oracle.py", "sha256": "6413dec752291d5bf7068a94c249e096d26490c64ddb5f7d3c278887ca9eae72"}
   ],
   "completeness": {
     "argument": "javap inventories every public constructor and method of the only changed library class, including exact primitive and array descriptors. The declared entrypoint set and both business classes form the complete static graph; the independently computed graph includes a three-edge cross-class path. A separately packaged JVM runner verifies every removed symbol succeeds against the base JAR and fails with NoSuchMethodError against the current JAR.",

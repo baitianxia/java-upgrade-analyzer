@@ -22,7 +22,7 @@
     {"id": "openjdk-jvm-symbol-linker", "organization": "OpenJDK", "mechanism": "actual_jvm_execution", "verifies": ["base_execution_succeeds", "current_no_such_member_error"]}
   ],
   "oracle_implementations": [
-    {"path": "tests/blackbox/oracles/openjdk_oracle.py", "sha256": "6e72442077371b86c943f790b5982144497725200da3e89f22f66ca2bfee38ca"}
+    {"path": "tests/blackbox/oracles/openjdk_oracle.py", "sha256": "6413dec752291d5bf7068a94c249e096d26490c64ddb5f7d3c278887ca9eae72"}
   ],
   "completeness": {
     "argument": "OpenJDK javap enumerates every public member of the only changed class on both sides. The symmetric difference contains exactly four removed and four added descriptors; unchanged members and normalized bodies are excluded. The three declared roots form the complete reachable graph. A separately packaged JVM runner proves each old symbolic reference succeeds on base and fails with the specified linkage error on current.",

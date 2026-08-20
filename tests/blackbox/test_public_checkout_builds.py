@@ -10,6 +10,8 @@ import tempfile
 import unittest
 import zipfile
 
+from tests.blackbox.managed_process import managed_run
+
 
 ROOT = Path(__file__).resolve().parents[2]
 TRUTH = json.loads((
@@ -22,7 +24,7 @@ def run(
     command: list[str], *, cwd: Path | None = None, timeout: int = 240,
     environment: dict[str, str] | None = None,
 ):
-    completed = subprocess.run(
+    completed = managed_run(
         command,
         cwd=str(cwd) if cwd else None,
         env=environment,
@@ -42,7 +44,7 @@ def run(
 
 
 def run_workflow(*arguments: str, environment: dict[str, str] | None = None):
-    return subprocess.run(
+    return managed_run(
         [sys.executable, str(ROOT / "scripts" / "run_step.py"), *arguments],
         cwd=str(ROOT),
         env=environment,
@@ -102,7 +104,7 @@ def git_repository(
 
 
 def full_jdk_home(java: str) -> Path:
-    completed = subprocess.run(
+    completed = managed_run(
         [java, "-XshowSettings:properties", "-version"],
         capture_output=True,
         text=True,
@@ -156,7 +158,7 @@ def find_jdk_home(java: str, major: int) -> Path | None:
             )
     java_home_tool = Path("/usr/libexec/java_home")
     if java_home_tool.is_file():
-        completed = subprocess.run(
+        completed = managed_run(
             [str(java_home_tool), "-v", "1.8" if major == 8 else str(major)],
             capture_output=True,
             text=True,

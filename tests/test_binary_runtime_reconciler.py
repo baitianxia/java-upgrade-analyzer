@@ -221,6 +221,32 @@ class BinaryRuntimeReconcilerTest(unittest.TestCase):
                 if item["class_name"] == "demo/Impl"
                 and item["member_name"] == "value"
             )
+            edges_by_identity = {
+                item["direct_edge_identity"]: item
+                for item in store.rows("direct_edges")
+            }
+            members_by_identity = {
+                item["member_identity"]: item
+                for item in store.rows("members")
+            }
+            resolved_initialization_sites = {
+                (
+                    members_by_identity[
+                        edges_by_identity[item["direct_edge_identity"]][
+                            "caller_member_identity"
+                        ]
+                    ]["class_name"],
+                    members_by_identity[
+                        edges_by_identity[item["direct_edge_identity"]][
+                            "caller_member_identity"
+                        ]
+                    ]["member_name"],
+                    item["initialized_owner"],
+                    item["trigger"]["trigger_kind"],
+                )
+                for item in result.class_initialization_resolutions
+                if item["class_initialization_status"] == "resolved"
+            }
 
         providers = {
             (item["initiating_loader_realm_identity"], item["class_name"]): item
@@ -328,14 +354,15 @@ class BinaryRuntimeReconcilerTest(unittest.TestCase):
             for target in item["initializer_target_identities"]
         }
         self.assertIn(init_member["member_identity"], init_targets)
-        self.assertEqual(
-            sum(
-                item["class_initialization_status"] == "resolved"
-                for item in result.class_initialization_resolutions
+        self.assertEqual(resolved_initialization_sites, {
+            ("demo/Caller", "create", "demo/Init", "new"),
+            ("demo/Caller", "staticCall", "demo/Init", "invokestatic"),
+            ("demo/Caller", "staticField", "demo/Init", "getstatic"),
+            (
+                "demo/OptionalEnum", "valueOf", "java/lang/Enum",
+                "invokestatic",
             ),
-            3,
-            "new/invokestatic/getstatic initialize; class literal must not",
-        )
+        })
 
     def test_parent_first_platform_provider_shadows_same_named_application_class(self):
         # The application artifact cannot define java.lang.String through javac,

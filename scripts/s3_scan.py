@@ -541,7 +541,8 @@ def _iter_jar_class_names(jar_bytes, max_classes=160):
                     break
                 if not entry.endswith('.class') or entry.startswith('META-INF/'):
                     continue
-                if entry.endswith('module-info.class') or entry.endswith('package-info.class'):
+                basename = entry.rsplit('/', 1)[-1]
+                if entry == 'module-info.class' or basename == 'package-info.class':
                     continue
                 classes.append(entry[:-6].replace('/', '.'))
     except Exception:

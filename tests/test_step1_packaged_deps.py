@@ -242,8 +242,18 @@ class Step1PackagedDepsTest(unittest.TestCase):
                 lib_entry = f"BOOT-INF/lib/dependency-{version}.jar"
                 with zipfile.ZipFile(artifact, "w") as archive:
                     archive.writestr(
+                        "META-INF/MANIFEST.MF",
+                        "Manifest-Version: 1.0\r\n"
+                        "Multi-Release: true\r\n\r\n",
+                    )
+                    archive.writestr(
                         "BOOT-INF/classes/biz/Application.class",
                         f"business-{version}".encode(),
+                    )
+                    archive.writestr(
+                        "BOOT-INF/classes/META-INF/versions/9/"
+                        "biz/Application.class",
+                        f"business-mr-{version}".encode(),
                     )
                     archive.writestr(lib_entry, nested)
                 side_meta[side] = {
@@ -268,6 +278,13 @@ class Step1PackagedDepsTest(unittest.TestCase):
                 current_entries=side_entries["current"],
             )
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            retained_business = {}
+            for item in manifest["business_artifacts"]:
+                with zipfile.ZipFile(item["retained_path"]) as archive:
+                    retained_business[item["side"]] = {
+                        "manifest": archive.read("META-INF/MANIFEST.MF"),
+                        "names": set(archive.namelist()),
+                    }
 
         self.assertEqual({item["side"] for item in items}, {"base", "current"})
         self.assertTrue(all("binary_runtime" in item["purposes"] for item in items))
@@ -279,6 +296,13 @@ class Step1PackagedDepsTest(unittest.TestCase):
             item["container_and_launcher_kind"] == "spring-boot-executable-jar"
             for item in manifest["business_artifacts"]
         ))
+        self.assertEqual(set(retained_business), {"base", "current"})
+        self.assertTrue(all(
+            row["manifest"]
+            == b"Manifest-Version: 1.0\r\nMulti-Release: true\r\n\r\n"
+            and "META-INF/versions/9/biz/Application.class" in row["names"]
+            for row in retained_business.values()
+        ))
 
     def test_thin_business_jar_retains_runtime_meta_inf_resources(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -286,7 +310,10 @@ class Step1PackagedDepsTest(unittest.TestCase):
             artifact = root / "app.jar"
             with zipfile.ZipFile(artifact, "w") as archive:
                 archive.writestr("biz/Application.class", b"class")
-                archive.writestr("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\n")
+                archive.writestr(
+                    "META-INF/MANIFEST.MF",
+                    b"Manifest-Version: 1.0\r\nMulti-Release: true\r\n\r\n",
+                )
                 archive.writestr("META-INF/services/demo.Service", b"biz.Provider\n")
                 archive.writestr(
                     "META-INF/persistence.xml",
@@ -314,10 +341,15 @@ class Step1PackagedDepsTest(unittest.TestCase):
             )
             with zipfile.ZipFile(business["retained_path"]) as retained:
                 names = set(retained.namelist())
+                retained_manifest = retained.read("META-INF/MANIFEST.MF")
 
         self.assertIn("META-INF/services/demo.Service", names)
         self.assertIn("META-INF/persistence.xml", names)
-        self.assertNotIn("META-INF/MANIFEST.MF", names)
+        self.assertIn("META-INF/MANIFEST.MF", names)
+        self.assertEqual(
+            retained_manifest,
+            b"Manifest-Version: 1.0\r\nMulti-Release: true\r\n\r\n",
+        )
         self.assertNotIn("META-INF/maven/acme/app/pom.properties", names)
 
     def test_packaging_detection_distinguishes_thin_from_corrupt_archive(self):

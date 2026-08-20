@@ -12,6 +12,7 @@ import re
 from typing import Any
 
 from binary_tool_execution import execute_binary_tool
+from javap_contract import javap_command
 from path_runtime import short_temporary_directory
 
 
@@ -178,7 +179,7 @@ def _preflight_jdk_home_uncached(jdk_home: str | Path) -> dict[str, Any]:
             reason_prefix="JDK_JAVAC_VERSION",
         ),
         "javap": _run_tool(
-            [str(tools["javap"]), "-version"],
+            javap_command(str(tools["javap"]), "-version"),
             stage="step0.jdk.javap_version",
             reason_prefix="JDK_JAVAP_VERSION",
         ),
@@ -202,7 +203,10 @@ def _preflight_jdk_home_uncached(jdk_home: str | Path) -> dict[str, Any]:
                 "JDK_JAVAC_PROBE_OUTPUT_MISSING", str(class_file)
             )
         javap_probe = _run_tool(
-            [str(tools["javap"]), "-classpath", str(temp), "-p", "-s", PROBE_CLASS],
+            javap_command(
+                str(tools["javap"]),
+                "-classpath", str(temp), "-p", "-s", PROBE_CLASS,
+            ),
             stage="step0.jdk.javap_probe",
             reason_prefix="JDK_JAVAP_PROBE",
             require_stdout=True,

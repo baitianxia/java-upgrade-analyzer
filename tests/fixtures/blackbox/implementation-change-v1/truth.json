@@ -10,7 +10,7 @@
     {"id": "openjdk-javap-normalized-code", "organization": "OpenJDK", "mechanism": "independent_bytecode_implementation_inventory", "verifies": ["complete_changed_method_body_set", "complete_direct_call_graph"]},
     {"id": "openjdk-jvm-behavior-probe", "organization": "OpenJDK", "mechanism": "actual_jvm_execution", "verifies": ["base_and_current_execute", "observable_return_value_changed"]}
   ],
-  "oracle_implementations": [{"path": "tests/blackbox/oracles/openjdk_oracle.py", "sha256": "6e72442077371b86c943f790b5982144497725200da3e89f22f66ca2bfee38ca"}],
+  "oracle_implementations": [{"path": "tests/blackbox/oracles/openjdk_oracle.py", "sha256": "6413dec752291d5bf7068a94c249e096d26490c64ddb5f7d3c278887ca9eae72"}],
   "completeness": {
     "argument": "OpenJDK javap independently compares normalized instructions for every public method of the only changed class and finds exactly two changed bodies while all public flags and descriptors remain identical. The sole declared entrypoint reaches exactly one changed method; separate JVM executions verify both authored base/current return values.",
     "verified_dimensions": ["api_identity", "jvm_descriptor", "closed_result_set", "entrypoint_reachability", "static_linkage"],

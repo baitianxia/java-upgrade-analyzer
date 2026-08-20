@@ -101,19 +101,33 @@
   ],
   "windows_test_selectors": [
     "tests.blackbox",
+    "tests.blackbox.test_public_artifact_safety.PublicArtifactSafetyBlackboxTest.test_every_archive_and_helper_budget_is_enforced_publicly",
     "tests.windows_native_contract.WindowsNativeContractTest.test_required_native_toolchain_is_available",
     "tests.windows_native_contract.WindowsNativeContractTest.test_native_process_metrics_report_cpu_and_peak_memory",
+    "tests.windows_native_contract.WindowsNativeContractTest.test_native_tool_failures_are_typed_without_shell",
+    "tests.windows_native_contract.WindowsNativeContractTest.test_cmd_and_bat_wrappers_preserve_unicode_and_metacharacters",
+    "tests.windows_native_contract.WindowsNativeContractTest.test_near_limit_unicode_path_survives_git_and_atomic_json",
     "tests.windows_native_contract.WindowsNativeContractTest.test_pythonw_parent_captures_unicode_and_metacharacter_argument",
     "tests.windows_native_contract.WindowsNativeContractTest.test_real_git_queries_keep_stdout_in_unicode_space_repository",
     "tests.windows_native_contract.WindowsNativeContractTest.test_windows_process_tree_cleanup_terminates_descendant",
     "tests.windows_native_contract.WindowsNativeContractTest.test_atomic_json_concurrency_never_exposes_partial_document",
+    "tests.test_platform_contract.PlatformContractTest.test_shared_path_policy_bounds_dynamic_components_without_collisions",
+    "tests.test_platform_contract.PlatformContractTest.test_windows_runtime_storage_uses_shared_short_root",
+    "tests.test_platform_contract.PlatformContractTest.test_windows_git_policy_is_applied_at_the_shared_command_boundary",
+    "tests.test_platform_contract.PlatformContractTest.test_windows_subprocess_policy_hides_every_console_child",
+    "tests.test_platform_contract.PlatformContractTest.test_windows_run_cmd_hides_python_and_other_non_git_children",
+    "tests.test_platform_contract.PlatformContractTest.test_windows_git_capture_uses_no_window_without_a_new_process_group",
     "tests.test_platform_contract.PlatformContractTest.test_pythonw_parent_repeatedly_captures_real_git_stdout",
     "tests.test_path_runtime_worktree_reliability.PathRuntimeWorktreeReliabilityTest.test_real_startup_recovery_removes_legacy_reserved_worktree",
     "tests.test_path_runtime_worktree_reliability.PathRuntimeWorktreeReliabilityTest.test_real_worktree_round_trip_ignores_inherited_git_dir",
+    "tests.test_path_runtime_worktree_reliability.PathRuntimeWorktreeReliabilityTest.test_windows_path_budget_is_checked_before_git_add",
     "tests.test_run_step_background",
-    "tests.test_build_tool_selection",
+    "tests.test_build_tool_selection.BuildToolSelectionTest.test_maven_prefers_executable_project_wrapper",
+    "tests.test_build_tool_selection.BuildToolSelectionTest.test_maven_without_project_scope_uses_analyzer_system_tool",
+    "tests.test_build_tool_selection.BuildToolSelectionTest.test_maven_project_commands_use_worktree_wrapper_without_newer_only_flag",
     "tests.test_jdk_preflight",
     "tests.test_process_metrics",
+    "tests.test_binary_tool_execution.BinaryToolExecutionTest.test_windows_no_window_policy_is_forwarded_to_typed_tools",
     "tests.test_step1_packaged_deps.Step1PackagedDepsTest.test_windows_step1_git_command_enables_long_paths_without_global_config",
     "tests.test_binary_performance_gate.PerformanceProcessMetricsTest.test_windows_fallback_uses_native_cpu_and_peak_memory",
     "tests.test_binary_pipeline_input_performance.BinaryPipelineInputPerformanceTest.test_windows_native_usage_populates_pipeline_phase_metrics",
@@ -121,23 +135,53 @@
   ],
   "required_windows_test_selectors": [
     "tests.blackbox",
+    "tests.blackbox.test_public_artifact_safety.PublicArtifactSafetyBlackboxTest.test_every_archive_and_helper_budget_is_enforced_publicly",
     "tests.windows_native_contract.WindowsNativeContractTest.test_required_native_toolchain_is_available",
     "tests.windows_native_contract.WindowsNativeContractTest.test_native_process_metrics_report_cpu_and_peak_memory",
+    "tests.windows_native_contract.WindowsNativeContractTest.test_native_tool_failures_are_typed_without_shell",
+    "tests.windows_native_contract.WindowsNativeContractTest.test_cmd_and_bat_wrappers_preserve_unicode_and_metacharacters",
+    "tests.windows_native_contract.WindowsNativeContractTest.test_near_limit_unicode_path_survives_git_and_atomic_json",
     "tests.windows_native_contract.WindowsNativeContractTest.test_pythonw_parent_captures_unicode_and_metacharacter_argument",
     "tests.windows_native_contract.WindowsNativeContractTest.test_real_git_queries_keep_stdout_in_unicode_space_repository",
     "tests.windows_native_contract.WindowsNativeContractTest.test_windows_process_tree_cleanup_terminates_descendant",
     "tests.windows_native_contract.WindowsNativeContractTest.test_atomic_json_concurrency_never_exposes_partial_document",
+    "tests.test_platform_contract.PlatformContractTest.test_shared_path_policy_bounds_dynamic_components_without_collisions",
+    "tests.test_platform_contract.PlatformContractTest.test_windows_runtime_storage_uses_shared_short_root",
+    "tests.test_platform_contract.PlatformContractTest.test_windows_git_policy_is_applied_at_the_shared_command_boundary",
+    "tests.test_platform_contract.PlatformContractTest.test_windows_subprocess_policy_hides_every_console_child",
+    "tests.test_platform_contract.PlatformContractTest.test_windows_run_cmd_hides_python_and_other_non_git_children",
+    "tests.test_platform_contract.PlatformContractTest.test_windows_git_capture_uses_no_window_without_a_new_process_group",
     "tests.test_platform_contract.PlatformContractTest.test_pythonw_parent_repeatedly_captures_real_git_stdout",
     "tests.test_path_runtime_worktree_reliability.PathRuntimeWorktreeReliabilityTest.test_real_startup_recovery_removes_legacy_reserved_worktree",
     "tests.test_path_runtime_worktree_reliability.PathRuntimeWorktreeReliabilityTest.test_real_worktree_round_trip_ignores_inherited_git_dir",
+    "tests.test_path_runtime_worktree_reliability.PathRuntimeWorktreeReliabilityTest.test_windows_path_budget_is_checked_before_git_add",
     "tests.test_run_step_background",
-    "tests.test_build_tool_selection",
+    "tests.test_build_tool_selection.BuildToolSelectionTest.test_maven_prefers_executable_project_wrapper",
+    "tests.test_build_tool_selection.BuildToolSelectionTest.test_maven_without_project_scope_uses_analyzer_system_tool",
+    "tests.test_build_tool_selection.BuildToolSelectionTest.test_maven_project_commands_use_worktree_wrapper_without_newer_only_flag",
     "tests.test_jdk_preflight",
     "tests.test_process_metrics",
+    "tests.test_binary_tool_execution.BinaryToolExecutionTest.test_windows_no_window_policy_is_forwarded_to_typed_tools",
     "tests.test_step1_packaged_deps.Step1PackagedDepsTest.test_windows_step1_git_command_enables_long_paths_without_global_config",
     "tests.test_binary_performance_gate.PerformanceProcessMetricsTest.test_windows_fallback_uses_native_cpu_and_peak_memory",
     "tests.test_binary_pipeline_input_performance.BinaryPipelineInputPerformanceTest.test_windows_native_usage_populates_pipeline_phase_metrics",
     "tests.test_binary_performance_gate.BinaryPerformanceGateTest.test_small_fixture_enforces_class_conservation_and_zero_warm_parse"
   ],
-  "minimum_windows_test_count": 80
+  "windows_excluded_test_selectors": [
+    "tests.blackbox.test_public_failure_contracts.PublicFailureContractsBlackboxTest.test_environment_failures_are_preflighted_and_only_transient_failures_retry"
+  ],
+  "required_windows_excluded_test_selectors": [
+    "tests.blackbox.test_public_failure_contracts.PublicFailureContractsBlackboxTest.test_environment_failures_are_preflighted_and_only_transient_failures_retry"
+  ],
+  "windows_exclusion_replacements": {
+    "tests.blackbox.test_public_failure_contracts.PublicFailureContractsBlackboxTest.test_environment_failures_are_preflighted_and_only_transient_failures_retry": {
+      "reason": "该案例用 POSIX shebang、mode-bit permission denial 和可执行脚本替换 java；这些故障注入语义不能冒充 Windows ACL/PE 执行语义。",
+      "replacement_selectors": [
+        "tests.blackbox.test_public_artifact_safety.PublicArtifactSafetyBlackboxTest.test_every_archive_and_helper_budget_is_enforced_publicly",
+        "tests.windows_native_contract.WindowsNativeContractTest.test_native_tool_failures_are_typed_without_shell",
+        "tests.windows_native_contract.WindowsNativeContractTest.test_required_native_toolchain_is_available"
+      ]
+    }
+  },
+  "minimum_windows_test_count": 104
 }

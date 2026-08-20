@@ -202,13 +202,44 @@ def write_query_index(graph, output_path, graph_stats=None, target_apis=None):
     return output
 
 
-def load_query_index(report_dir_or_file):
-    path = Path(report_dir_or_file)
-    if path.is_dir():
-        path = path / RUNTIME_DIRNAME / RUNTIME_INDEXES_DIRNAME / STEP5_QUERY_INDEX_FILE
-    data = json.loads(path.read_text(encoding="utf-8"))
+def load_query_inputs(report_dir_or_file):
+    requested = Path(report_dir_or_file)
+    report_root = requested if requested.is_dir() else None
+    path = requested
+    if report_root is not None:
+        path = report_root / RUNTIME_DIRNAME / RUNTIME_INDEXES_DIRNAME / STEP5_QUERY_INDEX_FILE
+    elif (
+        path.name == STEP5_QUERY_INDEX_FILE
+        and path.parent.name == RUNTIME_INDEXES_DIRNAME
+        and path.parent.parent.name == RUNTIME_DIRNAME
+    ):
+        report_root = path.parent.parent.parent
+
+    if report_root is not None:
+        from binary_report import load_consistent_step5_query_inputs
+
+        bundle = load_consistent_step5_query_inputs(report_root)
+        data = dict(bundle["index"])
+        alert_rows = tuple(dict(row) for row in bundle["alerts"])
+        path = Path(bundle["index_path"])
+    else:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        alerts_path = _alerts_path(path)
+        if alerts_path.is_file():
+            with open_csv_read(alerts_path) as handle:
+                alert_rows = tuple(dict(row) for row in csv.DictReader(handle))
+        else:
+            alert_rows = ()
     if data.get("schema") != SCHEMA:
         raise ValueError(f"不支持的查询索引格式：{path}")
+    if data.get("step4_publication_receipt_identity"):
+        if report_root is None:
+            raise ValueError("新格式 Step5 查询索引缺少可验证的报告根目录")
+    return data, alert_rows, path
+
+
+def load_query_index(report_dir_or_file):
+    data, _alert_rows, path = load_query_inputs(report_dir_or_file)
     return data, path
 
 
@@ -498,7 +529,9 @@ def _alerts_path(report_dir_or_file):
     return root / "evidence" / "call_chain" / "alerts.csv"
 
 
-def query_alert_chains(report_dir_or_file, method, limit=20):
+def query_alert_chains(
+    report_dir_or_file, method, limit=20, *, alert_rows=None
+):
     """Fallback to Step5 alerts.csv when the graph query index has no chain.
 
     The query index is built from the source/graph structure.  Runtime packaged
@@ -506,38 +539,40 @@ def query_alert_chains(report_dir_or_file, method, limit=20):
       business source -> dependency jar A -> dependency jar B -> changed API
     This fallback keeps the user-facing query useful after Step5 completes.
     """
-    alerts_path = _alerts_path(report_dir_or_file)
-    if not alerts_path.exists():
-        return []
+    if alert_rows is None:
+        alerts_path = _alerts_path(report_dir_or_file)
+        if not alerts_path.exists():
+            return []
+        with open_csv_read(alerts_path) as fh:
+            alert_rows = tuple(dict(row) for row in csv.DictReader(fh))
 
     method_name, signature = _split_method_and_signature(method)
     wanted_signature = normalize_signature_for_lookup(signature) if signature else ""
     chains = []
     seen = set()
-    with open_csv_read(alerts_path) as fh:
-        for row in csv.DictReader(fh):
-            if _clean(row.get("path_status")) and _clean(row.get("path_status")) != "reachable":
-                continue
-            changed_symbol = _clean(row.get("changed_symbol"))
-            row_method_name, embedded_signature = _split_method_and_signature(changed_symbol)
-            if row_method_name != method_name:
-                continue
-            row_signature = normalize_signature_for_lookup(
-                _clean(row.get("api_signature")) or embedded_signature
-            )
-            if wanted_signature and row_signature and row_signature != wanted_signature:
-                continue
-            path_text = _clean(row.get("path_text")).replace(" -> ", " → ")
-            if not path_text:
-                continue
-            if not _path_ends_with_target(path_text, method_name, wanted_signature):
-                continue
-            if path_text in seen:
-                continue
-            seen.add(path_text)
-            chains.append(path_text)
-            if len(chains) >= limit:
-                break
+    for row in alert_rows:
+        if _clean(row.get("path_status")) and _clean(row.get("path_status")) != "reachable":
+            continue
+        changed_symbol = _clean(row.get("changed_symbol"))
+        row_method_name, embedded_signature = _split_method_and_signature(changed_symbol)
+        if row_method_name != method_name:
+            continue
+        row_signature = normalize_signature_for_lookup(
+            _clean(row.get("api_signature")) or embedded_signature
+        )
+        if wanted_signature and row_signature and row_signature != wanted_signature:
+            continue
+        path_text = _clean(row.get("path_text")).replace(" -> ", " → ")
+        if not path_text:
+            continue
+        if not _path_ends_with_target(path_text, method_name, wanted_signature):
+            continue
+        if path_text in seen:
+            continue
+        seen.add(path_text)
+        chains.append(path_text)
+        if len(chains) >= limit:
+            break
     return chains
 
 
@@ -706,37 +741,41 @@ def _resolve_scope_targets(index, query, query_type):
     return matched, matched_coords, match_mode, warnings
 
 
-def _alert_scope_rows(report_dir_or_file):
-    alerts_path = _alerts_path(report_dir_or_file)
-    if not alerts_path.exists():
-        return []
+def _alert_scope_rows(report_dir_or_file, *, alert_rows=None):
+    if alert_rows is None:
+        alerts_path = _alerts_path(report_dir_or_file)
+        if not alerts_path.exists():
+            return []
+        with open_csv_read(alerts_path) as fh:
+            alert_rows = tuple(dict(row) for row in csv.DictReader(fh))
     rows = []
-    with open_csv_read(alerts_path) as fh:
-        for row in csv.DictReader(fh):
-            if _clean(row.get("path_status")) and _clean(row.get("path_status")) != "reachable":
-                continue
-            path_text = _clean(row.get("path_text")).replace(" -> ", " → ")
-            if not path_text:
-                continue
-            normalized = dict(row)
-            normalized["path_text"] = path_text
-            normalized["coord"] = _coord_without_versions(row.get("target_coord"))
-            api_name, embedded_signature = _split_method_and_signature(row.get("changed_symbol"))
-            normalized["api_name"] = api_name
-            normalized["api_signature"] = _clean(row.get("api_signature")) or embedded_signature
-            if not api_name or not _path_ends_with_target(
-                path_text,
-                api_name,
-                normalized["api_signature"],
-            ):
-                continue
-            rows.append(normalized)
+    for row in alert_rows:
+        if _clean(row.get("path_status")) and _clean(row.get("path_status")) != "reachable":
+            continue
+        path_text = _clean(row.get("path_text")).replace(" -> ", " → ")
+        if not path_text:
+            continue
+        normalized = dict(row)
+        normalized["path_text"] = path_text
+        normalized["coord"] = _coord_without_versions(row.get("target_coord"))
+        api_name, embedded_signature = _split_method_and_signature(row.get("changed_symbol"))
+        normalized["api_name"] = api_name
+        normalized["api_signature"] = _clean(row.get("api_signature")) or embedded_signature
+        if not api_name or not _path_ends_with_target(
+            path_text,
+            api_name,
+            normalized["api_signature"],
+        ):
+            continue
+        rows.append(normalized)
     return rows
 
 
-def query_alert_chains_by_scope(report_dir_or_file, query, query_type, limit=20):
+def query_alert_chains_by_scope(
+    report_dir_or_file, query, query_type, limit=20, *, alert_rows=None
+):
     """Query coord/package scope from alerts for indexes created before scope metadata."""
-    rows = _alert_scope_rows(report_dir_or_file)
+    rows = _alert_scope_rows(report_dir_or_file, alert_rows=alert_rows)
     warnings = []
     if query_type == "coord":
         matched_coords, match_mode, warnings = _resolve_coord_query(
@@ -785,7 +824,7 @@ def query_scope_call_chain_result(
     max_visits=50000,
 ):
     """Return all reachable changed-API chains for one dependency or package."""
-    index, index_path = load_query_index(report_dir_or_file)
+    index, alert_rows, index_path = load_query_inputs(report_dir_or_file)
     has_scope_metadata = "target_apis" in index
     targets, matched_coords, match_mode, warnings = _resolve_scope_targets(
         index, query, query_type,
@@ -836,6 +875,7 @@ def query_scope_call_chain_result(
         query,
         query_type,
         limit=limit,
+        alert_rows=alert_rows,
     )
     if not has_scope_metadata:
         targets = []
@@ -886,7 +926,7 @@ def query_scope_call_chain_result(
 
 def query_call_chain_result(report_dir_or_file, method, max_depth=5, limit=20, max_visits=50000, *, fuzzy=False):
     """Return query chains with trust metadata for CLI and programmatic callers."""
-    index, index_path = load_query_index(report_dir_or_file)
+    index, alert_rows, index_path = load_query_inputs(report_dir_or_file)
     exact_keys, matched_keys = _resolve_target_keys(index, method, fuzzy=fuzzy)
     exact_present = bool(exact_keys)
     warnings = []
@@ -900,7 +940,12 @@ def query_call_chain_result(report_dir_or_file, method, max_depth=5, limit=20, m
     )
     match_mode = "exact" if exact_present else "not_found"
     if not chains:
-        alert_chains = query_alert_chains(report_dir_or_file, method, limit=limit)
+        alert_chains = query_alert_chains(
+            report_dir_or_file,
+            method,
+            limit=limit,
+            alert_rows=alert_rows,
+        )
         if alert_chains:
             chains = alert_chains
             match_mode = "alerts_exact"

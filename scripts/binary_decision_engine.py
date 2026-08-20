@@ -187,7 +187,15 @@ class BinaryDecisionEngine:
         current_reconciliation: RuntimeReconciliationResult,
         artifact_local_diffs: Iterable[Mapping[str, Any]],
         projection_rules: Mapping[str, ProjectionRule] | None = None,
+        shared_runtime_evidence: bool = False,
     ):
+        self._validate_shared_runtime_evidence(
+            shared_runtime_evidence=shared_runtime_evidence,
+            base_store=base_store,
+            current_store=current_store,
+            base_reconciliation=base_reconciliation,
+            current_reconciliation=current_reconciliation,
+        )
         self.context = str(analysis_context_identity or "")
         self.runtime_comparison_identity = str(runtime_comparison_identity or "")
         self.base_store = base_store
@@ -215,28 +223,27 @@ class BinaryDecisionEngine:
             base_store, base_reconciliation, "provider_bindings",
             "provider_binding",
         )
-        current_provider_records = self._reconciliation_records(
-            current_store, current_reconciliation, "provider_bindings",
-            "provider_binding",
-        )
         self._base_providers = self._compact_records_by_key(
             base_provider_records,
             _PROVIDER_DECISION_FIELDS,
             duplicate_code="PROVIDER_BINDING_SCOPE_DUPLICATE",
             identity_field="provider_binding_identity",
         )
-        self._current_providers = self._compact_records_by_key(
-            current_provider_records,
-            _PROVIDER_DECISION_FIELDS,
-            duplicate_code="PROVIDER_BINDING_SCOPE_DUPLICATE",
-            identity_field="provider_binding_identity",
-        )
+        if shared_runtime_evidence:
+            self._current_providers = self._base_providers
+        else:
+            current_provider_records = self._reconciliation_records(
+                current_store, current_reconciliation, "provider_bindings",
+                "provider_binding",
+            )
+            self._current_providers = self._compact_records_by_key(
+                current_provider_records,
+                _PROVIDER_DECISION_FIELDS,
+                duplicate_code="PROVIDER_BINDING_SCOPE_DUPLICATE",
+                identity_field="provider_binding_identity",
+            )
         base_definition_records = self._reconciliation_records(
             base_store, base_reconciliation, "class_definitions",
-            "class_definition",
-        )
-        current_definition_records = self._reconciliation_records(
-            current_store, current_reconciliation, "class_definitions",
             "class_definition",
         )
         self._base_definitions = self._compact_records_by_key(
@@ -250,29 +257,40 @@ class BinaryDecisionEngine:
                 else frozenset({"evidence"})
             ),
         )
-        self._current_definitions = self._compact_records_by_key(
-            current_definition_records,
-            _DEFINITION_DECISION_FIELDS,
-            duplicate_code="CLASS_DEFINITION_SCOPE_DUPLICATE",
-            identity_field="class_definition_resolution_identity",
-            excluded_fields=(
-                frozenset()
-                if current_reconciliation.class_definitions
-                else frozenset({"evidence"})
-            ),
-        )
+        if shared_runtime_evidence:
+            self._current_definitions = self._base_definitions
+        else:
+            current_definition_records = self._reconciliation_records(
+                current_store, current_reconciliation, "class_definitions",
+                "class_definition",
+            )
+            self._current_definitions = self._compact_records_by_key(
+                current_definition_records,
+                _DEFINITION_DECISION_FIELDS,
+                duplicate_code="CLASS_DEFINITION_SCOPE_DUPLICATE",
+                identity_field="class_definition_resolution_identity",
+                excluded_fields=(
+                    frozenset()
+                    if current_reconciliation.class_definitions
+                    else frozenset({"evidence"})
+                ),
+            )
         self._base_resources = self._resource_records_by_key(
             self._reconciliation_records(
                 base_store, base_reconciliation, "resource_selections",
                 "resource_selection",
             )
         )
-        self._current_resources = self._resource_records_by_key(
-            self._reconciliation_records(
-                current_store, current_reconciliation, "resource_selections",
-                "resource_selection",
+        if shared_runtime_evidence:
+            self._current_resources = self._base_resources
+        else:
+            self._current_resources = self._resource_records_by_key(
+                self._reconciliation_records(
+                    current_store, current_reconciliation,
+                    "resource_selections", "resource_selection",
+                )
             )
-        )
+        self._shared_runtime_evidence = shared_runtime_evidence
         self._base_full_definitions = None
         self._current_full_definitions = None
         self._paired_semantic_member_outcome_deltas_cache = None
@@ -286,6 +304,69 @@ class BinaryDecisionEngine:
         self._current_hierarchy_parent_cache: dict[
             tuple[str, str], tuple[str, ...]
         ] = {}
+
+    @staticmethod
+    def _reconciliation_chunk_manifest(
+        store: BinaryFactStore,
+    ) -> tuple[tuple[int, bytes, int], ...]:
+        """Return the content-addressed persisted reconciliation inventory."""
+        return tuple(
+            (int(row[0]), bytes(row[1]), int(row[2]))
+            for row in store.connection.execute(
+                """
+                SELECT record_kind,chunk_identity,record_count
+                FROM reconciliation_records
+                ORDER BY record_kind,chunk_identity
+                """
+            )
+        )
+
+    @classmethod
+    def _validate_shared_runtime_evidence(
+        cls,
+        *,
+        shared_runtime_evidence: bool,
+        base_store: BinaryFactStore,
+        current_store: BinaryFactStore,
+        base_reconciliation: RuntimeReconciliationResult,
+        current_reconciliation: RuntimeReconciliationResult,
+    ) -> None:
+        """Fail closed before aliasing immutable identical-side indexes."""
+        if type(shared_runtime_evidence) is not bool:
+            raise BinaryFirstContractError(
+                "BINARY_DECISION_SHARED_RUNTIME_EVIDENCE_FLAG_INVALID",
+                repr(shared_runtime_evidence),
+            )
+        if not shared_runtime_evidence:
+            return
+        if base_reconciliation is not current_reconciliation:
+            raise BinaryFirstContractError(
+                "BINARY_DECISION_SHARED_RUNTIME_RECONCILIATION_NOT_IDENTICAL",
+                "shared runtime evidence requires one reconciliation object",
+            )
+        if (
+            base_store is current_store
+            or base_store.connection is current_store.connection
+        ):
+            raise BinaryFirstContractError(
+                "BINARY_DECISION_SHARED_RUNTIME_STORE_ALIAS",
+                "shared runtime evidence requires two independently owned stores",
+            )
+        if (
+            base_store.connection.in_transaction
+            or current_store.connection.in_transaction
+        ):
+            raise BinaryFirstContractError(
+                "BINARY_DECISION_SHARED_RUNTIME_STORE_UNCOMMITTED",
+                "shared runtime evidence requires committed stores",
+            )
+        if cls._reconciliation_chunk_manifest(
+            base_store
+        ) != cls._reconciliation_chunk_manifest(current_store):
+            raise BinaryFirstContractError(
+                "BINARY_DECISION_SHARED_RUNTIME_BACKUP_UNPROVEN",
+                "persisted reconciliation chunk inventories differ",
+            )
 
     @staticmethod
     def _reconciliation_records(

@@ -8,6 +8,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -44,7 +45,42 @@ from path_runtime import (
 )
 from csv_io import open_csv_read, open_csv_write
 from analysis_contract import build_project_scope, discover_project_modules, write_coverage_report
-from binary_report import BINARY_OUTPUT_RELATIVE_PATH
+from binary_report import (
+    BINARY_OUTPUT_RELATIVE_PATH,
+    BinaryReportError,
+    _report_publication_prepare_capability,
+    commit_report_publication,
+    complete_downstream_report_publication_after_gate,
+    ensure_report_publication_protocol,
+    finalize_irreversible_report_publication,
+    mark_report_publication_gate_passed,
+    load_consistent_step6_publication,
+    prepare_step4_publication_candidate,
+    prepare_step5_publication_candidate,
+    prepare_step6_publication_candidate,
+    publish_report_publication,
+    reconcile_current_release,
+    recover_downstream_report_publications,
+    recover_report_publication,
+    require_current_release_stage,
+    report_implementation_identity,
+    report_publication_committed_receipt,
+    report_publication_transaction_recovery_metadata,
+    report_publication_transaction_receipt,
+    report_publication_transaction_state,
+    report_uses_release_protocol,
+    rollback_report_publication,
+    verify_current_step4_release,
+)
+from binary_output import (
+    BinaryOutputError,
+    commit_pending_binary_generation,
+    compare_and_restore_active_binary_generation,
+    publish_pending_binary_generation,
+    read_active_binary_generation,
+    read_pending_binary_generation,
+    seal_active_binary_generation,
+)
 from binary_asm_helper import BinaryAsmError, resolve_asm_jar
 from jdk_preflight import JdkPreflightError, preflight_jdk_home
 from binary_runtime_materializer import (
@@ -52,6 +88,8 @@ from binary_runtime_materializer import (
     materialize_binary_pipeline_config,
 )
 from diagnostic_contract import canonical_reason_code, normalize_diagnostic_payload
+from process_lock import exclusive_file_lock
+from streaming_json import fsync_directory
 from pipeline_constants import (
     DELIVERABLES_DIRNAME,
     EVIDENCE_API_CHANGES_DIRNAME,
@@ -97,6 +135,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 SKILL_DIR = SCRIPT_DIR.parent
 DEFAULT_MANIFEST = SCRIPT_DIR / "step_manifest.json"
 CHECKPOINT_RULES_FILE = SKILL_DIR / "CHECKPOINT_RULES.md"
+_WORKFLOW_MUTATION_CONTEXT = threading.local()
 EXIT_AWAITING_USER = 4
 EXIT_INTERRUPTED = 130
 MAIN_STATE_FILE_NAME = "main_state.json"
@@ -106,11 +145,22 @@ LAST_STEP_SUMMARY_SCHEMA = "java-upgrade-analyzer.last-step-summary.v1"
 MAIN_STATE_SCHEMA = "java-upgrade-analyzer.main-state.v3"
 BACKGROUND_RUNTIME_DIRNAME = "background"
 BACKGROUND_STATUS_FILE_NAME = "status.json"
+BACKGROUND_LAUNCHER_LOCK_FILE_NAME = "launcher.lock"
+BACKGROUND_ACTIVE_LOCK_FILE_NAME = "active.lock"
+BACKGROUND_STATUS_SCHEMA = "java-upgrade-analyzer.background-run.v2"
+BACKGROUND_LEGACY_STATUS_SCHEMA = "java-upgrade-analyzer.background-run.v1"
+BACKGROUND_STARTING_GRACE_SECONDS = 30.0
+BACKGROUND_LOCK_TIMEOUT_SECONDS = 30.0
+BACKGROUND_LEGACY_RUNNING_GRACE_SECONDS = 24.0 * 60.0 * 60.0
+BACKGROUND_LEGACY_CLOCK_SKEW_SECONDS = 5.0 * 60.0
+_STEP4_DEFERRED_HANDOFF_LOCK_TIMEOUT_SECONDS = 5.0
+_STEP4_RECOVERY_WRITER_LOCK_TIMEOUT_SECONDS = 5.0
 STEP0_PREFLIGHT_FILE_NAME = "step0_preflight.json"
 STEP1_RUNTIME_PREFLIGHT_FILE_NAME = "step1_runtime_preflight.json"
 WORKTREE_RECOVERY_FILE_NAME = "git_worktree_recovery.json"
 BACKGROUND_CHILD_ENV = "JUA_BACKGROUND_CHILD"
 BACKGROUND_RUN_ID_ENV = "JUA_BACKGROUND_RUN_ID"
+BACKGROUND_CLAIM_TOKEN_ENV = "JUA_BACKGROUND_CLAIM_TOKEN"
 BACKGROUND_STATUS_PATH_ENV = "JUA_BACKGROUND_STATUS_PATH"
 TERMINAL_WORKFLOW_STATUSES = {"completed", "completed_with_limits"}
 USER_TASK_NAMES = {
@@ -144,6 +194,12 @@ SCRIPT_STEP_IDS = {
     "s3_scan.py": "step3",
     "binary_pipeline.py": "step4",
 }
+_BINARY_PIPELINE_FAILURE_SCHEMA = (
+    "java-upgrade-analyzer.binary-pipeline-failure.v1"
+)
+_BINARY_PIPELINE_STDERR_FAILURE_MAX_CHARS = 256 * 1024
+_BINARY_PROGRESS_MAX_BYTES = 4 * 1024 * 1024
+_STEP4_VALIDATION_CHECKPOINT_MAX_BYTES = 16 * 1024 * 1024
 STEP1_MAVEN_MODULE_SEP = re.compile(r"\[INFO\]\s*---.*@\s*(\S+)\s*---")
 SOURCE_INPUT_PURPOSE_VERSION = "source-input-purpose-v3"
 INTENT_PATCH_ALLOWED_SET_FIELDS = {
@@ -192,6 +248,10 @@ class StepError(RuntimeError):
             if str(code).strip()
         ))
         self.diagnostic = dict(diagnostic or {})
+
+
+class _BackgroundOwnershipError(StepError):
+    """The detached child could not prove ownership of this background run."""
 
 
 class StepInteractionRequired(StepError):
@@ -262,6 +322,14 @@ def runtime_background_dir(report_dir):
 
 def background_status_path(report_dir):
     return runtime_background_dir(report_dir) / BACKGROUND_STATUS_FILE_NAME
+
+
+def background_launcher_lock_path(report_dir):
+    return runtime_background_dir(report_dir) / BACKGROUND_LAUNCHER_LOCK_FILE_NAME
+
+
+def background_active_lock_path(report_dir):
+    return runtime_background_dir(report_dir) / BACKGROUND_ACTIVE_LOCK_FILE_NAME
 
 
 def worktree_recovery_path(report_dir):
@@ -534,12 +602,226 @@ def _pid_is_running(pid, platform_name=None):
     return True
 
 
-def _background_record_is_live(payload):
-    status = str((payload or {}).get("status") or "").strip()
-    if status not in {"starting", "running"}:
+@contextmanager
+def _acquire_background_lock(path, *, timeout_seconds, purpose):
+    """Acquire one report-owned lock without misclassifying body failures as lock failures."""
+    manager = exclusive_file_lock(path, timeout_seconds=timeout_seconds)
+    try:
+        acquired_path = manager.__enter__()
+    except TimeoutError as exc:
+        raise _BackgroundOwnershipError(
+            f"等待后台任务{purpose}超时：{path}"
+        ) from exc
+    except OSError as exc:
+        raise _BackgroundOwnershipError(
+            f"无法获取后台任务{purpose}：{path}：{exc}"
+        ) from exc
+    try:
+        yield acquired_path
+    except BaseException as body_error:
+        body_exception = sys.exc_info()
+        try:
+            suppressed = manager.__exit__(*body_exception)
+        except BaseException as release_error:
+            # Releasing a lock is secondary to the exception that caused the
+            # protected transaction to abort.  process_lock still closes the
+            # descriptor if explicit unlock fails; preserve the body failure
+            # and attach the release detail where the runtime supports notes.
+            add_note = getattr(body_error, "add_note", None)
+            if callable(add_note):
+                try:
+                    add_note(
+                        "后台任务锁释放时还发生了 "
+                        f"{type(release_error).__name__}: {release_error}"
+                    )
+                except BaseException:
+                    pass
+            suppressed = False
+        if suppressed:
+            return
+        raise
+    else:
+        manager.__exit__(None, None, None)
+
+
+def _background_lock_path_from_status(status_path, file_name):
+    return Path(status_path).expanduser().resolve().parent / file_name
+
+
+def _background_active_lease_is_held(status_path):
+    """Use the child-held OS lease as the authoritative running identity."""
+    lock_path = _background_lock_path_from_status(
+        status_path, BACKGROUND_ACTIVE_LOCK_FILE_NAME
+    )
+    manager = exclusive_file_lock(lock_path, timeout_seconds=0.0)
+    try:
+        manager.__enter__()
+    except TimeoutError:
+        return True
+    except OSError as exc:
+        raise _BackgroundOwnershipError(
+            f"无法检查后台任务活动租约：{lock_path}：{exc}"
+        ) from exc
+    manager.__exit__(None, None, None)
+    return False
+
+
+def _background_starting_claim_is_fresh(payload, now_epoch=None):
+    try:
+        deadline = float((payload or {}).get("starting_deadline_epoch"))
+    except (TypeError, ValueError):
         return False
-    tracked_pid = (payload or {}).get("pid") or (payload or {}).get("launcher_pid")
-    return _pid_is_running(tracked_pid)
+    current = time.time() if now_epoch is None else float(now_epoch)
+    return current < deadline
+
+
+def _background_legacy_started_epoch(payload, status_path=None):
+    started_at = str((payload or {}).get("started_at") or "").strip()
+    if started_at:
+        try:
+            normalized = started_at[:-1] + "+00:00" if started_at.endswith("Z") else started_at
+            parsed = datetime.fromisoformat(normalized)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+        except (OverflowError, TypeError, ValueError):
+            pass
+    if status_path is None:
+        return None
+    try:
+        return Path(status_path).stat().st_mtime
+    except OSError:
+        return None
+
+
+def _background_legacy_running_is_fresh(payload, status_path=None, now_epoch=None):
+    if (
+        str((payload or {}).get("schema") or "").strip()
+        != BACKGROUND_LEGACY_STATUS_SCHEMA
+        or str((payload or {}).get("status") or "").strip() != "running"
+    ):
+        return False
+    started_epoch = _background_legacy_started_epoch(
+        payload, status_path=status_path
+    )
+    if started_epoch is None:
+        return False
+    current = time.time() if now_epoch is None else float(now_epoch)
+    age_seconds = current - started_epoch
+    return (
+        age_seconds >= -BACKGROUND_LEGACY_CLOCK_SKEW_SECONDS
+        and age_seconds <= BACKGROUND_LEGACY_RUNNING_GRACE_SECONDS
+    )
+
+
+def _background_record_is_live(payload, status_path=None, now_epoch=None):
+    """Determine ownership without trusting a reusable PID.
+
+    A held active lease is authoritative for every transient status.  Before a
+    child has acquired that lease, a bounded ``starting`` claim protects the
+    parent-crash window.  A bare v2 ``running`` PID is deliberately
+    insufficient; v1 records receive only a bounded migration grace period.
+    """
+    status = str((payload or {}).get("status") or "").strip()
+    if status_path is not None and _background_active_lease_is_held(status_path):
+        return True
+    if status == "starting":
+        return _background_starting_claim_is_fresh(
+            payload, now_epoch=now_epoch
+        )
+    if _background_legacy_running_is_fresh(
+        payload, status_path=status_path, now_epoch=now_epoch
+    ):
+        tracked_pid = (payload or {}).get("pid") or (payload or {}).get(
+            "launcher_pid"
+        )
+        return _pid_is_running(tracked_pid)
+    return False
+
+
+def _background_child_configuration():
+    child_marker = str(os.environ.get(BACKGROUND_CHILD_ENV) or "").strip()
+    status_value = str(os.environ.get(BACKGROUND_STATUS_PATH_ENV) or "").strip()
+    run_id = str(os.environ.get(BACKGROUND_RUN_ID_ENV) or "").strip()
+    claim_token = str(os.environ.get(BACKGROUND_CLAIM_TOKEN_ENV) or "").strip()
+    if not any((child_marker, status_value, run_id, claim_token)):
+        return None
+    if child_marker != "1" or not status_value or not run_id or not claim_token:
+        raise _BackgroundOwnershipError(
+            "后台任务身份信息不完整，已拒绝执行以避免与其他任务并发。"
+        )
+    return Path(status_value).expanduser().resolve(), run_id, claim_token
+
+
+@contextmanager
+def _background_child_lease():
+    """Claim and hold the fixed active lease for the complete child CLI run."""
+    configuration = _background_child_configuration()
+    if configuration is None:
+        yield None
+        return
+
+    status_path, run_id, claim_token = configuration
+    active_lock_path = _background_lock_path_from_status(
+        status_path, BACKGROUND_ACTIVE_LOCK_FILE_NAME
+    )
+    launcher_lock_path = _background_lock_path_from_status(
+        status_path, BACKGROUND_LAUNCHER_LOCK_FILE_NAME
+    )
+    with _acquire_background_lock(
+        active_lock_path,
+        timeout_seconds=BACKGROUND_LOCK_TIMEOUT_SECONDS,
+        purpose="活动租约",
+    ):
+        with _acquire_background_lock(
+            launcher_lock_path,
+            timeout_seconds=BACKGROUND_LOCK_TIMEOUT_SECONDS,
+            purpose="启动事务锁",
+        ):
+            payload = _read_background_json(status_path)
+            recorded_pid = payload.get("pid")
+            try:
+                recorded_pid_matches = recorded_pid is None or int(recorded_pid) == os.getpid()
+            except (TypeError, ValueError):
+                recorded_pid_matches = False
+            if (
+                payload.get("run_id") != run_id
+                or payload.get("claim_token") != claim_token
+                or str(payload.get("status") or "") != "starting"
+                or not recorded_pid_matches
+            ):
+                raise _BackgroundOwnershipError(
+                    "后台任务启动声明已被替换，当前子进程无权继续执行。"
+                )
+            payload.update(
+                {
+                    "schema": BACKGROUND_STATUS_SCHEMA,
+                    "status": "running",
+                    "pid": os.getpid(),
+                    "claimed_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            _write_background_json(status_path, payload)
+        # Ownership markers are bootstrap credentials, not ambient workflow
+        # configuration.  Remove them while main() runs so subprocesses cannot
+        # accidentally present themselves as another copy of this child.
+        identity_keys = (
+            BACKGROUND_CHILD_ENV,
+            BACKGROUND_STATUS_PATH_ENV,
+            BACKGROUND_RUN_ID_ENV,
+            BACKGROUND_CLAIM_TOKEN_ENV,
+        )
+        saved_identity_environment = {
+            key: os.environ.pop(key, None) for key in identity_keys
+        }
+        try:
+            yield configuration
+        finally:
+            for key, value in saved_identity_environment.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
 
 def _background_platform_kwargs(platform_name=None):
@@ -570,134 +852,147 @@ def start_background_run(args, argv):
     background_dir = runtime_background_dir(report_dir)
     background_dir.mkdir(parents=True, exist_ok=True)
     status_path = background_status_path(report_dir)
-    existing = _read_background_json(status_path)
-    if _background_record_is_live(existing):
-        raise StepError(
-            "已有后台分析任务正在运行："
-            f"pid={existing.get('pid') or existing.get('launcher_pid')}；"
-            f"状态文件：{status_path}"
-        )
-
-    run_id = (
-        datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        + "-"
-        + uuid.uuid4().hex[:12]
-    )
+    launcher_lock_path = background_launcher_lock_path(report_dir)
     log_path = background_dir / "run.log"
     environment_path = background_dir / "environment.json"
-    path_from_environment = str(os.environ.get("PATH") or "")
-    path_value = path_from_environment or os.defpath
-    environment_payload = {
-        "schema": "java-upgrade-analyzer.background-environment.v1",
-        "run_id": run_id,
-        "captured_at": datetime.now(timezone.utc).isoformat(),
-        "python_executable": str(Path(sys.executable).resolve()),
-        "path": path_value,
-        "path_source": "current_process" if path_from_environment else "os.defpath_fallback",
-    }
-    _write_background_json(environment_path, environment_payload)
+    with _acquire_background_lock(
+        launcher_lock_path,
+        timeout_seconds=BACKGROUND_LOCK_TIMEOUT_SECONDS,
+        purpose="启动事务锁",
+    ):
+        existing = _read_background_json(status_path)
+        if _background_record_is_live(existing, status_path=status_path):
+            raise StepError(
+                "已有后台分析任务正在运行："
+                f"pid={existing.get('pid') or existing.get('launcher_pid')}；"
+                f"状态文件：{status_path}"
+            )
 
-    status_payload = {
-        "schema": "java-upgrade-analyzer.background-run.v1",
-        "run_id": run_id,
-        "status": "starting",
-        "step": str(args.step or ""),
-        "project_dir": str(project_dir),
-        "report_dir": str(report_dir),
-        "launcher_pid": os.getpid(),
-        "pid": None,
-        "exit_code": None,
-        "started_at": datetime.now(timezone.utc).isoformat(),
-        "finished_at": None,
-        "environment_path": str(environment_path),
-        "log_path": str(log_path),
-    }
-    _write_background_json(status_path, status_payload)
-
-    child_argv = _without_background_flag(argv)
-    command = [sys.executable, str(Path(__file__).resolve()), *child_argv]
-    child_env = os.environ.copy()
-    child_env.update(
-        {
-            "PATH": path_value,
-            BACKGROUND_CHILD_ENV: "1",
-            BACKGROUND_RUN_ID_ENV: run_id,
-            BACKGROUND_STATUS_PATH_ENV: str(status_path),
+        run_id = (
+            datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            + "-"
+            + uuid.uuid4().hex[:12]
+        )
+        claim_token = uuid.uuid4().hex
+        path_from_environment = str(os.environ.get("PATH") or "")
+        path_value = path_from_environment or os.defpath
+        environment_payload = {
+            "schema": "java-upgrade-analyzer.background-environment.v1",
+            "run_id": run_id,
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+            "python_executable": str(Path(sys.executable).resolve()),
+            "path": path_value,
+            "path_source": (
+                "current_process" if path_from_environment else "os.defpath_fallback"
+            ),
         }
-    )
-    try:
-        with open(log_path, "wb", buffering=0) as log_handle:
-            log_handle.write(
-                (
-                    f"[background] run_id={run_id} step={args.step} "
-                    f"started_at={status_payload['started_at']}\n"
-                ).encode("utf-8")
-            )
-            process = subprocess.Popen(
-                command,
-                cwd=str(Path.cwd()),
-                stdin=subprocess.DEVNULL,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                env=child_env,
-                close_fds=True,
-                **_background_platform_kwargs(),
-            )
-    except (OSError, ValueError) as exc:
-        status_payload.update(
+        _write_background_json(environment_path, environment_payload)
+
+        status_payload = {
+            "schema": BACKGROUND_STATUS_SCHEMA,
+            "run_id": run_id,
+            "claim_token": claim_token,
+            "status": "starting",
+            "step": str(args.step or ""),
+            "project_dir": str(project_dir),
+            "report_dir": str(report_dir),
+            "launcher_pid": os.getpid(),
+            "pid": None,
+            "exit_code": None,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "starting_deadline_epoch": (
+                time.time() + BACKGROUND_STARTING_GRACE_SECONDS
+            ),
+            "finished_at": None,
+            "environment_path": str(environment_path),
+            "log_path": str(log_path),
+        }
+        _write_background_json(status_path, status_payload)
+
+        child_argv = _without_background_flag(argv)
+        command = [sys.executable, str(Path(__file__).resolve()), *child_argv]
+        child_env = os.environ.copy()
+        child_env.update(
             {
-                "status": "failed",
-                "finished_at": datetime.now(timezone.utc).isoformat(),
-                "launch_error": str(exc),
+                "PATH": path_value,
+                BACKGROUND_CHILD_ENV: "1",
+                BACKGROUND_RUN_ID_ENV: run_id,
+                BACKGROUND_CLAIM_TOKEN_ENV: claim_token,
+                BACKGROUND_STATUS_PATH_ENV: str(status_path),
             }
         )
-        _write_background_json(status_path, status_payload)
-        raise StepError(f"后台任务启动失败：{exc}；状态文件：{status_path}") from exc
+        try:
+            with open(log_path, "wb", buffering=0) as log_handle:
+                log_handle.write(
+                    (
+                        f"[background] run_id={run_id} step={args.step} "
+                        f"started_at={status_payload['started_at']}\n"
+                    ).encode("utf-8")
+                )
+                process = subprocess.Popen(
+                    command,
+                    cwd=str(Path.cwd()),
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    env=child_env,
+                    close_fds=True,
+                    **_background_platform_kwargs(),
+                )
+        except (OSError, ValueError) as exc:
+            status_payload.update(
+                {
+                    "status": "failed",
+                    "finished_at": datetime.now(timezone.utc).isoformat(),
+                    "launch_error": str(exc),
+                }
+            )
+            _write_background_json(status_path, status_payload)
+            raise StepError(
+                f"后台任务启动失败：{exc}；状态文件：{status_path}"
+            ) from exc
 
-    latest = _read_background_json(status_path)
-    if latest.get("run_id") == run_id:
-        latest["pid"] = int(process.pid)
-        if latest.get("status") == "starting":
-            latest["status"] = "running"
-        _write_background_json(status_path, latest)
-        status_payload = latest
+        # The parent deliberately leaves the record in ``starting``.  The
+        # child is the only process allowed to publish ``running`` after it
+        # owns active.lock and has CAS-validated this run/token pair.
+        status_payload["pid"] = int(process.pid)
+        _write_background_json(status_path, status_payload)
     print(f"后台分析已启动（pid={process.pid}）。", file=sys.stderr)
     print(f"状态：{status_path}", file=sys.stderr)
     print(f"日志：{log_path}", file=sys.stderr)
     return status_payload
 
 
-def finish_background_run(exit_code):
-    status_value = str(os.environ.get(BACKGROUND_STATUS_PATH_ENV) or "").strip()
-    run_id = str(os.environ.get(BACKGROUND_RUN_ID_ENV) or "").strip()
-    if not status_value or not run_id:
-        return
-    status_path = Path(status_value)
-    payload = _read_background_json(status_path)
-    if payload.get("run_id") != run_id:
-        return
-    payload.update(
-        {
-            "status": _background_exit_status(exit_code),
-            "exit_code": int(exit_code),
-            "finished_at": datetime.now(timezone.utc).isoformat(),
-        }
+def finish_background_run(exit_code, configuration=None):
+    configuration = configuration or _background_child_configuration()
+    if configuration is None:
+        return False
+    status_path, run_id, claim_token = configuration
+    launcher_lock_path = _background_lock_path_from_status(
+        status_path, BACKGROUND_LAUNCHER_LOCK_FILE_NAME
     )
-    _write_background_json(status_path, payload)
-
-
-def wait_for_background_parent():
-    """Let the launcher publish the child PID before the child can finish."""
-    status_value = str(os.environ.get(BACKGROUND_STATUS_PATH_ENV) or "").strip()
-    run_id = str(os.environ.get(BACKGROUND_RUN_ID_ENV) or "").strip()
-    if not status_value or not run_id:
-        return
-    deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline:
-        payload = _read_background_json(status_value)
-        if payload.get("run_id") != run_id or payload.get("pid"):
-            return
-        time.sleep(0.01)
+    with _acquire_background_lock(
+        launcher_lock_path,
+        timeout_seconds=BACKGROUND_LOCK_TIMEOUT_SECONDS,
+        purpose="完成状态锁",
+    ):
+        payload = _read_background_json(status_path)
+        if (
+            payload.get("run_id") != run_id
+            or payload.get("claim_token") != claim_token
+            or payload.get("pid") != os.getpid()
+            or str(payload.get("status") or "") != "running"
+        ):
+            return False
+        payload.update(
+            {
+                "status": _background_exit_status(exit_code),
+                "exit_code": int(exit_code),
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        _write_background_json(status_path, payload)
+        return True
 
 
 def _write_text_file(path, text):
@@ -1062,7 +1357,7 @@ def _landing_status_lines(state):
     return ["当前状态：尚未开始", "当前任务：准备分析对象与版本范围。"]
 
 
-def _landing_existing_artifact_rows(report_dir):
+def _landing_existing_artifact_rows(report_dir, state=None):
     candidates = [
         ("依赖与 API 升级影响报告", "deliverables/report.md"),
         ("完整依赖分析明细", "deliverables/all-affected-dependencies.md"),
@@ -1079,9 +1374,63 @@ def _landing_existing_artifact_rows(report_dir):
         ("构建来源与制品身份", "evidence/dependencies/build_provenance.json"),
     ]
     root = Path(report_dir)
+    protocol_managed = report_uses_release_protocol(root)
+    release = None
+    if protocol_managed:
+        try:
+            release = reconcile_current_release(
+                root,
+                workflow_lock_held=_workflow_mutation_lock_is_held(),
+            )
+        except Exception:
+            # A fixed path is not authority.  If its receipt/content cannot be
+            # reconciled, omit it from the user entry page rather than expose
+            # stale bytes as a current result.
+            release = {}
+
+    def release_allows(relative_path):
+        if relative_path.startswith("deliverables/"):
+            stage = "step6"
+        elif relative_path.startswith("evidence/call_chain/"):
+            stage = "step5"
+        elif relative_path.startswith("evidence/api_changes/"):
+            stage = "step4"
+        else:
+            return True
+        if (
+            protocol_managed
+            and (release.get(stage) or {}).get("status") != "current"
+        ):
+            return False
+        state_view = dict((state or {}).get("state") or {})
+        completed_step = str(
+            state_view.get("completed_step") or ""
+        ).strip()
+        if not state_view:
+            return True
+        if completed_step not in STEP_SEQUENCE:
+            return False
+        return step_index(completed_step) >= step_index(stage)
+
     findings_artifacts = None
+    protocol_deliverable_names = None
     findings_path = s6_findings_path(report_dir)
-    if findings_path.is_file():
+    if protocol_managed and release_allows("deliverables/report.md"):
+        try:
+            step6_bundle = load_consistent_step6_publication(root)
+            findings_artifacts = dict(
+                ((step6_bundle.get("findings") or {}).get("artifacts") or {})
+            )
+            protocol_deliverable_names = {
+                f"deliverables/{name}"
+                for name in step6_bundle.get("deliverable_names") or ()
+            }
+        except (OSError, UnicodeError, json.JSONDecodeError, BinaryReportError):
+            findings_artifacts = {}
+            protocol_deliverable_names = set()
+    elif findings_path.is_file() and release_allows(
+        "deliverables/report.md"
+    ):
         try:
             findings_artifacts = dict(
                 (read_json(findings_path).get("artifacts") or {})
@@ -1100,6 +1449,12 @@ def _landing_existing_artifact_rows(report_dir):
         (question, relative_path)
         for question, relative_path in candidates
         if (root / relative_path).is_file()
+        and release_allows(relative_path)
+        and (
+            protocol_deliverable_names is None
+            or not relative_path.startswith("deliverables/")
+            or relative_path in protocol_deliverable_names
+        )
         and not (
             findings_artifacts is not None
             and relative_path in interaction_only_artifacts
@@ -1209,12 +1564,24 @@ def _landing_pending_interaction_lines(report_dir, state):
     return lines
 
 
-def write_report_landing_docs(report_dir, state=None):
+def write_report_landing_docs(
+    report_dir,
+    state=None,
+    *,
+    _workflow_lock_held=False,
+):
+    if not (_workflow_lock_held or _workflow_mutation_lock_is_held()):
+        with _workflow_mutation_lock(report_dir):
+            return write_report_landing_docs(
+                report_dir,
+                state,
+                _workflow_lock_held=True,
+            )
     report_dir = Path(report_dir)
     for path in (report_dir, deliverables_dir(report_dir), evidence_dir(report_dir), runtime_dir(report_dir)):
         path.mkdir(parents=True, exist_ok=True)
 
-    artifact_rows = _landing_existing_artifact_rows(report_dir)
+    artifact_rows = _landing_existing_artifact_rows(report_dir, state=state)
     lines = [
         "# 升级分析",
         "",
@@ -2360,17 +2727,100 @@ def print_output(stdout, stderr):
 
 def _subprocess_failure_detail(stderr, stdout, *, limit=800):
     """Return one bounded, credential-redacted diagnostic line for persistence."""
-    lines = [
-        line.strip()
-        for line in str(stderr or stdout or "").splitlines()
-        if line.strip()
-    ]
+    def meaningful_lines(value):
+        lines = []
+        for raw_line in str(value or "").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            # The JVM launcher writes this informational banner to stderr.
+            # Maven commonly writes its actual failure to stdout, so treating
+            # the banner as the error hides the actionable diagnostic.
+            if line.startswith("Picked up JAVA_TOOL_OPTIONS:"):
+                continue
+            if line in {"[ERROR]", "[FATAL]"}:
+                continue
+            if line.startswith("[ERROR] To see the full stack trace"):
+                continue
+            if line.startswith("[ERROR] Re-run Maven using the -X switch"):
+                continue
+            lines.append(line)
+        return lines
+
+    # Preserve the historical stderr preference when it contains a real
+    # diagnostic, but fall back to stdout after removing launcher boilerplate.
+    lines = meaningful_lines(stderr) or meaningful_lines(stdout)
     if not lines:
         return ""
     detail = _redact_git_sensitive_text(lines[-1])
     if len(detail) > limit:
         detail = detail[: max(limit - 1, 0)].rstrip() + "…"
     return detail
+
+
+def _binary_pipeline_failure_payload(candidate):
+    """Return an exact current child failure payload, otherwise ``None``."""
+
+    if type(candidate) is not dict:
+        return None
+    reason_code = candidate.get("reason_code")
+    attempt_identity = candidate.get("attempt_identity")
+    core_status = candidate.get("core_transaction_status")
+    core_succeeded = candidate.get("core_transaction_succeeded")
+    if (
+        candidate.get("schema") != _BINARY_PIPELINE_FAILURE_SCHEMA
+        or candidate.get("status") != "failed"
+        or candidate.get("fail_closed") is not True
+        or type(reason_code) is not str
+        or re.fullmatch(r"[A-Z][A-Z0-9_]{0,255}", reason_code) is None
+        or type(candidate.get("failure_type")) is not str
+        or type(candidate.get("detail")) is not str
+        or "cause" not in candidate
+        or type(candidate.get("failed_phase")) is not str
+        or type(candidate.get("last_progress")) is not dict
+        or type(attempt_identity) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", attempt_identity) is None
+        or type(candidate.get("progress_bound_to_attempt")) is not bool
+        or core_status not in {"failed", "succeeded"}
+        or type(core_succeeded) is not bool
+        or core_succeeded != (core_status == "succeeded")
+        or (
+            candidate.get("core_result_receipt") is not None
+            and type(candidate.get("core_result_receipt")) is not dict
+        )
+    ):
+        return None
+    return candidate
+
+
+def _binary_pipeline_failure_from_stderr(stderr):
+    """Parse only the child's final one-line public failure contract."""
+
+    lines = [line.strip() for line in str(stderr or "").splitlines() if line.strip()]
+    if not lines:
+        return None
+    final_line = lines[-1]
+    if len(final_line) > _BINARY_PIPELINE_STDERR_FAILURE_MAX_CHARS:
+        return None
+    try:
+        candidate = json.loads(final_line)
+    except (TypeError, ValueError, RecursionError):
+        return None
+    return _binary_pipeline_failure_payload(candidate)
+
+
+def _binary_pipeline_failure_from_result_path(path):
+    """Read a bounded child failure file without trusting arbitrary JSON."""
+
+    try:
+        with Path(path).open("rb") as handle:
+            content = handle.read(_BINARY_PIPELINE_STDERR_FAILURE_MAX_CHARS + 1)
+        if len(content) > _BINARY_PIPELINE_STDERR_FAILURE_MAX_CHARS:
+            return None
+        candidate = json.loads(content.decode("utf-8"))
+    except (OSError, UnicodeError, ValueError, RecursionError):
+        return None
+    return _binary_pipeline_failure_payload(candidate)
 
 
 def run_python(script_name, script_args, cwd, report_dir=None, timeout=None):
@@ -2461,12 +2911,29 @@ def run_python(script_name, script_args, cwd, report_dir=None, timeout=None):
             if result_index < len(script_args):
                 result_path = Path(str(script_args[result_index]))
                 if result_path.is_file():
-                    try:
-                        candidate = read_json(result_path)
-                    except (OSError, UnicodeError, json.JSONDecodeError):
-                        candidate = {}
-                    if isinstance(candidate, dict):
-                        structured_result = candidate
+                    if script_name == "binary_pipeline.py":
+                        structured_result = (
+                            _binary_pipeline_failure_from_result_path(
+                                result_path
+                            )
+                            or {}
+                        )
+                    else:
+                        try:
+                            candidate = read_json(result_path)
+                        except (
+                            OSError, UnicodeError, ValueError, RecursionError
+                        ):
+                            candidate = {}
+                        if isinstance(candidate, dict):
+                            structured_result = candidate
+        if script_name == "binary_pipeline.py":
+            validated_result = _binary_pipeline_failure_payload(
+                structured_result
+            )
+            if validated_result is None:
+                validated_result = _binary_pipeline_failure_from_stderr(stderr)
+            structured_result = validated_result or {}
         reason_codes = []
         for candidate in (
             structured_result.get("reason_code"),
@@ -5376,12 +5843,40 @@ def ensure_exists(path, message):
         raise StepError(message)
 
 
-def run_gate(gate_name, report_dir, cwd, strict_risk_gate=False):
+def run_gate(
+    gate_name,
+    report_dir,
+    cwd,
+    strict_risk_gate=False,
+    *,
+    publication_transaction=None,
+    candidate_activation_identity="",
+):
     if not gate_name:
         return
     gate_args = ["--step", gate_name, "--report-dir", str(report_dir)]
     if strict_risk_gate:
         gate_args.append("--strict-risk-gate")
+    if gate_name == "binary_final_report":
+        gate_result_path = (
+            runtime_state_dir(report_dir)
+            / "binary_gate_step6_result.json"
+        )
+        _prepare_fresh_subprocess_result(gate_result_path)
+        gate_args.extend(("--result-json", str(gate_result_path)))
+    if publication_transaction is not None:
+        transaction = dict(publication_transaction or {})
+        binding = dict(transaction.get("binding") or {})
+        gate_args.extend((
+            "--publication-transaction-id",
+            str(transaction.get("transaction_id") or ""),
+            "--publication-binding-json",
+            json.dumps(binding, ensure_ascii=True, sort_keys=True),
+            "--publication-content-identity",
+            str(transaction.get("published_content_identity") or ""),
+            "--candidate-activation-identity",
+            str(candidate_activation_identity or ""),
+        ))
     try:
         run_python("gate.py", gate_args, cwd, report_dir=report_dir)
     except StepError as exc:
@@ -5397,7 +5892,11 @@ def run_gate(gate_name, report_dir, cwd, strict_risk_gate=False):
                     for run in section.get("runs") or []:
                         if isinstance(run, dict) and run.get("reason_code"):
                             reason_codes.append(run["reason_code"])
-        raise StepError(str(exc), reason_codes=reason_codes) from exc
+        raise StepError(
+            str(exc),
+            reason_codes=reason_codes,
+            diagnostic=dict(exc.diagnostic or {}),
+        ) from exc
 
 
 def detect_build_tool(project_dir):
@@ -7830,24 +8329,61 @@ def _preflight_artifact_input(path, *, side):
 def _preflight_output_storage(report_dir):
     report = Path(report_dir).resolve()
     state = runtime_state_dir(report)
-    state.mkdir(parents=True, exist_ok=True)
     probe = state / f".step0-write-probe-{os.getpid()}-{time.monotonic_ns()}"
     try:
-        probe.write_bytes(b"step0-preflight\n")
+        state.mkdir(parents=True, exist_ok=True)
+        with probe.open("xb") as handle:
+            handle.write(b"step0-preflight\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        fsync_directory(state)
         with probe.open("rb") as handle:
             if handle.read() != b"step0-preflight\n":
                 raise OSError("write probe content mismatch")
+        usage = shutil.disk_usage(state)
     except OSError as exc:
         raise StepError(
             f"分析输出目录不可可靠写入：{state}（{exc}）",
             reason_codes=["STEP0_OUTPUT_STORAGE_UNAVAILABLE"],
         ) from exc
     finally:
+        primary = sys.exc_info()[1]
+        cleanup_error = None
         try:
             probe.unlink()
         except FileNotFoundError:
             pass
-    usage = shutil.disk_usage(state)
+        except OSError as exc:
+            cleanup_error = exc
+        else:
+            try:
+                fsync_directory(state)
+            except OSError as exc:
+                cleanup_error = exc
+        if cleanup_error is not None:
+            detail = (
+                "Step0 输出存储探针清理失败："
+                f"{probe}（{cleanup_error}）"
+            )
+            if primary is not None:
+                add_note = getattr(primary, "add_note", None)
+                if callable(add_note):
+                    try:
+                        add_note(detail)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        notes = list(getattr(primary, "__notes__", ()) or ())
+                        notes.append(detail)
+                        setattr(primary, "__notes__", notes)
+                    except Exception:
+                        pass
+            else:
+                raise StepError(
+                    f"分析输出目录不可可靠清理：{state}（{cleanup_error}）",
+                    reason_codes=["STEP0_OUTPUT_STORAGE_UNAVAILABLE"],
+                ) from cleanup_error
     return {
         "path": str(state),
         "free_bytes": int(usage.free),
@@ -7884,8 +8420,7 @@ def _preflight_pinned_build_tool(run_context, project_dir, side):
             commands = [
                 tool_prefix + ["-version"],
                 tool_prefix + [
-                    "-q", "help:evaluate", "-Dexpression=java.version",
-                    "-DforceStdout",
+                    "-q", "-N", "-DskipTests", "validate",
                 ],
             ]
         elif tool == "gradle":
@@ -7921,6 +8456,7 @@ def _preflight_pinned_build_tool(run_context, project_dir, side):
                         "tool": tool,
                         "command": [str(item) for item in command],
                         "exit_code": rc,
+                        "stdout_tail": str(stdout or "")[-4000:],
                         "stderr_tail": str(stderr or "")[-4000:],
                     },
                 )
@@ -8041,11 +8577,19 @@ def _preflight_explicit_binary_config(run_context, project_dir):
     unknown_policy = set(policy) - {
         "oracle_compile_timeout_seconds",
         "oracle_runtime_timeout_seconds",
+        "oracle_runtime_phase_time_budget_seconds",
+        "oracle_javap_time_budget_seconds",
         "oracle_max_attempts",
     }
     try:
         compile_timeout = float(policy.get("oracle_compile_timeout_seconds", 60))
         runtime_timeout = float(policy.get("oracle_runtime_timeout_seconds", 300))
+        runtime_phase_budget = float(
+            policy.get("oracle_runtime_phase_time_budget_seconds", 1800)
+        )
+        javap_budget = float(
+            policy.get("oracle_javap_time_budget_seconds", 300)
+        )
         attempts = int(policy.get("oracle_max_attempts", 2))
     except (TypeError, ValueError) as error:
         raise StepError(
@@ -8054,9 +8598,21 @@ def _preflight_explicit_binary_config(run_context, project_dir):
         ) from error
     if (
         unknown_policy
-        or isinstance(policy.get("oracle_max_attempts"), bool)
+        or any(
+            isinstance(policy.get(field), bool)
+            for field in (
+                "oracle_compile_timeout_seconds",
+                "oracle_runtime_timeout_seconds",
+                "oracle_runtime_phase_time_budget_seconds",
+                "oracle_javap_time_budget_seconds",
+                "oracle_max_attempts",
+            )
+        )
+        or isinstance(policy.get("oracle_max_attempts"), float)
         or not 0.01 <= compile_timeout <= 300
         or not 0.01 <= runtime_timeout <= 300
+        or not 1 <= runtime_phase_budget <= 7200
+        or not 0.01 <= javap_budget <= 1800
         or not 1 <= attempts <= 3
     ):
         raise StepError(
@@ -8088,6 +8644,8 @@ def _preflight_explicit_binary_config(run_context, project_dir):
         "tool_execution_policy": {
             "oracle_compile_timeout_seconds": compile_timeout,
             "oracle_runtime_timeout_seconds": runtime_timeout,
+            "oracle_runtime_phase_time_budget_seconds": runtime_phase_budget,
+            "oracle_javap_time_budget_seconds": javap_budget,
             "oracle_max_attempts": attempts,
         },
         "status": "passed",
@@ -8180,18 +8738,7 @@ def validate_step1_runtime_inputs(run_context, report_dir):
     try:
         config = materialize_binary_pipeline_config(
             report_dir,
-            runtime_overrides={
-                key: run_context.get(key)
-                for key in (
-                    "base_jdk_home",
-                    "current_jdk_home",
-                    "active_profile_identities",
-                    "external_config_snapshot_identities",
-                    "agent_transformer_plugin_profile_identities",
-                    "step0_preflight",
-                )
-                if run_context.get(key) not in (None, "", [], ())
-            },
+            runtime_overrides=_binary_runtime_overrides(run_context),
         )
     except BinaryRuntimeMaterializationError as error:
         raise StepError(
@@ -10737,7 +11284,11 @@ def persist_step_interaction(main_state, step_id, report_dir, run_context, inter
         pending_interaction=dict(interaction),
     )
     save_main_state(report_dir, main_state)
-    write_coverage_report(runtime_coverage_dir(report_dir), project_scope=run_context.get("project_scope"))
+    if step_id in {"step0", "step1", "step2", "step3"}:
+        write_coverage_report(
+            report_dir,
+            project_scope=run_context.get("project_scope"),
+        )
     save_interaction_file(report_dir, interaction)
     write_resume_snapshot(
         main_state,
@@ -10751,10 +11302,20 @@ def persist_step_interaction(main_state, step_id, report_dir, run_context, inter
 
 def build_final_completion_summary(report_dir):
     """Summarize result certainty without converting a completed run into a false success claim."""
-    findings_path = s6_findings_path(report_dir)
     try:
-        findings = read_json(findings_path) if findings_path.is_file() else {}
-    except (OSError, UnicodeError, json.JSONDecodeError):
+        if report_uses_release_protocol(report_dir):
+            findings = dict(
+                load_consistent_step6_publication(report_dir).get("findings")
+                or {}
+            )
+        else:
+            findings_path = s6_findings_path(report_dir)
+            findings = (
+                read_json(findings_path) if findings_path.is_file() else {}
+            )
+    except (
+        OSError, UnicodeError, json.JSONDecodeError, BinaryReportError
+    ):
         findings = {}
 
     coverage = dict(findings.get("coverage") or {})
@@ -10793,29 +11354,78 @@ def build_final_completion_summary(report_dir):
     dependency_total = int(scope.get("available_dependency_count") or 0)
     dependency_included = int(scope.get("included_dependency_count") or dependency_total)
     dependency_completed = int(scope.get("analyzed_dependency_count") or 0)
-    api_model = {
-        "total_count": api_included if partial_scope else api_total,
-        "completed_count": api_completed,
-        "incomplete_count": max(
-            (api_included if partial_scope else api_total) - api_completed,
-            0,
-        ),
-        "probable_count": probable_count,
-    }
-    dependency_model = {
-        "total_count": dependency_included if partial_scope else dependency_total,
-        "completed_count": dependency_completed,
-        "incomplete_count": max(
-            (dependency_included if partial_scope else dependency_total)
-            - dependency_completed,
-            0,
-        ),
-        "probable_any_count": probable_dependency_count,
-    }
+    report_population = dict(findings.get("report_population") or {})
+
+    def validated_population(name):
+        value = report_population.get(name)
+        if not isinstance(value, dict):
+            return None
+        counts = tuple(value.get(key) for key in (
+            "total_count", "completed_count", "incomplete_count"
+        ))
+        if (
+            any(not isinstance(count, int) or count < 0 for count in counts)
+            or counts[1] + counts[2] != counts[0]
+            or not isinstance(value.get("population_unconfirmed"), bool)
+        ):
+            return None
+        return dict(value)
+
+    population_schema_valid = report_population.get("schema") == (
+        "java-upgrade-analyzer.step6-report-population.v1"
+    )
+    published_api_population = (
+        validated_population("apis") if population_schema_valid else None
+    )
+    published_dependency_population = (
+        validated_population("dependencies")
+        if population_schema_valid else None
+    )
+    if published_api_population is not None:
+        api_model = {
+            **published_api_population,
+            "probable_count": probable_count,
+        }
+    else:
+        api_model = {
+            "total_count": api_included if partial_scope else api_total,
+            "completed_count": api_completed,
+            "incomplete_count": max(
+                (api_included if partial_scope else api_total) - api_completed,
+                0,
+            ),
+            "probable_count": probable_count,
+        }
+    if published_dependency_population is not None:
+        dependency_model = {
+            **published_dependency_population,
+            "probable_any_count": probable_dependency_count,
+        }
+    else:
+        dependency_model = {
+            "total_count": (
+                dependency_included if partial_scope else dependency_total
+            ),
+            "completed_count": dependency_completed,
+            "incomplete_count": max(
+                (dependency_included if partial_scope else dependency_total)
+                - dependency_completed,
+                0,
+            ),
+            "probable_any_count": probable_dependency_count,
+        }
 
     limitations = []
     if not findings:
         limitations.append("最终结构化结果缺失或无法读取")
+    elif (
+        findings.get("schema") == "java-upgrade-analyzer.binary-findings.v2"
+        and (
+            published_api_population is None
+            or published_dependency_population is None
+        )
+    ):
+        limitations.append("最终报告对象数量合同缺失或无效")
     if scope_mode == "partial":
         limitations.append("用户选择了部分变化依赖")
     elif scope_validation_status == "invalid":
@@ -10918,7 +11528,11 @@ def persist_completed_step(main_state, step_id, report_dir, run_context):
         completion_summary=completion_summary,
     )
     save_main_state(report_dir, main_state)
-    write_coverage_report(runtime_coverage_dir(report_dir), project_scope=run_context.get("project_scope"))
+    if step_id in {"step0", "step1", "step2", "step3"}:
+        write_coverage_report(
+            report_dir,
+            project_scope=run_context.get("project_scope"),
+        )
     clear_interaction_file(
         report_dir,
         preserve_informational=(step_id == "step6"),
@@ -11228,19 +11842,14 @@ def step_output_paths_for_cleanup(step_id, report_dir):
             evidence_static_scan_dir(report_dir) / STEP3_RISK_CANDIDATES_FILE,
         ],
         "step4": [
-            step4_api_changes_dir(report_dir),
             runtime_observability_dir(report_dir) / "step4_timing.csv",
         ],
         "step5": [
-            step5_call_chain_dir(report_dir),
-            step5_query_index_path(report_dir),
             runtime_observability_dir(report_dir) / "step5_timing.csv",
         ],
-        "step6": [
-            s6_findings_path(report_dir),
-            final_report_path(report_dir),
-            deliverables_dir(report_dir),
-        ],
+        # Formal Step4/5/6 trees are release-owned. Explicit reruns preserve
+        # the last committed bytes until a replacement release commits.
+        "step6": [],
     }
     normalized_step = str(step_id or "").strip()
     if normalized_step == "step0":
@@ -11252,14 +11861,1852 @@ def step_output_paths_for_cleanup(step_id, report_dir):
     return list(outputs.get(normalized_step, []))
 
 
+def _remove_step_output_without_following_parent_links(report_dir, path):
+    """Remove one report-owned output without path-based deletion races.
+
+    On POSIX, every lookup and mutation after opening the report root is
+    relative to a retained directory descriptor.  Replacing a checked parent
+    with a symlink can therefore neither redirect ``unlink`` nor redirect the
+    recursive directory walk outside the report.  Windows' Python API does not
+    expose handle-relative directory traversal; its compatibility path keeps
+    the static reparse-point checks and never runs on POSIX.
+    """
+
+    report = Path(report_dir).resolve()
+    target = Path(os.path.abspath(str(path)))
+    try:
+        relative = target.relative_to(report)
+    except ValueError as error:
+        raise StepError(
+            f"拒绝清理报告目录之外的 Step 产物：{target}",
+            reason_codes=["WORKFLOW_OUTPUT_CLEANUP_PATH_UNSAFE"],
+        ) from error
+    if not relative.parts:
+        raise StepError(
+            f"拒绝清理报告根目录：{target}",
+            reason_codes=["WORKFLOW_OUTPUT_CLEANUP_PATH_UNSAFE"],
+        )
+    try:
+        if _secure_step_output_cleanup_supported():
+            return _remove_step_output_with_directory_descriptors(
+                report, relative
+            )
+        if os.name == "nt":  # pragma: no cover - native Windows CI.
+            return _remove_step_output_windows_compat(report, relative)
+        raise OSError(
+            "secure descriptor-relative cleanup is unavailable"
+        )
+    except OSError as error:
+        raise StepError(
+            f"Step 产物清理路径不安全，已停止自动恢复：{target}",
+            reason_codes=["WORKFLOW_OUTPUT_CLEANUP_PATH_UNSAFE"],
+            diagnostic={"cleanup_path": str(target)},
+        ) from error
+    return True
+
+
+def _secure_step_output_cleanup_supported():
+    return bool(
+        os.name != "nt"
+        and int(getattr(os, "O_DIRECTORY", 0) or 0)
+        and int(getattr(os, "O_NOFOLLOW", 0) or 0)
+        and all(
+            operation in os.supports_dir_fd
+            for operation in (os.open, os.stat, os.unlink, os.rmdir)
+        )
+        and os.stat in os.supports_follow_symlinks
+        and os.listdir in os.supports_fd
+    )
+
+
+def _cleanup_directory_open_flags():
+    return (
+        os.O_RDONLY
+        | int(getattr(os, "O_DIRECTORY", 0) or 0)
+        | int(getattr(os, "O_NOFOLLOW", 0) or 0)
+        | int(getattr(os, "O_CLOEXEC", 0) or 0)
+        | int(getattr(os, "O_BINARY", 0) or 0)
+    )
+
+
+def _open_cleanup_directory(name, *, dir_fd=None, expected=None):
+    if dir_fd is None:
+        descriptor = os.open(name, _cleanup_directory_open_flags())
+    else:
+        descriptor = os.open(
+            name, _cleanup_directory_open_flags(), dir_fd=dir_fd
+        )
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISDIR(opened.st_mode):
+            raise OSError("cleanup path component is not a directory")
+        if expected is not None and not os.path.samestat(opened, expected):
+            raise OSError("cleanup directory changed while opening")
+        return descriptor, opened
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _verify_cleanup_directory_binding(
+    parent_fd, name, opened_fd, expected
+):
+    current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    opened = os.fstat(opened_fd)
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or not os.path.samestat(current, expected)
+        or not os.path.samestat(opened, expected)
+    ):
+        raise OSError("cleanup directory binding changed")
+
+
+def _remove_cleanup_directory_tree_at(
+    parent_fd, name, expected, *, depth=0
+):
+    if depth > 256:
+        raise OSError("cleanup directory nesting exceeds safety limit")
+    directory_fd, opened = _open_cleanup_directory(
+        name, dir_fd=parent_fd, expected=expected
+    )
+    try:
+        for child_name in sorted(os.listdir(directory_fd)):
+            child = os.stat(
+                child_name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            if stat.S_ISDIR(child.st_mode):
+                _remove_cleanup_directory_tree_at(
+                    directory_fd,
+                    child_name,
+                    child,
+                    depth=depth + 1,
+                )
+            elif stat.S_ISREG(child.st_mode) or stat.S_ISLNK(child.st_mode):
+                os.unlink(child_name, dir_fd=directory_fd)
+            else:
+                raise OSError(
+                    "cleanup tree contains a non-file filesystem object"
+                )
+        if os.listdir(directory_fd):
+            raise OSError("cleanup directory changed while removing contents")
+        _verify_cleanup_directory_binding(
+            parent_fd, name, directory_fd, opened
+        )
+        os.rmdir(name, dir_fd=parent_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _remove_step_output_with_directory_descriptors(
+    report, relative, *, synchronize_parent=False
+):
+    try:
+        root_expected = os.lstat(report)
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(root_expected.st_mode) or not stat.S_ISDIR(
+        root_expected.st_mode
+    ):
+        raise OSError("report root is not a real directory")
+    root_fd, root_opened = _open_cleanup_directory(
+        report, expected=root_expected
+    )
+    descriptors = [root_fd]
+    bindings = []
+    try:
+        parent_fd = root_fd
+        for part in relative.parts[:-1]:
+            try:
+                expected = os.stat(
+                    part, dir_fd=parent_fd, follow_symlinks=False
+                )
+            except FileNotFoundError:
+                return False
+            if stat.S_ISLNK(expected.st_mode) or not stat.S_ISDIR(
+                expected.st_mode
+            ):
+                raise OSError("output parent is not a real directory")
+            child_fd, child_opened = _open_cleanup_directory(
+                part, dir_fd=parent_fd, expected=expected
+            )
+            bindings.append(
+                (parent_fd, part, child_fd, child_opened)
+            )
+            descriptors.append(child_fd)
+            parent_fd = child_fd
+        leaf_name = relative.parts[-1]
+        try:
+            leaf = os.stat(
+                leaf_name, dir_fd=parent_fd, follow_symlinks=False
+            )
+        except FileNotFoundError:
+            return False
+        if stat.S_ISDIR(leaf.st_mode):
+            _remove_cleanup_directory_tree_at(
+                parent_fd, leaf_name, leaf
+            )
+        elif stat.S_ISREG(leaf.st_mode) or stat.S_ISLNK(leaf.st_mode):
+            os.unlink(leaf_name, dir_fd=parent_fd)
+        else:
+            raise OSError("output is not a regular file or directory")
+        if synchronize_parent:
+            # Durability must be established on the same directory object that
+            # owned the unlink.  Re-opening the pathname here would reintroduce
+            # the parent-swap race this descriptor walk is intended to close.
+            os.fsync(parent_fd)
+        for binding in reversed(bindings):
+            _verify_cleanup_directory_binding(*binding)
+        current_root = os.lstat(report)
+        if (
+            not os.path.samestat(current_root, root_expected)
+            or not os.path.samestat(os.fstat(root_fd), root_opened)
+        ):
+            raise OSError("report root changed during cleanup")
+        return True
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _windows_cleanup_directory_stat(path):
+    observed = os.lstat(path)
+    attributes = int(getattr(observed, "st_file_attributes", 0) or 0)
+    reparse_attribute = int(
+        getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0) or 0
+    )
+    is_junction = getattr(path, "is_junction", None)
+    if (
+        stat.S_ISLNK(observed.st_mode)
+        or not stat.S_ISDIR(observed.st_mode)
+        or (reparse_attribute and attributes & reparse_attribute)
+        or (callable(is_junction) and is_junction())
+    ):
+        raise OSError("output parent is a reparse point or not a directory")
+    return observed
+
+
+def _verify_windows_cleanup_bindings(bindings):
+    for path, expected in bindings:
+        current = _windows_cleanup_directory_stat(path)
+        if not os.path.samestat(current, expected):
+            raise OSError("output parent identity changed during cleanup")
+
+
+def _remove_step_output_windows_compat(
+    report, relative, *, synchronize_parent=False
+):
+    """Preserve native Windows operation until handle-relative APIs land."""
+
+    bindings = []
+    current = report
+    try:
+        bindings.append((current, _windows_cleanup_directory_stat(current)))
+    except FileNotFoundError:
+        return False
+    for part in relative.parts[:-1]:
+        current = current / part
+        try:
+            parent = _windows_cleanup_directory_stat(current)
+        except FileNotFoundError:
+            return False
+        bindings.append((current, parent))
+    _verify_windows_cleanup_bindings(bindings)
+    target = report / relative
+    try:
+        target_stat = os.lstat(target)
+    except FileNotFoundError:
+        return False
+    _verify_windows_cleanup_bindings(bindings)
+    if stat.S_ISLNK(target_stat.st_mode):
+        target.unlink()
+    elif stat.S_ISDIR(target_stat.st_mode):
+        shutil.rmtree(target)
+    elif stat.S_ISREG(target_stat.st_mode):
+        target.unlink()
+    else:
+        raise OSError("output is not a regular file or directory")
+    _verify_windows_cleanup_bindings(bindings)
+    if synchronize_parent:
+        fsync_directory(target.parent)
+        _verify_windows_cleanup_bindings(bindings)
+    return True
+
+
 def cleanup_step_outputs(step_id, report_dir):
     for path in step_output_paths_for_cleanup(step_id, report_dir):
-        if path.is_dir():
-            shutil.rmtree(path)
-        elif path.exists():
-            path.unlink()
-    if str(step_id or "").strip() == "step3":
-        cleanup_step3_candidate_outputs(report_dir)
+        _remove_step_output_without_following_parent_links(
+            report_dir, path
+        )
+    # Step3's legacy candidate section lives inside the Step4 publication
+    # tree.  Once Step4 is committed, no downstream/reset path may edit it in
+    # place; the next Step4 release replaces the complete tree transactionally.
+
+
+def _step4_report_publication_destinations(report_dir):
+    report = Path(report_dir).resolve()
+    return (
+        step4_api_changes_dir(report),
+        report / "evidence" / "source_analysis",
+    )
+
+
+def _downstream_report_publication_destinations(report_dir, stage):
+    report = Path(report_dir).resolve()
+    if stage == "step5":
+        return (
+            step5_call_chain_dir(report),
+            report / "evidence" / "binary_analysis",
+            report / RUNTIME_DIRNAME / "indexes",
+        )
+    if stage == "step6":
+        return (
+            deliverables_dir(report),
+            report / RUNTIME_DIRNAME / "findings",
+        )
+    raise ValueError(f"unsupported downstream publication stage: {stage}")
+
+
+def _report_publication_expectation(result, *, stage, required=False):
+    transaction = dict(
+        (result or {}).get("report_publication_transaction")
+        or (result or {}).get("publication_transaction")
+        or {}
+    )
+    transaction_id = transaction.get("transaction_id")
+    binding = transaction.get("binding")
+    valid = bool(
+        isinstance(transaction_id, str)
+        and len(transaction_id) == 32
+        and all(
+            character in "0123456789abcdef"
+            for character in transaction_id
+        )
+        and isinstance(binding, dict)
+        and bool(binding)
+    )
+    if required and not valid:
+        raise StepError(
+            f"{stage.capitalize()} 报告事务缺少创建者 transaction_id/binding。",
+            reason_codes=[
+                f"BINARY_{stage.upper()}_REPORT_TRANSACTION_MISSING"
+            ],
+        )
+    if not valid:
+        return None
+    return {
+        "transaction_id": transaction_id,
+        "binding": dict(binding),
+    }
+
+
+def _step4_report_publication_expectation(result, *, required=False):
+    return _report_publication_expectation(
+        result, stage="step4", required=required
+    )
+
+
+def _step4_validation_checkpoint_path(report_dir):
+    return (
+        Path(report_dir).resolve()
+        / BINARY_OUTPUT_RELATIVE_PATH
+        / "binary_observability"
+        / "validation_checkpoint.json"
+    )
+
+
+def _step4_checkpoint_stat_identity(value):
+    return (
+        int(value.st_dev),
+        int(value.st_ino),
+        int(value.st_mode),
+        int(value.st_nlink),
+        int(value.st_size),
+        int(getattr(value, "st_mtime_ns", int(value.st_mtime * 1_000_000_000))),
+        int(getattr(value, "st_ctime_ns", int(value.st_ctime * 1_000_000_000))),
+    )
+
+
+def _read_private_step4_checkpoint(entry, *, parent_fd=None):
+    def entry_stat():
+        if parent_fd is None:
+            return os.lstat(entry)
+        return os.stat(entry, dir_fd=parent_fd, follow_symlinks=False)
+
+    initial = entry_stat()
+    if (
+        not stat.S_ISREG(initial.st_mode)
+        or initial.st_nlink != 1
+        or initial.st_size > _STEP4_VALIDATION_CHECKPOINT_MAX_BYTES
+    ):
+        raise OSError("checkpoint is not a bounded private regular file")
+    flags = (
+        os.O_RDONLY
+        | int(getattr(os, "O_NOFOLLOW", 0) or 0)
+        | int(getattr(os, "O_NONBLOCK", 0) or 0)
+        | int(getattr(os, "O_CLOEXEC", 0) or 0)
+        | int(getattr(os, "O_BINARY", 0) or 0)
+    )
+    if parent_fd is None:
+        descriptor = os.open(entry, flags)
+    else:
+        descriptor = os.open(entry, flags, dir_fd=parent_fd)
+    try:
+        opened = os.fstat(descriptor)
+        current = entry_stat()
+        if (
+            _step4_checkpoint_stat_identity(initial)
+            != _step4_checkpoint_stat_identity(opened)
+            or _step4_checkpoint_stat_identity(opened)
+            != _step4_checkpoint_stat_identity(current)
+        ):
+            raise OSError("checkpoint changed while opening")
+        chunks = []
+        remaining = _STEP4_VALIDATION_CHECKPOINT_MAX_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        completed = os.fstat(descriptor)
+        final_path = entry_stat()
+        if (
+            len(raw) > _STEP4_VALIDATION_CHECKPOINT_MAX_BYTES
+            or len(raw) != completed.st_size
+            or _step4_checkpoint_stat_identity(opened)
+            != _step4_checkpoint_stat_identity(completed)
+            or _step4_checkpoint_stat_identity(completed)
+            != _step4_checkpoint_stat_identity(final_path)
+        ):
+            raise OSError("checkpoint changed while reading")
+        return raw
+    finally:
+        os.close(descriptor)
+
+
+def _read_step4_checkpoint_with_directory_descriptors(report, relative):
+    root_expected = os.lstat(report)
+    if stat.S_ISLNK(root_expected.st_mode) or not stat.S_ISDIR(
+        root_expected.st_mode
+    ):
+        raise OSError("report root is not a real directory")
+    root_fd, root_opened = _open_cleanup_directory(
+        report, expected=root_expected
+    )
+    descriptors = [root_fd]
+    bindings = []
+    try:
+        parent_fd = root_fd
+        for part in relative.parts[:-1]:
+            try:
+                expected = os.stat(
+                    part, dir_fd=parent_fd, follow_symlinks=False
+                )
+            except FileNotFoundError:
+                return None
+            if stat.S_ISLNK(expected.st_mode) or not stat.S_ISDIR(
+                expected.st_mode
+            ):
+                raise OSError("checkpoint parent is not a real directory")
+            child_fd, child_opened = _open_cleanup_directory(
+                part, dir_fd=parent_fd, expected=expected
+            )
+            bindings.append((parent_fd, part, child_fd, child_opened))
+            descriptors.append(child_fd)
+            parent_fd = child_fd
+        try:
+            raw = _read_private_step4_checkpoint(
+                relative.parts[-1], parent_fd=parent_fd
+            )
+        except FileNotFoundError:
+            return None
+        for binding in reversed(bindings):
+            _verify_cleanup_directory_binding(*binding)
+        current_root = os.lstat(report)
+        if (
+            not os.path.samestat(current_root, root_expected)
+            or not os.path.samestat(os.fstat(root_fd), root_opened)
+        ):
+            raise OSError("report root changed while reading checkpoint")
+        return raw
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _strict_step4_checkpoint_json(raw):
+    def object_pairs(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"duplicate JSON object key: {key}")
+            value[key] = item
+        return value
+
+    checkpoint = json.loads(
+        raw.decode("utf-8"),
+        object_pairs_hook=object_pairs,
+        parse_constant=lambda token: (_ for _ in ()).throw(
+            ValueError(f"non-finite JSON number: {token}")
+        ),
+    )
+    if not isinstance(checkpoint, dict):
+        raise ValueError("checkpoint JSON root is not an object")
+    return checkpoint
+
+
+def _read_step4_validation_checkpoint(report_dir, *, missing_ok=False):
+    path = _step4_validation_checkpoint_path(report_dir)
+    relative = (
+        Path(BINARY_OUTPUT_RELATIVE_PATH)
+        / "binary_observability"
+        / "validation_checkpoint.json"
+    )
+    report = path
+    for _part in relative.parts:
+        report = report.parent
+    try:
+        if report / relative != path:
+            raise OSError("checkpoint path is outside its fixed report location")
+        if _secure_step_output_cleanup_supported():
+            raw = _read_step4_checkpoint_with_directory_descriptors(
+                report, relative
+            )
+        elif os.name == "nt":  # pragma: no cover - native Windows CI.
+            raw = _read_private_step4_checkpoint(path)
+        else:
+            raise OSError(
+                "secure descriptor-relative checkpoint read is unavailable"
+            )
+    except FileNotFoundError:
+        raw = None
+    except (OSError, RuntimeError) as error:
+        raise StepError(
+            f"Step4 事务 checkpoint 无法安全读取：{error}",
+            reason_codes=["BINARY_STEP4_TRANSACTION_CHECKPOINT_INVALID"],
+        ) from error
+    if raw is None:
+        if missing_ok:
+            return None
+        raise StepError(
+            f"Step4 事务 checkpoint 不存在：{path}",
+            reason_codes=["BINARY_STEP4_TRANSACTION_CHECKPOINT_INVALID"],
+        ) from None
+    try:
+        return _strict_step4_checkpoint_json(raw)
+    except (UnicodeError, json.JSONDecodeError, ValueError) as error:
+        raise StepError(
+            f"Step4 事务 checkpoint 无法安全读取：{error}",
+            reason_codes=["BINARY_STEP4_TRANSACTION_CHECKPOINT_INVALID"],
+        ) from error
+
+
+def _delete_step4_validation_checkpoint_durable(path):
+    checkpoint_path = Path(os.path.abspath(str(path)))
+    checkpoint_relative = (
+        Path(BINARY_OUTPUT_RELATIVE_PATH)
+        / "binary_observability"
+        / "validation_checkpoint.json"
+    )
+    report = checkpoint_path
+    for _part in checkpoint_relative.parts:
+        report = report.parent
+    try:
+        if report / checkpoint_relative != checkpoint_path:
+            raise OSError("checkpoint path is outside its fixed report location")
+        if _secure_step_output_cleanup_supported():
+            removed = _remove_step_output_with_directory_descriptors(
+                report,
+                checkpoint_relative,
+                synchronize_parent=True,
+            )
+        elif os.name == "nt":  # pragma: no cover - native Windows CI.
+            removed = _remove_step_output_windows_compat(
+                report,
+                checkpoint_relative,
+                synchronize_parent=True,
+            )
+        else:
+            raise OSError(
+                "secure descriptor-relative checkpoint deletion is unavailable"
+            )
+        if not removed:
+            raise FileNotFoundError(checkpoint_path)
+    except OSError as error:
+        raise StepError(
+            f"Step4 事务 checkpoint 无法持久删除：{error}",
+            reason_codes=["BINARY_STEP4_TRANSACTION_CHECKPOINT_INVALID"],
+        ) from error
+
+
+def _cleanup_committed_step4_checkpoint(path):
+    """Remove a no-longer-authoritative checkpoint without undoing success."""
+
+    try:
+        _delete_step4_validation_checkpoint_durable(path)
+    except StepError:
+        return False
+    return True
+
+
+def _read_step4_active_descriptor(report_dir, *, missing_ok=False):
+    binary_root = Path(report_dir).resolve() / BINARY_OUTPUT_RELATIVE_PATH
+    try:
+        pending = read_pending_binary_generation(
+            binary_root, missing_ok=True
+        )
+        if pending is not None:
+            return dict(pending)
+        active = read_active_binary_generation(
+            binary_root,
+            missing_ok=bool(missing_ok),
+            allow_pending_activation=True,
+        )
+    except BinaryOutputError as error:
+        raise StepError(
+            f"Step4 active generation 描述符不安全或已损坏：{error}",
+            reason_codes=["BINARY_STEP4_ACTIVE_DESCRIPTOR_INVALID"],
+        ) from error
+    return dict(active or {})
+
+
+def _step4_activation_binding(report_dir, result=None):
+    payload = dict(result or {})
+    if payload.get("result_generation_identity") and payload.get(
+        "activation_identity"
+    ):
+        checkpoint = {}
+    else:
+        checkpoint = _read_step4_validation_checkpoint(
+            report_dir, missing_ok=True
+        ) or {}
+    return {
+        "result_generation_identity": str(
+            payload.get("result_generation_identity")
+            or checkpoint.get("result_generation_identity")
+            or ""
+        ),
+        "activation_identity": str(
+            payload.get("activation_identity")
+            or checkpoint.get("activation_identity")
+            or ""
+        ),
+    }
+
+
+def _revalidate_binary_step4_deferred_handoff(report_dir, result):
+    """Bind the child receipt to the exact private candidate now under lock.
+
+    ``binary_pipeline`` deliberately releases its output-root writer lock when
+    the subprocess exits.  The workflow parent must not trust the result it
+    observed before reacquiring that same lock: a standalone writer may have
+    replaced the checkpoint, pending candidate, or public predecessor in the
+    interval.  This check is intentionally performed only after the parent
+    owns ``.binary-pipeline-run.lock``.
+    """
+
+    report = Path(report_dir).resolve()
+    binary_root = report / BINARY_OUTPUT_RELATIVE_PATH
+    payload = dict(result or {})
+    identity_fields = (
+        "result_generation_identity",
+        "analysis_context_identity",
+        "validation_run_identity",
+        "activation_identity",
+    )
+    invalid_fields = [
+        field
+        for field in identity_fields
+        if not isinstance(payload.get(field), str)
+        or re.fullmatch(r"[0-9a-f]{64}", payload[field]) is None
+    ]
+    expected_checkpoint_path = _step4_validation_checkpoint_path(report)
+    declared_checkpoint_path = Path(
+        str(payload.get("validation_checkpoint_path") or "")
+    )
+    try:
+        declared_checkpoint_path = declared_checkpoint_path.resolve(
+            strict=True
+        )
+        resolved_checkpoint_path = expected_checkpoint_path.resolve(
+            strict=True
+        )
+    except (OSError, RuntimeError) as error:
+        raise StepError(
+            f"Step4 deferred handoff 的 checkpoint 路径无法确认：{error}",
+            reason_codes=[
+                "BINARY_STEP4_DEFERRED_HANDOFF_REVALIDATION_FAILED"
+            ],
+        ) from error
+    if (
+        payload.get("schema")
+        != "java-upgrade-analyzer.binary-pipeline-result.v1"
+        or payload.get("validation_status") != "passed"
+        or payload.get("validation_checkpoint_retained") is not True
+        or payload.get("activation_candidate_private") is not True
+        or "activation_predecessor" not in payload
+        or invalid_fields
+        or declared_checkpoint_path != resolved_checkpoint_path
+    ):
+        raise StepError(
+            "Step4 子进程结果不是完整、私有且可提交的 deferred handoff。",
+            reason_codes=[
+                "BINARY_STEP4_DEFERRED_HANDOFF_REVALIDATION_FAILED"
+            ],
+            diagnostic={"invalid_identity_fields": invalid_fields},
+        )
+
+    # Read one checkpoint snapshot under the writer lock and bind only the
+    # generation, validation and activation identities that affect results.
+    try:
+        checkpoint = _read_step4_validation_checkpoint(report)
+        pending = read_pending_binary_generation(
+            binary_root,
+            expected_activation_identity=payload["activation_identity"],
+        )
+        public_active = read_active_binary_generation(
+            binary_root, missing_ok=True
+        )
+    except StepError as error:
+        raise StepError(
+            str(error),
+            reason_codes=(
+                list(error.reason_codes)
+                + ["BINARY_STEP4_DEFERRED_HANDOFF_REVALIDATION_FAILED"]
+            ),
+            diagnostic=dict(error.diagnostic or {}),
+        ) from error
+    except BinaryOutputError as error:
+        raise StepError(
+            f"Step4 deferred handoff 的 activation binding 无法确认：{error}",
+            reason_codes=[
+                "BINARY_STEP4_DEFERRED_HANDOFF_REVALIDATION_FAILED"
+            ],
+            diagnostic={
+                "cause_reason_code": str(error.reason_code or ""),
+            },
+        ) from error
+
+    checkpoint_validation_sha256 = checkpoint.get(
+        "validation_result_sha256"
+    )
+    expected_pending = {
+        "result_generation_identity": payload[
+            "result_generation_identity"
+        ],
+        "validation_run_identity": payload["validation_run_identity"],
+        "validation_result_sha256": checkpoint_validation_sha256,
+        "activation_identity": payload["activation_identity"],
+        "activation_state": "pending",
+        "activation_predecessor": public_active,
+    }
+    observed_pending = {
+        key: (pending or {}).get(key)
+        for key in expected_pending
+    }
+    if (
+        observed_pending != expected_pending
+        or re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(checkpoint_validation_sha256 or ""),
+        )
+        is None
+        or checkpoint.get("analysis_context_identity")
+        != payload["analysis_context_identity"]
+        or payload.get("activation_predecessor") != public_active
+    ):
+        raise StepError(
+            "Step4 子进程结果、private candidate 与 public active predecessor "
+            "在 writer-lock handoff 时不一致。",
+            reason_codes=[
+                "BINARY_STEP4_DEFERRED_HANDOFF_REVALIDATION_FAILED"
+            ],
+            diagnostic={
+                "result_generation_identity": payload[
+                    "result_generation_identity"
+                ],
+                "activation_identity": payload["activation_identity"],
+                "pending_activation_state": str(
+                    (pending or {}).get("activation_state") or ""
+                ),
+                "public_predecessor_matches": (
+                    (pending or {}).get("activation_predecessor")
+                    == public_active
+                ),
+            },
+        )
+    return {
+        "checkpoint_path": str(resolved_checkpoint_path),
+        "pending": dict(pending or {}),
+        "public_active": dict(public_active or {}),
+    }
+
+
+def _rollback_binary_step4_transaction(report_dir, result=None):
+    """Rollback pending report views, then the exact bound activation token."""
+
+    statuses = {
+        "report_publication_rollback": "not_attempted",
+        "active_generation_rollback": "not_attempted",
+    }
+    destinations = _step4_report_publication_destinations(report_dir)
+    report_rollback_succeeded = False
+    report_already_committed = False
+    try:
+        metadata = report_publication_transaction_recovery_metadata(
+            destinations
+        )
+        state = str(metadata.get("state") or "absent")
+        expectation = _step4_report_publication_expectation(result)
+        if expectation is None and state != "absent":
+            observed_binding = dict(metadata.get("binding") or {})
+            declared_generation = str(
+                (result or {}).get("result_generation_identity") or ""
+            )
+            declared_activation = str(
+                (result or {}).get("activation_identity") or ""
+            )
+            if (
+                not declared_generation
+                or not declared_activation
+                or observed_binding.get("result_generation_identity")
+                != declared_generation
+                or observed_binding.get("activation_identity")
+                != declared_activation
+            ):
+                raise BinaryReportError(
+                    "BINARY_REPORT_PUBLICATION_TRANSACTION_BINDING_MISMATCH",
+                    str(metadata.get("transaction_id") or ""),
+                )
+            expectation = {
+                "transaction_id": metadata.get("transaction_id"),
+                "binding": observed_binding,
+            }
+        if state == "absent":
+            if expectation is None:
+                statuses["report_publication_rollback"] = "not_present"
+                report_rollback_succeeded = True
+            else:
+                raise BinaryReportError(
+                    "BINARY_REPORT_PUBLICATION_TRANSACTION_ID_MISMATCH",
+                    str(expectation["transaction_id"]),
+                )
+        elif state == "committed":
+            report_publication_transaction_receipt(
+                destinations,
+                expected_transaction_id=expectation["transaction_id"],
+                expected_binding=expectation["binding"],
+            )
+            statuses["report_publication_rollback"] = "already_committed"
+            report_already_committed = True
+        else:
+            restored = rollback_report_publication(
+                destinations,
+                expected_transaction_id=expectation["transaction_id"],
+                expected_binding=expectation["binding"],
+            )
+            statuses["report_publication_rollback"] = (
+                "restored_previous_reports" if restored else "not_present"
+            )
+            report_rollback_succeeded = True
+    except Exception as error:
+        statuses["report_publication_rollback"] = (
+            "rollback_failed:"
+            + error.__class__.__name__
+            + (
+                ":" + str(getattr(error, "reason_code", "") or "")
+                if getattr(error, "reason_code", "",) else ""
+            )
+        )
+    binding = _step4_activation_binding(report_dir, result)
+    if report_already_committed:
+        statuses["active_generation_rollback"] = (
+            "not_attempted_after_report_commit"
+        )
+    elif not report_rollback_succeeded:
+        statuses["active_generation_rollback"] = (
+            "not_attempted_after_report_rollback_failure"
+        )
+    elif binding["result_generation_identity"] and binding["activation_identity"]:
+        try:
+            restored = compare_and_restore_active_binary_generation(
+                Path(report_dir).resolve() / BINARY_OUTPUT_RELATIVE_PATH,
+                expected_current_identity=binding[
+                    "result_generation_identity"
+                ],
+                expected_activation_identity=binding["activation_identity"],
+            )
+            statuses["active_generation_rollback"] = (
+                "restored_lock_observed_predecessor"
+                if restored
+                else "skipped_active_generation_or_token_changed"
+            )
+        except Exception as error:
+            statuses["active_generation_rollback"] = (
+                "rollback_failed:"
+                + error.__class__.__name__
+                + (
+                    ":" + str(getattr(error, "reason_code", "") or "")
+                    if getattr(error, "reason_code", "",) else ""
+                )
+            )
+    else:
+        statuses["active_generation_rollback"] = (
+            "not_attempted_without_bound_activation"
+        )
+    return statuses
+
+
+def _checkpoint_result_for_recovery(report_dir, checkpoint):
+    return {
+        "validation_checkpoint_retained": True,
+        "validation_checkpoint_path": str(
+            _step4_validation_checkpoint_path(report_dir)
+        ),
+        "result_generation_identity": checkpoint.get(
+            "result_generation_identity"
+        ),
+        "validation_run_identity": checkpoint.get("validation_run_identity"),
+        "activation_identity": checkpoint.get("activation_identity"),
+    }
+
+
+def _require_successful_binary_step4_recovery_rollback(statuses):
+    observed = dict(statuses or {})
+    allowed = {
+        "report_publication_rollback": {
+            "restored_previous_reports",
+            "not_present",
+        },
+        "active_generation_rollback": {
+            "restored_lock_observed_predecessor",
+            # Legacy report-only transactions can legitimately have no
+            # activation binding.  A present-but-replaced binding is never
+            # equivalent to a successful rollback.
+            "not_attempted_without_bound_activation",
+        },
+    }
+    failures = {
+        key: value
+        for key, value in observed.items()
+        if key in allowed and value not in allowed[key]
+    }
+    for key in allowed:
+        if key not in observed:
+            failures[key] = "missing_rollback_status"
+    if failures:
+        raise StepError(
+            "Step4 中断事务无法安全回滚；已停止继续执行。",
+            reason_codes=["BINARY_STEP4_TRANSACTION_RECOVERY_FAILED"],
+            diagnostic={
+                "rollback_status": observed,
+                "unsafe_rollback_status": failures,
+            },
+        )
+
+
+def _finalize_stale_committed_step4_checkpoint(
+    report_dir,
+    checkpoint,
+    publication_receipt,
+):
+    """Remove a crash-reappeared checkpoint without discarding its receipt."""
+
+    report = Path(report_dir).resolve()
+    active = _read_step4_active_descriptor(report)
+    published = _read_background_json(
+        step4_api_changes_dir(report) / "summary.json"
+    )
+    binding = dict(publication_receipt.get("binding") or {})
+    if (
+        publication_receipt.get("state") != "committed"
+        or checkpoint.get("schema")
+        != "java-upgrade-analyzer.binary-generation-validation-checkpoint.v3"
+        or checkpoint.get("status")
+        != "independent_validation_passed_pending_activation"
+        or checkpoint.get("result_generation_identity")
+        != binding.get("result_generation_identity")
+        or checkpoint.get("validation_run_identity")
+        != binding.get("validation_run_identity")
+        or checkpoint.get("activation_identity")
+        != binding.get("activation_identity")
+        or active.get("result_generation_identity")
+        != binding.get("result_generation_identity")
+        or active.get("validation_run_identity")
+        != binding.get("validation_run_identity")
+        or active.get("validation_result_sha256")
+        != binding.get("validation_result_sha256")
+        or active.get("activation_identity")
+        or "activation_predecessor" in active
+        or published.get("result_generation_identity")
+        != binding.get("result_generation_identity")
+    ):
+        raise StepError(
+            "committed 报告事务、残留 checkpoint 与已封存 active generation 不一致。",
+            reason_codes=["BINARY_STEP4_TRANSACTION_BINDING_MISMATCH"],
+        )
+    # The active generation and committed report receipt above are the
+    # authority.  A stale resume checkpoint is recoverable housekeeping.
+    _cleanup_committed_step4_checkpoint(
+        _step4_validation_checkpoint_path(report)
+    )
+
+
+def _seal_binary_step4_activation(report_dir, result):
+    binding = _step4_activation_binding(report_dir, result)
+    binary_root = Path(report_dir).resolve() / BINARY_OUTPUT_RELATIVE_PATH
+    try:
+        pending = read_pending_binary_generation(
+            binary_root,
+            expected_activation_identity=binding["activation_identity"],
+            missing_ok=True,
+        )
+    except BinaryOutputError as error:
+        raise StepError(
+            f"Step4 private activation candidate 无法安全读取：{error}",
+            reason_codes=["BINARY_STEP4_ACTIVATION_SEAL_FAILED"],
+        ) from error
+    if pending is not None:
+        if publish_pending_binary_generation(
+            binary_root,
+            expected_current_identity=binding[
+                "result_generation_identity"
+            ],
+            expected_activation_identity=binding["activation_identity"],
+        ):
+            return "published_private_candidate"
+        raise StepError(
+            "Step4 已通过 gate，但 private active candidate 无法发布。",
+            reason_codes=["BINARY_STEP4_ACTIVATION_SEAL_FAILED"],
+        )
+    active = _read_step4_active_descriptor(report_dir)
+    if (
+        active.get("result_generation_identity")
+        == binding["result_generation_identity"]
+        and active.get("activation_identity")
+        == binding["activation_identity"]
+        and "activation_predecessor" in active
+    ):
+        return "legacy_public_candidate_pending"
+    if (
+        active.get("result_generation_identity")
+        == binding["result_generation_identity"]
+        and not active.get("activation_identity")
+        and "activation_predecessor" not in active
+    ):
+        return "already_sealed"
+    raise StepError(
+        "Step4 已通过 gate，但 active generation 的 activation receipt 无法封存。",
+        reason_codes=["BINARY_STEP4_ACTIVATION_SEAL_FAILED"],
+    )
+
+
+def _commit_binary_step4_activation_receipt(report_dir, result):
+    binding = _step4_activation_binding(report_dir, result)
+    binary_root = Path(report_dir).resolve() / BINARY_OUTPUT_RELATIVE_PATH
+    pending = read_pending_binary_generation(
+        binary_root,
+        expected_activation_identity=binding["activation_identity"],
+        missing_ok=True,
+    )
+    if pending is None:
+        # Backward-compatible recovery for the former public receipt protocol.
+        active = _read_step4_active_descriptor(report_dir)
+        if (
+            active.get("result_generation_identity")
+            == binding["result_generation_identity"]
+            and active.get("activation_identity")
+            == binding["activation_identity"]
+            and "activation_predecessor" in active
+        ):
+            if not seal_active_binary_generation(
+                binary_root,
+                expected_current_identity=binding[
+                    "result_generation_identity"
+                ],
+                expected_activation_identity=binding[
+                    "activation_identity"
+                ],
+            ):
+                raise StepError(
+                    "Step4 legacy activation receipt 无法提交。",
+                    reason_codes=[
+                        "BINARY_STEP4_ACTIVATION_COMMIT_FAILED"
+                    ],
+                )
+            return True
+        if (
+            active.get("result_generation_identity")
+            == binding["result_generation_identity"]
+            and not active.get("activation_identity")
+            and "activation_predecessor" not in active
+        ):
+            return True
+        raise StepError(
+            "Step4 activation receipt 的提交后状态与事务绑定不一致。",
+            reason_codes=["BINARY_STEP4_ACTIVATION_COMMIT_FAILED"],
+        )
+    if not commit_pending_binary_generation(
+        binary_root,
+        expected_current_identity=binding["result_generation_identity"],
+        expected_activation_identity=binding["activation_identity"],
+    ):
+        raise StepError(
+            "Step4 active candidate 已发布但 activation receipt 无法提交。",
+            reason_codes=["BINARY_STEP4_ACTIVATION_COMMIT_FAILED"],
+        )
+    return True
+
+
+def _step4_activation_recovery_state(report_dir, binding):
+    generation_identity = str(
+        (binding or {}).get("result_generation_identity") or ""
+    )
+    activation_identity = str(
+        (binding or {}).get("activation_identity") or ""
+    )
+    if not generation_identity or not activation_identity:
+        return "unbound"
+    active = _read_step4_active_descriptor(report_dir, missing_ok=True)
+    if not active:
+        return "absent"
+    if (
+        active.get("result_generation_identity") == generation_identity
+        and active.get("activation_identity") == activation_identity
+    ):
+        return "rollbackable"
+    if (
+        active.get("result_generation_identity") == generation_identity
+        and active.get("validation_run_identity")
+        == (binding or {}).get("validation_run_identity")
+        and active.get("validation_result_sha256")
+        == (binding or {}).get("validation_result_sha256")
+        and not active.get("activation_identity")
+        and "activation_predecessor" not in active
+    ):
+        return "sealed_bound_generation"
+    return "different_generation_or_token"
+
+
+_STEP4_RELEASE_CURRENT = "current_release_verified"
+_STEP4_RELEASE_REPUBLISH = "republish_step4_reports"
+_STEP4_RELEASE_RESUME_PIPELINE = "resume_step4_pipeline"
+_STEP4_RELEASE_FATAL = "fatal_recovery_state"
+_STEP4_REPORT_REPUBLICATION_MARKER_SCHEMA = (
+    "java-upgrade-analyzer.step4-report-republication-pending.v1"
+)
+
+_STEP4_RECOVERY_REPUBLISH_DISPOSITIONS = frozenset({
+    "cleaned_legacy_committed_report_transaction",
+    "committed_legacy_published_transaction_requires_republication",
+    "committed_receipt_requires_republication",
+    "committed_gate_policy_requires_republication",
+})
+_STEP4_RECOVERY_RESUME_DISPOSITIONS = frozenset({
+    "rolled_back_legacy_report_transaction",
+    "rolled_back_gate_policy_mismatch",
+    "rolled_back_interrupted_transaction",
+    "rolled_back_orphan_activation_candidate",
+    "validation_checkpoint_pending_activation",
+    "validation_checkpoint_resume_required",
+    "rolled_back_activation_before_report_publication",
+})
+_STEP4_RECOVERY_VERIFY_DISPOSITIONS = frozenset({
+    "nothing_to_recover",
+    "completed_gate_passed_transaction",
+    "completed_committed_transaction",
+    "completed_committed_receipt_checkpoint",
+})
+
+
+def _validated_active_generation_is_current(report_dir):
+    """Return whether the sealed active generation passes the current validator contract."""
+
+    try:
+        # The public release verifier uses this same deep generation loader.
+        # Calling it through binary_report is intentionally avoided here: a
+        # missing or stale Step4 report receipt must not hide that the costly
+        # immutable generation itself remains reusable.
+        from binary_report import load_validated_generation
+
+        load_validated_generation(Path(report_dir).resolve())
+    except (
+        BinaryReportError,
+        BinaryOutputError,
+        OSError,
+        RuntimeError,
+        ValueError,
+    ):
+        return False
+    return True
+
+
+def _classify_step4_recovery_disposition(
+    report_dir,
+    disposition,
+    *,
+    expected_gate_name,
+    expected_strict_risk_gate,
+):
+    """Convert recovery mechanics into one downstream-safe release action."""
+
+    normalized = str(disposition or "").strip()
+    if normalized == "no_bound_transaction":
+        return {
+            "action": _STEP4_RELEASE_FATAL,
+            "release_verified": False,
+            "disposition": normalized,
+            "reason_code": "BINARY_STEP4_TRANSACTION_RECOVERY_FAILED",
+        }
+    if normalized in _STEP4_RECOVERY_RESUME_DISPOSITIONS:
+        return {
+            "action": _STEP4_RELEASE_RESUME_PIPELINE,
+            "release_verified": False,
+            "disposition": normalized,
+            "reason_code": "BINARY_STEP4_PIPELINE_RESUME_REQUIRED",
+        }
+    if normalized in _STEP4_RECOVERY_REPUBLISH_DISPOSITIONS:
+        action = (
+            _STEP4_RELEASE_REPUBLISH
+            if _validated_active_generation_is_current(report_dir)
+            else _STEP4_RELEASE_RESUME_PIPELINE
+        )
+        return {
+            "action": action,
+            "release_verified": False,
+            "disposition": normalized,
+            "reason_code": (
+                "BINARY_STEP4_REPORT_REPUBLICATION_REQUIRED"
+                if action == _STEP4_RELEASE_REPUBLISH
+                else "BINARY_STEP4_PIPELINE_RESUME_REQUIRED"
+            ),
+        }
+    if normalized not in _STEP4_RECOVERY_VERIFY_DISPOSITIONS:
+        return {
+            "action": _STEP4_RELEASE_FATAL,
+            "release_verified": False,
+            "disposition": normalized,
+            "reason_code": "BINARY_STEP4_TRANSACTION_RECOVERY_FAILED",
+        }
+    try:
+        receipt = verify_current_step4_release(
+            Path(report_dir).resolve(),
+            expected_gate_name=str(expected_gate_name or ""),
+            expected_strict_risk_gate=bool(expected_strict_risk_gate),
+            workflow_lock_held=True,
+        )
+    except (BinaryReportError, BinaryOutputError, OSError, RuntimeError) as error:
+        reusable = _validated_active_generation_is_current(report_dir)
+        return {
+            "action": (
+                _STEP4_RELEASE_REPUBLISH
+                if reusable else _STEP4_RELEASE_RESUME_PIPELINE
+            ),
+            "release_verified": False,
+            "disposition": normalized,
+            "reason_code": (
+                "BINARY_STEP4_REPORT_REPUBLICATION_REQUIRED"
+                if reusable else "BINARY_STEP4_PIPELINE_RESUME_REQUIRED"
+            ),
+            "verification_error": (
+                f"{type(error).__name__}:"
+                f"{getattr(error, 'reason_code', '') or str(error)}"
+            ),
+        }
+    return {
+        "action": _STEP4_RELEASE_CURRENT,
+        "release_verified": True,
+        "disposition": normalized,
+        "reason_code": "",
+        "committed_receipt_identity": str(
+            receipt.get("committed_receipt_identity") or ""
+        ),
+        "result_generation_identity": str(
+            (receipt.get("binding") or {}).get(
+                "result_generation_identity"
+            ) or ""
+        ),
+    }
+
+
+def _recover_binary_step4_transaction(
+    report_dir,
+    *,
+    expected_gate_name=None,
+    expected_strict_risk_gate=None,
+):
+    report = Path(report_dir).resolve()
+    checkpoint_path = _step4_validation_checkpoint_path(report)
+    binary_root = report / BINARY_OUTPUT_RELATIVE_PATH
+    evidence_root = report / "evidence"
+    checkpoint = _read_step4_validation_checkpoint(
+        report, missing_ok=True
+    )
+    pending_activation = None
+    if binary_root.exists() or binary_root.is_symlink():
+        try:
+            pending_activation = read_pending_binary_generation(
+                binary_root, missing_ok=True
+            )
+        except BinaryOutputError as error:
+            raise StepError(
+                f"Step4 private activation candidate 无法安全恢复：{error}",
+                reason_codes=["BINARY_STEP4_ACTIVE_DESCRIPTOR_INVALID"],
+            ) from error
+    if (
+        checkpoint is None
+        and pending_activation is None
+        and not list(evidence_root.glob(".jua-br-*.transaction.json"))
+    ):
+        return "nothing_to_recover"
+    destinations = _step4_report_publication_destinations(report)
+    recovery_metadata = report_publication_transaction_recovery_metadata(
+        destinations
+    )
+    state = str(recovery_metadata.get("state") or "absent")
+    checkpoint = checkpoint or {}
+    committed_receipt = {}
+    if state == "absent":
+        committed_receipt = report_publication_committed_receipt(
+            destinations,
+            verify_content=True,
+        )
+    result = _checkpoint_result_for_recovery(report, checkpoint)
+    transaction_schema_status = str(
+        recovery_metadata.get("implementation_status") or "absent"
+    )
+    transaction_expectation = None
+    if state != "absent":
+        transaction_expectation = {
+            "transaction_id": recovery_metadata.get("transaction_id"),
+            "binding": dict(recovery_metadata.get("binding") or {}),
+        }
+        result["report_publication_transaction"] = dict(
+            transaction_expectation
+        )
+        stored_binding = transaction_expectation["binding"]
+        result.update({
+            "result_generation_identity": stored_binding.get(
+                "result_generation_identity"
+            ),
+            "validation_run_identity": stored_binding.get(
+                "validation_run_identity"
+            ),
+            "activation_identity": stored_binding.get(
+                "activation_identity"
+            ),
+        })
+    # Only the legacy transaction schema needs a compatibility recovery path.
+    # A different renderer identity is provenance, not a reason to discard a
+    # content-bound transaction for the same generation and validation.
+    if state != "absent" and transaction_schema_status == "legacy":
+        if state == "committed":
+            # The old transaction had already reached its logical commit
+            # point.  Verify its published content and remove only leftover
+            # marker/stage/backup files; the current run will republish via
+            # the current report implementation.
+            recover_report_publication(
+                destinations,
+                expected_transaction_id=transaction_expectation[
+                    "transaction_id"
+                ],
+                expected_binding=transaction_expectation["binding"],
+            )
+            return "cleaned_legacy_committed_report_transaction"
+        rollback_binding = dict(recovery_metadata.get("binding") or {})
+        activation_recovery_state = _step4_activation_recovery_state(
+            report, rollback_binding
+        )
+        if (
+            state == "published"
+            and activation_recovery_state == "sealed_bound_generation"
+        ):
+            finalize_irreversible_report_publication(
+                destinations,
+                expected_transaction_id=transaction_expectation[
+                    "transaction_id"
+                ],
+                expected_binding=transaction_expectation["binding"],
+            )
+            return (
+                "committed_legacy_published_transaction_"
+                "requires_republication"
+            )
+        if activation_recovery_state not in {"rollbackable", "unbound"}:
+            raise StepError(
+                "旧格式 Step4 报告事务无法与当前 active generation 安全回滚。",
+                reason_codes=["BINARY_STEP4_TRANSACTION_RECOVERY_FAILED"],
+                diagnostic={
+                    "report_transaction_state": state,
+                    "activation_recovery_state": activation_recovery_state,
+                },
+            )
+        if activation_recovery_state == "unbound":
+            # Legacy v2 transactions may intentionally have an empty binding
+            # and therefore cannot authorize any active-generation mutation.
+            # Their exact persisted transaction id plus exact empty binding is
+            # still sufficient to restore the report directories.  Keep the
+            # normal creator path strict: only this incompatible recovery path
+            # accepts an unbound transaction.
+            restored = recover_report_publication(
+                destinations,
+                expected_transaction_id=transaction_expectation[
+                    "transaction_id"
+                ],
+                expected_binding=transaction_expectation["binding"],
+            )
+            if not restored:
+                raise StepError(
+                    "旧格式 Step4 报告事务未能恢复旧报告。",
+                    reason_codes=[
+                        "BINARY_STEP4_TRANSACTION_RECOVERY_FAILED"
+                    ],
+                    diagnostic={
+                        "report_transaction_state": state,
+                        "activation_recovery_state": (
+                            "not_attempted_without_bound_activation"
+                        ),
+                    },
+                )
+            return "rolled_back_legacy_report_transaction"
+        rollback_result = {
+            "result_generation_identity": rollback_binding.get(
+                "result_generation_identity"
+            ),
+            "activation_identity": rollback_binding.get(
+                "activation_identity"
+            ),
+            "report_publication_transaction": dict(
+                transaction_expectation
+            ),
+        }
+        rollback_status = _rollback_binary_step4_transaction(
+            report,
+            rollback_result
+            if all(rollback_result.values())
+            else result,
+        )
+        _require_successful_binary_step4_recovery_rollback(rollback_status)
+        return "rolled_back_legacy_report_transaction"
+    if state in {"gate_passed", "published"}:
+        persisted_gate_receipt = dict(
+            recovery_metadata.get("gate_receipt") or {}
+        )
+        policy_mismatch = (
+            not isinstance(expected_gate_name, str)
+            or not expected_gate_name
+            or type(expected_strict_risk_gate) is not bool
+            or persisted_gate_receipt.get("gate_name")
+            != expected_gate_name
+            or persisted_gate_receipt.get("strict_risk_gate")
+            is not expected_strict_risk_gate
+        )
+        activation_recovery_state = _step4_activation_recovery_state(
+            report, transaction_expectation["binding"]
+        )
+        activation_is_rollbackable = (
+            activation_recovery_state == "rollbackable"
+        )
+        if policy_mismatch and activation_is_rollbackable:
+            rollback_status = _rollback_binary_step4_transaction(report, result)
+            _require_successful_binary_step4_recovery_rollback(rollback_status)
+            return "rolled_back_gate_policy_mismatch"
+        if policy_mismatch and activation_recovery_state != (
+            "sealed_bound_generation"
+        ):
+            raise StepError(
+                "Step4 gate policy 已变化，且 active generation 状态无法安全收敛。",
+                reason_codes=["BINARY_STEP4_TRANSACTION_RECOVERY_FAILED"],
+                diagnostic={
+                    "activation_recovery_state": activation_recovery_state,
+                    "persisted_gate_receipt": persisted_gate_receipt,
+                },
+            )
+        committed_under_different_policy = bool(policy_mismatch)
+        result["report_publication_gate_receipt"] = (
+            persisted_gate_receipt
+        )
+        try:
+            publish_report_publication(
+                destinations,
+                expected_transaction_id=transaction_expectation[
+                    "transaction_id"
+                ],
+                expected_binding=transaction_expectation["binding"],
+            )
+            _seal_binary_step4_activation(report, result)
+            if checkpoint:
+                _finalize_binary_step4_transaction(
+                    report, result, delete_checkpoint=False
+                )
+            else:
+                active = _read_step4_active_descriptor(report)
+                receipt = report_publication_transaction_receipt(
+                    destinations,
+                    expected_transaction_id=transaction_expectation[
+                        "transaction_id"
+                    ],
+                    expected_binding=transaction_expectation["binding"],
+                )
+                published = _read_background_json(
+                    step4_api_changes_dir(report) / "summary.json"
+                )
+                receipt_binding = dict(receipt.get("binding") or {})
+                active_token = active.get("activation_identity")
+                active_is_sealed = (
+                    not active_token and "activation_predecessor" not in active
+                )
+                if (
+                    receipt.get("state") != "published"
+                    or active.get("result_generation_identity")
+                    != receipt_binding.get("result_generation_identity")
+                    or active.get("validation_run_identity")
+                    != receipt_binding.get("validation_run_identity")
+                    or active.get("validation_result_sha256")
+                    != receipt_binding.get("validation_result_sha256")
+                    or (
+                        active_token
+                        and active_token
+                        != receipt_binding.get("activation_identity")
+                    )
+                    or (not active_token and not active_is_sealed)
+                    or active.get("result_generation_identity")
+                    != published.get("result_generation_identity")
+                ):
+                    raise StepError(
+                        "gate-passed 报告与 active generation 身份不一致。",
+                        reason_codes=[
+                            "BINARY_STEP4_TRANSACTION_BINDING_MISMATCH"
+                        ],
+                    )
+        except Exception:
+            if activation_is_rollbackable:
+                rollback_status = _rollback_binary_step4_transaction(
+                    report, result
+                )
+                _require_successful_binary_step4_recovery_rollback(
+                    rollback_status
+                )
+            raise
+        _commit_binary_step4_activation_receipt(report, result)
+        if checkpoint:
+            _finalize_binary_step4_transaction(report, result)
+        commit_report_publication(
+            destinations,
+            expected_transaction_id=transaction_expectation[
+                "transaction_id"
+            ],
+            expected_binding=transaction_expectation["binding"],
+        )
+        if committed_under_different_policy:
+            # The sealed generation and its independent validation remain
+            # reusable.  The current policy must gate a freshly rendered
+            # report release, but changing report policy is not a reason to
+            # repeat the multi-hour production generation.
+            return "committed_gate_policy_requires_republication"
+        return "completed_gate_passed_transaction"
+    if state == "committed":
+        receipt = report_publication_transaction_receipt(
+            destinations,
+            expected_transaction_id=transaction_expectation[
+                "transaction_id"
+            ],
+            expected_binding=transaction_expectation["binding"],
+        )
+        if checkpoint:
+            _finalize_stale_committed_step4_checkpoint(
+                report, checkpoint, receipt
+            )
+        recover_report_publication(
+            destinations,
+            expected_transaction_id=transaction_expectation[
+                "transaction_id"
+            ],
+            expected_binding=transaction_expectation["binding"],
+        )
+        return "completed_committed_transaction"
+    if state == "absent" and checkpoint and committed_receipt:
+        receipt_binding = dict(committed_receipt.get("binding") or {})
+        _finalize_stale_committed_step4_checkpoint(
+            report, checkpoint, committed_receipt
+        )
+        return "completed_committed_receipt_checkpoint"
+    if state in {"staging", "prepared", "pending_gate"}:
+        rollback_status = _rollback_binary_step4_transaction(report, result)
+        _require_successful_binary_step4_recovery_rollback(rollback_status)
+        return "rolled_back_interrupted_transaction"
+    if state == "absent" and not checkpoint and pending_activation is not None:
+        orphan_result = {
+            "result_generation_identity": pending_activation.get(
+                "result_generation_identity"
+            ),
+            "activation_identity": pending_activation.get(
+                "activation_identity"
+            ),
+        }
+        rollback = _rollback_binary_step4_transaction(report, orphan_result)
+        _require_successful_binary_step4_recovery_rollback(rollback)
+        return "rolled_back_orphan_activation_candidate"
+    if (
+        state == "absent"
+        and pending_activation is None
+        and checkpoint.get("schema")
+        == "java-upgrade-analyzer.binary-generation-validation-checkpoint.v3"
+        and checkpoint.get("status") in {
+            "awaiting_independent_validation",
+            "independent_validation_failed",
+        }
+    ):
+        # These are durable pipeline resume states, not incomplete report
+        # publication transactions.  Do not mutate or trust their payload
+        # here: binary_pipeline performs the complete schema, content,
+        # implementation, input and authority-binding validation before it
+        # reuses anything.  Preserving the checkpoint avoids repeating the
+        # expensive generation phases after a validator crash or a repaired
+        # deterministic validator defect.
+        return "validation_checkpoint_resume_required"
+    if (
+        state == "absent"
+        and checkpoint.get("status")
+        == "independent_validation_passed_pending_activation"
+    ):
+        active = _read_step4_active_descriptor(report, missing_ok=True)
+        if (
+            not checkpoint.get("activation_identity")
+            or active.get("result_generation_identity")
+            != checkpoint.get("result_generation_identity")
+            or active.get("activation_identity")
+            != checkpoint.get("activation_identity")
+        ):
+            # The durable validation receipt was written before activation.
+            # Let the pipeline resume when that exact token is not active yet.
+            return "validation_checkpoint_pending_activation"
+        rollback = _rollback_binary_step4_transaction(report, result)
+        _require_successful_binary_step4_recovery_rollback(rollback)
+        restored_active = _read_step4_active_descriptor(
+            report, missing_ok=True
+        )
+        published = _read_background_json(
+            step4_api_changes_dir(report) / "summary.json"
+        )
+        if (
+            not published.get("result_generation_identity")
+            or published.get("result_generation_identity")
+            == restored_active.get("result_generation_identity")
+        ):
+            return "rolled_back_activation_before_report_publication"
+        raise StepError(
+            "Step4 存在待提交 checkpoint，但缺少可验证的 gate/report 事务凭据；"
+            "已回滚绑定的 active generation，不能把报告身份相同当作 gate 已通过。",
+            reason_codes=["BINARY_STEP4_REPORT_RECOVERY_EVIDENCE_MISSING"],
+            diagnostic=rollback,
+        )
+    raise StepError(
+        "Step4 存在无法归属到合法事务状态的 checkpoint、activation 或发布标记。",
+        reason_codes=["BINARY_STEP4_TRANSACTION_RECOVERY_FAILED"],
+        diagnostic={
+            "report_transaction_state": state,
+            "checkpoint_status": str(checkpoint.get("status") or ""),
+            "pending_activation_present": pending_activation is not None,
+        },
+    )
+
+
+@contextmanager
+def _binary_step4_pipeline_writer_lock(
+    report_dir,
+    *,
+    timeout_seconds,
+    operation,
+):
+    """Acquire the pipeline writer lease and label acquisition failures only."""
+
+    lock_path = (
+        Path(report_dir).resolve()
+        / BINARY_OUTPUT_RELATIVE_PATH
+        / ".binary-pipeline-run.lock"
+    )
+    manager = exclusive_file_lock(
+        lock_path,
+        timeout_seconds=max(0.0, float(timeout_seconds)),
+    )
+    try:
+        acquired_path = manager.__enter__()
+    except TimeoutError as error:
+        if operation == "recovery":
+            message = (
+                "Step4 启动恢复等待 binary output writer 超时；"
+                "恢复未执行，本轮也未启动新的分析子进程。"
+            )
+            reason_code = "BINARY_STEP4_RECOVERY_WRITER_LOCK_TIMEOUT"
+        else:
+            message = (
+                "Step4 子进程结束后，另一 writer 抢先占用了 binary output；"
+                "本轮未使用失去独占性的 deferred candidate。"
+            )
+            reason_code = "BINARY_STEP4_DEFERRED_HANDOFF_LOCK_TIMEOUT"
+        raise StepError(
+            message,
+            reason_codes=[reason_code],
+            diagnostic={"lock_path": str(lock_path)},
+        ) from error
+    except OSError as error:
+        if operation == "recovery":
+            message = f"Step4 启动恢复无法安全获取 binary output writer lock：{error}"
+            reason_code = "BINARY_STEP4_RECOVERY_WRITER_LOCK_UNAVAILABLE"
+        else:
+            message = (
+                "Step4 deferred handoff 无法获取 binary output writer "
+                f"lock：{error}"
+            )
+            reason_code = "BINARY_STEP4_DEFERRED_HANDOFF_LOCK_UNAVAILABLE"
+        raise StepError(
+            message,
+            reason_codes=[reason_code],
+            diagnostic={"lock_path": str(lock_path)},
+        ) from error
+    try:
+        yield acquired_path
+    finally:
+        # process_lock closes the descriptor even when explicit unlock fails,
+        # and preserves a body exception as the primary failure.
+        manager.__exit__(*sys.exc_info())
+
+
+@contextmanager
+def _binary_step4_serialization_lock(report_dir, timeout_seconds=None):
+    """Own the report-local Step4 transaction lease without doing recovery."""
+
+    if timeout_seconds is None:
+        try:
+            timeout_seconds = float(
+                os.environ.get("JUA_STEP4_RUN_LOCK_TIMEOUT_SECONDS") or 1.0
+            )
+        except (TypeError, ValueError):
+            timeout_seconds = 1.0
+    lock_path = (
+        Path(report_dir).resolve()
+        / BINARY_OUTPUT_RELATIVE_PATH
+        / ".step4-run.lock"
+    )
+    manager = exclusive_file_lock(
+        lock_path,
+        timeout_seconds=max(0.0, float(timeout_seconds)),
+    )
+    try:
+        acquired_path = manager.__enter__()
+    except TimeoutError as error:
+        raise StepError(
+            "同一报告目录已有 Step4 binary generation 正在运行；"
+            "本轮未启动重复分析。",
+            reason_codes=["BINARY_STEP4_RUN_ALREADY_ACTIVE"],
+            diagnostic={"lock_path": str(lock_path)},
+        ) from error
+    except OSError as error:
+        raise StepError(
+            f"Step4 无法安全获取 report transaction lock：{error}",
+            reason_codes=["BINARY_STEP4_RUN_LOCK_UNAVAILABLE"],
+            diagnostic={"lock_path": str(lock_path)},
+        ) from error
+    try:
+        yield acquired_path
+    finally:
+        manager.__exit__(*sys.exc_info())
+
+
+@contextmanager
+def _binary_step4_run_lock(
+    report_dir,
+    timeout_seconds=None,
+    *,
+    expected_gate_name=None,
+    expected_strict_risk_gate=None,
+):
+    """Serialize the generation, activation, report and gate transaction."""
+
+    with _binary_step4_serialization_lock(
+        report_dir, timeout_seconds=timeout_seconds
+    ) as lock_path:
+        # Recovery reads and may roll back the same checkpoint/pending
+        # activation state written by the standalone binary pipeline. Hold
+        # its writer lease only for recovery, then release it before yielding
+        # so the long-running child can acquire the same lease.
+        with _binary_step4_pipeline_writer_lock(
+            report_dir,
+            timeout_seconds=_STEP4_RECOVERY_WRITER_LOCK_TIMEOUT_SECONDS,
+            operation="recovery",
+        ):
+            try:
+                _recover_binary_step4_transaction(
+                    report_dir,
+                    expected_gate_name=expected_gate_name,
+                    expected_strict_risk_gate=expected_strict_risk_gate,
+                )
+            except StepError:
+                raise
+            except Exception as error:
+                raise StepError(
+                    f"Step4 中断事务恢复失败：{error}",
+                    reason_codes=[
+                        "BINARY_STEP4_TRANSACTION_RECOVERY_FAILED"
+                    ],
+                ) from error
+        yield lock_path
+
+
+@contextmanager
+def _binary_step4_deferred_handoff_lock(
+    report_dir, timeout_seconds=None
+):
+    """Own the pipeline output writer lease for the complete parent handoff."""
+
+    timeout = (
+        _STEP4_DEFERRED_HANDOFF_LOCK_TIMEOUT_SECONDS
+        if timeout_seconds is None
+        else max(0.0, float(timeout_seconds))
+    )
+    with _binary_step4_pipeline_writer_lock(
+        report_dir,
+        timeout_seconds=timeout,
+        operation="handoff",
+    ) as acquired_path:
+        yield acquired_path
+
+
+_BINARY_RUNTIME_OVERRIDE_KEYS = (
+    "base_jdk_home",
+    "current_jdk_home",
+    "active_profile_identities",
+    "resolved_configuration_properties",
+    "base_resolved_configuration_properties",
+    "current_resolved_configuration_properties",
+    "external_config_snapshot_identities",
+    "agent_transformer_plugin_profile_identities",
+    "step0_preflight",
+    "jvm_system_properties",
+    "runtime_system_properties",
+    "jvm_arguments",
+    "runtime_jvm_arguments",
+    "base_jvm_system_properties",
+    "current_jvm_system_properties",
+    "base_runtime_system_properties",
+    "current_runtime_system_properties",
+    "base_jvm_arguments",
+    "current_jvm_arguments",
+    "base_runtime_jvm_arguments",
+    "current_runtime_jvm_arguments",
+)
+
+
+def _binary_runtime_overrides(run_context):
+    return {
+        key: (run_context or {}).get(key)
+        for key in _BINARY_RUNTIME_OVERRIDE_KEYS
+        if (run_context or {}).get(key) not in (None, "", [], ())
+    }
 
 
 def _binary_pipeline_config_path(run_context, project_dir, report_dir):
@@ -11268,18 +13715,7 @@ def _binary_pipeline_config_path(run_context, project_dir, report_dir):
         try:
             generated = materialize_binary_pipeline_config(
                 report_dir,
-                runtime_overrides={
-                    key: run_context.get(key)
-                    for key in (
-                        "base_jdk_home",
-                        "current_jdk_home",
-                        "active_profile_identities",
-                        "external_config_snapshot_identities",
-                        "agent_transformer_plugin_profile_identities",
-                        "step0_preflight",
-                    )
-                    if run_context.get(key) not in (None, "", [], ())
-                },
+                runtime_overrides=_binary_runtime_overrides(run_context),
             )
         except BinaryRuntimeMaterializationError as error:
             raise StepError(
@@ -11459,20 +13895,86 @@ def _resolved_binary_pipeline_config_path(
     return resolved
 
 
-def _record_binary_failure(report_dir, config_path, exc):
+def _binary_progress_file_snapshot(path):
+    """Read one race-checked, bounded progress snapshot and its identity."""
+
+    candidate = Path(path)
+    try:
+        before = candidate.stat()
+        if before.st_size > _BINARY_PROGRESS_MAX_BYTES:
+            return None, None
+        content = candidate.read_bytes()
+        after = candidate.stat()
+    except OSError:
+        return None, None
+    before_identity = (
+        int(before.st_dev), int(before.st_ino), int(before.st_size),
+        int(before.st_mtime_ns),
+    )
+    after_identity = (
+        int(after.st_dev), int(after.st_ino), int(after.st_size),
+        int(after.st_mtime_ns),
+    )
+    if before_identity != after_identity:
+        return None, None
+    identity = (*after_identity, hashlib.sha256(content).hexdigest())
+    try:
+        progress = json.loads(content.decode("utf-8"))
+    except (UnicodeError, ValueError, RecursionError):
+        return None, identity
+    return (progress if type(progress) is dict else None), identity
+
+
+def _binary_progress_file_identity(path):
+    """Return a cheap attempt boundary for non-authoritative progress."""
+
+    _progress, identity = _binary_progress_file_snapshot(path)
+    return identity
+
+
+def _attempt_bound_child_progress(structured_result):
+    """Return ``(has_child_contract, progress)`` without shared-file fallback."""
+
+    child_failure = _binary_pipeline_failure_payload(structured_result)
+    if child_failure is None:
+        return False, {}
+    if child_failure.get("progress_bound_to_attempt") is not True:
+        return True, {}
+    attempt_identity = child_failure["attempt_identity"]
+    progress = child_failure.get("last_progress")
+    if (
+        type(progress) is dict
+        and progress.get("attempt_identity") == attempt_identity
+    ):
+        return True, progress
+    return True, {}
+
+
+def _legacy_progress_after_baseline(path, progress_baseline):
+    """Use only a stable, changed legacy snapshot with no foreign attempt id."""
+
+    progress, identity = _binary_progress_file_snapshot(path)
+    if (
+        progress is None
+        or identity is None
+        or (
+            progress_baseline is not None
+            and identity == progress_baseline
+        )
+        or str(progress.get("attempt_identity") or "")
+    ):
+        return {}
+    return progress
+
+
+def _record_binary_failure(
+    report_dir, config_path, exc, *, progress_baseline=None,
+):
     report = Path(report_dir).resolve()
     binary_progress = (
         report / BINARY_OUTPUT_RELATIVE_PATH
         / "binary_observability" / "latest_in_progress.json"
     )
-    last_progress = {}
-    if binary_progress.is_file():
-        try:
-            candidate = read_json(binary_progress)
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            candidate = {}
-        if isinstance(candidate, dict):
-            last_progress = candidate
     run_log = runtime_background_dir(report) / "run.log"
     run_log_tail = ""
     if run_log.is_file():
@@ -11485,6 +13987,13 @@ def _record_binary_failure(report_dir, config_path, exc):
             run_log_tail = ""
     diagnostic = dict(getattr(exc, "diagnostic", {}) or {})
     structured_result = diagnostic.get("structured_result")
+    has_child_contract, last_progress = _attempt_bound_child_progress(
+        structured_result
+    )
+    if not has_child_contract:
+        last_progress = _legacy_progress_after_baseline(
+            binary_progress, progress_baseline
+        )
     subprocess_traceback = (
         str((structured_result or {}).get("traceback") or "")
         if isinstance(structured_result, dict)
@@ -11495,6 +14004,11 @@ def _record_binary_failure(report_dir, config_path, exc):
         or str(diagnostic.get("traceback") or "")
         or traceback.format_exc()
     )[-32000:]
+    structured_failed_phase = (
+        str((structured_result or {}).get("failed_phase") or "")
+        if has_child_contract
+        else ""
+    )
     failure = {
         "schema": "java-upgrade-analyzer.binary-generation-failure.v2",
         "authority": "binary_first",
@@ -11502,7 +14016,10 @@ def _record_binary_failure(report_dir, config_path, exc):
         "failure_type": type(exc).__name__,
         "failure_message": str(exc),
         "failure_reason_codes": list(getattr(exc, "reason_codes", []) or []),
-        "failed_phase": str(last_progress.get("current_phase") or ""),
+        "failed_phase": (
+            structured_failed_phase
+            or str(last_progress.get("current_phase") or "")
+        ),
         "last_progress": last_progress,
         "diagnostic": diagnostic,
         "traceback": recorded_traceback,
@@ -11525,64 +14042,274 @@ def _record_binary_failure(report_dir, config_path, exc):
     return failure, destination
 
 
-def _run_binary_step4(
-    *, run_context, project_dir, report_dir, s4_dir,
-):
-    config_path = None
-    binary_root = report_dir / BINARY_OUTPUT_RELATIVE_PATH
-    active_path = binary_root / "active_binary_generation.json"
-    previous_active = read_json(active_path) if active_path.is_file() else None
+def _prepare_fresh_subprocess_result(path):
+    """Remove a prior subprocess receipt before starting a new attempt."""
+
+    result_path = Path(path)
+    result_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        config_path = _resolved_binary_pipeline_config_path(
-            run_context, project_dir, report_dir
+        result_path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise StepError(
+            f"无法清理上一次子进程结果 {result_path}: {error}",
+            reason_codes=["BINARY_SUBPROCESS_RESULT_PATH_INVALID"],
+        ) from error
+    try:
+        fsync_directory(result_path.parent)
+    except OSError as error:
+        raise StepError(
+            f"无法持久清理上一次子进程结果 {result_path}: {error}",
+            reason_codes=["BINARY_SUBPROCESS_RESULT_PATH_INVALID"],
+        ) from error
+
+
+def _raise_binary_step4_run_failure(
+    *,
+    report_dir,
+    config_path,
+    progress_baseline,
+    error,
+    result=None,
+):
+    """Record and raise one reversible Step4 generation/handoff failure."""
+
+    # Only a receipt read from this child's dedicated result path can grant
+    # rollback authority.  Never adopt the live checkpoint here: another
+    # writer may have replaced checkpoint+pending state in the handoff gap.
+    owned_result = result if isinstance(result, dict) else {}
+    activated_generation_identity = str(
+        owned_result.get("result_generation_identity") or ""
+    )
+    activation_identity = str(
+        owned_result.get("activation_identity") or ""
+    )
+    has_owned_activation_receipt = bool(
+        re.fullmatch(r"[0-9a-f]{64}", activated_generation_identity)
+        and re.fullmatch(r"[0-9a-f]{64}", activation_identity)
+    )
+    if has_owned_activation_receipt:
+        rollback_status = _rollback_binary_step4_transaction(
+            report_dir, owned_result
         )
-        result_path = runtime_state_dir(report_dir) / "binary_pipeline_result.json"
-        pipeline_started = time.perf_counter()
-        run_python(
-            "binary_pipeline.py",
-            [
-                "--config", str(config_path),
-                "--output-root", str(binary_root),
-                "--result-json", str(result_path),
-            ],
-            project_dir,
-            report_dir=report_dir,
+    else:
+        rollback_status = {
+            "report_publication_rollback": (
+                "not_attempted_without_owned_receipt"
+            ),
+            "active_generation_rollback": (
+                "not_attempted_without_owned_receipt"
+            ),
+        }
+    _failure, failure_path = _record_binary_failure(
+        report_dir,
+        config_path,
+        error,
+        progress_baseline=progress_baseline,
+    )
+    raise StepError(
+        f"BINARY_GENERATION_FAILED: {error}; failure={failure_path}",
+        reason_codes=(
+            list(getattr(error, "reason_codes", []) or [])
+            + ["BINARY_GENERATION_FAILED"]
+        ),
+        diagnostic={
+            **dict(getattr(error, "diagnostic", {}) or {}),
+            **rollback_status,
+        },
+    ) from error
+
+
+def _prepare_binary_report_publication_candidate_in_process(
+    *,
+    phase,
+    report_dir,
+    output_dir=None,
+    output_findings=None,
+    output_report=None,
+    selected_coords=(),
+    selected_names=(),
+    candidate_activation_identity="",
+):
+    """Render one private report candidate in the lock-owning process.
+
+    The prepare-only binary-report API intentionally does not acquire the
+    workflow lock: its former subprocess caller inherited no safe way to prove
+    that the parent held that lock.  Keeping the call in this process lets the
+    thread-local workflow lease act as the trust boundary and avoids exposing
+    a forgeable CLI escape hatch.
+    """
+
+    normalized_phase = str(phase or "").strip()
+    if normalized_phase not in {"step4", "step5", "step6"}:
+        raise StepError(
+            f"报告候选阶段无效：{normalized_phase}",
+            reason_codes=["BINARY_REPORT_PREPARE_PHASE_INVALID"],
         )
-        pipeline_subprocess_seconds = round(
-            time.perf_counter() - pipeline_started, 6
+    report = Path(report_dir).resolve()
+    if not _workflow_mutation_lock_is_held(report):
+        raise StepError(
+            "报告候选只能在持有同一报告目录 workflow mutation lock 的编排进程内生成。",
+            reason_codes=["BINARY_REPORT_PREPARE_WORKFLOW_LOCK_REQUIRED"],
         )
-        result = read_json(result_path)
-        if (
-            result.get("validation_status") != "passed"
-            or not result.get("result_generation_identity")
-            or not result.get("analysis_context_identity")
-        ):
-            raise StepError(
-                "BINARY_PIPELINE_RESULT_INVALID: generation 未通过独立验证或身份缺失"
+
+    heartbeat_stop = threading.Event()
+    started = time.perf_counter()
+    try:
+        heartbeat_interval = float(
+            os.environ.get("JUA_HEARTBEAT_INTERVAL_SECONDS") or 30
+        )
+    except (TypeError, ValueError):
+        heartbeat_interval = 30.0
+    heartbeat_interval = max(0.01, heartbeat_interval)
+
+    def heartbeat_loop():
+        while not heartbeat_stop.wait(heartbeat_interval):
+            emit_progress(
+                normalized_phase,
+                "heartbeat",
+                "报告候选仍在生成，系统会继续自动处理，无需操作。",
+                elapsed=time.perf_counter() - started,
+                report_dir=report,
             )
-        report_started = time.perf_counter()
-        run_python(
-            "binary_report.py",
-            [
-                "--phase", "step4",
-                "--report-dir", str(report_dir),
-                "--output-dir", str(s4_dir),
-            ],
-            project_dir,
-            report_dir=report_dir,
+
+    heartbeat_thread = threading.Thread(
+        target=heartbeat_loop,
+        name=f"jua-report-prepare-{normalized_phase}",
+        daemon=True,
+    )
+    heartbeat_thread.start()
+    try:
+        with _report_publication_prepare_capability(
+            report, normalized_phase
+        ):
+            if normalized_phase == "step4":
+                result = prepare_step4_publication_candidate(
+                    report,
+                    output_dir,
+                    candidate_activation_identity=str(
+                        candidate_activation_identity or ""
+                    ),
+                )
+            elif normalized_phase == "step5":
+                result = prepare_step5_publication_candidate(
+                    report,
+                    output_dir,
+                    selected_coords=tuple(selected_coords or ()),
+                    selected_names=tuple(selected_names or ()),
+                )
+            else:
+                result = prepare_step6_publication_candidate(
+                    report,
+                    output_findings,
+                    output_report,
+                )
+    except BinaryReportError as error:
+        raise StepError(
+            f"binary_report in-process prepare 失败：{error}",
+            reason_codes=[str(error.reason_code or "")],
+            diagnostic={
+                "script": "binary_report.py",
+                "execution_mode": "lock_owning_parent_process",
+                "phase": normalized_phase,
+                "cause_reason_code": str(error.reason_code or ""),
+            },
+        ) from error
+    finally:
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=1)
+    return dict(result or {})
+
+
+def _prepare_binary_step4_deferred_handoff(
+    *,
+    result,
+    project_dir,
+    report_dir,
+    s4_dir,
+    pipeline_subprocess_seconds,
+):
+    """Validate the child receipt and create its report candidate under lock."""
+
+    _revalidate_binary_step4_deferred_handoff(report_dir, result)
+    report_started = time.perf_counter()
+    report_result = _prepare_binary_report_publication_candidate_in_process(
+        phase="step4",
+        report_dir=report_dir,
+        output_dir=s4_dir,
+        candidate_activation_identity=str(result["activation_identity"]),
+    )
+    report_seconds = round(time.perf_counter() - report_started, 6)
+    creator_transaction = dict(
+        report_result.get("publication_transaction") or {}
+    )
+    creator_expectation = _step4_report_publication_expectation(
+        {"publication_transaction": creator_transaction},
+        required=True,
+    )
+    # Preserve the child-issued creator token before any later receipt read.
+    # Failure cleanup must CAS against this transaction, never adopt a
+    # replacement that happens to share generation identities.
+    result["report_publication_transaction"] = dict(creator_expectation)
+    try:
+        publication_receipt = report_publication_transaction_receipt(
+            _step4_report_publication_destinations(report_dir),
+            expected_transaction_id=creator_expectation["transaction_id"],
+            expected_binding=creator_expectation["binding"],
         )
-        report_seconds = round(time.perf_counter() - report_started, 6)
-        timing_rows = list(result.get("phase_timings") or ())
-        timing_rows.extend((
-            {
-                "phase": "binary_pipeline_subprocess_total",
-                "elapsed_seconds": pipeline_subprocess_seconds,
-            },
-            {
-                "phase": "step4_human_report_publication",
-                "elapsed_seconds": report_seconds,
-            },
-        ))
+    except Exception as error:
+        raise StepError(
+            "Step4 报告创建者事务已被替换或无法验证。",
+            reason_codes=["BINARY_STEP4_REPORT_TRANSACTION_MISSING"],
+        ) from error
+    active_for_publication = _read_step4_active_descriptor(report_dir)
+    expected_publication_binding = {
+        "result_generation_identity": result[
+            "result_generation_identity"
+        ],
+        "validation_run_identity": result["validation_run_identity"],
+        "validation_result_sha256": active_for_publication.get(
+            "validation_result_sha256"
+        ),
+        "activation_identity": result["activation_identity"],
+        "report_implementation_identity": report_implementation_identity(),
+    }
+    if (
+        report_result.get("phase") != "step4"
+        or active_for_publication.get("result_generation_identity")
+        != result["result_generation_identity"]
+        or active_for_publication.get("validation_run_identity")
+        != result["validation_run_identity"]
+        or active_for_publication.get("activation_identity")
+        != result["activation_identity"]
+        or publication_receipt.get("state") != "pending_gate"
+        or publication_receipt.get("binding")
+        != expected_publication_binding
+        or creator_transaction.get("published_content_identity")
+        != publication_receipt.get("published_content_identity")
+        or creator_transaction.get("destinations")
+        != publication_receipt.get("destinations")
+        or creator_transaction.get("candidate_destinations")
+        != publication_receipt.get("candidate_destinations")
+    ):
+        raise StepError(
+            "Step4 报告未进入创建者绑定的 pending-gate 事务状态。",
+            reason_codes=["BINARY_STEP4_REPORT_TRANSACTION_MISSING"],
+        )
+    result["report_publication_transaction"] = publication_receipt
+    timing_rows = list(result.get("phase_timings") or ())
+    timing_rows.extend((
+        {
+            "phase": "binary_pipeline_subprocess_total",
+            "elapsed_seconds": pipeline_subprocess_seconds,
+        },
+        {
+            "phase": "step4_human_report_publication",
+            "elapsed_seconds": report_seconds,
+        },
+    ))
+    try:
         write_csv_rows(
             runtime_observability_dir(report_dir) / "step4_timing.csv",
             [
@@ -11603,27 +14330,790 @@ def _run_binary_step4(
                 }
                 for row in timing_rows
             ],
-            ("phase", "elapsed_seconds", "result_generation_identity", "details"),
-        )
-        return result
-    except StepError as exc:
-        # Generation activation and report publication form one logical
-        # transaction for consumers. Preserve the previous validated pointer if
-        # publishing the newly validated generation fails.
-        if previous_active is None:
-            if active_path.exists():
-                active_path.unlink()
-        else:
-            write_json(active_path, previous_active)
-        _failure, failure_path = _record_binary_failure(report_dir, config_path, exc)
-        raise StepError(
-            f"BINARY_GENERATION_FAILED: {exc}; failure={failure_path}",
-            reason_codes=(
-                list(getattr(exc, "reason_codes", []) or [])
-                + ["BINARY_GENERATION_FAILED"]
+            (
+                "phase", "elapsed_seconds", "result_generation_identity",
+                "details",
             ),
-            diagnostic=dict(getattr(exc, "diagnostic", {}) or {}),
-        ) from exc
+        )
+    except Exception:
+        # Timing is observability and cannot invalidate the already-bound
+        # generation/report transaction.
+        pass
+    return result
+
+
+def _run_binary_step4(
+    *,
+    run_context,
+    project_dir,
+    report_dir,
+    s4_dir,
+    complete_deferred_handoff=False,
+    gate_name=None,
+    strict_risk_gate=False,
+):
+    # Persist the one-way protocol boundary before binary_pipeline creates or
+    # replaces any protocol-era shared state.  A crash can no longer make a
+    # partially upgraded report look like a legacy report.
+    ensure_report_publication_protocol(report_dir)
+    config_path = None
+    binary_root = report_dir / BINARY_OUTPUT_RELATIVE_PATH
+    progress_baseline = _binary_progress_file_identity(
+        binary_root / "binary_observability" / "latest_in_progress.json"
+    )
+    result_path = runtime_state_dir(report_dir) / "binary_pipeline_result.json"
+    try:
+        config_path = _resolved_binary_pipeline_config_path(
+            run_context, project_dir, report_dir
+        )
+        _prepare_fresh_subprocess_result(result_path)
+        pipeline_started = time.perf_counter()
+        run_python(
+            "binary_pipeline.py",
+            [
+                "--config", str(config_path),
+                "--output-root", str(binary_root),
+                "--result-json", str(result_path),
+                "--retain-validation-checkpoint",
+            ],
+            project_dir,
+            report_dir=report_dir,
+        )
+        pipeline_subprocess_seconds = round(
+            time.perf_counter() - pipeline_started, 6
+        )
+    except Exception as error:
+        _raise_binary_step4_run_failure(
+            report_dir=report_dir,
+            config_path=config_path,
+            progress_baseline=progress_baseline,
+            error=error,
+        )
+
+    # Do not take this lease before launching binary_pipeline: the child owns
+    # the same lock for its long generation and validation transaction.  Once
+    # it exits, the parent takes over the exact writer lease and does not
+    # release it until the deferred report/activation transaction is complete.
+    with _binary_step4_deferred_handoff_lock(report_dir):
+        result = None
+        try:
+            # Preserve the child-issued receipt even if fail-closed
+            # revalidation below rejects current shared state.  It is an
+            # untrusted CAS token, never authority to adopt a live checkpoint.
+            result = read_json(result_path)
+            result = _prepare_binary_step4_deferred_handoff(
+                result=result,
+                project_dir=project_dir,
+                report_dir=report_dir,
+                s4_dir=s4_dir,
+                pipeline_subprocess_seconds=pipeline_subprocess_seconds,
+            )
+        except Exception as error:
+            # The writer lease is still held while rollback and failure
+            # evidence are produced, so neither can race another pipeline.
+            _raise_binary_step4_run_failure(
+                report_dir=report_dir,
+                config_path=config_path,
+                progress_baseline=progress_baseline,
+                error=error,
+                result=result,
+            )
+        if complete_deferred_handoff:
+            _complete_binary_step4_after_gate(
+                report_dir=report_dir,
+                project_dir=project_dir,
+                gate_name=gate_name,
+                strict_risk_gate=bool(strict_risk_gate),
+                result=result,
+            )
+        return result
+
+
+def _finalize_binary_step4_transaction(
+    report_dir, result, *, delete_checkpoint=True
+):
+    """Delete a retained checkpoint only after report publication and its gate."""
+
+    if not bool((result or {}).get("validation_checkpoint_retained")):
+        return False
+    report = Path(report_dir).resolve()
+    binary_root = report / BINARY_OUTPUT_RELATIVE_PATH
+    checkpoint_path = (
+        binary_root / "binary_observability" / "validation_checkpoint.json"
+    )
+    declared_path = Path(
+        str((result or {}).get("validation_checkpoint_path") or "")
+    )
+    transaction_expectation = _step4_report_publication_expectation(
+        result, required=True
+    )
+    try:
+        declared_path = declared_path.resolve(strict=True)
+        expected_path = checkpoint_path.resolve(strict=True)
+        checkpoint = _read_step4_validation_checkpoint(report)
+        active = _read_step4_active_descriptor(report)
+        publication_receipt = report_publication_transaction_receipt(
+            _step4_report_publication_destinations(report),
+            expected_transaction_id=transaction_expectation[
+                "transaction_id"
+            ],
+            expected_binding=transaction_expectation["binding"],
+        )
+        published = read_json(step4_api_changes_dir(report) / "summary.json")
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise StepError(
+            f"Step4 事务 checkpoint 无法完成提交：{error}",
+            reason_codes=["BINARY_STEP4_TRANSACTION_CHECKPOINT_INVALID"],
+        ) from error
+    generation_identity = str(
+        (result or {}).get("result_generation_identity") or ""
+    )
+    validation_identity = str((result or {}).get("validation_run_identity") or "")
+    activation_identity = str((result or {}).get("activation_identity") or "")
+    expected_publication_binding = {
+        "result_generation_identity": generation_identity,
+        "validation_run_identity": validation_identity,
+        "validation_result_sha256": active.get("validation_result_sha256"),
+        "activation_identity": activation_identity,
+    }
+    actual_publication_binding = dict(
+        publication_receipt.get("binding") or {}
+    )
+    actual_publication_binding.pop("report_implementation_identity", None)
+    if (
+        declared_path != expected_path
+        or checkpoint.get("schema")
+        != "java-upgrade-analyzer.binary-generation-validation-checkpoint.v3"
+        or checkpoint.get("status")
+        != "independent_validation_passed_pending_activation"
+        or checkpoint.get("result_generation_identity") != generation_identity
+        or checkpoint.get("validation_run_identity") != validation_identity
+        or checkpoint.get("activation_identity") != activation_identity
+        or active.get("result_generation_identity") != generation_identity
+        or (
+            active.get("activation_identity")
+            and active.get("activation_identity") != activation_identity
+        )
+        or published.get("result_generation_identity") != generation_identity
+        or publication_receipt.get("state") not in {
+            "gate_passed", "published"
+        }
+        or actual_publication_binding != expected_publication_binding
+        or publication_receipt.get("gate_receipt")
+        != (result or {}).get("report_publication_gate_receipt")
+    ):
+        raise StepError(
+            "Step4 事务 checkpoint、active generation 与已发布报告身份不一致。",
+            reason_codes=["BINARY_STEP4_TRANSACTION_BINDING_MISMATCH"],
+        )
+    if delete_checkpoint:
+        # Activation and report publication are already content-bound.
+        # Startup recovery can remove a leftover checkpoint later.
+        _cleanup_committed_step4_checkpoint(checkpoint_path)
+    return True
+
+
+def _complete_binary_step4_after_gate(
+    *,
+    report_dir,
+    project_dir,
+    gate_name,
+    strict_risk_gate,
+    result,
+):
+    destinations = _step4_report_publication_destinations(report_dir)
+    transaction_expectation = _step4_report_publication_expectation(
+        result, required=True
+    )
+    try:
+        run_gate(
+            gate_name,
+            report_dir,
+            project_dir,
+            strict_risk_gate=bool(strict_risk_gate),
+            publication_transaction=(
+                result or {}
+            ).get("report_publication_transaction"),
+            candidate_activation_identity=str(
+                (result or {}).get("activation_identity") or ""
+            ),
+        )
+        gate_receipt = mark_report_publication_gate_passed(
+            destinations,
+            expected_transaction_id=transaction_expectation[
+                "transaction_id"
+            ],
+            expected_binding=transaction_expectation["binding"],
+            gate_name=str(gate_name or ""),
+            strict_risk_gate=bool(strict_risk_gate),
+        )
+        result["report_publication_gate_receipt"] = gate_receipt
+        publish_report_publication(
+            destinations,
+            expected_transaction_id=transaction_expectation[
+                "transaction_id"
+            ],
+            expected_binding=transaction_expectation["binding"],
+        )
+        _seal_binary_step4_activation(report_dir, result)
+        # Validate every checkpoint/report/activation binding while rollback
+        # is still possible, but retain the checkpoint bytes until the
+        # activation receipt reaches its commit point below.
+        _finalize_binary_step4_transaction(
+            report_dir, result, delete_checkpoint=False
+        )
+    except Exception as error:
+        rollback = _rollback_binary_step4_transaction(report_dir, result)
+        if isinstance(error, StepError):
+            raise StepError(
+                str(error),
+                reason_codes=list(error.reason_codes),
+                diagnostic={
+                    **dict(error.diagnostic or {}),
+                    **rollback,
+                },
+            ) from error
+        raise StepError(
+            f"Step4 事务提交失败：{error}",
+            reason_codes=["BINARY_STEP4_TRANSACTION_COMMIT_FAILED"],
+            diagnostic=rollback,
+        ) from error
+    # Removing the private activation receipt is the single-generation commit
+    # point.  Reports are already gate-approved and published with rollback
+    # backups; startup recovery finishes their marker cleanup if we stop here.
+    _commit_binary_step4_activation_receipt(report_dir, result)
+    # Retain the content-bound checkpoint until the activation receipt reaches
+    # the irreversible commit point.  If deletion later fails, startup can
+    # safely finish the cleanup without repeating a multi-hour Step4 run.
+    _finalize_binary_step4_transaction(report_dir, result)
+    commit_report_publication(
+        destinations,
+        expected_transaction_id=transaction_expectation["transaction_id"],
+        expected_binding=transaction_expectation["binding"],
+    )
+    global_release = reconcile_current_release(
+        report_dir, workflow_lock_held=True
+    )
+    if (
+        (global_release.get("step4") or {}).get("status") != "current"
+        or (global_release.get("step5") or {}).get("status") != "stale"
+        or (global_release.get("step6") or {}).get("status") != "stale"
+    ):
+        raise StepError(
+            "Step4 提交后全局 release 未将下游阶段标记为 stale。",
+            reason_codes=["BINARY_GLOBAL_RELEASE_STATE_INVALID"],
+        )
+    return True
+
+
+def _republish_current_binary_step4_reports(
+    *,
+    report_dir,
+    project_dir,
+    gate_name,
+    strict_risk_gate,
+):
+    """Re-render and gate Step4 views from a sealed validated generation."""
+
+    report = Path(report_dir).resolve()
+    destinations = _step4_report_publication_destinations(report)
+    started = time.perf_counter()
+    creator = None
+    try:
+        baseline = report_publication_transaction_recovery_metadata(
+            destinations
+        )
+        if str(baseline.get("state") or "absent") != "absent":
+            raise StepError(
+                "Step4 快速重发布启动前仍有未收敛的报告事务。",
+                reason_codes=[
+                    "BINARY_STEP4_TRANSACTION_RECOVERY_FAILED"
+                ],
+            )
+        rendered = _prepare_binary_report_publication_candidate_in_process(
+            phase="step4",
+            report_dir=report,
+            output_dir=step4_api_changes_dir(report),
+        )
+        creator = _step4_report_publication_expectation(
+            {
+                "publication_transaction": rendered.get(
+                    "publication_transaction"
+                )
+            },
+            required=True,
+        )
+        receipt = report_publication_transaction_receipt(
+            destinations,
+            expected_transaction_id=creator["transaction_id"],
+            expected_binding=creator["binding"],
+        )
+        active = read_active_binary_generation(
+            report / BINARY_OUTPUT_RELATIVE_PATH
+        )
+        expected_binding = {
+            "result_generation_identity": active[
+                "result_generation_identity"
+            ],
+            "validation_run_identity": active["validation_run_identity"],
+            "validation_result_sha256": active[
+                "validation_result_sha256"
+            ],
+            "report_implementation_identity": (
+                report_implementation_identity()
+            ),
+        }
+        if (
+            rendered.get("phase") != "step4"
+            or receipt.get("state") != "pending_gate"
+            or dict(receipt.get("binding") or {}) != expected_binding
+            or receipt.get("published_content_identity")
+            != (rendered.get("publication_transaction") or {}).get(
+                "published_content_identity"
+            )
+        ):
+            raise StepError(
+                "Step4 快速重发布事务未绑定当前 sealed generation。",
+                reason_codes=[
+                    "BINARY_STEP4_REPORT_TRANSACTION_BINDING_MISMATCH"
+                ],
+            )
+        run_gate(
+            gate_name,
+            report,
+            project_dir,
+            strict_risk_gate=bool(strict_risk_gate),
+            publication_transaction=receipt,
+            candidate_activation_identity="",
+        )
+        active_lock_path = (
+            report
+            / BINARY_OUTPUT_RELATIVE_PATH
+            / ".active-generation.lock"
+        )
+        with exclusive_file_lock(active_lock_path, timeout_seconds=5.0):
+            # The gate ran outside this short commit lock.  Re-read both CAS
+            # inputs here so a standalone activation cannot make a valid old
+            # candidate overwrite the reports for a newer generation.
+            live_active = read_active_binary_generation(
+                report / BINARY_OUTPUT_RELATIVE_PATH
+            )
+            live_expected_binding = {
+                "result_generation_identity": live_active[
+                    "result_generation_identity"
+                ],
+                "validation_run_identity": live_active[
+                    "validation_run_identity"
+                ],
+                "validation_result_sha256": live_active[
+                    "validation_result_sha256"
+                ],
+                "report_implementation_identity": (
+                    report_implementation_identity()
+                ),
+            }
+            live_receipt = report_publication_transaction_receipt(
+                destinations,
+                expected_transaction_id=creator["transaction_id"],
+                expected_binding=creator["binding"],
+            )
+            if (
+                live_receipt.get("state") != "pending_gate"
+                or dict(live_receipt.get("binding") or {})
+                != live_expected_binding
+            ):
+                raise StepError(
+                    "Step4 gate 后 active generation 已变化，拒绝提交旧报告。",
+                    reason_codes=[
+                        "BINARY_STEP4_REPORT_TRANSACTION_BINDING_MISMATCH"
+                    ],
+                )
+            gate_receipt = mark_report_publication_gate_passed(
+                destinations,
+                expected_transaction_id=creator["transaction_id"],
+                expected_binding=creator["binding"],
+                gate_name=str(gate_name or ""),
+                strict_risk_gate=bool(strict_risk_gate),
+            )
+            if not gate_receipt:
+                raise StepError(
+                    "Step4 快速重发布没有生成持久 gate receipt。",
+                    reason_codes=[
+                        "BINARY_STEP4_REPORT_REPUBLICATION_FAILED"
+                    ],
+                )
+            publish_report_publication(
+                destinations,
+                expected_transaction_id=creator["transaction_id"],
+                expected_binding=creator["binding"],
+            )
+            commit_report_publication(
+                destinations,
+                expected_transaction_id=creator["transaction_id"],
+                expected_binding=creator["binding"],
+            )
+            global_release = reconcile_current_release(
+                report,
+                workflow_lock_held=True,
+                active_lock_held=True,
+            )
+            if (
+                (global_release.get("step4") or {}).get("status")
+                != "current"
+                or (global_release.get("step5") or {}).get("status")
+                != "stale"
+                or (global_release.get("step6") or {}).get("status")
+                != "stale"
+            ):
+                raise StepError(
+                    "Step4 重发布后全局 release 未将下游阶段标记为 stale。",
+                    reason_codes=["BINARY_GLOBAL_RELEASE_STATE_INVALID"],
+                )
+            verified = verify_current_step4_release(
+                report,
+                expected_gate_name=str(gate_name or ""),
+                expected_strict_risk_gate=bool(strict_risk_gate),
+                workflow_lock_held=True,
+                active_lock_held=True,
+            )
+    except Exception as error:
+        rollback_status = "not_attempted"
+        try:
+            metadata = report_publication_transaction_recovery_metadata(
+                destinations
+            )
+            metadata_state = str(metadata.get("state") or "absent")
+            rollback_expectation = creator
+            if rollback_expectation is None and metadata_state != "absent":
+                transaction_id = str(
+                    metadata.get("transaction_id") or ""
+                )
+                binding = dict(metadata.get("binding") or {})
+                if transaction_id and binding:
+                    rollback_expectation = {
+                        "transaction_id": transaction_id,
+                        "binding": binding,
+                    }
+            if metadata_state == "committed":
+                rollback_status = "already_committed"
+            elif rollback_expectation is not None:
+                restored = rollback_report_publication(
+                    destinations,
+                    expected_transaction_id=rollback_expectation[
+                        "transaction_id"
+                    ],
+                    expected_binding=rollback_expectation["binding"],
+                )
+                rollback_status = (
+                    "restored_previous_reports" if restored else "not_present"
+                )
+            else:
+                rollback_status = "not_present"
+        except Exception as rollback_error:
+            rollback_status = (
+                "rollback_failed:"
+                f"{type(rollback_error).__name__}:"
+                f"{getattr(rollback_error, 'reason_code', '') or rollback_error}"
+            )
+        if isinstance(error, StepError):
+            raise StepError(
+                str(error),
+                reason_codes=list(error.reason_codes),
+                diagnostic={
+                    **dict(error.diagnostic or {}),
+                    "report_publication_rollback": rollback_status,
+                },
+            ) from error
+        raise StepError(
+            f"Step4 报告快速重发布失败：{error}",
+            reason_codes=["BINARY_STEP4_REPORT_REPUBLICATION_FAILED"],
+            diagnostic={
+                "report_publication_rollback": rollback_status,
+            },
+        ) from error
+    try:
+        write_csv_rows(
+            runtime_observability_dir(report) / "step4_timing.csv",
+            [{
+                "phase": "step4_report_republication",
+                "elapsed_seconds": round(
+                    time.perf_counter() - started, 6
+                ),
+                "result_generation_identity": (
+                    (verified.get("binding") or {}).get(
+                        "result_generation_identity"
+                    ) or ""
+                ),
+                "details": json.dumps(
+                    {
+                        "report_only": True,
+                        "committed_receipt_identity": verified.get(
+                            "committed_receipt_identity"
+                        ),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+            }],
+            (
+                "phase", "elapsed_seconds", "result_generation_identity",
+                "details",
+            ),
+        )
+    except Exception:
+        # Timing is observability, not release authority.  Once the content,
+        # gate receipt, and committed publication have been verified, an
+        # auxiliary metrics write must not turn success into a false failure.
+        pass
+    return verified
+
+
+def _rollback_downstream_report_publication(
+    report_dir,
+    stage,
+    creator_expectation=None,
+):
+    """Rollback only the exact unfinished Step5/6 transaction we own."""
+
+    destinations = _downstream_report_publication_destinations(
+        report_dir, stage
+    )
+    try:
+        metadata = report_publication_transaction_recovery_metadata(
+            destinations
+        )
+        state = str(metadata.get("state") or "absent")
+        if state == "absent":
+            return "not_present"
+        if state == "committed":
+            return "already_committed"
+        expectation = dict(creator_expectation or {})
+        if not expectation:
+            transaction_id = str(metadata.get("transaction_id") or "")
+            binding = dict(metadata.get("binding") or {})
+            if not transaction_id or not binding:
+                raise BinaryReportError(
+                    "BINARY_REPORT_PUBLICATION_RECOVERY_METADATA_INVALID",
+                    stage,
+                )
+            expectation = {
+                "transaction_id": transaction_id,
+                "binding": binding,
+            }
+        restored = rollback_report_publication(
+            destinations,
+            expected_transaction_id=expectation["transaction_id"],
+            expected_binding=expectation["binding"],
+        )
+        return "restored_previous_reports" if restored else "not_present"
+    except Exception as error:
+        return (
+            "rollback_failed:"
+            f"{type(error).__name__}:"
+            f"{getattr(error, 'reason_code', '') or error}"
+        )
+
+
+_STEP6_INTERNAL_INPUT_RECOVERY_ATTEMPTS = set()
+
+
+def step6_internal_input_failure_owner_from_step_error(error):
+    """Read the authenticated binary-report failure handoff from a child."""
+
+    if not isinstance(error, StepError):
+        return None
+    diagnostic = dict(error.diagnostic or {})
+    structured = diagnostic.get("structured_result")
+    if not isinstance(structured, dict):
+        return None
+    if (
+        structured.get("schema")
+        != "java-upgrade-analyzer.binary-report-publication-failure.v1"
+        or structured.get("status") != "failed"
+        or structured.get("phase") != "step6"
+        or structured.get("reason_code") not in {
+            "BINARY_STEP6_INTERNAL_INPUT_INVALID",
+            "BINARY_STEP6_UPSTREAM_EVIDENCE_MISSING",
+        }
+    ):
+        return None
+    owner_step = str(structured.get("owner_step") or "").strip()
+    contract = structured.get("failure_contract")
+    if (
+        owner_step not in {"step1", "step2", "step3"}
+        or not isinstance(contract, dict)
+        or contract.get("schema")
+        != "java-upgrade-analyzer.step6-internal-input-failure.v1"
+        or contract.get("status") != "failed"
+        or contract.get("owner_step") != owner_step
+    ):
+        return None
+    failures = contract.get("failures")
+    if not isinstance(failures, list) or not failures:
+        return None
+    failure_owners = []
+    for failure in failures:
+        if not isinstance(failure, dict):
+            return None
+        failure_owner = str(failure.get("owner_step") or "").strip()
+        if failure_owner not in {"step1", "step2", "step3"}:
+            return None
+        failure_owners.append(failure_owner)
+    if min(failure_owners, key=step_index) != owner_step:
+        return None
+    return owner_step
+
+
+def _run_downstream_report_publication(
+    *,
+    stage,
+    report_dir,
+    project_dir,
+    gate_name,
+    strict_risk_gate,
+    output_dir=None,
+    output_findings=None,
+    output_report=None,
+    selected_coords=(),
+    selected_names=(),
+):
+    """Render, gate, and commit Step5/6 without exposing a failed candidate."""
+
+    report = Path(report_dir).resolve()
+    destinations = _downstream_report_publication_destinations(report, stage)
+    creator_expectation = None
+    started = time.perf_counter()
+    try:
+        baseline = report_publication_transaction_recovery_metadata(
+            destinations
+        )
+        if str(baseline.get("state") or "absent") != "absent":
+            raise StepError(
+                f"{stage.capitalize()} 启动前仍有未收敛的报告事务。",
+                reason_codes=[
+                    f"BINARY_{stage.upper()}_TRANSACTION_RECOVERY_FAILED"
+                ],
+            )
+        require_current_release_stage(
+            report,
+            "step4" if stage == "step5" else "step5",
+            workflow_lock_held=True,
+        )
+        result = _prepare_binary_report_publication_candidate_in_process(
+            phase=stage,
+            report_dir=report,
+            output_dir=output_dir,
+            output_findings=output_findings,
+            output_report=output_report,
+            selected_coords=selected_coords,
+            selected_names=selected_names,
+        )
+        creator_transaction = dict(
+            result.get("publication_transaction") or {}
+        )
+        creator_expectation = _report_publication_expectation(
+            {"publication_transaction": creator_transaction},
+            stage=stage,
+            required=True,
+        )
+        receipt = report_publication_transaction_receipt(
+            destinations,
+            expected_transaction_id=creator_expectation["transaction_id"],
+            expected_binding=creator_expectation["binding"],
+        )
+        if (
+            result.get("phase") != stage
+            or receipt.get("state") != "pending_gate"
+            or receipt.get("published_content_identity")
+            != creator_transaction.get("published_content_identity")
+            or receipt.get("destinations")
+            != creator_transaction.get("destinations")
+            or receipt.get("candidate_destinations")
+            != creator_transaction.get("candidate_destinations")
+        ):
+            raise StepError(
+                f"{stage.capitalize()} 报告未进入创建者绑定的 pending-gate 状态。",
+                reason_codes=[
+                    f"BINARY_{stage.upper()}_REPORT_TRANSACTION_MISSING"
+                ],
+            )
+        run_gate(
+            gate_name,
+            report,
+            project_dir,
+            strict_risk_gate=bool(strict_risk_gate),
+            publication_transaction=receipt,
+        )
+        completion = complete_downstream_report_publication_after_gate(
+            report,
+            stage,
+            expected_transaction_id=creator_expectation[
+                "transaction_id"
+            ],
+            expected_binding=creator_expectation["binding"],
+            gate_name=str(gate_name or ""),
+            strict_risk_gate=bool(strict_risk_gate),
+            workflow_lock_held=True,
+        )
+        release = dict(completion.get("global_release") or {})
+        expected_current = (
+            ("step4", "step5")
+            if stage == "step5"
+            else ("step4", "step5", "step6")
+        )
+        expected_stale = ("step6",) if stage == "step5" else ()
+        if any(
+            (release.get(item) or {}).get("status") != "current"
+            for item in expected_current
+        ) or any(
+            (release.get(item) or {}).get("status") != "stale"
+            for item in expected_stale
+        ):
+            raise StepError(
+                f"{stage.capitalize()} 提交后的全局 release 状态无效。",
+                reason_codes=["BINARY_GLOBAL_RELEASE_STATE_INVALID"],
+            )
+        return {
+            **result,
+            "publication_transaction": None,
+            "publication_receipt": completion.get(
+                "publication_receipt"
+            ),
+            "global_release": release,
+            "elapsed_seconds": round(
+                time.perf_counter() - started, 6
+            ),
+        }
+    except BaseException as error:
+        rollback_status = _rollback_downstream_report_publication(
+            report,
+            stage,
+            creator_expectation=creator_expectation,
+        )
+        if not isinstance(error, Exception):
+            raise
+        if isinstance(error, StepError):
+            raise StepError(
+                str(error),
+                reason_codes=list(error.reason_codes),
+                diagnostic={
+                    **dict(error.diagnostic or {}),
+                    "report_publication_rollback": rollback_status,
+                },
+            ) from error
+        raise StepError(
+            f"{stage.capitalize()} 候选报告发布失败：{error}",
+            reason_codes=[
+                f"BINARY_{stage.upper()}_REPORT_PUBLICATION_FAILED"
+            ],
+            diagnostic={
+                "report_publication_rollback": rollback_status,
+                "error_type": type(error).__name__,
+                "reason_code": str(
+                    getattr(error, "reason_code", "") or ""
+                ),
+            },
+        ) from error
 
 
 def step3_business_scan_roots(run_context, workspace=None):
@@ -11644,6 +15134,42 @@ def step3_business_scan_roots(run_context, workspace=None):
 
 
 def execute_step(step_id, args, manifest_steps, run_context, main_state=None):
+    if str(step_id or "").strip() == "step4":
+        gate_name = str(
+            (manifest_steps.get("step4") or {}).get("gate") or ""
+        )
+        strict_risk_gate = (
+            parse_bool_like(
+                run_context.get("strict_risk_gate"),
+                "strict_risk_gate",
+            )
+            if "strict_risk_gate" in run_context
+            else bool(getattr(args, "strict_risk_gate", False))
+        )
+        with _binary_step4_run_lock(
+            args.report_dir,
+            expected_gate_name=gate_name,
+            expected_strict_risk_gate=bool(strict_risk_gate),
+        ):
+            return _execute_step_unlocked(
+                step_id,
+                args,
+                manifest_steps,
+                run_context,
+                main_state=main_state,
+            )
+    return _execute_step_unlocked(
+        step_id,
+        args,
+        manifest_steps,
+        run_context,
+        main_state=main_state,
+    )
+
+
+def _execute_step_unlocked(
+    step_id, args, manifest_steps, run_context, main_state=None
+):
     project_dir = Path(args.project_dir).resolve()
     report_dir = Path(args.report_dir).resolve()
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -11655,6 +15181,9 @@ def execute_step(step_id, args, manifest_steps, run_context, main_state=None):
     dep_current = step1_current_resolved_path(report_dir)
     context_json = step2_context_path(report_dir)
     s4_dir = step4_api_changes_dir(report_dir)
+    binary_step4_result = None
+    binary_step4_handoff_completed = False
+    downstream_publication_result = None
 
     if step_id == "step0":
         if not run_context.get("step0_confirmation_acknowledged"):
@@ -11828,12 +15357,24 @@ def execute_step(step_id, args, manifest_steps, run_context, main_state=None):
                 pinned_context,
                 report_dir,
             ) as fully_pinned_context:
-                _run_binary_step4(
+                step4_strict_risk_gate = (
+                    parse_bool_like(
+                        run_context.get("strict_risk_gate"),
+                        "strict_risk_gate",
+                    )
+                    if "strict_risk_gate" in run_context
+                    else bool(getattr(args, "strict_risk_gate", False))
+                )
+                binary_step4_result = _run_binary_step4(
                     run_context=fully_pinned_context,
                     project_dir=project_dir,
                     report_dir=report_dir,
                     s4_dir=s4_dir,
+                    complete_deferred_handoff=True,
+                    gate_name=manifest_steps[step_id].get("gate"),
+                    strict_risk_gate=step4_strict_risk_gate,
                 )
+                binary_step4_handoff_completed = True
 
     elif step_id == "step5":
         validate_run_context_for_step(step_id, run_context)
@@ -11854,72 +15395,93 @@ def execute_step(step_id, args, manifest_steps, run_context, main_state=None):
             raise StepError(
                 "Step5 范围协议无效：全量分析不能同时携带目标依赖筛选条件。"
             )
-        if has_selection:
-            selection = build_step5_selection_summary(
-                read_csv_rows(s4_dir / "all_changed_apis.csv"),
-                selected_coords=selected_coords,
-                selected_names=selected_names,
+        downstream_publication_result = (
+            _run_downstream_report_publication(
+                stage="step5",
+                report_dir=report_dir,
+                project_dir=project_dir,
+                gate_name=manifest_steps[step_id].get("gate"),
+                strict_risk_gate=bool(
+                    run_context.get("strict_risk_gate")
+                ),
+                output_dir=step5_call_chain_dir(report_dir),
+                selected_coords=tuple(selected_coords),
+                selected_names=tuple(selected_names),
             )
-            unmatched = []
-            if selection.get("unmatched_coords"):
-                unmatched.append(
-                    "未匹配坐标: " + ", ".join(selection["unmatched_coords"][:10])
-                )
-            if selection.get("unmatched_names"):
-                unmatched.append(
-                    "未匹配名称: " + ", ".join(selection["unmatched_names"][:10])
-                )
-            if unmatched or not selection.get("matched_rows"):
-                raise StepError(
-                    "Step5 选择的变化依赖未在 all_changed_apis.csv 中匹配到有效目标；"
-                    + "；".join(unmatched or ["过滤结果为空"])
-                )
-        report_args = [
-            "--phase", "step5",
-            "--report-dir", str(report_dir),
-            "--output-dir", str(step5_call_chain_dir(report_dir)),
-        ]
-        for coord in selected_coords:
-            report_args.extend(("--selected-coord", str(coord)))
-        for name in selected_names:
-            report_args.extend(("--selected-name", str(name)))
-        report_started = time.perf_counter()
-        run_python(
-            "binary_report.py",
-            report_args,
-            project_dir,
-            report_dir=report_dir,
         )
-        write_csv_rows(
-            runtime_observability_dir(report_dir) / "step5_timing.csv",
-            [{
-                "phase": "validated_generation_scope_and_report_publication",
-                "elapsed_seconds": round(time.perf_counter() - report_started, 6),
-                "scope_mode": "partial" if has_selection else "full",
-                "selected_dependency_count": len(selected_coords) + len(selected_names),
-            }],
-            ("phase", "elapsed_seconds", "scope_mode", "selected_dependency_count"),
-        )
+        try:
+            write_csv_rows(
+                runtime_observability_dir(report_dir)
+                / "step5_timing.csv",
+                [{
+                    "phase": (
+                        "validated_generation_scope_and_report_publication"
+                    ),
+                    "elapsed_seconds": downstream_publication_result[
+                        "elapsed_seconds"
+                    ],
+                    "scope_mode": "partial" if has_selection else "full",
+                    "selected_dependency_count": (
+                        len(selected_coords) + len(selected_names)
+                    ),
+                }],
+                (
+                    "phase", "elapsed_seconds", "scope_mode",
+                    "selected_dependency_count",
+                ),
+            )
+        except Exception:
+            # Observability cannot reverse a content-verified committed release.
+            pass
 
     elif step_id == "step6":
-        ensure_exists(step5_call_chain_dir(report_dir) / "summary.json", "Step6 缺少 Step5 的 summary.json，请先执行 Step5")
-        run_python(
-            "binary_report.py",
-            [
-                "--phase", "step6",
-                "--report-dir", str(report_dir),
-                "--output-findings", str(s6_findings_path(report_dir)),
-                "--output-report", str(final_report_path(report_dir)),
-            ],
-            project_dir,
-            report_dir=report_dir,
+        downstream_publication_result = (
+            _run_downstream_report_publication(
+                stage="step6",
+                report_dir=report_dir,
+                project_dir=project_dir,
+                gate_name=manifest_steps[step_id].get("gate"),
+                strict_risk_gate=bool(
+                    run_context.get("strict_risk_gate")
+                ),
+                output_findings=s6_findings_path(report_dir),
+                output_report=final_report_path(report_dir),
+            )
         )
     else:
         raise StepError(f"未知 step: {step_id}")
 
     refreshed_run_context = build_run_context(args, run_context, {}, allow_external_seed=False)
     gate_name = manifest_steps[step_id].get("gate")
-    run_gate(gate_name, report_dir, project_dir, strict_risk_gate=bool(refreshed_run_context.get("strict_risk_gate")))
+    if step_id == "step4" and binary_step4_handoff_completed:
+        pass
+    elif (
+        step_id == "step4"
+        and binary_step4_result is not None
+        and binary_step4_result.get("validation_checkpoint_retained")
+    ):
+        _complete_binary_step4_after_gate(
+            report_dir=report_dir,
+            project_dir=project_dir,
+            gate_name=gate_name,
+            strict_risk_gate=bool(
+                refreshed_run_context.get("strict_risk_gate")
+            ),
+            result=binary_step4_result,
+        )
+    elif downstream_publication_result is None:
+        run_gate(
+            gate_name,
+            report_dir,
+            project_dir,
+            strict_risk_gate=bool(
+                refreshed_run_context.get("strict_risk_gate")
+            ),
+        )
+        if step_id == "step4" and binary_step4_result is not None:
+            _finalize_binary_step4_transaction(
+                report_dir, binary_step4_result
+            )
     if step_id == "step1":
         dependency_source_interaction = build_step1_dependency_source_interaction(
             refreshed_run_context,
@@ -12058,7 +15620,746 @@ def recover_worktrees_before_execution(
     return payload
 
 
-def main(argv=None, _skip_environment_contract=False):
+def _step4_recovery_step_rank(step_id):
+    normalized = str(step_id or "").strip()
+    if normalized == "done":
+        return len(STEP_SEQUENCE)
+    if normalized not in STEP_SEQUENCE:
+        return -1
+    return step_index(normalized)
+
+
+def _workflow_has_reached_step4(main_state, report_dir):
+    state = dict((main_state or {}).get("state") or {})
+    pending = dict(state.get("pending_interaction") or {})
+    observed_steps = (
+        state.get("current_step"),
+        state.get("completed_step"),
+        pending.get("step_id"),
+    )
+    if any(
+        _step4_recovery_step_rank(value) >= step_index("step4")
+        for value in observed_steps
+    ):
+        return True
+    step4_state = dict((main_state or {}).get("step4") or {})
+    if any(step4_state.get(section) for section in ("input", "derived", "output")):
+        return True
+    binary_root = (
+        Path(report_dir).resolve() / BINARY_OUTPUT_RELATIVE_PATH
+    )
+    return (
+        binary_root / "active_binary_generation.json"
+    ).is_file()
+
+
+def _startup_step4_recovery_target_hint(
+    args,
+    main_state,
+    structured_user_response,
+):
+    """Resolve only enough user intent to decide whether Step4 is relevant.
+
+    This helper never mutates state and deliberately does not validate or
+    apply the response.  Transaction recovery must run before either action.
+    """
+
+    response = dict(structured_user_response or {})
+    response_action = str(response.get("action") or "").strip()
+    restart_step_id = str(response.get("restart_step_id") or "").strip()
+    if (
+        response_action == "restart_from_step"
+        and restart_step_id in STEP_SEQUENCE
+    ):
+        return restart_step_id
+    requested = str(getattr(args, "step", "") or "").strip()
+    if requested and requested != "auto":
+        return requested
+    state = dict((main_state or {}).get("state") or {})
+    pending = dict(state.get("pending_interaction") or {})
+    if response_action == "rerun_current_step":
+        pending_step = str(pending.get("step_id") or "").strip()
+        if pending_step in STEP_SEQUENCE:
+            return pending_step
+    if not pending and response:
+        inferred = infer_non_pending_target_step_from_payload(response)
+        if inferred in STEP_SEQUENCE:
+            return inferred
+    current_step = str(state.get("current_step") or "").strip()
+    if current_step in STEP_SEQUENCE or current_step == "done":
+        return current_step
+    pending_step = str(pending.get("step_id") or "").strip()
+    return pending_step if pending_step in STEP_SEQUENCE else "step0"
+
+
+def _step4_republication_marker(main_state, *, missing_ok=False):
+    raw = ((main_state or {}).get("state") or {}).get(
+        "step4_report_republication_pending"
+    )
+    if raw in (None, {}):
+        if missing_ok:
+            return None
+        raise StepError(
+            "Step4 报告重发布缺少持久恢复标记。",
+            reason_codes=[
+                "BINARY_STEP4_REPORT_REPUBLICATION_MARKER_INVALID"
+            ],
+        )
+    if not isinstance(raw, dict):
+        raise StepError(
+            "Step4 报告重发布恢复标记不是对象。",
+            reason_codes=[
+                "BINARY_STEP4_REPORT_REPUBLICATION_MARKER_INVALID"
+            ],
+        )
+    marker = dict(raw)
+    marker_identity = str(marker.pop("marker_identity", "") or "")
+    expected_identity = hashlib.sha256(
+        json.dumps(
+            marker,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    if (
+        marker.get("schema")
+        != _STEP4_REPORT_REPUBLICATION_MARKER_SCHEMA
+        or marker_identity != expected_identity
+        or not re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(marker.get("result_generation_identity") or ""),
+        )
+        or type(marker.get("refresh_scope_interaction")) is not bool
+    ):
+        raise StepError(
+            "Step4 报告重发布恢复标记已损坏或字段不完整。",
+            reason_codes=[
+                "BINARY_STEP4_REPORT_REPUBLICATION_MARKER_INVALID"
+            ],
+        )
+    return {**marker, "marker_identity": marker_identity}
+
+
+def _begin_step4_report_republication_state(
+    *,
+    main_state,
+    report_dir,
+):
+    """Persist downstream invalidation before replacing Step4 reports."""
+
+    existing = _step4_republication_marker(main_state, missing_ok=True)
+    if existing is not None:
+        return existing
+    report = Path(report_dir).resolve()
+    prior_state = dict((main_state or {}).get("state") or {})
+    prior_pending = dict(prior_state.get("pending_interaction") or {})
+    prior_current_step = str(prior_state.get("current_step") or "").strip()
+    prior_completed_step = str(
+        prior_state.get("completed_step") or ""
+    ).strip()
+    step4_context = build_restore_context(main_state, "step4")
+    prior_step5_input = dict(
+        ((main_state or {}).get("step5") or {}).get("input") or {}
+    )
+    if not step4_context and not prior_step5_input:
+        raise StepError(
+            "Step4 generation 可复用，但主状态缺少重建 Step5 所需的输入上下文。",
+            reason_codes=["BINARY_STEP4_RECOVERY_CONTEXT_MISSING"],
+        )
+    active = _read_step4_active_descriptor(report)
+    generation_identity = str(
+        active.get("result_generation_identity") or ""
+    )
+    if not re.fullmatch(r"[0-9a-f]{64}", generation_identity):
+        raise StepError(
+            "Step4 报告重发布无法绑定 sealed generation。",
+            reason_codes=[
+                "BINARY_STEP4_REPORT_REPUBLICATION_MARKER_INVALID"
+            ],
+        )
+    marker = {
+        "schema": _STEP4_REPORT_REPUBLICATION_MARKER_SCHEMA,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "result_generation_identity": generation_identity,
+        "refresh_scope_interaction": (
+            str(prior_pending.get("step_id") or "").strip() == "step4"
+            or (
+                prior_current_step == "step4"
+                and _step4_recovery_step_rank(prior_completed_step)
+                < step_index("step4")
+            )
+        ),
+    }
+    marker["marker_identity"] = hashlib.sha256(
+        json.dumps(
+            marker,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    next_context = dict(step4_context)
+    next_context.update(prior_step5_input)
+    store_step_output(main_state, "step4", step4_context, report)
+    clear_steps_from(
+        main_state,
+        "step5",
+        preserve_current_input=next_context,
+    )
+    cleanup_step_outputs_from("step5", report)
+    update_main_state_state(
+        main_state,
+        current_step="step5",
+        completed_step="step4",
+        status="ready",
+        blocking_reason=None,
+        blocking_reason_codes=[],
+        pending_interaction=None,
+        completion_summary=None,
+        step4_report_republication_pending=marker,
+    )
+    save_main_state(report, main_state)
+    clear_interaction_file(report)
+    return marker
+
+
+def _clear_step4_republication_marker(main_state):
+    state = (main_state or {}).setdefault("state", {})
+    state.pop("step4_report_republication_pending", None)
+
+
+def _reconcile_main_state_after_step4_republication(
+    *,
+    main_state,
+    report_dir,
+    project_dir,
+    manifest_steps,
+    verified_release,
+):
+    """Make Step5 the only valid successor of a newly republished Step4."""
+
+    report = Path(report_dir).resolve()
+    marker = _step4_republication_marker(main_state)
+    step4_context = build_restore_context(main_state, "step4")
+    if not step4_context:
+        raise StepError(
+            "Step4 generation 可复用，但主状态缺少重建 Step5 所需的输入上下文。",
+            reason_codes=["BINARY_STEP4_RECOVERY_CONTEXT_MISSING"],
+        )
+    verified_generation_identity = str(
+        ((verified_release or {}).get("binding") or {}).get(
+            "result_generation_identity"
+        )
+        or ""
+    )
+    if (
+        verified_generation_identity
+        != marker["result_generation_identity"]
+    ):
+        raise StepError(
+            "Step4 重发布恢复标记与已验证 release generation 不一致。",
+            reason_codes=[
+                "BINARY_STEP4_REPORT_REPUBLICATION_MARKER_INVALID"
+            ],
+        )
+    interaction = None
+    if marker["refresh_scope_interaction"]:
+        interaction = build_interaction_payload(
+            "step4",
+            report,
+            manifest_steps,
+            project_dir,
+            run_context=step4_context,
+            main_state=main_state,
+        )
+    if interaction:
+        interaction = apply_interaction_protocol_enhancements(
+            interaction,
+            "step4",
+            project_dir=project_dir,
+            report_dir=report,
+        )
+        interaction = _sanitize_git_persistence_payload(interaction)
+        update_main_state_state(
+            main_state,
+            current_step=current_step_for_pending_interaction(
+                "step4", interaction
+            ),
+            completed_step="step4",
+            status=normalize_interaction_status(interaction.get("status")),
+            blocking_reason=(
+                interaction.get("question")
+                or interaction.get("title")
+                or "step4"
+            ),
+            blocking_reason_codes=[],
+            pending_interaction=dict(interaction),
+            completion_summary=None,
+        )
+    else:
+        update_main_state_state(
+            main_state,
+            current_step="step5",
+            completed_step="step4",
+            status="ready",
+            blocking_reason=None,
+            blocking_reason_codes=[],
+            pending_interaction=None,
+            completion_summary=None,
+        )
+    _clear_step4_republication_marker(main_state)
+    save_main_state(report, main_state)
+    if interaction:
+        save_interaction_file(report, interaction)
+        write_resume_snapshot(
+            main_state,
+            "step4",
+            report,
+            event="step_completed_awaiting_user",
+            interaction=interaction,
+        )
+    else:
+        clear_interaction_file(report)
+        write_resume_snapshot(
+            main_state,
+            "step4",
+            report,
+            event="step_completed",
+        )
+    return interaction
+
+
+def _apply_step4_startup_recovery(
+    *,
+    decision,
+    target_step_id,
+    args,
+    main_state,
+    report_dir,
+    project_dir,
+    manifest_steps,
+    gate_name,
+    strict_risk_gate,
+    has_structured_response,
+):
+    """Apply one classified recovery before any workflow fast path."""
+
+    action = str((decision or {}).get("action") or "").strip()
+    result = {
+        "action": action,
+        "applied": False,
+        "forced_step_id": "",
+        "discard_structured_response": False,
+        "interaction_refreshed": False,
+    }
+    pending_before_recovery = dict(
+        ((main_state or {}).get("state") or {}).get(
+            "pending_interaction"
+        ) or {}
+    )
+    durable_republication = _step4_republication_marker(
+        main_state, missing_ok=True
+    )
+    if action == _STEP4_RELEASE_FATAL:
+        raise StepError(
+            "Step4 中断事务状态无法安全归属，已拒绝继续。",
+            reason_codes=[
+                str((decision or {}).get("reason_code") or "")
+                or "BINARY_STEP4_TRANSACTION_RECOVERY_FAILED"
+            ],
+            diagnostic={"step4_recovery": dict(decision or {})},
+        )
+    if action not in {
+        _STEP4_RELEASE_CURRENT,
+        _STEP4_RELEASE_REPUBLISH,
+        _STEP4_RELEASE_RESUME_PIPELINE,
+    }:
+        raise StepError(
+            "Step4 恢复分类返回了未知动作。",
+            reason_codes=["BINARY_STEP4_TRANSACTION_RECOVERY_FAILED"],
+            diagnostic={"step4_recovery": dict(decision or {})},
+        )
+    if (
+        not _workflow_has_reached_step4(main_state, report_dir)
+        or _step4_recovery_step_rank(target_step_id)
+        < step_index("step4")
+    ):
+        if durable_republication is not None:
+            # An explicit restart to an earlier step supersedes this pending
+            # report-only recovery.  That earlier rerun will create a new
+            # generation before downstream work is allowed again.
+            _clear_step4_republication_marker(main_state)
+            save_main_state(report_dir, main_state)
+        return result
+
+    # An explicit Step4 request always means regenerate by user intent.  Clear
+    # any old confirmation before its generic pending fast path can return.
+    if (
+        str(getattr(args, "step", "") or "").strip() == "step4"
+    ):
+        if durable_republication is not None:
+            _clear_step4_republication_marker(main_state)
+        preserve_context = build_restore_context(main_state, "step4")
+        reset_step_state_for_restart(
+            main_state,
+            "step4",
+            report_dir,
+            preserve_current_input=preserve_context,
+        )
+        save_main_state(report_dir, main_state)
+        clear_interaction_file(report_dir)
+        result.update({
+            "action": _STEP4_RELEASE_RESUME_PIPELINE,
+            "classified_action": action,
+            "applied": True,
+            "explicit_pipeline": True,
+            "forced_step_id": "step4",
+            "discard_structured_response": bool(
+                has_structured_response
+                and _step4_recovery_step_rank(
+                    pending_before_recovery.get("step_id")
+                ) >= step_index("step4")
+            ),
+        })
+        return result
+
+    if action == _STEP4_RELEASE_CURRENT:
+        if durable_republication is None:
+            return result
+        verified = verify_current_step4_release(
+            report_dir,
+            expected_gate_name=str(gate_name or ""),
+            expected_strict_risk_gate=bool(strict_risk_gate),
+            workflow_lock_held=True,
+        )
+        interaction = _reconcile_main_state_after_step4_republication(
+            main_state=main_state,
+            report_dir=report_dir,
+            project_dir=project_dir,
+            manifest_steps=manifest_steps,
+            verified_release=verified,
+        )
+        result.update({
+            "applied": True,
+            "republication_reconciled": True,
+            "forced_step_id": (
+                "step5"
+                if _step4_recovery_step_rank(target_step_id)
+                > step_index("step5")
+                else ""
+            ),
+            "discard_structured_response": bool(
+                has_structured_response
+                and (
+                    durable_republication[
+                        "refresh_scope_interaction"
+                    ]
+                    or _step4_recovery_step_rank(target_step_id)
+                    > step_index("step5")
+                )
+            ),
+            "interaction_refreshed": bool(interaction),
+            "committed_receipt_identity": str(
+                verified.get("committed_receipt_identity") or ""
+            ),
+        })
+        return result
+
+    if action == _STEP4_RELEASE_REPUBLISH:
+        durable_republication = _begin_step4_report_republication_state(
+            main_state=main_state,
+            report_dir=report_dir,
+        )
+        verified = _republish_current_binary_step4_reports(
+            report_dir=report_dir,
+            project_dir=project_dir,
+            gate_name=gate_name,
+            strict_risk_gate=bool(strict_risk_gate),
+        )
+        interaction = _reconcile_main_state_after_step4_republication(
+            main_state=main_state,
+            report_dir=report_dir,
+            project_dir=project_dir,
+            manifest_steps=manifest_steps,
+            verified_release=verified,
+        )
+        result.update({
+            "applied": True,
+            "forced_step_id": (
+                "step5"
+                if _step4_recovery_step_rank(target_step_id)
+                > step_index("step5")
+                else ""
+            ),
+            "discard_structured_response": bool(
+                has_structured_response
+                and (
+                    durable_republication[
+                        "refresh_scope_interaction"
+                    ]
+                    or _step4_recovery_step_rank(target_step_id)
+                    > step_index("step5")
+                )
+            ),
+            "interaction_refreshed": bool(interaction),
+            "committed_receipt_identity": str(
+                verified.get("committed_receipt_identity") or ""
+            ),
+        })
+        return result
+
+    stale_response = bool(
+        has_structured_response
+        and (
+            _step4_recovery_step_rank(
+                pending_before_recovery.get("step_id")
+            )
+            >= step_index("step4")
+            or _step4_recovery_step_rank(target_step_id)
+            > step_index("step4")
+        )
+    )
+    if durable_republication is not None:
+        _clear_step4_republication_marker(main_state)
+    preserve_context = build_restore_context(main_state, "step4")
+    reset_step_state_for_restart(
+        main_state,
+        "step4",
+        report_dir,
+        preserve_current_input=preserve_context,
+    )
+    save_main_state(report_dir, main_state)
+    clear_interaction_file(report_dir)
+    result.update({
+        "applied": True,
+        "forced_step_id": "step4",
+        "discard_structured_response": stale_response,
+    })
+    return result
+
+
+def _recover_and_apply_step4_startup_state_under_locks(
+    *,
+    args,
+    main_state,
+    report_dir,
+    project_dir,
+    manifest_steps,
+    structured_user_response,
+    has_structured_response,
+    gate_name,
+    strict_risk_gate,
+):
+    disposition = _recover_binary_step4_transaction(
+        report_dir,
+        expected_gate_name=gate_name,
+        expected_strict_risk_gate=bool(strict_risk_gate),
+    )
+    decision = _classify_step4_recovery_disposition(
+        report_dir,
+        disposition,
+        expected_gate_name=gate_name,
+        expected_strict_risk_gate=bool(strict_risk_gate),
+    )
+    target_hint = _startup_step4_recovery_target_hint(
+        args,
+        main_state,
+        structured_user_response,
+    )
+    result = _apply_step4_startup_recovery(
+        decision=decision,
+        target_step_id=target_hint,
+        args=args,
+        main_state=main_state,
+        report_dir=report_dir,
+        project_dir=project_dir,
+        manifest_steps=manifest_steps,
+        gate_name=gate_name,
+        strict_risk_gate=bool(strict_risk_gate),
+        has_structured_response=has_structured_response,
+    )
+    return {
+        **result,
+        "disposition": disposition,
+        "decision": dict(decision or {}),
+        "target_hint": target_hint,
+    }
+
+
+def _recover_and_apply_step4_startup_state(
+    *,
+    args,
+    main_state,
+    report_dir,
+    project_dir,
+    manifest_steps,
+    structured_user_response,
+    has_structured_response,
+    gate_name,
+    strict_risk_gate,
+):
+    """Converge startup state while both Step4 ownership leases are held.
+
+    Startup can roll back a private candidate, classify the public active
+    generation, or republish reports from it.  A standalone pipeline writer
+    must not change those inputs between classification and the selected
+    recovery action's commit.  Unlike execute-time recovery, no child needs
+    this lease, so retain it through the complete apply operation.
+    """
+
+    with _binary_step4_serialization_lock(report_dir):
+        with _binary_step4_pipeline_writer_lock(
+            report_dir,
+            timeout_seconds=_STEP4_RECOVERY_WRITER_LOCK_TIMEOUT_SECONDS,
+            operation="recovery",
+        ):
+            return _recover_and_apply_step4_startup_state_under_locks(
+                args=args,
+                main_state=main_state,
+                report_dir=report_dir,
+                project_dir=project_dir,
+                manifest_steps=manifest_steps,
+                structured_user_response=structured_user_response,
+                has_structured_response=has_structured_response,
+                gate_name=gate_name,
+                strict_risk_gate=bool(strict_risk_gate),
+            )
+
+
+def _release_prerequisite_repair_step(release, target_step_id):
+    """Return the earliest stale release that must precede the target."""
+
+    target = str(target_step_id or "").strip()
+    if target == "done":
+        required = ("step4", "step5", "step6")
+    elif target == "step6":
+        required = ("step4", "step5")
+    elif target == "step5":
+        required = ("step4",)
+    else:
+        required = ()
+    return next(
+        (
+            stage
+            for stage in required
+            if (release.get(stage) or {}).get("status") != "current"
+        ),
+        "",
+    )
+
+
+def _downstream_gate_policy_is_current(
+    report_dir,
+    stage,
+    *,
+    expected_gate_name,
+    expected_strict_risk_gate,
+):
+    receipt = report_publication_committed_receipt(
+        _downstream_report_publication_destinations(
+            report_dir, stage
+        )
+    )
+    gate_receipt = dict(receipt.get("gate_receipt") or {})
+    return bool(
+        receipt
+        and gate_receipt.get("gate_name")
+        == str(expected_gate_name or "")
+        and gate_receipt.get("strict_risk_gate")
+        is bool(expected_strict_risk_gate)
+    )
+
+
+def _apply_downstream_release_startup_state(
+    *,
+    args,
+    main_state,
+    report_dir,
+    structured_user_response,
+    has_structured_response,
+    manifest_steps=None,
+    strict_risk_gate=False,
+):
+    """Converge workflow state to durable Step4/5/6 release receipts."""
+
+    target_hint = _startup_step4_recovery_target_hint(
+        args,
+        main_state,
+        structured_user_response,
+    )
+    if _step4_recovery_step_rank(target_hint) < step_index("step5"):
+        return {
+            "target_hint": target_hint,
+            "forced_step_id": "",
+            "discard_structured_response": False,
+            "release": None,
+        }
+    release = reconcile_current_release(
+        report_dir, workflow_lock_held=True
+    )
+    effective_release = {
+        **release,
+        **{
+            stage: dict(release.get(stage) or {})
+            for stage in ("step4", "step5", "step6")
+        },
+    }
+    expected_gates = {
+        "step5": str(
+            ((manifest_steps or {}).get("step5") or {}).get("gate")
+            or "binary_report"
+        ),
+        "step6": str(
+            ((manifest_steps or {}).get("step6") or {}).get("gate")
+            or "binary_final_report"
+        ),
+    }
+    for stage in ("step5", "step6"):
+        if (effective_release.get(stage) or {}).get("status") != "current":
+            continue
+        if not _downstream_gate_policy_is_current(
+            report_dir,
+            stage,
+            expected_gate_name=expected_gates[stage],
+            expected_strict_risk_gate=bool(strict_risk_gate),
+        ):
+            effective_release[stage] = {
+                "status": "stale",
+                "reason": "gate_policy_mismatch",
+            }
+    repair_step = _release_prerequisite_repair_step(
+        effective_release, target_hint
+    )
+    if not repair_step:
+        return {
+            "target_hint": target_hint,
+            "forced_step_id": "",
+            "discard_structured_response": False,
+            "release": effective_release,
+        }
+    preserve_context = build_restore_context(main_state, repair_step)
+    reset_step_state_for_restart(
+        main_state,
+        repair_step,
+        report_dir,
+        preserve_current_input=preserve_context,
+    )
+    save_main_state(report_dir, main_state)
+    clear_interaction_file(report_dir)
+    return {
+        "target_hint": target_hint,
+        "forced_step_id": repair_step,
+        "discard_structured_response": bool(
+            has_structured_response
+            and _step4_recovery_step_rank(target_hint)
+            >= step_index(repair_step)
+        ),
+        "release": effective_release,
+    }
+
+
+def _main_with_workflow_lock_held(argv=None, _skip_environment_contract=False):
     argv_values = list(sys.argv[1:] if argv is None else argv)
     ap = argparse.ArgumentParser(description="统一执行 Java 升级分析的单个 Step")
     ap.add_argument("--step", choices=STEP_SEQUENCE + ["auto"])
@@ -12166,6 +16467,193 @@ def main(argv=None, _skip_environment_contract=False):
             file=sys.stderr,
         )
     manifest_data, manifest_steps = load_manifest(args.manifest)
+    has_structured_response = bool(args.response_json or args.response_file)
+    structured_user_response = (
+        resolve_user_response(args, project_dir)
+        if has_structured_response
+        else None
+    )
+
+    # Downstream publication markers are independent of release validity.
+    # Converge them first, without reconciling a possibly stale Step4 receipt.
+    try:
+        downstream_publication_recovery = (
+            recover_downstream_report_publications(
+                report_dir,
+                workflow_lock_held=True,
+            )
+        )
+    except Exception as error:
+        wrapped = (
+            error
+            if isinstance(error, StepError)
+            else StepError(
+                f"Step5/Step6 启动恢复失败：{error}",
+                reason_codes=[
+                    "BINARY_DOWNSTREAM_TRANSACTION_RECOVERY_FAILED"
+                ],
+                diagnostic={
+                    "error_type": type(error).__name__,
+                    "reason_code": str(
+                        getattr(error, "reason_code", "") or ""
+                    ),
+                },
+            )
+        )
+        persist_step_error(main_state, "step5", report_dir, wrapped)
+        for line in build_user_runtime_message(
+            "failed", "step5", reason=wrapped,
+        ):
+            print(line, file=sys.stderr)
+        return 1
+
+    # Step4 transaction recovery is part of startup, not part of Step4
+    # execution.  It must precede auto-done, stale confirmation, and response
+    # paths because each of those can otherwise present or derive downstream
+    # results from an unverified release.
+    step4_recovery_context = build_restore_context(main_state, "step4")
+    expected_step4_strict_gate = (
+        parse_bool_like(
+            step4_recovery_context.get("strict_risk_gate"),
+            "strict_risk_gate",
+        )
+        if "strict_risk_gate" in step4_recovery_context
+        else bool(args.strict_risk_gate)
+    )
+    expected_step4_gate_name = str(
+        (manifest_steps.get("step4") or {}).get("gate") or ""
+    )
+    try:
+        step4_startup_recovery = (
+            _recover_and_apply_step4_startup_state(
+                args=args,
+                main_state=main_state,
+                report_dir=report_dir,
+                project_dir=project_dir,
+                manifest_steps=manifest_steps,
+                structured_user_response=structured_user_response,
+                has_structured_response=has_structured_response,
+                gate_name=expected_step4_gate_name,
+                strict_risk_gate=bool(expected_step4_strict_gate),
+            )
+        )
+    except StepError as exc:
+        persist_step_error(main_state, "step4", report_dir, exc)
+        for line in build_user_runtime_message(
+            "failed", "step4", reason=exc,
+        ):
+            print(line, file=sys.stderr)
+        return 1
+    except Exception as error:
+        wrapped = StepError(
+            f"Step4 启动恢复失败：{error}",
+            reason_codes=[
+                "BINARY_STEP4_TRANSACTION_RECOVERY_FAILED"
+            ],
+            diagnostic={
+                "error_type": type(error).__name__,
+                "reason_code": str(
+                    getattr(error, "reason_code", "") or ""
+                ),
+            },
+        )
+        persist_step_error(main_state, "step4", report_dir, wrapped)
+        for line in build_user_runtime_message(
+            "failed", "step4", reason=wrapped,
+        ):
+            print(line, file=sys.stderr)
+        return 1
+    if step4_startup_recovery.get("discard_structured_response"):
+        # The response was authored against a downstream state that recovery
+        # has just invalidated.  Never reinterpret it against a different
+        # generation or stage.
+        args.response_json = ""
+        args.response_file = ""
+        has_structured_response = False
+        structured_user_response = None
+        print(
+            "Step4 已恢复到更早的可靠边界；本次未套用针对旧下游结果的答复。",
+            file=sys.stderr,
+        )
+    if step4_startup_recovery.get("applied"):
+        if step4_startup_recovery.get("action") == _STEP4_RELEASE_REPUBLISH:
+            print(
+                "启动恢复：已复用通过独立校验的 Step4 generation，"
+                "重新生成并门禁当前报告；未重复执行耗时生成。",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "启动恢复：Step4 未提交状态已收敛，将从 Step4 的可靠边界继续。",
+                file=sys.stderr,
+            )
+
+    # Step5/6 use independent publication groups.  Their markers are already
+    # converged; now that Step4 is current, reconcile workflow state before an
+    # old confirmation, completion fast path, or fixed path can be presented.
+    try:
+        downstream_startup_state = (
+            _apply_downstream_release_startup_state(
+                args=args,
+                main_state=main_state,
+                report_dir=report_dir,
+                structured_user_response=structured_user_response,
+                has_structured_response=has_structured_response,
+                manifest_steps=manifest_steps,
+                strict_risk_gate=bool(expected_step4_strict_gate),
+            )
+        )
+    except Exception as error:
+        wrapped = (
+            error
+            if isinstance(error, StepError)
+            else StepError(
+                f"Step5/Step6 启动恢复失败：{error}",
+                reason_codes=[
+                    "BINARY_DOWNSTREAM_TRANSACTION_RECOVERY_FAILED"
+                ],
+                diagnostic={
+                    "error_type": type(error).__name__,
+                    "reason_code": str(
+                        getattr(error, "reason_code", "") or ""
+                    ),
+                },
+            )
+        )
+        persist_step_error(main_state, "step5", report_dir, wrapped)
+        for line in build_user_runtime_message(
+            "failed", "step5", reason=wrapped,
+        ):
+            print(line, file=sys.stderr)
+        return 1
+    recovered_actions = list(
+        downstream_publication_recovery.get("actions") or ()
+    )
+    if recovered_actions:
+        recovered_labels = "、".join(
+            f"{item.get('stage')}:{item.get('disposition')}"
+            for item in recovered_actions
+        )
+        print(
+            f"启动恢复：已收敛下游未完成发布事务（{recovered_labels}）。",
+            file=sys.stderr,
+        )
+    if downstream_startup_state.get("discard_structured_response"):
+        args.response_json = ""
+        args.response_file = ""
+        has_structured_response = False
+        structured_user_response = None
+        print(
+            "下游 release 已回退到更早的可靠边界；本次未套用针对旧结果的答复。",
+            file=sys.stderr,
+        )
+    if downstream_startup_state.get("forced_step_id"):
+        print(
+            "启动恢复：当前正式 release 不包含完整下游阶段，"
+            f"将从 {downstream_startup_state['forced_step_id']} 重建。",
+            file=sys.stderr,
+        )
+
     pending_interaction = (main_state.get("state") or {}).get("pending_interaction")
     if pending_interaction:
         original_pending_interaction = pending_interaction
@@ -12185,10 +16673,6 @@ def main(argv=None, _skip_environment_contract=False):
             main_state["state"]["pending_interaction"] = dict(pending_interaction)
             save_main_state(report_dir, main_state)
             save_interaction_file(report_dir, pending_interaction)
-    structured_user_response = None
-    has_structured_response = bool(args.response_json or args.response_file)
-    if has_structured_response:
-        structured_user_response = resolve_user_response(args, project_dir)
     if args.step == "auto" and has_structured_response and not pending_interaction:
         step_id = ""
     elif (
@@ -12197,6 +16681,29 @@ def main(argv=None, _skip_environment_contract=False):
         and not pending_interaction
         and str(((main_state or {}).get("state") or {}).get("current_step") or "").strip() == "done"
     ):
+        try:
+            require_current_release_stage(
+                report_dir, "step6", workflow_lock_held=True
+            )
+        except Exception as error:
+            wrapped = StepError(
+                f"最终 release 无法验证：{error}",
+                reason_codes=["BINARY_FINAL_RELEASE_NOT_CURRENT"],
+                diagnostic={
+                    "error_type": type(error).__name__,
+                    "reason_code": str(
+                        getattr(error, "reason_code", "") or ""
+                    ),
+                },
+            )
+            persist_step_error(
+                main_state, "step6", report_dir, wrapped
+            )
+            for line in build_user_runtime_message(
+                "failed", "step6", reason=wrapped,
+            ):
+                print(line, file=sys.stderr)
+            return 1
         repair_step_id = detect_integrity_repair_step("step6", report_dir)
         if not repair_step_id:
             completion_summary = build_final_completion_summary(report_dir)
@@ -12237,6 +16744,26 @@ def main(argv=None, _skip_environment_contract=False):
     user_response = response_result["user_response"]
     if response_result["early_exit_code"] is not None:
         return response_result["early_exit_code"]
+
+    forced_recovery_steps = [
+        str(value or "").strip()
+        for value in (
+            step4_startup_recovery.get("forced_step_id"),
+            downstream_startup_state.get("forced_step_id"),
+        )
+        if str(value or "").strip() in STEP_SEQUENCE
+    ]
+    forced_recovery_step = (
+        min(forced_recovery_steps, key=step_index)
+        if forced_recovery_steps
+        else ""
+    )
+    if (
+        forced_recovery_step in STEP_SEQUENCE
+        and _step4_recovery_step_rank(step_id)
+        > _step4_recovery_step_rank(forced_recovery_step)
+    ):
+        step_id = forced_recovery_step
 
     if (
         structured_user_response is None
@@ -12365,6 +16892,13 @@ def main(argv=None, _skip_environment_contract=False):
         completion_summary = persist_completed_step(
             main_state, step_id, report_dir, run_context
         )
+        if step_id == "step6":
+            report_key = str(report_dir.resolve())
+            _STEP6_INTERNAL_INPUT_RECOVERY_ATTEMPTS.difference_update({
+                item
+                for item in _STEP6_INTERNAL_INPUT_RECOVERY_ATTEMPTS
+                if item[0] == report_key
+            })
         if informational_interaction:
             save_interaction_file(report_dir, informational_interaction)
         for line in build_user_runtime_message(
@@ -12389,6 +16923,7 @@ def main(argv=None, _skip_environment_contract=False):
                     "--manifest", str(args.manifest),
                 ],
                 _skip_environment_contract=True,
+                _workflow_lock_held=True,
             )
         return 0
     except StepInteractionRequired as exc:
@@ -12398,6 +16933,42 @@ def main(argv=None, _skip_environment_contract=False):
         print(f"{task_name}需要补充上面的信息后才能继续。", file=sys.stderr)
         return EXIT_AWAITING_USER
     except StepError as exc:
+        internal_owner = (
+            step6_internal_input_failure_owner_from_step_error(exc)
+            if step_id == "step6"
+            else None
+        )
+        if internal_owner:
+            recovery_key = (str(report_dir.resolve()), internal_owner)
+            if recovery_key in _STEP6_INTERNAL_INPUT_RECOVERY_ATTEMPTS:
+                persist_step_error(main_state, step_id, report_dir, exc)
+                for line in build_user_runtime_message(
+                    "failed", step_id, reason=exc
+                ):
+                    print(line, file=sys.stderr)
+                return 1
+            _STEP6_INTERNAL_INPUT_RECOVERY_ATTEMPTS.add(recovery_key)
+            reset_step_state_for_restart(
+                main_state, internal_owner, report_dir
+            )
+            save_main_state(report_dir, main_state)
+            clear_interaction_file(report_dir)
+            print(
+                "Step6 检测到上游内部产物合同失效；"
+                f"将从{USER_TASK_NAMES.get(internal_owner, internal_owner)}"
+                "自动重建，不需要人工修补报告文件。",
+                file=sys.stderr,
+            )
+            return main(
+                [
+                    "--step", "auto",
+                    "--project-dir", str(project_dir),
+                    "--report-dir", str(report_dir),
+                    "--manifest", str(args.manifest),
+                ],
+                _skip_environment_contract=True,
+                _workflow_lock_held=True,
+            )
         persist_step_error(main_state, step_id, report_dir, exc)
         for line in build_user_runtime_message("failed", step_id, reason=exc):
             print(line, file=sys.stderr)
@@ -12410,6 +16981,119 @@ def main(argv=None, _skip_environment_contract=False):
             file=sys.stderr,
         )
         return EXIT_INTERRUPTED
+
+
+@contextmanager
+def _workflow_mutation_lock(report_dir, timeout_seconds=None):
+    if timeout_seconds is None:
+        try:
+            timeout_seconds = float(
+                os.environ.get("JUA_WORKFLOW_MUTATION_LOCK_TIMEOUT_SECONDS")
+                or 1.0
+            )
+        except (TypeError, ValueError):
+            timeout_seconds = 1.0
+    report_root = Path(report_dir).resolve()
+    lock_path = (
+        report_root
+        / RUNTIME_DIRNAME
+        / "state"
+        / ".workflow-mutation.lock"
+    )
+    manager = exclusive_file_lock(
+        lock_path, timeout_seconds=max(0.0, float(timeout_seconds))
+    )
+    try:
+        manager.__enter__()
+    except TimeoutError as error:
+        raise StepError(
+            "同一报告目录已有分析流程正在修改状态或发布结果。",
+            reason_codes=["WORKFLOW_MUTATION_ALREADY_ACTIVE"],
+        ) from error
+    prior_depth = int(
+        getattr(_WORKFLOW_MUTATION_CONTEXT, "depth", 0) or 0
+    )
+    prior_roots = tuple(
+        getattr(_WORKFLOW_MUTATION_CONTEXT, "report_roots", ()) or ()
+    )
+    prior_process_id = getattr(
+        _WORKFLOW_MUTATION_CONTEXT, "process_id", None
+    )
+    current_process_id = os.getpid()
+    if prior_process_id != current_process_id:
+        # A fork inherits Python thread-local memory but not this process's
+        # ownership claim.  Never carry the parent's lock stack into a child
+        # that acquires a different report lock.
+        prior_depth = 0
+        prior_roots = ()
+    _WORKFLOW_MUTATION_CONTEXT.depth = prior_depth + 1
+    _WORKFLOW_MUTATION_CONTEXT.report_roots = (*prior_roots, report_root)
+    _WORKFLOW_MUTATION_CONTEXT.process_id = current_process_id
+    try:
+        yield
+    finally:
+        _WORKFLOW_MUTATION_CONTEXT.depth = prior_depth
+        _WORKFLOW_MUTATION_CONTEXT.report_roots = prior_roots
+        _WORKFLOW_MUTATION_CONTEXT.process_id = prior_process_id
+        manager.__exit__(*sys.exc_info())
+
+
+def _workflow_mutation_lock_is_held(report_dir=None):
+    if (
+        not int(getattr(_WORKFLOW_MUTATION_CONTEXT, "depth", 0) or 0)
+        or getattr(_WORKFLOW_MUTATION_CONTEXT, "process_id", None)
+        != os.getpid()
+    ):
+        return False
+    if report_dir is None:
+        return True
+    report_root = Path(report_dir).resolve()
+    return report_root in tuple(
+        getattr(_WORKFLOW_MUTATION_CONTEXT, "report_roots", ()) or ()
+    )
+
+
+def _workflow_report_dir_from_argv(argv):
+    values = list(sys.argv[1:] if argv is None else argv)
+    try:
+        index = values.index("--report-dir")
+    except ValueError:
+        return Path(".upgrade-report").resolve()
+    if index + 1 >= len(values):
+        return Path(".upgrade-report").resolve()
+    return Path(str(values[index + 1] or ".upgrade-report")).resolve()
+
+
+def main(
+    argv=None,
+    _skip_environment_contract=False,
+    _workflow_lock_held=False,
+):
+    values = list(sys.argv[1:] if argv is None else argv)
+    if "--describe-step0-contract" in values or _workflow_lock_held:
+        return _main_with_workflow_lock_held(
+            argv, _skip_environment_contract=_skip_environment_contract
+        )
+    report_dir = _workflow_report_dir_from_argv(argv)
+    with _workflow_mutation_lock(report_dir):
+        report_key = str(report_dir.resolve())
+        _STEP6_INTERNAL_INPUT_RECOVERY_ATTEMPTS.difference_update({
+            item
+            for item in _STEP6_INTERNAL_INPUT_RECOVERY_ATTEMPTS
+            if item[0] == report_key
+        })
+        try:
+            return _main_with_workflow_lock_held(
+                argv, _skip_environment_contract=_skip_environment_contract
+            )
+        finally:
+            # Attempts are invocation-local.  A later run after the operator or
+            # environment repaired the producer must get one fresh auto-rebuild.
+            _STEP6_INTERNAL_INPUT_RECOVERY_ATTEMPTS.difference_update({
+                item
+                for item in _STEP6_INTERNAL_INPUT_RECOVERY_ATTEMPTS
+                if item[0] == report_key
+            })
 
 
 def _cli_report_dir(argv):
@@ -12449,10 +17133,38 @@ def _record_unexpected_cli_error(exc, argv=None):
 def cli_main(argv=None):
     """Keep implementation failures out of the user-facing terminal channel."""
     exit_code = 1
-    wait_for_background_parent()
     try:
-        exit_code = main(argv)
-    except StepError as exc:
+        with _background_child_lease() as background_ownership:
+            try:
+                exit_code = main(argv)
+            except StepError as exc:
+                reason = _humanize_interaction_text(str(exc)).strip()
+                print(
+                    f"分析未能继续：{reason or '当前输入或状态不完整。'}",
+                    file=sys.stderr,
+                )
+                print("已有正式产物保持不变；条件修正后重新运行即可。", file=sys.stderr)
+                exit_code = 1
+            except KeyboardInterrupt:
+                print("\n运行已停止。再次运行时会先检查已有证据完整性。", file=sys.stderr)
+                exit_code = EXIT_INTERRUPTED
+            except Exception as exc:
+                diagnostic_path = _record_unexpected_cli_error(exc, argv=argv)
+                print("系统未能完成当前操作，已停止以避免生成不完整结论。", file=sys.stderr)
+                if diagnostic_path:
+                    print(f"诊断已记录：{diagnostic_path}", file=sys.stderr)
+                else:
+                    print("当前无法写入诊断文件；已有正式产物保持不变。", file=sys.stderr)
+                exit_code = 1
+            finally:
+                status_published = finish_background_run(
+                    exit_code, configuration=background_ownership
+                )
+                if background_ownership is not None and not status_published:
+                    raise _BackgroundOwnershipError(
+                        "后台任务已失去完成状态写入权，已拒绝覆盖较新的运行记录。"
+                    )
+    except _BackgroundOwnershipError as exc:
         reason = _humanize_interaction_text(str(exc)).strip()
         print(f"分析未能继续：{reason or '当前输入或状态不完整。'}", file=sys.stderr)
         print("已有正式产物保持不变；条件修正后重新运行即可。", file=sys.stderr)
@@ -12468,8 +17180,6 @@ def cli_main(argv=None):
         else:
             print("当前无法写入诊断文件；已有正式产物保持不变。", file=sys.stderr)
         exit_code = 1
-    finally:
-        finish_background_run(exit_code)
     return exit_code
 
 

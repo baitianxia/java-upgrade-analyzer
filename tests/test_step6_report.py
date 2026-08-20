@@ -3,9 +3,11 @@ import tempfile
 import csv
 import itertools
 import json
+import os
 import re
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -15,6 +17,76 @@ import s6_report  # noqa: E402
 
 
 class Step6ReportObjectivityTest(unittest.TestCase):
+    def test_step5_input_paths_do_not_depend_on_orchestrated_environment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp).resolve()
+            expected_fallbacks = (
+                report / ".runtime" / "coverage" / "coverage.json",
+                report / ".runtime" / "cache" / "step5_selection.json",
+            )
+            self.assertEqual(
+                (
+                    s6_report._coverage_path(report),
+                    s6_report._step5_selection_path(report),
+                ),
+                expected_fallbacks,
+            )
+            with patch.dict(os.environ, {"JUA_ORCHESTRATED": "1"}):
+                self.assertEqual(
+                    (
+                        s6_report._coverage_path(report),
+                        s6_report._step5_selection_path(report),
+                    ),
+                    expected_fallbacks,
+                )
+
+            call_chain = report / "evidence" / "call_chain"
+            call_chain.mkdir(parents=True)
+            for name in ("coverage.json", "selection.json"):
+                (call_chain / name).write_text("{}", encoding="utf-8")
+            expected_committed = (
+                call_chain / "coverage.json",
+                call_chain / "selection.json",
+            )
+            with patch.dict(os.environ, {"JUA_ORCHESTRATED": "1"}):
+                self.assertEqual(
+                    (
+                        s6_report._coverage_path(report),
+                        s6_report._step5_selection_path(report),
+                    ),
+                    expected_committed,
+                )
+
+    def test_coverage_evidence_availability_is_confined_to_report_roots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp).resolve()
+            report = parent / "report"
+            inside = report / "evidence" / "static_scan" / "custom.txt"
+            inside.parent.mkdir(parents=True)
+            inside.write_text("inside", encoding="utf-8")
+            outside = parent / "outside-secret.txt"
+            outside.write_text("outside", encoding="utf-8")
+            findings = {
+                "artifacts": {},
+                "coverage": {
+                    "components": [{
+                        "evidence": [
+                            "evidence/static_scan/custom.txt",
+                            "../outside-secret.txt",
+                            str(outside),
+                        ]
+                    }]
+                },
+            }
+
+            available = s6_report._collect_available_evidence_paths(
+                report, findings
+            )
+
+        self.assertEqual(
+            available, ["evidence/static_scan/custom.txt"]
+        )
+
     def test_count_lines_accepts_path_objects_used_by_collect_findings(self):
         with tempfile.TemporaryDirectory() as tmp:
             csv_path = Path(tmp) / "scan.csv"
@@ -171,6 +243,10 @@ class Step6ReportObjectivityTest(unittest.TestCase):
         )
         if alert_rows is not None:
             alert_fields = [
+                "api_identity",
+                "reported_api_identity",
+                "change_fact_identity",
+                "decision_identity",
                 "target_coord",
                 "changed_symbol",
                 "api_signature",
@@ -209,6 +285,8 @@ class Step6ReportObjectivityTest(unittest.TestCase):
         )
         changed_path.parent.mkdir(parents=True, exist_ok=True)
         changed_fields = [
+            "change_fact_identity",
+            "decision_identity",
             "coord",
             "api_name",
             "api_signature",
@@ -2613,6 +2691,154 @@ class Step6ReportObjectivityTest(unittest.TestCase):
             s6_report.build_api_identity_key(compact),
             s6_report.build_api_identity_key(spaced),
         )
+
+    def test_two_same_type_change_facts_survive_step6_collection(self):
+        logical = {
+            "coord": "com.acme:lib",
+            "api": "com.acme.Api.call",
+            "api_signature": "()",
+            "symbol_kind": "method",
+            "change_type": "REMOVED",
+            "severity": "P1",
+            "old_version": "1.0.0",
+            "new_version": "2.0.0",
+        }
+        reported_identity = "r" * 64
+        facts = ("1" * 64, "2" * 64)
+
+        def result_item(fact_identity):
+            return {
+                **logical,
+                "api_identity": "|".join((
+                    logical["coord"],
+                    logical["api"],
+                    logical["api_signature"],
+                    logical["symbol_kind"],
+                    logical["change_type"],
+                    fact_identity,
+                )),
+                "reported_api_identity": reported_identity,
+                "change_fact_identity": fact_identity,
+                "decision_identity": fact_identity[::-1],
+                "analysis_status": "reachable",
+                "reason_code": "SYSTEM_CODE_REACHED",
+                "user_conclusion": "已确认影响",
+                "call_paths": [
+                    "com.app.Entry.run() → com.acme.Api.call()"
+                ],
+            }
+
+        summary_items = [result_item(fact) for fact in facts]
+        summary = {
+            "status": "done",
+            "total_apis": 2,
+            "reachable": 2,
+            "not_impacted": 0,
+            "uncertain": 0,
+            "not_analyzed": 0,
+            "not_found_in_static_analysis": 0,
+            "reachable_apis": summary_items,
+            "not_impacted_apis": [],
+            "uncertain_apis": [],
+            "not_analyzed_apis": [],
+            "not_found_apis": [],
+        }
+        changed_rows = [
+            {
+                **logical,
+                "api_name": logical["api"],
+                "change_fact_identity": item["change_fact_identity"],
+                "decision_identity": item["decision_identity"],
+            }
+            for item in summary_items
+        ]
+        alert_rows = [
+            {
+                "api_identity": item["api_identity"],
+                "reported_api_identity": reported_identity,
+                "change_fact_identity": item["change_fact_identity"],
+                "decision_identity": item["decision_identity"],
+                "target_coord": logical["coord"],
+                "changed_symbol": logical["api"],
+                "api_signature": logical["api_signature"],
+                "symbol_kind": logical["symbol_kind"],
+                "change_type": logical["change_type"],
+                "severity": logical["severity"],
+                "old_version": logical["old_version"],
+                "new_version": logical["new_version"],
+                "path_status": "reachable",
+                "conclusion_level": "confirmed",
+                "business_reachable": "true",
+                "business_entry": "com.app.Entry.run()",
+                "path_text": (
+                    "com.app.Entry.run() → com.acme.Api.call()"
+                ),
+            }
+            for item in summary_items
+        ]
+
+        self.assertNotEqual(
+            s6_report.build_api_identity_key(summary_items[0]),
+            s6_report.build_api_identity_key(summary_items[1]),
+        )
+        self.assertEqual(
+            s6_report.build_logical_api_identity_key(summary_items[0]),
+            s6_report.build_logical_api_identity_key(summary_items[1]),
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_collection_fixture(
+                tmp,
+                summary=summary,
+                changed_rows=changed_rows,
+                alert_rows=alert_rows,
+            )
+            by_api_dir = Path(tmp) / "evidence" / "call_chain" / "by_api"
+            by_api_dir.mkdir(parents=True)
+            for index, item in enumerate(summary_items, start=1):
+                (by_api_dir / f"fact-{index}.json").write_text(
+                    json.dumps({
+                        **item,
+                        "evidence_paths": [[{
+                            "caller_symbol": f"com.app.Entry{index}.run()",
+                            "callee_key": "com.acme.Api.call()",
+                        }]],
+                    }),
+                    encoding="utf-8",
+                )
+            findings = s6_report.collect_findings(tmp)
+            logical_rows = s6_report.build_api_result_rows(findings)
+            api_model = s6_report.build_human_api_analysis(findings)
+
+        self.assertEqual(
+            facts,
+            tuple(item["change_fact_identity"] for item in findings["p1"]),
+        )
+        self.assertEqual(
+            ["com.app.Entry1.run()", "com.app.Entry2.run()"],
+            [
+                item["evidence_paths"][0][0]["caller_symbol"]
+                for item in findings["p1"]
+            ],
+        )
+        self.assertEqual(
+            2, len(findings["impact_overview"]["fact_apis"])
+        )
+        self.assertEqual(
+            1, len(findings["impact_overview"]["apis"])
+        )
+        self.assertEqual(1, len(logical_rows))
+        self.assertEqual(1, len(api_model["rows"]))
+        self.assertFalse(any(
+            item.get("artifact") in {
+                "call_chain_summary", "call_chain_alerts", "changed_apis",
+            }
+            and item.get("stage") in {
+                "json_contract", "csv_consistency",
+                "identity_consistency", "field_consistency",
+            }
+            for item in findings["diagnostics"]
+        ))
 
     def test_duplicate_result_facts_merge_deterministically(self):
         identity = {

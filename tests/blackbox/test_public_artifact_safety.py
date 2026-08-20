@@ -17,6 +17,7 @@ from tests.blackbox.harness import (
     pipeline_config,
     required_tools,
 )
+from tests.blackbox.managed_process import managed_run
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -90,6 +91,7 @@ class PublicArtifactSafetyBlackboxTest(unittest.TestCase):
         *,
         limits: dict[str, object] | None = None,
         env: dict[str, str] | None = None,
+        cwd: Path | None = None,
     ) -> tuple[subprocess.CompletedProcess, dict[str, object], Path]:
         run_root = self.root / "runs" / name
         run_root.mkdir(parents=True)
@@ -100,7 +102,7 @@ class PublicArtifactSafetyBlackboxTest(unittest.TestCase):
         result_path = run_root / "result.json"
         output_root = run_root / "output"
         config_path.write_text(json.dumps(config), encoding="utf-8")
-        completed = subprocess.run(
+        completed = managed_run(
             [
                 sys.executable,
                 str(ROOT / "scripts" / "binary_pipeline.py"),
@@ -108,7 +110,7 @@ class PublicArtifactSafetyBlackboxTest(unittest.TestCase):
                 "--output-root", str(output_root),
                 "--result-json", str(result_path),
             ],
-            cwd=str(ROOT), capture_output=True, text=True,
+            cwd=str(cwd or ROOT), capture_output=True, text=True,
             encoding="utf-8", errors="replace", check=False, timeout=180,
             env=env,
         )
@@ -157,7 +159,7 @@ class PublicArtifactSafetyBlackboxTest(unittest.TestCase):
             self.baseline["current"], self.root / "mutated" / "corrupt-class.jar",
             replacements={class_name: corrupt_bytes},
         )
-        jvm = subprocess.run(
+        jvm = managed_run(
             [
                 self.tools["java"], "-cp",
                 os.pathsep.join(map(str, (corrupt, self.baseline["business"], self.baseline["oracle"]))),
@@ -183,7 +185,7 @@ class PublicArtifactSafetyBlackboxTest(unittest.TestCase):
             replacements={class_name: bytes(unsupported_bytes)},
         )
         self.assertEqual(int.from_bytes(unsupported_bytes[6:8], "big"), 71)
-        jvm = subprocess.run(
+        jvm = managed_run(
             [
                 self.tools["java"], "-cp",
                 os.pathsep.join(map(str, (unsupported, self.baseline["business"], self.baseline["oracle"]))),
@@ -276,51 +278,40 @@ class PublicArtifactSafetyBlackboxTest(unittest.TestCase):
         )
 
     def test_helper_heap_and_deadline_are_applied_by_the_public_cli(self):
-        wrapper_root = self.root / "java-wrapper"
-        wrapper_root.mkdir()
-        log_path = wrapper_root / "java-args.jsonl"
-        wrapper = wrapper_root / "java"
-        wrapper.write_text(
-            "#!/usr/bin/env python3\n"
-            "import json, os, pathlib, sys, time\n"
-            f"real={self.tools['java']!r}\n"
-            f"log=pathlib.Path({str(log_path)!r})\n"
-            "with log.open('a', encoding='utf-8') as out: out.write(json.dumps(sys.argv[1:])+'\\n')\n"
-            "if os.environ.get('JUA_TEST_SLEEP_HELPER') == '1' and 'BinaryFactExtractor' in sys.argv:\n"
-            "    time.sleep(1)\n"
-            "os.execv(real, [real, *sys.argv[1:]])\n",
-            encoding="utf-8",
-        )
-        wrapper.chmod(0o755)
+        log_pattern = Path("jvm-arguments-%p.log")
         environment = dict(os.environ)
-        environment["PATH"] = str(wrapper_root) + os.pathsep + environment.get("PATH", "")
+        logging_option = f"-Xlog:arguments=trace:file={log_pattern}"
+        environment["JAVA_TOOL_OPTIONS"] = " ".join(filter(None, (
+            environment.get("JAVA_TOOL_OPTIONS", ""), logging_option,
+        )))
 
         completed, public, _output = self.invoke(
             "heap", self.baseline,
             limits={"helper_max_heap": f"{TRUTH['minimum_helper_heap_megabytes']}m"},
-            env=environment,
+            env=environment, cwd=self.root,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr[-4000:])
-        logged = [json.loads(line) for line in log_path.read_text().splitlines()]
-        helper_calls = [args for args in logged if "BinaryFactExtractor" in args]
-        self.assertTrue(helper_calls)
-        self.assertTrue(any(
-            f"-Xmx{TRUTH['minimum_helper_heap_megabytes']}m" in args
-            for args in helper_calls
-        ))
+        jvm_logs = "\n".join(
+            path.read_text(encoding="utf-8", errors="replace")
+            for path in self.root.glob("jvm-arguments-*.log")
+        )
+        self.assertIn("java_command: BinaryFactExtractor", jvm_logs)
+        self.assertIn(
+            f"-Xmx{TRUTH['minimum_helper_heap_megabytes']}m", jvm_logs
+        )
         self.assertEqual(
             public["artifact_safety_policy"]["helper_max_heap"],
             f"{TRUTH['minimum_helper_heap_megabytes']}m",
         )
 
-        environment["JUA_TEST_SLEEP_HELPER"] = "1"
         completed, public, output = self.invoke(
             "timeout", self.baseline,
-            limits={"helper_timeout_seconds": 0.05}, env=environment,
+            limits={"helper_timeout_seconds": 0.01}, env=environment,
+            cwd=self.root,
         )
         self.assert_failed(
-            completed, public, output,
-            reason="ASM_HELPER_TIMEOUT", detail_marker="0.05",
+            completed, public, output, reason="ASM_HELPER_TIMEOUT",
+            detail_marker="0.01",
         )
 
 

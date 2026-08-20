@@ -18,6 +18,17 @@
   ],
   "public_failure_schema": "java-upgrade-analyzer.binary-pipeline-failure.v1",
   "max_attempts": 2,
+  "attempt_progress_binding": {
+    "stale_failed_phase": "",
+    "progress_bound_to_attempt": false,
+    "core_transaction_status": "failed"
+  },
+  "result_sink_failure": {
+    "reason_code": "BINARY_PIPELINE_CONFIG_SCHEMA_INVALID",
+    "core_transaction_status": "failed",
+    "result_json_persisted": false,
+    "persist_failure_type": "FileExistsError"
+  },
   "cases": {
     "missing": {
       "phase": "static_preflight",

@@ -1032,7 +1032,13 @@ def _csv_rows(path):
         return list(csv.DictReader(handle))
 
 
-def derive_coverage_report(report_dir, project_scope=None):
+def derive_coverage_report(
+    report_dir,
+    project_scope=None,
+    *,
+    api_changes_dir=None,
+    call_chain_dir=None,
+):
     """Derive coverage from evidence artifacts; never act as an additional truth source."""
     report = Path(report_dir)
     components = []
@@ -1114,7 +1120,11 @@ def derive_coverage_report(report_dir, project_scope=None):
         'metrics': step3_coverage.get('metrics') or {},
     })
 
-    api_changes_dir = report / "evidence" / "api_changes"
+    api_changes_dir = (
+        Path(api_changes_dir)
+        if api_changes_dir is not None
+        else report / "evidence" / "api_changes"
+    )
     api_path = api_changes_dir / "all_changed_apis.csv"
     step4_summary_path = api_changes_dir / "summary.json"
     api_rows = _csv_rows(api_path)
@@ -1161,7 +1171,11 @@ def derive_coverage_report(report_dir, project_scope=None):
         },
     })
 
-    call_chain_dir = report / "evidence" / "call_chain"
+    call_chain_dir = (
+        Path(call_chain_dir)
+        if call_chain_dir is not None
+        else report / "evidence" / "call_chain"
+    )
     step5_summary = call_chain_dir / "summary.json"
     if step5_summary.is_file():
         try:

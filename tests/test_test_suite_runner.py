@@ -89,13 +89,12 @@ class TestSuiteRunnerTest(unittest.TestCase):
             {"performance"},
         )
 
-    def test_windows_selectors_load_full_blackbox_and_native_contract_without_gaps(self):
-        windows, gaps = runner.load_selector_tests(
-            self.policy, "windows_test_selectors", ROOT,
-        )
+    def test_windows_selectors_load_governed_blackbox_and_native_replacements(self):
+        windows, gaps = runner.load_windows_tests(self.policy, ROOT)
         ids = {test.id() for test in windows}
 
         self.assertEqual(gaps, [])
+        self.assertEqual(len(ids), len(windows))
         self.assertGreaterEqual(
             len(windows), self.policy["minimum_windows_test_count"]
         )
@@ -105,9 +104,30 @@ class TestSuiteRunnerTest(unittest.TestCase):
             "test_pythonw_parent_captures_unicode_and_metacharacter_argument",
             ids,
         )
+        self.assertNotIn(
+            "tests.blackbox.test_public_failure_contracts."
+            "PublicFailureContractsBlackboxTest."
+            "test_environment_failures_are_preflighted_and_only_transient_failures_retry",
+            ids,
+        )
         self.assertIn(
             "tests.windows_native_contract.WindowsNativeContractTest."
             "test_native_process_metrics_report_cpu_and_peak_memory",
+            ids,
+        )
+        self.assertIn(
+            "tests.windows_native_contract.WindowsNativeContractTest."
+            "test_cmd_and_bat_wrappers_preserve_unicode_and_metacharacters",
+            ids,
+        )
+        self.assertIn(
+            "tests.windows_native_contract.WindowsNativeContractTest."
+            "test_near_limit_unicode_path_survives_git_and_atomic_json",
+            ids,
+        )
+        self.assertNotIn(
+            "tests.test_build_tool_selection.BuildToolSelectionTest."
+            "test_maven_uses_shell_for_non_executable_project_wrapper",
             ids,
         )
         self.assertIn(
@@ -142,7 +162,6 @@ class TestSuiteRunnerTest(unittest.TestCase):
         self.assertFalse(
             runner.public_capability_readiness_blocks("all", complete)
         )
-
 
 if __name__ == "__main__":
     unittest.main()

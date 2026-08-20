@@ -49,6 +49,25 @@ class Step3FinalArtifactDependencyScansTest(unittest.TestCase):
                 archive.writestr(name, content)
         return buffer.getvalue()
 
+    def test_class_name_filter_uses_exact_metadata_basenames(self):
+        jar_bytes = self._jar_bytes([
+            ("module-info.class", b"root-module"),
+            ("package-info.class", b"root-package"),
+            ("audit/module-info.class", b"nested-module"),
+            ("audit/package-info.class", b"nested-package"),
+            ("audit/notmodule-info.class", b"runtime-class"),
+            ("audit/notpackage-info.class", b"runtime-class"),
+        ])
+
+        self.assertEqual(
+            s3_scan._iter_jar_class_names(jar_bytes),
+            [
+                "audit.module-info",
+                "audit.notmodule-info",
+                "audit.notpackage-info",
+            ],
+        )
+
     def _prepare_report(self, root, dependency_rows, nested_entries):
         report_dir = root / ".upgrade-report"
         dependencies_dir = report_dir / "evidence" / "dependencies"

@@ -2,10 +2,12 @@ import ast
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -92,18 +94,40 @@ class PlatformContractTest(unittest.TestCase):
         )
 
     def test_windows_run_cmd_hides_python_and_other_non_git_children(self):
-        completed = SimpleNamespace(stdout=b"ok\n", stderr=b"", returncode=0)
+        process = SimpleNamespace(
+            stdin=None, stdout=None, stderr=None, returncode=0,
+        )
+        process.communicate = lambda input=None, timeout=None: (b"ok\n", b"")
         with patch.object(compat, "IS_WINDOWS", True), patch.object(
-            compat.subprocess, "run", return_value=completed,
-        ) as runner:
+            compat.subprocess, "Popen", return_value=process,
+        ) as popen:
             stdout, stderr, returncode = compat.run_cmd(
                 ["python.exe", "--version"]
             )
 
         self.assertEqual((stdout, stderr, returncode), ("ok\n", "", 0))
         self.assertEqual(
-            runner.call_args.kwargs["creationflags"], 0x08000000
+            popen.call_args.kwargs["creationflags"], 0x08000000
         )
+
+    def test_windows_job_assignment_failure_fails_closed_after_reaping_root(self):
+        process = SimpleNamespace(pid=43210)
+        with patch.object(
+            compat.subprocess, "Popen", return_value=process,
+        ), patch.object(
+            compat, "_attach_windows_managed_job",
+            side_effect=OSError("nested job rejected"),
+        ), patch.object(
+            compat, "_terminate_subprocess",
+        ) as terminate:
+            _stdout, stderr, returncode = compat.run_cmd(
+                [sys.executable, "-c", "pass"], timeout=1,
+            )
+
+        self.assertEqual(returncode, -1)
+        self.assertIn("MANAGED_PROCESS_JOB_ASSIGNMENT_FAILED", stderr)
+        self.assertIn("nested job rejected", stderr)
+        terminate.assert_called_once_with(process, process_group=True)
 
     def test_windows_git_capture_uses_no_window_without_a_new_process_group(self):
         process = SimpleNamespace(returncode=0)
@@ -254,6 +278,16 @@ class PlatformContractTest(unittest.TestCase):
         missing = []
         for source_path in sorted((ROOT / "scripts").glob("*.py")):
             tree = ast.parse(source_path.read_text(encoding="utf-8"))
+            managed_wrapper_lines = set()
+            if source_path.name == "compat.py":
+                for definition in tree.body:
+                    if (
+                        isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        and definition.name == "managed_popen"
+                    ):
+                        managed_wrapper_lines.update(
+                            range(definition.lineno, definition.end_lineno + 1)
+                        )
             for node in ast.walk(tree):
                 if not isinstance(node, ast.Call) or not isinstance(
                     node.func, ast.Attribute
@@ -264,6 +298,8 @@ class PlatformContractTest(unittest.TestCase):
                     and node.func.value.id == "subprocess"
                     and node.func.attr in {"run", "Popen"}
                 ):
+                    continue
+                if getattr(node, "lineno", 0) in managed_wrapper_lines:
                     continue
                 expanded = [
                     keyword.value for keyword in node.keywords
@@ -289,6 +325,86 @@ class PlatformContractTest(unittest.TestCase):
                     )
 
         self.assertEqual(missing, [])
+
+    def test_every_managed_popen_caller_has_success_and_failure_cleanup(self):
+        missing = []
+        cleanup_names = {
+            "_cancel_process",
+            "_terminate_subprocess",
+            "terminate_process_tree",
+        }
+        for source_path in sorted((ROOT / "scripts").glob("*.py")):
+            tree = ast.parse(source_path.read_text(encoding="utf-8"))
+            for definition in tree.body:
+                if not isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                calls = [node for node in ast.walk(definition) if isinstance(node, ast.Call)]
+                uses_managed_popen = any(
+                    (
+                        isinstance(call.func, ast.Name)
+                        and call.func.id == "managed_popen"
+                    )
+                    or (
+                        isinstance(call.func, ast.Attribute)
+                        and call.func.attr == "managed_popen"
+                    )
+                    for call in calls
+                )
+                if not uses_managed_popen:
+                    continue
+                called_names = {
+                    call.func.id
+                    for call in calls
+                    if isinstance(call.func, ast.Name)
+                } | {
+                    call.func.attr
+                    for call in calls
+                    if isinstance(call.func, ast.Attribute)
+                }
+                if "release_process_tree" not in called_names:
+                    missing.append(f"{source_path.name}:{definition.name}:success")
+                if not (cleanup_names & called_names):
+                    missing.append(f"{source_path.name}:{definition.name}:failure")
+
+        self.assertEqual(missing, [])
+
+    def test_synchronous_product_commands_cannot_bypass_tree_management(self):
+        """Only the deliberate background launcher may own a raw Popen."""
+        allowed = {
+            ("compat.py", "_detect_subprocess_encoding", "run"),
+            ("compat.py", "managed_popen", "Popen"),
+            ("compat.py", "_terminate_subprocess", "run"),
+            ("run_step.py", "start_background_run", "Popen"),
+        }
+        observed = set()
+        for source_path in sorted((ROOT / "scripts").glob("*.py")):
+            tree = ast.parse(source_path.read_text(encoding="utf-8"))
+            for definition in ast.walk(tree):
+                if not isinstance(
+                    definition, (ast.FunctionDef, ast.AsyncFunctionDef)
+                ):
+                    continue
+                for node in ast.walk(definition):
+                    if not (
+                        isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and isinstance(node.func.value, ast.Name)
+                        and node.func.value.id == "subprocess"
+                        and node.func.attr in {"run", "Popen"}
+                    ):
+                        continue
+                    identity = (
+                        source_path.name, definition.name, node.func.attr,
+                    )
+                    observed.add(identity)
+                    self.assertIn(
+                        identity,
+                        allowed,
+                        f"synchronous subprocess bypasses managed tree: "
+                        f"{source_path.name}:{node.lineno}",
+                    )
+
+        self.assertEqual(observed, allowed)
 
     def test_path_expanding_temporary_directories_cannot_bypass_shared_runtime(self):
         for path in sorted((ROOT / "scripts").glob("*.py")):
@@ -586,8 +702,8 @@ class PlatformContractTest(unittest.TestCase):
                 },
                 clear=False,
             ), patch.object(
-                compat.subprocess,
-                "run",
+                compat,
+                "run_managed_subprocess",
                 return_value=completed,
             ) as runner:
                 self.assertTrue(compat._git_executable_works(candidate))
@@ -1007,6 +1123,363 @@ time.sleep(60)
 
         self.assertFalse(child_alive, "timed-out Git descendant remained alive")
 
+    @unittest.skipIf(os.name == "nt", "POSIX process-group semantics only")
+    def test_non_git_timeout_terminates_descendant_after_root_exits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            helper = root / "foreground_parent.py"
+            child_pid_file = root / "child.pid"
+            helper.write_text(
+                """import subprocess
+import sys
+import time
+from pathlib import Path
+
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+Path(sys.argv[1]).write_text(str(child.pid), encoding="utf-8")
+time.sleep(0.1)
+""",
+                encoding="utf-8",
+            )
+            _stdout, stderr, returncode = compat.run_cmd(
+                [sys.executable, str(helper), str(child_pid_file)],
+                timeout=0.5,
+            )
+
+            self.assertEqual(returncode, -1)
+            self.assertIn("命令超时", stderr)
+            self.assertTrue(child_pid_file.is_file())
+            child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+            deadline = time.monotonic() + 3
+            child_alive = True
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(child_pid, 0)
+                except ProcessLookupError:
+                    child_alive = False
+                    break
+                proc_stat = Path(f"/proc/{child_pid}/stat")
+                if proc_stat.is_file():
+                    fields = proc_stat.read_text(encoding="utf-8").split()
+                    if len(fields) > 2 and fields[2] == "Z":
+                        child_alive = False
+                        break
+                time.sleep(0.05)
+
+        self.assertFalse(child_alive, "timed-out non-Git descendant remained alive")
+
+    def test_non_git_pipe_failure_terminates_managed_process_tree(self):
+        process = SimpleNamespace(
+            pid=43210, stdin=None, stdout=None, stderr=None, returncode=None,
+        )
+        process.communicate = lambda input=None, timeout=None: (_ for _ in ()).throw(
+            OSError("capture pipe failed")
+        )
+        with patch.object(compat, "managed_popen", return_value=process), patch.object(
+            compat, "_terminate_subprocess",
+        ) as terminate:
+            _stdout, stderr, returncode = compat.run_cmd(
+                [sys.executable, "-c", "pass"], timeout=1,
+            )
+
+        self.assertEqual(returncode, -1)
+        self.assertIn("执行异常：OSError", stderr)
+        terminate.assert_called_once_with(process, process_group=True)
+
+    def test_managed_subprocess_timeout_preserves_exception_after_tree_cleanup(self):
+        timeout_error = subprocess.TimeoutExpired(["worker"], 0.1)
+        calls = []
+        process = SimpleNamespace(returncode=None)
+
+        def communicate(input=None, timeout=None):
+            calls.append((input, timeout))
+            if len(calls) == 1:
+                raise timeout_error
+            return b"partial-out", b"partial-error"
+
+        process.communicate = communicate
+        with patch.object(
+            compat, "managed_popen", return_value=process,
+        ), patch.object(
+            compat, "terminate_process_tree",
+        ) as terminate:
+            with self.assertRaises(subprocess.TimeoutExpired) as raised:
+                compat.run_managed_subprocess(
+                    ["worker"], capture_output=True, timeout=0.1,
+                )
+
+        self.assertIs(raised.exception, timeout_error)
+        self.assertEqual(raised.exception.output, b"partial-out")
+        self.assertEqual(raised.exception.stderr, b"partial-error")
+        terminate.assert_called_once_with(process)
+        self.assertEqual(calls, [(None, 0.1), (None, 5)])
+
+    @unittest.skipIf(os.name == "nt", "POSIX process-group semantics only")
+    def test_managed_process_group_can_be_claimed_for_termination_only_once(self):
+        process = SimpleNamespace(pid=43210, returncode=None)
+        process.poll = lambda: None
+        process.kill = lambda: None
+        process.wait = lambda timeout=None: -9
+        compat._register_managed_process_tree(process)
+        self.addCleanup(compat._unregister_managed_process_tree, process)
+
+        with patch.object(compat.os, "killpg") as kill_group:
+            compat.terminate_process_tree(process)
+            compat.terminate_process_tree(process)
+
+        kill_group.assert_called_once_with(process.pid, signal.SIGKILL)
+        self.assertNotIn(process.pid, compat._POSIX_MANAGED_PROCESS_GROUPS)
+
+    def test_windows_released_token_cannot_target_reused_pid(self):
+        def process(pid, returncode):
+            item = SimpleNamespace(
+                pid=pid, returncode=returncode,
+                kill=lambda: None, wait=lambda timeout=None: returncode,
+            )
+            item.poll = lambda: item.returncode
+            return item
+
+        old = process(43210, 0)
+        replacement = process(43210, None)
+        setattr(old, compat._WINDOWS_JOB_HANDLE_ATTRIBUTE, 101)
+        setattr(replacement, compat._WINDOWS_JOB_HANDLE_ATTRIBUTE, 202)
+
+        def consume_job(item, *, terminate):
+            self.assertTrue(
+                getattr(item, compat._WINDOWS_JOB_HANDLE_ATTRIBUTE, None)
+            )
+            delattr(item, compat._WINDOWS_JOB_HANDLE_ATTRIBUTE)
+            return terminate
+
+        with patch.object(compat, "IS_WINDOWS", True), patch.object(
+            compat, "_release_windows_managed_job", side_effect=consume_job,
+        ) as release_job, patch.object(
+            compat.subprocess, "run",
+        ) as taskkill:
+            compat._register_managed_process_tree(old)
+            compat.release_process_tree(old)
+            compat._register_managed_process_tree(replacement)
+
+            compat.terminate_process_tree(old)
+
+            self.assertEqual(release_job.call_count, 1)
+            compat.terminate_process_tree(replacement)
+
+        self.assertEqual(release_job.call_count, 2)
+        self.assertIs(release_job.call_args_list[0].args[0], old)
+        self.assertEqual(
+            release_job.call_args_list[0].kwargs, {"terminate": False}
+        )
+        self.assertIs(release_job.call_args_list[1].args[0], replacement)
+        self.assertEqual(
+            release_job.call_args_list[1].kwargs, {"terminate": True}
+        )
+        taskkill.assert_not_called()
+        self.assertFalse(hasattr(old, compat._WINDOWS_JOB_HANDLE_ATTRIBUTE))
+        self.assertFalse(
+            hasattr(replacement, compat._WINDOWS_JOB_HANDLE_ATTRIBUTE)
+        )
+        self.assertFalse(
+            hasattr(old, compat._MANAGED_PROCESS_TREE_TOKEN_ATTRIBUTE)
+        )
+        self.assertFalse(
+            hasattr(replacement, compat._MANAGED_PROCESS_TREE_TOKEN_ATTRIBUTE)
+        )
+
+    def test_windows_release_and_terminate_race_consumes_one_owner(self):
+        process = SimpleNamespace(pid=54321, returncode=0)
+        process.poll = lambda: process.returncode
+        process.kill = lambda: None
+        process.wait = lambda timeout=None: process.returncode
+        setattr(process, compat._WINDOWS_JOB_HANDLE_ATTRIBUTE, 303)
+        barrier = threading.Barrier(3)
+        failures = []
+
+        def invoke(action):
+            try:
+                barrier.wait(timeout=2)
+                action(process)
+            except BaseException as error:
+                failures.append(error)
+
+        def consume_job(item, *, terminate):
+            self.assertTrue(
+                getattr(item, compat._WINDOWS_JOB_HANDLE_ATTRIBUTE, None)
+            )
+            delattr(item, compat._WINDOWS_JOB_HANDLE_ATTRIBUTE)
+            return terminate
+
+        with patch.object(compat, "IS_WINDOWS", True), patch.object(
+            compat, "_release_windows_managed_job", side_effect=consume_job,
+        ) as release_job, patch.object(
+            compat.subprocess, "run",
+        ) as taskkill:
+            compat._register_managed_process_tree(process)
+            releaser = threading.Thread(
+                target=invoke, args=(compat.release_process_tree,)
+            )
+            terminator = threading.Thread(
+                target=invoke, args=(compat.terminate_process_tree,)
+            )
+            releaser.start()
+            terminator.start()
+            barrier.wait(timeout=2)
+            releaser.join(timeout=2)
+            terminator.join(timeout=2)
+
+        self.assertFalse(releaser.is_alive())
+        self.assertFalse(terminator.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(release_job.call_count, 1)
+        self.assertIn(
+            release_job.call_args.kwargs,
+            ({"terminate": False}, {"terminate": True}),
+        )
+        taskkill.assert_not_called()
+        self.assertFalse(
+            hasattr(process, compat._WINDOWS_JOB_HANDLE_ATTRIBUTE)
+        )
+        self.assertFalse(
+            hasattr(process, compat._MANAGED_PROCESS_TREE_TOKEN_ATTRIBUTE)
+        )
+        self.assertNotIn(
+            getattr(
+                process, compat._MANAGED_PROCESS_TREE_TOKEN_ATTRIBUTE, None
+            ),
+            compat._MANAGED_PROCESS_TREES,
+        )
+
+    @unittest.skipIf(os.name == "nt", "POSIX ownership semantics only")
+    def test_posix_same_pid_tokens_cannot_claim_another_process_object(self):
+        old = SimpleNamespace(pid=65432)
+        replacement = SimpleNamespace(pid=65432)
+        with patch.object(
+            compat, "_ensure_managed_sigterm_handler",
+        ), patch.object(
+            compat, "_restore_managed_sigterm_handler",
+        ):
+            compat._register_managed_process_tree(old)
+            self.assertTrue(compat._unregister_managed_process_tree(old))
+            compat._register_managed_process_tree(replacement)
+
+            self.assertFalse(compat._claim_managed_process_tree(old))
+            self.assertTrue(compat._claim_managed_process_tree(replacement))
+
+        self.assertEqual(compat._POSIX_MANAGED_PROCESS_GROUPS, set())
+
+    @unittest.skipIf(os.name == "nt", "POSIX signal semantics only")
+    def test_sigterm_to_manager_terminates_isolated_foreground_tree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            child_pid_path = root / "child.pid"
+            parent_script = root / "command_parent.py"
+            manager_script = root / "manager.py"
+            parent_script.write_text(
+                """import subprocess
+import sys
+import time
+from pathlib import Path
+
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+Path(sys.argv[1]).write_text(str(child.pid), encoding="utf-8")
+time.sleep(60)
+""",
+                encoding="utf-8",
+            )
+            manager_script.write_text(
+                """import sys
+sys.path.insert(0, sys.argv[1])
+import compat
+compat.run_cmd([sys.executable, sys.argv[2], sys.argv[3]], timeout=60)
+""",
+                encoding="utf-8",
+            )
+            manager = subprocess.Popen([
+                sys.executable,
+                str(manager_script),
+                str(ROOT / "scripts"),
+                str(parent_script),
+                str(child_pid_path),
+            ])
+            child_pid = None
+            try:
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and not child_pid_path.is_file():
+                    time.sleep(0.05)
+                self.assertTrue(child_pid_path.is_file(), "child PID was not published")
+                child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+                os.kill(manager.pid, signal.SIGTERM)
+                manager.wait(timeout=5)
+
+                deadline = time.monotonic() + 3
+                child_alive = True
+                while time.monotonic() < deadline:
+                    try:
+                        os.kill(child_pid, 0)
+                    except ProcessLookupError:
+                        child_alive = False
+                        break
+                    proc_stat = Path(f"/proc/{child_pid}/stat")
+                    if proc_stat.is_file():
+                        fields = proc_stat.read_text(encoding="utf-8").split()
+                        if len(fields) > 2 and fields[2] == "Z":
+                            child_alive = False
+                            break
+                    time.sleep(0.05)
+            finally:
+                if manager.poll() is None:
+                    manager.kill()
+                    manager.wait(timeout=5)
+                if child_pid is not None:
+                    try:
+                        os.kill(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+        self.assertLess(manager.returncode, 0)
+        self.assertFalse(child_alive, "SIGTERM left managed descendant alive")
+
+    @unittest.skipIf(os.name == "nt", "POSIX signal semantics only")
+    def test_concurrent_managed_groups_restore_previous_sigterm_handler(self):
+        previous = signal.getsignal(signal.SIGTERM)
+
+        def custom_handler(_signum, _frame):
+            return None
+
+        first = second = None
+        try:
+            signal.signal(signal.SIGTERM, custom_handler)
+            first = compat.managed_popen([
+                sys.executable, "-c", "import time; time.sleep(0.2)",
+            ])
+            second = compat.managed_popen([
+                sys.executable, "-c", "import time; time.sleep(0.2)",
+            ])
+            self.assertIs(signal.getsignal(signal.SIGTERM), compat._managed_sigterm_handler)
+            self.assertEqual(
+                compat._POSIX_MANAGED_PROCESS_GROUPS,
+                {first.pid, second.pid},
+            )
+
+            first.wait(timeout=5)
+            compat.release_process_tree(first)
+            self.assertIs(signal.getsignal(signal.SIGTERM), compat._managed_sigterm_handler)
+            self.assertEqual(compat._POSIX_MANAGED_PROCESS_GROUPS, {second.pid})
+
+            second.wait(timeout=5)
+            compat.release_process_tree(second)
+            self.assertIs(signal.getsignal(signal.SIGTERM), custom_handler)
+            self.assertEqual(compat._POSIX_MANAGED_PROCESS_GROUPS, set())
+        finally:
+            for process in (first, second):
+                if process is not None and process.poll() is None:
+                    compat.terminate_process_tree(process)
+            signal.signal(signal.SIGTERM, previous)
+            compat._MANAGED_SIGTERM_HANDLER_INSTALLED = False
+            compat._PREVIOUS_SIGTERM_HANDLER = None
+            compat._POSIX_MANAGED_PROCESS_GROUPS.clear()
+            compat._MANAGED_PROCESS_TREES.clear()
+
     def test_bare_git_command_is_replaced_with_validated_absolute_path(self):
         with patch.object(
             compat, "find_executable", return_value="/Users/example/.local/bin/git"
@@ -1034,9 +1507,18 @@ time.sleep(60)
         workflow = ROOT / ".github" / "workflows" / "platform-contract.yml"
         text = workflow.read_text(encoding="utf-8")
 
-        for value in ("ubuntu-latest", "macos-latest", "windows-latest"):
+        for value in (
+            "ubuntu-latest", "macos-latest", "windows-2022", "windows-2025",
+        ):
             self.assertIn(value, text)
         self.assertRegex(text, r'java:\s*\["11",\s*"17",\s*"21"\]')
+        self.assertIn('java-version: "8"', text)
+        self.assertIn('java-version: "17"', text)
+        self.assertIn('echo "JAVA8_HOME=${JAVA_HOME}"', text)
+        self.assertIn('echo "JAVA17_HOME=${JAVA_HOME}"', text)
+        self.assertIn("gradle/actions/setup-gradle@v6", text)
+        self.assertIn('gradle-version: "8.10.2"', text)
+        self.assertIn("gradle --version", text)
         self.assertIn('python-version: "3.12"', text)
         self.assertIn("mvn -version", text)
         self.assertNotIn("cache: maven", text)
@@ -1048,6 +1530,13 @@ time.sleep(60)
         self.assertIn("steps.windows_suite.outcome", text)
         self.assertIn("gate|windows-native-suite-report|missing", text)
         self.assertIn("gate|windows-native-suite|", text)
+        self.assertIn("step|setup-windows-java8|", text)
+        self.assertIn("step|setup-windows-java17|", text)
+        self.assertIn("step|setup-windows-gradle|", text)
+        self.assertIn("step|verify-windows-gradle|", text)
+        self.assertIn('test "${#cell_files[@]}" -eq 12', text)
+        self.assertIn('[[ "${MATRIX_OS}" == windows-* ]]', text)
+        self.assertIn('sys.argv[4].startswith("windows-")', text)
         self.assertIn("push:", text)
         self.assertIn('- "main"', text)
         self.assertIn('- "codex/**"', text)

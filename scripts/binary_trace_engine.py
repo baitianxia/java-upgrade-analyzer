@@ -138,6 +138,8 @@ class BinaryTraceBundle:
     resource_activation_results: tuple[dict[str, Any], ...] = ()
     entrypoint_discovery_identity: str = ""
     entrypoint_records: tuple[dict[str, Any], ...] = ()
+    entrypoint_coverage_status: str = "complete"
+    entrypoint_coverage_gaps: tuple[str, ...] = ()
 
 
 class BinaryTraceEngine:
@@ -342,16 +344,28 @@ class BinaryTraceEngine:
             if not edge:
                 continue
             edge_kind = str(edge.get("edge_kind") or "")
-            dynamic_handle = edge_kind.startswith("invokedynamic_handle_")
+            dynamic_handle = (
+                edge_kind.startswith("invokedynamic_handle_")
+                or edge_kind.startswith("ldc_bootstrap_handle_")
+            )
             executable_linkage = edge_kind in {
                 "invokedynamic_bootstrap",
                 "ldc_constant_dynamic_bootstrap",
+                "ldc_handle",
             } or dynamic_handle
             if edge_kind not in {"method", "field"} and not executable_linkage:
                 continue
             caller = edge["caller_member_identity"]
             status = resolution["member_resolution_status"]
             dispatch = self.dispatch.get(edge_id) or {}
+            linkage_status = (
+                self.linkage_resolutions.get(edge_id) or {}
+            ).get("linkage_status")
+            loading_constraint_blocked = linkage_status in {
+                "loader_constraint_violation",
+                "loading_constraint_deferred_conflict",
+                "loading_constraint_unresolved",
+            }
             targets = list(dispatch.get("implementation_target_identities") or ())
             dispatch_status = dispatch.get("dispatch_status")
             if not targets and status == "resolved" and resolution.get("resolved_member_identity"):
@@ -360,6 +374,7 @@ class BinaryTraceEngine:
                 "possible"
                 if dispatch_status in {"possible", "partial_possible_set"}
                 or executable_linkage
+                or loading_constraint_blocked
                 else "exact"
             )
             for target in targets:
@@ -865,8 +880,13 @@ class BinaryTraceEngine:
         incompatible_statuses = {
             "no_such_member", "incompatible_class_change", "illegal_access",
             "no_class_definition", "class_definition_failed",
+            "loader_constraint_violation",
         }
-        unresolved_statuses = {"ambiguous", "unresolved", "unsupported"}
+        unresolved_statuses = {
+            "ambiguous", "unresolved", "unsupported",
+            "loading_constraint_deferred_conflict",
+            "loading_constraint_unresolved",
+        }
         # Removing a declaration is not necessarily a JVM linkage break.  A
         # symbolic reference to the old owner may resolve to an inherited
         # method with the exact same name and descriptor on the current side.
@@ -1114,6 +1134,16 @@ class BinaryTraceEngine:
             resource_activation_results=tuple(resource_results),
             entrypoint_discovery_identity=self.entrypoint_discovery.identity,
             entrypoint_records=tuple(self.entrypoint_discovery.records),
+            entrypoint_coverage_status=getattr(
+                self.entrypoint_discovery,
+                "coverage_status",
+                "partial"
+                if self.entrypoint_discovery.coverage_gaps
+                else "complete",
+            ),
+            entrypoint_coverage_gaps=tuple(
+                self.entrypoint_discovery.coverage_gaps
+            ),
         )
 
 
@@ -1289,6 +1319,12 @@ def build_binary_traces(
         resource_activation_results=(),
         entrypoint_discovery_identity=entrypoint_discovery.identity,
         entrypoint_records=tuple(entrypoint_discovery.records),
+        entrypoint_coverage_status=getattr(
+            entrypoint_discovery,
+            "coverage_status",
+            "partial" if entrypoint_discovery.coverage_gaps else "complete",
+        ),
+        entrypoint_coverage_gaps=tuple(entrypoint_discovery.coverage_gaps),
     )
 
 

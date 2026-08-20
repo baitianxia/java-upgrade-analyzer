@@ -6,12 +6,14 @@ from pathlib import Path
 import re
 import subprocess
 
+from tests.blackbox.managed_process import managed_run
+
 
 _FLAGS = re.compile(r"^\s*flags:\s*\(0x[0-9a-fA-F]+\)\s*(.*)$")
 
 
 def _class_flags(javap: str, jar: Path, class_name: str) -> tuple[str, ...]:
-    completed = subprocess.run(
+    completed = managed_run(
         [javap, "-classpath", str(jar), "-v", class_name],
         capture_output=True,
         text=True,

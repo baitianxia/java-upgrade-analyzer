@@ -34,7 +34,7 @@
     }
   ],
   "oracle_implementations": [
-    {"path": "tests/blackbox/oracles/openjdk_oracle.py", "sha256": "6e72442077371b86c943f790b5982144497725200da3e89f22f66ca2bfee38ca"}
+    {"path": "tests/blackbox/oracles/openjdk_oracle.py", "sha256": "6413dec752291d5bf7068a94c249e096d26490c64ddb5f7d3c278887ca9eae72"}
   ],
   "completeness": {
     "argument": "The declared library class set contains the removed type and one unchanged control class. JAR entry inventory and javap enumerate every public constructor, method and field in the base and prove the removed provider is absent in the current JAR while the control remains. The complete business entrypoint graph determines which removed members are reachable. Isolated JVM runners prove base member execution and business-class definition succeed, while the corresponding current operations fail because the owner class cannot be defined.",

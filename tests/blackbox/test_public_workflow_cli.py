@@ -11,6 +11,8 @@ import tempfile
 import unittest
 import zipfile
 
+from tests.blackbox.managed_process import managed_run
+
 
 ROOT = Path(__file__).resolve().parents[2]
 TRUTH = json.loads((
@@ -44,7 +46,7 @@ REPORT_BOUNDED_TRUTH = json.loads((
 
 
 def run_workflow(*arguments: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
+    return managed_run(
         [sys.executable, str(ROOT / "scripts" / "run_step.py"), *arguments],
         cwd=str(ROOT),
         capture_output=True,
@@ -95,7 +97,7 @@ def read_csv_rows(path: Path) -> list[dict]:
 
 
 def run_external(command: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess:
-    completed = subprocess.run(
+    completed = managed_run(
         command,
         cwd=str(cwd) if cwd else None,
         capture_output=True,
@@ -114,7 +116,7 @@ def run_external(command: list[str], *, cwd: Path | None = None) -> subprocess.C
 
 
 def full_jdk_home(java: str) -> Path:
-    completed = subprocess.run(
+    completed = managed_run(
         [java, "-XshowSettings:properties", "-version"],
         capture_output=True,
         text=True,
@@ -178,7 +180,7 @@ def find_full_jdk_home(java: str, major: int) -> Path | None:
             )
     java_home_tool = Path("/usr/libexec/java_home")
     if java_home_tool.is_file():
-        completed = subprocess.run(
+        completed = managed_run(
             [str(java_home_tool), "-v", "1.8" if major == 8 else str(major)],
             capture_output=True,
             text=True,
@@ -851,7 +853,7 @@ def create_step3_source_repository(root: Path, git: str) -> Path:
     return project
 
 
-def run_confirmed_artifact_workflow(
+def run_artifact_confirmation(
     report: Path, project: Path, artifacts: dict[str, Path], jdk_home: Path,
 ) -> tuple[subprocess.CompletedProcess, subprocess.CompletedProcess, tuple[str, ...]]:
     common = (
@@ -881,6 +883,15 @@ def run_confirmed_artifact_workflow(
     confirmed = run_workflow(
         "--step", "step0", *common,
         "--response-json", json.dumps({"action": "continue"}),
+    )
+    return first, confirmed, common
+
+
+def run_confirmed_artifact_workflow(
+    report: Path, project: Path, artifacts: dict[str, Path], jdk_home: Path,
+) -> tuple[subprocess.CompletedProcess, subprocess.CompletedProcess, tuple[str, ...]]:
+    first, confirmed, common = run_artifact_confirmation(
+        report, project, artifacts, jdk_home,
     )
     if confirmed.returncode != 0:
         raise AssertionError(confirmed.stderr)
@@ -1150,7 +1161,7 @@ class PublicWorkflowCliBlackboxTest(unittest.TestCase):
                 with zipfile.ZipFile(corrupt) as archive:
                     archive.namelist()
 
-            _initial, completed, _common = run_confirmed_artifact_workflow(
+            _initial, completed, _common = run_artifact_confirmation(
                 report,
                 project,
                 {"base": corrupt, "current": current},
@@ -1166,6 +1177,9 @@ class PublicWorkflowCliBlackboxTest(unittest.TestCase):
             for field, value in expected["workflow_state"].items():
                 self.assertEqual(state[field], value)
             self.assertIn(expected["blocking_reason_contains"], state["blocking_reason"])
+            self.assertIn(
+                expected["blocking_reason_code"], state["blocking_reason_codes"]
+            )
             self.assertFalse(
                 (report / "evidence" / "dependencies" / "dep_changes.csv").exists()
             )
@@ -1433,7 +1447,7 @@ class PublicWorkflowCliBlackboxTest(unittest.TestCase):
                     )), "example.Application", argument,
                 ])
                 self.assertEqual(base_run.stdout, stdout)
-                current_run = subprocess.run(
+                current_run = managed_run(
                     [
                         tools["java"], "-cp", os.pathsep.join((
                             str(artifacts["business"]),
@@ -1676,7 +1690,7 @@ class PublicWorkflowCliBlackboxTest(unittest.TestCase):
                 "example.Application",
             ])
             self.assertEqual(base_run.stdout, "base")
-            current_run = subprocess.run(
+            current_run = managed_run(
                 [
                     tools["java"], "-cp",
                     os.pathsep.join((str(extracted_business), str(current_dep))),
@@ -1809,7 +1823,7 @@ class PublicWorkflowCliBlackboxTest(unittest.TestCase):
                 "example.Application",
             ])
             self.assertEqual(base_run.stdout, str(sum(range(method_count))))
-            current_run = subprocess.run(
+            current_run = managed_run(
                 [
                     tools["java"], "-cp",
                     os.pathsep.join((
@@ -1938,7 +1952,7 @@ class PublicWorkflowCliBlackboxTest(unittest.TestCase):
                 "example.Application",
             ])
             self.assertEqual(base_execution.stdout, "base")
-            current_execution = subprocess.run(
+            current_execution = managed_run(
                 [
                     tools["java"], "-cp",
                     f'{artifacts["business"]}{separator}{artifacts["current_library"]}',

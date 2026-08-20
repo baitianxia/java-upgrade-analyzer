@@ -956,7 +956,7 @@
       "migration_status": "enforced",
       "user_effect": "A report generation is content-addressed, immutable, sidecar-integrity bound and activated only after independent validation; a collision or tamper never moves the active pointer.",
       "evidence_tests": [
-        "tests.test_binary_output.BinaryOutputTest.test_writes_immutable_generation_with_four_dimensions_and_attachments",
+        "tests.test_binary_output.BinaryOutputTest.test_writes_immutable_generation_with_four_bound_dimensions",
         "tests.test_binary_output.BinaryOutputTest.test_existing_generation_tampering_fails_without_moving_active_pointer",
         "tests.test_binary_output.BinaryOutputTest.test_generation_cannot_activate_without_independent_validation",
         "tests.test_binary_first_contract.BinaryFirstContractTest.test_phase_manifest_is_one_way_and_digest_bound"

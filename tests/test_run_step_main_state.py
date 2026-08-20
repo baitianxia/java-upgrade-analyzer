@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import io
 import json
 import os
@@ -6,9 +7,10 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,9 +22,241 @@ sys.path.insert(0, str(ROOT_DIR / "scripts"))
 
 import run_step  # noqa: E402
 import path_runtime  # noqa: E402
+import binary_output  # noqa: E402
+import binary_report  # noqa: E402
+import binary_pipeline  # noqa: E402
+from tests import test_binary_output as binary_output_fixtures  # noqa: E402
 
 
 class RunStepMainStateTest(unittest.TestCase):
+    def _performance_authority_binding(
+        self, marker="1", authority_mode="release_evidence"
+    ):
+        payload = {
+            "schema": (
+                "java-upgrade-analyzer.performance-authority-binding.v2"
+            ),
+            "authority_mode": authority_mode,
+            "support_contract_identity": marker * 64,
+            "evidence_sha256": "2" * 64,
+            "source_implementation_identity": "3" * 64,
+        }
+        payload["binding_identity"] = binary_pipeline._identity(
+            "binary_performance_authority_binding_identity",
+            {
+                key: payload[key]
+                for key in (
+                    "support_contract_identity",
+                    "evidence_sha256",
+                    "source_implementation_identity",
+                    "authority_mode",
+                )
+            },
+        )
+        return payload
+
+    def _write_release_authorized_generation(self, binary_root, marker="1"):
+        """Create the minimal immutable authority bytes needed by seal tests."""
+
+        root = Path(binary_root).resolve()
+        performance_binding = self._performance_authority_binding(marker)
+        publication_authority = {
+            "schema": (
+                "java-upgrade-analyzer.binary-publication-authority.v1"
+            ),
+            "authority_mode": "release_evidence",
+            "binding_identity": performance_binding["binding_identity"],
+            "public_activation_allowed": True,
+            "performance_authority_gate_binding": performance_binding,
+        }
+        publication_bytes = binary_output._json_bytes(
+            publication_authority
+        )
+        sidecar_identities = {
+            name: marker * 64
+            for name in binary_output._REQUIRED_CORE_GENERATION_SIDECARS
+        }
+        sidecar_identities["binary_publication_authority.json"] = (
+            hashlib.sha256(publication_bytes).hexdigest()
+        )
+        manifest = {
+            "schema": "java-upgrade-analyzer.binary-result-generation.v1",
+            "analysis_context_identity": marker * 64,
+            "authority": "binary_first",
+            "active_snapshot_identities": {
+                layer: marker * 64
+                for layer in binary_output._RESULT_GENERATION_SNAPSHOT_LAYERS
+            },
+            "trace_result_set_digest": marker * 64,
+            "sidecar_content_identities": sidecar_identities,
+            "policy_identities": {},
+            "attachment_policy": binary_output._GENERATION_ATTACHMENT_POLICY,
+        }
+        generation_identity = (
+            binary_output._result_generation_identity_from_manifest(manifest)
+        )
+        self.assertRegex(generation_identity, r"^[0-9a-f]{64}$")
+        manifest["result_generation_identity"] = generation_identity
+        generation = root / "binary_generations" / generation_identity
+        generation.mkdir(parents=True)
+        (generation / "binary_publication_authority.json").write_bytes(
+            publication_bytes
+        )
+        (generation / "result_generation.json").write_bytes(
+            binary_output._json_bytes(manifest)
+        )
+        return generation_identity
+
+    def _write_bound_step4_checkpoint(
+        self,
+        report,
+        *,
+        generation,
+        validation,
+        activation,
+        performance_binding,
+        validation_sha256="d" * 64,
+        analysis_context="1" * 64,
+    ):
+        checkpoint = {
+            "schema": (
+                "java-upgrade-analyzer."
+                "binary-generation-validation-checkpoint.v3"
+            ),
+            "status": (
+                "independent_validation_passed_pending_activation"
+            ),
+            "result_generation_identity": generation,
+            "analysis_context_identity": analysis_context,
+            "validation_run_identity": validation,
+            "validation_result_sha256": validation_sha256,
+            "activation_identity": activation,
+            "performance_authority_gate_binding": dict(
+                performance_binding
+            ),
+        }
+        checkpoint["checkpoint_content_identity"] = (
+            binary_pipeline._resume_checkpoint_content_identity(checkpoint)
+        )
+        run_step.write_json(
+            run_step._step4_validation_checkpoint_path(report), checkpoint
+        )
+        return checkpoint
+
+    def _write_fake_step4_pipeline_result(
+        self,
+        script_args,
+        *,
+        generation="a" * 64,
+        validation="b" * 64,
+        validation_sha256="d" * 64,
+        activation="c" * 64,
+        phase_timings=None,
+    ):
+        output_root = Path(
+            script_args[script_args.index("--output-root") + 1]
+        )
+        result_path = Path(
+            script_args[script_args.index("--result-json") + 1]
+        )
+        performance_binding = self._performance_authority_binding()
+        predecessor = run_step.read_active_binary_generation(
+            output_root, missing_ok=True
+        ) if output_root.exists() else None
+        pending_path = (
+            output_root
+            / "binary_observability"
+            / "pending_active_binary_generation.json"
+        )
+        run_step.write_json(pending_path, {
+            "schema": "java-upgrade-analyzer.active-binary-generation.v1",
+            "result_generation_identity": generation,
+            "generation_directory": f"binary_generations/{generation}",
+            "validation_run_identity": validation,
+            "validation_result_sha256": validation_sha256,
+            "activation_identity": activation,
+            "activation_predecessor": predecessor,
+            "activation_state": "pending",
+        })
+        self._write_bound_step4_checkpoint(
+            output_root.parent.parent,
+            generation=generation,
+            validation=validation,
+            activation=activation,
+            performance_binding=performance_binding,
+            validation_sha256=validation_sha256,
+        )
+        result = {
+            "schema": "java-upgrade-analyzer.binary-pipeline-result.v1",
+            "validation_status": "passed",
+            "result_generation_identity": generation,
+            "analysis_context_identity": "1" * 64,
+            "validation_run_identity": validation,
+            "activation_identity": activation,
+            "activation_predecessor": predecessor,
+            "activation_candidate_private": True,
+            "active_generation_descriptor": str(pending_path),
+            "performance_authority_gate_binding": performance_binding,
+            "validation_checkpoint_retained": True,
+            "validation_checkpoint_path": str(
+                run_step._step4_validation_checkpoint_path(
+                    output_root.parent.parent
+                )
+            ),
+        }
+        if phase_timings is not None:
+            result["phase_timings"] = list(phase_timings)
+        run_step.write_json(result_path, result)
+
+    def _fake_step4_report_result(self, report_dir):
+        report = Path(report_dir).resolve()
+        active = run_step._read_step4_active_descriptor(report)
+        generation = active["result_generation_identity"]
+        destinations = run_step._step4_report_publication_destinations(report)
+        transaction = binary_report._stage_directory_group(
+            (
+                (
+                    destinations[0],
+                    lambda stage, _prepared: run_step.write_json(
+                        stage / "summary.json",
+                        {"result_generation_identity": generation},
+                    ),
+                ),
+                (
+                    destinations[1],
+                    lambda stage, _prepared: (
+                        stage / "marker"
+                    ).write_text("source", encoding="utf-8"),
+                ),
+            ),
+            retain_transaction=True,
+            transaction_binding={
+                "result_generation_identity": generation,
+                "validation_run_identity": active["validation_run_identity"],
+                "validation_result_sha256": active[
+                    "validation_result_sha256"
+                ],
+                "activation_identity": active["activation_identity"],
+            },
+        )
+        return {
+            "phase": "step4",
+            "publication_transaction": transaction,
+        }
+
+    def _write_fake_step4_report_result(self, script_args):
+        """Compatibility helper for tests that exercise the old CLI shape."""
+
+        report = Path(
+            script_args[script_args.index("--report-dir") + 1]
+        ).resolve()
+        result_path = Path(
+            script_args[script_args.index("--result-json") + 1]
+        )
+        run_step.write_json(
+            result_path, self._fake_step4_report_result(report)
+        )
+
     def _git_source_repository(self, root):
         repository = Path(root) / "dependency-source"
         source = repository / "src" / "main" / "java" / "demo" / "Api.java"
@@ -236,6 +470,53 @@ class RunStepMainStateTest(unittest.TestCase):
                 .is_file()
             )
 
+    def test_step4_materializer_receives_all_runtime_jvm_override_shapes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = root / ".upgrade-report"
+            runtime_overrides = {
+                "resolved_configuration_properties": {
+                    "shared.feature": "enabled"
+                },
+                "base_resolved_configuration_properties": {
+                    "side.feature": "base"
+                },
+                "current_resolved_configuration_properties": {
+                    "side.feature": "current"
+                },
+                "jvm_system_properties": {"jdk.util.jar.version": "17"},
+                "runtime_system_properties": {
+                    "jdk.util.jar.enableMultiRelease": "true"
+                },
+                "jvm_arguments": ["-Djdk.util.jar.version=17"],
+                "runtime_jvm_arguments": "-Xmx256m",
+                "base_jvm_system_properties": {"base": "jvm"},
+                "current_jvm_system_properties": {"current": "jvm"},
+                "base_runtime_system_properties": {"base": "runtime"},
+                "current_runtime_system_properties": {"current": "runtime"},
+                "base_jvm_arguments": ["-Dbase.jvm=true"],
+                "current_jvm_arguments": ["-Dcurrent.jvm=true"],
+                "base_runtime_jvm_arguments": "-Dbase.runtime=true",
+                "current_runtime_jvm_arguments": "-Dcurrent.runtime=true",
+            }
+            automatic = {
+                "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+                "base": {"artifacts": []},
+                "current": {"artifacts": []},
+            }
+            with patch.object(
+                run_step,
+                "materialize_binary_pipeline_config",
+                return_value=automatic,
+            ) as materialize:
+                run_step._binary_pipeline_config_path(
+                    runtime_overrides, root, report
+                )
+
+            passed = materialize.call_args.kwargs["runtime_overrides"]
+
+        self.assertEqual(passed, runtime_overrides)
+
     def test_step4_config_without_source_records_missing_source_categories(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -347,14 +628,20 @@ class RunStepMainStateTest(unittest.TestCase):
             log = report / ".runtime" / "background" / "run.log"
             log.parent.mkdir(parents=True)
             log.write_text("traceback detail\n", encoding="utf-8")
-            with patch.object(
-                run_step,
-                "run_python",
-                side_effect=run_step.StepError(
+            def fail_current_pipeline(*_args, **_kwargs):
+                progress.write_text(json.dumps({
+                    "current_phase": "independent_validation",
+                    "last_completed_phase": "immutable_generation_write",
+                    "attempt": "current",
+                }), encoding="utf-8")
+                raise run_step.StepError(
                     "parser failed",
                     reason_codes=["ORACLE_FAILED"],
                     diagnostic={"traceback": "line 1"},
-                ),
+                )
+
+            with patch.object(
+                run_step, "run_python", side_effect=fail_current_pipeline,
             ):
                 with self.assertRaisesRegex(
                     run_step.StepError, "BINARY_GENERATION_FAILED"
@@ -380,7 +667,168 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertIn("traceback detail", failure["run_log_tail"])
             self.assertIn("ORACLE_FAILED", failure["failure_reason_codes"])
 
-    def test_step4_runs_only_binary_pipeline_and_binary_report(self):
+    def test_step4_pre_pipeline_failure_ignores_stale_phase_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = root / ".upgrade-report"
+            progress = (
+                report / ".runtime" / "binary_authority"
+                / "binary_observability" / "latest_in_progress.json"
+            )
+            progress.parent.mkdir(parents=True)
+            progress.write_text(json.dumps({
+                "current_phase": "validated_generation_activation",
+                "last_completed_phase": "independent_validation",
+                "attempt": "previous",
+            }), encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                run_step.StepError, "BINARY_GENERATION_FAILED"
+            ):
+                run_step._run_binary_step4(
+                    run_context={
+                        "binary_pipeline_config": str(root / "missing.json"),
+                    },
+                    project_dir=root,
+                    report_dir=report,
+                    s4_dir=report / "evidence" / "api_changes",
+                )
+
+            failures = list(
+                (report / ".runtime" / "binary_authority" / "binary_failures")
+                .glob("*.json")
+            )
+            self.assertEqual(len(failures), 1)
+            failure = json.loads(failures[0].read_text(encoding="utf-8"))
+
+        self.assertEqual(failure["failed_phase"], "")
+        self.assertEqual(failure["last_progress"], {})
+
+    def test_step4_parent_recovers_stderr_failure_without_borrowing_writer_phase(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = root / ".upgrade-report"
+            config = root / "binary.json"
+            config.write_text("{}", encoding="utf-8")
+            progress = (
+                report / run_step.BINARY_OUTPUT_RELATIVE_PATH
+                / "binary_observability" / "latest_in_progress.json"
+            )
+            public_failure = {
+                "schema": (
+                    "java-upgrade-analyzer.binary-pipeline-failure.v1"
+                ),
+                "status": "failed",
+                "reason_code": "BINARY_PIPELINE_CONFIG_SCHEMA_INVALID",
+                "failure_type": "BinaryPipelineError",
+                "detail": "invalid config",
+                "cause": None,
+                "failed_phase": "",
+                "last_progress": {},
+                "attempt_identity": "a" * 64,
+                "progress_bound_to_attempt": False,
+                "core_transaction_status": "failed",
+                "core_transaction_succeeded": False,
+                "core_result_receipt": None,
+                "fail_closed": True,
+            }
+
+            def fail_and_publish_competitor_progress(_cmd, **_kwargs):
+                progress.parent.mkdir(parents=True, exist_ok=True)
+                progress.write_text(json.dumps({
+                    "schema": "java-upgrade-analyzer.binary-progress.v1",
+                    "attempt_identity": "f" * 64,
+                    "status": "running",
+                    "current_phase": "validated_generation_activation",
+                }), encoding="utf-8")
+                return "", json.dumps(public_failure) + "\n", 1
+
+            with patch.object(
+                run_step,
+                "run_cmd",
+                side_effect=fail_and_publish_competitor_progress,
+            ), patch.object(run_step, "print_output"):
+                with self.assertRaises(run_step.StepError) as caught:
+                    run_step._run_binary_step4(
+                        run_context={
+                            "binary_pipeline_config": str(config),
+                        },
+                        project_dir=root,
+                        report_dir=report,
+                        s4_dir=run_step.step4_api_changes_dir(report),
+                    )
+            failure_paths = list((
+                report / run_step.BINARY_OUTPUT_RELATIVE_PATH
+                / "binary_failures"
+            ).glob("*.json"))
+            self.assertEqual(len(failure_paths), 1)
+            failure = json.loads(
+                failure_paths[0].read_text(encoding="utf-8")
+            )
+
+        self.assertIn(
+            "BINARY_PIPELINE_CONFIG_SCHEMA_INVALID",
+            caught.exception.reason_codes,
+        )
+        self.assertIn("BINARY_GENERATION_FAILED", caught.exception.reason_codes)
+        self.assertEqual(failure["failed_phase"], "")
+        self.assertEqual(failure["last_progress"], {})
+        structured = failure["diagnostic"]["structured_result"]
+        self.assertEqual(structured["core_transaction_status"], "failed")
+        self.assertEqual(structured["attempt_identity"], "a" * 64)
+
+    def test_binary_failure_record_uses_only_attempt_bound_child_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp) / ".upgrade-report"
+            progress_path = (
+                report / run_step.BINARY_OUTPUT_RELATIVE_PATH
+                / "binary_observability" / "latest_in_progress.json"
+            )
+            progress_path.parent.mkdir(parents=True)
+            progress_path.write_text(json.dumps({
+                "attempt_identity": "f" * 64,
+                "current_phase": "validated_generation_activation",
+            }), encoding="utf-8")
+            child_progress = {
+                "attempt_identity": "a" * 64,
+                "status": "running",
+                "current_phase": "independent_validation",
+            }
+            child_failure = {
+                "schema": (
+                    "java-upgrade-analyzer.binary-pipeline-failure.v1"
+                ),
+                "status": "failed",
+                "reason_code": "BINARY_INDEPENDENT_VALIDATION_FAILED",
+                "failure_type": "BinaryPipelineError",
+                "detail": "oracle mismatch",
+                "cause": None,
+                "failed_phase": "independent_validation",
+                "last_progress": child_progress,
+                "attempt_identity": "a" * 64,
+                "progress_bound_to_attempt": True,
+                "core_transaction_status": "failed",
+                "core_transaction_succeeded": False,
+                "core_result_receipt": None,
+                "fail_closed": True,
+            }
+            error = run_step.StepError(
+                "pipeline failed",
+                reason_codes=["BINARY_INDEPENDENT_VALIDATION_FAILED"],
+                diagnostic={"structured_result": child_failure},
+            )
+
+            failure, _path = run_step._record_binary_failure(
+                report,
+                "config.json",
+                error,
+                progress_baseline=None,
+            )
+
+        self.assertEqual(failure["last_progress"], child_progress)
+        self.assertEqual(failure["failed_phase"], "independent_validation")
+
+    def test_step4_runs_only_pipeline_as_child_and_prepares_report_in_process(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             report = root / ".upgrade-report"
@@ -392,24 +840,30 @@ class RunStepMainStateTest(unittest.TestCase):
 
             def fake_run(script_name, script_args, _cwd, **_kwargs):
                 calls.append((script_name, list(script_args)))
-                if script_name == "binary_pipeline.py":
-                    result_path = Path(
-                        script_args[script_args.index("--result-json") + 1]
-                    )
-                    run_step.write_json(result_path, {
-                        "validation_status": "passed",
-                        "result_generation_identity": "generation-1",
-                        "analysis_context_identity": "context-1",
-                        "phase_timings": [{
-                            "phase": "binary_trace",
-                            "elapsed_seconds": 0.125,
-                            "formal_trace_result_count": 1,
-                        }],
-                    })
-                else:
-                    self.assertEqual(script_name, "binary_report.py")
+                self.assertEqual(script_name, "binary_pipeline.py")
+                self._write_fake_step4_pipeline_result(
+                    script_args,
+                    phase_timings=[{
+                        "phase": "binary_trace",
+                        "elapsed_seconds": 0.125,
+                        "formal_trace_result_count": 1,
+                    }],
+                )
 
-            with patch.object(run_step, "run_python", side_effect=fake_run):
+            def prepare_report(**kwargs):
+                self.assertEqual(kwargs["phase"], "step4")
+                self.assertEqual(
+                    Path(kwargs["report_dir"]).resolve(), report.resolve()
+                )
+                return self._fake_step4_report_result(report)
+
+            with patch.object(
+                run_step, "run_python", side_effect=fake_run
+            ), patch.object(
+                run_step,
+                "_prepare_binary_report_publication_candidate_in_process",
+                side_effect=prepare_report,
+            ) as prepare:
                 result = run_step._run_binary_step4(
                     run_context={
                         "binary_pipeline_config": str(config),
@@ -418,12 +872,14 @@ class RunStepMainStateTest(unittest.TestCase):
                     report_dir=report,
                     s4_dir=s4_dir,
                 )
-            self.assertEqual(result["result_generation_identity"], "generation-1")
+            self.assertEqual(result["result_generation_identity"], "a" * 64)
             self.assertEqual(
                 [item[0] for item in calls],
-                ["binary_pipeline.py", "binary_report.py"],
+                ["binary_pipeline.py"],
             )
+            prepare.assert_called_once()
             pipeline_args = calls[0][1]
+            self.assertIn("--retain-validation-checkpoint", pipeline_args)
             resolved_config_path = Path(
                 pipeline_args[pipeline_args.index("--config") + 1]
             )
@@ -443,11 +899,2459 @@ class RunStepMainStateTest(unittest.TestCase):
                 timings = list(csv.DictReader(handle))
             self.assertEqual(timings[0]["phase"], "binary_trace")
             self.assertEqual(
-                timings[0]["result_generation_identity"], "generation-1"
+                timings[0]["result_generation_identity"], "a" * 64
             )
             self.assertEqual(
                 timings[-1]["phase"], "step4_human_report_publication"
             )
+
+    def test_step4_timing_write_failure_does_not_rollback_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = root / ".upgrade-report"
+            config = root / "binary.json"
+            config.write_text("{}", encoding="utf-8")
+
+            def fake_run(_script_name, script_args, _cwd, **_kwargs):
+                self._write_fake_step4_pipeline_result(script_args)
+
+            with patch.object(
+                run_step, "run_python", side_effect=fake_run
+            ), patch.object(
+                run_step,
+                "_prepare_binary_report_publication_candidate_in_process",
+                side_effect=lambda **_kwargs: (
+                    self._fake_step4_report_result(report)
+                ),
+            ), patch.object(
+                run_step,
+                "write_csv_rows",
+                side_effect=OSError("metrics unavailable"),
+            ), patch.object(
+                run_step, "_record_binary_failure"
+            ) as record_failure:
+                result = run_step._run_binary_step4(
+                    run_context={"binary_pipeline_config": str(config)},
+                    project_dir=root,
+                    report_dir=report,
+                    s4_dir=report / "evidence" / "api_changes",
+                )
+
+        self.assertEqual(result["result_generation_identity"], "a" * 64)
+        record_failure.assert_not_called()
+
+    def test_in_process_report_prepare_requires_workflow_lock_and_capability(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp).resolve() / ".upgrade-report"
+            output = report / "evidence" / "api_changes"
+            calls = []
+
+            def trusted_prepare(
+                report_dir,
+                output_dir,
+                *,
+                candidate_activation_identity="",
+            ):
+                binary_report._consume_report_publication_prepare_capability(
+                    report_dir, "step4"
+                )
+                calls.append(
+                    (
+                        Path(report_dir).resolve(),
+                        Path(output_dir).resolve(),
+                        candidate_activation_identity,
+                    )
+                )
+                return {"phase": "step4", "trusted": True}
+
+            with patch.object(
+                run_step,
+                "prepare_step4_publication_candidate",
+                side_effect=trusted_prepare,
+            ) as prepare:
+                with self.assertRaises(run_step.StepError) as unlocked:
+                    run_step._prepare_binary_report_publication_candidate_in_process(
+                        phase="step4",
+                        report_dir=report,
+                        output_dir=output,
+                        candidate_activation_identity="a" * 64,
+                    )
+                self.assertIn(
+                    "BINARY_REPORT_PREPARE_WORKFLOW_LOCK_REQUIRED",
+                    unlocked.exception.reason_codes,
+                )
+                prepare.assert_not_called()
+
+                with run_step._workflow_mutation_lock(
+                    report, timeout_seconds=0.1
+                ):
+                    with self.assertRaises(run_step.StepError) as wrong_root:
+                        run_step._prepare_binary_report_publication_candidate_in_process(
+                            phase="step4",
+                            report_dir=report.parent / "other-report",
+                            output_dir=(
+                                report.parent
+                                / "other-report"
+                                / "evidence"
+                                / "api_changes"
+                            ),
+                            candidate_activation_identity="a" * 64,
+                        )
+                    self.assertIn(
+                        "BINARY_REPORT_PREPARE_WORKFLOW_LOCK_REQUIRED",
+                        wrong_root.exception.reason_codes,
+                    )
+                    prepare.assert_not_called()
+                    result = (
+                        run_step._prepare_binary_report_publication_candidate_in_process(
+                            phase="step4",
+                            report_dir=report,
+                            output_dir=output,
+                            candidate_activation_identity="a" * 64,
+                        )
+                    )
+
+            self.assertEqual(result, {"phase": "step4", "trusted": True})
+            self.assertEqual(
+                calls,
+                [(report, output.resolve(), "a" * 64)],
+            )
+
+    def test_in_process_report_prepare_dispatches_step5_and_step6_under_lock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp).resolve() / ".upgrade-report"
+            step5_output = report / "evidence" / "call_chain"
+            findings = report / ".runtime" / "findings" / "s6_findings.json"
+            deliverable = report / "deliverables" / "report.md"
+            calls = []
+
+            def prepare_step5(
+                report_dir,
+                output_dir,
+                *,
+                selected_coords=(),
+                selected_names=(),
+            ):
+                binary_report._consume_report_publication_prepare_capability(
+                    report_dir, "step5"
+                )
+                calls.append(
+                    (
+                        "step5",
+                        Path(output_dir),
+                        tuple(selected_coords),
+                        tuple(selected_names),
+                    )
+                )
+                return {"phase": "step5"}
+
+            def prepare_step6(report_dir, output_findings, output_report):
+                binary_report._consume_report_publication_prepare_capability(
+                    report_dir, "step6"
+                )
+                calls.append(
+                    (
+                        "step6",
+                        Path(output_findings),
+                        Path(output_report),
+                    )
+                )
+                return {"phase": "step6"}
+
+            with patch.object(
+                run_step,
+                "prepare_step5_publication_candidate",
+                side_effect=prepare_step5,
+            ), patch.object(
+                run_step,
+                "prepare_step6_publication_candidate",
+                side_effect=prepare_step6,
+            ), run_step._workflow_mutation_lock(
+                report, timeout_seconds=0.1
+            ):
+                step5 = (
+                    run_step._prepare_binary_report_publication_candidate_in_process(
+                        phase="step5",
+                        report_dir=report,
+                        output_dir=step5_output,
+                        selected_coords=("com.example:demo",),
+                        selected_names=("demo",),
+                    )
+                )
+                step6 = (
+                    run_step._prepare_binary_report_publication_candidate_in_process(
+                        phase="step6",
+                        report_dir=report,
+                        output_findings=findings,
+                        output_report=deliverable,
+                    )
+                )
+
+            self.assertEqual(step5, {"phase": "step5"})
+            self.assertEqual(step6, {"phase": "step6"})
+            self.assertEqual(
+                calls,
+                [
+                    (
+                        "step5",
+                        step5_output,
+                        ("com.example:demo",),
+                        ("demo",),
+                    ),
+                    ("step6", findings, deliverable),
+                ],
+            )
+
+    def test_step4_deferred_handoff_writer_lock_covers_complete_commit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            report = root / ".upgrade-report"
+            config = root / "binary.json"
+            config.write_text("{}", encoding="utf-8")
+            state = {"held": False}
+            events = []
+
+            @contextmanager
+            def tracked_writer_lock(path, *, timeout_seconds):
+                self.assertEqual(
+                    Path(path).name, ".binary-pipeline-run.lock"
+                )
+                self.assertEqual(
+                    timeout_seconds,
+                    run_step._STEP4_DEFERRED_HANDOFF_LOCK_TIMEOUT_SECONDS,
+                )
+                self.assertFalse(state["held"])
+                events.append("writer_lock_enter")
+                state["held"] = True
+                try:
+                    yield Path(path)
+                finally:
+                    state["held"] = False
+                    events.append("writer_lock_exit")
+
+            def fake_run(script_name, script_args, _cwd, **_kwargs):
+                self.assertEqual(script_name, "binary_pipeline.py")
+                self.assertFalse(state["held"])
+                events.append("pipeline_child")
+                self._write_fake_step4_pipeline_result(script_args)
+
+            def prepare_report(**kwargs):
+                self.assertTrue(state["held"])
+                events.append("report_candidate")
+                return self._fake_step4_report_result(kwargs["report_dir"])
+
+            def locked_phase(name, value=None):
+                def invoke(*_args, **_kwargs):
+                    self.assertTrue(state["held"], name)
+                    events.append(name)
+                    return value
+                return invoke
+
+            original_revalidate = (
+                run_step._revalidate_binary_step4_deferred_handoff
+            )
+
+            def revalidate(*args, **kwargs):
+                self.assertTrue(state["held"], "revalidate_handoff")
+                events.append("revalidate_handoff")
+                return original_revalidate(*args, **kwargs)
+
+            def finalize(*_args, delete_checkpoint=True, **_kwargs):
+                name = (
+                    "delete_checkpoint"
+                    if delete_checkpoint
+                    else "validate_checkpoint"
+                )
+                self.assertTrue(state["held"], name)
+                events.append(name)
+                return True
+
+            with patch.object(
+                run_step,
+                "exclusive_file_lock",
+                side_effect=tracked_writer_lock,
+            ), patch.object(
+                run_step, "run_python", side_effect=fake_run
+            ), patch.object(
+                run_step,
+                "_prepare_binary_report_publication_candidate_in_process",
+                side_effect=prepare_report,
+            ), patch.object(
+                run_step,
+                "_revalidate_binary_step4_deferred_handoff",
+                side_effect=revalidate,
+            ), patch.object(
+                run_step, "run_gate", side_effect=locked_phase("gate")
+            ), patch.object(
+                run_step,
+                "mark_report_publication_gate_passed",
+                side_effect=locked_phase(
+                    "mark_gate", {"gate_receipt_identity": "receipt-1"}
+                ),
+            ), patch.object(
+                run_step,
+                "publish_report_publication",
+                side_effect=locked_phase("publish_reports", True),
+            ), patch.object(
+                run_step,
+                "_seal_binary_step4_activation",
+                side_effect=locked_phase("publish_activation", True),
+            ), patch.object(
+                run_step,
+                "_finalize_binary_step4_transaction",
+                side_effect=finalize,
+            ), patch.object(
+                run_step,
+                "_commit_binary_step4_activation_receipt",
+                side_effect=locked_phase("commit_activation", True),
+            ), patch.object(
+                run_step,
+                "commit_report_publication",
+                side_effect=locked_phase("commit_reports", True),
+            ), patch.object(
+                run_step,
+                "reconcile_current_release",
+                side_effect=locked_phase(
+                    "reconcile_release",
+                    {
+                        "step4": {"status": "current"},
+                        "step5": {"status": "stale"},
+                        "step6": {"status": "stale"},
+                    },
+                ),
+            ):
+                result = run_step._run_binary_step4(
+                    run_context={"binary_pipeline_config": str(config)},
+                    project_dir=root,
+                    report_dir=report,
+                    s4_dir=run_step.step4_api_changes_dir(report),
+                    complete_deferred_handoff=True,
+                    gate_name="jar_compare",
+                    strict_risk_gate=False,
+                )
+
+        self.assertEqual(result["result_generation_identity"], "a" * 64)
+        self.assertFalse(state["held"])
+        self.assertEqual(events, [
+            "pipeline_child",
+            "writer_lock_enter",
+            "revalidate_handoff",
+            "report_candidate",
+            "gate",
+            "mark_gate",
+            "publish_reports",
+            "publish_activation",
+            "validate_checkpoint",
+            "commit_activation",
+            "delete_checkpoint",
+            "commit_reports",
+            "reconcile_release",
+            "writer_lock_exit",
+        ])
+
+    def test_step4_deferred_handoff_revalidates_after_waiting_for_writer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            report = root / ".upgrade-report"
+            config = root / "binary.json"
+            config.write_text("{}", encoding="utf-8")
+            state = {"held": False}
+            calls = []
+            competitor_generation = "9" * 64
+            competitor_validation = "8" * 64
+            competitor_validation_sha256 = "7" * 64
+            competitor_activation = "f" * 64
+
+            @contextmanager
+            def replace_candidate_before_handoff(path, *, timeout_seconds):
+                self.assertFalse(state["held"])
+                pending_path = (
+                    report
+                    / run_step.BINARY_OUTPUT_RELATIVE_PATH
+                    / "binary_observability"
+                    / "pending_active_binary_generation.json"
+                )
+                self._write_bound_step4_checkpoint(
+                    report,
+                    generation=competitor_generation,
+                    validation=competitor_validation,
+                    activation=competitor_activation,
+                    performance_binding=self._performance_authority_binding(),
+                    validation_sha256=competitor_validation_sha256,
+                )
+                run_step.write_json(pending_path, {
+                    "schema": (
+                        "java-upgrade-analyzer."
+                        "active-binary-generation.v1"
+                    ),
+                    "result_generation_identity": competitor_generation,
+                    "generation_directory": (
+                        f"binary_generations/{competitor_generation}"
+                    ),
+                    "validation_run_identity": competitor_validation,
+                    "validation_result_sha256": (
+                        competitor_validation_sha256
+                    ),
+                    "activation_identity": competitor_activation,
+                    "activation_predecessor": None,
+                    "activation_state": "pending",
+                })
+                state["held"] = True
+                try:
+                    yield Path(path)
+                finally:
+                    state["held"] = False
+
+            def fake_run(script_name, script_args, _cwd, **_kwargs):
+                calls.append(script_name)
+                self.assertEqual(script_name, "binary_pipeline.py")
+                self._write_fake_step4_pipeline_result(script_args)
+
+            def record_failure(*_args, **_kwargs):
+                self.assertTrue(state["held"])
+                return {}, report / "failure.json"
+
+            with patch.object(
+                run_step,
+                "exclusive_file_lock",
+                side_effect=replace_candidate_before_handoff,
+            ), patch.object(
+                run_step, "run_python", side_effect=fake_run
+            ), patch.object(
+                run_step,
+                "_record_binary_failure",
+                side_effect=record_failure,
+            ):
+                with self.assertRaises(run_step.StepError) as caught:
+                    run_step._run_binary_step4(
+                        run_context={
+                            "binary_pipeline_config": str(config)
+                        },
+                        project_dir=root,
+                        report_dir=report,
+                        s4_dir=run_step.step4_api_changes_dir(report),
+                    )
+            remaining_pending = run_step.read_pending_binary_generation(
+                report / run_step.BINARY_OUTPUT_RELATIVE_PATH
+            )
+            remaining_checkpoint = run_step.read_json(
+                run_step._step4_validation_checkpoint_path(report)
+            )
+
+        self.assertEqual(calls, ["binary_pipeline.py"])
+        self.assertFalse(state["held"])
+        self.assertEqual(
+            remaining_pending["result_generation_identity"],
+            competitor_generation,
+        )
+        self.assertEqual(
+            remaining_pending["activation_identity"],
+            competitor_activation,
+        )
+        self.assertEqual(
+            remaining_checkpoint["result_generation_identity"],
+            competitor_generation,
+        )
+        self.assertIn(
+            "BINARY_STEP4_DEFERRED_HANDOFF_REVALIDATION_FAILED",
+            caught.exception.reason_codes,
+        )
+        self.assertIn(
+            "BINARY_GENERATION_FAILED", caught.exception.reason_codes
+        )
+
+    def test_step4_deferred_handoff_rejects_replaced_public_predecessor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp).resolve() / ".upgrade-report"
+            binary_root = report / run_step.BINARY_OUTPUT_RELATIVE_PATH
+            result_path = (
+                run_step.runtime_state_dir(report)
+                / "binary_pipeline_result.json"
+            )
+            self._write_fake_step4_pipeline_result([
+                "--output-root", str(binary_root),
+                "--result-json", str(result_path),
+            ])
+            replacement_generation = "f" * 64
+            run_step.write_json(
+                binary_root / "active_binary_generation.json",
+                {
+                    "schema": (
+                        "java-upgrade-analyzer."
+                        "active-binary-generation.v1"
+                    ),
+                    "result_generation_identity": replacement_generation,
+                    "generation_directory": (
+                        f"binary_generations/{replacement_generation}"
+                    ),
+                    "validation_run_identity": "e" * 64,
+                    "validation_result_sha256": "d" * 64,
+                },
+            )
+            result = run_step.read_json(result_path)
+
+            with run_step._binary_step4_deferred_handoff_lock(
+                report, timeout_seconds=0.1
+            ), self.assertRaises(run_step.StepError) as caught:
+                run_step._revalidate_binary_step4_deferred_handoff(
+                    report, result
+                )
+
+        self.assertIn(
+            "BINARY_STEP4_DEFERRED_HANDOFF_REVALIDATION_FAILED",
+            caught.exception.reason_codes,
+        )
+
+    def test_step4_deferred_handoff_binds_validation_sha_and_analysis_context(self):
+        for mutation in ("validation_sha256", "analysis_context"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as tmp:
+                report = Path(tmp).resolve() / ".upgrade-report"
+                binary_root = (
+                    report / run_step.BINARY_OUTPUT_RELATIVE_PATH
+                )
+                result_path = (
+                    run_step.runtime_state_dir(report)
+                    / "binary_pipeline_result.json"
+                )
+                self._write_fake_step4_pipeline_result([
+                    "--output-root", str(binary_root),
+                    "--result-json", str(result_path),
+                ])
+                result = run_step.read_json(result_path)
+                if mutation == "validation_sha256":
+                    pending_path = (
+                        binary_root
+                        / "binary_observability"
+                        / "pending_active_binary_generation.json"
+                    )
+                    pending = run_step.read_json(pending_path)
+                    pending["validation_result_sha256"] = "e" * 64
+                    run_step.write_json(pending_path, pending)
+                else:
+                    result["analysis_context_identity"] = "e" * 64
+
+                with run_step._binary_step4_deferred_handoff_lock(
+                    report, timeout_seconds=0.1
+                ), self.assertRaises(run_step.StepError) as caught:
+                    run_step._revalidate_binary_step4_deferred_handoff(
+                        report, result
+                    )
+
+            self.assertIn(
+                "BINARY_STEP4_DEFERRED_HANDOFF_REVALIDATION_FAILED",
+                caught.exception.reason_codes,
+            )
+
+    def test_step4_child_failure_never_adopts_live_checkpoint_for_rollback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            report = root / ".upgrade-report"
+            config = root / "binary.json"
+            config.write_text("{}", encoding="utf-8")
+            binary_root = report / run_step.BINARY_OUTPUT_RELATIVE_PATH
+            generation = "9" * 64
+            validation = "8" * 64
+            validation_sha256 = "7" * 64
+            activation = "6" * 64
+            self._write_bound_step4_checkpoint(
+                report,
+                generation=generation,
+                validation=validation,
+                activation=activation,
+                performance_binding=self._performance_authority_binding(),
+                validation_sha256=validation_sha256,
+            )
+            run_step.write_json(
+                binary_root
+                / "binary_observability"
+                / "pending_active_binary_generation.json",
+                {
+                    "schema": (
+                        "java-upgrade-analyzer."
+                        "active-binary-generation.v1"
+                    ),
+                    "result_generation_identity": generation,
+                    "generation_directory": (
+                        f"binary_generations/{generation}"
+                    ),
+                    "validation_run_identity": validation,
+                    "validation_result_sha256": validation_sha256,
+                    "activation_identity": activation,
+                    "activation_predecessor": None,
+                    "activation_state": "pending",
+                },
+            )
+
+            with patch.object(
+                run_step,
+                "run_python",
+                side_effect=run_step.StepError("child failed without receipt"),
+            ), patch.object(
+                run_step,
+                "_record_binary_failure",
+                return_value=({}, report / "failure.json"),
+            ):
+                with self.assertRaises(run_step.StepError) as caught:
+                    run_step._run_binary_step4(
+                        run_context={
+                            "binary_pipeline_config": str(config)
+                        },
+                        project_dir=root,
+                        report_dir=report,
+                        s4_dir=run_step.step4_api_changes_dir(report),
+                    )
+            remaining_pending = run_step.read_pending_binary_generation(
+                binary_root
+            )
+            remaining_checkpoint = run_step.read_json(
+                run_step._step4_validation_checkpoint_path(report)
+            )
+
+        self.assertEqual(
+            remaining_pending["activation_identity"], activation
+        )
+        self.assertEqual(
+            remaining_checkpoint["activation_identity"], activation
+        )
+        self.assertEqual(
+            caught.exception.diagnostic["active_generation_rollback"],
+            "not_attempted_without_owned_receipt",
+        )
+        self.assertEqual(
+            caught.exception.diagnostic["report_publication_rollback"],
+            "not_attempted_without_owned_receipt",
+        )
+
+    def test_step4_deferred_handoff_releases_writer_lock_on_report_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            report = root / ".upgrade-report"
+            config = root / "binary.json"
+            config.write_text("{}", encoding="utf-8")
+            state = {"held": False}
+            exits = []
+
+            @contextmanager
+            def tracked_writer_lock(path, *, timeout_seconds):
+                state["held"] = True
+                try:
+                    yield Path(path)
+                finally:
+                    state["held"] = False
+                    exits.append("released")
+
+            def fake_run(script_name, script_args, _cwd, **_kwargs):
+                self.assertEqual(script_name, "binary_pipeline.py")
+                self.assertFalse(state["held"])
+                self._write_fake_step4_pipeline_result(script_args)
+
+            def fail_report_prepare(**_kwargs):
+                self.assertTrue(state["held"])
+                raise run_step.StepError("injected report failure")
+
+            def record_failure(*_args, **_kwargs):
+                self.assertTrue(state["held"])
+                return {}, report / "failure.json"
+
+            with patch.object(
+                run_step,
+                "exclusive_file_lock",
+                side_effect=tracked_writer_lock,
+            ), patch.object(
+                run_step, "run_python", side_effect=fake_run
+            ), patch.object(
+                run_step,
+                "_prepare_binary_report_publication_candidate_in_process",
+                side_effect=fail_report_prepare,
+            ), patch.object(
+                run_step,
+                "_record_binary_failure",
+                side_effect=record_failure,
+            ):
+                with self.assertRaises(run_step.StepError):
+                    run_step._run_binary_step4(
+                        run_context={
+                            "binary_pipeline_config": str(config)
+                        },
+                        project_dir=root,
+                        report_dir=report,
+                        s4_dir=run_step.step4_api_changes_dir(report),
+                    )
+
+        self.assertFalse(state["held"])
+        self.assertEqual(exits, ["released"])
+
+    def test_step4_deferred_handoff_lock_timeout_does_not_mutate_candidate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            report = root / ".upgrade-report"
+            config = root / "binary.json"
+            config.write_text("{}", encoding="utf-8")
+            calls = []
+
+            class LockTimeout:
+                def __enter__(self):
+                    raise TimeoutError("writer busy")
+
+                def __exit__(self, *_args):
+                    self.fail("unacquired lock must not be released")
+
+            def fake_run(script_name, script_args, _cwd, **_kwargs):
+                calls.append(script_name)
+                self.assertEqual(script_name, "binary_pipeline.py")
+                self._write_fake_step4_pipeline_result(script_args)
+
+            with patch.object(
+                run_step,
+                "exclusive_file_lock",
+                return_value=LockTimeout(),
+            ), patch.object(
+                run_step, "run_python", side_effect=fake_run
+            ), patch.object(
+                run_step, "_rollback_binary_step4_transaction"
+            ) as rollback, patch.object(
+                run_step, "_record_binary_failure"
+            ) as record_failure:
+                with self.assertRaises(run_step.StepError) as caught:
+                    run_step._run_binary_step4(
+                        run_context={
+                            "binary_pipeline_config": str(config)
+                        },
+                        project_dir=root,
+                        report_dir=report,
+                        s4_dir=run_step.step4_api_changes_dir(report),
+                    )
+
+        self.assertEqual(calls, ["binary_pipeline.py"])
+        self.assertIn(
+            "BINARY_STEP4_DEFERRED_HANDOFF_LOCK_TIMEOUT",
+            caught.exception.reason_codes,
+        )
+        rollback.assert_not_called()
+        record_failure.assert_not_called()
+
+    def test_step4_deferred_handoff_contends_with_pipeline_writer_lock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp).resolve() / ".upgrade-report"
+            lock_path = (
+                report
+                / run_step.BINARY_OUTPUT_RELATIVE_PATH
+                / ".binary-pipeline-run.lock"
+            )
+            with run_step.exclusive_file_lock(
+                lock_path, timeout_seconds=1.0
+            ):
+                with self.assertRaises(run_step.StepError) as caught:
+                    with run_step._binary_step4_deferred_handoff_lock(
+                        report, timeout_seconds=0.01
+                    ):
+                        self.fail("competing handoff acquired writer lock")
+            with run_step._binary_step4_deferred_handoff_lock(
+                report, timeout_seconds=0.1
+            ) as acquired:
+                self.assertEqual(Path(acquired), lock_path)
+
+        self.assertIn(
+            "BINARY_STEP4_DEFERRED_HANDOFF_LOCK_TIMEOUT",
+            caught.exception.reason_codes,
+        )
+
+    def test_step4_recovery_waits_for_pipeline_writer_before_reading_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp).resolve() / ".upgrade-report"
+            writer_lock = (
+                report
+                / run_step.BINARY_OUTPUT_RELATIVE_PATH
+                / ".binary-pipeline-run.lock"
+            )
+            with run_step.exclusive_file_lock(
+                writer_lock, timeout_seconds=1.0
+            ), patch.object(
+                run_step,
+                "_STEP4_RECOVERY_WRITER_LOCK_TIMEOUT_SECONDS",
+                0.01,
+            ), patch.object(
+                run_step, "_recover_binary_step4_transaction"
+            ) as recover:
+                with self.assertRaises(run_step.StepError) as caught:
+                    with run_step._binary_step4_run_lock(
+                        report, timeout_seconds=0.1
+                    ):
+                        self.fail("recovery ran without the writer lease")
+
+        recover.assert_not_called()
+        self.assertIn(
+            "BINARY_STEP4_RECOVERY_WRITER_LOCK_TIMEOUT",
+            caught.exception.reason_codes,
+        )
+        self.assertEqual(
+            caught.exception.diagnostic.get("lock_path"), str(writer_lock)
+        )
+
+    def test_step4_recovery_releases_pipeline_writer_before_child_scope(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp).resolve() / ".upgrade-report"
+            writer_lock = (
+                report
+                / run_step.BINARY_OUTPUT_RELATIVE_PATH
+                / ".binary-pipeline-run.lock"
+            )
+            events = []
+
+            def recover(*_args, **_kwargs):
+                events.append("recovery")
+                with self.assertRaises(TimeoutError):
+                    with run_step.exclusive_file_lock(
+                        writer_lock, timeout_seconds=0.01
+                    ):
+                        self.fail("recovery did not hold the writer lease")
+
+            with patch.object(
+                run_step,
+                "_recover_binary_step4_transaction",
+                side_effect=recover,
+            ):
+                with run_step._binary_step4_run_lock(
+                    report, timeout_seconds=0.1
+                ):
+                    events.append("child_scope")
+                    with run_step.exclusive_file_lock(
+                        writer_lock, timeout_seconds=0.1
+                    ) as acquired:
+                        self.assertEqual(Path(acquired), writer_lock)
+                        events.append("child_writer_acquired")
+
+        self.assertEqual(
+            events,
+            ["recovery", "child_scope", "child_writer_acquired"],
+        )
+
+    def test_step4_recovery_pipeline_writer_lock_isolated_by_output_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            blocked_report = root / "blocked" / ".upgrade-report"
+            independent_report = root / "independent" / ".upgrade-report"
+            blocked_writer = (
+                blocked_report
+                / run_step.BINARY_OUTPUT_RELATIVE_PATH
+                / ".binary-pipeline-run.lock"
+            )
+            independent_writer = (
+                independent_report
+                / run_step.BINARY_OUTPUT_RELATIVE_PATH
+                / ".binary-pipeline-run.lock"
+            )
+            recoveries = []
+
+            with run_step.exclusive_file_lock(
+                blocked_writer, timeout_seconds=1.0
+            ), patch.object(
+                run_step,
+                "_recover_binary_step4_transaction",
+                side_effect=lambda *_args, **_kwargs: recoveries.append(
+                    "independent"
+                ),
+            ):
+                with run_step._binary_step4_run_lock(
+                    independent_report, timeout_seconds=0.1
+                ):
+                    with run_step.exclusive_file_lock(
+                        independent_writer, timeout_seconds=0.1
+                    ):
+                        pass
+
+        self.assertEqual(recoveries, ["independent"])
+
+    def test_step4_recovery_rejects_unsafe_pipeline_writer_lock_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp).resolve() / ".upgrade-report"
+            writer_lock = (
+                report
+                / run_step.BINARY_OUTPUT_RELATIVE_PATH
+                / ".binary-pipeline-run.lock"
+            )
+            writer_lock.mkdir(parents=True)
+            with patch.object(
+                run_step, "_recover_binary_step4_transaction"
+            ) as recover:
+                with self.assertRaises(run_step.StepError) as caught:
+                    with run_step._binary_step4_run_lock(
+                        report, timeout_seconds=0.1
+                    ):
+                        self.fail("unsafe writer path was accepted")
+
+        recover.assert_not_called()
+        self.assertIn(
+            "BINARY_STEP4_RECOVERY_WRITER_LOCK_UNAVAILABLE",
+            caught.exception.reason_codes,
+        )
+        self.assertEqual(
+            caught.exception.diagnostic.get("lock_path"), str(writer_lock)
+        )
+
+    def test_step4_main_startup_recovery_does_not_read_while_writer_is_busy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            report = root / ".upgrade-report"
+            writer_lock = (
+                report
+                / run_step.BINARY_OUTPUT_RELATIVE_PATH
+                / ".binary-pipeline-run.lock"
+            )
+            with run_step.exclusive_file_lock(
+                writer_lock, timeout_seconds=1.0
+            ), patch.object(
+                run_step,
+                "_STEP4_RECOVERY_WRITER_LOCK_TIMEOUT_SECONDS",
+                0.01,
+            ), patch.object(
+                run_step, "_recover_binary_step4_transaction"
+            ) as recover, patch.object(
+                run_step, "_classify_step4_recovery_disposition"
+            ) as classify, patch.object(
+                run_step, "_apply_step4_startup_recovery"
+            ) as apply_recovery:
+                with self.assertRaises(run_step.StepError) as caught:
+                    run_step._recover_and_apply_step4_startup_state(
+                        args=SimpleNamespace(step="auto"),
+                        main_state={},
+                        report_dir=report,
+                        project_dir=root,
+                        manifest_steps={},
+                        structured_user_response=None,
+                        has_structured_response=False,
+                        gate_name="binary_generation",
+                        strict_risk_gate=False,
+                    )
+
+        recover.assert_not_called()
+        classify.assert_not_called()
+        apply_recovery.assert_not_called()
+        self.assertIn(
+            "BINARY_STEP4_RECOVERY_WRITER_LOCK_TIMEOUT",
+            caught.exception.reason_codes,
+        )
+
+    def test_step4_main_startup_holds_both_locks_through_republish_apply(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            report = root / ".upgrade-report"
+            binary_root = report / run_step.BINARY_OUTPUT_RELATIVE_PATH
+            step4_lock = binary_root / ".step4-run.lock"
+            writer_lock = binary_root / ".binary-pipeline-run.lock"
+            events = []
+
+            def assert_startup_locks(phase):
+                for lock_path in (step4_lock, writer_lock):
+                    with self.assertRaises(TimeoutError):
+                        with run_step.exclusive_file_lock(
+                            lock_path, timeout_seconds=0.01
+                        ):
+                            self.fail(
+                                f"{phase} did not retain {lock_path.name}"
+                            )
+                events.append(phase)
+
+            def recover(*_args, **_kwargs):
+                assert_startup_locks("recover")
+                return "committed_receipt_requires_republication"
+
+            def classify(*_args, **_kwargs):
+                assert_startup_locks("classify")
+                return {"action": run_step._STEP4_RELEASE_REPUBLISH}
+
+            def apply_recovery(**_kwargs):
+                assert_startup_locks("republish_apply")
+                return {
+                    "action": run_step._STEP4_RELEASE_REPUBLISH,
+                    "applied": True,
+                }
+
+            with patch.object(
+                run_step,
+                "_recover_binary_step4_transaction",
+                side_effect=recover,
+            ), patch.object(
+                run_step,
+                "_classify_step4_recovery_disposition",
+                side_effect=classify,
+            ), patch.object(
+                run_step,
+                "_startup_step4_recovery_target_hint",
+                return_value="step5",
+            ), patch.object(
+                run_step,
+                "_apply_step4_startup_recovery",
+                side_effect=apply_recovery,
+            ):
+                result = run_step._recover_and_apply_step4_startup_state(
+                    args=SimpleNamespace(step="auto"),
+                    main_state={},
+                    report_dir=report,
+                    project_dir=root,
+                    manifest_steps={},
+                    structured_user_response=None,
+                    has_structured_response=False,
+                    gate_name="binary_generation",
+                    strict_risk_gate=False,
+                )
+            for lock_path in (step4_lock, writer_lock):
+                with run_step.exclusive_file_lock(
+                    lock_path, timeout_seconds=0.1
+                ):
+                    pass
+
+        self.assertEqual(events, ["recover", "classify", "republish_apply"])
+        self.assertEqual(
+            result["disposition"],
+            "committed_receipt_requires_republication",
+        )
+        self.assertEqual(result["target_hint"], "step5")
+
+    def test_step4_main_startup_releases_both_locks_when_apply_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            report = root / ".upgrade-report"
+            binary_root = report / run_step.BINARY_OUTPUT_RELATIVE_PATH
+            lock_paths = (
+                binary_root / ".step4-run.lock",
+                binary_root / ".binary-pipeline-run.lock",
+            )
+            with patch.object(
+                run_step,
+                "_recover_binary_step4_transaction",
+                return_value="nothing_to_recover",
+            ), patch.object(
+                run_step,
+                "_classify_step4_recovery_disposition",
+                return_value={"action": run_step._STEP4_RELEASE_CURRENT},
+            ), patch.object(
+                run_step,
+                "_startup_step4_recovery_target_hint",
+                return_value="step4",
+            ), patch.object(
+                run_step,
+                "_apply_step4_startup_recovery",
+                side_effect=run_step.StepError("injected startup failure"),
+            ):
+                with self.assertRaises(run_step.StepError):
+                    run_step._recover_and_apply_step4_startup_state(
+                        args=SimpleNamespace(step="auto"),
+                        main_state={},
+                        report_dir=report,
+                        project_dir=root,
+                        manifest_steps={},
+                        structured_user_response=None,
+                        has_structured_response=False,
+                        gate_name="binary_generation",
+                        strict_risk_gate=False,
+                    )
+            for lock_path in lock_paths:
+                with run_step.exclusive_file_lock(
+                    lock_path, timeout_seconds=0.1
+                ):
+                    pass
+
+    def test_step4_run_lock_rejects_concurrent_execution_for_same_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp).resolve() / ".upgrade-report"
+            acquired = threading.Event()
+            release = threading.Event()
+            failures = []
+
+            def hold_lock():
+                with run_step._binary_step4_run_lock(
+                    report, timeout_seconds=1
+                ):
+                    acquired.set()
+                    release.wait(timeout=2)
+
+            owner = threading.Thread(target=hold_lock)
+            owner.start()
+            self.assertTrue(acquired.wait(timeout=2))
+            try:
+                with self.assertRaises(run_step.StepError) as error:
+                    with run_step._binary_step4_run_lock(
+                        report, timeout_seconds=0.05
+                    ):
+                        failures.append("unexpected-acquire")
+            finally:
+                release.set()
+                owner.join(timeout=2)
+
+        self.assertFalse(owner.is_alive())
+        self.assertFalse(failures)
+        self.assertIn(
+            "BINARY_STEP4_RUN_ALREADY_ACTIVE", error.exception.reason_codes
+        )
+
+    def test_workflow_mutation_lock_covers_state_reset_before_step_execution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp).resolve() / ".upgrade-report"
+            acquired = threading.Event()
+            release = threading.Event()
+
+            def hold_lock():
+                with run_step._workflow_mutation_lock(
+                    report, timeout_seconds=1
+                ):
+                    acquired.set()
+                    release.wait(timeout=2)
+
+            owner = threading.Thread(target=hold_lock)
+            owner.start()
+            self.assertTrue(acquired.wait(timeout=2))
+            try:
+                with self.assertRaises(run_step.StepError) as caught:
+                    with run_step._workflow_mutation_lock(
+                        report, timeout_seconds=0.05
+                    ):
+                        self.fail("concurrent workflow mutation lock acquired")
+            finally:
+                release.set()
+                owner.join(timeout=2)
+
+        self.assertFalse(owner.is_alive())
+        self.assertIn(
+            "WORKFLOW_MUTATION_ALREADY_ACTIVE", caught.exception.reason_codes
+        )
+
+    def test_workflow_mutation_lock_does_not_reclassify_body_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp).resolve() / ".upgrade-report"
+            with self.assertRaisesRegex(
+                TimeoutError, "downstream operation timed out"
+            ):
+                with run_step._workflow_mutation_lock(
+                    report, timeout_seconds=0.1
+                ):
+                    raise TimeoutError("downstream operation timed out")
+
+            with run_step._workflow_mutation_lock(
+                report, timeout_seconds=0.1
+            ):
+                self.assertTrue(
+                    run_step._workflow_mutation_lock_is_held(report)
+                )
+
+    def test_step4_failure_rollback_does_not_clobber_newer_activation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            report = root / ".upgrade-report"
+            config = root / "binary.json"
+            config.write_text("{}", encoding="utf-8")
+            binary_root = report / run_step.BINARY_OUTPUT_RELATIVE_PATH
+            binary_root.mkdir(parents=True)
+            active_path = binary_root / "active_binary_generation.json"
+            previous = self._write_release_authorized_generation(
+                binary_root, marker="7"
+            )
+            attempted = self._write_release_authorized_generation(
+                binary_root, marker="8"
+            )
+            newer = self._write_release_authorized_generation(
+                binary_root, marker="9"
+            )
+            activation = "c" * 64
+            predecessor = {
+                "schema": "java-upgrade-analyzer.active-binary-generation.v1",
+                "result_generation_identity": previous,
+                "generation_directory": f"binary_generations/{previous}",
+                "validation_run_identity": "1" * 64,
+                "validation_result_sha256": "2" * 64,
+            }
+            run_step.write_json(active_path, {
+                **predecessor,
+            })
+
+            def fake_run(script_name, script_args, _cwd, **_kwargs):
+                self.assertEqual(script_name, "binary_pipeline.py")
+                self._write_fake_step4_pipeline_result(
+                    script_args,
+                    generation=attempted,
+                    validation="3" * 64,
+                    validation_sha256="4" * 64,
+                    activation=activation,
+                    phase_timings=[],
+                )
+
+            def fail_report_prepare(**_kwargs):
+                run_step.write_json(active_path, {
+                    "schema": "java-upgrade-analyzer.active-binary-generation.v1",
+                    "result_generation_identity": newer,
+                    "generation_directory": f"binary_generations/{newer}",
+                    "validation_run_identity": "5" * 64,
+                    "validation_result_sha256": "6" * 64,
+                    "activation_identity": "d" * 64,
+                    "activation_predecessor": predecessor,
+                })
+                raise run_step.StepError("injected report failure")
+
+            with patch.object(
+                run_step, "run_python", side_effect=fake_run
+            ), patch.object(
+                run_step,
+                "_prepare_binary_report_publication_candidate_in_process",
+                side_effect=fail_report_prepare,
+            ), patch.object(
+                run_step,
+                "_record_binary_failure",
+                return_value=({}, report / "failure.json"),
+            ):
+                with self.assertRaises(run_step.StepError) as error:
+                    run_step._run_binary_step4(
+                        run_context={"binary_pipeline_config": str(config)},
+                        project_dir=root,
+                        report_dir=report,
+                        s4_dir=report / "evidence" / "api_changes",
+                    )
+            final_active = run_step.read_json(active_path)
+
+        self.assertEqual(final_active["result_generation_identity"], newer)
+        self.assertEqual(
+            error.exception.diagnostic["active_generation_rollback"],
+            "skipped_active_generation_or_token_changed",
+        )
+
+    def test_committed_step4_checkpoint_cleanup_is_best_effort(self):
+        with patch.object(
+            run_step,
+            "_delete_step4_validation_checkpoint_durable",
+            side_effect=run_step.StepError("injected cleanup failure"),
+        ):
+            self.assertFalse(
+                run_step._cleanup_committed_step4_checkpoint(Path("unused"))
+            )
+
+    def test_step4_transaction_finalizer_deletes_only_fully_bound_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp).resolve() / ".upgrade-report"
+            binary_root = report / run_step.BINARY_OUTPUT_RELATIVE_PATH
+            checkpoint = (
+                binary_root
+                / "binary_observability"
+                / "validation_checkpoint.json"
+            )
+            checkpoint.parent.mkdir(parents=True)
+            summary = run_step.step4_api_changes_dir(report) / "summary.json"
+            generation = self._write_release_authorized_generation(
+                binary_root, marker="a"
+            )
+            validation = "b" * 64
+            activation = "c" * 64
+            validation_sha256 = "d" * 64
+            run_step.write_json(checkpoint, {
+                "schema": "java-upgrade-analyzer.binary-generation-validation-checkpoint.v3",
+                "status": "independent_validation_passed_pending_activation",
+                "result_generation_identity": generation,
+                "validation_run_identity": validation,
+                "activation_identity": activation,
+            })
+            run_step.write_json(binary_root / "active_binary_generation.json", {
+                "schema": "java-upgrade-analyzer.active-binary-generation.v1",
+                "result_generation_identity": generation,
+                "generation_directory": f"binary_generations/{generation}",
+                "validation_run_identity": validation,
+                "validation_result_sha256": validation_sha256,
+                "activation_identity": activation,
+                "activation_predecessor": None,
+            })
+            destinations = run_step._step4_report_publication_destinations(report)
+            transaction = binary_report._stage_directory_group((
+                (destinations[0], lambda stage, _prepared: run_step.write_json(
+                    stage / "summary.json",
+                    {"result_generation_identity": generation},
+                )),
+                (destinations[1], lambda stage, _prepared: (
+                    stage / "marker"
+                ).write_text("source", encoding="utf-8")),
+            ),
+                retain_transaction=True,
+                transaction_binding={
+                    "result_generation_identity": generation,
+                    "validation_run_identity": validation,
+                    "validation_result_sha256": validation_sha256,
+                    "activation_identity": activation,
+                },
+            )
+            gate_receipt = binary_report.mark_report_publication_gate_passed(
+                destinations,
+                expected_transaction_id=transaction["transaction_id"],
+                expected_binding=transaction["binding"],
+                gate_name="jar_compare",
+                strict_risk_gate=False,
+            )
+            binary_report.publish_report_publication(
+                destinations,
+                expected_transaction_id=transaction["transaction_id"],
+                expected_binding=transaction["binding"],
+            )
+            result = {
+                "validation_checkpoint_retained": True,
+                "validation_checkpoint_path": str(checkpoint),
+                "result_generation_identity": generation,
+                "validation_run_identity": validation,
+                "activation_identity": activation,
+                "report_publication_transaction": transaction,
+                "report_publication_gate_receipt": gate_receipt,
+            }
+
+            finalized = run_step._finalize_binary_step4_transaction(
+                report, result
+            )
+
+        self.assertTrue(finalized)
+        self.assertFalse(checkpoint.exists())
+
+    def test_report_implementation_identity_is_static_diagnostic_metadata(self):
+        original = binary_report.report_implementation_identity()
+        changed_runtime = dict(
+            binary_report._CAPTURED_REPORT_RUNTIME_IDENTITY
+        )
+        changed_runtime["platform"] += "-changed"
+        with patch.object(
+            binary_report, "_report_runtime_identity", return_value=changed_runtime
+        ):
+            self.assertEqual(
+                binary_report.report_implementation_identity(), original
+            )
+
+    def test_report_implementation_metadata_does_not_affect_release_binding(self):
+        loaded = {
+            "manifest": {"result_generation_identity": "a" * 64},
+            "active": {
+                "validation_run_identity": "b" * 64,
+                "validation_result_sha256": "c" * 64,
+            },
+        }
+        binding = {
+            "result_generation_identity": "a" * 64,
+            "validation_run_identity": "b" * 64,
+            "validation_result_sha256": "c" * 64,
+            "report_implementation_identity": "d" * 64,
+        }
+
+        self.assertTrue(
+            binary_report._step4_publication_binding_matches_loaded(
+                binding, loaded
+            )
+        )
+
+    def test_changed_report_implementation_is_diagnostic_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp).resolve() / ".upgrade-report"
+            destinations = (
+                run_step._step4_report_publication_destinations(report)
+            )
+            transaction = binary_report._stage_directory_group((
+                (destinations[0], lambda stage, _prepared: (
+                    stage / "marker"
+                ).write_text("new-api", encoding="utf-8")),
+                (destinations[1], lambda stage, _prepared: (
+                    stage / "marker"
+                ).write_text("new-source", encoding="utf-8")),
+            ), retain_transaction=True)
+            transaction_path, _group = (
+                binary_report._publication_transaction_path(
+                    [Path(item).resolve() for item in destinations]
+                )
+            )
+            payload = run_step.read_json(transaction_path)
+            current = payload["binding"]["report_implementation_identity"]
+            payload["binding"]["report_implementation_identity"] = (
+                "0" * 64 if current != "0" * 64 else "1" * 64
+            )
+            binary_report._atomic_json(transaction_path, payload)
+
+            metadata = (
+                binary_report.report_publication_transaction_recovery_metadata(
+                    destinations
+                )
+            )
+            receipt = binary_report.report_publication_transaction_receipt(
+                destinations,
+                expected_transaction_id=metadata["transaction_id"],
+                expected_binding=metadata["binding"],
+            )
+            gate_receipt = binary_report.mark_report_publication_gate_passed(
+                destinations,
+                expected_transaction_id=metadata["transaction_id"],
+                expected_binding=metadata["binding"],
+                gate_name="jar_compare",
+                strict_risk_gate=False,
+            )
+            binary_report.publish_report_publication(
+                destinations,
+                expected_transaction_id=metadata["transaction_id"],
+                expected_binding=metadata["binding"],
+            )
+            cleanup_complete = binary_report.commit_report_publication(
+                destinations,
+                expected_transaction_id=metadata["transaction_id"],
+                expected_binding=metadata["binding"],
+            )
+
+            self.assertEqual(metadata["implementation_status"], "mismatch")
+            self.assertEqual(receipt["state"], "pending_gate")
+            self.assertEqual(gate_receipt["gate_name"], "jar_compare")
+            self.assertTrue(cleanup_complete)
+            self.assertEqual(
+                tuple(
+                    (destination / "marker").read_text(encoding="utf-8")
+                    for destination in destinations
+                ),
+                ("new-api", "new-source"),
+            )
+
+    def test_legacy_report_rollback_failure_never_reports_success(self):
+        for transaction_kind in ("legacy_v2",):
+            for state in ("pending_gate", "gate_passed"):
+                for failed_layer in ("report", "active"):
+                    with (
+                        self.subTest(
+                            kind=transaction_kind,
+                            state=state,
+                            failed_layer=failed_layer,
+                        ),
+                        tempfile.TemporaryDirectory() as tmp,
+                    ):
+                        report = Path(tmp).resolve() / ".upgrade-report"
+                        destinations = (
+                            run_step._step4_report_publication_destinations(
+                                report
+                            )
+                        )
+                        for destination, value in zip(
+                            destinations, ("old-api", "old-source")
+                        ):
+                            destination.mkdir(parents=True)
+                            (destination / "marker").write_text(
+                                value, encoding="utf-8"
+                            )
+                        binary_root = (
+                            report / run_step.BINARY_OUTPUT_RELATIVE_PATH
+                        )
+                        generation = self._write_release_authorized_generation(
+                            binary_root, marker="b"
+                        )
+                        validation = "b" * 64
+                        validation_sha256 = "c" * 64
+                        activation = "d" * 64
+                        active_path = (
+                            binary_root / "active_binary_generation.json"
+                        )
+                        run_step.write_json(active_path, {
+                            "schema": (
+                                "java-upgrade-analyzer."
+                                "active-binary-generation.v1"
+                            ),
+                            "result_generation_identity": generation,
+                            "generation_directory": (
+                                f"binary_generations/{generation}"
+                            ),
+                            "validation_run_identity": validation,
+                            "validation_result_sha256": validation_sha256,
+                            "activation_identity": activation,
+                            "activation_predecessor": None,
+                        })
+                        transaction = binary_report._stage_directory_group((
+                            (destinations[0], lambda stage, _prepared: (
+                                stage / "marker"
+                            ).write_text("new-api", encoding="utf-8")),
+                            (destinations[1], lambda stage, _prepared: (
+                                stage / "marker"
+                            ).write_text("new-source", encoding="utf-8")),
+                        ),
+                            retain_transaction=True,
+                            transaction_binding={
+                                "result_generation_identity": generation,
+                                "validation_run_identity": validation,
+                                "validation_result_sha256": (
+                                    validation_sha256
+                                ),
+                                "activation_identity": activation,
+                            },
+                        )
+                        if state == "gate_passed":
+                            binary_report.mark_report_publication_gate_passed(
+                                destinations,
+                                expected_transaction_id=transaction[
+                                    "transaction_id"
+                                ],
+                                expected_binding=transaction["binding"],
+                                gate_name="jar_compare",
+                                strict_risk_gate=False,
+                            )
+                        normalized = [
+                            Path(item).resolve() for item in destinations
+                        ]
+                        transaction_path, _group = (
+                            binary_report._publication_transaction_path(
+                                normalized
+                            )
+                        )
+                        payload = run_step.read_json(transaction_path)
+                        if transaction_kind == "legacy_v2":
+                            payload["schema"] = (
+                                binary_report
+                                ._LEGACY_REPORT_PUBLICATION_TRANSACTION_SCHEMA
+                            )
+                            payload["binding"].pop(
+                                "report_implementation_identity"
+                            )
+                            payload.pop("gate_receipt")
+                        else:
+                            payload["binding"][
+                                "report_implementation_identity"
+                            ] = "0" * 64
+                            if state == "gate_passed":
+                                previous_gate_receipt = payload["gate_receipt"]
+                                payload["gate_receipt"] = (
+                                    binary_report._new_report_gate_receipt(
+                                        payload,
+                                        gate_name=previous_gate_receipt[
+                                            "gate_name"
+                                        ],
+                                        strict_risk_gate=(
+                                            previous_gate_receipt[
+                                                "strict_risk_gate"
+                                            ]
+                                        ),
+                                    )
+                                )
+                        binary_report._atomic_json(transaction_path, payload)
+                        patch_target = (
+                            "rollback_report_publication"
+                            if failed_layer == "report"
+                            else "compare_and_restore_active_binary_generation"
+                        )
+
+                        with patch.object(
+                            run_step,
+                            patch_target,
+                            side_effect=OSError("injected rollback failure"),
+                        ), self.assertRaises(run_step.StepError) as caught:
+                            run_step._recover_binary_step4_transaction(report)
+                        rollback_status = caught.exception.diagnostic[
+                            "rollback_status"
+                        ]
+
+                    self.assertIn(
+                        "BINARY_STEP4_TRANSACTION_RECOVERY_FAILED",
+                        caught.exception.reason_codes,
+                    )
+                    failed_status_key = (
+                        "report_publication_rollback"
+                        if failed_layer == "report"
+                        else "active_generation_rollback"
+                    )
+                    self.assertTrue(
+                        rollback_status[failed_status_key].startswith(
+                            "rollback_failed:"
+                        )
+                    )
+
+    def test_unknown_report_transaction_schema_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp).resolve() / ".upgrade-report"
+            destinations = run_step._step4_report_publication_destinations(
+                report
+            )
+            for destination, value in zip(
+                destinations, ("old-api", "old-source")
+            ):
+                destination.mkdir(parents=True)
+                (destination / "marker").write_text(value, encoding="utf-8")
+            transaction = binary_report._stage_directory_group((
+                (destinations[0], lambda stage, _prepared: (
+                    stage / "marker"
+                ).write_text("new-api", encoding="utf-8")),
+                (destinations[1], lambda stage, _prepared: (
+                    stage / "marker"
+                ).write_text("new-source", encoding="utf-8")),
+            ), retain_transaction=True)
+            normalized = [Path(item).resolve() for item in destinations]
+            transaction_path, _group = (
+                binary_report._publication_transaction_path(normalized)
+            )
+            payload = run_step.read_json(transaction_path)
+            payload["schema"] = (
+                "java-upgrade-analyzer.binary-report-publication-transaction.v999"
+            )
+            binary_report._atomic_json(transaction_path, payload)
+
+            with self.assertRaises(binary_report.BinaryReportError) as caught:
+                binary_report.report_publication_transaction_recovery_metadata(
+                    destinations
+                )
+            published = tuple(
+                (destination / "marker").read_text(encoding="utf-8")
+                for destination in destinations
+            )
+
+        self.assertEqual(
+            caught.exception.reason_code,
+            "BINARY_REPORT_PUBLICATION_RECOVERY_INVALID",
+        )
+        self.assertEqual(published, ("old-api", "old-source"))
+
+    def test_step4_gate_or_finalize_failure_rolls_back_all_three_state_layers(self):
+        for failure_phase in ("gate", "finalize"):
+            with self.subTest(failure_phase=failure_phase), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                report = root / ".upgrade-report"
+                destinations = run_step._step4_report_publication_destinations(
+                    report
+                )
+                for destination, value in zip(
+                    destinations, ("old-api", "old-source")
+                ):
+                    destination.mkdir(parents=True)
+                    (destination / "marker").write_text(value, encoding="utf-8")
+                transaction = binary_report._stage_directory_group((
+                    (destinations[0], lambda stage, _prepared: (
+                        stage / "marker"
+                    ).write_text("new-api", encoding="utf-8")),
+                    (destinations[1], lambda stage, _prepared: (
+                        stage / "marker"
+                    ).write_text("new-source", encoding="utf-8")),
+                ), retain_transaction=True)
+                binary_root = report / run_step.BINARY_OUTPUT_RELATIVE_PATH
+                active_path = binary_root / "active_binary_generation.json"
+                checkpoint = run_step._step4_validation_checkpoint_path(report)
+                predecessor_identity = "a" * 64
+                generation = "c" * 64
+                activation = "d" * 64
+                validation = "e" * 64
+                predecessor = {
+                    "schema": "java-upgrade-analyzer.active-binary-generation.v1",
+                    "result_generation_identity": predecessor_identity,
+                    "generation_directory": (
+                        f"binary_generations/{predecessor_identity}"
+                    ),
+                    "validation_run_identity": "1" * 64,
+                    "validation_result_sha256": "2" * 64,
+                }
+                run_step.write_json(active_path, {
+                    "schema": "java-upgrade-analyzer.active-binary-generation.v1",
+                    "result_generation_identity": generation,
+                    "generation_directory": f"binary_generations/{generation}",
+                    "validation_run_identity": validation,
+                    "validation_result_sha256": "3" * 64,
+                    "activation_identity": activation,
+                    "activation_predecessor": predecessor,
+                })
+                run_step.write_json(checkpoint, {
+                    "schema": "java-upgrade-analyzer.binary-generation-validation-checkpoint.v3",
+                    "status": "independent_validation_passed_pending_activation",
+                    "result_generation_identity": generation,
+                    "validation_run_identity": validation,
+                    "activation_identity": activation,
+                })
+                result = {
+                    "validation_checkpoint_retained": True,
+                    "validation_checkpoint_path": str(checkpoint),
+                    "result_generation_identity": generation,
+                    "validation_run_identity": validation,
+                    "activation_identity": activation,
+                    "report_publication_transaction": transaction,
+                }
+                gate_error = (
+                    run_step.StepError("injected gate failure")
+                    if failure_phase == "gate" else None
+                )
+                finalize_error = (
+                    run_step.StepError("injected finalize failure")
+                    if failure_phase == "finalize" else None
+                )
+                with patch.object(
+                    run_step,
+                    "run_gate",
+                    side_effect=gate_error,
+                ), patch.object(
+                    run_step,
+                    "_finalize_binary_step4_transaction",
+                    side_effect=finalize_error,
+                ):
+                    with self.assertRaises(run_step.StepError) as caught:
+                        run_step._complete_binary_step4_after_gate(
+                            report_dir=report,
+                            project_dir=root,
+                            gate_name="jar_compare",
+                            strict_risk_gate=False,
+                            result=result,
+                        )
+                final_active = run_step.read_json(active_path)
+                report_values = tuple(
+                    (destination / "marker").read_text(encoding="utf-8")
+                    for destination in destinations
+                )
+                checkpoint_retained = checkpoint.is_file()
+                publication_state = (
+                    binary_report.report_publication_transaction_state(
+                        destinations
+                    )
+                )
+
+            self.assertEqual(
+                final_active["result_generation_identity"], predecessor_identity
+            )
+            self.assertEqual(report_values, ("old-api", "old-source"))
+            self.assertTrue(checkpoint_retained)
+            self.assertEqual(publication_state, "absent")
+            self.assertEqual(
+                caught.exception.diagnostic["active_generation_rollback"],
+                "restored_lock_observed_predecessor",
+            )
+            self.assertEqual(
+                caught.exception.diagnostic["report_publication_rollback"],
+                "restored_previous_reports",
+            )
+
+    def test_step4_startup_never_treats_matching_report_as_gate_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            report = root / ".upgrade-report"
+            binary_root = report / run_step.BINARY_OUTPUT_RELATIVE_PATH
+            checkpoint = run_step._step4_validation_checkpoint_path(report)
+            active_path = binary_root / "active_binary_generation.json"
+            summary = run_step.step4_api_changes_dir(report) / "summary.json"
+            predecessor_identity = self._write_release_authorized_generation(
+                binary_root, marker="2"
+            )
+            generation = self._write_release_authorized_generation(
+                binary_root, marker="3"
+            )
+            activation = "d" * 64
+            predecessor = {
+                "schema": "java-upgrade-analyzer.active-binary-generation.v1",
+                "result_generation_identity": predecessor_identity,
+                "generation_directory": f"binary_generations/{predecessor_identity}",
+                "validation_run_identity": "1" * 64,
+                "validation_result_sha256": "2" * 64,
+            }
+            run_step.write_json(active_path, {
+                "schema": "java-upgrade-analyzer.active-binary-generation.v1",
+                "result_generation_identity": generation,
+                "generation_directory": f"binary_generations/{generation}",
+                "validation_run_identity": "3" * 64,
+                "validation_result_sha256": "4" * 64,
+                "activation_identity": activation,
+                "activation_predecessor": predecessor,
+            })
+            run_step.write_json(checkpoint, {
+                "schema": "java-upgrade-analyzer.binary-generation-validation-checkpoint.v3",
+                "status": "independent_validation_passed_pending_activation",
+                "result_generation_identity": generation,
+                "validation_run_identity": "3" * 64,
+                "activation_identity": activation,
+            })
+            run_step.write_json(
+                summary, {"result_generation_identity": generation}
+            )
+
+            with self.assertRaises(run_step.StepError) as caught:
+                run_step._recover_binary_step4_transaction(report)
+            final_active = run_step.read_json(active_path)
+            checkpoint_retained = checkpoint.is_file()
+
+        self.assertIn(
+            "BINARY_STEP4_REPORT_RECOVERY_EVIDENCE_MISSING",
+            caught.exception.reason_codes,
+        )
+        self.assertEqual(
+            final_active["result_generation_identity"], predecessor_identity
+        )
+        self.assertTrue(checkpoint_retained)
+
+    def test_step4_startup_allows_validated_checkpoint_before_activation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp).resolve() / ".upgrade-report"
+            binary_root = report / run_step.BINARY_OUTPUT_RELATIVE_PATH
+            checkpoint = run_step._step4_validation_checkpoint_path(report)
+            active_path = binary_root / "active_binary_generation.json"
+            predecessor_identity = self._write_release_authorized_generation(
+                binary_root, marker="c"
+            )
+            generation = self._write_release_authorized_generation(
+                binary_root, marker="d"
+            )
+            activation = "d" * 64
+            run_step.write_json(active_path, {
+                "schema": "java-upgrade-analyzer.active-binary-generation.v1",
+                "result_generation_identity": predecessor_identity,
+                "generation_directory": f"binary_generations/{predecessor_identity}",
+                "validation_run_identity": "1" * 64,
+                "validation_result_sha256": "2" * 64,
+            })
+            run_step.write_json(checkpoint, {
+                "schema": "java-upgrade-analyzer.binary-generation-validation-checkpoint.v3",
+                "status": "independent_validation_passed_pending_activation",
+                "result_generation_identity": generation,
+                "validation_run_identity": "3" * 64,
+                "activation_identity": activation,
+            })
+
+            recovery = run_step._recover_binary_step4_transaction(report)
+            final_active = run_step.read_json(active_path)
+            checkpoint_retained = checkpoint.is_file()
+
+        self.assertEqual(recovery, "validation_checkpoint_pending_activation")
+        self.assertEqual(
+            final_active["result_generation_identity"], predecessor_identity
+        )
+        self.assertTrue(checkpoint_retained)
+
+    def test_step4_startup_preserves_prevalidation_resume_checkpoints(self):
+        for status in (
+            "awaiting_independent_validation",
+            "independent_validation_failed",
+        ):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp:
+                report = Path(tmp).resolve() / ".upgrade-report"
+                checkpoint = run_step._step4_validation_checkpoint_path(
+                    report
+                )
+                run_step.write_json(checkpoint, {
+                    "schema": (
+                        "java-upgrade-analyzer."
+                        "binary-generation-validation-checkpoint.v3"
+                    ),
+                    "status": status,
+                    "result_generation_identity": "a" * 64,
+                })
+
+                recovery = run_step._recover_binary_step4_transaction(report)
+
+                self.assertEqual(
+                    recovery, "validation_checkpoint_resume_required"
+                )
+                self.assertTrue(checkpoint.is_file())
+                disposition = run_step._classify_step4_recovery_disposition(
+                    report,
+                    recovery,
+                    expected_gate_name="jar_compare",
+                    expected_strict_risk_gate=False,
+                )
+                self.assertEqual(
+                    disposition["action"],
+                    run_step._STEP4_RELEASE_RESUME_PIPELINE,
+                )
+
+    def test_step4_startup_rolls_back_activation_before_report_started(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp).resolve() / ".upgrade-report"
+            binary_root = report / run_step.BINARY_OUTPUT_RELATIVE_PATH
+            checkpoint = run_step._step4_validation_checkpoint_path(report)
+            active_path = binary_root / "active_binary_generation.json"
+            predecessor_identity = self._write_release_authorized_generation(
+                binary_root, marker="e"
+            )
+            generation = self._write_release_authorized_generation(
+                binary_root, marker="f"
+            )
+            activation = "d" * 64
+            predecessor = {
+                "schema": "java-upgrade-analyzer.active-binary-generation.v1",
+                "result_generation_identity": predecessor_identity,
+                "generation_directory": f"binary_generations/{predecessor_identity}",
+                "validation_run_identity": "1" * 64,
+                "validation_result_sha256": "2" * 64,
+            }
+            run_step.write_json(active_path, {
+                "schema": "java-upgrade-analyzer.active-binary-generation.v1",
+                "result_generation_identity": generation,
+                "generation_directory": f"binary_generations/{generation}",
+                "validation_run_identity": "3" * 64,
+                "validation_result_sha256": "4" * 64,
+                "activation_identity": activation,
+                "activation_predecessor": predecessor,
+            })
+            run_step.write_json(checkpoint, {
+                "schema": "java-upgrade-analyzer.binary-generation-validation-checkpoint.v3",
+                "status": "independent_validation_passed_pending_activation",
+                "result_generation_identity": generation,
+                "validation_run_identity": "3" * 64,
+                "activation_identity": activation,
+            })
+
+            recovery = run_step._recover_binary_step4_transaction(report)
+            final_active = run_step.read_json(active_path)
+
+        self.assertEqual(
+            recovery, "rolled_back_activation_before_report_publication"
+        )
+        self.assertEqual(
+            final_active["result_generation_identity"], predecessor_identity
+        )
+
+    def test_step4_startup_recovers_process_death_with_pending_gate_reports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp).resolve() / ".upgrade-report"
+            destinations = run_step._step4_report_publication_destinations(report)
+            for destination, value in zip(
+                destinations, ("old-api", "old-source")
+            ):
+                destination.mkdir(parents=True)
+                (destination / "marker").write_text(value, encoding="utf-8")
+            transaction = binary_report._stage_directory_group((
+                (destinations[0], lambda stage, _prepared: (
+                    stage / "marker"
+                ).write_text("new-api", encoding="utf-8")),
+                (destinations[1], lambda stage, _prepared: (
+                    stage / "marker"
+                ).write_text("new-source", encoding="utf-8")),
+            ), retain_transaction=True)
+            binary_root = report / run_step.BINARY_OUTPUT_RELATIVE_PATH
+            checkpoint = run_step._step4_validation_checkpoint_path(report)
+            active_path = binary_root / "active_binary_generation.json"
+            predecessor_identity = self._write_release_authorized_generation(
+                binary_root, marker="f"
+            )
+            generation = self._write_release_authorized_generation(
+                binary_root, marker="1"
+            )
+            activation = "d" * 64
+            predecessor = {
+                "schema": "java-upgrade-analyzer.active-binary-generation.v1",
+                "result_generation_identity": predecessor_identity,
+                "generation_directory": f"binary_generations/{predecessor_identity}",
+                "validation_run_identity": "1" * 64,
+                "validation_result_sha256": "2" * 64,
+            }
+            run_step.write_json(active_path, {
+                "schema": "java-upgrade-analyzer.active-binary-generation.v1",
+                "result_generation_identity": generation,
+                "generation_directory": f"binary_generations/{generation}",
+                "validation_run_identity": "3" * 64,
+                "validation_result_sha256": "4" * 64,
+                "activation_identity": activation,
+                "activation_predecessor": predecessor,
+            })
+            run_step.write_json(checkpoint, {
+                "schema": "java-upgrade-analyzer.binary-generation-validation-checkpoint.v3",
+                "status": "independent_validation_passed_pending_activation",
+                "result_generation_identity": generation,
+                "validation_run_identity": "3" * 64,
+                "activation_identity": activation,
+            })
+
+            recovery = run_step._recover_binary_step4_transaction(report)
+            final_active = run_step.read_json(active_path)
+            report_values = tuple(
+                (destination / "marker").read_text(encoding="utf-8")
+                for destination in destinations
+            )
+            state = binary_report.report_publication_transaction_state(
+                destinations
+            )
+            checkpoint_retained = checkpoint.is_file()
+
+        self.assertEqual(recovery, "rolled_back_interrupted_transaction")
+        self.assertEqual(
+            final_active["result_generation_identity"], predecessor_identity
+        )
+        self.assertEqual(report_values, ("old-api", "old-source"))
+        self.assertEqual(state, "absent")
+        self.assertTrue(checkpoint_retained)
+
+    def test_step4_private_publish_does_not_require_performance_authority(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp).resolve() / ".upgrade-report"
+            generation = "a" * 64
+            activation = "c" * 64
+            result = {
+                "result_generation_identity": generation,
+                "activation_identity": activation,
+            }
+
+            def publish_without_guard(*_args, **kwargs):
+                self.assertIsNone(kwargs.get("publication_guard"))
+                return True
+
+            with patch.object(
+                run_step,
+                "read_pending_binary_generation",
+                return_value={"activation_identity": activation},
+            ), patch.object(
+                run_step,
+                "publish_pending_binary_generation",
+                side_effect=publish_without_guard,
+            ):
+                outcome = run_step._seal_binary_step4_activation(
+                    report, result
+                )
+
+        self.assertEqual(outcome, "published_private_candidate")
+
+    def test_step4_gate_success_commits_reports_active_and_checkpoint_together(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            report = root / ".upgrade-report"
+            destinations = run_step._step4_report_publication_destinations(report)
+            for destination, value in zip(
+                destinations, ("old-api", "old-source")
+            ):
+                destination.mkdir(parents=True)
+                (destination / "marker").write_text(value, encoding="utf-8")
+            binary_root = report / run_step.BINARY_OUTPUT_RELATIVE_PATH
+            checkpoint = run_step._step4_validation_checkpoint_path(report)
+            active_path = binary_root / "active_binary_generation.json"
+            generation = self._write_release_authorized_generation(
+                binary_root, marker="5"
+            )
+            activation = "d" * 64
+            validation = "e" * 64
+            binary_output._write_active_descriptor(binary_root, {
+                "schema": "java-upgrade-analyzer.active-binary-generation.v1",
+                "result_generation_identity": generation,
+                "generation_directory": f"binary_generations/{generation}",
+                "validation_run_identity": validation,
+                "validation_result_sha256": "4" * 64,
+                "activation_identity": activation,
+                "activation_predecessor": None,
+            }, expect_missing=True)
+            run_step.write_json(checkpoint, {
+                "schema": "java-upgrade-analyzer.binary-generation-validation-checkpoint.v3",
+                "status": "independent_validation_passed_pending_activation",
+                "result_generation_identity": generation,
+                "validation_run_identity": validation,
+                "activation_identity": activation,
+            })
+
+            def write_api(stage, _prepared):
+                (stage / "marker").write_text("new-api", encoding="utf-8")
+                run_step.write_json(
+                    stage / "summary.json",
+                    {"result_generation_identity": generation},
+                )
+
+            transaction = binary_report._stage_directory_group((
+                (destinations[0], write_api),
+                (destinations[1], lambda stage, _prepared: (
+                    stage / "marker"
+                ).write_text("new-source", encoding="utf-8")),
+            ),
+                retain_transaction=True,
+                transaction_binding={
+                    "result_generation_identity": generation,
+                    "validation_run_identity": validation,
+                    "validation_result_sha256": "4" * 64,
+                    "activation_identity": activation,
+                },
+            )
+            result = {
+                "validation_checkpoint_retained": True,
+                "validation_checkpoint_path": str(checkpoint),
+                "result_generation_identity": generation,
+                "validation_run_identity": validation,
+                "activation_identity": activation,
+                "report_publication_transaction": transaction,
+            }
+
+            with patch.object(
+                run_step, "run_gate", return_value=None
+            ), patch.object(
+                run_step,
+                "reconcile_current_release",
+                return_value={
+                    "step4": {"status": "current"},
+                    "step5": {"status": "stale"},
+                    "step6": {"status": "stale"},
+                },
+            ), patch.object(
+                binary_output,
+                "_verify_pending_generation_integrity",
+                return_value=None,
+            ):
+                committed = run_step._complete_binary_step4_after_gate(
+                    report_dir=report,
+                    project_dir=root,
+                    gate_name="jar_compare",
+                    strict_risk_gate=False,
+                    result=result,
+                )
+            final_active = run_step.read_json(active_path)
+            report_values = tuple(
+                (destination / "marker").read_text(encoding="utf-8")
+                for destination in destinations
+            )
+            checkpoint_exists = checkpoint.exists()
+            state = binary_report.report_publication_transaction_state(
+                destinations
+            )
+
+        self.assertTrue(committed)
+        self.assertEqual(final_active["result_generation_identity"], generation)
+        self.assertEqual(report_values, ("new-api", "new-source"))
+        self.assertFalse(checkpoint_exists)
+        self.assertEqual(state, "absent")
+
+    def test_step4_retains_checkpoint_until_activation_receipt_commit(self):
+        events = []
+        result = {
+            "activation_identity": "a" * 64,
+            "report_publication_transaction": {
+                "transaction_id": "transaction-1",
+                "binding": {},
+            },
+        }
+
+        def finalize(_report, _result, *, delete_checkpoint=True):
+            events.append(
+                "delete_checkpoint"
+                if delete_checkpoint
+                else "validate_checkpoint"
+            )
+            return True
+
+        with patch.object(
+            run_step,
+            "_step4_report_publication_expectation",
+            return_value={"transaction_id": "transaction-1", "binding": {}},
+        ), patch.object(
+            run_step, "run_gate", return_value=None
+        ), patch.object(
+            run_step,
+            "mark_report_publication_gate_passed",
+            return_value={"gate_receipt_identity": "receipt-1"},
+        ), patch.object(
+            run_step, "publish_report_publication", return_value=True
+        ), patch.object(
+            run_step, "_seal_binary_step4_activation", return_value=True
+        ), patch.object(
+            run_step,
+            "_finalize_binary_step4_transaction",
+            side_effect=finalize,
+        ), patch.object(
+            run_step,
+            "_commit_binary_step4_activation_receipt",
+            side_effect=lambda *_args: events.append("commit_activation"),
+        ), patch.object(
+            run_step,
+            "commit_report_publication",
+            side_effect=lambda *_args, **_kwargs: (
+                events.append("commit_reports") or True
+            ),
+        ), patch.object(
+            run_step,
+            "reconcile_current_release",
+            return_value={
+                "step4": {"status": "current"},
+                "step5": {"status": "stale"},
+                "step6": {"status": "stale"},
+            },
+        ):
+            run_step._complete_binary_step4_after_gate(
+                report_dir=Path("/unused/report"),
+                project_dir=Path("/unused/project"),
+                gate_name="jar_compare",
+                strict_risk_gate=False,
+                result=result,
+            )
+
+        self.assertEqual(events, [
+            "validate_checkpoint",
+            "commit_activation",
+            "delete_checkpoint",
+            "commit_reports",
+        ])
+
+    def test_step4_gate_passed_recovery_rejects_consistent_report_and_active_tampering(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp).resolve() / ".upgrade-report"
+            destinations = run_step._step4_report_publication_destinations(report)
+            generation = "a" * 64
+            replacement_generation = "b" * 64
+            validation = "c" * 64
+            validation_sha256 = "d" * 64
+            activation = "e" * 64
+            binary_root = report / run_step.BINARY_OUTPUT_RELATIVE_PATH
+            active_path = binary_root / "active_binary_generation.json"
+            run_step.write_json(active_path, {
+                "schema": "java-upgrade-analyzer.active-binary-generation.v1",
+                "result_generation_identity": generation,
+                "generation_directory": f"binary_generations/{generation}",
+                "validation_run_identity": validation,
+                "validation_result_sha256": validation_sha256,
+                "activation_identity": activation,
+                "activation_predecessor": None,
+            })
+
+            def write_api(stage, _prepared):
+                run_step.write_json(stage / "summary.json", {
+                    "result_generation_identity": generation,
+                })
+
+            transaction = binary_report._stage_directory_group((
+                (destinations[0], write_api),
+                (destinations[1], lambda stage, _prepared: (
+                    stage / "marker"
+                ).write_text("source", encoding="utf-8")),
+            ),
+                retain_transaction=True,
+                transaction_binding={
+                    "result_generation_identity": generation,
+                    "validation_run_identity": validation,
+                    "validation_result_sha256": validation_sha256,
+                    "activation_identity": activation,
+                },
+            )
+            binary_report.mark_report_publication_gate_passed(
+                destinations,
+                expected_transaction_id=transaction["transaction_id"],
+                expected_binding=transaction["binding"],
+                gate_name="jar_compare",
+                strict_risk_gate=False,
+            )
+
+            # Replace both private candidate identities consistently.  The
+            # durable report digest and activation CAS must prevent recovery
+            # from either committing or claiming a successful rollback.
+            candidate_api = Path(
+                transaction["candidate_destinations"][0]
+            )
+            run_step.write_json(candidate_api / "summary.json", {
+                "result_generation_identity": replacement_generation,
+            })
+            pending_path = (
+                binary_root
+                / "binary_observability"
+                / "pending_active_binary_generation.json"
+            )
+            run_step.write_json(pending_path, {
+                "schema": "java-upgrade-analyzer.active-binary-generation.v1",
+                "result_generation_identity": replacement_generation,
+                "generation_directory": (
+                    f"binary_generations/{replacement_generation}"
+                ),
+                "validation_run_identity": validation,
+                "validation_result_sha256": validation_sha256,
+                "activation_identity": activation,
+                "activation_predecessor": None,
+                "activation_state": "pending",
+            })
+
+            with self.assertRaises(
+                binary_report.BinaryReportError
+            ) as caught:
+                run_step._recover_binary_step4_transaction(
+                    report,
+                    expected_gate_name="jar_compare",
+                    expected_strict_risk_gate=False,
+                )
+            state = binary_report.report_publication_transaction_state(
+                destinations
+            )
+
+        self.assertEqual(
+            caught.exception.reason_code,
+            "BINARY_REPORT_PUBLICATION_CONTENT_MISMATCH",
+        )
+        self.assertEqual(state, "gate_passed")
+
+    def test_step4_recovers_crash_after_active_seal_before_report_commit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp).resolve() / ".upgrade-report"
+            destinations = run_step._step4_report_publication_destinations(report)
+            validation = "b" * 64
+            validation_sha256 = "c" * 64
+            activation = "d" * 64
+            binary_root = report / run_step.BINARY_OUTPUT_RELATIVE_PATH
+            active_path = binary_root / "active_binary_generation.json"
+            generation = self._write_release_authorized_generation(
+                binary_root, marker="6"
+            )
+            binary_output._write_active_descriptor(binary_root, {
+                "schema": "java-upgrade-analyzer.active-binary-generation.v1",
+                "result_generation_identity": generation,
+                "generation_directory": f"binary_generations/{generation}",
+                "validation_run_identity": validation,
+                "validation_result_sha256": validation_sha256,
+                "activation_identity": activation,
+                "activation_predecessor": None,
+            }, expect_missing=True)
+
+            transaction = binary_report._stage_directory_group((
+                (destinations[0], lambda stage, _prepared: run_step.write_json(
+                    stage / "summary.json",
+                    {"result_generation_identity": generation},
+                )),
+                (destinations[1], lambda stage, _prepared: (
+                    stage / "marker"
+                ).write_text("source", encoding="utf-8")),
+            ),
+                retain_transaction=True,
+                transaction_binding={
+                    "result_generation_identity": generation,
+                    "validation_run_identity": validation,
+                    "validation_result_sha256": validation_sha256,
+                    "activation_identity": activation,
+                },
+            )
+            binary_report.mark_report_publication_gate_passed(
+                destinations,
+                expected_transaction_id=transaction["transaction_id"],
+                expected_binding=transaction["binding"],
+                gate_name="jar_compare",
+                strict_risk_gate=False,
+            )
+            # This recovery fixture intentionally models only the descriptor
+            # transaction; generation byte-integrity has dedicated
+            # binary_output coverage.
+            with patch.object(
+                binary_output,
+                "_verify_pending_generation_integrity",
+                return_value=None,
+            ):
+                self.assertTrue(run_step.seal_active_binary_generation(
+                    binary_root,
+                    expected_current_identity=generation,
+                    expected_activation_identity=activation,
+                ))
+
+            recovery = run_step._recover_binary_step4_transaction(
+                report,
+                expected_gate_name="jar_compare",
+                expected_strict_risk_gate=False,
+            )
+            active = run_step.read_json(active_path)
+            state = binary_report.report_publication_transaction_state(
+                destinations
+            )
+
+        self.assertEqual(recovery, "completed_gate_passed_transaction")
+        self.assertNotIn("activation_identity", active)
+        self.assertNotIn("activation_predecessor", active)
+        self.assertEqual(state, "absent")
+
+    def test_step4_finalize_and_recovery_reject_active_descriptor_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp).resolve() / ".upgrade-report"
+            binary_root = report / run_step.BINARY_OUTPUT_RELATIVE_PATH
+            checkpoint = run_step._step4_validation_checkpoint_path(report)
+            generation = "a" * 64
+            validation = "b" * 64
+            activation = "c" * 64
+            run_step.write_json(checkpoint, {
+                "schema": "java-upgrade-analyzer.binary-generation-validation-checkpoint.v3",
+                "status": "independent_validation_passed_pending_activation",
+                "result_generation_identity": generation,
+                "validation_run_identity": validation,
+                "activation_identity": activation,
+            })
+            external = Path(tmp).resolve() / "external-active.json"
+            run_step.write_json(external, {
+                "result_generation_identity": generation,
+                "validation_run_identity": validation,
+                "validation_result_sha256": "d" * 64,
+                "activation_identity": activation,
+            })
+            external_bytes = external.read_bytes()
+            active_path = binary_root / "active_binary_generation.json"
+            try:
+                active_path.symlink_to(external)
+            except OSError as error:
+                self.skipTest(f"symlinks unavailable: {error}")
+            destinations = run_step._step4_report_publication_destinations(
+                report
+            )
+            transaction = binary_report._stage_directory_group((
+                (destinations[0], lambda stage, _prepared: run_step.write_json(
+                    stage / "summary.json",
+                    {"result_generation_identity": generation},
+                )),
+                (destinations[1], lambda stage, _prepared: (
+                    stage / "marker"
+                ).write_text("source", encoding="utf-8")),
+            ),
+                retain_transaction=True,
+                transaction_binding={
+                    "result_generation_identity": generation,
+                    "validation_run_identity": validation,
+                    "validation_result_sha256": "d" * 64,
+                    "activation_identity": activation,
+                },
+            )
+            gate_receipt = binary_report.mark_report_publication_gate_passed(
+                destinations,
+                expected_transaction_id=transaction["transaction_id"],
+                expected_binding=transaction["binding"],
+                gate_name="jar_compare",
+                strict_risk_gate=False,
+            )
+            result = {
+                "validation_checkpoint_retained": True,
+                "validation_checkpoint_path": str(checkpoint),
+                "result_generation_identity": generation,
+                "validation_run_identity": validation,
+                "activation_identity": activation,
+                "report_publication_transaction": transaction,
+                "report_publication_gate_receipt": gate_receipt,
+            }
+
+            with self.assertRaises(run_step.StepError) as finalize_error:
+                run_step._finalize_binary_step4_transaction(report, result)
+            with self.assertRaises(run_step.StepError) as recovery_error:
+                run_step._recover_binary_step4_transaction(
+                    report,
+                    expected_gate_name="jar_compare",
+                    expected_strict_risk_gate=False,
+                )
+
+            self.assertTrue(checkpoint.is_file())
+            self.assertEqual(external.read_bytes(), external_bytes)
+
+        self.assertIn(
+            "BINARY_STEP4_ACTIVE_DESCRIPTOR_INVALID",
+            finalize_error.exception.reason_codes,
+        )
+        self.assertIn(
+            "BINARY_STEP4_ACTIVE_DESCRIPTOR_INVALID",
+            recovery_error.exception.reason_codes,
+        )
+
+    def test_step4_recovery_rejects_checkpoint_links_and_fifo(self):
+        checkpoint_payload = {
+            "schema": "java-upgrade-analyzer.binary-generation-validation-checkpoint.v3",
+            "status": "independent_validation_passed_pending_activation",
+            "result_generation_identity": "a" * 64,
+            "validation_run_identity": "b" * 64,
+            "activation_identity": "c" * 64,
+        }
+        for kind in ("symlink", "hardlink", "fifo"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                report = Path(tmp).resolve() / ".upgrade-report"
+                checkpoint = run_step._step4_validation_checkpoint_path(report)
+                checkpoint.parent.mkdir(parents=True)
+                external = Path(tmp).resolve() / "external-checkpoint.json"
+                external_bytes = json.dumps(checkpoint_payload).encode("utf-8")
+                if kind == "fifo":
+                    if not hasattr(os, "mkfifo"):
+                        self.skipTest("FIFO is unavailable")
+                    try:
+                        os.mkfifo(checkpoint)
+                    except OSError as error:
+                        self.skipTest(f"FIFO is unavailable: {error}")
+                else:
+                    external.write_bytes(external_bytes)
+                    try:
+                        if kind == "symlink":
+                            checkpoint.symlink_to(external)
+                        else:
+                            os.link(external, checkpoint)
+                    except OSError as error:
+                        self.skipTest(f"{kind} is unavailable: {error}")
+
+                with self.assertRaises(run_step.StepError) as caught:
+                    run_step._recover_binary_step4_transaction(report)
+
+                self.assertIn(
+                    "BINARY_STEP4_TRANSACTION_CHECKPOINT_INVALID",
+                    caught.exception.reason_codes,
+                )
+                if kind != "fifo":
+                    self.assertEqual(external.read_bytes(), external_bytes)
 
     def test_binary_pipeline_config_intent_targets_step4_and_is_persisted(self):
         response = {"action": "continue", "binary_pipeline_config": "binary.json"}
@@ -539,6 +3443,23 @@ class RunStepMainStateTest(unittest.TestCase):
                 run_step, "detect_build_tool", return_value="maven"
             ), patch.object(
                 run_step, "execute_step", side_effect=fake_execute
+            ), patch.object(
+                run_step,
+                "_recover_and_apply_step4_startup_state",
+                return_value={
+                    "action": run_step._STEP4_RELEASE_CURRENT,
+                    "applied": False,
+                    "forced_step_id": "",
+                    "discard_structured_response": False,
+                },
+            ), patch.object(
+                run_step,
+                "_apply_downstream_release_startup_state",
+                return_value={
+                    "forced_step_id": "",
+                    "discard_structured_response": False,
+                    "release": {},
+                },
             ):
                 exit_code = run_step.main(
                     [
@@ -594,6 +3515,23 @@ class RunStepMainStateTest(unittest.TestCase):
                 run_step, "detect_build_tool", return_value="maven"
             ), patch.object(
                 run_step, "execute_step", side_effect=fake_execute
+            ), patch.object(
+                run_step,
+                "_recover_and_apply_step4_startup_state",
+                return_value={
+                    "action": run_step._STEP4_RELEASE_CURRENT,
+                    "applied": False,
+                    "forced_step_id": "",
+                    "discard_structured_response": False,
+                },
+            ), patch.object(
+                run_step,
+                "_apply_downstream_release_startup_state",
+                return_value={
+                    "forced_step_id": "",
+                    "discard_structured_response": False,
+                    "release": {},
+                },
             ):
                 exit_code = run_step.main(
                     [
@@ -684,6 +3622,23 @@ class RunStepMainStateTest(unittest.TestCase):
                 run_step,
                 "execute_step",
                 return_value=routine_review,
+            ), patch.object(
+                run_step,
+                "_recover_and_apply_step4_startup_state",
+                return_value={
+                    "action": run_step._STEP4_RELEASE_CURRENT,
+                    "applied": False,
+                    "forced_step_id": "",
+                    "discard_structured_response": False,
+                },
+            ), patch.object(
+                run_step,
+                "_apply_downstream_release_startup_state",
+                return_value={
+                    "forced_step_id": "",
+                    "discard_structured_response": False,
+                    "release": {},
+                },
             ):
                 exit_code = run_step.main()
 
@@ -1510,6 +4465,20 @@ class RunStepMainStateTest(unittest.TestCase):
             resume_text = run_step.resume_context_path(report_dir).read_text(
                 encoding="utf-8"
             )
+            coverage_path = (
+                report_dir / ".runtime" / "coverage" / "coverage.json"
+            )
+            coverage = json.loads(
+                coverage_path.read_text(encoding="utf-8")
+            )
+            nested_coverage_exists = (
+                report_dir
+                / ".runtime"
+                / "coverage"
+                / ".runtime"
+                / "coverage"
+                / "coverage.json"
+            ).exists()
 
         self.assertFalse(summary_bytes.startswith(b"\xef\xbb\xbf"))
         self.assertEqual(summary["event"], "step_completed")
@@ -1524,6 +4493,44 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertIn("## 可直接转述的状态", resume_text)
         self.assertIn("兼容性线索", resume_text)
         self.assertIn("继续执行依赖 API 变化", resume_text)
+        self.assertEqual(
+            coverage["schema"], "java-upgrade-analyzer.coverage.v1"
+        )
+        self.assertFalse(nested_coverage_exists)
+
+    def test_interactive_step_writes_coverage_below_report_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / ".upgrade-report"
+            state = run_step.new_main_state(report_dir)
+            interaction = {
+                "step_id": "step3",
+                "status": "awaiting_user_input",
+                "question": "请确认兼容性线索。",
+            }
+
+            run_step.persist_step_interaction(
+                state,
+                "step3",
+                report_dir,
+                {"project_scope": {}},
+                interaction,
+            )
+            coverage_path = (
+                report_dir / ".runtime" / "coverage" / "coverage.json"
+            )
+            nested_coverage = (
+                report_dir
+                / ".runtime"
+                / "coverage"
+                / ".runtime"
+                / "coverage"
+                / "coverage.json"
+            )
+            coverage_exists = coverage_path.is_file()
+            nested_coverage_exists = nested_coverage.exists()
+
+        self.assertTrue(coverage_exists)
+        self.assertFalse(nested_coverage_exists)
 
     def test_completed_checkpoint_snapshot_names_required_user_input(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3400,7 +6407,7 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertEqual(state["step4"]["input"]["base_branch"], "base")
             self.assertEqual(state["step4"]["output"], {})
             self.assertTrue(retained_path.exists())
-            self.assertFalse(incomplete_path.exists())
+            self.assertTrue(incomplete_path.exists())
 
     def test_execute_step1_does_not_pass_business_inputs_via_cli(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3717,13 +6724,11 @@ class RunStepMainStateTest(unittest.TestCase):
 
             def fake_run_python(script_name, script_args, _cwd, **_kwargs):
                 captured.append((script_name, list(script_args)))
-                if script_name == "binary_pipeline.py":
-                    result_path = Path(script_args[script_args.index("--result-json") + 1])
-                    run_step.write_json(result_path, {
-                        "validation_status": "passed",
-                        "result_generation_identity": "generation-1",
-                        "analysis_context_identity": "context-1",
-                    })
+                self.assertEqual(script_name, "binary_pipeline.py")
+                self._write_fake_step4_pipeline_result(script_args)
+
+            def prepare_report(**kwargs):
+                return self._fake_step4_report_result(kwargs["report_dir"])
 
             with patch.object(run_step, "validate_run_context_for_step"), \
                  patch.object(run_step, "ensure_exists"), \
@@ -3741,11 +6746,20 @@ class RunStepMainStateTest(unittest.TestCase):
                      side_effect=lambda context, _report: nullcontext(context),
                  ), \
                  patch.object(run_step, "run_python", side_effect=fake_run_python), \
-                 patch.object(run_step, "run_gate"), \
+                 patch.object(
+                     run_step,
+                     "_prepare_binary_report_publication_candidate_in_process",
+                     side_effect=prepare_report,
+                 ), \
+                 patch.object(
+                     run_step,
+                     "_complete_binary_step4_after_gate",
+                     return_value=True,
+                 ), \
                  patch.object(run_step, "build_interaction_payload", return_value={}):
                 run_step.execute_step("step4", args, manifest_steps, run_context)
 
-        self.assertEqual([item[0] for item in captured], ["binary_pipeline.py", "binary_report.py"])
+        self.assertEqual([item[0] for item in captured], ["binary_pipeline.py"])
         pipeline_args = captured[0][1]
         self.assertNotIn("--dependency-repo-mappings", pipeline_args)
         self.assertNotIn("--source-branches", pipeline_args)
@@ -3776,10 +6790,26 @@ class RunStepMainStateTest(unittest.TestCase):
 
             def fail(_cmd, **_kwargs):
                 result_path.write_text(json.dumps({
+                    "schema": (
+                        "java-upgrade-analyzer.binary-pipeline-failure.v1"
+                    ),
                     "status": "failed",
                     "reason_code": "BINARY_JDK_PREFLIGHT_FAILED",
+                    "failure_type": "BinaryPipelineError",
+                    "detail": "preflight failed",
+                    "cause": None,
                     "failed_phase": "static_preflight",
+                    "last_progress": {
+                        "attempt_identity": "a" * 64,
+                        "current_phase": "static_preflight",
+                    },
+                    "attempt_identity": "a" * 64,
+                    "progress_bound_to_attempt": True,
+                    "core_transaction_status": "failed",
+                    "core_transaction_succeeded": False,
+                    "core_result_receipt": None,
                     "traceback": "preflight traceback",
+                    "fail_closed": True,
                 }), encoding="utf-8")
                 return "", "pipeline failed", 1
 
@@ -3799,6 +6829,310 @@ class RunStepMainStateTest(unittest.TestCase):
             raised.exception.diagnostic["structured_result"]["failed_phase"],
             "static_preflight",
         )
+
+    def test_run_python_recovers_exact_pipeline_failure_from_final_stderr(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result_path = root / "missing-pipeline-result.json"
+            receipt = {
+                "result_generation_identity": "b" * 64,
+                "activation_identity": "c" * 64,
+                "activation_disposition": (
+                    "private_candidate_pending_parent_commit"
+                ),
+            }
+            public_failure = {
+                "schema": (
+                    "java-upgrade-analyzer.binary-pipeline-failure.v1"
+                ),
+                "status": "failed",
+                "reason_code": "BINARY_PIPELINE_RESULT_PERSIST_FAILED",
+                "failure_type": "OSError",
+                "detail": "result sink unavailable",
+                "cause": {
+                    "failure_stage": "result_persistence",
+                    "failure_type": "OSError",
+                },
+                "failed_phase": "result_delivery",
+                "last_progress": {},
+                "attempt_identity": "a" * 64,
+                "progress_bound_to_attempt": False,
+                "core_transaction_status": "succeeded",
+                "core_transaction_succeeded": True,
+                "core_result_receipt": receipt,
+                "fail_closed": True,
+            }
+            stderr = "\n".join((
+                json.dumps({
+                    "level": "error",
+                    "reason_code": "MUST_NOT_BE_PARSED",
+                }),
+                json.dumps(public_failure),
+            )) + "\n"
+
+            def fail_with_invalid_result(_cmd, **_kwargs):
+                result_path.write_text("{invalid-json", encoding="utf-8")
+                return "", stderr, 1
+
+            with patch.object(
+                run_step, "run_cmd", side_effect=fail_with_invalid_result
+            ), patch.object(run_step, "print_output"):
+                with self.assertRaises(run_step.StepError) as caught:
+                    run_step.run_python(
+                        "binary_pipeline.py",
+                        ["--result-json", str(result_path)],
+                        root,
+                        report_dir=root,
+                    )
+
+        self.assertIn(
+            "BINARY_PIPELINE_RESULT_PERSIST_FAILED",
+            caught.exception.reason_codes,
+        )
+        structured = caught.exception.diagnostic["structured_result"]
+        self.assertEqual(structured["core_transaction_status"], "succeeded")
+        self.assertEqual(structured["core_result_receipt"], receipt)
+
+    def test_run_python_does_not_treat_arbitrary_stderr_json_as_pipeline_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result_path = root / "missing-pipeline-result.json"
+            arbitrary_log = json.dumps({
+                "status": "failed",
+                "reason_code": "MUST_NOT_BE_PARSED",
+                "failed_phase": "validated_generation_activation",
+            }) + "\n"
+            with patch.object(
+                run_step,
+                "run_cmd",
+                return_value=("", arbitrary_log, 1),
+            ), patch.object(run_step, "print_output"):
+                with self.assertRaises(run_step.StepError) as caught:
+                    run_step.run_python(
+                        "binary_pipeline.py",
+                        ["--result-json", str(result_path)],
+                        root,
+                        report_dir=root,
+                    )
+
+        self.assertNotIn("MUST_NOT_BE_PARSED", caught.exception.reason_codes)
+        self.assertEqual(
+            caught.exception.diagnostic["structured_result"], {}
+        )
+
+    def test_step6_failure_owner_requires_complete_child_contract(self):
+        valid = run_step.StepError(
+            "Step6 failed",
+            reason_codes=["BINARY_STEP6_INTERNAL_INPUT_INVALID"],
+            diagnostic={"structured_result": {
+                "schema": (
+                    "java-upgrade-analyzer."
+                    "binary-report-publication-failure.v1"
+                ),
+                "status": "failed",
+                "phase": "step6",
+                "reason_code": "BINARY_STEP6_INTERNAL_INPUT_INVALID",
+                "owner_step": "step2",
+                "failure_contract": {
+                    "schema": (
+                        "java-upgrade-analyzer."
+                        "step6-internal-input-failure.v1"
+                    ),
+                    "status": "failed",
+                    "owner_step": "step2",
+                    "failures": [{"owner_step": "step2"}],
+                },
+            }},
+        )
+        forged = run_step.StepError(
+            "Step6 failed",
+            diagnostic={"structured_result": {
+                "schema": (
+                    "java-upgrade-analyzer."
+                    "binary-report-publication-failure.v1"
+                ),
+                "status": "failed",
+                "phase": "step6",
+                "reason_code": "BINARY_STEP6_INTERNAL_INPUT_INVALID",
+                "owner_step": "step1",
+                "failure_contract": {
+                    "schema": (
+                        "java-upgrade-analyzer."
+                        "step6-internal-input-failure.v1"
+                    ),
+                    "status": "failed",
+                    "owner_step": "step3",
+                },
+            }},
+        )
+
+        self.assertEqual(
+            run_step.step6_internal_input_failure_owner_from_step_error(
+                valid
+            ),
+            "step2",
+        )
+        self.assertIsNone(
+            run_step.step6_internal_input_failure_owner_from_step_error(
+                forged
+            )
+        )
+
+    def test_final_report_gate_preserves_step6_owner_contract(self):
+        structured_result = {
+            "schema": (
+                "java-upgrade-analyzer."
+                "binary-report-publication-failure.v1"
+            ),
+            "status": "failed",
+            "phase": "step6",
+            "reason_code": "BINARY_STEP6_INTERNAL_INPUT_INVALID",
+            "owner_step": "step2",
+            "failure_contract": {
+                "schema": (
+                    "java-upgrade-analyzer."
+                    "step6-internal-input-failure.v1"
+                ),
+                "status": "failed",
+                "owner_step": "step2",
+                "failures": [{"owner_step": "step2"}],
+            },
+        }
+        child_error = run_step.StepError(
+            "gate failed",
+            reason_codes=["BINARY_STEP6_INTERNAL_INPUT_INVALID"],
+            diagnostic={"structured_result": structured_result},
+        )
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            run_step, "run_python", side_effect=child_error
+        ) as run_python:
+            with self.assertRaises(run_step.StepError) as caught:
+                run_step.run_gate(
+                    "binary_final_report",
+                    Path(tmp) / ".upgrade-report",
+                    Path(tmp),
+                )
+
+        gate_args = run_python.call_args.args[1]
+        self.assertIn("--result-json", gate_args)
+        self.assertEqual(
+            run_step.step6_internal_input_failure_owner_from_step_error(
+                caught.exception
+            ),
+            "step2",
+        )
+
+    def test_step6_internal_input_failure_rebuilds_from_earliest_owner(self):
+        for owner_step in ("step1", "step2", "step3"):
+            with self.subTest(owner_step=owner_step), tempfile.TemporaryDirectory() as tmp:
+                project_dir = Path(tmp) / "project"
+                source_dir = project_dir / "src/main/java"
+                source_dir.mkdir(parents=True)
+                report_dir = project_dir / ".upgrade-report"
+                state = run_step.new_main_state(report_dir)
+                state["state"].update({
+                    "current_step": "step6",
+                    "completed_step": "step5",
+                    "status": "ready",
+                })
+                state["step6"]["input"] = {
+                    "target_module": ".",
+                    "source_dirs": [str(source_dir)],
+                    "source_dirs_status": "explicit",
+                }
+                run_step.save_main_state(report_dir, state)
+                executed = []
+
+                def fake_execute(step_id, *_args, **_kwargs):
+                    executed.append(step_id)
+                    if step_id != "step6":
+                        return None
+                    raise run_step.StepError(
+                        "binary_report.py execution failed",
+                        reason_codes=[
+                            "BINARY_STEP6_INTERNAL_INPUT_INVALID"
+                        ],
+                        diagnostic={"structured_result": {
+                            "schema": (
+                                "java-upgrade-analyzer."
+                                "binary-report-publication-failure.v1"
+                            ),
+                            "status": "failed",
+                            "phase": "step6",
+                            "reason_code": (
+                                "BINARY_STEP6_INTERNAL_INPUT_INVALID"
+                            ),
+                            "owner_step": owner_step,
+                            "failure_contract": {
+                                "schema": (
+                                    "java-upgrade-analyzer."
+                                    "step6-internal-input-failure.v1"
+                                ),
+                                "status": "failed",
+                                "owner_step": owner_step,
+                                "failures": [{
+                                    "owner_step": owner_step,
+                                }],
+                            },
+                        }},
+                    )
+
+                steps = {
+                    step: {"gate": "noop", "interaction": None}
+                    for step in run_step.STEP_SEQUENCE
+                }
+                with patch.object(
+                    run_step,
+                    "contract_payload",
+                    return_value={"status": "passed", "checks": []},
+                ), patch.object(
+                    run_step,
+                    "load_manifest",
+                    return_value=({"auto_run_until_checkpoint": False}, steps),
+                ), patch.object(
+                    run_step,
+                    "detect_integrity_repair_step",
+                    return_value=None,
+                ), patch.object(
+                    run_step, "detect_build_tool", return_value="maven"
+                ), patch.object(
+                    run_step, "execute_step", side_effect=fake_execute
+                ), patch.object(
+                    run_step,
+                    "_recover_and_apply_step4_startup_state",
+                    return_value={
+                        "action": run_step._STEP4_RELEASE_CURRENT,
+                        "applied": False,
+                        "forced_step_id": "",
+                        "discard_structured_response": False,
+                    },
+                ), patch.object(
+                    run_step,
+                    "_apply_downstream_release_startup_state",
+                    return_value={
+                        "forced_step_id": "",
+                        "discard_structured_response": False,
+                        "release": {},
+                    },
+                ):
+                    exit_code = run_step.main(
+                        [
+                            "--step", "step6",
+                            "--project-dir", str(project_dir),
+                            "--report-dir", str(report_dir),
+                        ],
+                        _skip_environment_contract=True,
+                    )
+
+                self.assertEqual(exit_code, 0)
+                self.assertEqual(executed, ["step6", owner_step])
+                saved = run_step.load_main_state(report_dir)
+                self.assertEqual(
+                    saved["state"]["completed_step"], owner_step
+                )
+                self.assertFalse(
+                    run_step._STEP6_INTERNAL_INPUT_RECOVERY_ATTEMPTS
+                )
 
     def test_run_python_emits_heartbeat_during_silent_long_phase(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -4521,27 +7855,28 @@ class RunStepMainStateTest(unittest.TestCase):
             manifest_steps = {"step5": {"gate": "binary_report"}}
             captured = {}
 
-            def fake_run_python(script_name, script_args, _cwd, **kwargs):
-                captured["script_name"] = script_name
-                captured["script_args"] = list(script_args)
-                captured["timeout"] = kwargs.get("timeout")
+            def fake_publish(**kwargs):
+                captured.update(kwargs)
+                return {"elapsed_seconds": 0.01}
 
             with patch.object(run_step, "validate_run_context_for_step"), \
-                 patch.object(run_step, "run_python", side_effect=fake_run_python), \
-                 patch.object(run_step, "run_gate"), \
+                 patch.object(run_step, "require_current_release_stage"), \
+                 patch.object(
+                     run_step,
+                     "_run_downstream_report_publication",
+                     side_effect=fake_publish,
+                 ), \
                  patch.object(run_step, "build_interaction_payload", return_value={}), \
                 patch.object(run_step, "build_run_context", return_value=run_context):
                 run_step.execute_step("step5", args, manifest_steps, run_context)
             timing_path = report_dir / ".runtime/observability/step5_timing.csv"
             self.assertTrue(timing_path.read_bytes().startswith(b"\xef\xbb\xbf"))
 
-        self.assertEqual(captured["script_name"], "binary_report.py")
+        self.assertEqual(captured["stage"], "step5")
         self.assertEqual(
-            captured["script_args"].count("--selected-coord"),
-            1,
+            captured["selected_coords"], ("com.example:demo-lib",)
         )
-        self.assertIn("com.example:demo-lib", captured["script_args"])
-        self.assertIn("core-lib", captured["script_args"])
+        self.assertEqual(captured["selected_names"], ("core-lib",))
 
     def test_materialize_step5_rejects_partial_scope_without_targets(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -4611,7 +7946,14 @@ class RunStepMainStateTest(unittest.TestCase):
             manifest_steps = {"step5": {"gate": "binary_report"}}
 
             with patch.object(run_step, "validate_run_context_for_step"), \
-                 patch.object(run_step, "run_gate"), \
+                 patch.object(run_step, "require_current_release_stage"), \
+                 patch.object(
+                     run_step,
+                     "_run_downstream_report_publication",
+                     side_effect=run_step.StepError(
+                         "BINARY_STEP5_SELECTION_UNMATCHED"
+                     ),
+                 ), \
                  patch.object(run_step, "build_interaction_payload", return_value={}):
                 with self.assertRaises(run_step.StepError):
                     run_step.execute_step("step5", args, manifest_steps, run_context)
@@ -4789,6 +8131,23 @@ class RunStepMainStateTest(unittest.TestCase):
                 run_step,
                 "execute_step",
                 side_effect=fake_execute_step,
+            ), patch.object(
+                run_step,
+                "_recover_and_apply_step4_startup_state",
+                return_value={
+                    "action": run_step._STEP4_RELEASE_CURRENT,
+                    "applied": False,
+                    "forced_step_id": "",
+                    "discard_structured_response": False,
+                },
+            ), patch.object(
+                run_step,
+                "_apply_downstream_release_startup_state",
+                return_value={
+                    "forced_step_id": "",
+                    "discard_structured_response": False,
+                    "release": {},
+                },
             ):
                 exit_code = run_step.main()
 
@@ -4835,14 +8194,12 @@ class RunStepMainStateTest(unittest.TestCase):
 
             def fake_run_python(script_name, script_args, *_args, **_kwargs):
                 captured.append((script_name, list(script_args)))
-                if script_name == "binary_pipeline.py":
-                    result_path = Path(script_args[script_args.index("--result-json") + 1])
-                    run_step.write_json(result_path, {
-                        "validation_status": "passed",
-                        "result_generation_identity": "generation-1",
-                        "analysis_context_identity": "context-1",
-                    })
+                self.assertEqual(script_name, "binary_pipeline.py")
+                self._write_fake_step4_pipeline_result(script_args)
                 return None
+
+            def prepare_report(**kwargs):
+                return self._fake_step4_report_result(kwargs["report_dir"])
 
             with patch.object(run_step, "validate_run_context_for_step"), \
                     patch.object(
@@ -4856,7 +8213,17 @@ class RunStepMainStateTest(unittest.TestCase):
                         run_step,
                         "materialize_pinned_dependency_source_workspaces",
                         side_effect=lambda context, _report: nullcontext(context),
-                    ), patch.object(run_step, "run_python", side_effect=fake_run_python):
+                    ), patch.object(
+                        run_step, "run_python", side_effect=fake_run_python
+                    ), patch.object(
+                        run_step,
+                        "_prepare_binary_report_publication_candidate_in_process",
+                        side_effect=prepare_report,
+                    ), patch.object(
+                        run_step,
+                        "_complete_binary_step4_after_gate",
+                        return_value=True,
+                    ):
                 run_step.execute_step(
                     "step4",
                     args,
@@ -4937,8 +8304,312 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertTrue(main_state.exists())
             self.assertTrue(interaction.exists())
 
+    def test_cleanup_step_outputs_never_traverses_parent_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report_dir = root / "report"
+            external = root / "external-context"
+            external.mkdir()
+            external_context = external / "context.json"
+            external_graph = external / "dep_graph.json"
+            external_context.write_text("outside", encoding="utf-8")
+            external_graph.write_text("outside", encoding="utf-8")
+            evidence = report_dir / "evidence"
+            evidence.mkdir(parents=True)
+            (evidence / "context").symlink_to(
+                external, target_is_directory=True
+            )
 
-    def test_cleanup_step_outputs_step3_removes_bridge_artifacts(self):
+            with self.assertRaises(run_step.StepError) as caught:
+                run_step.cleanup_step_outputs("step2", report_dir)
+
+            self.assertIn(
+                "WORKFLOW_OUTPUT_CLEANUP_PATH_UNSAFE",
+                caught.exception.reason_codes,
+            )
+            self.assertEqual(
+                external_context.read_text(encoding="utf-8"), "outside"
+            )
+            self.assertEqual(
+                external_graph.read_text(encoding="utf-8"), "outside"
+            )
+            self.assertTrue((evidence / "context").is_symlink())
+
+    def test_cleanup_step_outputs_unlinks_leaf_symlink_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report_dir = root / "report"
+            context = run_step.step2_context_path(report_dir)
+            context.parent.mkdir(parents=True)
+            external = root / "external-context.json"
+            external.write_text("outside", encoding="utf-8")
+            context.symlink_to(external)
+
+            run_step.cleanup_step_outputs("step2", report_dir)
+
+            self.assertFalse(context.exists())
+            self.assertFalse(context.is_symlink())
+            self.assertEqual(
+                external.read_text(encoding="utf-8"), "outside"
+            )
+
+    def test_cleanup_step_outputs_directory_tree_unlinks_nested_symlink_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report_dir = root / "report"
+            artifacts = run_step.step1_artifacts_dir(report_dir)
+            nested = artifacts / "nested"
+            nested.mkdir(parents=True)
+            (nested / "inside.jar").write_text("inside", encoding="utf-8")
+            external = root / "external.jar"
+            external.write_text("outside", encoding="utf-8")
+            (nested / "outside-link.jar").symlink_to(external)
+
+            run_step.cleanup_step_outputs("step1", report_dir)
+
+            self.assertFalse(artifacts.exists())
+            self.assertEqual(external.read_text(encoding="utf-8"), "outside")
+
+    @unittest.skipUnless(
+        run_step._secure_step_output_cleanup_supported(),
+        "descriptor-relative cleanup requires POSIX dir_fd support",
+    )
+    def test_cleanup_step_outputs_parent_swap_cannot_delete_external_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report_dir = root / "report"
+            context_dir = report_dir / "evidence" / "context"
+            context_dir.mkdir(parents=True)
+            original_context = context_dir / "context.json"
+            original_context.write_text("inside", encoding="utf-8")
+            moved_context = context_dir.with_name("context-original")
+            external = root / "external-context"
+            external.mkdir()
+            external_context = external / "context.json"
+            external_context.write_text("outside", encoding="utf-8")
+            real_unlink = os.unlink
+            raced = False
+
+            def swap_parent_before_unlink(name, *args, **kwargs):
+                nonlocal raced
+                if (
+                    not raced
+                    and name == "context.json"
+                    and kwargs.get("dir_fd") is not None
+                ):
+                    raced = True
+                    context_dir.rename(moved_context)
+                    context_dir.symlink_to(
+                        external, target_is_directory=True
+                    )
+                return real_unlink(name, *args, **kwargs)
+
+            with patch.object(
+                run_step,
+                "_secure_step_output_cleanup_supported",
+                return_value=True,
+            ), patch.object(
+                run_step.os,
+                "unlink",
+                side_effect=swap_parent_before_unlink,
+            ):
+                with self.assertRaises(run_step.StepError) as caught:
+                    run_step.cleanup_step_outputs("step2", report_dir)
+
+            self.assertTrue(raced)
+            self.assertIn(
+                "WORKFLOW_OUTPUT_CLEANUP_PATH_UNSAFE",
+                caught.exception.reason_codes,
+            )
+            self.assertEqual(
+                external_context.read_text(encoding="utf-8"), "outside"
+            )
+            self.assertFalse((moved_context / "context.json").exists())
+            self.assertTrue(context_dir.is_symlink())
+
+    @unittest.skipUnless(
+        run_step._secure_step_output_cleanup_supported(),
+        "checkpoint reads require POSIX dir_fd support",
+    )
+    def test_step4_checkpoint_root_swap_cannot_redirect_reader(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = root / "report"
+            checkpoint = run_step._step4_validation_checkpoint_path(report)
+            checkpoint.parent.mkdir(parents=True)
+            checkpoint.write_text(
+                '{"status": "inside"}\n', encoding="utf-8"
+            )
+            moved_report = root / "report-original"
+            replacement = root / "replacement-report"
+            replacement_checkpoint = (
+                replacement
+                / run_step.BINARY_OUTPUT_RELATIVE_PATH
+                / "binary_observability"
+                / "validation_checkpoint.json"
+            )
+            replacement_checkpoint.parent.mkdir(parents=True)
+            replacement_checkpoint.write_text(
+                '{"status": "outside"}\n', encoding="utf-8"
+            )
+            original_read = run_step._read_private_step4_checkpoint
+            raced = False
+
+            def swap_root_then_read(entry, *, parent_fd=None):
+                nonlocal raced
+                if parent_fd is not None and not raced:
+                    raced = True
+                    report.rename(moved_report)
+                    replacement.rename(report)
+                return original_read(entry, parent_fd=parent_fd)
+
+            with patch.object(
+                run_step,
+                "_read_private_step4_checkpoint",
+                side_effect=swap_root_then_read,
+            ), self.assertRaises(run_step.StepError) as caught:
+                run_step._read_step4_validation_checkpoint(report)
+
+            self.assertTrue(raced)
+            self.assertIn(
+                "BINARY_STEP4_TRANSACTION_CHECKPOINT_INVALID",
+                caught.exception.reason_codes,
+            )
+            self.assertEqual(
+                (
+                    report
+                    / run_step.BINARY_OUTPUT_RELATIVE_PATH
+                    / "binary_observability"
+                    / "validation_checkpoint.json"
+                ).read_text(encoding="utf-8"),
+                '{"status": "outside"}\n',
+            )
+            self.assertEqual(
+                (
+                    moved_report
+                    / run_step.BINARY_OUTPUT_RELATIVE_PATH
+                    / "binary_observability"
+                    / "validation_checkpoint.json"
+                ).read_text(encoding="utf-8"),
+                '{"status": "inside"}\n',
+            )
+
+    def test_step4_checkpoint_reader_rejects_non_strict_and_oversized_json(self):
+        invalid_payloads = (
+            b'{"status":"first","status":"second"}\n',
+            b'{"status":NaN}\n',
+            b'{"status":"oversized"}\n',
+        )
+        for index, payload in enumerate(invalid_payloads):
+            with self.subTest(index=index), tempfile.TemporaryDirectory() as tmp:
+                report = Path(tmp) / "report"
+                checkpoint = run_step._step4_validation_checkpoint_path(report)
+                checkpoint.parent.mkdir(parents=True)
+                checkpoint.write_bytes(payload)
+                size_limit = (
+                    len(payload) - 1
+                    if index == len(invalid_payloads) - 1
+                    else run_step._STEP4_VALIDATION_CHECKPOINT_MAX_BYTES
+                )
+
+                with patch.object(
+                    run_step,
+                    "_STEP4_VALIDATION_CHECKPOINT_MAX_BYTES",
+                    size_limit,
+                ), self.assertRaises(run_step.StepError) as caught:
+                    run_step._read_step4_validation_checkpoint(report)
+
+                self.assertIn(
+                    "BINARY_STEP4_TRANSACTION_CHECKPOINT_INVALID",
+                    caught.exception.reason_codes,
+                )
+
+    @unittest.skipUnless(
+        run_step._secure_step_output_cleanup_supported(),
+        "checkpoint deletion requires POSIX dir_fd support",
+    )
+    def test_step4_checkpoint_parent_swap_cannot_delete_external_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = root / "report"
+            checkpoint = run_step._step4_validation_checkpoint_path(report)
+            checkpoint.parent.mkdir(parents=True)
+            checkpoint.write_text("inside\n", encoding="utf-8")
+            moved_parent = checkpoint.parent.with_name(
+                "binary_observability-original"
+            )
+            external = root / "external-observability"
+            external.mkdir()
+            external_checkpoint = external / "validation_checkpoint.json"
+            external_checkpoint.write_text("outside\n", encoding="utf-8")
+            real_unlink = os.unlink
+            real_rename = os.rename
+            raced = False
+
+            def swap_parent_before_unlink(name, *args, **kwargs):
+                nonlocal raced
+                if (
+                    not raced
+                    and name == "validation_checkpoint.json"
+                    and kwargs.get("dir_fd") is not None
+                ):
+                    raced = True
+                    real_rename(checkpoint.parent, moved_parent)
+                    checkpoint.parent.symlink_to(
+                        external, target_is_directory=True
+                    )
+                return real_unlink(name, *args, **kwargs)
+
+            with patch.object(
+                run_step,
+                "_secure_step_output_cleanup_supported",
+                return_value=True,
+            ), patch.object(
+                run_step.os,
+                "unlink",
+                side_effect=swap_parent_before_unlink,
+            ), self.assertRaises(run_step.StepError) as caught:
+                run_step._delete_step4_validation_checkpoint_durable(
+                    checkpoint
+                )
+
+            self.assertTrue(raced)
+            self.assertIn(
+                "BINARY_STEP4_TRANSACTION_CHECKPOINT_INVALID",
+                caught.exception.reason_codes,
+            )
+            self.assertEqual(
+                external_checkpoint.read_text(encoding="utf-8"), "outside\n"
+            )
+            self.assertFalse(
+                (moved_parent / "validation_checkpoint.json").exists()
+            )
+            self.assertTrue(checkpoint.parent.is_symlink())
+
+    @unittest.skipIf(os.name == "nt", "POSIX capability fallback contract")
+    def test_cleanup_step_outputs_fails_closed_without_secure_primitives(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp)
+            context = run_step.step2_context_path(report_dir)
+            context.parent.mkdir(parents=True)
+            context.write_text("inside", encoding="utf-8")
+
+            with patch.object(
+                run_step,
+                "_secure_step_output_cleanup_supported",
+                return_value=False,
+            ):
+                with self.assertRaises(run_step.StepError) as caught:
+                    run_step.cleanup_step_outputs("step2", report_dir)
+
+            self.assertIn(
+                "WORKFLOW_OUTPUT_CLEANUP_PATH_UNSAFE",
+                caught.exception.reason_codes,
+            )
+            self.assertEqual(context.read_text(encoding="utf-8"), "inside")
+
+
+    def test_cleanup_step_outputs_step3_does_not_mutate_committed_step4_tree(self):
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp)
             risk_candidates = self._static_scan_dir(report_dir) / run_step.STEP3_RISK_CANDIDATES_FILE
@@ -4978,11 +8649,11 @@ class RunStepMainStateTest(unittest.TestCase):
 
             self.assertFalse(risk_candidates.exists())
             self.assertTrue(all(not path.exists() for path in database_contract_files))
-            self.assertFalse(candidate_hits.exists())
+            self.assertTrue(candidate_hits.exists())
             summary = json.loads(summary_path.read_text(encoding="utf-8"))
-            self.assertNotIn("step3", summary)
+            self.assertEqual(summary["step3"]["candidate_hit_count"], 1)
             self.assertEqual(summary["step4"]["target_count"], 2)
-            self.assertNotIn("candidate_hits_csv", summary["artifacts"])
+            self.assertIn("candidate_hits_csv", summary["artifacts"])
 
     def test_main_explicit_step_run_resets_current_and_downstream_state_and_outputs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -5065,10 +8736,10 @@ class RunStepMainStateTest(unittest.TestCase):
         self.assertEqual(captured["run_context"]["current_branch"], "current")
         self.assertEqual(captured["run_context"]["source_dirs"], [str(source_dir.resolve())])
         self.assertFalse(captured["step3_output_exists"])
-        self.assertFalse(captured["step4_output_exists"])
-        self.assertFalse(captured["step5_output_exists"])
-        self.assertFalse(captured["step6_findings_exists"])
-        self.assertFalse(captured["step6_report_exists"])
+        self.assertTrue(captured["step4_output_exists"])
+        self.assertTrue(captured["step5_output_exists"])
+        self.assertTrue(captured["step6_findings_exists"])
+        self.assertTrue(captured["step6_report_exists"])
         self.assertTrue(captured["step1_output_exists"])
         self.assertEqual(captured["state"]["state"]["current_step"], "step3")
         self.assertEqual(captured["state"]["state"]["completed_step"], "step2")
@@ -5219,6 +8890,23 @@ class RunStepMainStateTest(unittest.TestCase):
                 run_step,
                 "execute_step",
                 side_effect=fake_execute_step,
+            ), patch.object(
+                run_step,
+                "_recover_and_apply_step4_startup_state",
+                return_value={
+                    "action": run_step._STEP4_RELEASE_CURRENT,
+                    "applied": False,
+                    "forced_step_id": "",
+                    "discard_structured_response": False,
+                },
+            ), patch.object(
+                run_step,
+                "_apply_downstream_release_startup_state",
+                return_value={
+                    "forced_step_id": "",
+                    "discard_structured_response": False,
+                    "release": {},
+                },
             ):
                 exit_code = run_step.main()
 
@@ -5318,9 +9006,9 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertEqual(captured["step_id"], "step4")
             self.assertEqual(captured["run_context"]["base_branch"], "base")
             self.assertEqual(captured["run_context"]["current_branch"], "current")
-            self.assertFalse(captured["s4_exists_before_step"])
-            self.assertFalse(captured["s5_exists_before_step"])
-            self.assertFalse(captured["s6_exists_before_step"])
+            self.assertTrue(captured["s4_exists_before_step"])
+            self.assertTrue(captured["s5_exists_before_step"])
+            self.assertTrue(captured["s6_exists_before_step"])
             self.assertEqual(saved["state"]["current_step"], "step5")
             self.assertEqual(saved["state"]["completed_step"], "step4")
             self.assertEqual(saved["step5"]["input"]["base_branch"], "base")
@@ -6204,6 +9892,938 @@ class RunStepMainStateTest(unittest.TestCase):
             enhanced["source_ref_decision_items"][0]["source_project_dir"],
             "/actual/repository",
         )
+
+    def test_step4_startup_target_hint_preserves_explicit_rerun_intent(self):
+        state = run_step.new_main_state(Path.cwd() / ".upgrade-report-test")
+        state["state"].update({
+            "current_step": "step5",
+            "completed_step": "step4",
+            "pending_interaction": {
+                "step_id": "step4",
+                "options": [{"id": "rerun_current_step"}],
+            },
+        })
+        args = SimpleNamespace(step="auto")
+
+        self.assertEqual(
+            run_step._startup_step4_recovery_target_hint(
+                args,
+                state,
+                {"action": "rerun_current_step"},
+            ),
+            "step4",
+        )
+        self.assertEqual(
+            run_step._startup_step4_recovery_target_hint(
+                args,
+                state,
+                {
+                    "action": "restart_from_step",
+                    "restart_step_id": "step2",
+                },
+            ),
+            "step2",
+        )
+
+    def test_step4_recovery_disposition_classifier_is_fail_closed(self):
+        report = Path.cwd() / ".upgrade-report-test"
+        cases = (
+            (
+                "no_bound_transaction",
+                run_step._STEP4_RELEASE_FATAL,
+                None,
+            ),
+            (
+                "rolled_back_interrupted_transaction",
+                run_step._STEP4_RELEASE_RESUME_PIPELINE,
+                None,
+            ),
+            (
+                "committed_receipt_requires_republication",
+                run_step._STEP4_RELEASE_REPUBLISH,
+                True,
+            ),
+            (
+                "unexpected-new-disposition",
+                run_step._STEP4_RELEASE_FATAL,
+                None,
+            ),
+        )
+        for disposition, expected, reusable in cases:
+            with self.subTest(disposition=disposition):
+                manager = (
+                    patch.object(
+                        run_step,
+                        "_validated_active_generation_is_current",
+                        return_value=reusable,
+                    )
+                    if reusable is not None
+                    else nullcontext()
+                )
+                with manager:
+                    decision = run_step._classify_step4_recovery_disposition(
+                        report,
+                        disposition,
+                        expected_gate_name="jar_compare",
+                        expected_strict_risk_gate=False,
+                    )
+                self.assertEqual(decision["action"], expected)
+
+        receipt = {
+            "committed_receipt_identity": "a" * 64,
+            "binding": {"result_generation_identity": "b" * 64},
+        }
+        with patch.object(
+            run_step,
+            "verify_current_step4_release",
+            return_value=receipt,
+        ):
+            decision = run_step._classify_step4_recovery_disposition(
+                report,
+                "nothing_to_recover",
+                expected_gate_name="jar_compare",
+                expected_strict_risk_gate=False,
+            )
+        self.assertEqual(decision["action"], run_step._STEP4_RELEASE_CURRENT)
+        self.assertTrue(decision["release_verified"])
+
+        for reusable, expected in (
+            (True, run_step._STEP4_RELEASE_REPUBLISH),
+            (False, run_step._STEP4_RELEASE_RESUME_PIPELINE),
+        ):
+            with (
+                self.subTest(reusable=reusable),
+                patch.object(
+                    run_step,
+                    "verify_current_step4_release",
+                    side_effect=binary_report.BinaryReportError(
+                        "TEST_RELEASE_INVALID", "fixture"
+                    ),
+                ),
+                patch.object(
+                    run_step,
+                    "_validated_active_generation_is_current",
+                    return_value=reusable,
+                ),
+            ):
+                decision = run_step._classify_step4_recovery_disposition(
+                    report,
+                    "nothing_to_recover",
+                    expected_gate_name="jar_compare",
+                    expected_strict_risk_gate=False,
+                )
+            self.assertEqual(decision["action"], expected)
+
+    def test_step4_republication_marker_invalidates_done_before_publish(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp) / ".upgrade-report"
+            state = run_step.new_main_state(report)
+            state["state"].update({
+                "current_step": "done",
+                "completed_step": "step6",
+                "status": "completed",
+            })
+            state["step4"]["output"] = {
+                "step0_confirmed": True,
+                "source_dirs": [str(Path(tmp) / "src")],
+            }
+            state["step5"]["input"] = {
+                "step5_scope_mode": "full",
+            }
+            generation = "a" * 64
+            with patch.object(
+                run_step,
+                "_read_step4_active_descriptor",
+                return_value={"result_generation_identity": generation},
+            ):
+                marker = run_step._begin_step4_report_republication_state(
+                    main_state=state,
+                    report_dir=report,
+                )
+
+            persisted = run_step.load_main_state(report)
+            self.assertEqual(persisted["state"]["current_step"], "step5")
+            self.assertEqual(persisted["state"]["completed_step"], "step4")
+            self.assertIsNone(persisted["state"]["pending_interaction"])
+            self.assertEqual(
+                persisted["state"][
+                    "step4_report_republication_pending"
+                ]["marker_identity"],
+                marker["marker_identity"],
+            )
+
+            with patch.object(
+                run_step,
+                "build_interaction_payload",
+                return_value=None,
+            ):
+                interaction = (
+                    run_step._reconcile_main_state_after_step4_republication(
+                        main_state=persisted,
+                        report_dir=report,
+                        project_dir=Path(tmp),
+                        manifest_steps={"step4": {}},
+                        verified_release={
+                            "binding": {
+                                "result_generation_identity": generation
+                            }
+                        },
+                    )
+                )
+            finalized = run_step.load_main_state(report)
+
+        self.assertIsNone(interaction)
+        self.assertNotIn(
+            "step4_report_republication_pending", finalized["state"]
+        )
+        self.assertEqual(finalized["state"]["current_step"], "step5")
+
+    def test_step4_republication_orders_durable_invalidation_before_publish(self):
+        state = run_step.new_main_state(Path.cwd() / ".upgrade-report-test")
+        state["state"].update({
+            "current_step": "done",
+            "completed_step": "step6",
+        })
+        state["step4"]["output"] = {"step0_confirmed": True}
+        marker = {
+            "schema": run_step._STEP4_REPORT_REPUBLICATION_MARKER_SCHEMA,
+            "result_generation_identity": "a" * 64,
+            "refresh_scope_interaction": False,
+            "marker_identity": "b" * 64,
+        }
+        verified = {
+            "binding": {"result_generation_identity": "a" * 64},
+            "committed_receipt_identity": "c" * 64,
+        }
+        events = []
+
+        with (
+            patch.object(
+                run_step,
+                "_workflow_has_reached_step4",
+                return_value=True,
+            ),
+            patch.object(
+                run_step,
+                "_begin_step4_report_republication_state",
+                side_effect=lambda **_kwargs: (
+                    events.append("invalidate") or marker
+                ),
+            ),
+            patch.object(
+                run_step,
+                "_republish_current_binary_step4_reports",
+                side_effect=lambda **_kwargs: (
+                    events.append("publish") or verified
+                ),
+            ),
+            patch.object(
+                run_step,
+                "_reconcile_main_state_after_step4_republication",
+                side_effect=lambda **_kwargs: events.append("reconcile"),
+            ),
+        ):
+            result = run_step._apply_step4_startup_recovery(
+                decision={"action": run_step._STEP4_RELEASE_REPUBLISH},
+                target_step_id="done",
+                args=SimpleNamespace(step="auto"),
+                main_state=state,
+                report_dir=Path.cwd() / ".upgrade-report-test",
+                project_dir=Path.cwd(),
+                manifest_steps={"step4": {}},
+                gate_name="jar_compare",
+                strict_risk_gate=False,
+                has_structured_response=False,
+            )
+
+        self.assertEqual(events, ["invalidate", "publish", "reconcile"])
+        self.assertTrue(result["applied"])
+        self.assertEqual(result["forced_step_id"], "step5")
+
+    def test_explicit_step4_clears_old_pending_card_and_runs_pipeline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp) / ".upgrade-report"
+            state = run_step.new_main_state(report)
+            state["state"].update({
+                "current_step": "step5",
+                "completed_step": "step4",
+                "pending_interaction": {"step_id": "step4"},
+            })
+            state["step4"]["input"] = {"step0_confirmed": True}
+
+            result = run_step._apply_step4_startup_recovery(
+                decision={"action": run_step._STEP4_RELEASE_CURRENT},
+                target_step_id="step4",
+                args=SimpleNamespace(step="step4"),
+                main_state=state,
+                report_dir=report,
+                project_dir=Path(tmp),
+                manifest_steps={"step4": {}},
+                gate_name="jar_compare",
+                strict_risk_gate=False,
+                has_structured_response=True,
+            )
+
+        self.assertTrue(result["explicit_pipeline"])
+        self.assertEqual(result["forced_step_id"], "step4")
+        self.assertTrue(result["discard_structured_response"])
+        self.assertIsNone(state["state"]["pending_interaction"])
+        self.assertEqual(state["state"]["current_step"], "step4")
+
+    def test_step4_renderer_failure_rolls_back_child_transaction_without_result(self):
+        transaction_id = "a" * 32
+        binding = {"report_implementation_identity": "b" * 64}
+        metadata = {
+            "state": "pending_gate",
+            "transaction_id": transaction_id,
+            "binding": binding,
+        }
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(
+                run_step,
+                "report_publication_transaction_recovery_metadata",
+                side_effect=[{"state": "absent"}, metadata],
+            ),
+            patch.object(
+                run_step,
+                "_prepare_binary_report_publication_candidate_in_process",
+                side_effect=run_step.StepError("renderer failed"),
+            ),
+            patch.object(
+                run_step,
+                "rollback_report_publication",
+                return_value=True,
+            ) as rollback,
+        ):
+            with self.assertRaises(run_step.StepError) as caught:
+                run_step._republish_current_binary_step4_reports(
+                    report_dir=Path(tmp) / ".upgrade-report",
+                    project_dir=Path(tmp),
+                    gate_name="jar_compare",
+                    strict_risk_gate=False,
+                )
+
+        rollback.assert_called_once_with(
+            run_step._step4_report_publication_destinations(
+                Path(tmp) / ".upgrade-report"
+            ),
+            expected_transaction_id=transaction_id,
+            expected_binding=binding,
+        )
+        self.assertEqual(
+            caught.exception.diagnostic["report_publication_rollback"],
+            "restored_previous_reports",
+        )
+
+    def test_step4_republication_timing_failure_does_not_reverse_commit(self):
+        generation = "1" * 64
+        validation = "2" * 64
+        validation_sha256 = "3" * 64
+        implementation = "4" * 64
+        content_identity = "5" * 64
+        committed_identity = "6" * 64
+        binding = {
+            "result_generation_identity": generation,
+            "validation_run_identity": validation,
+            "validation_result_sha256": validation_sha256,
+            "report_implementation_identity": implementation,
+        }
+        transaction = {
+            "transaction_id": "a" * 32,
+            "binding": binding,
+            "published_content_identity": content_identity,
+        }
+        rendered = {
+            "phase": "step4",
+            "publication_transaction": transaction,
+        }
+        receipt = {
+            **transaction,
+            "state": "pending_gate",
+        }
+        verified = {
+            "binding": binding,
+            "committed_receipt_identity": committed_identity,
+        }
+        release = {
+            "step4": {"status": "current"},
+            "step5": {"status": "stale"},
+            "step6": {"status": "stale"},
+        }
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(
+                run_step,
+                "report_publication_transaction_recovery_metadata",
+                return_value={"state": "absent"},
+            ),
+            patch.object(
+                run_step,
+                "_prepare_binary_report_publication_candidate_in_process",
+                return_value=rendered,
+            ),
+            patch.object(
+                run_step,
+                "report_publication_transaction_receipt",
+                return_value=receipt,
+            ),
+            patch.object(
+                run_step,
+                "read_active_binary_generation",
+                return_value={
+                    "result_generation_identity": generation,
+                    "validation_run_identity": validation,
+                    "validation_result_sha256": validation_sha256,
+                },
+            ),
+            patch.object(
+                run_step,
+                "report_implementation_identity",
+                return_value=implementation,
+            ),
+            patch.object(run_step, "run_gate", return_value=None),
+            patch.object(
+                run_step,
+                "mark_report_publication_gate_passed",
+                return_value={"gate": "passed"},
+            ),
+            patch.object(
+                run_step,
+                "publish_report_publication",
+                return_value=True,
+            ),
+            patch.object(
+                run_step,
+                "commit_report_publication",
+                return_value=True,
+            ),
+            patch.object(
+                run_step,
+                "reconcile_current_release",
+                return_value=release,
+            ),
+            patch.object(
+                run_step,
+                "verify_current_step4_release",
+                return_value=verified,
+            ),
+            patch.object(
+                run_step,
+                "write_csv_rows",
+                side_effect=OSError("metrics unavailable"),
+            ),
+        ):
+            result = run_step._republish_current_binary_step4_reports(
+                report_dir=Path(tmp) / ".upgrade-report",
+                project_dir=Path(tmp),
+                gate_name="jar_compare",
+                strict_risk_gate=False,
+            )
+
+        self.assertEqual(result, verified)
+
+    def test_step4_republication_rejects_generation_switch_after_gate(self):
+        old_generation = "1" * 64
+        old_validation = "2" * 64
+        old_validation_sha = "3" * 64
+        new_generation = "7" * 64
+        new_validation = "8" * 64
+        new_validation_sha = "9" * 64
+        implementation = "4" * 64
+        binding = {
+            "result_generation_identity": old_generation,
+            "validation_run_identity": old_validation,
+            "validation_result_sha256": old_validation_sha,
+            "report_implementation_identity": implementation,
+        }
+        transaction = {
+            "transaction_id": "a" * 32,
+            "binding": binding,
+            "published_content_identity": "5" * 64,
+        }
+        receipt = {**transaction, "state": "pending_gate"}
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(
+                run_step,
+                "report_publication_transaction_recovery_metadata",
+                side_effect=[
+                    {"state": "absent"},
+                    {
+                        "state": "pending_gate",
+                        "transaction_id": transaction["transaction_id"],
+                        "binding": binding,
+                    },
+                ],
+            ),
+            patch.object(
+                run_step,
+                "_prepare_binary_report_publication_candidate_in_process",
+                return_value={
+                    "phase": "step4",
+                    "publication_transaction": transaction,
+                },
+            ),
+            patch.object(
+                run_step,
+                "report_publication_transaction_receipt",
+                return_value=receipt,
+            ),
+            patch.object(
+                run_step,
+                "read_active_binary_generation",
+                side_effect=[
+                    {
+                        "result_generation_identity": old_generation,
+                        "validation_run_identity": old_validation,
+                        "validation_result_sha256": old_validation_sha,
+                    },
+                    {
+                        "result_generation_identity": new_generation,
+                        "validation_run_identity": new_validation,
+                        "validation_result_sha256": new_validation_sha,
+                    },
+                ],
+            ),
+            patch.object(
+                run_step,
+                "report_implementation_identity",
+                return_value=implementation,
+            ),
+            patch.object(run_step, "run_gate", return_value=None),
+            patch.object(
+                run_step, "mark_report_publication_gate_passed"
+            ) as mark_gate,
+            patch.object(
+                run_step,
+                "rollback_report_publication",
+                return_value=True,
+            ) as rollback,
+        ):
+            with self.assertRaises(run_step.StepError) as caught:
+                run_step._republish_current_binary_step4_reports(
+                    report_dir=Path(tmp) / ".upgrade-report",
+                    project_dir=Path(tmp),
+                    gate_name="binary_generation",
+                    strict_risk_gate=False,
+                )
+
+        self.assertIn(
+            "BINARY_STEP4_REPORT_TRANSACTION_BINDING_MISMATCH",
+            caught.exception.reason_codes,
+        )
+        mark_gate.assert_not_called()
+        rollback.assert_called_once()
+
+    def test_startup_recovery_failure_persists_blocked_step4_before_return(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            report = Path(tmp) / ".upgrade-report"
+            project.mkdir()
+            state = run_step.new_main_state(report)
+            state["state"].update({
+                "current_step": "done",
+                "completed_step": "step6",
+                "status": "completed",
+            })
+            run_step.save_main_state(report, state)
+            failure = run_step.StepError(
+                "corrupt recovery",
+                reason_codes=["BINARY_STEP4_TRANSACTION_RECOVERY_FAILED"],
+            )
+            with (
+                patch.object(
+                    run_step,
+                    "recover_worktrees_before_execution",
+                    return_value={"removed_count": 0},
+                ),
+                patch.object(
+                    run_step,
+                    "load_manifest",
+                    return_value=({}, {"step4": {"gate": "jar_compare"}}),
+                ),
+                patch.object(
+                    run_step,
+                    "_recover_and_apply_step4_startup_state",
+                    side_effect=failure,
+                ),
+            ):
+                exit_code = run_step.main(
+                    [
+                        "--step", "auto",
+                        "--project-dir", str(project),
+                        "--report-dir", str(report),
+                    ],
+                    _skip_environment_contract=True,
+                )
+            persisted = run_step.load_main_state(report)
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(persisted["state"]["current_step"], "step4")
+        self.assertEqual(persisted["state"]["status"], "blocked_by_system")
+        self.assertIn(
+            "BINARY_STEP4_TRANSACTION_RECOVERY_FAILED",
+            persisted["state"]["blocking_reason_codes"],
+        )
+
+    def test_downstream_publication_gates_candidate_before_commit(self):
+        transaction = {
+            "transaction_id": "a" * 32,
+            "binding": {
+                "result_generation_identity": "b" * 64,
+                "report_implementation_identity": "c" * 64,
+            },
+            "published_content_identity": "d" * 64,
+            "destinations": ["one", "two", "three"],
+            "candidate_destinations": ["s1", "s2", "s3"],
+        }
+        receipt = {**transaction, "state": "pending_gate"}
+        release = {
+            "step4": {"status": "current"},
+            "step5": {"status": "current"},
+            "step6": {"status": "stale"},
+        }
+        events = []
+
+        def prepare_report(**kwargs):
+            events.append("render")
+            self.assertEqual(kwargs["phase"], "step5")
+            return {
+                "phase": "step5",
+                "publication_transaction": transaction,
+            }
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(
+                run_step,
+                "report_publication_transaction_recovery_metadata",
+                return_value={"state": "absent"},
+            ),
+            patch.object(run_step, "require_current_release_stage"),
+            patch.object(
+                run_step,
+                "_prepare_binary_report_publication_candidate_in_process",
+                side_effect=prepare_report,
+            ),
+            patch.object(
+                run_step,
+                "report_publication_transaction_receipt",
+                return_value=receipt,
+            ),
+            patch.object(
+                run_step,
+                "run_gate",
+                side_effect=lambda *_args, **_kwargs: events.append("gate"),
+            ) as gate,
+            patch.object(
+                run_step,
+                "complete_downstream_report_publication_after_gate",
+                side_effect=lambda *_args, **_kwargs: (
+                    events.append("commit")
+                    or {
+                        "publication_receipt": {
+                            "committed_receipt_identity": "e" * 64
+                        },
+                        "global_release": release,
+                    }
+                ),
+            ) as complete,
+        ):
+            result = run_step._run_downstream_report_publication(
+                stage="step5",
+                report_dir=Path(tmp) / ".upgrade-report",
+                project_dir=Path(tmp),
+                gate_name="binary_report",
+                strict_risk_gate=True,
+                output_dir=(
+                    Path(tmp) / ".upgrade-report" / "evidence" / "call_chain"
+                ),
+            )
+
+        self.assertEqual(events, ["render", "gate", "commit"])
+        self.assertIsNone(result["publication_transaction"])
+        gate.assert_called_once()
+        self.assertEqual(
+            gate.call_args.kwargs["publication_transaction"], receipt
+        )
+        complete.assert_called_once_with(
+            (Path(tmp) / ".upgrade-report").resolve(),
+            "step5",
+            expected_transaction_id="a" * 32,
+            expected_binding=transaction["binding"],
+            gate_name="binary_report",
+            strict_risk_gate=True,
+            workflow_lock_held=True,
+        )
+
+    def test_downstream_candidate_gate_failure_restores_previous_reports(self):
+        transaction = {
+            "transaction_id": "a" * 32,
+            "binding": {"report_implementation_identity": "b" * 64},
+            "published_content_identity": "c" * 64,
+            "destinations": ["one", "two"],
+            "candidate_destinations": ["s1", "s2"],
+        }
+        receipt = {**transaction, "state": "pending_gate"}
+        metadata = {
+            "state": "pending_gate",
+            "transaction_id": transaction["transaction_id"],
+            "binding": transaction["binding"],
+        }
+
+        def prepare_report(**kwargs):
+            self.assertEqual(kwargs["phase"], "step6")
+            return {
+                "phase": "step6",
+                "publication_transaction": transaction,
+            }
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(
+                run_step,
+                "report_publication_transaction_recovery_metadata",
+                side_effect=[{"state": "absent"}, metadata],
+            ),
+            patch.object(run_step, "require_current_release_stage"),
+            patch.object(
+                run_step,
+                "_prepare_binary_report_publication_candidate_in_process",
+                side_effect=prepare_report,
+            ),
+            patch.object(
+                run_step,
+                "report_publication_transaction_receipt",
+                return_value=receipt,
+            ),
+            patch.object(
+                run_step,
+                "run_gate",
+                side_effect=run_step.StepError("candidate rejected"),
+            ),
+            patch.object(
+                run_step,
+                "rollback_report_publication",
+                return_value=True,
+            ) as rollback,
+            patch.object(
+                run_step,
+                "complete_downstream_report_publication_after_gate",
+            ) as complete,
+        ):
+            with self.assertRaises(run_step.StepError) as caught:
+                run_step._run_downstream_report_publication(
+                    stage="step6",
+                    report_dir=Path(tmp) / ".upgrade-report",
+                    project_dir=Path(tmp),
+                    gate_name="binary_final_report",
+                    strict_risk_gate=False,
+                    output_findings=(
+                        Path(tmp) / ".upgrade-report" / ".runtime"
+                        / "findings" / "s6_findings.json"
+                    ),
+                    output_report=(
+                        Path(tmp) / ".upgrade-report" / "deliverables"
+                        / "report.md"
+                    ),
+                )
+
+        complete.assert_not_called()
+        rollback.assert_called_once_with(
+            run_step._downstream_report_publication_destinations(
+                Path(tmp) / ".upgrade-report", "step6"
+            ),
+            expected_transaction_id=transaction["transaction_id"],
+            expected_binding=transaction["binding"],
+        )
+        self.assertEqual(
+            caught.exception.diagnostic["report_publication_rollback"],
+            "restored_previous_reports",
+        )
+
+    def test_release_prerequisites_allow_target_stage_to_be_stale(self):
+        release = {
+            "step4": {"status": "current"},
+            "step5": {"status": "current"},
+            "step6": {"status": "stale"},
+        }
+        self.assertEqual(
+            run_step._release_prerequisite_repair_step(
+                release, "step6"
+            ),
+            "",
+        )
+        self.assertEqual(
+            run_step._release_prerequisite_repair_step(release, "done"),
+            "step6",
+        )
+
+    def test_done_state_is_rewound_to_earliest_stale_release(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp) / ".upgrade-report"
+            state = run_step.new_main_state(report)
+            state["state"].update({
+                "current_step": "done",
+                "completed_step": "step6",
+                "status": "completed",
+                "pending_interaction": {"step_id": "step6"},
+            })
+            state["step5"]["input"] = {"step0_confirmed": True}
+            release = {
+                "step4": {"status": "current"},
+                "step5": {"status": "stale"},
+                "step6": {"status": "stale"},
+            }
+            with (
+                patch.object(
+                    run_step,
+                    "reconcile_current_release",
+                    return_value=release,
+                ),
+                patch.object(run_step, "save_main_state"),
+                patch.object(run_step, "clear_interaction_file"),
+            ):
+                result = run_step._apply_downstream_release_startup_state(
+                    args=SimpleNamespace(step="auto"),
+                    main_state=state,
+                    report_dir=report,
+                    structured_user_response={"action": "continue"},
+                    has_structured_response=True,
+                )
+
+        self.assertEqual(result["forced_step_id"], "step5")
+        self.assertTrue(result["discard_structured_response"])
+        self.assertEqual(state["state"]["current_step"], "step5")
+        self.assertEqual(state["state"]["completed_step"], "step4")
+        self.assertIsNone(state["state"]["pending_interaction"])
+
+    def test_done_state_rewinds_when_downstream_gate_policy_changed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp) / ".upgrade-report"
+            state = run_step.new_main_state(report)
+            state["state"].update({
+                "current_step": "done",
+                "completed_step": "step6",
+                "status": "completed",
+            })
+            state["step5"]["input"] = {"step0_confirmed": True}
+            release = {
+                "step4": {"status": "current"},
+                "step5": {"status": "current"},
+                "step6": {"status": "current"},
+            }
+            with (
+                patch.object(
+                    run_step,
+                    "reconcile_current_release",
+                    return_value=release,
+                ),
+                patch.object(
+                    run_step,
+                    "_downstream_gate_policy_is_current",
+                    side_effect=lambda _report, stage, **_kwargs: (
+                        stage != "step5"
+                    ),
+                ),
+                patch.object(run_step, "save_main_state"),
+                patch.object(run_step, "clear_interaction_file"),
+            ):
+                result = run_step._apply_downstream_release_startup_state(
+                    args=SimpleNamespace(step="auto"),
+                    main_state=state,
+                    report_dir=report,
+                    structured_user_response=None,
+                    has_structured_response=False,
+                    manifest_steps={
+                        "step5": {"gate": "binary_report"},
+                        "step6": {"gate": "binary_final_report"},
+                    },
+                    strict_risk_gate=True,
+                )
+
+        self.assertEqual(result["forced_step_id"], "step5")
+        self.assertEqual(
+            result["release"]["step5"]["reason"],
+            "gate_policy_mismatch",
+        )
+        self.assertEqual(state["state"]["current_step"], "step5")
+
+    def test_landing_suppresses_preserved_release_at_in_progress_stage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp) / ".upgrade-report"
+            for relative in (
+                "deliverables/report.md",
+                "evidence/call_chain/alerts.csv",
+                "evidence/api_changes/all_changed_apis.csv",
+            ):
+                path = report / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("old", encoding="utf-8")
+            active = (
+                report
+                / run_step.BINARY_OUTPUT_RELATIVE_PATH
+                / "active_binary_generation.json"
+            )
+            active.parent.mkdir(parents=True, exist_ok=True)
+            active.write_text("{}", encoding="utf-8")
+            state = run_step.new_main_state(report)
+            state["state"].update({
+                "current_step": "step5",
+                "completed_step": "step4",
+            })
+            release = {
+                "step4": {"status": "current"},
+                "step5": {"status": "current"},
+                "step6": {"status": "current"},
+            }
+            with patch.object(
+                run_step,
+                "reconcile_current_release",
+                return_value=release,
+            ):
+                rows = run_step._landing_existing_artifact_rows(
+                    report, state=state
+                )
+
+        paths = {relative for _label, relative in rows}
+        self.assertIn(
+            "evidence/api_changes/all_changed_apis.csv", paths
+        )
+        self.assertNotIn("evidence/call_chain/alerts.csv", paths)
+        self.assertNotIn("deliverables/report.md", paths)
+
+    def test_protocol_landing_hides_stale_fixed_downstream_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp) / ".upgrade-report"
+            for relative in (
+                "deliverables/report.md",
+                "evidence/call_chain/alerts.csv",
+                "evidence/api_changes/all_changed_apis.csv",
+            ):
+                path = report / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("old", encoding="utf-8")
+            run_step.ensure_report_publication_protocol(report)
+            release = {
+                "step4": {"status": "current"},
+                "step5": {"status": "stale"},
+                "step6": {"status": "stale"},
+            }
+            with patch.object(
+                run_step,
+                "reconcile_current_release",
+                return_value=release,
+            ):
+                rows = run_step._landing_existing_artifact_rows(report)
+
+        paths = {relative for _label, relative in rows}
+        self.assertIn(
+            "evidence/api_changes/all_changed_apis.csv", paths
+        )
+        self.assertNotIn("evidence/call_chain/alerts.csv", paths)
+        self.assertNotIn("deliverables/report.md", paths)
 
 
 if __name__ == "__main__":

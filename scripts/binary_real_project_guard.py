@@ -19,6 +19,7 @@ from binary_fact_store import BinaryFactStore
 from binary_pipeline import BinaryPipelineError, run_pipeline
 from binary_result_truth import evaluate_formal_result_truth, validate_result_truth
 from binary_tool_execution import execute_binary_tool
+from javap_contract import javap_command
 from path_runtime import short_temporary_directory
 
 
@@ -72,10 +73,10 @@ def _javap_contracts(
     *, javap: str, classpath: list[Path], class_name: str,
 ) -> dict[tuple[str, str, str, str], tuple[str, ...]]:
     completed = execute_binary_tool(
-        [
+        javap_command(
             javap, "-classpath", os.pathsep.join(map(str, classpath)),
             "-p", "-s", "-v", class_name,
-        ],
+        ),
         stage="binary_real_project.oracle_javap",
         reason_prefix="REAL_PROJECT_ORACLE_JAVAP",
         timeout_seconds=60,
@@ -937,7 +938,7 @@ def materialize_case(
     return {
         "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
         "source_inputs": {
-            "purpose_version": "source-input-purpose-v2",
+            "purpose_version": "source-input-purpose-v3",
             "business": {"status": "not_provided", "origin": "not_provided"},
             "dependencies": {"status": "not_provided", "origin": "not_provided"},
         },

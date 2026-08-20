@@ -27,7 +27,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest, windows-2022, windows-2025]
         java: ["11", "17", "21"]
     steps:
       - name: Checkout
@@ -40,6 +40,32 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Setup Windows Reference JDK 8
+        id: setup_windows_java8
+        if: ${{ runner.os == 'Windows' }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "8"
+
+      - name: Record Windows Reference JDK 8 Home
+        if: ${{ runner.os == 'Windows' }}
+        shell: bash
+        run: echo "JAVA8_HOME=${JAVA_HOME}" >> "${GITHUB_ENV}"
+
+      - name: Setup Windows Reference JDK 17
+        id: setup_windows_java17
+        if: ${{ runner.os == 'Windows' }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Record Windows Reference JDK 17 Home
+        if: ${{ runner.os == 'Windows' }}
+        shell: bash
+        run: echo "JAVA17_HOME=${JAVA_HOME}" >> "${GITHUB_ENV}"
+
       - name: Setup Java
         id: setup_java
         uses: actions/setup-java@v4
@@ -47,9 +73,21 @@ jobs:
           distribution: temurin
           java-version: ${{ matrix.java }}
 
+      - name: Setup Windows Gradle
+        id: setup_windows_gradle
+        if: ${{ runner.os == 'Windows' }}
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: "8.10.2"
+
       - name: Verify Maven
         id: verify_maven
         run: mvn -version
+
+      - name: Verify Windows Gradle
+        id: verify_windows_gradle
+        if: ${{ runner.os == 'Windows' }}
+        run: gradle --version
 
       - name: Install Declared Runtime Dependencies
         id: install_dependencies
@@ -100,8 +138,12 @@ jobs:
           WINDOWS_SUITE_JSON: ${{ runner.temp }}/windows-native-suite.json
           CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
           SETUP_PYTHON_OUTCOME: ${{ steps.setup_python.outcome }}
+          SETUP_WINDOWS_JAVA8_OUTCOME: ${{ steps.setup_windows_java8.outcome }}
+          SETUP_WINDOWS_JAVA17_OUTCOME: ${{ steps.setup_windows_java17.outcome }}
           SETUP_JAVA_OUTCOME: ${{ steps.setup_java.outcome }}
+          SETUP_WINDOWS_GRADLE_OUTCOME: ${{ steps.setup_windows_gradle.outcome }}
           VERIFY_MAVEN_OUTCOME: ${{ steps.verify_maven.outcome }}
+          VERIFY_WINDOWS_GRADLE_OUTCOME: ${{ steps.verify_windows_gradle.outcome }}
           INSTALL_DEPENDENCIES_OUTCOME: ${{ steps.install_dependencies.outcome }}
           QUALITY_GATE_OUTCOME: ${{ steps.quality_gate.outcome }}
           WINDOWS_SUITE_OUTCOME: ${{ steps.windows_suite.outcome }}
@@ -115,9 +157,15 @@ jobs:
           printf 'step|setup-python|%s\n' "${SETUP_PYTHON_OUTCOME}" >> "${CELL_RESULT_PATH}"
           printf 'step|setup-java|%s\n' "${SETUP_JAVA_OUTCOME}" >> "${CELL_RESULT_PATH}"
           printf 'step|verify-maven|%s\n' "${VERIFY_MAVEN_OUTCOME}" >> "${CELL_RESULT_PATH}"
+          if [[ "${MATRIX_OS}" == windows-* ]]; then
+            printf 'step|setup-windows-java8|%s\n' "${SETUP_WINDOWS_JAVA8_OUTCOME}" >> "${CELL_RESULT_PATH}"
+            printf 'step|setup-windows-java17|%s\n' "${SETUP_WINDOWS_JAVA17_OUTCOME}" >> "${CELL_RESULT_PATH}"
+            printf 'step|setup-windows-gradle|%s\n' "${SETUP_WINDOWS_GRADLE_OUTCOME}" >> "${CELL_RESULT_PATH}"
+            printf 'step|verify-windows-gradle|%s\n' "${VERIFY_WINDOWS_GRADLE_OUTCOME}" >> "${CELL_RESULT_PATH}"
+          fi
           printf 'step|install-dependencies|%s\n' "${INSTALL_DEPENDENCIES_OUTCOME}" >> "${CELL_RESULT_PATH}"
           printf 'step|quality-gate|%s\n' "${QUALITY_GATE_OUTCOME}" >> "${CELL_RESULT_PATH}"
-          if [[ "${MATRIX_OS}" = "windows-latest" ]]; then
+          if [[ "${MATRIX_OS}" == windows-* ]]; then
             printf 'step|windows-native-suite|%s\n' "${WINDOWS_SUITE_OUTCOME}" >> "${CELL_RESULT_PATH}"
           fi
           if [[ "${ARTIFACT_FACTS_OUTCOME}" != "skipped" ]]; then
@@ -139,7 +187,7 @@ jobs:
               else:
                   payload = json.loads(source.read_text(encoding="utf-8"))
                   handle.write(f"gate|quality-gate|{payload.get('status') or 'missing'}\n")
-              if sys.argv[4] == "windows-latest":
+              if sys.argv[4].startswith("windows-"):
                   windows_source = Path(sys.argv[3])
                   if not windows_source.is_file():
                       handle.write("gate|windows-native-suite-report|missing\n")
@@ -207,7 +255,7 @@ jobs:
 
           shopt -s nullglob
           cell_files=("${CELL_RESULTS_DIR}"/platform-cell-*.txt)
-          test "${#cell_files[@]}" -eq 9
+          test "${#cell_files[@]}" -eq 12
           for result_file in "${cell_files[@]}"; do
             IFS='|' read -r CELL_STATUS MATRIX_OS MATRIX_JAVA < "${result_file}"
             case "${CELL_STATUS}" in

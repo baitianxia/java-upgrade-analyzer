@@ -360,6 +360,40 @@ class BinaryEntrypointDiscoveryTest(unittest.TestCase):
             result.coverage_gaps,
         )
 
+    def test_materialized_entrypoint_gap_is_not_silently_dropped(self):
+        store, runtime, _member = self.fixture()
+        profile = FakeProfile()
+        profile.payload["entrypoint_discovery_coverage_gaps"] = [
+            "packaged_main_class_manifest_missing"
+        ]
+
+        result = discover_binary_entrypoints(store, profile, runtime)
+
+        self.assertEqual(result.coverage_status, "partial")
+        self.assertIn(
+            "packaged_main_class_manifest_missing", result.coverage_gaps
+        )
+
+    def test_empty_declared_entrypoint_gaps_preserve_complete_coverage(self):
+        store, runtime, _member = self.fixture()
+        profile = FakeProfile()
+        profile.payload["entrypoint_discovery_coverage_gaps"] = []
+
+        result = discover_binary_entrypoints(store, profile, runtime)
+
+        self.assertEqual(result.coverage_status, "complete")
+        self.assertEqual(result.coverage_gaps, ())
+
+    def test_falsey_non_object_entrypoint_profile_is_not_treated_as_empty_valid(self):
+        store, runtime, _member = self.fixture()
+        profile = FakeProfile()
+        profile.payload["business_entrypoint_profile"] = []
+
+        result = discover_binary_entrypoints(store, profile, runtime)
+
+        self.assertEqual(result.coverage_status, "partial")
+        self.assertIn("entrypoint_profile_invalid", result.coverage_gaps)
+
     def test_conditional_dependency_auto_configuration_is_not_promoted_to_exact(self):
         store, runtime, member = self.fixture(
             class_annotations=[
