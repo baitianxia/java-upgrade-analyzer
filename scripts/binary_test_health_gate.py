@@ -45,20 +45,20 @@ MUTATIONS = (
         "id": "identity_accepts_non_finite_float",
         "module": "binary_first_contract",
         "path": SCRIPTS / "binary_first_contract.py",
-        "old": """return json.dumps(
+        "old": """return surrogate_safe_json_bytes(
         canonical,
         ensure_ascii=False,
         sort_keys=True,
         separators=(\",\", \":\"),
         allow_nan=False,
-    ).encode(\"utf-8\")""",
-        "new": """return json.dumps(
+    )""",
+        "new": """return surrogate_safe_json_bytes(
         canonical,
         ensure_ascii=False,
         sort_keys=True,
         separators=(\",\", \":\"),
         allow_nan=True,
-    ).encode(\"utf-8\")""",
+    )""",
         "test": (
             "tests.test_binary_first_contract.BinaryFirstContractTest."
             "test_canonical_identity_rejects_non_finite_float"

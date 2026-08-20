@@ -10,6 +10,8 @@ import re
 import subprocess
 import sys
 
+from compat import run_managed_subprocess
+
 
 @dataclass(frozen=True)
 class WindowsProcessUsage:
@@ -154,7 +156,7 @@ def _darwin_available_memory_bytes() -> int | None:
     """
 
     try:
-        completed = subprocess.run(
+        completed = run_managed_subprocess(
             ["/usr/bin/vm_stat"],
             capture_output=True,
             text=True,

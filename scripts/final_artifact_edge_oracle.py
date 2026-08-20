@@ -124,7 +124,8 @@ METHOD_HANDLE_REFERENCE_KINDS = frozenset(
 )
 PROCEDURE = (
     "javap with stable English/UTF-8 JVM properties -c -p -s "
-    "<extracted-class-file>; add -sysinfo to non-verbose multi-class batches "
+    "<exact class-file path or staged-JAR entry URL>; add -sysinfo to "
+    "non-verbose multi-class batches "
     "for path-bound output segmentation; add -v for classes with BootstrapMethods or "
     "CONSTANT_MethodHandle entries; "
     "bind caller owner/name/descriptor identities from strict-MUTF8 raw "
@@ -139,7 +140,7 @@ PROCEDURE = (
     "ACC_MODULE module descriptors and retain malformed ACC_MODULE classfiles "
     "for fail-closed scanning"
 )
-ORACLE_PROCEDURE_VERSION = "java-upgrade-analyzer.final-artifact-javap.v16"
+ORACLE_PROCEDURE_VERSION = "java-upgrade-analyzer.final-artifact-javap.v17"
 MAX_JAVAP_WORKERS = 8
 # Windows' command-line limit is much smaller than POSIX ARG_MAX. On POSIX,
 # larger batches materially reduce target-JVM startup overhead while remaining
@@ -150,8 +151,18 @@ MAX_JAVAP_WORKERS = 8
 # starts across large dependency sets.  Keep explicit headroom for quoting,
 # the executable path and JVM options, and additionally enforce the actual
 # rendered command length for every group below.
-MAX_CLASSES_PER_JAVAP_BATCH = 128 if os.name == "nt" else 256
+# The rendered-command budget remains the effective Windows guard for real
+# extracted paths.  A higher count ceiling lets short paths use the available
+# CreateProcess budget and commonly turns a 250-500 class JAR from 2-4 JVM
+# cold starts into one, while POSIX keeps its established output-size bound.
+MAX_CLASSES_PER_JAVAP_BATCH = 512 if os.name == "nt" else 256
 MAX_JAVAP_COMMAND_CHARS = 24_000 if os.name == "nt" else 0
+# Validation scans artifacts concurrently. Retain bytes only for ordinary
+# artifacts whose selected class set fits this per-scan bound; larger archives
+# keep the established file-backed path. At eight workers this adds at most
+# 128 MiB while eliminating small-file churn for the usual dependencies.
+MAX_STAGED_JAVAP_CLASS_BYTES = 16 * 1024 * 1024
+USE_STAGED_JAVAP_ARCHIVE = os.name == "nt"
 JAVAP_VERSION_TIMEOUT_SECONDS = 5.0
 _IMMUTABLE_ORACLE_CACHE: dict[tuple[str, str, str, str, str], str] = {}
 _JAVAP_VERSION_CACHE: dict[tuple[str, int, int, int], str] = {}
@@ -164,6 +175,7 @@ class PackagedClass:
     extracted_path: Path
     content: bytes | None = None
     requires_verbose_javap: bool | None = None
+    javap_argument: str = ""
 
 
 @dataclass(frozen=True)
@@ -738,6 +750,37 @@ def _write_extracted_class(destination: Path, index: int, content: bytes) -> Pat
     return class_path
 
 
+def _stage_javap_archive(
+    destination: Path,
+    entries: list[PackagedClass],
+) -> list[PackagedClass]:
+    """Store exact class bytes in one uncompressed JAR for javap URL input."""
+
+    archive_path = destination / "javap-classes.jar"
+    archive_uri = archive_path.resolve().as_uri()
+    staged: list[PackagedClass] = []
+    with zipfile.ZipFile(
+        archive_path, "x", compression=zipfile.ZIP_STORED, allowZip64=True
+    ) as archive:
+        for index, entry in enumerate(entries):
+            if entry.content is None:
+                raise ValueError("staged javap entry bytes are missing")
+            archive_entry = f"classes/class-{index:06d}.class"
+            archive.writestr(
+                archive_entry,
+                entry.content,
+                compress_type=zipfile.ZIP_STORED,
+            )
+            staged.append(PackagedClass(
+                artifact_entry=entry.artifact_entry,
+                extracted_path=entry.extracted_path,
+                content=entry.content,
+                requires_verbose_javap=entry.requires_verbose_javap,
+                javap_argument=f"jar:{archive_uri}!/{archive_entry}",
+            ))
+    return staged
+
+
 def _classfile_header_facts(content: bytes) -> tuple[bool, int | None]:
     """Return ``(has_method_handle, access_flags)`` from a classfile header.
 
@@ -812,11 +855,69 @@ def _extract_packaged_classes(
     target_major: int | None,
     *,
     defer_writes: bool = False,
+    stage_javap_archive: bool = False,
+    max_staged_class_bytes: int = MAX_STAGED_JAVAP_CLASS_BYTES,
     excluded_nested_jars: set[str] | None = None,
     include_nested_runtime_jars: bool = True,
 ) -> tuple[list[PackagedClass], list[str]]:
     entries: list[PackagedClass] = []
     failures: list[str] = []
+    staged_class_bytes = 0
+    staging_enabled = bool(stage_javap_archive)
+
+    def spill_staged_entries() -> None:
+        nonlocal entries, staging_enabled
+        materialized: list[PackagedClass] = []
+        for entry in entries:
+            if entry.content is None:
+                materialized.append(entry)
+                continue
+            try:
+                path = _write_extracted_class(
+                    destination, len(materialized), entry.content
+                )
+            except OSError as error:
+                failures.append(
+                    f"{entry.artifact_entry}: extract failed: {error}"
+                )
+                continue
+            materialized.append(PackagedClass(
+                entry.artifact_entry,
+                path,
+                None,
+                entry.requires_verbose_javap,
+            ))
+        entries = materialized
+        staging_enabled = False
+
+    def append_class(
+        artifact_entry: str,
+        content: bytes,
+        requires_verbose: bool,
+    ) -> None:
+        nonlocal staged_class_bytes, staging_enabled
+        if staging_enabled:
+            if staged_class_bytes + len(content) <= max_staged_class_bytes:
+                path = destination / f"class-{len(entries):06d}.class"
+                entries.append(PackagedClass(
+                    artifact_entry,
+                    path,
+                    content,
+                    requires_verbose,
+                ))
+                staged_class_bytes += len(content)
+                return
+            spill_staged_entries()
+        path = destination / f"class-{len(entries):06d}.class"
+        if not defer_writes:
+            path = _write_extracted_class(destination, len(entries), content)
+        entries.append(PackagedClass(
+            artifact_entry,
+            path,
+            content if defer_writes else None,
+            requires_verbose,
+        ))
+
     try:
         if isinstance(snapshot, bytes):
             archive_source = io.BytesIO(snapshot)
@@ -864,15 +965,7 @@ def _extract_packaged_classes(
                         and _classfile_is_valid_module_descriptor(content)
                     ):
                         continue
-                    path = destination / f"class-{len(entries):06d}.class"
-                    if not defer_writes:
-                        path = _write_extracted_class(destination, len(entries), content)
-                    entries.append(PackagedClass(
-                        info.filename,
-                        path,
-                        content if defer_writes else None,
-                        requires_verbose,
-                    ))
+                    append_class(info.filename, content, requires_verbose)
                 except (OSError, zipfile.BadZipFile) as error:
                     failures.append(f"{info.filename}: extract failed: {error}")
 
@@ -915,19 +1008,27 @@ def _extract_packaged_classes(
                                     )
                                 ):
                                     continue
-                                path = destination / f"class-{len(entries):06d}.class"
-                                if not defer_writes:
-                                    path = _write_extracted_class(destination, len(entries), content)
-                                entries.append(PackagedClass(
+                                append_class(
                                     f"{nested_name}!/{class_info.filename}",
-                                    path,
-                                    content if defer_writes else None,
+                                    content,
                                     requires_verbose,
-                                ))
+                                )
                     except (OSError, zipfile.BadZipFile) as error:
                         failures.append(f"{nested_name}: nested JAR read failed: {error}")
     except (OSError, zipfile.BadZipFile) as error:
         failures.append(f"final-artifact: artifact read failed: {error}")
+    if staging_enabled and entries:
+        try:
+            entries = _stage_javap_archive(destination, entries)
+        except Exception:
+            # This JAR is only a performance transport. Fall back to the
+            # established exact class-file path; never weaken or fail an
+            # analysis because an internal staging optimization was unusable.
+            try:
+                (destination / "javap-classes.jar").unlink()
+            except OSError:
+                pass
+            spill_staged_entries()
     return entries, failures
 
 
@@ -2850,7 +2951,11 @@ def _cancel_process(process: subprocess.Popen) -> None:
 
 
 def _materialize_packaged_class(entry: PackagedClass) -> str:
-    if entry.content is None or entry.extracted_path.exists():
+    if (
+        entry.javap_argument
+        or entry.content is None
+        or entry.extracted_path.exists()
+    ):
         return ""
     try:
         entry.extracted_path.write_bytes(entry.content)
@@ -2874,6 +2979,14 @@ def _entry_requires_verbose_javap(entry: PackagedClass) -> bool:
 def _javap_path_key(path: str | Path) -> str:
     """Normalize a javap path lexically without restatting every class file."""
     return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+
+def _entry_javap_argument(entry: PackagedClass) -> str:
+    return entry.javap_argument or str(entry.extracted_path)
+
+
+def _entry_javap_section_key(entry: PackagedClass) -> str:
+    return _javap_path_key(_entry_javap_argument(entry))
 
 
 def _parse_entry_with_javap(
@@ -2904,7 +3017,7 @@ def _parse_entry_with_javap(
         command = _javap_command(javap)
         if _entry_requires_verbose_javap(entry) if verbose is None else verbose:
             command.append("-v")
-        command.extend(("-c", "-p", "-s", str(entry.extracted_path)))
+        command.extend(("-c", "-p", "-s", _entry_javap_argument(entry)))
         process = managed_popen(
             command,
             stdout=subprocess.PIPE,
@@ -3048,6 +3161,33 @@ def _parse_entry_group_with_javap(
             for entry in candidates
         ]
 
+    def parse_smaller_batches(candidates: list[PackagedClass]) -> list[dict]:
+        """Bisect a failed aggregate invocation until its bad class is isolated."""
+
+        if len(candidates) <= 1:
+            return parse_separately(candidates)
+        midpoint = len(candidates) // 2
+        return [
+            *_parse_entry_group_with_javap(
+                candidates[:midpoint],
+                artifact_sha256,
+                javap,
+                version,
+                cancellation_event,
+                overall_deadline,
+                force_verbose=force_verbose,
+            ),
+            *_parse_entry_group_with_javap(
+                candidates[midpoint:],
+                artifact_sha256,
+                javap,
+                version,
+                cancellation_event,
+                overall_deadline,
+                force_verbose=force_verbose,
+            ),
+        ]
+
     materialize_errors = {
         entry.extracted_path: error
         for entry in entries
@@ -3076,7 +3216,7 @@ def _parse_entry_group_with_javap(
             # remains bound to the correct output section.
             command.append("-sysinfo")
         command.extend(("-c", "-p", "-s"))
-        command.extend(str(entry.extracted_path) for entry in entries)
+        command.extend(_entry_javap_argument(entry) for entry in entries)
         process = managed_popen(
             command,
             stdout=subprocess.PIPE,
@@ -3130,7 +3270,7 @@ def _parse_entry_group_with_javap(
                         or time.perf_counter() < overall_deadline
                     )
                 ):
-                    return parse_separately(entries)
+                    return parse_smaller_batches(entries)
                 return [
                     {"rows": [], "failures": [], "completed": False, "parsed": False}
                     for _entry in entries
@@ -3145,7 +3285,7 @@ def _parse_entry_group_with_javap(
         raise
     release_process_tree(process)
     if process.returncode != 0:
-        return parse_separately(entries)
+        return parse_smaller_batches(entries)
 
     sections: dict[str, str] = {}
     markers = list(re.finditer(r"(?m)^Classfile (?P<path>.+)\n", stdout))
@@ -3156,7 +3296,7 @@ def _parse_entry_group_with_javap(
         )
     results = []
     for entry in entries:
-        section = sections.get(_javap_path_key(entry.extracted_path))
+        section = sections.get(_entry_javap_section_key(entry))
         if section is None:
             results.extend(parse_separately([entry]))
             continue
@@ -3225,7 +3365,7 @@ def _javap_batch_command_chars(
 ) -> int:
     """Return the conservative Windows command-line rendering length."""
     command = _javap_command(javap, "-v", "-sysinfo", "-c", "-p", "-s")
-    command.extend(str(entry.extracted_path) for entry in entries)
+    command.extend(_entry_javap_argument(entry) for entry in entries)
     return len(subprocess.list2cmdline(command))
 
 
@@ -3633,10 +3773,13 @@ def _scan_final_artifact_snapshot(
                 snapshot,
                 Path(temporary_directory),
                 target_major,
-                # Selective scans probe extracted files one at a time. Keeping
-                # every class body in PackagedClass.content would reintroduce
-                # O(total uncompressed class bytes) resident memory.
                 defer_writes=False,
+                # javap accepts exact ``jar:file:...!/entry`` URLs. For the
+                # ordinary bounded artifact, one uncompressed staging JAR
+                # avoids a small file per class and keeps member parsing in
+                # memory. Oversized artifacts automatically spill to the
+                # established file-backed representation.
+                stage_javap_archive=USE_STAGED_JAVAP_ARCHIVE,
                 excluded_nested_jars=set(normalized_exclusions),
                 include_nested_runtime_jars=include_nested_runtime_jars,
             )

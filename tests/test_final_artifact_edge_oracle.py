@@ -483,6 +483,82 @@ class FinalArtifactEdgeOraclePerformanceTest(unittest.TestCase):
             ],
         )
 
+    @unittest.skipUnless(JDK_TOOLS, "JDK tools are required")
+    def test_staged_javap_archive_preserves_exact_bytes_and_spills_by_budget(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifact = root / "fixture.jar"
+            payloads = {
+                "odd/EntryOne.class": _minimal_static_edge_class(
+                    "raw/ActualOne", "first"
+                ),
+                "odd/EntryTwo.class": _minimal_static_edge_class(
+                    "raw/ActualTwo", "second"
+                ),
+            }
+            with zipfile.ZipFile(artifact, "w") as archive:
+                for name, content in payloads.items():
+                    archive.writestr(name, content)
+
+            staged_root = root / "staged"
+            staged_root.mkdir()
+            entries, failures = oracle._extract_packaged_classes(
+                artifact,
+                staged_root,
+                target_major=21,
+                stage_javap_archive=True,
+            )
+            self.assertEqual(failures, [])
+            self.assertEqual(list(staged_root.iterdir()), [
+                staged_root / "javap-classes.jar"
+            ])
+            self.assertTrue(all(
+                entry.content == payloads[entry.artifact_entry]
+                for entry in entries
+            ))
+            self.assertTrue(all(
+                entry.javap_argument.startswith("jar:file:")
+                for entry in entries
+            ))
+            self.assertTrue(all(
+                not entry.extracted_path.exists() for entry in entries
+            ))
+
+            results = oracle._parse_entry_group_with_javap(
+                entries,
+                "a" * 64,
+                str(shutil.which("javap")),
+                oracle._javap_version(
+                    str(shutil.which("javap")), timeout=5.0
+                ),
+                oracle.Event(),
+                None,
+            )
+            self.assertTrue(all(result["parsed"] for result in results), results)
+            self.assertEqual(
+                [
+                    {row["caller_owner"] for row in result["rows"]}
+                    for result in results
+                ],
+                [{"raw.ActualOne"}, {"raw.ActualTwo"}],
+            )
+
+            spilled_root = root / "spilled"
+            spilled_root.mkdir()
+            spilled, spill_failures = oracle._extract_packaged_classes(
+                artifact,
+                spilled_root,
+                target_major=21,
+                stage_javap_archive=True,
+                max_staged_class_bytes=0,
+            )
+            self.assertEqual(spill_failures, [])
+            self.assertTrue(all(not entry.javap_argument for entry in spilled))
+            self.assertTrue(all(entry.content is None for entry in spilled))
+            self.assertTrue(all(
+                entry.extracted_path.is_file() for entry in spilled
+            ))
+
     def test_boot_archive_can_exclude_external_target_provider_from_consumer_oracle(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -643,13 +719,13 @@ class FinalArtifactEdgeOraclePerformanceTest(unittest.TestCase):
             for index in range(256)
         ]
         with patch.object(
-            oracle, "MAX_CLASSES_PER_JAVAP_BATCH", 128
+            oracle, "MAX_CLASSES_PER_JAVAP_BATCH", 512
         ), patch.object(
             oracle, "MAX_JAVAP_COMMAND_CHARS", 24_000
         ):
             groups = oracle._javap_batch_groups(entries, 1, "javap")
 
-        self.assertEqual([len(group) for group in groups], [128, 128])
+        self.assertEqual([len(group) for group in groups], [256])
         self.assertGreaterEqual(oracle.MAX_CLASSES_PER_JAVAP_BATCH, 128)
 
     def test_command_line_overflow_recursively_splits_without_losing_classes(self):

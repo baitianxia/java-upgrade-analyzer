@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 import base64
 import binascii
 import hashlib
@@ -112,7 +112,7 @@ def _template_payload(snapshot: ArtifactSnapshot) -> dict[str, Any]:
         "artifact_content_sha256": snapshot.artifact_content_sha256,
         "artifact_byte_length": snapshot.artifact_byte_length,
         "archive_comment_sha256": snapshot.archive_comment_sha256,
-        "entries": [asdict(item) for item in snapshot.entries],
+        "entries": [dict(vars(item)) for item in snapshot.entries],
         "class_records": list(snapshot.class_records),
         "class_payloads": [
             [label, base64.b64encode(content).decode("ascii")]
@@ -223,7 +223,7 @@ def _rebind(
         "artifact_instance_identity": artifact_instance_identity,
         "artifact_content_sha256": payload["artifact_content_sha256"],
         "archive_comment_sha256": payload["archive_comment_sha256"],
-        "entries": [asdict(item) for item in entries],
+        "entries": [dict(vars(item)) for item in entries],
         "parser_identity": payload["parser_identity"],
         "runtime_semantics_diagnostic_codes": payload[
             "runtime_semantics_diagnostic_codes"

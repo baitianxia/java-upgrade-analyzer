@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from dataclasses import asdict
+from functools import lru_cache
 import hashlib
 import json
 from pathlib import Path
@@ -15,14 +15,16 @@ import zlib
 from binary_artifact_diff import ArtifactSnapshot
 from binary_first_contract import (
     BinaryFirstContractError,
+    JVM_TEXT_TRANSPORT_PREFIX,
     canonical_identity_native_json,
+    canonical_json_string,
     surrogate_safe_json_dumps,
     transport_jvm_value,
 )
 from binary_first_model import ArtifactInstance
 
 
-SCHEMA_VERSION = "binary-fact-sqlite-v7"
+SCHEMA_VERSION = "binary-fact-sqlite-v8"
 RECONCILIATION_KIND_CODES = {
     "provider_binding": 1,
     "class_definition": 2,
@@ -66,14 +68,105 @@ def _json(value: Any) -> str:
     )
 
 
+def _json_and_transport_jvm_value(value: Any) -> tuple[Any, str]:
+    """Serialize ordinary JVM facts once and transport exceptional text.
+
+    The previous path recursively scanned the complete fact tree for JVM text
+    requiring transport and then traversed it again to produce JSON.  Let the
+    C JSON encoder and UTF-8 encoder detect the overwhelmingly rare surrogate
+    case; only that exceptional case pays for the defensive tree conversion
+    and second serialization.
+    """
+
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    try:
+        encoded.encode("utf-8")
+    except UnicodeEncodeError:
+        pass
+    else:
+        # A raw JVM value beginning with the reserved transport prefix must
+        # also be escaped to keep restore_jvm_text collision-free.  Searching
+        # the serialized tree avoids a second Python-level recursive walk.
+        if f'"{JVM_TEXT_TRANSPORT_PREFIX}' not in encoded:
+            return value, encoded
+    transported = transport_jvm_value(value)
+    return transported, _json(transported)
+
+
 def _identity(namespace: str, payload: Any) -> str:
     return canonical_identity_native_json(
         namespace, payload, schema_version="1"
     )
 
 
+_DIRECT_EDGE_IDENTITY_PREFIX = (
+    b'{"namespace":"binary_direct_edge_identity","payload":'
+)
+_DIRECT_EDGE_IDENTITY_SUFFIX = b',"schema_version":"1"}'
+
+
+@lru_cache(maxsize=4_096)
+def _cached_canonical_edge_json_bytes(value: str) -> bytes:
+    return canonical_json_string(value).encode("utf-8")
+
+
+@lru_cache(maxsize=4_096)
+def _cached_canonical_edge_integer_bytes(value: int) -> bytes:
+    return str(int(value)).encode("ascii")
+
+
+def _direct_edge_identity_from_json(
+    caller_member_identity: str,
+    bytecode_offset: int,
+    instruction_index: int,
+    edge_kind: str,
+    symbolic_owner: str,
+    symbolic_name: str,
+    symbolic_descriptor: str,
+    edge_json: str,
+) -> str:
+    """Hash one edge while reusing its already-canonical payload JSON.
+
+    The key order and scalar spellings below are the exact output of the
+    frozen sorted compact JSON encoder used by ``_identity``.  All values are
+    native scalars and ``edge_json`` is produced by ``_json`` (or read from a
+    same-schema fact store), so this removes a redundant payload decode/tree
+    encode without changing one hashed byte.
+    """
+
+    body = b"".join((
+        b'{"bytecode_offset":',
+        _cached_canonical_edge_integer_bytes(bytecode_offset),
+        b',"caller_member_identity":',
+        _cached_canonical_edge_json_bytes(caller_member_identity),
+        b',"edge_kind":',
+        _cached_canonical_edge_json_bytes(edge_kind),
+        b',"edge_payload":',
+        edge_json.encode("utf-8"),
+        b',"instruction_index":',
+        _cached_canonical_edge_integer_bytes(instruction_index),
+        b',"symbolic_descriptor":',
+        _cached_canonical_edge_json_bytes(symbolic_descriptor),
+        b',"symbolic_name":',
+        _cached_canonical_edge_json_bytes(symbolic_name),
+        b',"symbolic_owner":',
+        _cached_canonical_edge_json_bytes(symbolic_owner),
+        b"}",
+    ))
+    digest = hashlib.sha256(_DIRECT_EDGE_IDENTITY_PREFIX)
+    digest.update(body)
+    digest.update(_DIRECT_EDGE_IDENTITY_SUFFIX)
+    return digest.hexdigest()
+
+
 class BinaryFactStore:
-    FACT_INSERT_CHUNK_SIZE = 2_000
+    FACT_INSERT_CHUNK_SIZE = 8_000
 
     def __init__(
         self,
@@ -206,6 +299,7 @@ class BinaryFactStore:
                 interfaces_json TEXT NOT NULL,
                 nest_host TEXT,
                 nest_members_json TEXT NOT NULL,
+                has_runtime_annotations INTEGER NOT NULL,
                 class_bytes_zlib BLOB NOT NULL,
                 fact_zlib BLOB NOT NULL,
                 UNIQUE(artifact_instance_identity, physical_entry_label)
@@ -410,7 +504,7 @@ class BinaryFactStore:
                             entry.resource_category,
                             entry.normalized_resource_digest,
                             _json(entry.resource_semantic_facts),
-                            _json(asdict(entry)),
+                            _json(vars(entry)),
                         )
                         for entry in snapshot.entries
                     ),
@@ -444,7 +538,7 @@ class BinaryFactStore:
                 def flush_fact_rows() -> None:
                     if class_rows:
                         self.connection.executemany(
-                            "INSERT INTO classes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            "INSERT INTO classes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                             class_rows,
                         )
                     if member_rows:
@@ -488,22 +582,28 @@ class BinaryFactStore:
                     # requires strict UTF-8 text.  Preserve those rare values
                     # with the reversible internal transport used by the
                     # independent oracle; ordinary strings remain untouched.
-                    record = transport_jvm_value(source_record)
+                    record, record_fact_json = _json_and_transport_jvm_value(
+                        source_record
+                    )
                     label = str(record.get("class_entry") or "")
                     parse_status = (
                         "parsed" if record.get("frame_type") == "class_fact" else "failed"
                     )
-                    added_hierarchy_types.update(
-                        str(value)
-                        for value in (
-                            record.get("super_name"),
-                            *(record.get("interfaces") or ()),
-                        )
-                        if value
+                    (
+                        record_has_runtime_annotations,
+                        record_hierarchy_types,
+                        record_has_main_method,
+                    ) = self._runtime_trigger_fact_components(
+                        record,
+                        include_main_method=parse_status == "parsed",
                     )
+                    added_hierarchy_types.update(record_hierarchy_types)
                     added_has_runtime_annotations = (
                         added_has_runtime_annotations
-                        or bool(record.get("annotations"))
+                        or record_has_runtime_annotations
+                    )
+                    added_has_main_method = (
+                        added_has_main_method or record_has_main_method
                     )
                     class_name = str(record.get("class_name") or entry.logical_class_entry.removesuffix(".class"))
                     variant_identity = _identity(
@@ -534,33 +634,18 @@ class BinaryFactStore:
                             _json(record.get("interfaces") or []),
                             record.get("nest_host"),
                             _json(record.get("nest_members") or []),
+                            int(record_has_runtime_annotations),
                             sqlite3.Binary(zlib.compress(class_payload, level=1)),
                             sqlite3.Binary(zlib.compress(
-                                _json(record).encode("utf-8"), level=1
+                                record_fact_json.encode("utf-8"), level=1
                             )),
                         )
                     )
                     counts["classes"] += 1
                     flush_fact_rows_if_full()
                     if parse_status != "parsed":
-                        if not added_has_runtime_annotations:
-                            (
-                                record_has_runtime_annotations,
-                                _record_hierarchy_types,
-                                _record_has_main_method,
-                            ) = self._runtime_trigger_fact_components(
-                                record,
-                                include_main_method=False,
-                            )
-                            added_has_runtime_annotations = (
-                                record_has_runtime_annotations
-                            )
                         continue
                     for field in record.get("fields") or ():
-                        if not added_has_runtime_annotations:
-                            added_has_runtime_annotations = bool(
-                                (field or {}).get("annotations")
-                            )
                         _member_identity, member_row = self._member_values(
                             variant_identity,
                             instance.identity,
@@ -574,16 +659,6 @@ class BinaryFactStore:
                         flush_fact_rows_if_full()
                     for method in record.get("methods") or ():
                         contract = method.get("contract") or {}
-                        if not added_has_runtime_annotations:
-                            added_has_runtime_annotations = bool(
-                                contract.get("annotations")
-                            )
-                        if not added_has_main_method:
-                            added_has_main_method = (
-                                str(contract.get("name") or "") == "main"
-                                and str(contract.get("descriptor") or "")
-                                == "([Ljava/lang/String;)V"
-                            )
                         member_identity, member_row = self._member_values(
                             variant_identity,
                             instance.identity,
@@ -597,18 +672,16 @@ class BinaryFactStore:
                         flush_fact_rows_if_full()
                         for instruction_index, instruction in enumerate(method.get("instructions") or ()):
                             for edge in self._instruction_edges(instruction):
-                                edge_identity = _identity(
-                                    "binary_direct_edge_identity",
-                                    {
-                                        "caller_member_identity": member_identity,
-                                        "bytecode_offset": edge["bytecode_offset"],
-                                        "instruction_index": instruction_index,
-                                        "edge_kind": edge["edge_kind"],
-                                        "symbolic_owner": edge["symbolic_owner"],
-                                        "symbolic_name": edge["symbolic_name"],
-                                        "symbolic_descriptor": edge["symbolic_descriptor"],
-                                        "edge_payload": edge["payload"],
-                                    },
+                                edge_json = _json(edge["payload"])
+                                edge_identity = _direct_edge_identity_from_json(
+                                    member_identity,
+                                    edge["bytecode_offset"],
+                                    instruction_index,
+                                    edge["edge_kind"],
+                                    edge["symbolic_owner"],
+                                    edge["symbolic_name"],
+                                    edge["symbolic_descriptor"],
+                                    edge_json,
                                 )
                                 edge_rows.append(
                                     (
@@ -623,7 +696,7 @@ class BinaryFactStore:
                                         edge["symbolic_owner"],
                                         edge["symbolic_name"],
                                         edge["symbolic_descriptor"],
-                                        _json(edge["payload"]),
+                                        edge_json,
                                     )
                                 )
                                 counts["edges"] += 1
@@ -1999,8 +2072,9 @@ class BinaryFactStore:
         The full builders require parsed ASM facts for selected classes. Most
         dependencies have no runtime-visible annotations or callback hierarchy
         at all, so retaining every parsed fact merely to produce an empty
-        overlay is avoidable. This scan keeps only a small hierarchy-name set
-        and stops retaining each decompressed document immediately.
+        overlay is avoidable. The exact trigger fields are normalized beside
+        the compressed fact, allowing reopened and SQLite-rebound stores to
+        recover the summary without inflating every ASM document.
         """
 
         current_data_version = self._runtime_trigger_data_version()
@@ -2019,22 +2093,17 @@ class BinaryFactStore:
             has_annotations = False
             hierarchy_types: set[str] = set()
             for raw in self.connection.execute(
-                "SELECT fact_zlib FROM classes"
+                "SELECT has_runtime_annotations,super_name,interfaces_json "
+                "FROM classes"
             ):
-                fact = json.loads(
-                    zlib.decompress(raw[0]).decode("utf-8")
-                )
-                (
-                    fact_has_annotations,
-                    fact_hierarchy_types,
-                    _fact_has_main_method,
-                ) = self._runtime_trigger_fact_components(
-                    fact,
-                    include_main_method=False,
-                )
-                hierarchy_types.update(fact_hierarchy_types)
-                has_annotations = (
-                    has_annotations or fact_has_annotations
+                has_annotations = has_annotations or bool(raw[0])
+                hierarchy_types.update(
+                    str(value)
+                    for value in (
+                        raw[1],
+                        *(json.loads(raw[2]) if raw[2] != "[]" else ()),
+                    )
+                    if value
                 )
             has_main_method = self.connection.execute(
                 """
@@ -2106,6 +2175,7 @@ class BinaryFactStore:
 
 
 __all__ = [
-    "BinaryFactStore", "BinaryFactStoreError", "SCHEMA_VERSION",
+    "BinaryFactStore", "BinaryFactStoreError",
+    "SCHEMA_VERSION",
     "RECONCILIATION_KIND_CODES",
 ]

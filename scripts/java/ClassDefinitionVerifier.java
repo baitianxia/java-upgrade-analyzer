@@ -1,13 +1,13 @@
 /* Target-JVM class-definition verifier. Never initializes analyzed classes. */
 import java.io.*;
-import java.net.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.security.MessageDigest;
 import java.util.*;
-import java.util.Base64;
 
 public final class ClassDefinitionVerifier {
+    private static final byte[] BUNDLE_MAGIC = new byte[]{'J','U','A','C','L','S','B','2'};
+    private static final int MAX_CLASS_NAME_BYTES = 1024 * 1024;
     private static Map<String,Object> map(Object... values) {
         LinkedHashMap<String,Object> result = new LinkedHashMap<>();
         for (int i=0;i<values.length;i+=2) result.put((String)values[i], values[i+1]);
@@ -19,57 +19,32 @@ public final class ClassDefinitionVerifier {
         return result.toString();
     }
     private static String sha(byte[] bytes) throws Exception { return hex(MessageDigest.getInstance("SHA-256").digest(bytes)); }
-    private static byte[] frame(DataInputStream in) throws Exception {
-        int length;
-        try { length=in.readInt(); } catch (EOFException eof) { return null; }
-        if (length<2 || length>4*1024*1024) throw new IOException("invalid frame length");
-        byte[] payload=new byte[length]; in.readFully(payload); return payload;
-    }
-    private static String field(String json,String key) throws Exception {
-        String marker="\""+key+"\":\""; int start=json.indexOf(marker);
-        if(start<0) throw new IOException("missing "+key); start+=marker.length(); int end=json.indexOf('"',start);
-        if(end<0) throw new IOException("unterminated "+key); return json.substring(start,end);
-    }
     private static void write(DataOutputStream out,Map<String,Object> value) throws Exception {
         byte[] payload=Json.stringify(value).getBytes(StandardCharsets.UTF_8);
         out.writeInt(payload.length); out.write(payload); out.flush();
     }
     public static void main(String[] args) {
-        if(args.length!=1){System.err.println("usage: ClassDefinitionVerifier <class-root>");System.exit(64);}
+        if(args.length!=1){System.err.println("usage: ClassDefinitionVerifier <class-bundle>");System.exit(64);}
         try{run(Paths.get(args[0]));}catch(Throwable error){error.printStackTrace(System.err);System.exit(2);}
     }
-    private static void run(Path root) throws Exception {
-        root=root.toRealPath();
-        DataInputStream in=new DataInputStream(new BufferedInputStream(System.in));
+    private static void run(Path bundlePath) throws Exception {
+        bundlePath=bundlePath.toRealPath();
+        if(!Files.isRegularFile(bundlePath))throw new IOException("class bundle is not a regular file");
         DataOutputStream out=new DataOutputStream(new BufferedOutputStream(System.out));
-        byte[] headerBytes=frame(in); if(headerBytes==null)throw new IOException("header missing");
-        String header=new String(headerBytes,StandardCharsets.UTF_8);
-        if(!"definition_input_header".equals(field(header,"frame_type")))throw new IOException("bad header");
-        int expected=Integer.parseInt(field(header,"class_count"));
-        List<String> names=new ArrayList<>();
-        while(true){
-            byte[] bytes=frame(in); if(bytes==null)throw new IOException("footer missing");
-            String json=new String(bytes,StandardCharsets.UTF_8); String type=field(json,"frame_type");
-            if("definition_input_footer".equals(type))break;
-            if(!"class_name".equals(type))throw new IOException("bad frame type");
-            String name=new String(Base64.getDecoder().decode(field(json,"class_name_b64")),StandardCharsets.UTF_8);
-            if(!name.matches("(?:[A-Za-z_$][A-Za-z0-9_$]*|package-info|module-info)(?:/(?:[A-Za-z_$][A-Za-z0-9_$]*|package-info|module-info))*"))throw new IOException("unsafe class name");
-            names.add(name);
-        }
-        if(names.size()!=expected || frame(in)!=null)throw new IOException("input count/trailing bytes");
-        write(out,map("frame_type","definition_output_header","schema","target-jvm-definition-v1","class_count",names.size()));
-        int ready=0,failed=0;
-        ClassLoader parent=ClassLoader.getSystemClassLoader().getParent();
-        try(URLClassLoader loader=new URLClassLoader(new URL[]{root.toUri().toURL()},parent)){
+        try(ClassBundle bundle=new ClassBundle(bundlePath)){
+            List<String> names=bundle.names();
+            write(out,map("frame_type","definition_output_header","schema","target-jvm-definition-v2","class_count",names.size()));
+            int ready=0,failed=0;
+            ClassLoader parent=ClassLoader.getSystemClassLoader().getParent();
+            BundleClassLoader loader=new BundleClassLoader(bundle,parent);
             for(String internal:names){
-                Path path=root.resolve(internal+".class").normalize();
-                if(!path.startsWith(root))throw new IOException("class path escaped root");
-                byte[] bytes=Files.readAllBytes(path);
+                byte[] bytes=bundle.read(internal);
+                loader.prime(internal,bytes);
                 boolean classLoaded=false;
                 try{
                     Class<?> type=Class.forName(internal.replace('/','.'),false,loader);
                     classLoaded=true;
-                    // Resolve the class's own executable/field descriptors.  Do
+                    // Resolve the class's own executable/field descriptors. Do
                     // not enumerate InnerClasses: a loadable outer class may
                     // legitimately advertise optional nested implementations
                     // whose dependencies are absent until that feature is used.
@@ -79,10 +54,67 @@ public final class ClassDefinitionVerifier {
                 }catch(Throwable error){
                     write(out,map("frame_type","class_definition","class_name",internal,"class_bytes_sha256",sha(bytes),"status","verification_failed","failure_phase",classLoaded?"member_linkage":"class_load","failure_kind",error.getClass().getName(),"failure_message",String.valueOf(error.getMessage())));
                     failed++;
+                }finally{
+                    loader.clearPrime(internal);
                 }
             }
+            write(out,map("frame_type","definition_output_footer","class_count",names.size(),"definition_ready_count",ready,"failure_count",failed));
         }
-        write(out,map("frame_type","definition_output_footer","class_count",names.size(),"definition_ready_count",ready,"failure_count",failed));
+    }
+    private static final class BundleEntry {
+        final long offset; final int length;
+        BundleEntry(long offset,int length){this.offset=offset;this.length=length;}
+    }
+    private static final class ClassBundle implements Closeable {
+        private final RandomAccessFile file;
+        private final LinkedHashMap<String,BundleEntry> entries=new LinkedHashMap<>();
+        ClassBundle(Path path) throws Exception {
+            file=new RandomAccessFile(path.toFile(),"r");
+            try{
+                byte[] magic=new byte[BUNDLE_MAGIC.length]; file.readFully(magic);
+                if(!Arrays.equals(magic,BUNDLE_MAGIC))throw new IOException("invalid class bundle magic");
+                long unsignedCount=Integer.toUnsignedLong(file.readInt());
+                if(unsignedCount>Integer.MAX_VALUE)throw new IOException("invalid class bundle count");
+                int count=(int)unsignedCount; String previous=null;
+                for(int index=0;index<count;index++){
+                    long unsignedNameLength=Integer.toUnsignedLong(file.readInt());
+                    long unsignedClassLength=Integer.toUnsignedLong(file.readInt());
+                    if(unsignedNameLength<1||unsignedNameLength>MAX_CLASS_NAME_BYTES||unsignedClassLength<1||unsignedClassLength>Integer.MAX_VALUE)throw new IOException("invalid class bundle record length");
+                    byte[] nameBytes=new byte[(int)unsignedNameLength]; file.readFully(nameBytes);
+                    String name=new String(nameBytes,StandardCharsets.UTF_8);
+                    if(!Arrays.equals(nameBytes,name.getBytes(StandardCharsets.UTF_8)))throw new IOException("invalid UTF-8 class name");
+                    if(!name.matches("(?:[A-Za-z_$][A-Za-z0-9_$]*|package-info|module-info)(?:/(?:[A-Za-z_$][A-Za-z0-9_$]*|package-info|module-info))*"))throw new IOException("unsafe class name");
+                    if(previous!=null&&previous.compareTo(name)>=0)throw new IOException("class bundle names are not strictly sorted");
+                    long offset=file.getFilePointer(); long end=offset+unsignedClassLength;
+                    if(end<offset||end>file.length())throw new IOException("class bundle record exceeds file");
+                    entries.put(name,new BundleEntry(offset,(int)unsignedClassLength));
+                    file.seek(end); previous=name;
+                }
+                if(file.getFilePointer()!=file.length())throw new IOException("trailing class bundle bytes");
+            }catch(Throwable error){file.close();throw error;}
+        }
+        List<String> names(){return new ArrayList<>(entries.keySet());}
+        synchronized byte[] read(String name) throws IOException {
+            BundleEntry entry=entries.get(name); if(entry==null)throw new FileNotFoundException(name);
+            byte[] bytes=new byte[entry.length]; file.seek(entry.offset); file.readFully(bytes); return bytes;
+        }
+        public void close() throws IOException {file.close();}
+    }
+    private static final class BundleClassLoader extends ClassLoader {
+        private final ClassBundle bundle;
+        private String primedName;
+        private byte[] primedBytes;
+        BundleClassLoader(ClassBundle bundle,ClassLoader parent){super(parent);this.bundle=bundle;}
+        void prime(String name,byte[] bytes){primedName=name;primedBytes=bytes;}
+        void clearPrime(String name){if(name.equals(primedName)){primedName=null;primedBytes=null;}}
+        protected Class<?> findClass(String binaryName) throws ClassNotFoundException {
+            String internal=binaryName.replace('.','/');
+            try{
+                byte[] bytes=internal.equals(primedName)?primedBytes:bundle.read(internal);
+                if(bytes==null)throw new FileNotFoundException(internal);
+                return defineClass(binaryName,bytes,0,bytes.length);
+            }catch(IOException error){throw new ClassNotFoundException(binaryName,error);}
+        }
     }
     private static final class Json {
         static String stringify(Object value){StringBuilder out=new StringBuilder();append(out,value);return out.toString();}

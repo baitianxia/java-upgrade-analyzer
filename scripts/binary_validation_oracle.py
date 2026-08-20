@@ -5573,6 +5573,24 @@ def _validate_direct_edges(
                 for future in completed:
                     active.pop(future)
                     scan_key, result = future.result()
+                    # Refill the just-freed worker slot before normalizing and
+                    # compressing this result. Projection encoding is CPU and
+                    # disk work; starting the next independent javap process
+                    # first overlaps both without exceeding the existing JVM
+                    # or memory-worker bound. At most the one result already
+                    # owned by this completed Future is retained here.
+                    if (
+                        phase_deadline is None
+                        or time.perf_counter() < phase_deadline
+                    ):
+                        try:
+                            request = next(requests)
+                        except StopIteration:
+                            request = None
+                        if request is not None:
+                            active[executor.submit(
+                                scan_request, request
+                            )] = request[0]
                     available_scan_keys.add(scan_key)
                     if spooled_scan_results:
                         scan_cache.put_evidence(
@@ -5595,16 +5613,6 @@ def _validate_direct_edges(
                         str(scan_requests.get(scan_key) or ""),
                     )
                     del result
-                    if (
-                        phase_deadline is not None
-                        and time.perf_counter() >= phase_deadline
-                    ):
-                        continue
-                    try:
-                        request = next(requests)
-                    except StopIteration:
-                        continue
-                    active[executor.submit(scan_request, request)] = request[0]
     for scan_key in scan_requests:
         if scan_key in available_scan_keys:
             continue
@@ -6214,8 +6222,8 @@ def _validate_runtime_outcomes(
             ))
 
     dispatch_count = 0
-    with tempfile.TemporaryDirectory(
-        prefix="binary-validation-dispatch-"
+    with short_temporary_directory(
+        prefix="binary-validation-dispatch"
     ) as dispatch_temp:
         seen_connection = sqlite3.connect(
             Path(dispatch_temp) / "seen.sqlite", uri=True
@@ -8760,6 +8768,31 @@ def _validate_closed_world_results(
     entrypoint_truth: Mapping[str, Any] | None = None,
     progress_callback: ValidationProgressCallback | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Validate closed-world outputs in one bounded short-path workspace."""
+
+    # The on-disk graph can contain millions of keys and expands its path with
+    # SQLite sidecars. Keep its complete lifetime inside the shared short-path
+    # runtime so Windows never falls back to an unbounded user temp path.
+    with short_temporary_directory(
+        prefix="binary-validation-graph"
+    ) as graph_temporary:
+        return _validate_closed_world_results_in_workspace(
+            generation,
+            graph_directory=Path(graph_temporary),
+            entrypoint_validation_issues=entrypoint_validation_issues,
+            entrypoint_truth=entrypoint_truth,
+            progress_callback=progress_callback,
+        )
+
+
+def _validate_closed_world_results_in_workspace(
+    generation: Path,
+    *,
+    graph_directory: Path,
+    entrypoint_validation_issues: Iterable[Mapping[str, Any]] = (),
+    entrypoint_truth: Mapping[str, Any] | None = None,
+    progress_callback: ValidationProgressCallback | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Rebuild formal reachability from already independently validated facts.
 
     Direct/reconciliation records are admitted here only after their preceding
@@ -8902,7 +8935,6 @@ def _validate_closed_world_results(
         entrypoint_truth,
     )
     graph_index: _ClosedWorldGraphIndex | None = None
-    graph_temporary: tempfile.TemporaryDirectory | None = None
     legacy_transitions: Mapping[
         str, Iterable[tuple[str, str, str]]
     ] = {}
@@ -8916,21 +8948,13 @@ def _validate_closed_world_results(
             paired_missing, unresolved_aliases = (
                 _closed_world_decision_aliases(generation)
             )
-            graph_temporary = tempfile.TemporaryDirectory(
-                prefix="binary-validation-graph-"
+            graph_index = _ClosedWorldGraphIndex(
+                generation,
+                graph_directory / "closed-world-index.sqlite",
+                paired_artifact_missing_targets=paired_missing,
+                unresolved_edge_alias_targets=unresolved_aliases,
+                progress_callback=progress_callback,
             )
-            try:
-                graph_index = _ClosedWorldGraphIndex(
-                    generation,
-                    Path(graph_temporary.name) / "closed-world-index.sqlite",
-                    paired_artifact_missing_targets=paired_missing,
-                    unresolved_edge_alias_targets=unresolved_aliases,
-                    progress_callback=progress_callback,
-                )
-            except BaseException:
-                graph_temporary.cleanup()
-                graph_temporary = None
-                raise
         else:
             semantic_payload = _load_json(
                 generation / "binary_runtime_semantic_overlay.json"
@@ -9467,8 +9491,6 @@ def _validate_closed_world_results(
     }
     if graph_index is not None:
         graph_index.close()
-    if graph_temporary is not None:
-        graph_temporary.cleanup()
     return issues, closed_world_truth
 
 

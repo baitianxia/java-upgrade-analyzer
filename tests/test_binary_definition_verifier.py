@@ -1,6 +1,8 @@
 import gc
+import hashlib
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -133,6 +135,35 @@ class BinaryDefinitionVerifierTest(unittest.TestCase):
                 self.assertEqual(raised.exception.reason_code, expected_reason)
                 self.assertEqual(list(Path(tmp).iterdir()), [])
 
+    def test_class_bundle_is_single_file_with_exact_sorted_bytes_and_hashes(self):
+        payloads = {
+            "alpha/A": b"first-class-bytes",
+            "beta/B": b"second-class-bytes",
+        }
+        names = sorted(payloads)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bundle = root / "classes.bundle"
+            hashes = verifier._write_class_bundle(bundle, names, payloads)
+            expected = bytearray(verifier._BUNDLE_MAGIC)
+            expected.extend(struct.pack(">I", len(names)))
+            for name in names:
+                name_bytes = name.encode("utf-8")
+                content = payloads[name]
+                expected.extend(struct.pack(">II", len(name_bytes), len(content)))
+                expected.extend(name_bytes)
+                expected.extend(content)
+
+            self.assertEqual(bundle.read_bytes(), bytes(expected))
+            self.assertEqual(list(root.iterdir()), [bundle])
+            self.assertEqual(
+                hashes,
+                {
+                    name: hashlib.sha256(payloads[name]).hexdigest()
+                    for name in names
+                },
+            )
+
     @unittest.skipUnless(hasattr(os, "fork"), "fork is unavailable")
     def test_forked_child_cache_clear_does_not_remove_parent_helper(self):
         verifier._compile_helper.cache_clear()
@@ -259,6 +290,46 @@ class BinaryDefinitionVerifierTest(unittest.TestCase):
         self.assertEqual(
             outcomes["demo/UsesMissing"]["failure_phase"], "member_linkage"
         )
+
+    def test_bundle_loader_resolves_selected_class_dependencies_exactly(self):
+        home = jdk_home()
+        if not home or not shutil.which("javac"):
+            self.skipTest("full JDK required")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "src" / "demo" / "Child.java"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                "package demo; public class Child extends Parent { "
+                "public Parent value() { return this; } } "
+                "class Parent {}\n",
+                encoding="utf-8",
+            )
+            classes = root / "classes"
+            classes.mkdir()
+            completed = subprocess.run(
+                ["javac", "-d", str(classes), str(source)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            payloads = {
+                name: (classes / f"demo/{name}.class").read_bytes()
+                for name in ("Child", "Parent")
+            }
+            selected = {f"demo/{name}": value for name, value in payloads.items()}
+            outcomes = verify_class_definitions(
+                JdkPlatformImage(home, asm_jar=resolve_asm_jar()), selected
+            )
+
+        self.assertEqual(set(outcomes), set(selected))
+        for name, content in selected.items():
+            self.assertEqual(outcomes[name]["status"], "definition_ready")
+            self.assertEqual(
+                outcomes[name]["class_bytes_sha256"],
+                hashlib.sha256(content).hexdigest(),
+            )
 
 
 if __name__ == "__main__":

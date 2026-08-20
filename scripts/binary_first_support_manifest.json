@@ -249,7 +249,7 @@
   },
   "oracle_support_manifest": {
     "status": "implemented_independent_validation_v3",
-    "final_artifact_edge_oracle_procedure_version": "java-upgrade-analyzer.final-artifact-javap.v16",
+    "final_artifact_edge_oracle_procedure_version": "java-upgrade-analyzer.final-artifact-javap.v17",
     "production_binary_authority_switch_allowed": true,
     "production_identity_influence": "none_validation_attachment_only",
     "independent_layers": [
@@ -294,8 +294,8 @@
   "performance_gate": {
     "status": "passed",
     "path": "tests/fixtures/binary_first/performance_gate.json",
-    "sha256": "bdfdb7ab76d09274c3ea68323f1fbab2bfe0bd6e8d5eff8428ff404cab8989b4",
-    "source_implementation_identity": "c3abc9d48304f783e9874646afcd3a30160314b73136172ab981bb2130f6bc1d",
+    "sha256": "fb8960ad7122031b3e5befd173cf22ae211fda6de938783e2f995851ade9e2fe",
+    "source_implementation_identity": "62b0b4a1fccd1856a5401655a42215abfebb9afefa029ee96f15aef096085252",
     "dataset": "400 JAR / 100000 class store + identical and one-JAR-changed full 400 JAR / 100000 class pipelines",
     "warm_parser_invocations": 0,
     "blocks_binary_authority_switch": false

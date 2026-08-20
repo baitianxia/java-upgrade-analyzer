@@ -45,7 +45,7 @@ _CANONICAL_JSON_ENCODER = json.JSONEncoder(
     allow_nan=False,
 )
 _STREAMING_DIGEST_BUFFER_CHARS = 64 * 1024
-_JVM_TEXT_TRANSPORT_PREFIX = "~jua-utf16-v1~"
+JVM_TEXT_TRANSPORT_PREFIX = "~jua-utf16-v1~"
 
 
 class BinaryFirstContractError(ValueError):
@@ -114,8 +114,26 @@ def _encode_basestring_surrogate_safe(value: str) -> str:
     return _surrogate_safe_text(encode_basestring(value))
 
 
+def canonical_json_string(value: str) -> str:
+    """Encode one string with the frozen compact canonical-JSON spelling.
+
+    Hot identity builders that already own a canonical JSON subtree can use
+    this scalar primitive to assemble the enclosing object without decoding
+    and re-encoding that subtree.  Keeping the surrogate-safe implementation
+    here prevents those optimized builders from drifting from the general
+    canonical identity contract.
+    """
+
+    if type(value) is not str:
+        raise BinaryFirstContractError(
+            "BINARY_IDENTITY_STRING_INVALID",
+            "canonical JSON string values must be native strings",
+        )
+    return _encode_basestring_surrogate_safe(value)
+
+
 def _jvm_text_requires_transport(value: str) -> bool:
-    if value.startswith(_JVM_TEXT_TRANSPORT_PREFIX):
+    if value.startswith(JVM_TEXT_TRANSPORT_PREFIX):
         return True
     try:
         value.encode("utf-8")
@@ -137,15 +155,15 @@ def transport_jvm_text(value: str) -> str:
     encoded = base64.urlsafe_b64encode(
         value.encode("utf-16-be", errors="surrogatepass")
     ).decode("ascii")
-    return _JVM_TEXT_TRANSPORT_PREFIX + encoded
+    return JVM_TEXT_TRANSPORT_PREFIX + encoded
 
 
 def restore_jvm_text(value: str) -> str:
     """Reverse :func:`transport_jvm_text` for JVM protocol boundaries."""
 
-    if not value.startswith(_JVM_TEXT_TRANSPORT_PREFIX):
+    if not value.startswith(JVM_TEXT_TRANSPORT_PREFIX):
         return value
-    payload = value[len(_JVM_TEXT_TRANSPORT_PREFIX):]
+    payload = value[len(JVM_TEXT_TRANSPORT_PREFIX):]
     try:
         raw = base64.b64decode(
             payload.encode("ascii"), altchars=b"-_", validate=True
@@ -937,10 +955,12 @@ __all__ = [
     "FORMAL_IMPACT_CONCLUSIONS",
     "FORMAL_REACHABILITY_STATUSES",
     "FORMAL_RUNTIME_VERIFICATION_STATUSES",
+    "JVM_TEXT_TRANSPORT_PREFIX",
     "PHASE_ORDER",
     "analysis_context_identity",
     "artifact_content_identity",
     "canonical_identity",
+    "canonical_json_string",
     "canonical_payload_bytes",
     "derive_formal_result_state",
     "derive_path_set_complete",

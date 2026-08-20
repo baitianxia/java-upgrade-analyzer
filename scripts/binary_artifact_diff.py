@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 import fnmatch
 import hashlib
 import json
@@ -1087,7 +1087,7 @@ def _snapshot_private_archive(
         "artifact_instance_identity": artifact_instance_identity,
         "artifact_content_sha256": artifact_content_sha256,
         "archive_comment_sha256": archive_comment_sha,
-        "entries": [asdict(item) for item in entries],
+        "entries": [dict(vars(item)) for item in entries],
         "parser_identity": asm_run.parser_identity,
         "class_input_digest": asm_run.class_input_digest,
         "fact_output_digest": asm_run.fact_output_digest,
@@ -1491,8 +1491,8 @@ def compare_artifact_snapshots(
 
     payload_sequence_base = [(item.name, item.name_ordinal, item.content_sha256) for item in base.entries]
     payload_sequence_current = [(item.name, item.name_ordinal, item.content_sha256) for item in current.entries]
-    full_container_base = [asdict(item) for item in base.entries]
-    full_container_current = [asdict(item) for item in current.entries]
+    full_container_base = [dict(vars(item)) for item in base.entries]
+    full_container_current = [dict(vars(item)) for item in current.entries]
     if base.artifact_content_sha256 == current.artifact_content_sha256:
         container_status = "identical"
     elif payload_sequence_base == payload_sequence_current:

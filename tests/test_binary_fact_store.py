@@ -20,8 +20,16 @@ sys.path.insert(0, str(ROOT_DIR / "scripts"))
 import binary_asm_helper  # noqa: E402
 import binary_artifact_diff  # noqa: E402
 import binary_validation_oracle  # noqa: E402
-from binary_fact_store import BinaryFactStore, BinaryFactStoreError  # noqa: E402
-from binary_first_contract import restore_jvm_text, transport_jvm_text  # noqa: E402
+from binary_fact_store import (  # noqa: E402
+    BinaryFactStore,
+    BinaryFactStoreError,
+    _json_and_transport_jvm_value,
+)
+from binary_first_contract import (  # noqa: E402
+    canonical_identity_native_json,
+    restore_jvm_text,
+    transport_jvm_text,
+)
 from binary_first_model import ArtifactInstance  # noqa: E402
 
 
@@ -173,6 +181,79 @@ class BinaryFactStoreTest(unittest.TestCase):
         self.assertIn(transported, {row["member_name"] for row in members})
         self.assertEqual(restore_jvm_text(transported), raw_member)
 
+    def test_fact_json_fast_path_preserves_ordinary_and_transport_text(self):
+        ordinary = {"nested": ["运行时😀", 7, None], "flag": True}
+        record, encoded = _json_and_transport_jvm_value(ordinary)
+        self.assertIs(record, ordinary)
+        self.assertEqual(
+            encoded,
+            json.dumps(
+                ordinary,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ),
+        )
+
+        for raw in (json.loads('"\\ud800"'), "~jua-utf16-v1~literal"):
+            with self.subTest(raw=repr(raw)):
+                source = {"value": raw}
+                transported_record, transported_json = (
+                    _json_and_transport_jvm_value(source)
+                )
+                stored = json.loads(transported_json)["value"]
+                self.assertIsNot(transported_record, source)
+                self.assertEqual(stored, transport_jvm_text(raw))
+                self.assertEqual(restore_jvm_text(stored), raw)
+
+    def test_direct_edge_fast_identity_is_exact_for_canonical_payloads(self):
+        from binary_fact_store import _direct_edge_identity_from_json
+
+        transported_surrogate = transport_jvm_text(json.loads('"\\ud800"'))
+        payloads = (
+            {},
+            {"opcode": "invokevirtual", "interface": False},
+            {
+                "bootstrap": [None, True, -1, "运行时😀"],
+                "transported": transported_surrogate,
+            },
+        )
+        for payload in payloads:
+            values = {
+                "caller_member_identity": "a" * 64,
+                "bytecode_offset": 37,
+                "instruction_index": 11,
+                "edge_kind": "invoke/运行时",
+                "symbolic_owner": "fixture.运行时",
+                "symbolic_name": transported_surrogate,
+                "symbolic_descriptor": "(Ljava/lang/String;)V",
+                "edge_payload": payload,
+            }
+            with self.subTest(payload=payload):
+                self.assertEqual(
+                    _direct_edge_identity_from_json(
+                        values["caller_member_identity"],
+                        values["bytecode_offset"],
+                        values["instruction_index"],
+                        values["edge_kind"],
+                        values["symbolic_owner"],
+                        values["symbolic_name"],
+                        values["symbolic_descriptor"],
+                        json.dumps(
+                            payload,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            allow_nan=False,
+                        ),
+                    ),
+                    canonical_identity_native_json(
+                        "binary_direct_edge_identity", values,
+                        schema_version="1",
+                    ),
+                )
+
     def test_constructor_failure_closes_partially_initialized_connection(self):
         connections = []
         real_connect = sqlite3.connect
@@ -235,7 +316,7 @@ class BinaryFactStoreTest(unittest.TestCase):
             )[0]["value"]
 
         by_name = {row["resource_name"]: row for row in resources}
-        self.assertEqual(schema, "binary-fact-sqlite-v7")
+        self.assertEqual(schema, "binary-fact-sqlite-v8")
         self.assertEqual(counts["resources"], 3)
         self.assertEqual(
             by_name["config/runtime.xml"]["content_sha256"],
@@ -328,7 +409,7 @@ class BinaryFactStoreTest(unittest.TestCase):
                 "metadata", where="key='schema_version'"
             )[0]["value"]
 
-        self.assertEqual(version, "binary-fact-sqlite-v7")
+        self.assertEqual(version, "binary-fact-sqlite-v8")
         self.assertEqual(after, before)
 
     def test_custom_invokedynamic_bootstrap_tag_validates_from_nested_payload(self):
@@ -1201,7 +1282,7 @@ class BinaryFactStoreTest(unittest.TestCase):
             stored_header = dict(store.connection.execute(
                 """
                 SELECT class_access,super_name,interfaces_json,
-                       nest_host,nest_members_json
+                       nest_host,nest_members_json,has_runtime_annotations
                 FROM classes
                 """
             ).fetchone())
@@ -1237,6 +1318,18 @@ class BinaryFactStoreTest(unittest.TestCase):
         self.assertEqual(
             json.loads(stored_header["nest_members_json"]),
             fact.get("nest_members") or [],
+        )
+        self.assertEqual(
+            bool(stored_header["has_runtime_annotations"]),
+            bool(fact.get("annotations"))
+            or any(
+                (field or {}).get("annotations")
+                for field in fact.get("fields") or ()
+            )
+            or any(
+                ((method or {}).get("contract") or {}).get("annotations")
+                for method in fact.get("methods") or ()
+            ),
         )
         self.assertLess(stored_lengths[0], len(self.class_bytes))
         self.assertLess(stored_lengths[1], len(row["fact_json"].encode("utf-8")))
@@ -1304,7 +1397,10 @@ class BinaryFactStoreTest(unittest.TestCase):
             ):
                 incremental_summary = store.runtime_trigger_summary()
 
-        with BinaryFactStore(database) as reopened:
+        with BinaryFactStore(database) as reopened, patch(
+            "binary_fact_store.zlib.decompress",
+            side_effect=AssertionError("reopened summary decompressed facts"),
+        ):
             reopened_summary = reopened.runtime_trigger_summary()
 
         self.assertEqual(reopened_summary, incremental_summary)

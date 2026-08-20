@@ -51,8 +51,8 @@ Pages wired down:                         500.
             "sysconf",
             side_effect=ValueError("not available"),
         ), patch.object(
-            process_metrics.subprocess,
-            "run",
+            process_metrics,
+            "run_managed_subprocess",
             return_value=SimpleNamespace(returncode=0, stdout=output),
         ) as run:
             available = process_metrics.system_available_memory_bytes(
@@ -76,8 +76,8 @@ Pages wired down:                         500.
             "sysconf",
             side_effect=ValueError("not available"),
         ), patch.object(
-            process_metrics.subprocess,
-            "run",
+            process_metrics,
+            "run_managed_subprocess",
             return_value=SimpleNamespace(returncode=0, stdout="unknown"),
         ):
             self.assertIsNone(

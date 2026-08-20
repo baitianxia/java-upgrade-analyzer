@@ -530,6 +530,8 @@ class _ReconciliationAccumulator:
 
 
 class RuntimeReconciler:
+    DIRECT_EDGE_SCAN_ORDER = "rowid"
+
     def __init__(
         self,
         store: BinaryFactStore,
@@ -2023,14 +2025,27 @@ class RuntimeReconciler:
             and self.profile.payload.get("runtime_class_closure_coverage_status") == "complete"
             and not self.coverage_gaps
         )
+        edge_scan_order = self.DIRECT_EDGE_SCAN_ORDER
+        if edge_scan_order not in {"rowid", "direct_edge_identity"}:
+            raise RuntimeReconciliationError(
+                "RUNTIME_DIRECT_EDGE_SCAN_ORDER_INVALID", edge_scan_order
+            )
+        # ``direct_edge_identity`` is a uniformly distributed SHA-256 value.
+        # Ordering a multi-gigabyte rowid table by that secondary index makes
+        # SQLite perform one effectively random table lookup per edge. The
+        # insertion rowid is deterministic and lets SQLite stream the complete
+        # table sequentially; every edge still produces the same resolution
+        # records. Only their sequence, private chunk grouping and aggregate
+        # result identity change; downstream conclusions index the records by
+        # their unchanged subject/record identities.
         for raw_edge in self.store.connection.execute(
-            """
+            f"""
             SELECT direct_edge_identity,caller_member_identity,
                    caller_artifact_instance_identity,instruction_index,
                    bytecode_offset,edge_kind,opcode,
                    symbolic_owner,symbolic_name,symbolic_descriptor,edge_json
             FROM direct_edges
-            ORDER BY direct_edge_identity
+            ORDER BY {edge_scan_order}
             """
         ):
             # sqlite3.Row already provides stable name-based access. Copying

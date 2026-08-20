@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import base64
 from functools import lru_cache
 import hashlib
 import io
@@ -11,11 +10,11 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import shutil
-import subprocess
+import struct
 import weakref
 from typing import Any, Mapping
 
-from binary_asm_helper import _canonical_json, _read_frame, _write_frame
+from binary_asm_helper import _read_frame
 from binary_first_contract import BinaryFirstContractError, canonical_identity
 from binary_platform_image import JdkPlatformImage
 from binary_tool_execution import execute_binary_tool
@@ -24,7 +23,10 @@ from path_runtime import make_short_temp_dir, short_temporary_directory
 
 
 JAVA_HELPER = Path(__file__).resolve().parent / "java" / "ClassDefinitionVerifier.java"
-SCHEMA = "target-jvm-definition-v1"
+SCHEMA = "target-jvm-definition-v2"
+_BUNDLE_MAGIC = b"JUACLSB2"
+_MAX_BUNDLE_CLASS_NAME_BYTES = 1024 * 1024
+_MAX_BUNDLE_CLASS_BYTES = 0x7FFF_FFFF
 
 
 class ClassDefinitionVerifierError(BinaryFirstContractError):
@@ -130,6 +132,62 @@ def verifier_identity(platform: JdkPlatformImage) -> str:
     )
 
 
+def _write_class_bundle(
+    path: Path,
+    names: list[str],
+    selected_class_bytes: Mapping[str, bytes],
+) -> dict[str, str]:
+    """Write one bounded random-access class bundle for the target JVM.
+
+    A single bundle preserves the exact selected class bytes while avoiding a
+    directory entry and later recursive deletion for every class.  The Java
+    verifier independently validates the magic, count, sorted unique names,
+    record bounds, and absence of trailing bytes before defining any class.
+    """
+
+    if len(names) > 0x7FFF_FFFF:
+        raise ClassDefinitionVerifierError(
+            "CLASS_DEFINITION_BUNDLE_COUNT_INVALID",
+            "class bundle count exceeds the verifier limit",
+        )
+    expected_hashes: dict[str, str] = {}
+    with path.open("xb") as handle:
+        handle.write(_BUNDLE_MAGIC)
+        handle.write(struct.pack(">I", len(names)))
+        for name in names:
+            logical_path = PurePosixPath(name)
+            if (
+                logical_path.is_absolute()
+                or ".." in logical_path.parts
+                or not name
+                or "." in name
+            ):
+                raise ClassDefinitionVerifierError(
+                    "CLASS_DEFINITION_NAME_INVALID", name
+                )
+            try:
+                name_bytes = name.encode("utf-8")
+            except UnicodeEncodeError as error:
+                raise ClassDefinitionVerifierError(
+                    "CLASS_DEFINITION_NAME_INVALID", name
+                ) from error
+            content = bytes(selected_class_bytes[name])
+            if (
+                not name_bytes
+                or len(name_bytes) > _MAX_BUNDLE_CLASS_NAME_BYTES
+                or not content
+                or len(content) > _MAX_BUNDLE_CLASS_BYTES
+            ):
+                raise ClassDefinitionVerifierError(
+                    "CLASS_DEFINITION_BUNDLE_RECORD_INVALID", name
+                )
+            expected_hashes[name] = hashlib.sha256(content).hexdigest()
+            handle.write(struct.pack(">II", len(name_bytes), len(content)))
+            handle.write(name_bytes)
+            handle.write(content)
+    return expected_hashes
+
+
 def verify_class_definitions(
     platform: JdkPlatformImage,
     selected_class_bytes: Mapping[str, bytes],
@@ -150,34 +208,10 @@ def verify_class_definitions(
             "CLASS_DEFINITION_INPUT_DUPLICATE", "class names must be unique"
         )
     with short_temporary_directory(prefix="definition-input") as temp_text:
-        root = Path(temp_text)
-        expected_hashes = {}
-        created_parents = set()
-        for name in names:
-            path = PurePosixPath(name)
-            if path.is_absolute() or ".." in path.parts or not name or "." in name:
-                raise ClassDefinitionVerifierError(
-                    "CLASS_DEFINITION_NAME_INVALID", name
-                )
-            destination = root.joinpath(*path.parts).with_suffix(".class")
-            parent = destination.parent
-            if parent not in created_parents:
-                parent.mkdir(parents=True, exist_ok=True)
-                created_parents.add(parent)
-            content = bytes(selected_class_bytes[name])
-            expected_hashes[name] = hashlib.sha256(content).hexdigest()
-            destination.write_bytes(content)
-        protocol = io.BytesIO()
-        _write_frame(protocol, _canonical_json({
-            "frame_type": "definition_input_header",
-            "class_count": str(len(names)),
-        }))
-        for name in names:
-            _write_frame(protocol, _canonical_json({
-                "frame_type": "class_name",
-                "class_name_b64": base64.b64encode(name.encode("utf-8")).decode("ascii"),
-            }))
-        _write_frame(protocol, _canonical_json({"frame_type": "definition_input_footer"}))
+        bundle_path = Path(temp_text) / "classes.bundle"
+        expected_hashes = _write_class_bundle(
+            bundle_path, names, selected_class_bytes
+        )
         java_options = ["-Xverify:all"]
         if platform.platform_image_format == "jdk8-classpath":
             java_options.append(
@@ -189,12 +223,11 @@ def verify_class_definitions(
                 *java_options,
                 "-cp", str(helper_dir),
                 "ClassDefinitionVerifier",
-                str(root),
+                str(bundle_path),
             ],
             stage="binary_definition.verify",
             reason_prefix="CLASS_DEFINITION_VERIFIER",
             timeout_seconds=timeout_seconds,
-            input_data=protocol.getvalue(),
             text=False,
             require_stdout=True,
         )

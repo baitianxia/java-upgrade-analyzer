@@ -287,6 +287,32 @@ class BinaryFirstContractTest(unittest.TestCase):
         )
         self.assertEqual(json.loads(encoded.decode("utf-8")), payload)
 
+    def test_canonical_json_string_matches_frozen_encoder(self):
+        values = (
+            "",
+            "plain",
+            "line\n\"quoted\"\\",
+            "运行时😀",
+            json.loads('"\\ud800"'),
+        )
+        for value in values:
+            with self.subTest(value=repr(value)):
+                self.assertEqual(
+                    contract.canonical_json_string(value),
+                    contract.surrogate_safe_json_dumps(
+                        value,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ),
+                )
+        with self.assertRaisesRegex(
+            contract.BinaryFirstContractError,
+            "canonical JSON string values must be native strings",
+        ):
+            contract.canonical_json_string(1)
+
     def test_jvm_text_transport_is_reversible_and_collision_free(self):
         raw_surrogate = json.loads('"\\ud800"')
         values = (

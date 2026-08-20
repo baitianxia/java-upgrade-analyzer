@@ -599,6 +599,42 @@ class BinaryRuntimeReconcilerTest(unittest.TestCase):
         self.assertEqual(hydrated.identity, compact.identity)
         self.assertEqual(compact_evidence, full_evidence)
 
+    def test_sequential_edge_scan_preserves_every_reconciliation_record(self):
+        with (
+            self.build_store() as sequential_store,
+            self.build_store() as legacy_store,
+        ):
+            sequential = RuntimeReconciler(
+                sequential_store,
+                self.profile,
+                self.platform,
+                analysis_context_identity="analysis-context-edge-order",
+            ).reconcile()
+            with patch.object(
+                RuntimeReconciler,
+                "DIRECT_EDGE_SCAN_ORDER",
+                "direct_edge_identity",
+            ):
+                legacy = RuntimeReconciler(
+                    legacy_store,
+                    self.profile,
+                    self.platform,
+                    analysis_context_identity="analysis-context-edge-order",
+                ).reconcile()
+            sequential_records = sorted(
+                sequential_store.rows("reconciliation_records"),
+                key=lambda item: item["record_identity"],
+            )
+            legacy_records = sorted(
+                legacy_store.rows("reconciliation_records"),
+                key=lambda item: item["record_identity"],
+            )
+
+        self.assertEqual(sequential_records, legacy_records)
+        self.assertEqual(sequential.universe_identity, legacy.universe_identity)
+        self.assertEqual(sequential.coverage_status, legacy.coverage_status)
+        self.assertEqual(sequential.coverage_gaps, legacy.coverage_gaps)
+
     def test_member_resolution_remains_resolved_when_access_linkage_fails(self):
         current_source = self.root / "current-src" / "demo" / "FinalApi.java"
         current_source.parent.mkdir(parents=True)
