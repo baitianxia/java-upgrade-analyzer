@@ -22,7 +22,7 @@ from binary_first_contract import (
 from binary_first_model import ArtifactInstance
 
 
-SCHEMA_VERSION = "binary-fact-sqlite-v6"
+SCHEMA_VERSION = "binary-fact-sqlite-v7"
 RECONCILIATION_KIND_CODES = {
     "provider_binding": 1,
     "class_definition": 2,
@@ -201,6 +201,11 @@ class BinaryFactStore:
                 class_contract_digest TEXT NOT NULL,
                 parse_status TEXT NOT NULL,
                 failure_kind TEXT NOT NULL,
+                class_access INTEGER,
+                super_name TEXT,
+                interfaces_json TEXT NOT NULL,
+                nest_host TEXT,
+                nest_members_json TEXT NOT NULL,
                 class_bytes_zlib BLOB NOT NULL,
                 fact_zlib BLOB NOT NULL,
                 UNIQUE(artifact_instance_identity, physical_entry_label)
@@ -439,7 +444,7 @@ class BinaryFactStore:
                 def flush_fact_rows() -> None:
                     if class_rows:
                         self.connection.executemany(
-                            "INSERT INTO classes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            "INSERT INTO classes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                             class_rows,
                         )
                     if member_rows:
@@ -524,6 +529,11 @@ class BinaryFactStore:
                             str(record.get("class_contract_digest") or ""),
                             parse_status,
                             str(record.get("failure_kind") or ""),
+                            record.get("class_access"),
+                            record.get("super_name"),
+                            _json(record.get("interfaces") or []),
+                            record.get("nest_host"),
+                            _json(record.get("nest_members") or []),
                             sqlite3.Binary(zlib.compress(class_payload, level=1)),
                             sqlite3.Binary(zlib.compress(
                                 _json(record).encode("utf-8"), level=1
@@ -1299,20 +1309,23 @@ class BinaryFactStore:
     ) -> list[dict[str, Any]]:
         """Expand loadable Class/MethodType bootstrap constants recursively."""
         result: list[dict[str, Any]] = []
-
-        def visit(candidate: Any) -> None:
+        pending = [value]
+        while pending:
+            candidate = pending.pop()
             if isinstance(candidate, (list, tuple)):
-                for nested in candidate:
-                    visit(nested)
-                return
+                # Reverse push preserves the original left-to-right DFS fact
+                # order without allocating a self-recursive closure per
+                # invokedynamic/ConstantDynamic instruction.
+                pending.extend(reversed(candidate))
+                continue
             if not isinstance(candidate, dict):
-                return
+                continue
             constant_kind = str(candidate.get("kind") or "")
             if constant_kind == "method_type":
                 result.extend(BinaryFactStore._method_type_edges(
                     candidate, bci, opcode=opcode
                 ))
-                return
+                continue
             if constant_kind == "type":
                 descriptor = str(candidate.get("descriptor") or "")
                 result.append({
@@ -1329,7 +1342,7 @@ class BinaryFactStore:
                         "type_use_kind": "bootstrap_class_constant",
                     },
                 })
-                return
+                continue
             if constant_kind == "constant_dynamic":
                 result.extend(BinaryFactStore._field_descriptor_type_edges(
                     str(candidate.get("descriptor") or ""),
@@ -1337,9 +1350,7 @@ class BinaryFactStore:
                     type_use_kind="constant_dynamic_descriptor",
                     opcode=opcode,
                 ))
-                visit(candidate.get("arguments") or ())
-
-        visit(value)
+                pending.append(candidate.get("arguments") or ())
         unique: list[dict[str, Any]] = []
         seen: set[tuple[str, str]] = set()
         for edge in result:
@@ -1374,14 +1385,15 @@ class BinaryFactStore:
 
     @staticmethod
     def _collect_handles(value: Any, output: list[dict[str, Any]]) -> None:
-        if isinstance(value, dict):
-            if value.get("kind") == "handle":
-                output.append(value)
-            for nested in value.values():
-                BinaryFactStore._collect_handles(nested, output)
-        elif isinstance(value, list):
-            for nested in value:
-                BinaryFactStore._collect_handles(nested, output)
+        pending = [value]
+        while pending:
+            candidate = pending.pop()
+            if isinstance(candidate, dict):
+                if candidate.get("kind") == "handle":
+                    output.append(candidate)
+                pending.extend(reversed(tuple(candidate.values())))
+            elif isinstance(candidate, list):
+                pending.extend(reversed(candidate))
 
     def add_reconciliation_record(
         self,
@@ -1425,6 +1437,7 @@ class BinaryFactStore:
         record_kind: str,
         records: Iterable[tuple[str, str, Mapping[str, Any]]],
         collect_identities: bool = True,
+        manage_transaction: bool = True,
     ) -> list[str]:
         """Persist one internal record family without redundant envelopes.
 
@@ -1432,10 +1445,18 @@ class BinaryFactStore:
         and kind per bounded chunk.  Keeping those values out of a temporary
         wrapper avoids a payload copy and two short-lived dictionaries for
         every runtime record; the stored envelope and identities remain byte
-        identical to :meth:`add_reconciliation_records`.
+        identical to :meth:`add_reconciliation_records`. Internal bulk writers
+        may disable transaction management only while an enclosing caller owns
+        the SQLite transaction; the public default retains standalone
+        atomicity.
         """
         context = str(analysis_context_identity)
         kind = str(record_kind)
+        if not manage_transaction and not self.connection.in_transaction:
+            raise BinaryFactStoreError(
+                "FACT_STORE_RECONCILIATION_TRANSACTION_MISSING",
+                "bulk reconciliation writes require an enclosing transaction",
+            )
         if kind not in RECONCILIATION_KIND_CODES:
             raise BinaryFactStoreError(
                 "FACT_STORE_RECONCILIATION_KIND_INVALID", kind
@@ -1476,7 +1497,10 @@ class BinaryFactStore:
             serialized = bytearray(b"[")
 
         try:
-            with self.connection:
+            transaction = (
+                self.connection if manage_transaction else nullcontext()
+            )
+            with transaction:
                 existing = self.connection.execute(
                     "SELECT value FROM metadata WHERE key=?",
                     ("reconciliation_analysis_context_identity",),
@@ -1501,14 +1525,21 @@ class BinaryFactStore:
                     payload_json = _json(payload).encode("utf-8")
                     status_json = _json(status).encode("utf-8")
                     subject_json = _json(subject_identity).encode("utf-8")
-                    record_payload = (
-                        b'{"analysis_context_identity":' + context_json
-                        + b',"payload":' + payload_json
-                        + b',"status":' + status_json
-                        + b',"subject_identity":' + subject_json + b"}"
-                    )
                     digest = hashlib.sha256(identity_prefix)
-                    digest.update(record_payload)
+                    # Hash the canonical envelope in-place.  Concatenating it
+                    # first copied every payload through several temporary
+                    # ``bytes`` objects; at multi-million-edge scale that was
+                    # pure memory bandwidth and allocator pressure.  These
+                    # fragments are exactly the former canonical byte stream.
+                    digest.update(b'{"analysis_context_identity":')
+                    digest.update(context_json)
+                    digest.update(b',"payload":')
+                    digest.update(payload_json)
+                    digest.update(b',"status":')
+                    digest.update(status_json)
+                    digest.update(b',"subject_identity":')
+                    digest.update(subject_json)
+                    digest.update(b"}")
                     digest.update(identity_suffix)
                     record_identity = digest.hexdigest()
                     if collect_identities:

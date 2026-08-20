@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
+import errno
 import hashlib
 import io
 import json
@@ -143,7 +144,14 @@ MAX_JAVAP_WORKERS = 8
 # Windows' command-line limit is much smaller than POSIX ARG_MAX. On POSIX,
 # larger batches materially reduce target-JVM startup overhead while remaining
 # far below the platform argument boundary, even for long extracted paths.
-MAX_CLASSES_PER_JAVAP_BATCH = 32 if os.name == "nt" else 256
+# Python launches javap through CreateProcess rather than cmd.exe, so Windows'
+# applicable command-line ceiling is 32,767 UTF-16 code units.  The previous
+# fixed batch of 32 left most of that budget unused and multiplied JVM cold
+# starts across large dependency sets.  Keep explicit headroom for quoting,
+# the executable path and JVM options, and additionally enforce the actual
+# rendered command length for every group below.
+MAX_CLASSES_PER_JAVAP_BATCH = 128 if os.name == "nt" else 256
+MAX_JAVAP_COMMAND_CHARS = 24_000 if os.name == "nt" else 0
 JAVAP_VERSION_TIMEOUT_SECONDS = 5.0
 _IMMUTABLE_ORACLE_CACHE: dict[tuple[str, str, str, str, str], str] = {}
 _JAVAP_VERSION_CACHE: dict[tuple[str, int, int, int], str] = {}
@@ -3078,6 +3086,28 @@ def _parse_entry_group_with_javap(
             errors="replace",
         )
     except OSError as error:
+        if len(entries) > 1 and _command_line_too_long(error):
+            midpoint = len(entries) // 2
+            return [
+                *_parse_entry_group_with_javap(
+                    entries[:midpoint],
+                    artifact_sha256,
+                    javap,
+                    version,
+                    cancellation_event,
+                    deadline,
+                    force_verbose=force_verbose,
+                ),
+                *_parse_entry_group_with_javap(
+                    entries[midpoint:],
+                    artifact_sha256,
+                    javap,
+                    version,
+                    cancellation_event,
+                    deadline,
+                    force_verbose=force_verbose,
+                ),
+            ]
         return [
             {
                 "rows": [],
@@ -3190,6 +3220,51 @@ def _worker_exception_result(entry: PackagedClass, error: BaseException) -> dict
     }
 
 
+def _javap_batch_command_chars(
+    javap: str, entries: list[PackagedClass],
+) -> int:
+    """Return the conservative Windows command-line rendering length."""
+    command = _javap_command(javap, "-v", "-sysinfo", "-c", "-p", "-s")
+    command.extend(str(entry.extracted_path) for entry in entries)
+    return len(subprocess.list2cmdline(command))
+
+
+def _javap_batch_groups(
+    entries: list[PackagedClass],
+    requested_workers: int,
+    javap: str,
+) -> list[list[PackagedClass]]:
+    """Partition javap work by CPU balance and the real command-line budget."""
+    group_size = min(
+        MAX_CLASSES_PER_JAVAP_BATCH,
+        max(1, (len(entries) + requested_workers - 1) // requested_workers),
+    )
+    groups: list[list[PackagedClass]] = []
+    current: list[PackagedClass] = []
+    for entry in entries:
+        candidate = [*current, entry]
+        command_too_long = bool(
+            MAX_JAVAP_COMMAND_CHARS
+            and _javap_batch_command_chars(javap, candidate)
+            > MAX_JAVAP_COMMAND_CHARS
+        )
+        if current and (len(current) >= group_size or command_too_long):
+            groups.append(current)
+            current = [entry]
+        else:
+            current = candidate
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _command_line_too_long(error: OSError) -> bool:
+    return (
+        error.errno == errno.E2BIG
+        or getattr(error, "winerror", None) == 206
+    )
+
+
 def _parse_entry_batch(
     entries: list[PackagedClass],
     artifact_sha256: str,
@@ -3208,14 +3283,10 @@ def _parse_entry_batch(
     )
     requested_workers = min(MAX_JAVAP_WORKERS, max(1, int(requested_workers)))
     if batch_javap:
-        # JVM startup dominates a full-closure scan. Keep argv bounded for
-        # Windows while parsing a group per javap process instead of launching
-        # one target JVM for every class in every dependency JAR.
-        group_size = min(
-            MAX_CLASSES_PER_JAVAP_BATCH,
-            max(1, (len(entries) + requested_workers - 1) // requested_workers),
-        )
-        groups = [entries[index:index + group_size] for index in range(0, len(entries), group_size)]
+        # JVM startup dominates a full-closure scan. Keep argv within the
+        # rendered Windows CreateProcess budget while parsing a group per javap
+        # process instead of launching one target JVM for every class.
+        groups = _javap_batch_groups(entries, requested_workers, javap)
     else:
         groups = [[entry] for entry in entries]
     worker_count = min(len(groups), requested_workers)

@@ -628,9 +628,8 @@ def _validated_class_definition_payload(
     }
 
 
-def _validated_member_resolution_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """Validate a member resolution without choosing its identity encoder."""
-    payload = dict(payload or {})
+def _validate_member_resolution_payload(payload: Mapping[str, Any]) -> None:
+    """Validate a member resolution payload without copying its fact tree."""
     status = str(payload.get("member_resolution_status") or "")
     if status not in MEMBER_RESOLUTION_STATUSES:
         raise BinaryFirstContractError("MEMBER_RESOLUTION_STATUS_INVALID", status)
@@ -649,6 +648,12 @@ def _validated_member_resolution_payload(payload: Mapping[str, Any]) -> dict[str
         raise BinaryFirstContractError(
             "MEMBER_RESOLUTION_TARGET_INVALID", f"{status} cannot select a member"
         )
+
+
+def _validated_member_resolution_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate a member resolution without choosing its identity encoder."""
+    payload = dict(payload or {})
+    _validate_member_resolution_payload(payload)
     return payload
 
 
@@ -717,9 +722,10 @@ def _class_definition_resolution_identity_native(
 
 def _member_resolution_identity_native(payload: Mapping[str, Any]) -> str:
     """Fast internal identity for reconciler-owned native JSON payloads."""
+    _validate_member_resolution_payload(payload)
     return canonical_identity_native_json(
         "member_resolution",
-        _validated_member_resolution_payload(payload),
+        payload,
         schema_version="1",
     )
 

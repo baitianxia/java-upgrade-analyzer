@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 import gc
 import hashlib
 from importlib import metadata
@@ -705,13 +706,19 @@ _GENERATION_NONPRODUCING_LOCAL_IMPORTS = {
 }
 
 
-def _local_python_imports(source: Path) -> set[str]:
+@lru_cache(maxsize=128)
+def _local_python_imports_from_exact_bytes(
+    source_label: str,
+    content: bytes,
+) -> frozenset[str]:
+    """Parse one exact source version once without trusting file metadata."""
+
     try:
-        tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
-    except (OSError, UnicodeError, SyntaxError) as error:
+        tree = ast.parse(content, filename=source_label)
+    except (UnicodeError, SyntaxError) as error:
         raise BinaryPipelineError(
             "BINARY_GENERATION_SOURCE_IMPORT_CLOSURE_INVALID",
-            f"{source}: {error}",
+            f"{source_label}: {error}",
         ) from error
     imported = set()
     for node in ast.walk(tree):
@@ -719,7 +726,21 @@ def _local_python_imports(source: Path) -> set[str]:
             imported.update(alias.name.split(".", 1)[0] for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module:
             imported.add(node.module.split(".", 1)[0])
-    return imported
+    return frozenset(imported)
+
+
+def _local_python_imports(source: Path) -> set[str]:
+    try:
+        content = source.read_bytes()
+    except OSError as error:
+        raise BinaryPipelineError(
+            "BINARY_GENERATION_SOURCE_IMPORT_CLOSURE_INVALID",
+            f"{source}: {error}",
+        ) from error
+    # Exact bytes, not path/mtime, are the cache authority.  A source rewrite
+    # in a long-running process therefore forces a new AST parse, while the
+    # repeated generation/validation identity checks in one run share it.
+    return set(_local_python_imports_from_exact_bytes(str(source), content))
 
 
 def _validate_generation_source_import_closure() -> None:

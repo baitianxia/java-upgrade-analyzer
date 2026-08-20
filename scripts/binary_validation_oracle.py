@@ -18,6 +18,7 @@ import errno
 from functools import lru_cache
 import gc
 import hashlib
+import heapq
 from itertools import chain
 import json
 import os
@@ -2072,7 +2073,11 @@ def _observe_classes(
             "\n".join(item["path"] for item in artifacts) + "\n", encoding="utf-8"
         )
         observations: dict[str, dict[str, Any]] = {}
-        pending = {str(item).replace("/", ".") for item in initial_classes if item}
+        pending = {
+            str(item).replace("/", ".") for item in initial_classes if item
+        }
+        pending_heap = list(pending)
+        heapq.heapify(pending_heap)
         java = jdk_tool_path(jdk_home, "java")
         java_options = ["-Xverify:all"]
         if (jdk_home / "jre" / "lib" / "rt.jar").is_file():
@@ -2207,11 +2212,14 @@ def _observe_classes(
             )
 
         def next_batch() -> tuple[str, ...]:
-            batch = tuple(
-                sorted(pending)[:batch_size]
-            )
-            pending.difference_update(batch)
-            return batch
+            batch = []
+            while pending_heap and len(batch) < batch_size:
+                class_name = heapq.heappop(pending_heap)
+                if class_name not in pending:
+                    continue
+                pending.remove(class_name)
+                batch.append(class_name)
+            return tuple(batch)
 
         def merge_batch_result(round_number, batch, result, active=()):
             candidate_rows, dependencies = result
@@ -2227,6 +2235,7 @@ def _observe_classes(
                 ):
                     requested.add(dependency)
                     pending.add(dependency)
+                    heapq.heappush(pending_heap, dependency)
             in_flight = sum(len(item[1]) for item in active)
             _notify_progress(
                 progress_callback,

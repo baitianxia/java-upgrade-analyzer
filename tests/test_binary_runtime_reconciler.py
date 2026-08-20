@@ -5,6 +5,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
+import weakref
 from pathlib import Path
 import zipfile
 
@@ -14,6 +16,7 @@ sys.path.insert(0, str(ROOT_DIR / "scripts"))
 
 import binary_asm_helper  # noqa: E402
 import binary_artifact_diff  # noqa: E402
+import binary_runtime_reconciler as runtime_reconciler  # noqa: E402
 from binary_fact_store import BinaryFactStore  # noqa: E402
 from binary_first_model import ArtifactInstance, RuntimeProfile  # noqa: E402
 from binary_platform_image import JdkPlatformImage  # noqa: E402
@@ -194,8 +197,81 @@ class BinaryRuntimeReconcilerTest(unittest.TestCase):
         store.add_artifact_snapshot(self.instance, snapshot)
         return store
 
+    def test_edge_payload_cache_is_bounded_and_keeps_fact_validation(self):
+        runtime_reconciler._load_small_edge_json.cache_clear()
+        runtime_reconciler._loading_constraint_type_owners_from_edge_json.cache_clear()
+        payload = (
+            '{"interface":false,"loading_constraint_type_owners":'
+            '["demo/A","demo/B"]}'
+        )
+
+        first = runtime_reconciler._load_edge_json(payload)
+        second = runtime_reconciler._load_edge_json(payload)
+        owners = (
+            runtime_reconciler._loading_constraint_type_owners_from_edge_json(
+                payload
+            )
+        )
+        owners_again = (
+            runtime_reconciler._loading_constraint_type_owners_from_edge_json(
+                payload
+            )
+        )
+        cache = runtime_reconciler._load_small_edge_json.cache_info()
+        owner_cache = (
+            runtime_reconciler.
+            _loading_constraint_type_owners_from_edge_json.cache_info()
+        )
+
+        self.assertIs(first, second)
+        self.assertEqual(owners, ("demo/A", "demo/B"))
+        self.assertIs(owners, owners_again)
+        self.assertGreaterEqual(cache.hits, 1)
+        self.assertEqual(cache.maxsize, 16_384)
+        self.assertEqual(owner_cache.hits, 1)
+        oversized = '{"value":"' + (
+            "x" * (runtime_reconciler._EDGE_JSON_CACHE_MAX_VALUE_BYTES + 1)
+        ) + '"}'
+        before = runtime_reconciler._load_small_edge_json.cache_info()
+        self.assertEqual(
+            runtime_reconciler._load_edge_json(oversized),
+            runtime_reconciler._load_edge_json(oversized),
+        )
+        after = runtime_reconciler._load_small_edge_json.cache_info()
+        self.assertEqual(after, before)
+        with self.assertRaises(
+            runtime_reconciler.RuntimeReconciliationError
+        ):
+            runtime_reconciler._loading_constraint_type_owners_from_edge_json(
+                '{"loading_constraint_type_owners":["demo/B","demo/A"]}'
+            )
+
+    def test_initialization_reads_normalized_headers_not_full_fact_blobs(self):
+        with self.build_store() as store:
+            statements = []
+            store.connection.set_trace_callback(statements.append)
+            reconciler = RuntimeReconciler(
+                store,
+                self.profile,
+                self.platform,
+                analysis_context_identity="analysis-context-header-read",
+            )
+            store.connection.set_trace_callback(None)
+            caller = next(
+                row for row in reconciler.classes
+                if row["class_name"] == "demo/Caller"
+            )
+
+        self.assertEqual(caller["class_name"], "demo/Caller")
+        self.assertEqual(caller["super_name"], "java/lang/Object")
+        self.assertFalse(any(
+            "fact_zlib" in statement.lower() for statement in statements
+        ))
+
     def test_provider_definition_member_resolution_and_dispatch_are_physical(self):
         with self.build_store() as store:
+            traced_statements = []
+            store.connection.set_trace_callback(traced_statements.append)
             reconciler = RuntimeReconciler(
                 store,
                 self.profile,
@@ -203,6 +279,29 @@ class BinaryRuntimeReconcilerTest(unittest.TestCase):
                 analysis_context_identity="analysis-context-1",
             )
             result = reconciler.reconcile()
+            store.connection.set_trace_callback(None)
+            cache_before = (
+                reconciler._symbolic_member_cache_hits,
+                reconciler._symbolic_member_cache_misses,
+            )
+            first_resolution = reconciler._resolve_symbolic_member(
+                "application-loader",
+                "demo/FinalApi",
+                "method",
+                "value",
+                "()Ljava/lang/String;",
+            )
+            second_resolution = reconciler._resolve_symbolic_member(
+                "application-loader",
+                "demo/FinalApi",
+                "method",
+                "value",
+                "()Ljava/lang/String;",
+            )
+            cache_after = (
+                reconciler._symbolic_member_cache_hits,
+                reconciler._symbolic_member_cache_misses,
+            )
             stored = store.counts()["reconciliation_records"]
             init_member = next(
                 item for item in store.rows("members")
@@ -253,6 +352,23 @@ class BinaryRuntimeReconcilerTest(unittest.TestCase):
             for item in result.provider_bindings
         }
         self.assertEqual(result.coverage_status, "complete")
+        self.assertEqual(first_resolution, second_resolution)
+        self.assertEqual(cache_after[1], cache_before[1] + 1)
+        self.assertEqual(cache_after[0], cache_before[0] + 1)
+        self.assertLessEqual(
+            len(reconciler._symbolic_member_root_cache),
+            runtime_reconciler._SYMBOLIC_MEMBER_CACHE_MAX_ENTRIES,
+        )
+        self.assertEqual(
+            runtime_reconciler._SYMBOLIC_MEMBER_CACHE_MAX_ENTRIES, 16_384
+        )
+        self.assertEqual(
+            sum(
+                statement.strip().upper() == "COMMIT"
+                for statement in traced_statements
+            ),
+            1,
+        )
         self.assertEqual(
             providers[("application-loader", "demo/Caller")]["selected_artifact_instance_identity"],
             self.instance.identity,
@@ -363,6 +479,45 @@ class BinaryRuntimeReconcilerTest(unittest.TestCase):
                 "invokestatic",
             ),
         })
+        reconciler_reference = weakref.ref(reconciler)
+        del reconciler
+        self.assertIsNone(reconciler_reference())
+
+    def test_reconciliation_failure_rolls_back_all_persisted_chunks(self):
+        with self.build_store() as store:
+            reconciler = RuntimeReconciler(
+                store,
+                self.profile,
+                self.platform,
+                analysis_context_identity="analysis-context-rollback",
+            )
+            original = store.add_reconciliation_payloads
+            calls = 0
+
+            def fail_after_write(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                result = original(*args, **kwargs)
+                if calls == 2:
+                    raise RuntimeError("synthetic reconciliation failure")
+                return result
+
+            with patch.object(
+                store,
+                "add_reconciliation_payloads",
+                side_effect=fail_after_write,
+            ), self.assertRaisesRegex(
+                RuntimeError, "synthetic reconciliation failure"
+            ):
+                reconciler.reconcile()
+
+            self.assertGreaterEqual(calls, 2)
+            self.assertEqual(store.counts()["reconciliation_records"], 0)
+            context = store.connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                ("reconciliation_analysis_context_identity",),
+            ).fetchone()
+            self.assertIsNone(context)
 
     def test_parent_first_platform_provider_shadows_same_named_application_class(self):
         # The application artifact cannot define java.lang.String through javac,

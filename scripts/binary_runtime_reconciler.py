@@ -5,9 +5,9 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
+from functools import lru_cache
 import json
 from typing import Any, Iterable, Mapping
-import zlib
 
 from binary_definition_verifier import (
     ClassDefinitionVerifierError,
@@ -43,6 +43,19 @@ ACC_INTERFACE = 0x0200
 ACC_ABSTRACT = 0x0400
 MIN_MULTI_RELEASE_VERSION = 8
 MIN_MULTI_RELEASE_RUNTIME_MAJOR = 9
+
+# Runtime edge payloads are canonical fact-store JSON and are commonly shared
+# by millions of ordinary bytecode references. Cache only bounded payloads:
+# bootstrap constants can contain arbitrarily large nested arguments and must
+# never turn this CPU optimization into an unbounded residency increase.
+_EDGE_JSON_CACHE_MAX_ENTRIES = 16_384
+_EDGE_JSON_CACHE_MAX_VALUE_BYTES = 16 * 1024
+
+# Symbolic resolution is a pure function once definition evidence has been
+# built. Real applications repeatedly call a much smaller common API surface
+# from millions of call sites, so a bounded root-resolution cache removes the
+# repeated hierarchy walks without retaining the complete edge population.
+_SYMBOLIC_MEMBER_CACHE_MAX_ENTRIES = 16_384
 
 
 class RuntimeReconciliationError(BinaryFirstContractError):
@@ -120,14 +133,7 @@ class _ClassRow(_CompactRow):
     FIELDS = (
         "class_variant_identity", "artifact_instance_identity", "class_name",
         "class_major", "multi_release_version", "parse_status", "failure_kind",
-    )
-    INDEX = {name: index for index, name in enumerate(FIELDS)}
-
-
-class _ClassFactHeader(_CompactRow):
-    FIELDS = (
-        "class_name", "class_access", "super_name", "interfaces",
-        "nest_host", "nest_members",
+        "class_access", "super_name", "interfaces", "nest_host", "nest_members",
     )
     INDEX = {name: index for index, name in enumerate(FIELDS)}
 
@@ -177,6 +183,16 @@ def _shared_string(value: Any, pool: dict[str, str]) -> Any:
     return pool.setdefault(value, value)
 
 
+def _shared_string_tuple_json(
+    value: str, pool: dict[str, str],
+) -> tuple[str, ...]:
+    if value == "[]":
+        return ()
+    return tuple(
+        _shared_string(item, pool) for item in json.loads(value)
+    )
+
+
 def _identity(namespace: str, payload: Any) -> str:
     return canonical_identity_native_json(
         namespace, payload, schema_version="1"
@@ -223,6 +239,28 @@ def _loads(value: str) -> Any:
     return json.loads(value or "{}")
 
 
+@lru_cache(maxsize=_EDGE_JSON_CACHE_MAX_ENTRIES)
+def _load_small_edge_json(value: str) -> Any:
+    """Decode one trusted, bounded fact-store edge payload.
+
+    Callers treat the returned JSON tree as immutable. Keeping this cache
+    separate from generic resource JSON prevents large XML/resource semantic
+    payloads from surviving the reconciliation phase merely because they were
+    decoded once.
+    """
+    return json.loads(value)
+
+
+def _load_edge_json(value: str) -> Any:
+    normalized = str(value or "{}")
+    # Four bytes per Unicode scalar is the conservative UTF-8 bound. Avoid
+    # allocating encoded bytes merely to decide whether a hot payload may be
+    # cached.
+    if len(normalized) <= _EDGE_JSON_CACHE_MAX_VALUE_BYTES // 4:
+        return _load_small_edge_json(normalized)
+    return json.loads(normalized)
+
+
 def _loading_constraint_type_owners(
     payload: Mapping[str, Any],
 ) -> tuple[str, ...]:
@@ -243,6 +281,14 @@ def _loading_constraint_type_owners(
             f"{LOADING_CONSTRAINT_TYPE_OWNERS_KEY} must be sorted and unique",
         )
     return normalized
+
+
+@lru_cache(maxsize=_EDGE_JSON_CACHE_MAX_ENTRIES)
+def _loading_constraint_type_owners_from_edge_json(
+    value: str,
+) -> tuple[str, ...]:
+    """Decode and validate the canonical descriptor-owner declaration once."""
+    return _loading_constraint_type_owners(_load_edge_json(value))
 
 
 def _package(class_name: str) -> str:
@@ -466,6 +512,7 @@ class _ReconciliationAccumulator:
             record_kind=kind,
             records=pending,
             collect_identities=False,
+            manage_transaction=False,
         )
         pending.clear()
 
@@ -544,41 +591,23 @@ class RuntimeReconciler:
                 row[4],
                 _shared_string(row[5], shared_strings),
                 _shared_string(row[6], shared_strings),
+                row[7],
+                _shared_string(row[8], shared_strings),
+                _shared_string_tuple_json(row[9], shared_strings),
+                _shared_string(row[10], shared_strings),
+                _shared_string_tuple_json(row[11], shared_strings),
             ))
             for row in store.connection.execute(
                 """
                 SELECT class_variant_identity,artifact_instance_identity,
                        class_name,class_major,multi_release_version,
-                       parse_status,failure_kind
+                       parse_status,failure_kind,class_access,super_name,
+                       interfaces_json,nest_host,nest_members_json
                 FROM classes
                 """
             )
         ]
         self.class_by_variant = {row["class_variant_identity"]: row for row in self.classes}
-        self.class_fact_headers: dict[str, Mapping[str, Any]] = {}
-        for row in store.connection.execute(
-            "SELECT class_variant_identity,fact_zlib FROM classes"
-        ):
-            fact = json.loads(zlib.decompress(row["fact_zlib"]).decode("utf-8"))
-            variant_identity = _shared_string(
-                row["class_variant_identity"], shared_strings
-            )
-            self.class_fact_headers[variant_identity] = (
-                _ClassFactHeader((
-                    _shared_string(fact.get("class_name"), shared_strings),
-                    fact.get("class_access"),
-                    _shared_string(fact.get("super_name"), shared_strings),
-                    tuple(
-                        _shared_string(value, shared_strings)
-                        for value in fact.get("interfaces") or ()
-                    ),
-                    _shared_string(fact.get("nest_host"), shared_strings),
-                    tuple(
-                        _shared_string(value, shared_strings)
-                        for value in fact.get("nest_members") or ()
-                    ),
-                ))
-            )
         self.members_by_variant: dict[str, list[Mapping[str, Any]]] = {}
         self.member_by_identity: dict[str, Mapping[str, Any]] = {}
         for raw in store.connection.execute(
@@ -622,6 +651,12 @@ class RuntimeReconciler:
         self.virtual_dispatch_cache: dict[
             tuple[str, str, str], tuple[str, ...]
         ] = {}
+        self._symbolic_member_root_cache: dict[
+            tuple[str, str, str, str, str],
+            tuple[Mapping[str, Any] | None, Mapping[str, Any] | None],
+        ] = {}
+        self._symbolic_member_cache_hits = 0
+        self._symbolic_member_cache_misses = 0
         self.artifact_manifest_cache: dict[str, dict[str, list[str]]] = {}
         self.artifact_security_unsupported_cache: dict[str, bool] = {}
         self.concrete_subtype_cache: dict[
@@ -1042,7 +1077,9 @@ class RuntimeReconciler:
             (self.profile.identity,),
         ):
             loading_constraint_classes.update(
-                _loading_constraint_type_owners(_loads(row["edge_json"]))
+                _loading_constraint_type_owners_from_edge_json(
+                    str(row["edge_json"] or "{}")
+                )
             )
         initial_classes.update(
             name for name in self.additional_initial_classes if name != "module-info"
@@ -1086,7 +1123,7 @@ class RuntimeReconciler:
 
     def _class_fact(self, provider: Mapping[str, Any]) -> dict[str, Any] | None:
         variant = provider.get("selected_class_variant_identity")
-        fact = self.class_fact_headers.get(str(variant or ""))
+        fact = self.class_by_variant.get(str(variant or ""))
         if fact:
             return fact
         for name in (provider.get("class_name"),):
@@ -1364,7 +1401,52 @@ class RuntimeReconciler:
         self.class_info_cache[cache_key] = result
         return result
 
+    def _resolve_symbolic_member_root(
+        self,
+        initiating_realm: str,
+        owner: str,
+        kind: str,
+        name: str,
+        descriptor: str,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        return self._resolve_symbolic_member_uncached(
+            initiating_realm, owner, kind, name, descriptor, ()
+        )
+
     def _resolve_symbolic_member(
+        self,
+        initiating_realm: str,
+        owner: str,
+        kind: str,
+        name: str,
+        descriptor: str,
+        visited=(),
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        if not visited:
+            key = (initiating_realm, owner, kind, name, descriptor)
+            try:
+                cached = self._symbolic_member_root_cache.pop(key)
+            except KeyError:
+                self._symbolic_member_cache_misses += 1
+                cached = self._resolve_symbolic_member_root(*key)
+                if len(self._symbolic_member_root_cache) >= (
+                    _SYMBOLIC_MEMBER_CACHE_MAX_ENTRIES
+                ):
+                    oldest = next(iter(self._symbolic_member_root_cache))
+                    del self._symbolic_member_root_cache[oldest]
+            else:
+                self._symbolic_member_cache_hits += 1
+            # Pop/reinsert makes the ordinary insertion-ordered dict a bounded
+            # LRU without wrapping a bound method. A functools wrapper stored
+            # on self would create a reference cycle retaining the reconciler's
+            # complete class/member indexes until cyclic GC.
+            self._symbolic_member_root_cache[key] = cached
+            return cached
+        return self._resolve_symbolic_member_uncached(
+            initiating_realm, owner, kind, name, descriptor, visited
+        )
+
+    def _resolve_symbolic_member_uncached(
         self,
         initiating_realm: str,
         owner: str,
@@ -1403,7 +1485,7 @@ class RuntimeReconciler:
         for parent in parents:
             if not parent:
                 continue
-            resolved, resolved_provider = self._resolve_symbolic_member(
+            resolved, resolved_provider = self._resolve_symbolic_member_uncached(
                 defining, parent, kind, name, descriptor, next_visited
             )
             if resolved:
@@ -1579,13 +1661,13 @@ class RuntimeReconciler:
 
     @staticmethod
     def _opcode_compatible(edge: Mapping[str, Any], member: Mapping[str, Any]) -> bool:
-        opcode = int(edge.get("opcode") or 0)
+        opcode = int(edge["opcode"] or 0)
         is_static = bool(int(member["access_flags"]) & ACC_STATIC)
         if opcode in {178, 179, 184}:
             return is_static
         if opcode in {180, 181, 182, 183, 185}:
             return not is_static
-        payload = _loads(edge.get("edge_json") or "{}")
+        payload = _load_edge_json(edge["edge_json"] or "{}")
         tag = int(payload.get("tag") or (payload.get("bootstrap") or {}).get("tag") or 0)
         if tag == 6:
             return is_static
@@ -1594,7 +1676,7 @@ class RuntimeReconciler:
         return True
 
     def _type_resolution(self, edge: Mapping[str, Any], caller_realm: str) -> dict[str, Any]:
-        owner = str(edge.get("symbolic_owner") or "")
+        owner = str(edge["symbolic_owner"] or "")
         provider_owner = _type_provider_owner(owner)
         provider = self._provider(caller_realm, provider_owner) if provider_owner else None
         definition = (
@@ -1614,13 +1696,13 @@ class RuntimeReconciler:
             "initiating_loader_realm_identity": caller_realm,
             "symbolic_owner": owner,
             "resolved_provider_owner": provider_owner,
-            "symbolic_descriptor": edge.get("symbolic_descriptor"),
+            "symbolic_descriptor": edge["symbolic_descriptor"],
             "type_resolution_status": status,
             "provider_binding_identity": (provider or {}).get("provider_binding_identity", ""),
             "class_definition_resolution_identity": (definition or {}).get(
                 "class_definition_resolution_identity", ""
             ),
-            "type_use": _loads(edge.get("edge_json") or "{}"),
+            "type_use": _loads(edge["edge_json"] or "{}"),
         }
         payload["type_resolution_identity"] = _identity(
             "type_resolution_identity", payload
@@ -1669,11 +1751,63 @@ class RuntimeReconciler:
             )
         return targets, complete
 
+    def _append_class_initialization_chain(
+        self,
+        realm: str,
+        name: str,
+        visited: set[tuple[str, str]],
+        chain: list[str],
+    ) -> bool:
+        """Append JVMS initialization targets without a recursive closure.
+
+        A nested self-recursive function formerly allocated a reference cycle
+        for every ``new``/``getstatic``/``putstatic``/``invokestatic`` edge.
+        Those cycles captured the complete reconciler and could keep millions
+        of class/member index entries alive until a later cyclic-GC pass.
+        """
+        key = (realm, name)
+        if key in visited:
+            return True
+        visited.add(key)
+        provider = self._provider(realm, name)
+        definition = self.definition_records.get(key)
+        if (
+            provider.get("class_provider_status") != "resolved"
+            or not definition
+            or not self._class_load_ready(definition)
+        ):
+            return False
+        info = self._class_info(provider)
+        if not info:
+            return False
+        defining = info["defining_loader_realm_identity"]
+        complete = True
+        if not (info["access_flags"] & ACC_INTERFACE) and info["super_name"]:
+            super_complete = self._append_class_initialization_chain(
+                defining, info["super_name"], visited, chain
+            )
+            complete = complete and super_complete
+        for interface in info["interfaces"]:
+            interface_targets, interface_complete = (
+                self._default_interface_initializers(
+                    defining, interface, visited
+                )
+            )
+            chain.extend(interface_targets)
+            complete = complete and interface_complete
+        chain.extend(
+            member["member_identity"] for member in info["members"]
+            if member["member_kind"] == "method"
+            and member["member_name"] == "<clinit>"
+            and member["descriptor"] == "()V"
+        )
+        return complete
+
     def _class_initialization_resolution(
         self, edge: Mapping[str, Any], caller_realm: str, caller_class: str
     ) -> dict[str, Any]:
-        trigger = _loads(edge.get("edge_json") or "{}")
-        owner = str(edge.get("symbolic_owner") or "")
+        trigger = _loads(edge["edge_json"] or "{}")
+        owner = str(edge["symbolic_owner"] or "")
         target_owner = owner
         target_realm = caller_realm
         if trigger.get("trigger_kind") in {"invokestatic", "getstatic", "putstatic"}:
@@ -1694,44 +1828,11 @@ class RuntimeReconciler:
         complete = True
         visited: set[tuple[str, str]] = set()
 
-        def visit(realm: str, name: str) -> None:
-            nonlocal complete
-            key = (realm, name)
-            if key in visited:
-                return
-            visited.add(key)
-            provider = self._provider(realm, name)
-            definition = self.definition_records.get(key)
-            if (
-                provider.get("class_provider_status") != "resolved"
-                or not definition
-                or not self._class_load_ready(definition)
-            ):
-                complete = False
-                return
-            info = self._class_info(provider)
-            if not info:
-                complete = False
-                return
-            defining = info["defining_loader_realm_identity"]
-            if not (info["access_flags"] & ACC_INTERFACE) and info["super_name"]:
-                visit(defining, info["super_name"])
-            for interface in info["interfaces"]:
-                interface_targets, interface_complete = self._default_interface_initializers(
-                    defining, interface, visited
-                )
-                chain.extend(interface_targets)
-                complete = complete and interface_complete
-            chain.extend(
-                member["member_identity"] for member in info["members"]
-                if member["member_kind"] == "method"
-                and member["member_name"] == "<clinit>"
-                and member["descriptor"] == "()V"
-            )
-
         already_initialized = caller_class == target_owner and caller_realm == target_realm
         if not already_initialized:
-            visit(target_realm, target_owner)
+            complete = self._append_class_initialization_chain(
+                target_realm, target_owner, visited, chain
+            )
         status = (
             "not_applicable_already_initialized"
             if already_initialized
@@ -1778,7 +1879,11 @@ class RuntimeReconciler:
         """
         constraints: list[dict[str, Any]] = []
         aggregate = "not_applicable"
-        for class_name in sorted(set(descriptor_type_names)):
+        # The sole caller supplies the tuple returned by
+        # _loading_constraint_type_owners_from_edge_json, which has already
+        # proved sorted/unique non-empty names. Rebuilding a set and sorting it
+        # for every direct edge duplicated that work millions of times.
+        for class_name in descriptor_type_names:
             if caller_defining_loader_realm == declaration_loader_realm:
                 item = {
                     "class_name": class_name,
@@ -1887,9 +1992,30 @@ class RuntimeReconciler:
         universe: tuple[tuple[str, str], ...],
         accumulator: _ReconciliationAccumulator,
     ) -> None:
-        artifact_realm = {
-            identity: row["loader_realm_identity"] for identity, row in self.artifacts.items()
-        }
+        active_caller_binding_by_variant: dict[str, tuple[str, str]] = {}
+        for caller in self.classes:
+            artifact = self.artifacts.get(
+                caller["artifact_instance_identity"]
+            )
+            if artifact is None:
+                continue
+            artifact_loader_realm = artifact["loader_realm_identity"]
+            provider = self._provider(
+                artifact_loader_realm, caller["class_name"]
+            )
+            if (
+                provider.get("class_provider_status") == "resolved"
+                and provider.get("selected_class_variant_identity")
+                == caller["class_variant_identity"]
+            ):
+                active_caller_binding_by_variant[
+                    caller["class_variant_identity"]
+                ] = (
+                    caller["artifact_instance_identity"],
+                    str(provider[
+                        "selected_defining_loader_realm_identity"
+                    ]),
+                )
         member_by_identity = self.member_by_identity
         hierarchy_complete = (
             self.profile.complete
@@ -1907,30 +2033,22 @@ class RuntimeReconciler:
             ORDER BY direct_edge_identity
             """
         ):
-            edge = dict(raw_edge)
+            # sqlite3.Row already provides stable name-based access. Copying
+            # eleven columns into a new dict for every direct edge allocated
+            # millions of short-lived hash tables without changing a value.
+            edge = raw_edge
             caller_artifact = edge["caller_artifact_instance_identity"]
-            if caller_artifact not in artifact_realm:
-                continue
             caller = member_by_identity.get(edge["caller_member_identity"])
             if caller is None:
                 continue
-            artifact_loader_realm = artifact_realm[caller_artifact]
-            caller_provider = self._provider(
-                artifact_loader_realm, str(caller["class_name"])
+            caller_binding = active_caller_binding_by_variant.get(
+                caller["class_variant_identity"]
             )
-            if (
-                caller_provider.get("class_provider_status") != "resolved"
-                or caller_provider.get("selected_class_variant_identity")
-                != caller["class_variant_identity"]
-            ):
+            if caller_binding is None or caller_binding[0] != caller_artifact:
                 # A shadowed physical caller variant is not D in any target
                 # runtime constant pool and therefore imposes no constraints.
                 continue
-            caller_realm = str(
-                caller_provider[
-                    "selected_defining_loader_realm_identity"
-                ]
-            )
+            caller_realm = caller_binding[1]
             if edge["edge_kind"] == "type":
                 accumulator.add(
                     "type_resolution",
@@ -1954,7 +2072,7 @@ class RuntimeReconciler:
                     "linkage_kind": "constant_dynamic",
                     "linkage_status": "represented_by_bootstrap_handles",
                     "coverage_status": "complete",
-                    "payload": _loads(edge.get("edge_json") or "{}"),
+                    "payload": _loads(edge["edge_json"] or "{}"),
                 }
                 linkage["linkage_resolution_identity"] = _identity(
                     "linkage_resolution_identity", linkage
@@ -1962,9 +2080,10 @@ class RuntimeReconciler:
                 accumulator.add("linkage_resolution", linkage)
                 continue
             owner = edge["symbolic_owner"]
-            edge_payload = _loads(edge.get("edge_json") or "{}")
-            descriptor_type_names = _loading_constraint_type_owners(
-                edge_payload
+            edge_json = str(edge["edge_json"] or "{}")
+            edge_payload = _load_edge_json(edge_json)
+            descriptor_type_names = (
+                _loading_constraint_type_owners_from_edge_json(edge_json)
             )
             # Ordinary MethodHandle edges store the handle directly, while an
             # invokedynamic bootstrap edge wraps it in ``payload.bootstrap``.
@@ -2079,14 +2198,14 @@ class RuntimeReconciler:
                             linkage_status = "incompatible_class_change"
                         else:
                             linkage_status = "resolved"
-            resolution_identity = _member_resolution_identity_native(
-                {"member_resolution_status": status, **payload}
-            )
             member_record = {
                 **payload,
                 "member_resolution_status": status,
-                "member_resolution_identity": resolution_identity,
             }
+            resolution_identity = _member_resolution_identity_native(
+                member_record
+            )
+            member_record["member_resolution_identity"] = resolution_identity
             accumulator.add("member_resolution", member_record)
 
             executable_dispatch = edge["edge_kind"] == "method" and kind == "method"
@@ -2108,7 +2227,7 @@ class RuntimeReconciler:
                 targets = ()
                 coverage = "complete" if dispatch_status == "not_applicable" else "partial"
             else:
-                opcode = int(edge.get("opcode") or 0)
+                opcode = int(edge["opcode"] or 0)
                 virtual = opcode in {182, 185} or handle_tag in {5, 9}
                 if array_clone:
                     dispatch_fixed_by_final_declaration = True
@@ -2206,6 +2325,38 @@ class RuntimeReconciler:
         *,
         retain_record_kinds: Iterable[str] | None = None,
     ) -> RuntimeReconciliationResult:
+        """Build and atomically persist the complete runtime truth set.
+
+        Chunking still bounds Python residency, but one SQLite transaction
+        avoids thousands of durable commit boundaries on large Windows/VM
+        disks. Any exception rolls every reconciliation chunk back, so a
+        caller can never observe a partially persisted runtime result.
+        """
+        owns_transaction = not self.store.connection.in_transaction
+        if owns_transaction:
+            self.store.connection.execute("BEGIN")
+        try:
+            result = self._reconcile(retain_record_kinds=retain_record_kinds)
+            if owns_transaction:
+                self.store.connection.commit()
+            return result
+        except BaseException:
+            if owns_transaction and self.store.connection.in_transaction:
+                self.store.connection.rollback()
+            raise
+        finally:
+            # These caches contain only immutable derivations of fact-store
+            # edge payloads. They are useful throughout one side's multi-
+            # million-edge walk but must not overlap the independent Oracle's
+            # own large indexes or survive a failed pipeline attempt.
+            _loading_constraint_type_owners_from_edge_json.cache_clear()
+            _load_small_edge_json.cache_clear()
+
+    def _reconcile(
+        self,
+        *,
+        retain_record_kinds: Iterable[str] | None = None,
+    ) -> RuntimeReconciliationResult:
         retained_kinds = (
             set(_RECONCILIATION_RECORD_FIELDS)
             if retain_record_kinds is None
@@ -2225,7 +2376,21 @@ class RuntimeReconciler:
             accumulator.add("provider_binding", record)
         self._compact_persisted_runtime_records(retained_kinds)
         self._build_definitions(universe, accumulator)
-        self._resolve_edges(universe, accumulator)
+        # Resolution before definition evidence is complete can legitimately
+        # return a different answer. Clear any diagnostic/preflight calls at
+        # the exact point definitions become immutable, then cache only the
+        # stable root resolutions used by the complete edge walk.
+        self._symbolic_member_root_cache.clear()
+        self._symbolic_member_cache_hits = 0
+        self._symbolic_member_cache_misses = 0
+        try:
+            self._resolve_edges(universe, accumulator)
+        finally:
+            # Downstream phases consume persisted evidence, not this lookup
+            # cache. Release its bounded but potentially sizeable key set
+            # before the independent Oracle constructs its own graph, also on
+            # an interrupted or failed edge walk.
+            self._symbolic_member_root_cache.clear()
         for record in self._resource_selections():
             accumulator.add("resource_selection", record)
         accumulator.flush()

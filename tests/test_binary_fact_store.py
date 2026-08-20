@@ -235,7 +235,7 @@ class BinaryFactStoreTest(unittest.TestCase):
             )[0]["value"]
 
         by_name = {row["resource_name"]: row for row in resources}
-        self.assertEqual(schema, "binary-fact-sqlite-v6")
+        self.assertEqual(schema, "binary-fact-sqlite-v7")
         self.assertEqual(counts["resources"], 3)
         self.assertEqual(
             by_name["config/runtime.xml"]["content_sha256"],
@@ -328,7 +328,7 @@ class BinaryFactStoreTest(unittest.TestCase):
                 "metadata", where="key='schema_version'"
             )[0]["value"]
 
-        self.assertEqual(version, "binary-fact-sqlite-v6")
+        self.assertEqual(version, "binary-fact-sqlite-v7")
         self.assertEqual(after, before)
 
     def test_custom_invokedynamic_bootstrap_tag_validates_from_nested_payload(self):
@@ -633,6 +633,33 @@ class BinaryFactStoreTest(unittest.TestCase):
                     raised.exception.reason_code,
                     "FACT_STORE_METHOD_HANDLE_DESCRIPTOR_INVALID",
                 )
+
+    def test_deep_bootstrap_arguments_are_complete_without_python_recursion(self):
+        type_value = {"kind": "type", "descriptor": "Ldeep/Type;"}
+        handle_value = {
+            "kind": "handle",
+            "tag": 6,
+            "owner": "deep/Target",
+            "name": "run",
+            "descriptor": "()V",
+            "interface": False,
+        }
+        nested_types = type_value
+        nested_handles = handle_value
+        for _ in range(2_000):
+            nested_types = [nested_types]
+            nested_handles = [nested_handles]
+
+        type_edges = BinaryFactStore._bootstrap_argument_type_edges(
+            nested_types, 7
+        )
+        handles = []
+        BinaryFactStore._collect_handles(nested_handles, handles)
+
+        self.assertEqual(
+            [edge["symbolic_owner"] for edge in type_edges], ["deep/Type"]
+        )
+        self.assertEqual(handles, [handle_value])
 
     def test_all_method_handle_reference_kinds_materialize_constraints(self):
         expected_reference_kinds = {
@@ -972,6 +999,48 @@ class BinaryFactStoreTest(unittest.TestCase):
         self.assertEqual(specialized_identities, ordinary_identities)
         self.assertEqual(specialized_path.read_bytes(), ordinary_path.read_bytes())
 
+    def test_specialized_reconciliation_writer_can_join_outer_transaction(self):
+        with BinaryFactStore() as store:
+            store.connection.execute("BEGIN")
+            store.add_reconciliation_payloads(
+                analysis_context_identity="context",
+                record_kind="member_resolution",
+                records=[(
+                    "resolved",
+                    "subject",
+                    {
+                        "direct_edge_identity": "edge",
+                        "member_resolution_status": "resolved",
+                    },
+                )],
+                manage_transaction=False,
+            )
+            self.assertTrue(store.connection.in_transaction)
+            self.assertEqual(store.counts()["reconciliation_records"], 1)
+            store.connection.rollback()
+            self.assertEqual(store.counts()["reconciliation_records"], 0)
+            context = store.connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                ("reconciliation_analysis_context_identity",),
+            ).fetchone()
+
+        self.assertIsNone(context)
+
+    def test_specialized_writer_rejects_unowned_bulk_transaction(self):
+        with BinaryFactStore() as store:
+            with self.assertRaises(BinaryFactStoreError) as caught:
+                store.add_reconciliation_payloads(
+                    analysis_context_identity="context",
+                    record_kind="member_resolution",
+                    records=[("resolved", "subject", {"value": 1})],
+                    manage_transaction=False,
+                )
+
+        self.assertEqual(
+            caught.exception.reason_code,
+            "FACT_STORE_RECONCILIATION_TRANSACTION_MISSING",
+        )
+
     def test_secondary_indexes_can_be_deferred_until_bulk_load_finishes(self):
         artifact = self.make_jar("deferred-indexes.jar")
         instance = self.instance(artifact, 0)
@@ -1129,6 +1198,13 @@ class BinaryFactStoreTest(unittest.TestCase):
             stored_lengths = store.connection.execute(
                 "SELECT length(class_bytes_zlib), length(fact_zlib) FROM classes"
             ).fetchone()
+            stored_header = dict(store.connection.execute(
+                """
+                SELECT class_access,super_name,interfaces_json,
+                       nest_host,nest_members_json
+                FROM classes
+                """
+            ).fetchone())
             row = store.rows("classes")[0]
             metadata_only = store.rows(
                 "classes",
@@ -1151,6 +1227,17 @@ class BinaryFactStoreTest(unittest.TestCase):
         self.assertNotIn("fact_zlib", metadata_only)
         fact = json.loads(row["fact_json"])
         self.assertEqual(fact["class_name"], "demo/Caller")
+        self.assertEqual(stored_header["class_access"], fact["class_access"])
+        self.assertEqual(stored_header["super_name"], fact.get("super_name"))
+        self.assertEqual(
+            json.loads(stored_header["interfaces_json"]),
+            fact.get("interfaces") or [],
+        )
+        self.assertEqual(stored_header["nest_host"], fact.get("nest_host"))
+        self.assertEqual(
+            json.loads(stored_header["nest_members_json"]),
+            fact.get("nest_members") or [],
+        )
         self.assertLess(stored_lengths[0], len(self.class_bytes))
         self.assertLess(stored_lengths[1], len(row["fact_json"].encode("utf-8")))
 

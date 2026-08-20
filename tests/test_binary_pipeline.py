@@ -4288,6 +4288,29 @@ class BinaryPipelineTest(unittest.TestCase):
             "BINARY_GENERATION_SOURCE_IMPORT_CLOSURE_INVALID",
         )
 
+    def test_local_import_cache_is_bound_to_exact_source_bytes(self):
+        binary_pipeline._local_python_imports_from_exact_bytes.cache_clear()
+        with tempfile.TemporaryDirectory() as temp_text:
+            source = Path(temp_text) / "fixture.py"
+            source.write_text("import json\n", encoding="utf-8")
+            with patch.object(
+                binary_pipeline.ast,
+                "parse",
+                wraps=binary_pipeline.ast.parse,
+            ) as parse:
+                self.assertEqual(
+                    binary_pipeline._local_python_imports(source), {"json"}
+                )
+                self.assertEqual(
+                    binary_pipeline._local_python_imports(source), {"json"}
+                )
+                source.write_text("import sqlite3\n", encoding="utf-8")
+                self.assertEqual(
+                    binary_pipeline._local_python_imports(source), {"sqlite3"}
+                )
+        self.assertEqual(parse.call_count, 2)
+        binary_pipeline._local_python_imports_from_exact_bytes.cache_clear()
+
     def test_generation_runtime_identity_is_stable_and_fails_closed(self):
         pins = binary_pipeline._runtime_requirement_pins(
             binary_pipeline.RUNTIME_REQUIREMENTS_PATH.read_bytes()

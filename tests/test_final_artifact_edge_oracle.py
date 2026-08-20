@@ -1,4 +1,5 @@
 import base64
+import errno
 import hashlib
 import io
 import json
@@ -604,6 +605,87 @@ class FinalArtifactEdgeOraclePerformanceTest(unittest.TestCase):
         self.assertLessEqual(
             max(observed_group_sizes), oracle.MAX_CLASSES_PER_JAVAP_BATCH
         )
+
+    def test_javap_batch_groups_use_rendered_command_budget(self):
+        entries = [
+            oracle.PackagedClass(
+                f"fixture/C{index}.class",
+                Path("C:/") / ("long-path-segment-" * 5)
+                / f"class-{index:03d}.class",
+            )
+            for index in range(12)
+        ]
+        three_entry_chars = oracle._javap_batch_command_chars(
+            "javap", entries[:3]
+        )
+        with patch.object(
+            oracle, "MAX_CLASSES_PER_JAVAP_BATCH", 128
+        ), patch.object(
+            oracle, "MAX_JAVAP_COMMAND_CHARS", three_entry_chars - 1
+        ):
+            groups = oracle._javap_batch_groups(entries, 1, "javap")
+
+        self.assertEqual(
+            [entry for group in groups for entry in group], entries
+        )
+        self.assertTrue(all(len(group) <= 2 for group in groups))
+        self.assertTrue(all(
+            oracle._javap_batch_command_chars("javap", group)
+            < three_entry_chars
+            for group in groups
+        ))
+
+    def test_large_windows_safe_batch_reduces_jvm_start_count(self):
+        entries = [
+            oracle.PackagedClass(
+                f"fixture/C{index}.class", Path(f"class-{index:06d}.class")
+            )
+            for index in range(256)
+        ]
+        with patch.object(
+            oracle, "MAX_CLASSES_PER_JAVAP_BATCH", 128
+        ), patch.object(
+            oracle, "MAX_JAVAP_COMMAND_CHARS", 24_000
+        ):
+            groups = oracle._javap_batch_groups(entries, 1, "javap")
+
+        self.assertEqual([len(group) for group in groups], [128, 128])
+        self.assertGreaterEqual(oracle.MAX_CLASSES_PER_JAVAP_BATCH, 128)
+
+    def test_command_line_overflow_recursively_splits_without_losing_classes(self):
+        entries = [
+            oracle.PackagedClass(
+                f"fixture/C{index}.class", Path(f"unused-{index}.class")
+            )
+            for index in range(4)
+        ]
+
+        def parse_entry(entry, artifact_sha256, *_args, **_kwargs):
+            return _fake_parse_result(entry, artifact_sha256)
+
+        with patch.object(
+            oracle,
+            "managed_popen",
+            side_effect=OSError(errno.E2BIG, "argument list too long"),
+        ) as popen, patch.object(
+            oracle,
+            "_parse_entry_with_javap",
+            side_effect=parse_entry,
+        ) as individual:
+            results = oracle._parse_entry_group_with_javap(
+                entries,
+                "a" * 64,
+                "javap",
+                "21",
+                oracle.Event(),
+                time.perf_counter() + 5,
+                force_verbose=False,
+            )
+
+        self.assertEqual(len(results), len(entries))
+        self.assertTrue(all(result["parsed"] for result in results))
+        self.assertEqual(popen.call_count, 3)
+        self.assertEqual(individual.call_count, 4)
 
     def test_concurrent_scan_retains_every_class_parse_failure_in_entry_order(self):
         with tempfile.TemporaryDirectory() as temp_dir:

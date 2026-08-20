@@ -1370,6 +1370,14 @@ class BinaryValidationPerformanceSafetyTest(unittest.TestCase):
 
         self.assertEqual([len(batch) for batch in observed_batches], [2, 2, 1])
         self.assertEqual(
+            observed_batches,
+            [
+                ["demo.C0", "demo.C1"],
+                ["demo.C2", "demo.C3"],
+                ["demo.C4"],
+            ],
+        )
+        self.assertEqual(
             {name for batch in observed_batches for name in batch},
             {name.replace("/", ".") for name in classes},
         )
