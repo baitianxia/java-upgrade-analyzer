@@ -7,6 +7,7 @@ fails closed unless it is executing on a native Windows host.
 """
 
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import json
 import os
 import shutil
@@ -16,6 +17,8 @@ import tempfile
 import threading
 import time
 import unittest
+import warnings
+import zipfile
 from pathlib import Path
 
 
@@ -23,13 +26,21 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import compat  # noqa: E402
+import binary_artifact_diff  # noqa: E402
+import binary_output  # noqa: E402
+import binary_pipeline  # noqa: E402
+import binary_report  # noqa: E402
+import binary_validation_oracle  # noqa: E402
 import path_runtime  # noqa: E402
 import run_step  # noqa: E402
 from binary_tool_execution import (  # noqa: E402
     execute_binary_tool,
     tool_failure_is_retryable,
 )
-from process_metrics import windows_current_process_usage  # noqa: E402
+from process_metrics import (  # noqa: E402
+    system_available_memory_bytes,
+    windows_current_process_usage,
+)
 
 
 class WindowsNativeContractTest(unittest.TestCase):
@@ -98,6 +109,98 @@ class WindowsNativeContractTest(unittest.TestCase):
         self.assertGreaterEqual(usage.user_seconds, 0)
         self.assertGreaterEqual(usage.system_seconds, 0)
         self.assertGreater(usage.peak_rss_bytes, 0)
+
+    def test_native_available_memory_preflight_reports_physical_bytes(self):
+        available = system_available_memory_bytes()
+
+        self.assertIsInstance(available, int)
+        self.assertGreater(available, 0)
+
+    def test_native_generation_file_fsync_accepts_owned_file(self):
+        with tempfile.TemporaryDirectory(prefix="jua fsync ") as tmp:
+            target = Path(tmp) / "generation.json"
+            target.write_text("{}\n", encoding="utf-8")
+
+            binary_output._fsync_regular_file(target)
+
+    def test_native_report_file_fsync_accepts_owned_file(self):
+        with tempfile.TemporaryDirectory(prefix="jua report fsync ") as tmp:
+            target = Path(tmp) / "report.json"
+            content = b"{}\n"
+            target.write_bytes(content)
+
+            digest = binary_report._report_file_sha256(
+                target, make_durable=True
+            )
+
+        self.assertEqual(digest, hashlib.sha256(content).hexdigest())
+
+    def test_native_checkpoint_write_read_roundtrip_is_exact(self):
+        with tempfile.TemporaryDirectory(prefix="jua checkpoint ") as tmp:
+            output = Path(tmp) / "binary-output"
+            payload = {
+                "schema": binary_pipeline.RESUME_CHECKPOINT_SCHEMA,
+                "status": "awaiting_independent_validation",
+                "result_generation_identity": "a" * 64,
+            }
+
+            persisted = binary_pipeline._write_resume_checkpoint_roundtrip(
+                output, payload
+            )
+
+        self.assertEqual(
+            persisted["checkpoint_content_identity"],
+            binary_pipeline._resume_checkpoint_content_identity(persisted),
+        )
+        self.assertEqual(persisted["schema"], payload["schema"])
+
+    def test_native_path_and_descriptor_checkpoint_identity_match(self):
+        with tempfile.TemporaryDirectory(prefix="jua checkpoint stat ") as tmp:
+            target = Path(tmp) / "checkpoint.json"
+            target.write_text("{}\n", encoding="utf-8")
+            path_stat = os.lstat(target)
+            descriptor = os.open(
+                target, os.O_RDONLY | int(getattr(os, "O_BINARY", 0) or 0)
+            )
+            try:
+                descriptor_stat = os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+
+        self.assertEqual(
+            binary_pipeline._checkpoint_stat_identity(path_stat),
+            binary_pipeline._checkpoint_stat_identity(descriptor_stat),
+        )
+        self.assertEqual(
+            run_step._step4_checkpoint_stat_identity(path_stat),
+            run_step._step4_checkpoint_stat_identity(descriptor_stat),
+        )
+
+    def test_native_duplicate_maven_metadata_policy_is_symmetric(self):
+        with tempfile.TemporaryDirectory(prefix="jua duplicate maven ") as tmp:
+            artifact = Path(tmp) / "jmxmon.jar"
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                with zipfile.ZipFile(artifact, "w") as archive:
+                    archive.writestr(
+                        "META-INF/maven/example/jmxmon/pom.xml", b"first"
+                    )
+                    archive.writestr(
+                        "META-INF/maven/example/jmxmon/pom.xml", b"second"
+                    )
+            with zipfile.ZipFile(artifact) as archive:
+                selected, _target_required = (
+                    binary_artifact_diff.select_runtime_resource_entries(
+                        archive, 17
+                    )
+                )
+            inventory = binary_validation_oracle._archive_inventory(
+                artifact, 17
+            )
+
+        self.assertEqual(selected, {})
+        self.assertEqual(inventory["failures"], [])
+        self.assertEqual(inventory["resources"], {})
 
     def test_native_tool_failures_are_typed_without_shell(self):
         cases = (

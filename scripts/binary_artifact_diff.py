@@ -23,7 +23,7 @@ from typing import Any, Iterable, Iterator, Mapping
 import xml.etree.ElementTree as ET
 import zipfile
 
-from artifact_safety import inspect_archive
+from artifact_safety import inspect_archive, is_allowed_duplicate_archive_entry
 from binary_asm_helper import BinaryClassInput, BinaryFactRun, extract_class_facts
 from binary_first_contract import (
     BinaryFirstContractError,
@@ -413,6 +413,15 @@ def select_runtime_resource_entries(
         selected_version = max(eligible)
         physical_entries = versions[selected_version]
         if len(physical_entries) != 1:
+            # Maven build metadata is physical provenance, not a runtime
+            # resource.  Some otherwise valid shaded JARs contain the same
+            # pom.xml/properties entry more than once.  Inventory every
+            # occurrence below, but do not pretend either duplicate wins at
+            # runtime.
+            if is_allowed_duplicate_archive_entry(
+                logical, allow_duplicate_maven_metadata=True
+            ):
+                continue
             raise BinaryArtifactDiffError(
                 "ARTIFACT_RUNTIME_RESOURCE_DUPLICATE",
                 f"{logical}: version={selected_version}; "

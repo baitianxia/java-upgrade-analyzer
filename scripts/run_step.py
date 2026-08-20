@@ -76,6 +76,7 @@ from binary_output import (
     BinaryOutputError,
     commit_pending_binary_generation,
     compare_and_restore_active_binary_generation,
+    prune_unreferenced_binary_generations,
     publish_pending_binary_generation,
     read_active_binary_generation,
     read_pending_binary_generation,
@@ -2831,7 +2832,7 @@ def run_python(script_name, script_args, cwd, report_dir=None, timeout=None):
     }
     if report_dir is not None:
         env["UPGRADE_REPORT_DIR"] = str(Path(report_dir).resolve())
-    stream_output = script_name == "s1_dep_diff.py"
+    stream_output = script_name in {"s1_dep_diff.py", "binary_pipeline.py"}
     run_kwargs = {
         "cwd": str(cwd),
         "env": env,
@@ -12224,7 +12225,6 @@ def _step4_checkpoint_stat_identity(value):
         int(value.st_nlink),
         int(value.st_size),
         int(getattr(value, "st_mtime_ns", int(value.st_mtime * 1_000_000_000))),
-        int(getattr(value, "st_ctime_ns", int(value.st_ctime * 1_000_000_000))),
     )
 
 
@@ -13006,6 +13006,7 @@ _STEP4_RECOVERY_REPUBLISH_DISPOSITIONS = frozenset({
     "committed_gate_policy_requires_republication",
 })
 _STEP4_RECOVERY_RESUME_DISPOSITIONS = frozenset({
+    "discarded_invalid_checkpoint_for_rerun",
     "rolled_back_legacy_report_transaction",
     "rolled_back_gate_policy_mismatch",
     "rolled_back_interrupted_transaction",
@@ -13137,14 +13138,39 @@ def _recover_binary_step4_transaction(
     *,
     expected_gate_name=None,
     expected_strict_risk_gate=None,
+    discard_invalid_checkpoint=False,
 ):
     report = Path(report_dir).resolve()
     checkpoint_path = _step4_validation_checkpoint_path(report)
     binary_root = report / BINARY_OUTPUT_RELATIVE_PATH
     evidence_root = report / "evidence"
-    checkpoint = _read_step4_validation_checkpoint(
-        report, missing_ok=True
-    )
+    invalid_checkpoint_discarded = False
+    try:
+        checkpoint = _read_step4_validation_checkpoint(
+            report, missing_ok=True
+        )
+    except StepError:
+        if not discard_invalid_checkpoint:
+            raise
+        _delete_step4_validation_checkpoint_durable(checkpoint_path)
+        checkpoint = None
+        invalid_checkpoint_discarded = True
+    if (
+        checkpoint is not None
+        and discard_invalid_checkpoint
+        and (
+            checkpoint.get("schema")
+            != "java-upgrade-analyzer.binary-generation-validation-checkpoint.v3"
+            or checkpoint.get("status") not in {
+                "awaiting_independent_validation",
+                "independent_validation_failed",
+                "independent_validation_passed_pending_activation",
+            }
+        )
+    ):
+        _delete_step4_validation_checkpoint_durable(checkpoint_path)
+        checkpoint = None
+        invalid_checkpoint_discarded = True
     pending_activation = None
     if binary_root.exists() or binary_root.is_symlink():
         try:
@@ -13161,7 +13187,11 @@ def _recover_binary_step4_transaction(
         and pending_activation is None
         and not list(evidence_root.glob(".jua-br-*.transaction.json"))
     ):
-        return "nothing_to_recover"
+        return (
+            "discarded_invalid_checkpoint_for_rerun"
+            if invalid_checkpoint_discarded
+            else "nothing_to_recover"
+        )
     destinations = _step4_report_publication_destinations(report)
     recovery_metadata = report_publication_transaction_recovery_metadata(
         destinations
@@ -14039,7 +14069,27 @@ def _record_binary_failure(
         / f"{identity}.json"
     )
     write_json(destination, failure)
+    try:
+        write_json(
+            report
+            / BINARY_OUTPUT_RELATIVE_PATH
+            / "binary_observability"
+            / "latest_failure.json",
+            failure,
+        )
+    except (OSError, TypeError, ValueError):
+        # Immutable failure evidence above remains authoritative.  A convenience
+        # pointer must never replace the primary error with an observability
+        # write failure.
+        pass
     return failure, destination
+
+
+def _record_binary_failure_best_effort(report_dir, config_path, error):
+    try:
+        return _record_binary_failure(report_dir, config_path, error)
+    except Exception:
+        return None, None
 
 
 def _prepare_fresh_subprocess_result(path):
@@ -14513,6 +14563,39 @@ def _finalize_binary_step4_transaction(
     return True
 
 
+def _prune_binary_step4_generations_best_effort(report_dir):
+    """Reclaim stale Step4 generations without changing analysis authority."""
+
+    binary_root = Path(report_dir).resolve() / BINARY_OUTPUT_RELATIVE_PATH
+    try:
+        summary = prune_unreferenced_binary_generations(binary_root)
+    except (BinaryOutputError, OSError, RuntimeError) as error:
+        summary = {
+            "schema": "java-upgrade-analyzer.binary-generation-gc.v1",
+            "removed_generation_identities": [],
+            "retained_generation_identities": [],
+            "skipped_entries": [],
+            "failures": [{
+                "generation_identity": "",
+                "error_type": type(error).__name__,
+                "reason_code": str(getattr(error, "reason_code", "") or ""),
+                "detail": str(error),
+            }],
+            "protected_generation_identities": [],
+            "removed_count": 0,
+            "retained_count": 0,
+            "failure_count": 1,
+        }
+    try:
+        write_json(
+            binary_root / "binary_observability" / "latest_generation_gc.json",
+            summary,
+        )
+    except (OSError, TypeError, ValueError):
+        pass
+    return summary
+
+
 def _complete_binary_step4_after_gate(
     *,
     report_dir,
@@ -14603,6 +14686,7 @@ def _complete_binary_step4_after_gate(
             "Step4 提交后全局 release 未将下游阶段标记为 stale。",
             reason_codes=["BINARY_GLOBAL_RELEASE_STATE_INVALID"],
         )
+    _prune_binary_step4_generations_best_effort(report_dir)
     return True
 
 
@@ -15692,6 +15776,29 @@ def _startup_step4_recovery_target_hint(
     return pending_step if pending_step in STEP_SEQUENCE else "step0"
 
 
+def _startup_discards_invalid_step4_checkpoint(
+    args,
+    structured_user_response,
+    target_hint,
+):
+    """Return whether explicit user intent supersedes an unreadable checkpoint."""
+
+    response = dict(structured_user_response or {})
+    action = str(response.get("action") or "").strip()
+    explicit_cli_step = str(getattr(args, "step", "") or "").strip()
+    explicit_regeneration = bool(
+        explicit_cli_step in STEP_SEQUENCE
+        and _step4_recovery_step_rank(explicit_cli_step)
+        <= step_index("step4")
+    )
+    response_regeneration = bool(
+        action in {"rerun_current_step", "restart_from_step"}
+        and _step4_recovery_step_rank(target_hint) >= 0
+        and _step4_recovery_step_rank(target_hint) <= step_index("step4")
+    )
+    return explicit_regeneration or response_regeneration
+
+
 def _step4_republication_marker(main_state, *, missing_ok=False):
     raw = ((main_state or {}).get("state") or {}).get(
         "step4_report_republication_pending"
@@ -16151,21 +16258,28 @@ def _recover_and_apply_step4_startup_state_under_locks(
     gate_name,
     strict_risk_gate,
 ):
+    target_hint = _startup_step4_recovery_target_hint(
+        args,
+        main_state,
+        structured_user_response,
+    )
     disposition = _recover_binary_step4_transaction(
         report_dir,
         expected_gate_name=gate_name,
         expected_strict_risk_gate=bool(strict_risk_gate),
+        discard_invalid_checkpoint=(
+            _startup_discards_invalid_step4_checkpoint(
+                args,
+                structured_user_response,
+                target_hint,
+            )
+        ),
     )
     decision = _classify_step4_recovery_disposition(
         report_dir,
         disposition,
         expected_gate_name=gate_name,
         expected_strict_risk_gate=bool(strict_risk_gate),
-    )
-    target_hint = _startup_step4_recovery_target_hint(
-        args,
-        main_state,
-        structured_user_response,
     )
     result = _apply_step4_startup_recovery(
         decision=decision,
@@ -16538,6 +16652,7 @@ def _main_with_workflow_lock_held(argv=None, _skip_environment_contract=False):
             )
         )
     except StepError as exc:
+        _record_binary_failure_best_effort(report_dir, None, exc)
         persist_step_error(main_state, "step4", report_dir, exc)
         for line in build_user_runtime_message(
             "failed", "step4", reason=exc,
@@ -16557,6 +16672,7 @@ def _main_with_workflow_lock_held(argv=None, _skip_environment_contract=False):
                 ),
             },
         )
+        _record_binary_failure_best_effort(report_dir, None, wrapped)
         persist_step_error(main_state, "step4", report_dir, wrapped)
         for line in build_user_runtime_message(
             "failed", "step4", reason=wrapped,

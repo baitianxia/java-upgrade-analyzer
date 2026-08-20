@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
+import warnings
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,6 +28,86 @@ from binary_tool_execution import BinaryToolFailure, BinaryToolResult  # noqa: E
 
 
 class BinaryValidationPerformanceSafetyTest(unittest.TestCase):
+    def test_maven_metadata_duplicate_policy_matches_production_and_oracle(self):
+        with tempfile.TemporaryDirectory() as temp_text:
+            artifact = Path(temp_text) / "duplicate-maven.jar"
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                with zipfile.ZipFile(artifact, "w") as archive:
+                    archive.writestr(
+                        "META-INF/maven/example/jmxmon/pom.xml", b"first"
+                    )
+                    archive.writestr(
+                        "META-INF/maven/example/jmxmon/pom.xml", b"second"
+                    )
+            with zipfile.ZipFile(artifact) as archive:
+                selected, target_required = (
+                    production_artifact.select_runtime_resource_entries(
+                        archive, 17
+                    )
+                )
+            inventory = oracle._archive_inventory(artifact, 17)
+
+        self.assertFalse(target_required)
+        self.assertNotIn(
+            "META-INF/maven/example/jmxmon/pom.xml", selected
+        )
+        self.assertEqual(inventory["failures"], [])
+        self.assertNotIn(
+            "META-INF/maven/example/jmxmon/pom.xml",
+            inventory["resources"],
+        )
+
+    def test_non_maven_resource_duplicates_remain_blocking_in_both_paths(self):
+        with tempfile.TemporaryDirectory() as temp_text:
+            artifact = Path(temp_text) / "duplicate-runtime.jar"
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                with zipfile.ZipFile(artifact, "w") as archive:
+                    archive.writestr("config/runtime.xml", b"first")
+                    archive.writestr("config/runtime.xml", b"second")
+            with zipfile.ZipFile(artifact) as archive, self.assertRaises(
+                production_artifact.BinaryArtifactDiffError
+            ) as caught:
+                production_artifact.select_runtime_resource_entries(
+                    archive, 17
+                )
+            inventory = oracle._archive_inventory(artifact, 17)
+
+        self.assertEqual(
+            caught.exception.reason_code,
+            "ARTIFACT_RUNTIME_RESOURCE_DUPLICATE",
+        )
+        self.assertEqual(
+            inventory["failures"],
+            ["duplicate_resource:config/runtime.xml:0"],
+        )
+
+    def test_low_memory_preflight_emits_nonblocking_progress_warning(self):
+        events = []
+
+        def progress(*event):
+            events.append(event)
+
+        with patch.object(
+            oracle,
+            "system_available_memory_bytes",
+            return_value=1024,
+        ), patch.object(
+            oracle,
+            "validate_oracle_tool_execution_policy",
+            side_effect=RuntimeError("stop after memory preflight"),
+        ), self.assertRaisesRegex(RuntimeError, "stop after memory preflight"):
+            oracle.validate_generation(
+                {}, Path("unused-generation"), progress_callback=progress
+            )
+
+        self.assertEqual(events[0][0], "validation-memory-preflight")
+        self.assertEqual(events[0][2], 1024)
+        self.assertEqual(
+            events[0][3], oracle.LOW_AVAILABLE_MEMORY_WARNING_BYTES
+        )
+
     def test_immutable_sqlite_setup_failure_closes_connection(self):
         class FailingConnection:
             def __init__(self):

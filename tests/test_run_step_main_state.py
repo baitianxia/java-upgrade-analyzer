@@ -666,6 +666,16 @@ class RunStepMainStateTest(unittest.TestCase):
             self.assertEqual(failure["traceback"], "line 1")
             self.assertIn("traceback detail", failure["run_log_tail"])
             self.assertIn("ORACLE_FAILED", failure["failure_reason_codes"])
+            latest_failure = json.loads((
+                report
+                / run_step.BINARY_OUTPUT_RELATIVE_PATH
+                / "binary_observability"
+                / "latest_failure.json"
+            ).read_text(encoding="utf-8"))
+            self.assertEqual(
+                latest_failure["binary_failure_identity"],
+                failure["binary_failure_identity"],
+            )
 
     def test_step4_pre_pipeline_failure_ignores_stale_phase_progress(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2737,6 +2747,50 @@ class RunStepMainStateTest(unittest.TestCase):
                     disposition["action"],
                     run_step._STEP4_RELEASE_RESUME_PIPELINE,
                 )
+
+    def test_explicit_rerun_discards_schema_less_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp).resolve() / ".upgrade-report"
+            checkpoint = run_step._step4_validation_checkpoint_path(report)
+            checkpoint.parent.mkdir(parents=True)
+            checkpoint.write_text("{}\n", encoding="utf-8")
+
+            with self.assertRaises(run_step.StepError) as blocked:
+                run_step._recover_binary_step4_transaction(report)
+            recovery = run_step._recover_binary_step4_transaction(
+                report, discard_invalid_checkpoint=True
+            )
+
+            self.assertIn(
+                "BINARY_STEP4_TRANSACTION_RECOVERY_FAILED",
+                blocked.exception.reason_codes,
+            )
+            self.assertEqual(
+                recovery, "discarded_invalid_checkpoint_for_rerun"
+            )
+            self.assertFalse(checkpoint.exists())
+
+    def test_startup_checkpoint_discard_requires_explicit_regeneration(self):
+        auto_args = SimpleNamespace(step="auto")
+        explicit_args = SimpleNamespace(step="step4")
+
+        self.assertFalse(
+            run_step._startup_discards_invalid_step4_checkpoint(
+                auto_args, {}, "step4"
+            )
+        )
+        self.assertTrue(
+            run_step._startup_discards_invalid_step4_checkpoint(
+                explicit_args, {}, "step4"
+            )
+        )
+        self.assertTrue(
+            run_step._startup_discards_invalid_step4_checkpoint(
+                auto_args,
+                {"action": "restart_from_step", "restart_step_id": "step3"},
+                "step3",
+            )
+        )
 
     def test_step4_startup_rolls_back_activation_before_report_started(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -6782,6 +6836,25 @@ class RunStepMainStateTest(unittest.TestCase):
 
         self.assertIsNone(captured["timeout"])
         self.assertEqual(captured["cwd"], tmp)
+
+    def test_run_python_streams_binary_pipeline_progress_from_stderr(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            captured = {}
+
+            def fake_run_cmd(_cmd, **kwargs):
+                captured.update(kwargs)
+                return "", "oracle progress\n", 0
+
+            with patch.object(
+                run_step, "run_cmd", side_effect=fake_run_cmd
+            ), patch.object(run_step, "print_output") as print_mock:
+                run_step.run_python(
+                    "binary_pipeline.py", [], tmp, report_dir=tmp
+                )
+
+        self.assertTrue(captured["stream_output"])
+        self.assertFalse(captured["stream_stdout"])
+        print_mock.assert_called_once_with("", "")
 
     def test_run_python_preserves_structured_pipeline_failure_diagnostics(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -59,6 +59,7 @@ from binary_output import (
     activate_binary_generation,
     binary_publication_reauthorization_receipt,
     is_complete_v3_validation_result,
+    prune_unreferenced_binary_generations,
     read_pending_binary_generation,
     read_binary_generation_publication_authority_binding,
     seal_active_binary_generation,
@@ -413,6 +414,41 @@ def _write_non_authoritative_json(
     except (OSError, UnicodeError, TypeError, ValueError):
         return False
     return True
+
+
+def _prune_unreferenced_generations_best_effort(
+    output_root: Path,
+    *,
+    protected_generation_identities: Iterable[str] = (),
+) -> dict[str, Any]:
+    """Reclaim stale generation bytes without making cleanup a result gate."""
+
+    try:
+        summary = prune_unreferenced_binary_generations(
+            output_root,
+            protected_generation_identities=protected_generation_identities,
+        )
+    except (BinaryOutputError, OSError, RuntimeError) as error:
+        summary = {
+            "schema": "java-upgrade-analyzer.binary-generation-gc.v1",
+            "removed_generation_identities": [],
+            "retained_generation_identities": [],
+            "skipped_entries": [],
+            "failures": [{
+                "generation_identity": "",
+                "error_type": type(error).__name__,
+                "reason_code": str(getattr(error, "reason_code", "") or ""),
+                "detail": str(error),
+            }],
+            "removed_count": 0,
+            "retained_count": 0,
+            "failure_count": 1,
+        }
+    _write_non_authoritative_json(
+        output_root / "binary_observability" / "latest_generation_gc.json",
+        summary,
+    )
+    return summary
 
 
 def _write_text_atomic_durable(path: str | Path, content: str) -> Path:
@@ -1868,11 +1904,16 @@ def _resume_checkpoint_content_identity(payload: Mapping[str, Any]) -> str:
     )
 
 
-def _write_resume_checkpoint(output_root: Path, payload: Mapping[str, Any]) -> Path:
+def _normalized_resume_checkpoint(payload: Mapping[str, Any]) -> dict[str, Any]:
     normalized = dict(payload)
     normalized["checkpoint_content_identity"] = (
         _resume_checkpoint_content_identity(normalized)
     )
+    return normalized
+
+
+def _write_resume_checkpoint(output_root: Path, payload: Mapping[str, Any]) -> Path:
+    normalized = _normalized_resume_checkpoint(payload)
     content = json.dumps(
         normalized,
         ensure_ascii=False,
@@ -1907,6 +1948,31 @@ def _write_resume_checkpoint(output_root: Path, payload: Mapping[str, Any]) -> P
             "BINARY_RESUME_CHECKPOINT_WRITE_FAILED",
             f"cannot durably write validation checkpoint {destination}: {error}",
         ) from error
+
+
+def _write_resume_checkpoint_roundtrip(
+    output_root: Path,
+    payload: Mapping[str, Any],
+    *,
+    reason_code: str = "BINARY_RESUME_CHECKPOINT_ROUNDTRIP_FAILED",
+) -> dict[str, Any]:
+    """Durably write a checkpoint and prove the exact bytes are readable.
+
+    A checkpoint is authoritative only for crash recovery.  Returning a
+    silent empty mapping after a known write turns an observability glitch
+    into a schema-less state transition, so the producer must fail at the
+    write boundary instead.
+    """
+
+    expected = _normalized_resume_checkpoint(payload)
+    _write_resume_checkpoint(output_root, expected)
+    persisted = _read_resume_checkpoint(output_root)
+    if persisted != expected:
+        raise BinaryPipelineError(
+            reason_code,
+            str(_resume_checkpoint_path(output_root)),
+        )
+    return persisted
 
 
 def _rebind_resume_checkpoint_performance_authority(
@@ -1957,18 +2023,11 @@ def _rebind_resume_checkpoint_performance_authority(
         **dict(checkpoint),
         "performance_authority_gate_binding": dict(current_binding),
     }
-    _write_resume_checkpoint(output_root, updated)
-    persisted = _read_resume_checkpoint(output_root)
-    expected_persisted = dict(updated)
-    expected_persisted["checkpoint_content_identity"] = (
-        _resume_checkpoint_content_identity(expected_persisted)
+    return _write_resume_checkpoint_roundtrip(
+        output_root,
+        updated,
+        reason_code="BINARY_RESUME_PERFORMANCE_AUTHORITY_REBIND_FAILED",
     )
-    if persisted != expected_persisted:
-        raise BinaryPipelineError(
-            "BINARY_RESUME_PERFORMANCE_AUTHORITY_REBIND_FAILED",
-            str(_resume_checkpoint_path(output_root)),
-        )
-    return persisted
 
 
 def _delete_resume_checkpoint_durable(output_root: Path) -> bool:
@@ -2082,7 +2141,6 @@ def _checkpoint_stat_identity(value: os.stat_result) -> tuple[int, ...]:
         int(value.st_nlink),
         int(value.st_size),
         int(getattr(value, "st_mtime_ns", int(value.st_mtime * 1_000_000_000))),
-        int(getattr(value, "st_ctime_ns", int(value.st_ctime * 1_000_000_000))),
     )
 
 
@@ -2970,6 +3028,22 @@ def _persist_validation_checkpoint(
     checkpoint: Mapping[str, Any],
     validation: Mapping[str, Any],
 ) -> dict[str, Any]:
+    if (
+        checkpoint.get("schema") != RESUME_CHECKPOINT_SCHEMA
+        or checkpoint.get("status") not in {
+            _RESUME_AWAITING_VALIDATION,
+            _RESUME_VALIDATION_FAILED,
+            _RESUME_VALIDATION_PASSED,
+        }
+        or checkpoint.get("result_generation_identity")
+        != manifest.get("result_generation_identity")
+        or checkpoint.get("checkpoint_content_identity")
+        != _resume_checkpoint_content_identity(checkpoint)
+    ):
+        raise BinaryPipelineError(
+            "BINARY_VALIDATION_CHECKPOINT_STATE_INVALID",
+            str(_resume_checkpoint_path(output_root)),
+        )
     status = str(validation.get("status") or "")
     if status not in {"passed", "failed"}:
         raise BinaryPipelineError(
@@ -3041,8 +3115,11 @@ def _persist_validation_checkpoint(
         updated["activation_identity"] = activation_identity
     else:
         updated.pop("activation_identity", None)
-    _write_resume_checkpoint(output_root, updated)
-    return _read_resume_checkpoint(output_root)
+    return _write_resume_checkpoint_roundtrip(
+        output_root,
+        updated,
+        reason_code="BINARY_VALIDATION_CHECKPOINT_ROUNDTRIP_FAILED",
+    )
 
 
 def _quarantine_resume_generation(
@@ -3622,7 +3699,7 @@ def _resume_generation_validation(
 class _ArtifactDigestRecord:
     content_sha256: str
     byte_length: int
-    file_identity: tuple[int, int, int, int, int]
+    file_identity: tuple[int, int, int, int]
 
 
 class _ArtifactDigestSession:
@@ -3650,13 +3727,12 @@ class _ArtifactDigestSession:
         self.parallel_hash_file_count = 0
 
     @staticmethod
-    def _file_identity(stat_result) -> tuple[int, int, int, int, int]:
+    def _file_identity(stat_result) -> tuple[int, int, int, int]:
         return (
             int(stat_result.st_dev),
             int(stat_result.st_ino),
             int(stat_result.st_size),
             int(getattr(stat_result, "st_mtime_ns", stat_result.st_mtime * 1e9)),
-            int(getattr(stat_result, "st_ctime_ns", stat_result.st_ctime * 1e9)),
         )
 
     @staticmethod
@@ -6231,7 +6307,18 @@ def _run_pipeline_under_lock(
         ],
     )
     if resumed_result is not None:
+        if (
+            not retain_validation_checkpoint
+            or resumed_result.get("activation_candidate_discarded") is True
+        ):
+            _prune_unreferenced_generations_best_effort(output_root)
         return resumed_result
+    # A checkpoint that reached this point was either absent or explicitly
+    # rejected by the resume decision above.  Remove its stale reference before
+    # reclaiming generations so a failed old attempt cannot consume another
+    # full generation's worth of disk during this rerun.
+    _delete_resume_checkpoint_durable(output_root)
+    _prune_unreferenced_generations_best_effort(output_root)
     input_profile_started = time.perf_counter()
     platform_started = input_profile_started
     base_jdk_home = Path(
@@ -7138,8 +7225,9 @@ def _run_pipeline_under_lock(
                     else None
                 ),
             }
-            _write_resume_checkpoint(output_root, validation_checkpoint)
-            validation_checkpoint = _read_resume_checkpoint(output_root)
+            validation_checkpoint = _write_resume_checkpoint_roundtrip(
+                output_root, validation_checkpoint
+            )
             # Independent validation reconstructs its own truth from immutable
             # output. Release production graphs and serialized sidecar buffers
             # first so their complete base/current object graphs do not overlap
@@ -7312,6 +7400,16 @@ def _run_pipeline_under_lock(
                 **activation_record,
                 **checkpoint_receipt,
             }
+            # The isolated performance worker still has to read the immutable
+            # validation attachment and generation metrics after this call
+            # returns. Its private root is removed as a whole by the harness,
+            # so generation GC here would both race that read and save no
+            # persistent disk space.
+            if (
+                not performance_measurement_run
+                and (not checkpoint_receipt or candidate_discarded)
+            ):
+                _prune_unreferenced_generations_best_effort(output_root)
             return result
         finally:
             primary = sys.exc_info()[1]

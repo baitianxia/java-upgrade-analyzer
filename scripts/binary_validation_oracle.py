@@ -33,6 +33,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 import zlib
 
+from artifact_safety import is_allowed_duplicate_archive_entry
 from binary_first_contract import (
     BinaryFirstContractError,
     canonical_identity,
@@ -48,6 +49,7 @@ from binary_validation_contract import (
 from binary_tool_execution import execute_binary_tool, tool_failure_is_retryable
 from jdk_preflight import JdkPreflightError, jdk_tool_path, preflight_jdk_home
 from progress_logging import emit_progress
+from process_metrics import system_available_memory_bytes
 from streaming_json import (
     files_equal,
     fsync_directory,
@@ -76,6 +78,7 @@ LOADING_CONSTRAINT_TYPE_OWNERS_KEY = "loading_constraint_type_owners"
 # closure.  Batching preserves the independent JVM observation while bounding
 # metaspace, reflection metadata and captured JSON for each child process.
 MAX_CLASSES_PER_RUNTIME_ORACLE_PROCESS = 2_000
+LOW_AVAILABLE_MEMORY_WARNING_BYTES = 4 * 1024 * 1024 * 1024
 # Avoid process-startup concurrency for tiny projects/tests. Above this point
 # each batch has enough reflection work to amortize one isolated JVM process.
 MIN_CLASSES_FOR_CONCURRENT_RUNTIME_ORACLE = 4_000
@@ -917,6 +920,10 @@ def _archive_inventory(path: Path, target_major: int) -> dict[str, Any]:
                 continue
             version = max(eligible)
             if len(versions[version]) != 1:
+                if is_allowed_duplicate_archive_entry(
+                    name, allow_duplicate_maven_metadata=True
+                ):
+                    continue
                 failures.append(f"duplicate_resource:{name}:{version}")
                 continue
             resources[name] = [versions[version][0]]
@@ -7487,6 +7494,25 @@ def validate_generation(
     # later run cannot inherit stale filesystem/symlink state.
     _file_url_path.cache_clear()
     progress_callback = progress_callback or _environment_progress_callback()
+    try:
+        available_memory = system_available_memory_bytes()
+    # This is an advisory preflight only.  Platform probes may fail in ways
+    # other than OSError (for example a missing ctypes symbol on an unusual
+    # Windows runtime); validation itself must remain authoritative.
+    except Exception:
+        available_memory = None
+    if (
+        available_memory is not None
+        and available_memory < LOW_AVAILABLE_MEMORY_WARNING_BYTES
+    ):
+        _notify_progress(
+            progress_callback,
+            "validation-memory-preflight",
+            "可用内存低于 4 GiB；将继续使用分批校验，系统可能出现换页",
+            available_memory,
+            LOW_AVAILABLE_MEMORY_WARNING_BYTES,
+            f"available_memory_bytes={available_memory}",
+        )
     tool_policy = validate_oracle_tool_execution_policy(config)
     requested_generation = Path(generation_directory).expanduser()
     if requested_generation.is_symlink():

@@ -104,6 +104,12 @@
     "tests.blackbox.test_public_artifact_safety.PublicArtifactSafetyBlackboxTest.test_every_archive_and_helper_budget_is_enforced_publicly",
     "tests.windows_native_contract.WindowsNativeContractTest.test_required_native_toolchain_is_available",
     "tests.windows_native_contract.WindowsNativeContractTest.test_native_process_metrics_report_cpu_and_peak_memory",
+    "tests.windows_native_contract.WindowsNativeContractTest.test_native_available_memory_preflight_reports_physical_bytes",
+    "tests.windows_native_contract.WindowsNativeContractTest.test_native_generation_file_fsync_accepts_owned_file",
+    "tests.windows_native_contract.WindowsNativeContractTest.test_native_report_file_fsync_accepts_owned_file",
+    "tests.windows_native_contract.WindowsNativeContractTest.test_native_checkpoint_write_read_roundtrip_is_exact",
+    "tests.windows_native_contract.WindowsNativeContractTest.test_native_path_and_descriptor_checkpoint_identity_match",
+    "tests.windows_native_contract.WindowsNativeContractTest.test_native_duplicate_maven_metadata_policy_is_symmetric",
     "tests.windows_native_contract.WindowsNativeContractTest.test_native_tool_failures_are_typed_without_shell",
     "tests.windows_native_contract.WindowsNativeContractTest.test_cmd_and_bat_wrappers_preserve_unicode_and_metacharacters",
     "tests.windows_native_contract.WindowsNativeContractTest.test_near_limit_unicode_path_survives_git_and_atomic_json",
@@ -138,6 +144,12 @@
     "tests.blackbox.test_public_artifact_safety.PublicArtifactSafetyBlackboxTest.test_every_archive_and_helper_budget_is_enforced_publicly",
     "tests.windows_native_contract.WindowsNativeContractTest.test_required_native_toolchain_is_available",
     "tests.windows_native_contract.WindowsNativeContractTest.test_native_process_metrics_report_cpu_and_peak_memory",
+    "tests.windows_native_contract.WindowsNativeContractTest.test_native_available_memory_preflight_reports_physical_bytes",
+    "tests.windows_native_contract.WindowsNativeContractTest.test_native_generation_file_fsync_accepts_owned_file",
+    "tests.windows_native_contract.WindowsNativeContractTest.test_native_report_file_fsync_accepts_owned_file",
+    "tests.windows_native_contract.WindowsNativeContractTest.test_native_checkpoint_write_read_roundtrip_is_exact",
+    "tests.windows_native_contract.WindowsNativeContractTest.test_native_path_and_descriptor_checkpoint_identity_match",
+    "tests.windows_native_contract.WindowsNativeContractTest.test_native_duplicate_maven_metadata_policy_is_symmetric",
     "tests.windows_native_contract.WindowsNativeContractTest.test_native_tool_failures_are_typed_without_shell",
     "tests.windows_native_contract.WindowsNativeContractTest.test_cmd_and_bat_wrappers_preserve_unicode_and_metacharacters",
     "tests.windows_native_contract.WindowsNativeContractTest.test_near_limit_unicode_path_survives_git_and_atomic_json",
@@ -183,5 +195,5 @@
       ]
     }
   },
-  "minimum_windows_test_count": 104
+  "minimum_windows_test_count": 110
 }

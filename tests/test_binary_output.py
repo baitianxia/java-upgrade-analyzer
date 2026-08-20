@@ -7,6 +7,7 @@ import io
 import json
 import os
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -46,6 +47,136 @@ from signature_utils import jvm_method_parameter_signature  # noqa: E402
 
 
 class BinaryOutputTest(unittest.TestCase):
+    def test_windows_regular_file_fsync_uses_read_write_descriptor(self):
+        opened = Mock(st_mode=stat.S_IFREG | 0o600)
+        with patch.object(binary_output.os, "name", "nt"), patch.object(
+            binary_output.os, "open", return_value=91
+        ) as open_mock, patch.object(
+            binary_output.os, "fstat", return_value=opened
+        ), patch.object(binary_output.os, "fsync") as fsync_mock, patch.object(
+            binary_output.os, "close"
+        ) as close_mock:
+            binary_output._fsync_regular_file(Path("generation.json"))
+
+        flags = open_mock.call_args.args[1]
+        self.assertEqual(flags & os.O_RDWR, os.O_RDWR)
+        fsync_mock.assert_called_once_with(91)
+        close_mock.assert_called_once_with(91)
+
+    def test_generation_gc_preserves_all_live_references(self):
+        with tempfile.TemporaryDirectory() as temp_text:
+            output = Path(temp_text).resolve() / "binary-output"
+            generations = output / "binary_generations"
+            generations.mkdir(parents=True)
+            active_identity = "a" * 64
+            pending_identity = "b" * 64
+            stale_identity = "c" * 64
+            for identity in (
+                active_identity, pending_identity, stale_identity
+            ):
+                generation = generations / identity
+                generation.mkdir()
+                (generation / "payload").write_text(
+                    identity, encoding="utf-8"
+                )
+            unknown = generations / "operator-notes"
+            unknown.mkdir()
+            active = {
+                "schema": "java-upgrade-analyzer.active-binary-generation.v1",
+                "result_generation_identity": active_identity,
+                "generation_directory": f"binary_generations/{active_identity}",
+                "validation_run_identity": "1" * 64,
+                "validation_result_sha256": "2" * 64,
+            }
+            (output / "active_binary_generation.json").write_text(
+                json.dumps(active), encoding="utf-8"
+            )
+            observability = output / "binary_observability"
+            observability.mkdir()
+            pending = {
+                "schema": "java-upgrade-analyzer.active-binary-generation.v1",
+                "result_generation_identity": pending_identity,
+                "generation_directory": f"binary_generations/{pending_identity}",
+                "validation_run_identity": "3" * 64,
+                "validation_result_sha256": "4" * 64,
+                "activation_identity": "5" * 64,
+                "activation_predecessor": active,
+                "activation_state": "pending",
+            }
+            (
+                observability / "pending_active_binary_generation.json"
+            ).write_text(json.dumps(pending), encoding="utf-8")
+
+            summary = binary_output.prune_unreferenced_binary_generations(
+                output
+            )
+
+            self.assertTrue((generations / active_identity).is_dir())
+            self.assertTrue((generations / pending_identity).is_dir())
+            self.assertFalse((generations / stale_identity).exists())
+            self.assertTrue(unknown.is_dir())
+            self.assertEqual(
+                summary["removed_generation_identities"], [stale_identity]
+            )
+            self.assertEqual(
+                set(summary["retained_generation_identities"]),
+                {active_identity, pending_identity},
+            )
+            self.assertEqual(summary["skipped_entries"], ["operator-notes"])
+
+    def test_generation_gc_reports_delete_failure_without_blocking(self):
+        with tempfile.TemporaryDirectory() as temp_text:
+            output = Path(temp_text).resolve() / "binary-output"
+            stale_identity = "d" * 64
+            stale = output / "binary_generations" / stale_identity
+            stale.mkdir(parents=True)
+
+            with patch.object(
+                binary_output,
+                "_rmtree_missing_ok",
+                side_effect=OSError("generation is busy"),
+            ):
+                summary = binary_output.prune_unreferenced_binary_generations(
+                    output
+                )
+
+            self.assertTrue(stale.is_dir())
+            self.assertEqual(summary["removed_count"], 0)
+            self.assertEqual(summary["failure_count"], 1)
+            self.assertEqual(
+                summary["failures"][0]["generation_identity"],
+                stale_identity,
+            )
+
+    def test_windows_report_durability_uses_read_write_descriptor(self):
+        opened = Mock(
+            st_mode=stat.S_IFREG | 0o600,
+            st_nlink=1,
+            st_dev=1,
+            st_ino=2,
+            st_size=2,
+            st_mtime_ns=3,
+            st_ctime_ns=4,
+        )
+        handle = io.BytesIO(b"{}")
+        handle.fileno = Mock(return_value=91)
+        with patch.object(binary_report.os, "name", "nt"), patch.object(
+            binary_report.os, "lstat", return_value=opened
+        ), patch.object(
+            binary_report.os, "open", return_value=91
+        ) as open_mock, patch.object(
+            binary_report.os, "fstat", return_value=opened
+        ), patch.object(
+            binary_report.os, "fdopen", return_value=handle
+        ), patch.object(binary_report.os, "fsync"):
+            digest = binary_report._report_file_sha256(
+                Path("report.json"), make_durable=True
+            )
+
+        flags = open_mock.call_args.args[1]
+        self.assertEqual(flags & os.O_RDWR, os.O_RDWR)
+        self.assertEqual(digest, hashlib.sha256(b"{}").hexdigest())
+
     def _write_step6_manifest_and_step3_contract(self, report: Path) -> None:
         dependencies = report / "evidence" / "dependencies"
         static = report / "evidence" / "static_scan"

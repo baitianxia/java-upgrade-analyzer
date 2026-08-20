@@ -85,6 +85,59 @@ def jdk_home():
 
 
 class BinaryPipelineTest(unittest.TestCase):
+    def test_checkpoint_identity_ignores_windows_ctime_api_difference(self):
+        common = {
+            "st_dev": 1,
+            "st_ino": 2,
+            "st_mode": 0o100600,
+            "st_nlink": 1,
+            "st_size": 42,
+            "st_mtime": 1.0,
+            "st_mtime_ns": 123,
+        }
+        path_stat = Mock(**common, st_ctime_ns=10)
+        descriptor_stat = Mock(**common, st_ctime_ns=20)
+
+        self.assertEqual(
+            binary_pipeline._checkpoint_stat_identity(path_stat),
+            binary_pipeline._checkpoint_stat_identity(descriptor_stat),
+        )
+
+    def test_checkpoint_write_roundtrip_fails_before_empty_state_can_flow(self):
+        with patch.object(
+            binary_pipeline, "_write_resume_checkpoint"
+        ) as write_mock, patch.object(
+            binary_pipeline, "_read_resume_checkpoint", return_value={}
+        ), self.assertRaises(BinaryPipelineError) as caught:
+            binary_pipeline._write_resume_checkpoint_roundtrip(
+                Path("output"),
+                {"schema": binary_pipeline.RESUME_CHECKPOINT_SCHEMA},
+            )
+
+        write_mock.assert_called_once()
+        self.assertEqual(
+            caught.exception.reason_code,
+            "BINARY_RESUME_CHECKPOINT_ROUNDTRIP_FAILED",
+        )
+
+    def test_validation_checkpoint_rejects_schema_less_source_state(self):
+        with patch.object(
+            binary_pipeline, "_write_resume_checkpoint_roundtrip"
+        ) as write_mock, self.assertRaises(BinaryPipelineError) as caught:
+            binary_pipeline._persist_validation_checkpoint(
+                Path("output"),
+                Path("generation"),
+                {"result_generation_identity": "a" * 64},
+                {},
+                {},
+            )
+
+        write_mock.assert_not_called()
+        self.assertEqual(
+            caught.exception.reason_code,
+            "BINARY_VALIDATION_CHECKPOINT_STATE_INVALID",
+        )
+
     @unittest.skipUnless(
         binary_pipeline._secure_resume_checkpoint_dirfd_supported(),
         "checkpoint mutation requires POSIX dir_fd support",

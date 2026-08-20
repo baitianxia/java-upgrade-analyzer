@@ -386,8 +386,13 @@ def _fsync_directory(path: Path) -> bool:
 def _fsync_regular_file(path: Path) -> None:
     """Synchronize one already-validated generation file without following links."""
 
+    # CPython implements os.fsync with the Windows CRT ``_commit`` call.
+    # Unlike POSIX fsync, _commit rejects a descriptor opened read-only with
+    # EBADF.  Generation files are owned writable files at this point, so use
+    # a read/write descriptor only on Windows and retain the narrower POSIX
+    # access mode everywhere else.
     flags = (
-        os.O_RDONLY
+        (os.O_RDWR if os.name == "nt" else os.O_RDONLY)
         | int(getattr(os, "O_NOFOLLOW", 0) or 0)
         | int(getattr(os, "O_BINARY", 0) or 0)
     )
@@ -443,7 +448,10 @@ def _regular_file_snapshot(value: os.stat_result) -> _StatSnapshot:
         int(value.st_nlink),
         int(value.st_size),
         int(value.st_mtime_ns),
-        int(value.st_ctime_ns),
+        # Windows may expose different creation/change-time values for lstat
+        # and fstat on the same file.  It is not a stable cross-API identity;
+        # content hashes, inode/device, size and mtime remain enforced.
+        0 if os.name == "nt" else int(value.st_ctime_ns),
     )
 
 
@@ -1678,7 +1686,11 @@ def _read_active_descriptor(
                 or final_path_stat.st_nlink != 1
                 or final_opened_stat.st_size != opened_stat.st_size
                 or final_opened_stat.st_mtime_ns != opened_stat.st_mtime_ns
-                or final_opened_stat.st_ctime_ns != opened_stat.st_ctime_ns
+                or (
+                    os.name != "nt"
+                    and final_opened_stat.st_ctime_ns
+                    != opened_stat.st_ctime_ns
+                )
             ):
                 raise BinaryOutputError(
                     "BINARY_ACTIVE_GENERATION_DESCRIPTOR_INVALID",
@@ -1977,6 +1989,142 @@ def read_pending_binary_generation(
             "BINARY_ACTIVE_GENERATION_ACTIVATION_RECEIPT_INVALID", expected
         )
     return normalized
+
+
+def prune_unreferenced_binary_generations(
+    output_root: str | Path,
+    *,
+    protected_generation_identities: Iterable[str] = (),
+) -> dict[str, Any]:
+    """Remove content-addressed generations with no live recovery reference.
+
+    The active descriptor, a pending activation and both of their predecessors
+    are read while holding the descriptor lock.  Callers may additionally
+    protect a generation referenced by a validated resume checkpoint.  Unknown
+    directory names and non-physical leaves are never touched.
+    """
+
+    requested_root = Path(output_root).expanduser()
+    summary: dict[str, Any] = {
+        "schema": "java-upgrade-analyzer.binary-generation-gc.v1",
+        "removed_generation_identities": [],
+        "retained_generation_identities": [],
+        "skipped_entries": [],
+        "failures": [],
+        "protected_generation_identities": [],
+        "removed_count": 0,
+        "retained_count": 0,
+        "failure_count": 0,
+    }
+    try:
+        root = _canonical_physical_output_root(
+            requested_root,
+            reason_code="BINARY_GENERATION_GC_ROOT_INVALID",
+        )
+    except BinaryOutputError as error:
+        if not requested_root.exists() and not requested_root.is_symlink():
+            return summary
+        raise
+
+    protected = set()
+    for identity in protected_generation_identities:
+        normalized = str(identity or "")
+        if not _is_sha256_identity(normalized):
+            raise BinaryOutputError(
+                "BINARY_GENERATION_GC_PROTECTED_IDENTITY_INVALID", normalized
+            )
+        protected.add(normalized)
+
+    def protect_descriptor(value: Any) -> None:
+        core = _active_descriptor_core(value)
+        if core is not None:
+            protected.add(core["result_generation_identity"])
+        if isinstance(value, Mapping):
+            predecessor = _active_descriptor_core(
+                value.get("activation_predecessor")
+            )
+            if predecessor is not None:
+                protected.add(predecessor["result_generation_identity"])
+
+    try:
+        with _active_generation_lock(root):
+            active, _active_identity = _read_active_descriptor(
+                root, missing_ok=True
+            )
+            if active is not None and _active_descriptor_core(active) is None:
+                raise BinaryOutputError(
+                    "BINARY_GENERATION_GC_REFERENCE_INVALID",
+                    str(root / "active_binary_generation.json"),
+                )
+            pending, _pending_identity = _read_active_descriptor(
+                root,
+                missing_ok=True,
+                relative_path=_PENDING_ACTIVE_DESCRIPTOR_RELATIVE_PATH,
+            )
+            if pending is not None and _pending_active_descriptor(pending) is None:
+                raise BinaryOutputError(
+                    "BINARY_GENERATION_GC_REFERENCE_INVALID",
+                    str(root / _PENDING_ACTIVE_DESCRIPTOR_RELATIVE_PATH),
+                )
+            protect_descriptor(active)
+            protect_descriptor(pending)
+            try:
+                generations = _physical_generation_namespace(
+                    root,
+                    create=False,
+                    reason_code="BINARY_GENERATION_GC_NAMESPACE_INVALID",
+                )
+            except BinaryOutputError:
+                if not (root / "binary_generations").exists():
+                    summary["protected_generation_identities"] = sorted(
+                        protected
+                    )
+                    return summary
+                raise
+
+            removed_any = False
+            for child in sorted(generations.iterdir(), key=lambda item: item.name):
+                identity = child.name
+                if not _is_sha256_identity(identity):
+                    summary["skipped_entries"].append(identity)
+                    continue
+                if identity in protected:
+                    summary["retained_generation_identities"].append(identity)
+                    continue
+                try:
+                    physical = _physical_generation_directory(
+                        generations,
+                        identity,
+                        reason_code="BINARY_GENERATION_GC_ENTRY_INVALID",
+                    )
+                    _rmtree_missing_ok(physical)
+                    removed_any = True
+                    summary["removed_generation_identities"].append(identity)
+                except (BinaryOutputError, OSError) as error:
+                    summary["failures"].append({
+                        "generation_identity": identity,
+                        "error_type": type(error).__name__,
+                        "detail": str(error),
+                    })
+            if removed_any:
+                try:
+                    _fsync_directory(generations)
+                except OSError as error:
+                    summary["failures"].append({
+                        "generation_identity": "",
+                        "error_type": type(error).__name__,
+                        "detail": f"generation namespace fsync failed: {error}",
+                    })
+    except _ActiveGenerationLockAcquireTimeout as error:
+        raise BinaryOutputError(
+            "BINARY_GENERATION_GC_LOCK_TIMEOUT", str(error)
+        ) from error
+
+    summary["protected_generation_identities"] = sorted(protected)
+    summary["removed_count"] = len(summary["removed_generation_identities"])
+    summary["retained_count"] = len(summary["retained_generation_identities"])
+    summary["failure_count"] = len(summary["failures"])
+    return summary
 
 
 def _public_active_is_sealed(value: Any) -> bool:
@@ -4472,6 +4620,7 @@ __all__ = [
     "compare_and_restore_active_binary_generation",
     "is_complete_v3_validation_result",
     "publish_pending_binary_generation",
+    "prune_unreferenced_binary_generations",
     "read_active_binary_generation",
     "read_binary_generation_publication_authority_binding",
     "read_pending_binary_generation",

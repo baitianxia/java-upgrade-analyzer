@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import ctypes
 from ctypes import wintypes
+import os
 import sys
 
 
@@ -27,6 +28,20 @@ class _ProcessMemoryCounters(ctypes.Structure):
         ("quota_non_paged_pool_usage", ctypes.c_size_t),
         ("pagefile_usage", ctypes.c_size_t),
         ("peak_pagefile_usage", ctypes.c_size_t),
+    ]
+
+
+class _MemoryStatusEx(ctypes.Structure):
+    _fields_ = [
+        ("dwLength", wintypes.DWORD),
+        ("dwMemoryLoad", wintypes.DWORD),
+        ("ullTotalPhys", ctypes.c_ulonglong),
+        ("ullAvailPhys", ctypes.c_ulonglong),
+        ("ullTotalPageFile", ctypes.c_ulonglong),
+        ("ullAvailPageFile", ctypes.c_ulonglong),
+        ("ullTotalVirtual", ctypes.c_ulonglong),
+        ("ullAvailVirtual", ctypes.c_ulonglong),
+        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
     ]
 
 
@@ -98,4 +113,35 @@ def windows_current_process_usage(
     )
 
 
-__all__ = ["WindowsProcessUsage", "windows_current_process_usage"]
+def system_available_memory_bytes(
+    platform_name: str | None = None,
+) -> int | None:
+    """Return immediately available physical memory when the host exposes it."""
+
+    platform_value = str(platform_name or sys.platform).lower()
+    if platform_value in {"nt", "win32", "windows"}:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        global_memory_status = kernel32.GlobalMemoryStatusEx
+        global_memory_status.argtypes = [ctypes.POINTER(_MemoryStatusEx)]
+        global_memory_status.restype = wintypes.BOOL
+        status = _MemoryStatusEx()
+        status.dwLength = ctypes.sizeof(status)
+        if not global_memory_status(ctypes.byref(status)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return int(status.ullAvailPhys)
+
+    try:
+        pages = int(os.sysconf("SC_AVPHYS_PAGES"))
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+    if pages < 0 or page_size <= 0:
+        return None
+    return pages * page_size
+
+
+__all__ = [
+    "WindowsProcessUsage",
+    "system_available_memory_bytes",
+    "windows_current_process_usage",
+]

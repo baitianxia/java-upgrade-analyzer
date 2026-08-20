@@ -6,6 +6,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import warnings
 from unittest import mock
 from pathlib import Path
 import zipfile
@@ -110,6 +111,33 @@ class BinaryArtifactDiffTest(unittest.TestCase):
             comparison_or_runtime_scope={"pairing": "pair-1"},
             asm_jar=self.asm_jar,
         )
+
+    def test_snapshot_inventories_duplicate_maven_metadata_without_runtime_winner(self):
+        metadata = "META-INF/maven/example/jmxmon/pom.xml"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            artifact = self.jar("duplicate-maven.jar", [
+                (metadata, b"first"),
+                (metadata, b"second"),
+            ])
+
+        with mock.patch.object(
+            diff,
+            "extract_class_facts",
+            side_effect=self.empty_fact_run,
+        ):
+            snapshot = diff.snapshot_archive(
+                artifact,
+                artifact_instance_identity="duplicate-maven",
+                expected_sha256=diff._sha256_file(artifact),
+                asm_jar=self.asm_jar,
+                target_jvm_major=17,
+            )
+
+        entries = [item for item in snapshot.entries if item.name == metadata]
+        self.assertEqual(len(entries), 2)
+        self.assertEqual([item.name_ordinal for item in entries], [0, 1])
+        self.assertFalse(any(item.runtime_effective for item in entries))
 
     def test_unknown_attribute_is_scoped_not_global_class_fact_loss(self):
         snapshot = diff.ArtifactSnapshot(

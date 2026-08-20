@@ -294,8 +294,8 @@
   "performance_gate": {
     "status": "passed",
     "path": "tests/fixtures/binary_first/performance_gate.json",
-    "sha256": "7ab8336d557770d8b5bc30fc058a55753f0f5d54e8a3d33211eddd5f15298899",
-    "source_implementation_identity": "8dffe0ab8263bd818e4e38e0567f6216281add882b9b6fc039e216b21657ddf6",
+    "sha256": "bdfdb7ab76d09274c3ea68323f1fbab2bfe0bd6e8d5eff8428ff404cab8989b4",
+    "source_implementation_identity": "c3abc9d48304f783e9874646afcd3a30160314b73136172ab981bb2130f6bc1d",
     "dataset": "400 JAR / 100000 class store + identical and one-JAR-changed full 400 JAR / 100000 class pipelines",
     "warm_parser_invocations": 0,
     "blocks_binary_authority_switch": false

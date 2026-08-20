@@ -1,6 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +20,20 @@ class ProcessMetricsTest(unittest.TestCase):
         self.assertIsNone(
             process_metrics.windows_current_process_usage("posix")
         )
+
+    def test_available_memory_uses_available_pages_not_total_pages(self):
+        values = {
+            "SC_AVPHYS_PAGES": 123,
+            "SC_PAGE_SIZE": 4096,
+        }
+        with patch.object(
+            process_metrics.os,
+            "sysconf",
+            side_effect=lambda name: values[name],
+        ):
+            available = process_metrics.system_available_memory_bytes("posix")
+
+        self.assertEqual(available, 123 * 4096)
 
 
 if __name__ == "__main__":

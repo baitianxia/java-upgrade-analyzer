@@ -46,7 +46,7 @@ class TestTrustGateTest(unittest.TestCase):
         self.assertEqual(result["counts"]["public_scenario_contracts"], 89)
         self.assertEqual(result["counts"]["public_scenario_dimensions"], 260)
         self.assertEqual(result["counts"]["public_support_claims"], 22)
-        self.assertEqual(result["counts"]["windows_selectors"], 32)
+        self.assertEqual(result["counts"]["windows_selectors"], 38)
         self.assertEqual(result["counts"]["windows_excluded_selectors"], 1)
 
     def test_required_windows_selector_cannot_be_silently_removed(self):

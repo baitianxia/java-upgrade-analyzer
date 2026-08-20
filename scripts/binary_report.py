@@ -779,7 +779,11 @@ def _report_file_sha256(path: Path, *, make_durable: bool = False) -> str:
     try:
         descriptor = os.open(
             path,
-            os.O_RDONLY
+            (
+                os.O_RDWR
+                if os.name == "nt" and make_durable
+                else os.O_RDONLY
+            )
             | int(getattr(os, "O_NOFOLLOW", 0) or 0)
             | int(getattr(os, "O_NONBLOCK", 0) or 0)
             | int(getattr(os, "O_BINARY", 0) or 0),
@@ -817,7 +821,11 @@ def _report_file_sha256(path: Path, *, make_durable: bool = False) -> str:
                 or final_path_stat.st_nlink != 1
                 or final_opened_stat.st_size != opened_stat.st_size
                 or final_opened_stat.st_mtime_ns != opened_stat.st_mtime_ns
-                or final_opened_stat.st_ctime_ns != opened_stat.st_ctime_ns
+                or (
+                    os.name != "nt"
+                    and final_opened_stat.st_ctime_ns
+                    != opened_stat.st_ctime_ns
+                )
             ):
                 raise BinaryReportError(
                     "BINARY_REPORT_PUBLICATION_CONTENT_INVALID",
@@ -984,7 +992,10 @@ def _copy_report_file_secure(source: Path, destination: Path) -> None:
             or final_path_stat.st_nlink != 1
             or final_opened_stat.st_size != opened_stat.st_size
             or final_opened_stat.st_mtime_ns != opened_stat.st_mtime_ns
-            or final_opened_stat.st_ctime_ns != opened_stat.st_ctime_ns
+            or (
+                os.name != "nt"
+                and final_opened_stat.st_ctime_ns != opened_stat.st_ctime_ns
+            )
         ):
             raise BinaryReportError(
                 "BINARY_REPORT_PUBLICATION_CONTENT_INVALID",
@@ -1075,7 +1086,10 @@ def _copy_report_directory_secure(
         if (
             (int(final_stat.st_dev), int(final_stat.st_ino)) != identity
             or final_stat.st_mtime_ns != initial_stat.st_mtime_ns
-            or final_stat.st_ctime_ns != initial_stat.st_ctime_ns
+            or (
+                os.name != "nt"
+                and final_stat.st_ctime_ns != initial_stat.st_ctime_ns
+            )
         ):
             raise BinaryReportError(
                 "BINARY_REPORT_PUBLICATION_CONTENT_INVALID",
@@ -1401,7 +1415,11 @@ def _read_private_publication_json(path: Path) -> dict[str, Any] | None:
                 or final_path_stat.st_nlink != 1
                 or final_opened_stat.st_size != opened_stat.st_size
                 or final_opened_stat.st_mtime_ns != opened_stat.st_mtime_ns
-                or final_opened_stat.st_ctime_ns != opened_stat.st_ctime_ns
+                or (
+                    os.name != "nt"
+                    and final_opened_stat.st_ctime_ns
+                    != opened_stat.st_ctime_ns
+                )
             ):
                 raise BinaryReportError(
                     "BINARY_REPORT_PUBLICATION_RECOVERY_INVALID",
@@ -1893,7 +1911,10 @@ def _load_publication_transaction(
             or current_stat.st_nlink != 1
             or opened_stat.st_size != marker_stat.st_size
             or opened_stat.st_mtime_ns != marker_stat.st_mtime_ns
-            or opened_stat.st_ctime_ns != marker_stat.st_ctime_ns
+            or (
+                os.name != "nt"
+                and opened_stat.st_ctime_ns != marker_stat.st_ctime_ns
+            )
         ):
             raise BinaryReportError(
                 "BINARY_REPORT_PUBLICATION_RECOVERY_INVALID",
@@ -1913,7 +1934,11 @@ def _load_publication_transaction(
                 or final_path_stat.st_nlink != 1
                 or final_opened_stat.st_size != opened_stat.st_size
                 or final_opened_stat.st_mtime_ns != opened_stat.st_mtime_ns
-                or final_opened_stat.st_ctime_ns != opened_stat.st_ctime_ns
+                or (
+                    os.name != "nt"
+                    and final_opened_stat.st_ctime_ns
+                    != opened_stat.st_ctime_ns
+                )
             ):
                 raise BinaryReportError(
                     "BINARY_REPORT_PUBLICATION_RECOVERY_INVALID",

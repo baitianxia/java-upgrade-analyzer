@@ -1499,7 +1499,6 @@ def _probe_artifact_stat_identity(value: os.stat_result) -> tuple[int, ...]:
         int(value.st_mode),
         int(value.st_size),
         int(getattr(value, "st_mtime_ns", int(value.st_mtime * 1_000_000_000))),
-        int(getattr(value, "st_ctime_ns", int(value.st_ctime * 1_000_000_000))),
     )
 
 
