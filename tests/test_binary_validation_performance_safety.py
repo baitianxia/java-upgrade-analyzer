@@ -12,6 +12,7 @@ import time
 import unittest
 import warnings
 import zipfile
+import zlib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -28,6 +29,158 @@ from binary_tool_execution import BinaryToolFailure, BinaryToolResult  # noqa: E
 
 
 class BinaryValidationPerformanceSafetyTest(unittest.TestCase):
+    def test_artifact_truth_identity_uses_bounded_native_fast_path(self):
+        rows = [
+            ("demo.Caller", "run", "()V", index)
+            for index in range(50)
+        ]
+        expected = oracle.canonical_identity_streaming(
+            "artifact-facts", rows, schema_version="1"
+        )
+        with patch.object(
+            oracle,
+            "canonical_identity_native_json",
+            wraps=oracle.canonical_identity_native_json,
+        ) as native, patch.object(
+            oracle,
+            "canonical_identity_streaming",
+            wraps=oracle.canonical_identity_streaming,
+        ) as streaming:
+            actual = oracle._artifact_truth_identity("artifact-facts", rows)
+        self.assertEqual(actual, expected)
+        native.assert_called_once()
+        streaming.assert_not_called()
+
+        with patch.object(
+            oracle, "_NATIVE_ARTIFACT_IDENTITY_MAX_ESTIMATED_BYTES", 1
+        ), patch.object(
+            oracle,
+            "canonical_identity_streaming",
+            wraps=oracle.canonical_identity_streaming,
+        ) as streaming:
+            bounded = oracle._artifact_truth_identity("artifact-facts", rows)
+        self.assertEqual(bounded, expected)
+        streaming.assert_called_once()
+
+    def test_large_item_progress_is_bounded_but_keeps_boundaries(self):
+        events = []
+        for current in range(1, 401):
+            oracle._notify_counted_progress(
+                lambda *event: events.append(event),
+                "validation-inventory",
+                "working",
+                current,
+                400,
+                f"artifact-{current}",
+            )
+
+        self.assertEqual(len(events), 21)
+        self.assertEqual(events[0][2:4], (1, 400))
+        self.assertEqual(events[-1][2:4], (400, 400))
+
+    def test_closed_world_disk_index_replays_all_transition_domains(self):
+        with tempfile.TemporaryDirectory() as temp_text:
+            generation = Path(temp_text)
+            database = generation / "current_binary_facts.sqlite"
+            connection = sqlite3.connect(database)
+            connection.executescript(
+                """
+                CREATE TABLE direct_edges (
+                    direct_edge_identity TEXT PRIMARY KEY,
+                    caller_member_identity TEXT NOT NULL,
+                    edge_kind TEXT NOT NULL,
+                    symbolic_owner TEXT NOT NULL,
+                    symbolic_name TEXT NOT NULL,
+                    symbolic_descriptor TEXT NOT NULL
+                );
+                CREATE INDEX direct_edges_caller_member
+                    ON direct_edges(caller_member_identity);
+                CREATE TABLE reconciliation_records (
+                    chunk_identity BLOB PRIMARY KEY,
+                    record_kind INTEGER NOT NULL,
+                    record_count INTEGER NOT NULL,
+                    payload_zlib BLOB NOT NULL
+                );
+                """
+            )
+            connection.executemany(
+                "INSERT INTO direct_edges VALUES (?,?,?,?,?,?)",
+                [
+                    ("edge-method", "caller", "method", "demo/B", "run", "()V"),
+                    ("edge-type", "caller", "type", "demo/T", "", "Ldemo/T;"),
+                    ("edge-init", "caller", "class_init", "demo/I", "", ""),
+                ],
+            )
+
+            def add_chunk(kind, payloads):
+                encoded = json.dumps([
+                    {"payload": payload} for payload in payloads
+                ]).encode("utf-8")
+                connection.execute(
+                    "INSERT INTO reconciliation_records VALUES (?,?,?,?)",
+                    (
+                        kind.encode("ascii"),
+                        oracle._ORACLE_RECONCILIATION_KIND_CODES[kind],
+                        len(payloads),
+                        zlib.compress(encoded),
+                    ),
+                )
+
+            add_chunk("member_resolution", [{
+                "direct_edge_identity": "edge-method",
+                "member_resolution_status": "resolved",
+                "resolved_member_identity": "target-method",
+            }])
+            add_chunk("dispatch_resolution", [])
+            add_chunk("type_resolution", [{
+                "direct_edge_identity": "edge-type",
+                "type_resolution_status": "resolved",
+            }])
+            add_chunk("class_initialization_resolution", [{
+                "direct_edge_identity": "edge-init",
+                "class_initialization_status": "resolved",
+                "initializer_target_identities": ["target-init"],
+            }])
+            add_chunk("linkage_resolution", [{
+                "direct_edge_identity": "edge-method",
+                "linkage_status": "linked",
+            }])
+            connection.commit()
+            connection.close()
+            (generation / "binary_runtime_semantic_overlay.json").write_text(
+                json.dumps({
+                    "coverage_gaps": [],
+                    "rows": [{
+                        "caller_member_identity": "caller",
+                        "target_member_identity": "target-semantic",
+                        "path_certainty": "possible",
+                        "semantic_edge_identity": "edge-semantic",
+                    }],
+                }),
+                encoding="utf-8",
+            )
+            index = oracle._ClosedWorldGraphIndex(
+                generation,
+                generation / "index.sqlite",
+                paired_artifact_missing_targets=set(),
+                unresolved_edge_alias_targets={},
+            )
+            try:
+                transitions = set(index.transitions("caller"))
+                resolution_status = index.resolution_status("edge-method")
+                linkage_status = index.linkage_status("edge-method")
+            finally:
+                index.close()
+
+        self.assertIn(("target-method", "exact", "edge-method"), transitions)
+        self.assertIn(("target-init", "exact", "edge-init"), transitions)
+        self.assertIn(
+            ("target-semantic", "possible", "edge-semantic"), transitions
+        )
+        self.assertTrue(any(row[2] == "edge-type" for row in transitions))
+        self.assertEqual(resolution_status, "resolved")
+        self.assertEqual(linkage_status, "linked")
+
     def test_maven_metadata_duplicate_policy_matches_production_and_oracle(self):
         with tempfile.TemporaryDirectory() as temp_text:
             artifact = Path(temp_text) / "duplicate-maven.jar"
@@ -1716,12 +1869,19 @@ class BinaryValidationPerformanceSafetyTest(unittest.TestCase):
         )
         scan_cache = {}
         truth_cache = {}
+        projection_cache = {}
         with patch.object(
             oracle, "scan_final_artifact", return_value=scan_result
         ) as scan:
             first_issues, first_truth = oracle._validate_direct_edges(
                 connection, [artifact], javap="javap",
                 scan_cache=scan_cache, truth_cache=truth_cache,
+                validated_projection_cache=projection_cache,
+            )
+            cached_issues, cached_truth = oracle._validate_direct_edges(
+                connection, [artifact], javap="javap",
+                scan_cache=scan_cache, truth_cache=truth_cache,
+                validated_projection_cache=projection_cache,
             )
             connection.execute(
                 "INSERT INTO direct_edges VALUES (?,?,?,?,?,?,?,?,?)",
@@ -1733,10 +1893,13 @@ class BinaryValidationPerformanceSafetyTest(unittest.TestCase):
             second_issues, second_truth = oracle._validate_direct_edges(
                 connection, [artifact], javap="javap",
                 scan_cache=scan_cache, truth_cache=truth_cache,
+                validated_projection_cache=projection_cache,
             )
 
         scan.assert_called_once()
         self.assertEqual(first_issues, [])
+        self.assertEqual(cached_issues, [])
+        self.assertEqual(first_truth, cached_truth)
         self.assertEqual(first_truth, second_truth)
         self.assertIn(
             "ORACLE_DIRECT_EDGE_EXTRA",
@@ -3177,6 +3340,336 @@ class BinaryValidationPerformanceSafetyTest(unittest.TestCase):
             "ORACLE_TRACE_PATH_ENTRYPOINT_MISMATCH",
             {item["reason_code"] for item in issues},
         )
+
+    def test_projected_scan_spool_round_trips_and_reads_only_requested_field(self):
+        key = ("a" * 64, "javap")
+        raw = {
+            "artifact_sha256": key[0],
+            "complete": True,
+            "failures": [],
+            "edges": [{
+                "caller_owner": "demo.A",
+                "caller_member": "run",
+                "caller_descriptor": "()V",
+                "callee_owner": "demo.B",
+                "callee_member": "value",
+                "callee_descriptor": "()I",
+                "opcode_family": "invokevirtual",
+                "instruction_offset": 7,
+                "reference_kind": "method",
+                "reference_interface": False,
+            }],
+            "structural_facts": {
+                "class_names": ["demo/A"],
+                "type_edges": [[
+                    "demo/A", "run", "()V", 7, "demo/B", "new",
+                ]],
+                "class_init_edges": [],
+                "clinit_classes": [],
+                "semantic_instructions": [[
+                    "demo/A", "run", "()V", 7, "new", "class demo/B",
+                ]],
+                "declared_members": [[
+                    "demo/A", "method", "run", "()V", 1,
+                ]],
+            },
+        }
+        cache = oracle._OracleScanSpoolCache(memory_limit_per_entry=1)
+        self.addCleanup(cache.clear)
+        cache.put_result(key, raw)
+        first = cache.get_evidence(key, {})
+
+        with patch.object(
+            cache, "_projection", wraps=cache._projection
+        ) as projection:
+            semantic = cache.get_projection(
+                key, "semantic_instructions", {}
+            )
+
+        self.assertEqual(
+            semantic,
+            {("demo/A", "run", "()V", 7, "new", "class demo/B")},
+        )
+        self.assertEqual(
+            [call.args[1] for call in projection.call_args_list],
+            ["semantic_instructions"],
+        )
+        self.assertEqual(cache.get_evidence(key, {}), first)
+        self.assertTrue(cache._entries[key]._rolled)
+
+    def test_projected_scan_spool_direct_view_skips_structural_fields(self):
+        key = ("b" * 64, "javap")
+        raw = {
+            "artifact_sha256": key[0],
+            "complete": True,
+            "failures": [],
+            "edges": [{
+                "caller_owner": "demo.A",
+                "caller_member": "run\ud800",
+                "caller_descriptor": "()V",
+                "callee_owner": "demo.B",
+                "callee_member": "value",
+                "callee_descriptor": "()I",
+                "opcode_family": "invokevirtual",
+                "instruction_offset": 7,
+                "reference_kind": "method",
+                "reference_interface": False,
+            }],
+            "structural_facts": {
+                "class_names": ["demo/A"],
+                "type_edges": [],
+                "class_init_edges": [],
+                "clinit_classes": [],
+                "semantic_instructions": [[
+                    "demo/A", "run\ud800", "()V", 7, "return", "",
+                ]],
+                "declared_members": [],
+            },
+        }
+        cache = oracle._OracleScanSpoolCache(memory_limit_per_entry=1)
+        self.addCleanup(cache.clear)
+        cache.put_result(key, raw)
+        cache.get_evidence(key, {})
+
+        with patch.object(
+            cache, "_projection", wraps=cache._projection
+        ) as projection:
+            direct = cache.get_direct_evidence(key, {})
+
+        self.assertEqual(
+            next(iter(direct.direct_truth.direct_edges))[1],
+            transport_jvm_text("run\ud800"),
+        )
+        self.assertEqual(
+            [call.args[1] for call in projection.call_args_list],
+            [
+                "metadata", "direct_edges", "dynamic_handle_edges",
+                "discovery_classes",
+            ],
+        )
+
+    def test_fused_production_projection_matches_independent_legacy_views(self):
+        connection = self.edge_connection()
+        self.addCleanup(connection.close)
+        connection.execute(
+            "INSERT INTO members VALUES (?,?,?,?)",
+            ("caller", "demo/Caller", "run", "()V"),
+        )
+        rows = [
+            (
+                "artifact", "caller", "method", "demo/Api", "call", "()V",
+                184, 1, json.dumps({
+                    "interface": False,
+                    "loading_constraint_type_owners": ["demo/Arg"],
+                }),
+            ),
+            (
+                "artifact", "caller", "type", "demo/Type", "", "", 187, 2,
+                json.dumps({"type_use_kind": "new"}),
+            ),
+            (
+                "artifact", "caller", "class_init", "demo/Init", "", "",
+                178, 3, json.dumps({"trigger_kind": "getstatic"}),
+            ),
+            (
+                "artifact", "caller", "ldc_handle", "demo/Handle", "apply",
+                "()V", 18, 4, json.dumps({
+                    "tag": 6,
+                    "interface": False,
+                    "loading_constraint_type_owners": ["demo/HandleArg"],
+                }),
+            ),
+        ]
+        connection.executemany(
+            "INSERT INTO direct_edges VALUES (?,?,?,?,?,?,?,?,?)", rows
+        )
+        direct_issues = []
+        direct, dynamic = oracle._production_direct_truth_for_artifact(
+            connection, "artifact", direct_issues
+        )
+        structural_issues = []
+        type_edges, init_edges = (
+            oracle._production_structural_truth_for_artifact(
+                connection, "artifact", structural_issues
+            )
+        )
+        fused_issues = []
+        fused = oracle._production_direct_truth_for_artifact(
+            connection,
+            "artifact",
+            fused_issues,
+            include_structural=True,
+        )
+
+        self.assertEqual(fused, (direct, dynamic, type_edges, init_edges))
+        self.assertEqual(direct_issues, [])
+        self.assertEqual(structural_issues, [])
+        self.assertEqual(fused_issues, [])
+
+    def test_resolution_affected_owner_closure_is_conservative_and_bounded(self):
+        ready = {
+            "status": "definition_ready",
+            "modifiers": 1,
+            "interfaces": (),
+            "members": (),
+            "javap_declared_members": (),
+        }
+        base = {
+            "demo/Parent": {**ready, "super_name": "java/lang/Object"},
+            "demo/Child": {**ready, "super_name": "demo/Parent"},
+            "demo/Unrelated": {**ready, "super_name": "java/lang/Object"},
+        }
+        current = copy.deepcopy(base)
+        current["demo/Parent"]["members"] = ("method|changed|()V|1",)
+
+        affected = oracle._resolution_affected_owners({
+            "base": base, "current": current,
+        })
+
+        self.assertEqual(affected, {"demo/Parent", "demo/Child"})
+
+    def test_common_edge_intersection_prunes_only_unaffected_targets(self):
+        def build_database(path, rows):
+            connection = sqlite3.connect(path)
+            connection.executescript(
+                """
+                CREATE TABLE members (
+                    member_identity TEXT PRIMARY KEY,
+                    class_name TEXT NOT NULL,
+                    member_name TEXT NOT NULL,
+                    descriptor TEXT NOT NULL
+                );
+                CREATE TABLE direct_edges (
+                    caller_member_identity TEXT NOT NULL,
+                    edge_kind TEXT NOT NULL,
+                    symbolic_owner TEXT NOT NULL,
+                    symbolic_name TEXT NOT NULL,
+                    symbolic_descriptor TEXT NOT NULL,
+                    opcode INTEGER NOT NULL,
+                    bytecode_offset INTEGER NOT NULL,
+                    edge_json TEXT NOT NULL
+                );
+                CREATE INDEX direct_edges_symbolic_target ON direct_edges(
+                    symbolic_owner,symbolic_name,symbolic_descriptor
+                );
+                """
+            )
+            connection.execute(
+                "INSERT INTO members VALUES (?,?,?,?)",
+                ("caller", "demo/Caller", "run", "()V"),
+            )
+            connection.executemany(
+                "INSERT INTO direct_edges VALUES (?,?,?,?,?,?,?,?)", rows
+            )
+            connection.commit()
+            connection.close()
+
+        common_changed = (
+            "caller", "method", "demo/Changed", "call", "()V", 184, 1,
+            '{"interface":false}',
+        )
+        common_unrelated = (
+            "caller", "field", "demo/Unrelated", "value", "I", 178, 2,
+            "{}",
+        )
+        with tempfile.TemporaryDirectory() as temp_text:
+            root = Path(temp_text)
+            base = root / "base.sqlite"
+            current = root / "current.sqlite"
+            build_database(base, [common_changed, common_unrelated])
+            build_database(current, [
+                common_changed,
+                common_unrelated,
+                (
+                    "caller", "method", "demo/CurrentOnly", "call", "()V",
+                    184, 3, '{"interface":false}',
+                ),
+            ])
+
+            unfiltered = list(oracle._iter_common_validated_direct_edges(
+                base, current
+            ))
+            filtered = list(oracle._iter_common_validated_direct_edges(
+                base, current, {"demo.Changed"}
+            ))
+            empty = list(oracle._iter_common_validated_direct_edges(
+                base, current, set()
+            ))
+
+        self.assertEqual(len(unfiltered), 2)
+        self.assertEqual(filtered, [(
+            "demo.Caller", "run", "()V", "demo.Changed", "call", "()V",
+            "invokestatic", 1, "method",
+        )])
+        self.assertEqual(empty, [])
+
+    def test_sqlite_logical_equality_ignores_only_normalized_header_fields(self):
+        with tempfile.TemporaryDirectory() as temp_text:
+            root = Path(temp_text)
+            left = root / "left.sqlite"
+            right = root / "right.sqlite"
+            connection = sqlite3.connect(left)
+            connection.execute("CREATE TABLE facts(value TEXT NOT NULL)")
+            connection.execute("INSERT INTO facts VALUES ('same')")
+            connection.commit()
+            connection.close()
+            shutil.copyfile(left, right)
+
+            content = bytearray(right.read_bytes())
+            for offset, value in ((24, 7), (40, 11), (92, 13)):
+                content[offset:offset + 4] = value.to_bytes(4, "big")
+            right.write_bytes(content)
+            self.assertTrue(
+                oracle._sqlite_logical_contents_equal(left, right)
+            )
+
+            content[-1] ^= 1
+            right.write_bytes(content)
+            self.assertFalse(
+                oracle._sqlite_logical_contents_equal(left, right)
+            )
+
+    def test_artifact_scan_concurrency_adapts_to_memory_headroom(self):
+        gib = 1024 * 1024 * 1024
+        with patch.object(oracle.os, "cpu_count", return_value=16):
+            for available, expected in (
+                (1 * gib, 1), (3 * gib, 2), (6 * gib, 4), (12 * gib, 8),
+            ):
+                with self.subTest(available=available), patch.object(
+                    oracle,
+                    "system_available_memory_bytes",
+                    return_value=available,
+                ):
+                    self.assertEqual(
+                        oracle._artifact_scan_worker_count(100),
+                        (expected, available),
+                    )
+
+    def test_archive_inventory_does_not_materialize_ordinary_class_body(self):
+        from tests.test_final_artifact_edge_oracle import (
+            _minimal_static_edge_class,
+        )
+
+        content = _minimal_static_edge_class("demo/Ordinary", "run")
+        with tempfile.TemporaryDirectory() as temp_text:
+            artifact = Path(temp_text) / "ordinary.jar"
+            with zipfile.ZipFile(artifact, "w", zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("demo/Ordinary.class", content)
+            original_read = zipfile.ZipFile.read
+            full_reads = []
+
+            def tracking_read(archive, name, *args, **kwargs):
+                full_reads.append(str(getattr(name, "filename", name)))
+                return original_read(archive, name, *args, **kwargs)
+
+            with patch.object(zipfile.ZipFile, "read", new=tracking_read):
+                inventory = oracle._archive_inventory(artifact, 17)
+
+        self.assertEqual(
+            inventory["classes"],
+            {"demo/Ordinary": "demo/Ordinary.class"},
+        )
+        self.assertEqual(full_reads, [])
 
 
 if __name__ == "__main__":

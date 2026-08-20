@@ -1,6 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -34,6 +35,54 @@ class ProcessMetricsTest(unittest.TestCase):
             available = process_metrics.system_available_memory_bytes("posix")
 
         self.assertEqual(available, 123 * 4096)
+
+    def test_darwin_available_memory_uses_reclaimable_vm_pages(self):
+        output = """\
+Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                               100.
+Pages active:                             900.
+Pages inactive:                           200.
+Pages speculative:                         30.
+Pages purgeable:                           40.
+Pages wired down:                         500.
+"""
+        with patch.object(
+            process_metrics.os,
+            "sysconf",
+            side_effect=ValueError("not available"),
+        ), patch.object(
+            process_metrics.subprocess,
+            "run",
+            return_value=SimpleNamespace(returncode=0, stdout=output),
+        ) as run:
+            available = process_metrics.system_available_memory_bytes(
+                "darwin"
+            )
+
+        self.assertEqual(available, (100 + 200 + 30 + 40) * 16384)
+        run.assert_called_once_with(
+            ["/usr/bin/vm_stat"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=2.0,
+            check=False,
+        )
+
+    def test_darwin_available_memory_fails_open_on_unknown_output(self):
+        with patch.object(
+            process_metrics.os,
+            "sysconf",
+            side_effect=ValueError("not available"),
+        ), patch.object(
+            process_metrics.subprocess,
+            "run",
+            return_value=SimpleNamespace(returncode=0, stdout="unknown"),
+        ):
+            self.assertIsNone(
+                process_metrics.system_available_memory_bytes("darwin")
+            )
 
 
 if __name__ == "__main__":

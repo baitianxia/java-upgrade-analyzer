@@ -6,6 +6,8 @@ from dataclasses import dataclass
 import ctypes
 from ctypes import wintypes
 import os
+import re
+import subprocess
 import sys
 
 
@@ -134,10 +136,60 @@ def system_available_memory_bytes(
         pages = int(os.sysconf("SC_AVPHYS_PAGES"))
         page_size = int(os.sysconf("SC_PAGE_SIZE"))
     except (AttributeError, OSError, TypeError, ValueError):
-        return None
+        if platform_value not in {"darwin", "mac", "macos"}:
+            return None
+        return _darwin_available_memory_bytes()
     if pages < 0 or page_size <= 0:
         return None
     return pages * page_size
+
+
+def _darwin_available_memory_bytes() -> int | None:
+    """Return reclaimable macOS pages from the native ``vm_stat`` probe.
+
+    Darwin does not expose ``SC_AVPHYS_PAGES``. Treat free, inactive,
+    speculative and purgeable pages as immediately reclaimable, matching the
+    memory classes macOS can release before swapping. The probe is advisory:
+    any unsupported output or command failure simply returns ``None``.
+    """
+
+    try:
+        completed = subprocess.run(
+            ["/usr/bin/vm_stat"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=2.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    page_match = re.search(
+        r"page size of\s+([0-9]+)\s+bytes", completed.stdout
+    )
+    if page_match is None:
+        return None
+    page_size = int(page_match.group(1))
+    if page_size <= 0:
+        return None
+    counts = {}
+    for name, value in re.findall(
+        r"^Pages (free|inactive|speculative|purgeable):\s+([0-9]+)\.",
+        completed.stdout,
+        flags=re.MULTILINE,
+    ):
+        counts[name] = int(value)
+    if "free" not in counts:
+        return None
+    available_pages = sum(counts.get(name, 0) for name in (
+        "free", "inactive", "speculative", "purgeable",
+    ))
+    if available_pages < 0:
+        return None
+    return available_pages * page_size
 
 
 __all__ = [

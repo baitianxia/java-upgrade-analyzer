@@ -310,6 +310,10 @@ class BinaryFactStore:
                     symbolic_name,
                     symbolic_descriptor
                 );
+            CREATE INDEX IF NOT EXISTS direct_edges_caller_artifact
+                ON direct_edges(caller_artifact_instance_identity);
+            CREATE INDEX IF NOT EXISTS direct_edges_caller_member
+                ON direct_edges(caller_member_identity);
             CREATE INDEX IF NOT EXISTS reconciliation_records_kind
                 ON reconciliation_records(record_kind);
             """
