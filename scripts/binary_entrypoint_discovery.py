@@ -176,9 +176,9 @@ def _annotations(payload: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
 
 def _annotation_descriptors(payload: Mapping[str, Any]) -> set[str]:
     return {
-        str(item.get("descriptor") or "")
+        descriptor
         for item in _annotations(payload)
-        if str(item.get("descriptor") or "")
+        if (descriptor := str(item.get("descriptor") or ""))
     }
 
 
@@ -207,7 +207,8 @@ def _descriptor_parameters(descriptor: str) -> tuple[str, ...] | None:
         else:
             index += 1
         result.append(value[start:index])
-    return tuple(result) if index < len(value) and value[index] == ")" else None
+    # The loop stops before the end only when it encounters ``)``.
+    return tuple(result) if index < len(value) else None
 
 
 def _type_descriptors(value: Any) -> set[str]:
@@ -278,8 +279,9 @@ def _condition_status(
 ) -> tuple[str, tuple[dict[str, Any], ...]]:
     """Evaluate the bounded condition subset whose inputs are in RuntimeProfile."""
     active_profiles = {
-        str(value or "").strip()
+        normalized
         for value in runtime_profile.payload.get("active_profile_identities") or ()
+        if (normalized := str(value or "").strip())
     }
     resolved_properties = {
         str(key): str(value) for key, value in (
@@ -302,9 +304,9 @@ def _condition_status(
             for value in _string_values(raw)
         )
         types = sorted(
-            _descriptor_class_name(item)
+            class_name
             for item in _type_descriptors(annotation.get("values") or ())
-            if _descriptor_class_name(item)
+            if (class_name := _descriptor_class_name(item))
         )
         if descriptor == "Lorg/springframework/context/annotation/Profile;":
             candidates = {value for value in strings if value}
@@ -337,11 +339,11 @@ def _condition_status(
             if prefix and not prefix.endswith("."):
                 prefix += "."
             declared_names = tuple(
-                str(value or "").strip()
+                normalized
                 for value in (
                     attributes.get("name") or attributes.get("value") or ()
                 )
-                if str(value or "").strip()
+                if (normalized := str(value or "").strip())
             )
             names = tuple(prefix + value for value in declared_names)
             having_value = str(
@@ -442,12 +444,15 @@ def _hierarchy_types(
             continue
         fact = selected[1]
         parents = [
-            str(value or "")
+            normalized
             for value in (
                 fact.get("super_name"),
                 *(fact.get("interfaces") or ()),
             )
-            if str(value or "") and str(value or "") != "java/lang/Object"
+            if (
+                (normalized := str(value or ""))
+                and normalized != "java/lang/Object"
+            )
         ]
         for parent in parents:
             if parent not in result:
@@ -827,9 +832,9 @@ def discover_binary_entrypoints(
     )
     activated_classes = set(resource_activated_classes)
     declared_activated_classes = {
-        str(item or "").replace(".", "/")
+        normalized.replace(".", "/")
         for item in profile.get("activated_classes") or ()
-        if str(item or "").strip()
+        if (normalized := str(item or "").strip())
     }
     activated_classes.update(declared_activated_classes)
     imported_activated_classes: set[str] = set()
@@ -839,9 +844,9 @@ def discover_binary_entrypoints(
         "Ljakarta/persistence/MappedSuperclass;",
     }
     activated_entity_classes = {
-        str(value or "").replace(".", "/")
+        normalized.replace(".", "/")
         for value in profile.get("activated_entity_classes") or ()
-        if str(value or "").strip()
+        if (normalized := str(value or "").strip())
     }
     for selection in getattr(reconciliation, "resource_selections", ()):
         if selection.get("resource_selection_status") != "resolved":
@@ -906,7 +911,8 @@ def discover_binary_entrypoints(
             for imported in _annotation_imports(
                 _realm, _annotations(fact), selected_classes
             ):
-                if imported and imported not in activated_classes:
+                # ``_annotation_imports`` only returns non-empty class names.
+                if imported not in activated_classes:
                     activated_classes.add(imported)
                     imported_activated_classes.add(imported)
                     changed = True
@@ -1143,8 +1149,6 @@ def discover_binary_entrypoints(
         for factory_member in members_by_variant.get(
             class_row["class_variant_identity"], ()
         ):
-            if factory_member.get("member_kind") != "method":
-                continue
             descriptor = str(factory_member.get("descriptor") or "")
             method_fact = method_facts.get((
                 str(factory_member.get("member_name") or ""), descriptor,
@@ -1174,9 +1178,9 @@ def discover_binary_entrypoints(
                 if preceding_literals:
                     callback_names.add(preceding_literals[-1])
             receiver_owners = {
-                _descriptor_class_name(parameter)
+                owner
                 for parameter in (_descriptor_parameters(descriptor) or ())
-                if _descriptor_class_name(parameter)
+                if (owner := _descriptor_class_name(parameter))
             }
             for receiver_owner in sorted(receiver_owners):
                 selected_receiver = selected_classes.get((realm, receiver_owner))
@@ -1218,9 +1222,9 @@ def discover_binary_entrypoints(
                         )
 
     activated_resource_names = {
-        str(item or "").removeprefix("classpath:").lstrip("/")
+        normalized.removeprefix("classpath:").lstrip("/")
         for item in profile.get("activated_resource_names") or ()
-        if str(item or "").strip()
+        if (normalized := str(item or "").strip())
     }
     import_resource_descriptor = (
         "Lorg/springframework/context/annotation/ImportResource;"

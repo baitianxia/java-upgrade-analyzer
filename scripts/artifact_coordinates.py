@@ -18,7 +18,8 @@ def split_artifact_coord(coord):
 
 def artifact_ga(coord):
     group_id, artifact_id, _classifier = split_artifact_coord(coord)
-    return f"{group_id}:{artifact_id}" if group_id and artifact_id else ""
+    # split_artifact_coord returns either both GA components or neither.
+    return f"{group_id}:{artifact_id}" if group_id else ""
 
 
 def artifact_classifier(coord):
@@ -32,7 +33,7 @@ def normalize_artifact_coord(coord, classifier=""):
     that need to reject disagreement should validate it before normalization.
     """
     group_id, artifact_id, coord_classifier = split_artifact_coord(coord)
-    if not group_id or not artifact_id:
+    if not group_id:
         return str(coord or "").strip()
     effective_classifier = coord_classifier or str(classifier or "").strip()
     normalized = f"{group_id}:{artifact_id}"

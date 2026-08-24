@@ -112,7 +112,8 @@ def _detect_subprocess_encoding():
             output = result.stdout.decode('mbcs', errors='replace')
             if '65001' in output:
                 return 'utf-8'
-            if '936' in output or '54936' in output:
+            # 54936 already contains the substring 936.
+            if '936' in output:
                 return 'gbk'
             if '950' in output:
                 return 'big5'
@@ -322,7 +323,7 @@ def _read_maven_settings_local_repo():
         root = ET.fromstring(text)
         for elem in root.iter():
             if (elem.tag or '').endswith('localRepository') and (elem.text or '').strip():
-                return (elem.text or '').strip()
+                return elem.text.strip()
     except Exception:
         m = re.search(r'<localRepository>\s*([^<]+)\s*</localRepository>', text)
         if m:
@@ -358,12 +359,14 @@ def maven_repo_dir():
 def _decode_subprocess_output(raw_bytes):
     if not raw_bytes:
         return ''
-    for enc in ['utf-8', _SUBPROCESS_ENCODING, 'latin-1']:
+    for enc in ('utf-8', _SUBPROCESS_ENCODING):
         try:
             return raw_bytes.decode(enc)
         except (UnicodeDecodeError, LookupError):
             continue
-    return raw_bytes.decode('utf-8', errors='replace')
+    # Latin-1 defines every byte value, so this final decode cannot fail and
+    # does not need an unreachable retry/fallback branch.
+    return raw_bytes.decode('latin-1')
 
 
 def _normalized_executable_path(value):
@@ -1339,14 +1342,17 @@ def find_executable(name):
     跨平台查找可执行文件。
     Windows 上会自动尝试加 .cmd/.bat/.exe 后缀。
     """
-    if str(name or '').strip().lower() in {'git', 'git.exe'}:
+    normalized_name = str(name or '').strip()
+    if not normalized_name:
+        return None
+    if normalized_name.lower() in {'git', 'git.exe'}:
         return _find_working_git()
-    found = shutil.which(name)
+    found = shutil.which(normalized_name)
     if found:
         return found
     if IS_WINDOWS:
         for ext in ['.cmd', '.bat', '.exe', '']:
-            found = shutil.which(name + ext)
+            found = shutil.which(normalized_name + ext)
             if found:
                 return found
     return None
@@ -1405,7 +1411,7 @@ def resolve_command(cmd):
 def _xml_first_text(elem, local_tag):
     for child in list(elem):
         if (child.tag or '').endswith(local_tag) and (child.text or '').strip():
-            return (child.text or '').strip()
+            return child.text.strip()
     return ''
 
 
@@ -1440,7 +1446,7 @@ def _extract_gradle_group_from_text(text):
         return ''
 
     def is_valid_group_id(value):
-        value = (value or '').strip()
+        value = value.strip()
         if not value:
             return False
         if any(ch.isupper() for ch in value):
@@ -1455,7 +1461,7 @@ def _extract_gradle_group_from_text(text):
     for pattern in patterns:
         m = re.search(pattern, text, re.MULTILINE)
         if m:
-            candidate = (m.group(1) or '').strip()
+            candidate = m.group(1).strip()
             if is_valid_group_id(candidate):
                 return candidate
     return ''
@@ -1473,7 +1479,7 @@ def _extract_gradle_artifact_from_text(text):
     for pattern in patterns:
         m = re.search(pattern, text, re.MULTILINE)
         if m:
-            return (m.group(1) or '').strip()
+            return m.group(1).strip()
     return ''
 
 
@@ -1485,7 +1491,7 @@ def _extract_group_from_gradle_properties(module_dir):
             continue
         m = re.search(r'^\s*group\s*=\s*([A-Za-z0-9_.\-]+)\s*$', text, re.MULTILINE)
         if m:
-            return (m.group(1) or '').strip()
+            return m.group(1).strip()
     return ''
 
 
@@ -1498,7 +1504,7 @@ def _extract_artifact_from_settings(module_dir):
                 continue
             m = re.search(r'^\s*rootProject\.name\s*=\s*[\'"]([^\'"]+)[\'"]', text, re.MULTILINE)
             if m:
-                return (m.group(1) or '').strip()
+                return m.group(1).strip()
     return ''
 
 
@@ -1570,11 +1576,17 @@ def _parse_gradle_coord(build_file):
     group_id = _extract_gradle_group_from_text(text) or _extract_group_from_gradle_properties(module_dir)
     artifact_id = _extract_gradle_artifact_from_text(text)
     if not artifact_id:
-        artifact_id = (
-            _artifact_id_from_gradle_build_file(build_file)
-            or module_dir.name
-            or _extract_artifact_from_settings(module_dir)
-        )
+        artifact_id = _artifact_id_from_gradle_build_file(build_file)
+    if not artifact_id and any(
+        (module_dir / name).is_file()
+        for name in ('settings.gradle', 'settings.gradle.kts')
+    ):
+        # A root project's declared name is stable across temporary checkout
+        # directories.  Do not search ancestor settings for nested modules:
+        # their artifact identity remains the module/build-file name.
+        artifact_id = _extract_artifact_from_settings(module_dir)
+    if not artifact_id:
+        artifact_id = module_dir.name
     if group_id and artifact_id:
         return f"{group_id}:{artifact_id}"
     return None
@@ -1606,7 +1618,6 @@ def _resolve_repo_probe_roots(project_dir):
     path = path.resolve()
 
     roots = []
-    seen = set()
     manifest_names = {
         'pom.xml',
         'build.gradle',
@@ -1619,10 +1630,6 @@ def _resolve_repo_probe_roots(project_dir):
         has_marker = any((candidate / name).exists() for name in manifest_names) or (candidate / '.git').exists()
         if not has_marker:
             continue
-        resolved = str(candidate.resolve())
-        if resolved in seen:
-            continue
-        seen.add(resolved)
         roots.append(candidate.resolve())
     if not roots:
         roots.append(path)
@@ -1719,9 +1726,9 @@ def infer_maven_coord_locations(
     skip_dirs = {'.git', 'target', 'build', '.gradle', 'out', 'bin', '.idea', '.upgrade-report'}
     count = 0
     target_coords = {
-        str(item or "").strip()
+        normalized
         for item in (target_coords or [])
-        if str(item or "").strip()
+        if (normalized := str(item or "").strip())
     }
 
     def add_location(coord, module_dir, repo_root):
@@ -1753,7 +1760,7 @@ def infer_maven_coord_locations(
             c = _parse_pom_coord(str(direct_pom))
             add_location(c, probe_root, repo_root)
         for direct_build in _iter_gradle_build_files(probe_root):
-            if direct_build.exists() and not skip_probe_root_as_module:
+            if not skip_probe_root_as_module:
                 c = _parse_gradle_coord_with_repo_context(str(direct_build), repo_root)
                 add_location(c, probe_root, repo_root)
 

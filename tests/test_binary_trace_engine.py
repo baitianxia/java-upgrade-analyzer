@@ -443,6 +443,1108 @@ class BinaryTraceFastPathTest(unittest.TestCase):
         self.assertNotIn("materialize_graph", engine.call_args.kwargs)
 
 
+class BinaryTraceBoundaryTest(unittest.TestCase):
+    @staticmethod
+    def discovery(*, exact=(), possible=(), gaps=(), records=()):
+        return SimpleNamespace(
+            exact_member_identities=tuple(exact),
+            possible_member_identities=tuple(possible),
+            identity="discovery",
+            coverage_gaps=tuple(gaps),
+            records=tuple(records),
+        )
+
+    @staticmethod
+    def runtime(**overrides):
+        values = {
+            "provider_bindings": (),
+            "member_resolutions": (),
+            "dispatch_resolutions": (),
+            "type_resolutions": (),
+            "class_initialization_resolutions": (),
+            "linkage_resolutions": (),
+            "class_definitions": (),
+            "coverage_gaps": (),
+        }
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    @staticmethod
+    def decisions(**overrides):
+        values = {
+            "authoritative_decisions": (),
+            "diagnostic_decisions": (),
+            "excluded_decisions": (),
+            "projection_assessments": (),
+            "formal_projections": (),
+            "candidate_projection_plans": (),
+            "analysis_context_identity": "context",
+        }
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    @staticmethod
+    def graph_engine():
+        engine = object.__new__(BinaryTraceEngine)
+        engine.member_resolutions = {}
+        engine.edges = {}
+        engine.dispatch = {}
+        engine.linkage_resolutions = {}
+        engine.reverse = defaultdict(list)
+        engine.unresolved_edge_alias_targets = {}
+        engine.paired_artifact_missing_targets = set()
+        engine.type_resolutions = {}
+        engine.class_initializations = {}
+        engine.inline_overlay = SimpleNamespace(rows=())
+        engine.semantic_edges = {}
+        return engine
+
+    def test_scalar_helpers_cover_empty_visibility_and_contract_transition_matrix(self):
+        self.assertEqual(binary_trace_engine._loads(None), {})
+        self.assertEqual(binary_trace_engine._loads(""), {})
+        self.assertEqual(binary_trace_engine._loads('{"a":1}'), {"a": 1})
+        for access, rank in (
+            (None, 1),
+            (0, 1),
+            (binary_trace_engine.ACC_PUBLIC, 3),
+            (binary_trace_engine.ACC_PROTECTED, 2),
+            (binary_trace_engine.ACC_PRIVATE, 0),
+        ):
+            with self.subTest(access=access):
+                self.assertEqual(binary_trace_engine._visibility_rank(access), rank)
+
+        no_change = ({}, {"fact_scope": None}, {
+            "fact_scope": {"member_change_kind": "implementation_changed"},
+        })
+        for decision in no_change:
+            self.assertEqual(
+                binary_trace_engine._contract_change_linkage_reasons(decision),
+                frozenset(),
+            )
+        malformed = (
+            None,
+            {"base_contract": None, "current_contract": {}},
+            {"base_contract": {}, "current_contract": None},
+            {"base_contract": [], "current_contract": {}},
+        )
+        for evidence in malformed:
+            decision = {
+                "fact_scope": {"member_change_kind": "contract_changed"},
+                "evidence": evidence,
+            }
+            self.assertEqual(
+                binary_trace_engine._contract_change_linkage_reasons(decision),
+                frozenset(),
+            )
+
+        already_final = {
+            "fact_scope": {
+                "member_kind": "method",
+                "member_change_kind": "contract_changed",
+            },
+            "evidence": {
+                "base_contract": {"access": binary_trace_engine.ACC_FINAL},
+                "current_contract": {"access": binary_trace_engine.ACC_FINAL},
+            },
+        }
+        self.assertEqual(
+            binary_trace_engine._contract_change_linkage_reasons(already_final),
+            frozenset(),
+        )
+
+        transitions = (
+            ({"access": binary_trace_engine.ACC_PUBLIC}, {"access": 0},
+             {"access_reduced"}),
+            ({"access": 0}, {"access": binary_trace_engine.ACC_STATIC},
+             {"static_instance_changed"}),
+            ({"access": 0}, {"access": binary_trace_engine.ACC_ABSTRACT},
+             {"became_abstract"}),
+            ({"access": 0}, {"access": binary_trace_engine.ACC_FINAL}, set()),
+        )
+        for base, current, reasons in transitions:
+            decision = {
+                "fact_scope": {
+                    "member_kind": "field",
+                    "member_change_kind": "contract_changed",
+                },
+                "evidence": {"base_contract": base, "current_contract": current},
+            }
+            with self.subTest(base=base, current=current):
+                self.assertEqual(
+                    binary_trace_engine._contract_change_linkage_reasons(decision),
+                    frozenset(reasons),
+                )
+        self.assertEqual(
+            binary_trace_engine._unresolved_edge_certainty(
+                "ambiguous", paired_artifact_change=True
+            ),
+            "possible",
+        )
+
+    def test_constructor_binds_empty_and_partial_decision_evidence_without_graph(self):
+        removed = {
+            "fact_kind": "method",
+            "fact_scope": {
+                "class_name": None,
+                "member_name": None,
+                "descriptor": None,
+                "member_kind": None,
+                "member_change_kind": "removed",
+            },
+            "dependency_artifacts": (
+                {"side": "base"}, {"side": "current"}, {"side": None},
+            ),
+            "evidence": {
+                "current_unresolved_direct_edge_identities": ("edge-alias",),
+            },
+            "decision_identity": "removed",
+        }
+        diagnostic = {
+            "fact_kind": "field",
+            "fact_scope": {
+                "class_name": "demo.Type",
+                "member_name": "value",
+                "descriptor": "I",
+                "member_kind": "field",
+            },
+            "evidence": None,
+            "decision_identity": "diagnostic",
+        }
+        ignored = {
+            "fact_kind": "class",
+            "fact_scope": None,
+            "decision_identity": "ignored",
+        }
+        decisions = self.decisions(
+            authoritative_decisions=(removed, ignored),
+            diagnostic_decisions=(diagnostic,),
+            excluded_decisions=({"decision_identity": "excluded"},),
+            projection_assessments=({
+                "projection_assessment_identity": "assessment",
+            },),
+        )
+        engine = BinaryTraceEngine(
+            object(),
+            SimpleNamespace(identity="profile"),
+            self.runtime(),
+            decisions,
+            entrypoint_discovery=self.discovery(),
+            materialize_graph=False,
+        )
+        self.assertTrue(engine.paired_artifact_missing_targets)
+        self.assertTrue(engine.unresolved_edge_alias_targets)
+        self.assertEqual(set(engine.decision_by_identity), {
+            "removed", "ignored", "diagnostic", "excluded",
+        })
+        self.assertIn("assessment", engine.assessment_by_identity)
+
+        explicit_removed = dict(
+            removed,
+            decision_identity="explicit-removed",
+            fact_scope={
+                "class_name": "demo.Type",
+                "member_name": "run",
+                "descriptor": "()V",
+                "member_kind": "method",
+                "member_change_kind": "removed",
+            },
+            dependency_artifacts=({"side": "base"}, {"side": "current"}),
+            evidence=None,
+        )
+        no_artifacts_removed = dict(
+            explicit_removed,
+            decision_identity="no-artifacts-removed",
+            dependency_artifacts=None,
+        )
+        explicit = BinaryTraceEngine(
+            object(), SimpleNamespace(identity="profile"), self.runtime(),
+            self.decisions(authoritative_decisions=(
+                explicit_removed, no_artifacts_removed,
+            )),
+            entrypoint_discovery=self.discovery(), materialize_graph=False,
+            semantic_overlay=SimpleNamespace(identity="semantic", rows=()),
+        )
+        self.assertTrue(explicit.paired_artifact_missing_targets)
+
+        with self.assertRaises(ValueError):
+            BinaryTraceEngine(
+                object(),
+                SimpleNamespace(identity="profile"),
+                self.runtime(),
+                self.decisions(),
+                entrypoint_discovery=self.discovery(exact=("entry",)),
+                materialize_graph=False,
+            )
+
+    def test_constructor_materializes_nonempty_semantic_and_resolution_rows(self):
+        class Connection:
+            def execute(self, statement):
+                if "FROM members" in statement:
+                    return ({
+                        "member_identity": "member",
+                        "class_name": "demo/Member",
+                        "member_name": "run",
+                        "descriptor": "()V",
+                    },)
+                if "FROM direct_edges" in statement:
+                    return ()
+                raise AssertionError(statement)
+
+        store = SimpleNamespace(connection=Connection())
+        semantic = SimpleNamespace(
+            identity="semantic",
+            rows=({
+                "semantic_edge_identity": "semantic-edge",
+                "caller_member_identity": "member",
+                "target_member_identity": "target",
+                "path_certainty": "exact",
+            },),
+        )
+        runtime = self.runtime(
+            type_resolutions=({
+                "direct_edge_identity": "type-resolution-edge",
+            },),
+            class_definitions=({
+                "initiating_loader_realm_identity": None,
+                "class_name": None,
+                "class_definition_status": None,
+            },),
+        )
+        engine = BinaryTraceEngine(
+            store, SimpleNamespace(identity="profile"), runtime,
+            self.decisions(), entrypoint_discovery=self.discovery(),
+            semantic_overlay=semantic,
+        )
+        self.assertIn("semantic-edge", engine.semantic_edges)
+        self.assertIn("target", engine.reverse)
+        self.assertEqual(engine.graph_stats["runtime_semantic_overlay_identity"], "semantic")
+
+    def test_reverse_graph_admits_only_reconciled_executable_edges_and_overlays(self):
+        engine = self.graph_engine()
+        engine.member_resolutions = {
+            "missing-edge": {"member_resolution_status": "resolved"},
+            "unsupported": {
+                "member_resolution_status": "resolved",
+                "member_resolution_identity": "r-unsupported",
+            },
+            "resolved": {
+                "member_resolution_status": "resolved",
+                "resolved_member_identity": "target-resolved",
+                "member_resolution_identity": "r-resolved",
+            },
+            "possible": {
+                "member_resolution_status": "resolved",
+                "member_resolution_identity": "r-possible",
+            },
+            "resolved-empty": {
+                "member_resolution_status": "resolved",
+                "resolved_member_identity": "",
+                "member_resolution_identity": "r-empty",
+            },
+            "missing-kind": {
+                "member_resolution_status": "resolved",
+                "resolved_member_identity": "unused",
+                "member_resolution_identity": "r-missing-kind",
+            },
+            "unresolved-method": {
+                "member_resolution_status": "ambiguous",
+                "member_resolution_identity": "r-unresolved-method",
+            },
+            "dynamic-first": {
+                "member_resolution_status": "resolved",
+                "resolved_member_identity": "dynamic-first-target",
+                "member_resolution_identity": "r-dynamic-first",
+            },
+            "dynamic-second": {
+                "member_resolution_status": "resolved",
+                "resolved_member_identity": "dynamic-second-target",
+                "member_resolution_identity": "r-dynamic-second",
+            },
+            "unresolved": {
+                "member_resolution_status": "no_class_definition",
+                "member_resolution_identity": "r-unresolved",
+            },
+        }
+        base_edge = {
+            "caller_member_identity": "caller",
+            "symbolic_owner": "demo/Target",
+            "symbolic_name": "run",
+            "symbolic_descriptor": "()V",
+        }
+        engine.edges = {
+            "unsupported": dict(base_edge, edge_kind="resource"),
+            "resolved": dict(base_edge, edge_kind="method"),
+            "possible": dict(base_edge, edge_kind="invokedynamic_bootstrap"),
+            "unresolved": dict(base_edge, edge_kind="field"),
+            "resolved-empty": dict(base_edge, edge_kind="method"),
+            "missing-kind": dict(base_edge, edge_kind=None),
+            "unresolved-method": dict(base_edge, edge_kind="method"),
+            "dynamic-first": dict(base_edge, edge_kind="invokedynamic_handle_0"),
+            "dynamic-second": dict(base_edge, edge_kind="ldc_bootstrap_handle_0"),
+            "type-none": dict(base_edge, edge_kind="type", direct_edge_identity="type-none"),
+            "type-bad": dict(base_edge, edge_kind="type", direct_edge_identity="type-bad"),
+            "type-good": dict(base_edge, edge_kind="type", direct_edge_identity="type-good"),
+            "other": dict(base_edge, edge_kind="method", direct_edge_identity="other"),
+        }
+        engine.dispatch = {
+            "possible": {
+                "dispatch_status": "possible",
+                "implementation_target_identities": ("target-possible",),
+                "dispatch_resolution_identity": "dispatch",
+            },
+        }
+        engine.linkage_resolutions = {
+            "resolved": {"linkage_status": "resolved"},
+            "possible": {"linkage_status": "loader_constraint_violation"},
+        }
+        alias = BinaryTraceEngine._symbolic_target(
+            "alias/Owner", "run", "()V", "method"
+        )
+        engine.unresolved_edge_alias_targets = {"unresolved": (alias,)}
+        engine.paired_artifact_missing_targets = {alias}
+        engine.type_resolutions = {
+            "type-bad": {"type_resolution_status": "missing"},
+            "type-good": {"type_resolution_status": "resolved"},
+        }
+        engine.class_initializations = {
+            "missing-edge": {
+                "class_initialization_status": "resolved",
+                "initializer_target_identities": ("init-missing",),
+            },
+            "other": {"class_initialization_status": "not_required"},
+            "resolved": {
+                "class_initialization_status": "resolved",
+                "initializer_target_identities": ("initializer",),
+                "class_initialization_resolution_identity": "init-resolution",
+            },
+        }
+        engine.inline_overlay = SimpleNamespace(rows=(
+            {"consumption_state": "unchanged"},
+            {"consumption_state": "changed_with_source", "binding_certainty": "unknown"},
+            {"consumption_state": "changed_with_source", "binding_certainty": "proven",
+             "consumer_member_identity": "", "changed_field_member_identity": "target"},
+            {"consumption_state": "changed_with_source", "binding_certainty": "possible",
+             "consumer_member_identity": "inline-caller", "changed_field_member_identity": "",
+             "inline_overlay_identity": "inline-missing"},
+            {"consumption_state": "changed_with_source", "binding_certainty": "proven",
+             "consumer_member_identity": "inline-caller", "changed_field_member_identity": "inline-target",
+             "inline_overlay_identity": "inline-proven"},
+            {"consumption_state": "changed_with_source", "binding_certainty": "possible",
+             "consumer_member_identity": "inline-caller", "changed_field_member_identity": "inline-possible",
+             "inline_overlay_identity": "inline-possible"},
+        ))
+        engine.semantic_edges = {
+            "missing-caller": {"semantic_edge_identity": "missing-caller",
+                               "caller_member_identity": "", "target_member_identity": "target"},
+            "missing-target": {"semantic_edge_identity": "missing-target",
+                               "caller_member_identity": "caller", "target_member_identity": ""},
+            "semantic-exact": {"semantic_edge_identity": "semantic-exact",
+                               "caller_member_identity": "semantic-caller",
+                               "target_member_identity": "semantic-target",
+                               "path_certainty": "exact"},
+            "semantic-possible": {"semantic_edge_identity": "semantic-possible",
+                                  "caller_member_identity": "semantic-caller",
+                                  "target_member_identity": "semantic-possible-target",
+                                  "path_certainty": "possible"},
+        }
+
+        engine._build_reverse_graph()
+
+        self.assertEqual(engine.reverse["target-resolved"][0]["certainty"], "exact")
+        self.assertEqual(engine.reverse["target-possible"][0]["certainty"], "possible")
+        self.assertEqual(engine.reverse[alias][0]["certainty"], "exact")
+        self.assertIn("initializer", engine.reverse)
+        self.assertIn("inline-target", engine.reverse)
+        self.assertIn("semantic-target", engine.reverse)
+        self.assertNotIn("init-missing", engine.reverse)
+
+    def test_reachability_scc_and_batch_graph_cover_cycles_duplicates_and_possible_paths(self):
+        self.assertEqual(
+            BinaryTraceEngine._reachable(("a",), {"a": {"b"}, "b": {"a", "c"}}),
+            {"a", "b", "c"},
+        )
+        self.assertEqual(BinaryTraceEngine._scc_count(set(), {}), (0, 0))
+        self.assertEqual(
+            BinaryTraceEngine._scc_count(
+                {"a", "b", "c", "d"},
+                {"a": {"b", "c"}, "b": {"a", "d"}, "c": {"d"}},
+            ),
+            (3, 2),
+        )
+
+        engine = object.__new__(BinaryTraceEngine)
+        engine.exact_entrypoints = {"root"}
+        engine.possible_entrypoints = {"possible-root"}
+        engine.entrypoints = engine.exact_entrypoints | engine.possible_entrypoints
+        engine.reverse = defaultdict(list, {
+            "middle": [
+                {"caller_member_identity": "root", "certainty": "exact"},
+                {"caller_member_identity": "possible-root", "certainty": "possible"},
+            ],
+            "target": [
+                {"caller_member_identity": "middle", "certainty": "exact"},
+                {"caller_member_identity": "root", "certainty": "exact"},
+                {"caller_member_identity": "middle", "certainty": "possible"},
+                {"caller_member_identity": "root", "certainty": "possible"},
+            ],
+        })
+        engine.semantic_edges = {}
+        engine.semantic_overlay = SimpleNamespace(identity="semantic")
+        engine.entrypoint_discovery = self.discovery(
+            exact=("root",), possible=("possible-root",)
+        )
+        engine._prepare_batch_graph()
+        self.assertIn("target", engine.possible_path_nodes)
+        self.assertIn("middle", engine.exact_reachable_nodes)
+        self.assertGreaterEqual(engine.graph_stats["possible_scc_count"], 1)
+
+    def test_target_selection_covers_resolution_provider_and_symbolic_fallbacks(self):
+        class Store:
+            result = []
+
+            def rows(self, *_args, **_kwargs):
+                return list(self.result)
+
+        engine = object.__new__(BinaryTraceEngine)
+        engine.providers = {}
+        engine.store = Store()
+        resolved = {
+            "fact_kind": "member_resolution",
+            "evidence": {"current_resolution": {
+                "resolved_member_identity": "resolved-member",
+            }},
+        }
+        self.assertEqual(engine._target_nodes(resolved), ("resolved-member",))
+        for decision in (
+            {},
+            {"fact_kind": "member_resolution", "evidence": None},
+            {"fact_kind": "member_resolution", "evidence": {
+                "current_resolution": None,
+            }},
+        ):
+            with self.subTest(decision=decision):
+                self.assertEqual(len(engine._target_nodes(decision)), 1)
+
+        decision = {
+            "fact_kind": "method",
+            "fact_scope": {
+                "initiating_loader_realm_identity": "loader",
+                "class_name": "demo.Type",
+                "member_kind": "method",
+                "member_name": "run",
+                "descriptor": "()V",
+            },
+        }
+        symbolic = engine._target_nodes(decision)
+        engine.providers[("loader", "demo/Type")] = {
+            "class_provider_status": "ambiguous",
+        }
+        self.assertEqual(engine._target_nodes(decision), symbolic)
+        engine.providers[("loader", "demo/Type")] = {
+            "class_provider_status": "resolved",
+            "selected_class_variant_identity": "variant",
+        }
+        engine.store.result = []
+        self.assertEqual(engine._target_nodes(decision), symbolic)
+        engine.store.result = [
+            {"member_identity": "one"}, {"member_identity": "two"},
+        ]
+        self.assertEqual(engine._target_nodes(decision), symbolic)
+        engine.store.result = [{"member_identity": "physical"}]
+        self.assertEqual(engine._target_nodes(decision), ("physical",))
+
+        class_decision = {"fact_kind": "class", "fact_scope": {
+            "class_name": None,
+            "member_kind": None,
+            "member_name": None,
+            "descriptor": None,
+        }}
+        self.assertEqual(len(engine._target_nodes(class_decision)), 1)
+
+    @staticmethod
+    def trace_engine(*, exact=(), possible=(), max_paths=20, max_nodes=100):
+        engine = object.__new__(BinaryTraceEngine)
+        engine.entrypoints = set(exact) | set(possible)
+        engine.exact_entrypoints = set(exact)
+        engine.possible_entrypoints = set(possible)
+        engine.exact_reachable_nodes = set()
+        engine.possible_reachable_nodes = set(engine.entrypoints)
+        engine.possible_path_nodes = set(possible)
+        engine.reverse = defaultdict(list)
+        engine._trace_cache = {}
+        engine.max_paths_per_target = max_paths
+        engine.max_visited_nodes = max_nodes
+        engine.entrypoint_records_by_member = defaultdict(list)
+        engine.members = {}
+        engine.edges = {}
+        engine.semantic_edges = {}
+        return engine
+
+    def test_trace_enumeration_covers_cache_limits_metadata_and_possible_overflow(self):
+        engine = self.trace_engine(exact=("root",))
+        self.assertEqual(engine._trace(("unreachable",)), ([], []))
+        self.assertEqual(engine._trace(("unreachable",)), ([], []))
+
+        engine = self.trace_engine(exact=("root",))
+        engine.exact_reachable_nodes = {"root", "target"}
+        engine.possible_reachable_nodes = {"root", "target"}
+        engine.reverse["target"].append({
+            "caller_member_identity": "root",
+            "direct_edge_identity": "missing-edge",
+            "certainty": "exact",
+        })
+        engine.entrypoint_records_by_member["root"].append({
+            "entrypoint_record_identity": "entry-record",
+            "member_identity": "root",
+            "path_certainty": "exact",
+        })
+        paths, gaps = engine._trace(("target", "target"))
+        self.assertEqual(gaps, [])
+        self.assertEqual(paths[0]["path_certainty"], "exact")
+        self.assertEqual(paths[0]["edges"][0]["caller_class_name"], "")
+        self.assertEqual(paths[0]["edges"][0]["edge_kind"], "")
+
+        limited = self.trace_engine(exact=("root",), max_paths=0)
+        limited.exact_reachable_nodes = {"root", "target"}
+        limited.possible_reachable_nodes = {"root", "target"}
+        limited.reverse["target"].append({
+            "caller_member_identity": "root",
+            "direct_edge_identity": "edge",
+            "certainty": "exact",
+        })
+        self.assertEqual(limited._trace(("target",)), ([], []))
+
+        node_limited = self.trace_engine(exact=("root",), max_nodes=0)
+        node_limited.exact_reachable_nodes = {"root", "target"}
+        node_limited.possible_reachable_nodes = {"root", "target"}
+        node_limited.reverse["target"].append({
+            "caller_member_identity": "root",
+            "direct_edge_identity": "edge",
+            "certainty": "exact",
+        })
+        self.assertIn("trace_node_limit_exceeded", node_limited._trace(("target",))[1])
+
+        possible = self.trace_engine(
+            possible=("possible-a", "possible-b"), max_paths=1
+        )
+        possible.possible_reachable_nodes.update({"target"})
+        possible.possible_path_nodes.add("target")
+        possible.reverse["target"].extend((
+            {"caller_member_identity": "possible-a",
+             "direct_edge_identity": "edge-a", "certainty": "possible"},
+            {"caller_member_identity": "possible-b",
+             "direct_edge_identity": "edge-b", "certainty": "possible"},
+        ))
+        paths, gaps = possible._trace(("target",))
+        self.assertEqual(len(paths), 1)
+        self.assertIn("trace_path_enumeration_limit_exceeded", gaps)
+
+        exact_overflow = self.trace_engine(exact=("root-a", "root-b"), max_paths=1)
+        exact_overflow.exact_reachable_nodes.update({"target"})
+        exact_overflow.possible_reachable_nodes.update({"target"})
+        exact_overflow.reverse["target"].extend((
+            {"caller_member_identity": "root-a", "direct_edge_identity": "a",
+             "certainty": "exact"},
+            {"caller_member_identity": "root-b", "direct_edge_identity": "b",
+             "certainty": "exact"},
+        ))
+        self.assertIn(
+            "trace_path_enumeration_limit_exceeded",
+            exact_overflow._trace(("target",))[1],
+        )
+
+        mixed = self.trace_engine(
+            exact=("exact-root",), possible=("possible-root",)
+        )
+        mixed.exact_reachable_nodes.update({"target", "possible-root"})
+        mixed.possible_reachable_nodes.update({"target"})
+        mixed.possible_path_nodes.add("target")
+        mixed.reverse["target"].extend((
+            {"caller_member_identity": "exact-root", "direct_edge_identity": "exact",
+             "certainty": "exact"},
+            {"caller_member_identity": "possible-root", "direct_edge_identity": "possible",
+             "certainty": "exact"},
+        ))
+        mixed.reverse["exact-root"].append({
+            "caller_member_identity": "exact-root",
+            "direct_edge_identity": "cycle",
+            "certainty": "possible",
+        })
+        mixed.entrypoint_records_by_member["exact-root"].append({
+            "entrypoint_record_identity": "nonmatching",
+            "path_certainty": "possible",
+        })
+        mixed.semantic_edges["exact"] = {
+            "semantic_edge_identity": "exact",
+            "semantic_edge_kind": "reflection",
+            "evidence": {"source": "semantic"},
+            "target_dependency_coord": "demo:target",
+        }
+        paths, gaps = mixed._trace(("target",))
+        self.assertEqual(gaps, [])
+        self.assertTrue(any(path["path_certainty"] == "exact" for path in paths))
+        self.assertTrue(any(path["path_certainty"] == "possible" for path in paths))
+        exact_path = next(path for path in paths if path["path_certainty"] == "exact")
+        self.assertEqual(exact_path["entrypoint_records"], [])
+        self.assertEqual(exact_path["edges"][0]["semantic_evidence"], {
+            "source": "semantic",
+        })
+        self.assertEqual(
+            exact_path["edges"][0]["target_dependency_coord"], "demo:target"
+        )
+
+    @staticmethod
+    def result_engine(paths, trace_gaps=(), runtime_gaps=()):
+        engine = object.__new__(BinaryTraceEngine)
+        engine._target_nodes = lambda _decision: ("target",)
+        engine._trace = lambda _targets: (list(paths), list(trace_gaps))
+        engine.entrypoint_gaps = ()
+        engine.runtime = SimpleNamespace(coverage_gaps=tuple(runtime_gaps))
+        engine.member_resolutions = {}
+        engine.linkage_resolutions = {}
+        engine.members = {}
+        engine.class_definition_statuses = {}
+        engine.decisions = SimpleNamespace(analysis_context_identity="context")
+        engine.profile = SimpleNamespace(identity="profile")
+        engine.batch_graph_identity = "batch"
+        return engine
+
+    def test_result_truth_and_static_linkage_matrix(self):
+        base = {
+            "decision_identity": "decision",
+            "fact_kind": "method",
+            "fact_scope": None,
+            "coverage_gaps": None,
+        }
+        result = self.result_engine([])._result_for(
+            projection_identity="projection",
+            decision=base,
+            assessment_identity="assessment",
+            diagnostic=False,
+        )
+        self.assertEqual(result["reachability_status"], "not_found_in_static_analysis")
+        self.assertEqual(result["static_linkage_status"], "compatible_or_not_applicable")
+
+        incomplete = self.result_engine([], runtime_gaps=("runtime-gap",))._result_for(
+            projection_identity="projection",
+            decision=base,
+            assessment_identity="assessment",
+            diagnostic=True,
+        )
+        self.assertEqual(incomplete["reachability_status"], "not_analyzed")
+        self.assertEqual(incomplete["candidate_fact_status"], "candidate")
+
+        path = {
+            "path_certainty": "exact",
+            "edges": [{
+                "direct_edge_identity": "edge",
+                "caller_member_identity": "caller",
+            }],
+        }
+        engine = self.result_engine([path])
+        engine.member_resolutions["edge"] = {
+            "member_resolution_status": "resolved",
+            "initiating_loader_realm_identity": None,
+        }
+        engine.linkage_resolutions["edge"] = {"linkage_status": "resolved"}
+        rebound = dict(base, fact_scope={"member_change_kind": "removed"})
+        result = engine._result_for(
+            projection_identity="projection", decision=rebound,
+            assessment_identity="assessment", diagnostic=False,
+        )
+        self.assertEqual(result["reachability_status"], "reachable")
+        self.assertEqual(result["static_linkage_status"], "compatible_or_not_applicable")
+
+        engine.member_resolutions["edge"]["member_resolution_status"] = "illegal_access"
+        result = engine._result_for(
+            projection_identity="projection", decision=base,
+            assessment_identity="assessment", diagnostic=False,
+        )
+        self.assertEqual(result["static_linkage_status"], "incompatible_if_executed")
+
+        possible_path = dict(path, path_certainty="possible")
+        engine = self.result_engine([possible_path])
+        engine.member_resolutions["edge"] = {
+            "member_resolution_status": "ambiguous",
+        }
+        result = engine._result_for(
+            projection_identity="projection", decision=base,
+            assessment_identity="assessment", diagnostic=False,
+        )
+        self.assertEqual(result["reachability_status"], "uncertain")
+        self.assertEqual(result["static_linkage_status"], "undetermined")
+
+        unknown_edge = dict(path)
+        unknown_edge["edges"] = [{
+            "direct_edge_identity": "unknown-edge",
+            "caller_member_identity": "known-caller",
+        }]
+        engine = self.result_engine([unknown_edge])
+        engine.members["known-caller"] = {"class_name": "demo/Caller"}
+        neutral = engine._result_for(
+            projection_identity="projection",
+            decision=dict(base, coverage_gaps=("decision-gap",)),
+            assessment_identity="assessment",
+            diagnostic=False,
+        )
+        self.assertIn("decision-gap", neutral["trace_coverage_gaps"])
+
+        removed_without_path = self.result_engine([])._result_for(
+            projection_identity="projection",
+            decision=dict(base, fact_scope={"member_change_kind": "removed"}),
+            assessment_identity="assessment",
+            diagnostic=False,
+        )
+        self.assertEqual(
+            removed_without_path["static_linkage_status"],
+            "incompatible_if_executed",
+        )
+
+        contract_change = {
+            **base,
+            "fact_scope": {"member_change_kind": "contract_changed",
+                           "member_kind": "method"},
+            "evidence": {
+                "base_contract": {"access": binary_trace_engine.ACC_PUBLIC},
+                "current_contract": {
+                    "access": binary_trace_engine.ACC_PUBLIC
+                    | binary_trace_engine.ACC_ABSTRACT,
+                },
+            },
+        }
+        self.assertEqual(
+            self.result_engine([])._result_for(
+                projection_identity="projection", decision=contract_change,
+                assessment_identity="assessment", diagnostic=False,
+            )["static_linkage_status"],
+            "incompatible_if_executed",
+        )
+
+        legal_access_engine = self.result_engine([path])
+        legal_access_engine.member_resolutions["edge"] = {
+            "member_resolution_status": "resolved",
+            "initiating_loader_realm_identity": "loader",
+        }
+        legal_access_engine.linkage_resolutions["edge"] = {
+            "linkage_status": "resolved",
+        }
+        legal_access_engine.members["caller"] = {"class_name": "demo/Caller"}
+        legal_access_engine.class_definition_statuses[(
+            "loader", "demo/Caller"
+        )] = "definition_ready"
+        legal_access = dict(contract_change)
+        legal_access["evidence"] = {
+            "base_contract": {"access": binary_trace_engine.ACC_PUBLIC},
+            "current_contract": {"access": binary_trace_engine.ACC_PROTECTED},
+        }
+        self.assertEqual(
+            legal_access_engine._result_for(
+                projection_identity="projection", decision=legal_access,
+                assessment_identity="assessment", diagnostic=False,
+            )["static_linkage_status"],
+            "compatible_or_not_applicable",
+        )
+
+        provider = self.result_engine([])._result_for(
+            projection_identity="projection",
+            decision=dict(base, fact_kind="provider_topology"),
+            assessment_identity="assessment", diagnostic=False,
+        )
+        self.assertEqual(provider["static_linkage_status"], "undetermined")
+
+    @staticmethod
+    def service_engine(*, certainty=None, gaps=(), include_load=True, near=True,
+                       dependency_artifacts=None, include_member=True,
+                       mechanism=None):
+        engine = object.__new__(BinaryTraceEngine)
+        caller = "caller"
+        literal = {
+            "direct_edge_identity": "literal",
+            "caller_member_identity": caller,
+            "instruction_index": 10,
+            "edge_kind": "type",
+            "symbolic_owner": "demo/Api",
+            "edge_json": '{"type_use_kind":"class_literal"}',
+        }
+        rows = [literal, {
+            "direct_edge_identity": "non-literal",
+            "caller_member_identity": caller,
+            "instruction_index": None,
+            "edge_kind": "type",
+            "symbolic_owner": "demo/Api",
+            "edge_json": None,
+        }, {
+            "direct_edge_identity": "sort-missing-kind",
+            "caller_member_identity": "other-caller",
+            "instruction_index": None,
+            "edge_kind": None,
+            "symbolic_owner": "other/Type",
+        }]
+        if include_load:
+            rows.extend(({
+                "direct_edge_identity": "load-missing-descriptor",
+                "caller_member_identity": caller,
+                "instruction_index": 8,
+                "edge_kind": "method",
+                "symbolic_owner": "java/util/ServiceLoader",
+                "symbolic_name": "load",
+                "symbolic_descriptor": None,
+            }, {
+                "direct_edge_identity": "load-before-literal",
+                "caller_member_identity": caller,
+                "instruction_index": 8,
+                "edge_kind": "method",
+                "symbolic_owner": "java/util/ServiceLoader",
+                "symbolic_name": "load",
+                "symbolic_descriptor": "(Ljava/lang/Class;)Ljava/util/ServiceLoader;",
+            }, {
+                "direct_edge_identity": "load",
+                "caller_member_identity": caller,
+                "instruction_index": 12 if near else 20,
+                "edge_kind": "method",
+                "symbolic_owner": "java/util/ServiceLoader",
+                "symbolic_name": "load",
+                "symbolic_descriptor": "(Ljava/lang/Class;)Ljava/util/ServiceLoader;",
+            }))
+        engine.edges = {
+            item["direct_edge_identity"]: item for item in rows
+        }
+        engine.exact_reachable_nodes = {caller} if certainty == "exact" else set()
+        engine.possible_reachable_nodes = (
+            {caller} if certainty == "possible" else set()
+        )
+        engine.members = ({
+            caller: {
+                "class_name": "demo/Caller",
+                "member_name": "run",
+                "descriptor": "()V",
+            },
+        } if include_member else {})
+        engine._trace = lambda _targets: ([{"path_identity": "path"}], list(gaps))
+        engine.entrypoint_gaps = ()
+        engine.runtime = SimpleNamespace(coverage_gaps=())
+        engine.decisions = BinaryTraceBoundaryTest.decisions(
+            authoritative_decisions=(
+                {"fact_kind": "class", "decision_identity": "class"},
+                {"fact_kind": "resource", "fact_scope": None,
+                 "decision_identity": "empty-scope"},
+                {"fact_kind": "resource", "fact_scope": {
+                    "resource_name": "META-INF/other",
+                }, "decision_identity": "other-resource"},
+                {"fact_kind": "resource", "fact_scope": {
+                    "resource_name": "META-INF/services/demo.Api",
+                    "resource_mechanism": mechanism,
+                }, "decision_identity": "service",
+                 "dependency_artifacts": dependency_artifacts},
+            ),
+        )
+        return engine
+
+    def test_service_activation_covers_all_four_statuses_and_call_pair_boundaries(self):
+        expected = {
+            "exact": "reachable",
+            "possible": "uncertain",
+            None: "not_found_in_static_analysis",
+        }
+        for certainty, status in expected.items():
+            engine = self.service_engine(
+                certainty=certainty,
+                dependency_artifacts=({"coord": "demo:api"},)
+                if certainty == "exact" else None,
+                include_member=certainty != "possible",
+                mechanism="service_loader" if certainty == "exact" else None,
+            )
+            with self.subTest(certainty=certainty):
+                results = engine._service_activation_results()
+                self.assertEqual(len(results), 1)
+                self.assertEqual(results[0]["activation_status"], status)
+                self.assertEqual(results[0]["path_set_complete"], True)
+                if certainty == "possible":
+                    self.assertEqual(
+                        results[0]["activation_callers"][0]["caller_class_name"],
+                        "",
+                    )
+
+        analyzed_gap = self.service_engine(
+            certainty=None, gaps=("trace-gap",)
+        )._service_activation_results()[0]
+        self.assertEqual(analyzed_gap["activation_status"], "not_analyzed")
+        self.assertFalse(analyzed_gap["path_set_complete"])
+
+        no_near_load = self.service_engine(
+            certainty="exact", near=False
+        )._service_activation_results()[0]
+        self.assertEqual(
+            no_near_load["activation_status"],
+            "not_found_in_static_analysis",
+        )
+
+        zero_index = self.service_engine(certainty="exact")
+        zero_index.edges["literal"]["instruction_index"] = None
+        zero_index.edges["load"]["instruction_index"] = None
+        self.assertEqual(
+            zero_index._service_activation_results()[0]["activation_status"],
+            "reachable",
+        )
+
+    def test_build_skips_non_targetable_candidate_and_binds_partial_coverage(self):
+        engine = object.__new__(BinaryTraceEngine)
+        engine.decisions = self.decisions(
+            candidate_projection_plans=({
+                "planning_status": "unsupported",
+                "decision_identity": "ignored",
+            },),
+        )
+        engine.assessment_by_identity = {}
+        engine.decision_by_identity = {}
+        engine._service_activation_results = lambda: []
+        engine.entrypoint_discovery = self.discovery(gaps=("entry-gap",))
+        engine.entrypoint_gaps = ("entry-gap",)
+        engine.semantic_overlay = SimpleNamespace(
+            identity="semantic", coverage_gaps=("semantic-gap",)
+        )
+        engine.runtime = SimpleNamespace(coverage_gaps=("runtime-gap",))
+        engine.batch_graph_identity = "batch"
+        engine.graph_stats = {"node_count": 0}
+        bundle = engine.build()
+        self.assertEqual(bundle.formal_results, ())
+        self.assertEqual(bundle.candidate_results, ())
+        self.assertEqual(bundle.coverage_status, "partial")
+        self.assertEqual(
+            set(bundle.coverage_gaps),
+            {"entry-gap", "semantic-gap", "runtime-gap"},
+        )
+
+    def test_build_materializes_formal_targetable_candidates_and_resource_digests(self):
+        engine = object.__new__(BinaryTraceEngine)
+        engine.decisions = self.decisions(
+            formal_projections=({
+                "projection_identity": "formal-projection",
+                "projection_assessment_identity": "assessment",
+            },),
+            candidate_projection_plans=(
+                {"planning_status": "targetable", "decision_identity": "candidate",
+                 "candidate_projection_plan_identity": "empty-plan",
+                 "projection_obligation_keys": ()},
+                {"planning_status": "targetable", "decision_identity": "candidate",
+                 "candidate_projection_plan_identity": "plan",
+                 "projection_obligation_keys": ("one", "two")},
+            ),
+        )
+        engine.assessment_by_identity = {
+            "assessment": {
+                "projection_assessment_identity": "assessment",
+                "decision_identity": "formal",
+            },
+        }
+        engine.decision_by_identity = {
+            "formal": {"decision_identity": "formal"},
+            "candidate": {"decision_identity": "candidate"},
+        }
+
+        def result_for(**arguments):
+            return {
+                "trace_result_identity": "trace-" + arguments["projection_identity"],
+                "trace_coverage_gaps": (
+                    ["result-gap"] if arguments["diagnostic"] else []
+                ),
+            }
+
+        engine._result_for = result_for
+        engine._service_activation_results = lambda: [{
+            "resource_activation_result_identity": "resource-result",
+        }]
+        engine.entrypoint_discovery = self.discovery(records=(
+            {"member_identity": "entry"},
+        ))
+        engine.entrypoint_gaps = ()
+        engine.semantic_overlay = None
+        engine.runtime = SimpleNamespace(coverage_gaps=())
+        engine.batch_graph_identity = "batch"
+        engine.graph_stats = {"node_count": 1}
+        bundle = engine.build()
+        self.assertEqual(len(bundle.formal_results), 1)
+        self.assertEqual(len(bundle.candidate_results), 2)
+        self.assertEqual(len(bundle.resource_activation_results), 1)
+        self.assertEqual(bundle.coverage_gaps, ("result-gap",))
+        self.assertEqual(bundle.entrypoint_coverage_status, "complete")
+
+    def test_no_target_fast_path_preserves_partial_gaps_and_semantic_identity(self):
+        discovery = self.discovery(gaps=("entry-gap",))
+        decisions = self.decisions(authoritative_decisions=(
+            {"fact_kind": "resource", "fact_scope": None},
+            {"fact_kind": "resource", "fact_scope": {}},
+            {"fact_kind": "method"},
+        ))
+        semantic = SimpleNamespace(
+            rows=(object(),), identity="semantic", coverage_gaps=("semantic-gap",)
+        )
+        with patch.object(
+            binary_trace_engine, "discover_binary_entrypoints", return_value=discovery
+        ), patch.object(binary_trace_engine, "BinaryTraceEngine") as engine:
+            bundle = build_binary_traces(
+                object(), object(), self.runtime(coverage_gaps=("runtime-gap",)),
+                decisions, semantic_overlay=semantic,
+            )
+        engine.assert_not_called()
+        self.assertEqual(bundle.coverage_status, "partial")
+        self.assertEqual(
+            set(bundle.coverage_gaps),
+            {"entry-gap", "runtime-gap", "semantic-gap"},
+        )
+        self.assertEqual(bundle.graph_stats["runtime_semantic_edge_count"], 1)
+        self.assertEqual(bundle.entrypoint_coverage_status, "partial")
+
+    def test_trace_builder_routes_possible_roots_and_service_short_circuit_inputs(self):
+        runtime = self.runtime()
+        cases = (
+            (
+                self.decisions(formal_projections=({"projection": "p"},)),
+                self.discovery(possible=("possible-entry",)),
+            ),
+            (
+                self.decisions(
+                    formal_projections=({"projection": "p"},),
+                    authoritative_decisions=({
+                        "fact_kind": "resource",
+                        "fact_scope": {
+                            "resource_name": "META-INF/services/demo.Api",
+                        },
+                    },),
+                ),
+                self.discovery(),
+            ),
+            (
+                self.decisions(candidate_projection_plans=({
+                    "planning_status": "unsupported",
+                },)),
+                self.discovery(),
+            ),
+        )
+        for decisions, discovery in cases:
+            with self.subTest(decisions=decisions), patch.object(
+                binary_trace_engine,
+                "discover_binary_entrypoints",
+                return_value=discovery,
+            ), patch.object(
+                binary_trace_engine, "BinaryTraceEngine"
+            ) as engine, patch.object(
+                binary_trace_engine,
+                "hydrate_runtime_reconciliation",
+                return_value=runtime,
+            ), patch.object(
+                binary_trace_engine,
+                "_hydrate_trace_reconciliation",
+                return_value=runtime,
+            ):
+                engine.return_value.build.return_value = "built"
+                result = build_binary_traces(
+                    object(), object(), runtime, decisions
+                )
+            if decisions.formal_projections:
+                self.assertEqual(result, "built")
+
+
 class BinaryTraceEngineTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

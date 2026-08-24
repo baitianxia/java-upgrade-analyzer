@@ -1999,9 +1999,27 @@ class BinaryValidationPerformanceSafetyTest(unittest.TestCase):
                 "failures": [],
             }
 
+        # Use a deterministic phase clock. Runtime call/branch observation can
+        # add more than the deliberately tiny 10 ms budget before the executor
+        # submits its first task; wall-clock coupling would then test profiler
+        # overhead instead of the shared-deadline contract. The main thread
+        # sees time expire immediately after its initial submission while the
+        # worker still receives a positive remaining budget.
+        main_thread = threading.current_thread()
+        main_clock_calls = 0
+        clock_lock = threading.Lock()
+
+        def phase_clock():
+            nonlocal main_clock_calls
+            if threading.current_thread() is not main_thread:
+                return 0.0
+            with clock_lock:
+                main_clock_calls += 1
+                return 0.0 if main_clock_calls <= 2 else 0.02
+
         with patch.object(oracle.os, "cpu_count", return_value=1), patch.object(
             oracle, "scan_final_artifact", side_effect=slow_scan
-        ) as scan:
+        ) as scan, patch.object(oracle.time, "perf_counter", side_effect=phase_clock):
             issues, _truth = oracle._validate_direct_edges(
                 connection,
                 artifacts,
@@ -3133,12 +3151,11 @@ class BinaryValidationPerformanceSafetyTest(unittest.TestCase):
         reported_api_identity = oracle._identity("reported_api_identity", {
             "analysis_context_identity": analysis_context,
             "current_runtime_profile_identity": runtime_profile,
-            "initiating_loader_realm_identity": "application-loader",
             "class_name": "demo/Api",
             "member_kind": "method",
             "member_name": "changed",
             "descriptor": "()V",
-            "grouping_rule_version": "binary-reported-api-v1",
+            "grouping_rule_version": "binary-reported-api-v2",
         })
         reported_api = {
             "reported_api_identity": reported_api_identity,
@@ -3146,6 +3163,7 @@ class BinaryValidationPerformanceSafetyTest(unittest.TestCase):
             "display_member": "changed",
             "display_descriptor": "()V",
             "display_member_kind": "method",
+            "initiating_loader_realms": ["application-loader"],
             "reachability_status": status,
             "is_reachable": False,
             "impact_conclusion": "inconclusive",

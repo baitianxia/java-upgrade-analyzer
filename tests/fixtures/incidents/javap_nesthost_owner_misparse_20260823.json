@@ -1,0 +1,24 @@
+{
+  "schema": "java-upgrade-analyzer.test-incident-evidence.v1",
+  "incident_id": "javap-nesthost-owner-misparse-20260823",
+  "observed_at": "2026-08-23T10:19:19Z",
+  "platform": "macOS aarch64 Release gate with OpenJDK javap 21.0.8",
+  "trigger": "all six fixed real-project validations scanned ordinary nested classes whose verbose javap output contains a post-body NestHost: class attribute",
+  "actual_pre_fix_behavior": "the independent direct-edge and structural parsers treated NestHost: class <outer> as a second top-level class declaration and failed validation with javap/classfile owner mismatch",
+  "expected_behavior": "only a Java declaration line with legal declaration modifiers may establish the rendered owner; class-level NestHost and other colon-delimited attributes must not replace the raw classfile this_class owner",
+  "root_cause": "CLASS_DECLARATION_RE accepted any non-whitespace prefix before the class keyword, so the attribute label NestHost: satisfied the declaration grammar",
+  "independent_evidence": {
+    "artifact": "logback-classic-1.5.34.jar",
+    "artifact_sha256": "b65e05076a5c1aadb659b4fe4bc5fee31cb26cd70390292eb03e4a7a24cff10f",
+    "class_entry": "ch/qos/logback/classic/pattern/NamedConverter$NameCache.class",
+    "class_sha256": "d89de12ac9fd548c30164a0ad41d248d07161b2e45e5126361cbbe37be0e9eb8",
+    "raw_classfile_owner": "ch/qos/logback/classic/pattern/NamedConverter$NameCache",
+    "javap_declaration": "class ch.qos.logback.classic.pattern.NamedConverter$NameCache extends java.util.LinkedHashMap<java.lang.String, java.lang.String>",
+    "post_body_attribute": "NestHost: class ch/qos/logback/classic/pattern/NamedConverter"
+  },
+  "reproduction": [
+    "Run javap -verbose -c -s -p on the fixed nested-class entry and compare its first declaration with the raw classfile this_class value.",
+    "Feed the complete output, including the post-body NestHost attribute, through both independent Oracle parsers.",
+    "Run the public nested-class removal black box and all six fixed real-project guards; require zero direct or structural parse failures."
+  ]
+}

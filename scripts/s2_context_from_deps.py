@@ -62,7 +62,7 @@ def _normalize_pinned_relative_path(value, *, allow_root=True):
     if text.startswith('/') or re.match(r'^[A-Za-z]:/', text):
         return ''
     parts = [part for part in text.split('/') if part not in ('', '.')]
-    if not parts or any(part == '..' for part in parts):
+    if any(part == '..' for part in parts):
         return ''
     return '/'.join(parts)
 
@@ -71,18 +71,28 @@ def _valid_pinned_source_snapshot(orchestrated_input, current_revision):
     snapshot = (orchestrated_input or {}).get('pinned_source_snapshot')
     if not isinstance(snapshot, dict):
         return {}
-    commit = str(snapshot.get('commit') or '').strip().lower()
+    raw_commit = snapshot.get('commit')
+    project_path = snapshot.get('project_path')
+    source_roots = snapshot.get('source_roots')
+    if (
+        not isinstance(raw_commit, str)
+        or not isinstance(project_path, str)
+        or not isinstance(source_roots, list)
+        or any(not isinstance(value, str) for value in source_roots)
+    ):
+        return {}
+    commit = raw_commit.strip().lower()
     if (
         snapshot.get('schema') != PINNED_SOURCE_SNAPSHOT_SCHEMA
         or not _FULL_GIT_COMMIT_RE.fullmatch(commit)
         or commit != str(current_revision or '').strip().lower()
         or not _normalize_pinned_relative_path(
-            snapshot.get('project_path'), allow_root=True,
+            project_path, allow_root=True,
         )
     ):
         return {}
     roots = []
-    for value in snapshot.get('source_roots') or []:
+    for value in source_roots:
         normalized = _normalize_pinned_relative_path(value, allow_root=True)
         if not normalized:
             return {}
@@ -90,7 +100,7 @@ def _valid_pinned_source_snapshot(orchestrated_input, current_revision):
     normalized = dict(snapshot)
     normalized['commit'] = commit
     normalized['project_path'] = _normalize_pinned_relative_path(
-        snapshot.get('project_path'), allow_root=True,
+        project_path, allow_root=True,
     )
     normalized['source_roots'] = list(dict.fromkeys(roots))
     return normalized
@@ -292,26 +302,19 @@ def build_dep_graph(deps):
     # dependency presence/version; until a resolved dependency:tree is supplied
     # this contextual graph deliberately leaves relationships unknown.
     edges = []
-
-    analysis_order = topological_sort(
-        list(changed_deps.keys()),
-        [(edge['from'], edge['to']) for edge in edges],
-    )
-
-    from_nodes = {edge['from'] for edge in edges}
-    to_nodes = {edge['to'] for edge in edges}
+    analysis_order = list(changed_deps)
     dependencies = []
     for index, coord in enumerate(analysis_order):
         dep = changed_deps[coord]
-        is_leaf = coord not in from_nodes
-        is_root = coord not in to_nodes
         dependencies.append(
             {
                 **dep,
                 'analysis_index': index,
-                'is_leaf': is_leaf,
-                'is_root': is_root,
-                'layer': 'leaf' if is_leaf else ('root' if is_root else 'middle'),
+                # No authoritative resolved edge exists in this schema, so
+                # every retained node is intentionally isolated.
+                'is_leaf': True,
+                'is_root': True,
+                'layer': 'leaf',
             }
         )
 
@@ -512,7 +515,7 @@ def collect_changed_dependencies(deps):
         parts = coord.split(':')
         changed.append({
             'coord': coord,
-            'group_id': parts[0] if len(parts) >= 1 else '',
+            'group_id': parts[0],
             'artifact_id': parts[1] if len(parts) >= 2 else '',
             'old_version': old_version,
             'new_version': new_version,
@@ -606,7 +609,7 @@ def is_git_repo(work_dir='.', *, strict_git=False):
         git_cmd() + ['rev-parse', '--is-inside-work-tree'],
         cwd=work_dir, timeout=10
     )
-    inside = rc == 0 and str(stdout or '').strip().lower() == 'true'
+    inside = rc == 0 and str(stdout).strip().lower() == 'true'
     if strict_git and not inside:
         raise RuntimeError(
             "STEP2_GIT_REPOSITORY_PROBE_FAILED:"
@@ -748,7 +751,8 @@ def detect_jdk_from_pom(pom_content):
             for child in list(properties_node):
                 key = _xml_local_name(child.tag)
                 value = ''.join(child.itertext()).strip()
-                if key and value:
+                # ElementTree only yields elements with a non-empty tag here.
+                if value:
                     properties[key] = value
 
         plugin_values = {
@@ -841,7 +845,7 @@ def detect_jdk_from_gradle(gradle_content):
     content = re.sub(r'(?m)//.*$', ' ', content)
 
     def expression_version(expression):
-        expression = str(expression or '').strip()
+        expression = str(expression).strip()
         direct = normalize_jdk_version(expression)
         if direct:
             return direct
@@ -1046,21 +1050,29 @@ def detect_artifact_jdk_evidence(output_path=''):
     except (OSError, ValueError, TypeError):
         return {}
 
+    if not isinstance(payload, dict):
+        return {}
+    sides = payload.get('sides')
+    if not isinstance(sides, list):
+        return {}
+
     evidence = {}
-    for item in payload.get('sides') or []:
-        side = str((item or {}).get('side') or '').strip()
+    for item in sides:
+        if not isinstance(item, dict):
+            continue
+        side = str(item.get('side') or '').strip()
         if side not in ('base', 'current'):
             continue
-        raw_path = str((item or {}).get('artifact_path') or '').strip()
+        raw_path = str(item.get('artifact_path') or '').strip()
         if not raw_path:
             continue
         artifact_path = Path(raw_path).expanduser()
         if not artifact_path.is_absolute():
             artifact_path = provenance_path.parent / artifact_path
         detected = detect_jdk_from_artifact(artifact_path)
-        detected['build_runtime_jdk_home'] = str((item or {}).get('jdk_home') or '')
-        detected['build_tool'] = str((item or {}).get('build_tool') or '')
-        detected['revision'] = str((item or {}).get('revision') or '')
+        detected['build_runtime_jdk_home'] = str(item.get('jdk_home') or '')
+        detected['build_tool'] = str(item.get('build_tool') or '')
+        detected['revision'] = str(item.get('revision') or '')
         evidence[side] = detected
     return evidence
 
@@ -1200,14 +1212,14 @@ def detect_jdk_versions_from_manifests(
         base_pom = ''
         cur_pom = ''
         for candidate in pom_candidates:
-            if not base_pom:
-                base_pom = git_show_file(
-                    base_branch, candidate, work_dir, strict_git=strict_git,
-                )
-            if not cur_pom:
-                cur_pom = git_show_file(
-                    cur_branch, candidate, work_dir, strict_git=strict_git,
-                )
+            # The loop exits as soon as either side exists, therefore both
+            # values are necessarily empty at the start of every iteration.
+            base_pom = git_show_file(
+                base_branch, candidate, work_dir, strict_git=strict_git,
+            )
+            cur_pom = git_show_file(
+                cur_branch, candidate, work_dir, strict_git=strict_git,
+            )
             if base_pom or cur_pom:
                 matched_candidate = candidate
                 break

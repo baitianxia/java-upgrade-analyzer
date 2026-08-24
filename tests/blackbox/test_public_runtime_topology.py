@@ -349,15 +349,119 @@ class PublicRuntimeTopologyBlackboxTest(unittest.TestCase):
                     len(truth["required_platform_classes"]),
                 )
 
+    def test_provider_topology_has_one_public_identity_across_loader_realms(self):
+        truth = TRUTH["cases"]["provider_identity_across_loader_realms"]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            base = compile_jar(root, "provider-identity-base", {
+                "lib/Outer.java": (
+                    "package lib; public class Outer { "
+                    "public static class Removed { "
+                    "public static int value(){return 1;} } "
+                    "public static class Control { "
+                    "public static int value(){return 7;} } }"
+                ),
+            }, self.javac)
+            current = compile_jar(root, "provider-identity-current", {
+                "lib/Outer.java": (
+                    "package lib; public class Outer { "
+                    "public static class Control { "
+                    "public static int value(){return 7;} } }"
+                ),
+            }, self.javac)
+            business = compile_jar(root, "provider-identity-business", {
+                "biz/Entry.java": (
+                    "package biz; public class Entry { "
+                    "public String run(){return lib.Outer.Removed.value()+\":\"+"
+                    "lib.Outer.Control.value();} public static void main(String[] a){"
+                    "System.out.print(new Entry().run());} }"
+                ),
+            }, self.javac, classpath=(base,))
+
+            base_run = execute([
+                self.java, "-Xverify:all", "-cp",
+                os.pathsep.join((str(business), str(base))), "biz.Entry",
+            ])
+            self.assertEqual(base_run.stdout, truth["expected_base_stdout"])
+            current_run = managed_run(
+                [
+                    self.java, "-Xverify:all", "-cp",
+                    os.pathsep.join((str(business), str(current))), "biz.Entry",
+                ],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", check=False, timeout=180,
+            )
+            self.assertNotEqual(current_run.returncode, 0)
+            self.assertIn(
+                truth["expected_current_error"],
+                current_run.stdout + current_run.stderr,
+            )
+            with zipfile.ZipFile(base) as archive:
+                self.assertEqual(
+                    sorted(name for name in archive.namelist() if name.endswith(".class")),
+                    truth["base_class_entries"],
+                )
+            with zipfile.ZipFile(current) as archive:
+                self.assertEqual(
+                    sorted(name for name in archive.namelist() if name.endswith(".class")),
+                    truth["current_class_entries"],
+                )
+
+            entrypoint = ("biz/Entry", "run", "()Ljava/lang/String;")
+            result, formal, _overlay = public_pipeline(
+                root / "provider-identity-report",
+                standard_config(
+                    side(self.home, business, base, "1", entrypoint),
+                    side(self.home, business, current, "2", entrypoint),
+                ),
+            )
+            self.assertEqual(result["validation_status"], "passed")
+            public_identities = [
+                (
+                    row.get("display_owner"), row.get("display_member"),
+                    row.get("display_descriptor"),
+                    row.get("display_member_kind"),
+                )
+                for row in formal["by_api"]
+            ]
+            self.assertEqual(len(public_identities), len(set(public_identities)))
+            target_rows = [
+                row for row in formal["by_api"]
+                if row.get("display_owner") == truth["class_name"]
+                and row.get("display_member_kind") == "provider_topology"
+            ]
+            self.assertEqual(
+                len(target_rows), truth["expected_public_identity_count"],
+            )
+            target = target_rows[0]
+            self.assertEqual(
+                target["initiating_loader_realms"],
+                truth["expected_loader_realms"],
+            )
+            self.assertEqual(
+                len(target["contributing_change_fact_ids"]),
+                truth["expected_contributing_fact_count"],
+            )
+            for field, value in truth["expected_state"].items():
+                self.assertEqual(target[field], value, (field, target))
+
     def test_classpath_and_resource_order_match_actual_classloader(self):
         truth = TRUTH["cases"]["classpath_and_resources"]
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             provider_a = compile_jar(root, "provider-a", {
-                "dup/Provider.java": "package dup; public class Provider { public static int value(){return 1;} }",
+                "dup/Provider.java": (
+                    "package dup; public class Provider { "
+                    "static class Helper { int value(){return 1;} } "
+                    "public static int value(){return new Helper().value();} }"
+                ),
             }, self.javac)
             provider_b = compile_jar(root, "provider-b", {
-                "dup/Provider.java": "package dup; public class Provider { public static int value(){return 2;} }",
+                "dup/Provider.java": (
+                    "package dup; public class Provider { "
+                    "static class Helper { int value(){return 2;} } "
+                    "public static int value(){return new Helper().value();} }"
+                ),
             }, self.javac)
             append_resources(provider_a, {
                 truth["first_resource_name"]: "A",
@@ -401,7 +505,13 @@ class PublicRuntimeTopologyBlackboxTest(unittest.TestCase):
                     self.assertEqual(
                         archive.read(truth["first_resource_name"]), expected_value
                     )
-                    self.assertIn("dup/Provider.class", archive.namelist())
+                    self.assertEqual(
+                        sorted(
+                            name for name in archive.namelist()
+                            if name.startswith("dup/") and name.endswith(".class")
+                        ),
+                        truth["provider_class_entries"],
+                    )
 
             entrypoint = ("biz/Entry", "run", "()Ljava/lang/String;")
 
@@ -463,6 +573,56 @@ class PublicRuntimeTopologyBlackboxTest(unittest.TestCase):
             self.assertEqual(current_selected, truth["current_selected_lineage"])
             self.assertEqual(base_resources, truth["base_resource_order"])
             self.assertEqual(current_resources, truth["current_resource_order"])
+
+            database = generations / "current_binary_facts.sqlite"
+            with closing(sqlite3.connect(database)) as connection:
+                connection.row_factory = sqlite3.Row
+                physical_dispatch_edges = [dict(row) for row in connection.execute(
+                    """
+                    SELECT e.direct_edge_identity,
+                           e.caller_artifact_instance_identity,
+                           e.symbolic_owner,e.symbolic_name,e.symbolic_descriptor
+                    FROM direct_edges AS e
+                    WHERE e.edge_kind='method' AND e.opcode=182
+                      AND e.symbolic_owner=? AND e.symbolic_name=?
+                      AND e.symbolic_descriptor=?
+                    ORDER BY e.direct_edge_identity
+                    """,
+                    tuple(truth["shadowed_dispatch_target"]),
+                )]
+            dispatch_identities = {
+                row["direct_edge_identity"]
+                for row in [payload(item) for item in reconciliation_rows(
+                    generations, "current"
+                )]
+                if row.get("record_kind") == "dispatch_resolution"
+            }
+            selected_artifact = next(
+                payload(row)["selected_artifact_instance_identity"]
+                for row in reconciliation_rows(generations, "current")
+                if payload(row).get("record_kind") == "provider_binding"
+                and payload(row).get("class_name") == truth["class_name"]
+            )
+            self.assertEqual(
+                len(physical_dispatch_edges),
+                truth["expected_physical_dispatch_edge_count"],
+            )
+            selected_edges = [
+                row for row in physical_dispatch_edges
+                if row["caller_artifact_instance_identity"] == selected_artifact
+            ]
+            shadowed_edges = [
+                row for row in physical_dispatch_edges
+                if row["caller_artifact_instance_identity"] != selected_artifact
+            ]
+            self.assertEqual(len(selected_edges), 1)
+            self.assertEqual(len(shadowed_edges), 1)
+            self.assertIn(
+                selected_edges[0]["direct_edge_identity"], dispatch_identities,
+            )
+            self.assertNotIn(
+                shadowed_edges[0]["direct_edge_identity"], dispatch_identities,
+            )
 
     def test_parent_first_realm_shadows_child_provider_like_urlclassloader(self):
         truth = TRUTH["cases"]["parent_first"]

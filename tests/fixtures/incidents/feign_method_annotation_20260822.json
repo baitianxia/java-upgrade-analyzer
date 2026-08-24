@@ -1,0 +1,15 @@
+{
+  "schema": "java-upgrade-analyzer.test-incident-evidence.v1",
+  "incident_id": "feign-method-annotation-20260822",
+  "observed_at": "2026-08-22T00:00:00+08:00",
+  "platform": "macOS aarch64 local JVM black-box fixture",
+  "trigger": "a business interface declares Feign Core @RequestLine only on the method and has no class-level @FeignClient annotation",
+  "actual_pre_fix_behavior": "the semantic overlay emitted no declarative_http_client_dispatch row for the annotated method; the independent validation oracle repeated the same class-only assumption and therefore accepted the omission",
+  "expected_behavior": "OpenJDK reflection and javap both prove the runtime-visible method annotation, so the method must produce an exact declarative HTTP dispatch edge when the runtime handler is present",
+  "root_cause": "both the producer and validation oracle gated client discovery on class annotations before inspecting member annotations",
+  "reproduction": [
+    "Compile an interface whose call() method has runtime-visible feign.RequestLine and whose class has no FeignClient annotation.",
+    "Use JVM reflection and javap -v to establish the annotation independently of analyzer output.",
+    "Run the public binary pipeline with a Feign runtime handler and inspect the closed semantic overlay rows."
+  ]
+}

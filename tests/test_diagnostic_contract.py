@@ -15,6 +15,7 @@ from diagnostic_contract import (  # noqa: E402
     normalize_component_reason_codes,
     normalize_diagnostic_payload,
 )
+import diagnostic_contract  # noqa: E402
 
 
 class DiagnosticContractTest(unittest.TestCase):
@@ -86,6 +87,116 @@ class DiagnosticContractTest(unittest.TestCase):
             "BINARY_ARTIFACT_PARSE_FAILED",
         ):
             self.assertIsNotNone(pattern.fullmatch(code))
+
+    def test_empty_alias_duplicate_and_mapping_boundaries_are_deterministic(self):
+        self.assertEqual(diagnostic_contract._upper_snake(None), "")
+        self.assertEqual(diagnostic_contract._upper_snake(" HTTPServer "), "HTTP_SERVER")
+        self.assertEqual(canonical_reason_code(None, default=None), "UNKNOWN")
+        self.assertEqual(canonical_reason_code("", default="fallback code"), "FALLBACK_CODE")
+        self.assertEqual(
+            diagnostic_contract.canonical_reason_codes(
+                [None, "", "alpha reason", "ALPHA_REASON"],
+            ),
+            ["ALPHA_REASON"],
+        )
+        self.assertEqual(diagnostic_contract.canonical_reason_codes(None), [])
+        self.assertEqual(diagnostic_contract.reason_code_aliases("unknown"), [])
+        self.assertEqual(
+            diagnostic_contract.diagnostic_identity(None, None),
+            {
+                "diagnostic_schema": diagnostic_contract.DIAGNOSTIC_CONTRACT_SCHEMA,
+                "origin_step": "",
+                "reason_code": "UNKNOWN",
+                "reason_code_aliases": [],
+            },
+        )
+
+        empty = normalize_diagnostic_payload(None, origin_step=" STEP2 ")
+        self.assertEqual(empty["origin_step"], "step2")
+        self.assertEqual(empty["reason_code_aliases"], [])
+        self.assertEqual(
+            empty["diagnostic_schema"],
+            diagnostic_contract.DIAGNOSTIC_CONTRACT_SCHEMA,
+        )
+
+        aliases = normalize_diagnostic_payload({
+            "reason_code": "archive unsafe",
+            "origin_step": " STEP3 ",
+            "reason_code_aliases": ["legacy", "", "legacy"],
+            "reason_codes": ("archive unsafe", "ARCHIVE_UNSAFE", None),
+        })
+        self.assertEqual(aliases["reason_code"], "ARCHIVE_UNSAFE")
+        self.assertEqual(aliases["origin_step"], "step3")
+        self.assertEqual(
+            aliases["reason_code_aliases"],
+            ["legacy", "archive unsafe"],
+        )
+        self.assertEqual(aliases["reason_codes"], ["ARCHIVE_UNSAFE"])
+
+        published_alias = normalize_diagnostic_payload({
+            "reason_code": "unresolved_dependency_coordinates_after_enrichment",
+        })
+        self.assertEqual(
+            published_alias["reason_code"],
+            DEPENDENCY_COORDINATES_UNRESOLVED,
+        )
+        self.assertEqual(
+            published_alias["reason_code_aliases"],
+            ["unresolved_dependency_coordinates_after_enrichment"],
+        )
+        canonical_payload = normalize_diagnostic_payload({
+            "reason_code": "ARCHIVE_UNSAFE",
+        })
+        self.assertEqual(canonical_payload["reason_code_aliases"], [])
+
+        preserved_collection = normalize_diagnostic_payload({
+            "reason_codes": "not-a-collection-contract",
+            "origin_step": "existing",
+        }, origin_step="ignored")
+        self.assertEqual(
+            preserved_collection["reason_codes"],
+            "not-a-collection-contract",
+        )
+        self.assertEqual(preserved_collection["origin_step"], "existing")
+
+        self.assertEqual(
+            normalize_component_reason_codes(None),
+            {"reason_codes": []},
+        )
+        component = normalize_component_reason_codes({
+            "reason_codes": [
+                None,
+                "",
+                "unresolved_dependency_coordinates_after_enrichment",
+                "unresolved_dependency_coordinates_after_enrichment",
+                DEPENDENCY_COORDINATES_UNRESOLVED,
+            ],
+        })
+        self.assertEqual(
+            component["reason_codes"],
+            [DEPENDENCY_COORDINATES_UNRESOLVED],
+        )
+        self.assertEqual(
+            component["reason_code_aliases"],
+            {
+                DEPENDENCY_COORDINATES_UNRESOLVED: [
+                    "unresolved_dependency_coordinates_after_enrichment",
+                ],
+            },
+        )
+
+        self.assertIsNone(diagnostic_contract.normalize_diagnostic_mapping(None))
+        self.assertEqual(diagnostic_contract.normalize_diagnostic_mapping({}), {})
+        reason_only = diagnostic_contract.normalize_diagnostic_mapping({
+            "reason_code": "archive unsafe",
+            "reason_codes": "leave-string-unchanged",
+        })
+        self.assertEqual(reason_only["reason_code"], "ARCHIVE_UNSAFE")
+        self.assertEqual(reason_only["reason_codes"], "leave-string-unchanged")
+        reasons_only = diagnostic_contract.normalize_diagnostic_mapping({
+            "reason_codes": {"archive unsafe", "ARCHIVE_UNSAFE"},
+        })
+        self.assertEqual(reasons_only["reason_codes"], ["ARCHIVE_UNSAFE"])
 
 
 if __name__ == "__main__":

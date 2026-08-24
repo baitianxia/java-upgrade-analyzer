@@ -71,27 +71,27 @@ def _formal_step5_target(item):
 
     artifacts = list(item.get("dependency_artifacts") or ())
     lineages = sorted({
-        str(artifact.get("logical_dependency_lineage") or "").strip()
+        str(artifact["logical_dependency_lineage"]).strip()
         for artifact in artifacts
         if str(artifact.get("logical_dependency_lineage") or "").strip()
     })
     base_coords = [
-        str(artifact.get("coord") or "").strip()
+        str(artifact["coord"]).strip()
         for artifact in artifacts
         if artifact.get("side") == "base" and artifact.get("coord")
     ]
     current_coords = [
-        str(artifact.get("coord") or "").strip()
+        str(artifact["coord"]).strip()
         for artifact in artifacts
         if artifact.get("side") == "current" and artifact.get("coord")
     ]
     fallback_origin = next((
-        str(artifact.get("runtime_code_source_origin_identity") or "").strip()
+        str(artifact["runtime_code_source_origin_identity"]).strip()
         for artifact in artifacts
         if artifact.get("runtime_code_source_origin_identity")
     ), "")
     declared_coords = sorted({
-        str(coord or "").strip()
+        str(coord).strip()
         for key in ("base_dependency_coords", "current_dependency_coords")
         for coord in item.get(key) or ()
         if str(coord or "").strip()
@@ -123,7 +123,7 @@ def _formal_step5_target(item):
         path for path in item.get("paths") or ()
         if isinstance(path, dict) and str(path.get("path_text") or "").strip()
     ]
-    paths = [str(path.get("path_text") or "").strip() for path in path_records]
+    paths = [str(path["path_text"]).strip() for path in path_records]
     return {
         "reported_api_identity": str(
             item.get("reported_api_identity") or ""
@@ -136,7 +136,7 @@ def _formal_step5_target(item):
         "call_paths": paths,
         "path_details": [{
             "path_status": str(item.get("reachability_status") or ""),
-            "path_text": str(path.get("path_text") or "").strip(),
+            "path_text": str(path["path_text"]).strip(),
             "path_certainty": str(path.get("path_certainty") or ""),
             "entry_kinds": list(path.get("entry_kinds") or ()),
             "entry_kind_labels": list(path.get("entry_kind_labels") or ()),
@@ -158,7 +158,7 @@ def _formal_step5_target(item):
             item.get("runtime_verification_status") or ""
         ),
         "contributing_change_fact_ids": [
-            str(identity or "").strip()
+            str(identity).strip()
             for identity in item.get("contributing_change_fact_ids") or ()
             if str(identity or "").strip()
         ],
@@ -169,12 +169,12 @@ def _formal_step5_resource(item):
     coord = _formal_step5_target(item)["coord"]
     artifacts = list(item.get("dependency_artifacts") or ())
     base_coords = [
-        str(artifact.get("coord") or "").strip()
+        str(artifact["coord"]).strip()
         for artifact in artifacts
         if artifact.get("side") == "base" and artifact.get("coord")
     ]
     current_coords = [
-        str(artifact.get("coord") or "").strip()
+        str(artifact["coord"]).strip()
         for artifact in artifacts
         if artifact.get("side") == "current" and artifact.get("coord")
     ]
@@ -209,7 +209,6 @@ def _formal_step5_resource(item):
         "activation_callers": callers,
         "business_entries": sorted({
             caller["display_caller"] for caller in callers
-            if caller.get("display_caller")
         }),
     }
 
@@ -295,26 +294,26 @@ def _step4_decision_projection(decision):
     evidence = decision.get("evidence") or {}
     artifacts = list(decision.get("dependency_artifacts") or ())
     lineages = [
-        str(item.get("logical_dependency_lineage") or "").strip()
+        str(item["logical_dependency_lineage"]).strip()
         for item in artifacts if item.get("logical_dependency_lineage")
     ]
     base_coords = [
-        str(item.get("coord") or "").strip()
+        str(item["coord"]).strip()
         for item in artifacts
         if item.get("side") == "base" and item.get("coord")
     ]
     current_coords = [
-        str(item.get("coord") or "").strip()
+        str(item["coord"]).strip()
         for item in artifacts
         if item.get("side") == "current" and item.get("coord")
     ]
-    coord = next((value for value in lineages if value), "")
+    coord = next(iter(lineages), "")
     if not coord:
         candidate = next(iter(current_coords or base_coords), "")
         parts = candidate.split(":")
         coord = ":".join(parts[:-1]) if len(parts) >= 3 else candidate
     coord = coord or next((
-        str(item.get("runtime_code_source_origin_identity") or "").strip()
+        str(item["runtime_code_source_origin_identity"]).strip()
         for item in artifacts if item.get("runtime_code_source_origin_identity")
     ), "") or "UNBOUND_RUNTIME_ARTIFACT"
 
@@ -489,7 +488,8 @@ def _step4_source_truth(loaded):
         line = int(location.get("line") or 0)
         end_line = int(location.get("end_line") or 0)
         line_text = (
-            str(line) if not end_line or end_line == line
+            "" if line <= 0
+            else str(line) if not end_line or end_line == line
             else f"{line}-{end_line}"
         )
         method_rows.append({
@@ -770,8 +770,13 @@ def gate_step1_scope(d):
         fail("evidence/dependencies/deps_current_resolved.csv 没有有效当前依赖数据行，请重新执行 Step 1")
     if not provenance_file.exists():
         fail("evidence/dependencies/build_provenance.json 不存在，无法证明 base/current 均来自成功构建或有效产物")
-    with open(provenance_file, encoding="utf-8", errors="replace") as f:
-        provenance = json.load(f)
+    try:
+        with open(provenance_file, encoding="utf-8", errors="replace") as f:
+            provenance = json.load(f)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        fail(f"evidence/dependencies/build_provenance.json 无效：{type(exc).__name__}")
+    if not isinstance(provenance, dict):
+        fail("evidence/dependencies/build_provenance.json 根节点不是对象")
     sides = list(provenance.get("sides") or [])
     if not provenance.get("both_builds_succeeded") or {item.get("side") for item in sides} != {"base", "current"}:
         fail("仅允许分析 base/current 均成功构建的升级结果")
@@ -784,10 +789,47 @@ def gate_step1_scope(d):
         manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         fail(f"Step1 依赖制品清单无法读取：{type(exc).__name__}")
-    manifest_items = list(manifest.get("items") or [])
+    if not isinstance(manifest, dict):
+        fail("Step1 依赖制品清单根节点不是对象")
+    manifest_items = manifest.get("items")
+    if manifest_items is None:
+        manifest_items = []
+    if not isinstance(manifest_items, list) or any(
+        not isinstance(item, dict) for item in manifest_items
+    ):
+        fail("Step1 依赖制品清单 items 不是完整对象列表")
+    if any(
+        str(item.get("side") or "") not in {"base", "current"}
+        or not str(item.get("coord") or "").strip()
+        or not str(item.get("version") or "").strip()
+        or not str(item.get("lib_entry") or "").replace("\\", "/").strip()
+        for item in manifest_items
+    ):
+        fail("Step1 依赖制品清单 items 缺少 side/coord/version/lib_entry 身份")
+    business_artifacts = manifest.get("business_artifacts")
+    if business_artifacts is None:
+        business_artifacts = []
+    if not isinstance(business_artifacts, list) or any(
+        not isinstance(item, dict) for item in business_artifacts
+    ):
+        fail("Step1 依赖制品清单 business_artifacts 不是完整对象列表")
+    if any(
+        str(item.get("side") or "") not in {"base", "current"}
+        for item in business_artifacts
+    ):
+        fail("Step1 依赖制品清单 business_artifacts 含无效 side")
+    manifest_entry_keys = [
+        (
+            str(item["side"]).strip(),
+            str(item["lib_entry"]).replace("\\", "/").strip(),
+        )
+        for item in manifest_items
+    ]
+    if len(set(manifest_entry_keys)) != len(manifest_entry_keys):
+        fail("Step1 依赖制品清单含重复 side/lib_entry，无法唯一绑定最终制品")
     gav_hashes = {}
     for item in manifest_items:
-        coord = str(item.get("coord") or "").strip()
+        coord = str(item["coord"]).strip()
         coord_parts = coord.split(":", 2)
         classifier = str(item.get("classifier") or "").strip()
         if not classifier and len(coord_parts) == 3:
@@ -798,9 +840,9 @@ def gate_step1_scope(d):
             else coord
         )
         key = (
-            str(item.get("side") or "").strip(),
+            str(item["side"]).strip(),
             gav_coord,
-            str(item.get("version") or "").strip(),
+            str(item["version"]).strip(),
             classifier,
         )
         gav_hashes.setdefault(key, set()).add(
@@ -815,11 +857,10 @@ def gate_step1_scope(d):
             )
     item_by_side_entry = {
         (
-            str(item.get("side") or "").strip(),
-            str(item.get("lib_entry") or "").replace("\\", "/").strip(),
+            str(item["side"]).strip(),
+            str(item["lib_entry"]).replace("\\", "/").strip(),
         ): item
         for item in manifest_items
-        if isinstance(item, dict)
     }
     for row in dep_rows:
         if str(row.get("resolution_status") or "").strip() != "resolved":
@@ -838,6 +879,24 @@ def gate_step1_scope(d):
             item = item_by_side_entry.get((side, lib_entry))
             if not item:
                 fail(f"Step1 未留存变化依赖 JAR：{row.get('coord')}（{side}）")
+            row_coord = str(row.get("coord") or "").strip()
+            row_coord_parts = row_coord.split(":", 2)
+            row_gav = (
+                ":".join(row_coord_parts[:2])
+                if len(row_coord_parts) >= 2 else row_coord
+            )
+            item_coord = str(item["coord"]).strip()
+            item_coord_parts = item_coord.split(":", 2)
+            item_gav = (
+                ":".join(item_coord_parts[:2])
+                if len(item_coord_parts) >= 2 else item_coord
+            )
+            expected_version = str(row[version_field]).strip()
+            if item_gav != row_gav or str(item["version"]).strip() != expected_version:
+                fail(
+                    f"Step1 变化依赖与留存 JAR 身份不一致："
+                    f"{row.get('coord')}（{side}）"
+                )
             retained_path = Path(str(item.get("retained_path") or ""))
             expected_sha = str(item.get("nested_jar_sha256") or "").strip()
             if not retained_path.is_file() or not expected_sha:
@@ -863,6 +922,16 @@ def gate_step1_scope(d):
         item = item_by_side_entry.get(("current", lib_entry))
         if not item or "binary_runtime" not in set(item.get("purposes") or ()):
             fail(f"Step1 未留存当前运行依赖 JAR：{coord}")
+        coord_parts = coord.split(":", 2)
+        row_gav = ":".join(coord_parts[:2]) if len(coord_parts) >= 2 else coord
+        item_coord = str(item["coord"]).strip()
+        item_coord_parts = item_coord.split(":", 2)
+        item_gav = (
+            ":".join(item_coord_parts[:2])
+            if len(item_coord_parts) >= 2 else item_coord
+        )
+        if item_gav != row_gav or str(item["version"]).strip() != version:
+            fail(f"Step1 当前运行依赖与留存 JAR 身份不一致：{coord}")
         retained_path = Path(str(item.get("retained_path") or ""))
         expected_sha = str(item.get("nested_jar_sha256") or "").strip()
         if not retained_path.is_file() or not expected_sha:
@@ -870,8 +939,8 @@ def gate_step1_scope(d):
         if sha256_file(retained_path) != expected_sha:
             fail(f"Step1 当前运行依赖 JAR SHA-256 不一致：{coord}")
         require_safe_step1_retained_archive(retained_path, coord)
-    for item in manifest.get("business_artifacts") or ():
-        if not isinstance(item, dict) or str(item.get("side") or "") != "current":
+    for item in business_artifacts:
+        if str(item["side"]) != "current":
             continue
         retained_path = Path(str(item.get("retained_path") or ""))
         expected_sha = str(item.get("sha256") or "").strip()
@@ -1112,7 +1181,7 @@ def gate_binary_generation(
         ) == "targetable"
     ]
     expected_unprojectable = {
-        str(item.get("decision_identity") or "").strip()
+        str(item["decision_identity"]).strip()
         for item in authoritative_decisions
         if assessment_by_decision[item["decision_identity"]].get(
             "analysis_projection_status"
@@ -1333,15 +1402,29 @@ def gate_binary_report(
         != loaded["manifest"].get("result_generation_identity")
     ):
         fail("Step5 发布结果与 active binary generation 不一致")
-    if candidate_publication_binding is not None and (
-        summary.get("step4_publication_receipt_identity")
-        != candidate_publication_binding.get(
-            "upstream_publication_receipt_identity"
-        )
-        or summary.get("step5_publication_input_identity")
-        != candidate_publication_binding.get("publication_input_identity")
+    step4_receipt_identity = summary.get("step4_publication_receipt_identity")
+    step5_publication_input_identity = summary.get(
+        "step5_publication_input_identity"
+    )
+    if (
+        not isinstance(step4_receipt_identity, str)
+        or not step4_receipt_identity.strip()
+        or not isinstance(step5_publication_input_identity, str)
+        or not step5_publication_input_identity.strip()
     ):
-        fail("Step5 发布摘要未绑定当前候选事务的上游/范围身份")
+        fail("Step5 发布摘要缺少非空的上游/范围身份")
+    if candidate_publication_binding is not None:
+        if not isinstance(candidate_publication_binding, dict):
+            fail("Step5 候选发布绑定不是对象")
+        if (
+            step4_receipt_identity
+            != candidate_publication_binding.get(
+                "upstream_publication_receipt_identity"
+            )
+            or step5_publication_input_identity
+            != candidate_publication_binding.get("publication_input_identity")
+        ):
+            fail("Step5 发布摘要未绑定当前候选事务的上游/范围身份")
     user_files = (
         call_chain_dir / "summary.md",
         call_chain_dir / "alerts.csv",
@@ -1363,20 +1446,27 @@ def gate_binary_report(
             "path_status", "path_text",
         ),
     )
+    if any(not str(row.get("api_identity") or "").strip() for row in alert_rows):
+        fail("Step5 alerts.csv 含缺少 API 身份的记录")
     published_api_identities = {
-        row["api_identity"] for row in alert_rows if row.get("api_identity")
+        row["api_identity"] for row in alert_rows
     }
-    if len(published_api_identities) != int(summary.get("total_apis") or 0):
+    try:
+        total_apis = int(summary.get("total_apis") or 0)
+    except (TypeError, ValueError):
+        fail("Step5 summary.json 的 total_apis 不是整数")
+    if total_apis < 0:
+        fail("Step5 summary.json 的 total_apis 不能为负数")
+    if len(published_api_identities) != total_apis:
         fail("Step5 alerts.csv 的唯一 API 数与 summary.json 不一致")
     if any(not row.get("target_coord") for row in alert_rows):
         fail("Step5 触达结果丢失依赖包维度")
     by_identity_statuses = {}
     for row in alert_rows:
-        identity = str(row.get("api_identity") or "")
-        if identity:
-            by_identity_statuses.setdefault(identity, set()).add(
-                str(row.get("path_status") or "")
-            )
+        identity = str(row["api_identity"])
+        by_identity_statuses.setdefault(identity, set()).add(
+            str(row.get("path_status") or "")
+        )
     if any(len(statuses) != 1 for statuses in by_identity_statuses.values()):
         fail("Step5 alerts.csv 同一 API 出现互相冲突的分析状态")
     summary_buckets = (
@@ -1398,7 +1488,7 @@ def gate_binary_report(
         ):
             fail(f"Step5 summary.json 的 {key} 含错误分析状态")
         summary_items.extend(bucket)
-    if len(summary_items) != int(summary.get("total_apis") or 0):
+    if len(summary_items) != total_apis:
         fail("Step5 summary.json 的逐 API 明细数与 total_apis 不一致")
     if (
         summary.get("not_impacted") != 0
@@ -1449,11 +1539,6 @@ def gate_binary_report(
             json.loads(path.read_text(encoding="utf-8"))
             for path in by_api_files
         ]
-        by_api_identities = {
-            str(payload.get("api_identity") or "")
-            for payload in by_api_payloads
-            if isinstance(payload, dict)
-        }
         selection = json.loads(
             (call_chain_dir / "selection.json").read_text(encoding="utf-8")
         )
@@ -1462,12 +1547,17 @@ def gate_binary_report(
         )
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         fail(f"Step5 事务内结构化文件无效：{exc}")
+    if any(not isinstance(payload, dict) for payload in by_api_payloads):
+        fail("Step5 by_api 明细含非对象记录")
+    by_api_identities = {
+        str(payload.get("api_identity") or "")
+        for payload in by_api_payloads
+    }
     if by_api_identities != published_api_identities:
         fail("Step5 by_api 明细与 alerts.csv 的 API 身份集合不一致")
     if (
-        any(not isinstance(payload, dict) for payload in by_api_payloads)
-        or {
-            str(payload.get("api_identity") or ""): payload
+        {
+            str(payload["api_identity"]): payload
             for payload in by_api_payloads
         }
         != summary_by_identity
@@ -1491,7 +1581,10 @@ def gate_binary_report(
     ):
         fail("Step5 selection.json 与发布摘要的范围/上游身份不一致")
 
-    formal_rows = (loaded.get("formal") or {}).get("by_api")
+    formal_payload = loaded.get("formal")
+    if not isinstance(formal_payload, dict):
+        fail("validated generation 的 formal 根节点不是对象")
+    formal_rows = formal_payload.get("by_api")
     if not isinstance(formal_rows, list) or any(
         not isinstance(item, dict) for item in formal_rows
     ):
@@ -1509,7 +1602,7 @@ def gate_binary_report(
         target["reported_api_identity"]: target for target in formal_targets
     }
     step4_rows, step4_snapshot = _load_current_step4_api_rows(
-        d, str(summary.get("step4_publication_receipt_identity") or "")
+        d, step4_receipt_identity
     )
     step4_fact_values = [
         str(row.get("change_fact_identity") or "").strip()
@@ -1535,12 +1628,9 @@ def gate_binary_report(
         all_expected_pairs.extend(
             (reported_identity, fact_id) for fact_id in fact_ids
         )
-    if len(set(all_expected_pairs)) != len(all_expected_pairs):
-        fail("validated generation 的 reported API/变化事实映射重复")
-
-    formal_resource_rows = (loaded.get("formal") or {}).get(
-        "resource_activation_results"
-    ) or []
+    formal_resource_rows = formal_payload.get("resource_activation_results")
+    if formal_resource_rows is None:
+        formal_resource_rows = []
     if not isinstance(formal_resource_rows, list) or any(
         not isinstance(item, dict) for item in formal_resource_rows
     ):
@@ -1550,11 +1640,11 @@ def gate_binary_report(
     ]
     available_coords = sorted({
         *(
-            str(step4_by_fact[fact_id].get("coord") or "").strip()
+            str(step4_by_fact[fact_id]["coord"]).strip()
             for _reported, fact_id in all_expected_pairs
         ),
         *(
-            str(item.get("coord") or "").strip()
+            str(item["coord"]).strip()
             for item in expected_resources
         ),
     } - {""})
@@ -1607,7 +1697,7 @@ def gate_binary_report(
         fail("Step5 selection.json 的依赖范围不是 generation 真值的精确分区")
     included_pairs = [
         pair for pair in all_expected_pairs
-        if str(step4_by_fact[pair[1]].get("coord") or "")
+        if str(step4_by_fact[pair[1]]["coord"])
         in set(expected_included_coords)
     ]
     expected_generation_reported_identities = sorted({
@@ -1620,7 +1710,7 @@ def gate_binary_report(
         or selection.get("analyzed_api_count") != len(included_pairs)
         or selection.get("excluded_api_count")
         != len(all_expected_pairs) - len(included_pairs)
-        or int(summary.get("total_apis") or 0) != len(included_pairs)
+        or total_apis != len(included_pairs)
     ):
         fail("Step5 选择范围未精确投影 generation 的变化事实集合")
     live_input_identity = _step5_publication_input_identity(
@@ -1632,17 +1722,12 @@ def gate_binary_report(
     if (
         selection.get("step5_publication_input_identity")
         != live_input_identity
-        or (
-            candidate_publication_binding is not None
-            and candidate_publication_binding.get("publication_input_identity")
-            != live_input_identity
-        )
     ):
         fail("Step5 publication input identity 未绑定真实选择范围")
 
     candidate_pairs = [
         (
-            str(item.get("reported_api_identity") or ""),
+            str(item["reported_api_identity"]),
             str(item.get("change_fact_identity") or ""),
         )
         for item in summary_items
@@ -1650,50 +1735,42 @@ def gate_binary_report(
     if Counter(candidate_pairs) != Counter(included_pairs):
         fail("Step5 summary.json 漏报、增报或重复了 generation 变化事实")
     for item in summary_items:
-        reported_identity = str(item.get("reported_api_identity") or "")
-        fact_identity = str(item.get("change_fact_identity") or "")
-        expected = formal_by_reported_identity.get(reported_identity)
-        change = step4_by_fact.get(fact_identity)
-        expected_symbol_kind = str(
-            (change or {}).get("symbol_kind")
-            or (expected or {}).get("symbol_kind")
-            or ""
-        )
+        reported_identity = str(item["reported_api_identity"])
+        fact_identity = str(item["change_fact_identity"])
+        expected = formal_by_reported_identity[reported_identity]
+        change = step4_by_fact[fact_identity]
+        expected_symbol_kind = str(change["symbol_kind"])
         expected_api_identity = "|".join((
-            str((change or {}).get("coord") or ""),
-            str((expected or {}).get("api") or ""),
-            str((expected or {}).get("api_signature") or ""),
+            str(change["coord"]),
+            str(expected["api"]),
+            str(expected["api_signature"]),
             expected_symbol_kind,
-            str((change or {}).get("change_type") or ""),
+            str(change["change_type"]),
             fact_identity,
         ))
         expected_core = {
-                "coord": str(change.get("coord") or ""),
-                "api": str(expected.get("api") or ""),
-                "api_signature": str(expected.get("api_signature") or ""),
-                "symbol_kind": expected_symbol_kind,
-                "analysis_status": str(expected.get("analysis_status") or ""),
-                "change_type": str(change.get("change_type") or ""),
-                "old_version": str(change.get("old_version") or ""),
-                "new_version": str(change.get("new_version") or ""),
-                "decision_identity": str(change.get("decision_identity") or ""),
-                "api_identity": expected_api_identity,
-                "impact_conclusion": str(
-                    expected.get("impact_conclusion") or ""
-                ),
-                "static_linkage_status": str(
-                    expected.get("static_linkage_status") or ""
-                ),
-                "runtime_verification_status": str(
-                    expected.get("runtime_verification_status") or ""
-                ),
-            } if expected is not None and change is not None else {}
+            "coord": str(change["coord"]),
+            "api": str(expected["api"]),
+            "api_signature": str(expected["api_signature"]),
+            "symbol_kind": expected_symbol_kind,
+            "analysis_status": str(expected["analysis_status"]),
+            "change_type": str(change["change_type"]),
+            "old_version": str(change["old_version"]),
+            "new_version": str(change["new_version"]),
+            "decision_identity": str(change["decision_identity"]),
+            "api_identity": expected_api_identity,
+            "impact_conclusion": str(expected["impact_conclusion"]),
+            "static_linkage_status": str(expected["static_linkage_status"]),
+            "runtime_verification_status": str(
+                expected["runtime_verification_status"]
+            ),
+        }
         core_mismatches = [
             key for key, expected_value in expected_core.items()
             if str(item.get(key) or "") != expected_value
         ]
         actual_paths = [
-            str(path or "").strip()
+            str(path).strip()
             for path in item.get("call_paths") or ()
             if str(path or "").strip()
         ]
@@ -1702,65 +1779,53 @@ def gate_binary_report(
                 "path_set_complete", "exact_path_exists",
                 "possible_path_exists",
             )
-            if expected is not None
-            and bool(item.get(key)) != bool(expected[key])
+            if bool(item.get(key)) != bool(expected[key])
         ]
         if (
-            expected is None
-            or change is None
-            or core_mismatches
+            core_mismatches
             or actual_paths != expected["call_paths"]
             or item.get("path_details") != expected["path_details"]
             or boolean_mismatches
         ):
             mismatch_labels = list(core_mismatches)
-            if expected is not None and actual_paths != expected["call_paths"]:
+            if actual_paths != expected["call_paths"]:
                 mismatch_labels.append("call_paths")
-            if (
-                expected is not None
-                and item.get("path_details") != expected["path_details"]
-            ):
+            if item.get("path_details") != expected["path_details"]:
                 mismatch_labels.append("path_details")
             mismatch_labels.extend(boolean_mismatches)
             fail(
                 "Step5 summary.json 未精确投影 generation/Step4 API 真值："
                 f"reported={reported_identity} fact={fact_identity} "
-                f"fields={mismatch_labels or ['missing_truth']}"
+                f"fields={mismatch_labels}"
             )
 
     published_resources = summary.get("resource_activation_results")
     if not isinstance(published_resources, list) or published_resources != [
         item for item in expected_resources
-        if item.get("coord") in set(expected_included_coords)
+        if item["coord"] in set(expected_included_coords)
     ]:
         fail("Step5 资源激活结果未精确投影 generation 真值和选择范围")
 
     alerts_by_identity = defaultdict(list)
     for row in alert_rows:
-        alerts_by_identity[str(row.get("api_identity") or "")].append(row)
+        alerts_by_identity[str(row["api_identity"])].append(row)
     for identity, item in summary_by_identity.items():
-        rows = alerts_by_identity.get(identity) or []
+        rows = alerts_by_identity[identity]
         expected_paths = [
-            str(path or "").strip()
+            str(path).strip()
             for path in item.get("call_paths") or ()
             if str(path or "").strip()
         ] or [""]
         expected_core = {
-            "target_coord": str(item.get("coord") or ""),
-            "changed_symbol": str(item.get("api") or ""),
-            "api_signature": str(item.get("api_signature") or ""),
-            "symbol_kind": str(item.get("symbol_kind") or ""),
-            "change_type": str(item.get("change_type") or ""),
-            "reported_api_identity": str(
-                item.get("reported_api_identity") or ""
-            ),
-            "change_fact_identity": str(
-                item.get("change_fact_identity") or ""
-            ),
-            "decision_identity": str(
-                item.get("decision_identity") or ""
-            ),
-            "path_status": str(item.get("analysis_status") or ""),
+            "target_coord": str(item["coord"]),
+            "changed_symbol": str(item["api"]),
+            "api_signature": str(item["api_signature"]),
+            "symbol_kind": str(item["symbol_kind"]),
+            "change_type": str(item["change_type"]),
+            "reported_api_identity": str(item["reported_api_identity"]),
+            "change_fact_identity": str(item["change_fact_identity"]),
+            "decision_identity": str(item["decision_identity"]),
+            "path_status": str(item["analysis_status"]),
         }
         if (
             len(rows) != len(expected_paths)
@@ -1829,15 +1894,15 @@ def gate_binary_report(
         fail("Step5 调用链查询索引与 active binary generation 不一致")
     summary_targets = [
         (
-            str(item.get("coord") or ""),
-            str(item.get("api") or ""),
-            str(item.get("api_signature") or ""),
-            str(item.get("symbol_kind") or ""),
-            str(item.get("api_identity") or ""),
-            str(item.get("reported_api_identity") or ""),
-            str(item.get("change_fact_identity") or ""),
-            str(item.get("decision_identity") or ""),
-            str(item.get("change_type") or ""),
+            str(item["coord"]),
+            str(item["api"]),
+            str(item["api_signature"]),
+            str(item["symbol_kind"]),
+            str(item["api_identity"]),
+            str(item["reported_api_identity"]),
+            str(item["change_fact_identity"]),
+            str(item["decision_identity"]),
+            str(item["change_type"]),
         )
         for item in summary_items
     ]

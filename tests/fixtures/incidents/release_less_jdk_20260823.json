@@ -1,0 +1,24 @@
+{
+  "schema": "java-upgrade-analyzer.test-incident-evidence.v1",
+  "incident_id": "release-less-jdk-layout-20260823",
+  "observed_at": "2026-08-23T00:00:00+08:00",
+  "platform": "macOS aarch64 public Step0-Step6 black-box workflow",
+  "trigger": "official Amazon Corretto 8u504 macOS aarch64 JDK archive whose valid full-JDK layout has java, javac, javap and rt.jar but no physical release file",
+  "actual_pre_fix_behavior": "Step0 rejected the selected full JDK with JDK_RELEASE_MISSING before compiling or executing the probe",
+  "expected_behavior": "a full JDK must be accepted when its own java executable supplies a parseable version and runtime properties; the exact executable bytes and complete probe output must be content-bound, and Step0-Step6 plus the independent Oracle must still pass",
+  "root_cause": "JDK identity and version discovery treated the optional vendor release metadata file as a mandatory full-JDK capability",
+  "independent_evidence": {
+    "archive_sha256": "425eaab72289ffb346fae3d904de7301dc9fcb70ae9dc095fac2ea1b1c621bea",
+    "checksum_source": "vendor-published SHA-256 endpoint",
+    "java_version": "1.8.0_504",
+    "required_tools": ["java", "javac", "javap"],
+    "required_platform_image": "jre/lib/rt.jar",
+    "physical_release_file": false
+  },
+  "reproduction": [
+    "Verify the archive bytes against the vendor-published SHA-256 and unpack it without adding synthetic metadata.",
+    "Select the unpacked Contents/Home as both base and current JDK for the public artifact workflow.",
+    "Run Step0-Step6 and require java-properties-probe as the metadata source on both sides.",
+    "Repeat with a release-less hard-linked mirror of the same JDK bytes and compare the complete closed truth."
+  ]
+}

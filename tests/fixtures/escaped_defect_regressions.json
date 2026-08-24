@@ -1,0 +1,791 @@
+{
+  "schema": "java-upgrade-analyzer.escaped-defect-regressions.v1",
+  "minimum_registered_defects": 26,
+  "minimum_independent_truth_documents": 18,
+  "legacy_evidence_note": "这些历史缺陷在原轮次没有保存结构化 incident telemetry；observed_behavior 来自 testing-strategy.md 的明确记录，escape_reason 是根据随后新增的最小回归所重建的可审计测试缺口，不冒充当时已经记录的事实。新缺陷必须直接链接本轮复现、实际输出和根因证据。",
+  "defects": [
+    {
+      "id": "access-reduction-state-drift",
+      "title": "访问收窄被赋予错误的链接状态",
+      "risk": "critical",
+      "observed_behavior": "成员访问级别收窄后，正式结果的链接状态与目标 JVM 行为不一致。",
+      "correct_behavior": "访问收窄必须按调用者、接收者、运行包和实际解析结果区分合法与非法链接。",
+      "root_cause_family": "access-linkage-state-model",
+      "escape_reason": "早期场景没有把成员解析成功与访问链接失败拆成两个独立状态。",
+      "resolution_scope": "root-cause-model-and-public-regression",
+      "source_evidence": ["docs/developer/testing-strategy.md"],
+      "truth_evidence": [{
+        "path": "tests/fixtures/blackbox/access-restriction-v1/truth.json",
+        "control_pointers": ["/forbidden_results/0"]
+      }],
+      "regressions": [
+        {
+          "selector": "tests.blackbox.test_public_binary_cli.PublicBinaryCliBlackboxTest.test_public_cli_matches_closed_truth_and_ignores_packaging_noise",
+          "role": "blackbox",
+          "required_profiles": ["quick", "step5", "blackbox", "windows", "release"]
+        },
+        {
+          "selector": "tests.test_binary_trace_engine.BinaryTraceFastPathTest.test_contract_access_reduction_is_linkage_incompatible_without_a_path",
+          "role": "whitebox",
+          "required_profiles": ["quick", "step5", "release"]
+        }
+      ]
+    },
+    {
+      "id": "protected-subclass-false-positive",
+      "title": "合法 protected 子类路径被误报不兼容",
+      "risk": "critical",
+      "observed_behavior": "目标 JVM 可合法执行的 protected 子类访问被报告为不兼容。",
+      "correct_behavior": "已验证的合法子类路径必须保留 resolved 链接结论。",
+      "root_cause_family": "protected-access-path-semantics",
+      "escape_reason": "原有访问案例没有同时包含合法子类路径和相近非法路径。",
+      "resolution_scope": "root-cause-model-and-public-regression",
+      "source_evidence": ["docs/developer/testing-strategy.md"],
+      "truth_evidence": [{
+        "path": "tests/fixtures/blackbox/access-level-matrix-v1/truth.json",
+        "control_pointers": ["/expected_results/0", "/forbidden_results/0"]
+      }],
+      "regressions": [
+        {
+          "selector": "tests.blackbox.test_public_binary_cli.PublicBinaryCliBlackboxTest.test_public_cli_matches_closed_truth_and_ignores_packaging_noise",
+          "role": "blackbox",
+          "required_profiles": ["quick", "step5", "blackbox", "windows", "release"]
+        },
+        {
+          "selector": "tests.test_binary_trace_engine.BinaryTraceFastPathTest.test_observed_legal_protected_path_refines_access_reduction",
+          "role": "whitebox",
+          "required_profiles": ["quick", "step5", "release"]
+        }
+      ]
+    },
+    {
+      "id": "protected-receiver-false-negative",
+      "title": "非法 protected 外部接收者路径被误报兼容",
+      "risk": "critical",
+      "observed_behavior": "违反 protected 接收者约束的调用路径被报告为可链接。",
+      "correct_behavior": "外部接收者约束必须由真实类定义和访问链接结果判定为非法。",
+      "root_cause_family": "protected-access-path-semantics",
+      "escape_reason": "只覆盖了声明可见性，没有覆盖接收者类型这一 JVM 约束。",
+      "resolution_scope": "root-cause-model-and-public-regression",
+      "source_evidence": ["docs/developer/testing-strategy.md"],
+      "truth_evidence": [{
+        "path": "tests/fixtures/blackbox/access-level-matrix-v1/truth.json",
+        "control_pointers": ["/expected_results/0", "/forbidden_results/0"]
+      }],
+      "regressions": [
+        {
+          "selector": "tests.blackbox.test_public_binary_cli.PublicBinaryCliBlackboxTest.test_public_cli_matches_closed_truth_and_ignores_packaging_noise",
+          "role": "blackbox",
+          "required_profiles": ["quick", "step5", "blackbox", "windows", "release"]
+        },
+        {
+          "selector": "tests.test_binary_runtime_reconciler.BinaryRuntimeReconcilerTest.test_member_resolution_remains_resolved_when_access_linkage_fails",
+          "role": "whitebox",
+          "required_profiles": ["quick", "step5", "release"]
+        }
+      ]
+    },
+    {
+      "id": "definite-missing-class-downgraded",
+      "title": "确定缺类被错误降级为可能缺失",
+      "risk": "critical",
+      "observed_behavior": "存在配对制品证据的确定缺类仍被降级为不确定路径。",
+      "correct_behavior": "配对制品已证明的缺类和缺成员必须输出精确失败，不得弱化。",
+      "root_cause_family": "missing-linkage-certainty",
+      "escape_reason": "原测试没有区分带跨版本制品证据与无配对证据的缺类。",
+      "resolution_scope": "root-cause-model-and-public-regression",
+      "source_evidence": ["docs/developer/testing-strategy.md"],
+      "truth_evidence": [{
+        "path": "tests/fixtures/blackbox/removed-class-v1/truth.json",
+        "control_pointers": ["/expected_results/0", "/forbidden_results/0"]
+      }],
+      "regressions": [
+        {
+          "selector": "tests.blackbox.test_public_binary_cli.PublicBinaryCliBlackboxTest.test_public_cli_matches_closed_truth_and_ignores_packaging_noise",
+          "role": "blackbox",
+          "required_profiles": ["quick", "step5", "blackbox", "windows", "release"]
+        },
+        {
+          "selector": "tests.test_binary_trace_engine.BinaryTraceFastPathTest.test_definitive_missing_linkage_edges_are_exact",
+          "role": "whitebox",
+          "required_profiles": ["quick", "step5", "release"]
+        }
+      ]
+    },
+    {
+      "id": "inherited-declaration-attribution-lost",
+      "title": "继承成员的真实声明归属丢失",
+      "risk": "critical",
+      "observed_behavior": "子类符号引用未保留父类真实声明，导致变化归属和路径判断错误。",
+      "correct_behavior": "继承解析必须同时保留符号 owner、解析 owner 和依赖 lineage。",
+      "root_cause_family": "inherited-member-resolution",
+      "escape_reason": "早期闭集只覆盖直接声明，没有覆盖子类符号引用到父类声明的重绑定。",
+      "resolution_scope": "root-cause-model-and-public-regression",
+      "source_evidence": ["docs/developer/testing-strategy.md"],
+      "truth_evidence": [{
+        "path": "tests/fixtures/blackbox/virtual-inherited-dispatch-v1/truth.json",
+        "control_pointers": ["/expected_results/0", "/forbidden_results/0"]
+      }],
+      "regressions": [
+        {
+          "selector": "tests.blackbox.test_public_binary_cli.PublicBinaryCliBlackboxTest.test_public_cli_matches_closed_truth_and_ignores_packaging_noise",
+          "role": "blackbox",
+          "required_profiles": ["quick", "step5", "blackbox", "windows", "release"]
+        },
+        {
+          "selector": "tests.test_binary_decision_engine.BinaryDecisionIdentityRegressionTest.test_removed_inherited_member_keeps_base_resolution_as_trace_anchor",
+          "role": "whitebox",
+          "required_profiles": ["quick", "step5", "release"]
+        }
+      ]
+    },
+    {
+      "id": "abstract-transition-misclassified",
+      "title": "具体方法变为 abstract 被误判",
+      "risk": "critical",
+      "observed_behavior": "会在目标 JVM 触发 AbstractMethodError 的变化没有得到对应兼容性结论。",
+      "correct_behavior": "具体到 abstract 的变化必须与原本已是 abstract 的控制场景区分。",
+      "root_cause_family": "jvm-access-flag-transition",
+      "escape_reason": "原案例只比较成员存在性，没有覆盖 access flags 的方向性变化。",
+      "resolution_scope": "root-cause-model-and-public-regression",
+      "source_evidence": ["docs/developer/testing-strategy.md"],
+      "truth_evidence": [{
+        "path": "tests/fixtures/blackbox/abstract-method-change-v1/truth.json",
+        "control_pointers": ["/expected_results/0", "/forbidden_results/0"]
+      }],
+      "regressions": [
+        {
+          "selector": "tests.blackbox.test_public_binary_cli.PublicBinaryCliBlackboxTest.test_public_cli_matches_closed_truth_and_ignores_packaging_noise",
+          "role": "blackbox",
+          "required_profiles": ["quick", "step5", "blackbox", "windows", "release"]
+        },
+        {
+          "selector": "tests.test_binary_trace_engine.BinaryTraceFastPathTest.test_concrete_method_becoming_abstract_breaks_binary_compatibility",
+          "role": "whitebox",
+          "required_profiles": ["quick", "step5", "release"]
+        }
+      ]
+    },
+    {
+      "id": "final-transition-misclassified",
+      "title": "类或方法变为 final 被误判",
+      "risk": "critical",
+      "observed_behavior": "旧子类定义或覆盖会失败的 final 变化未被正确报告。",
+      "correct_behavior": "class/method final 变化必须分别按类定义和覆盖链接语义裁决。",
+      "root_cause_family": "jvm-access-flag-transition",
+      "escape_reason": "原案例没有用旧子类在当前制品上的真实类定义行为交叉验证。",
+      "resolution_scope": "root-cause-model-and-public-regression",
+      "source_evidence": ["docs/developer/testing-strategy.md"],
+      "truth_evidence": [
+        {
+          "path": "tests/fixtures/blackbox/final-class-change-v1/truth.json",
+          "control_pointers": ["/expected_results/0", "/forbidden_results/0"]
+        },
+        {
+          "path": "tests/fixtures/blackbox/final-method-change-v1/truth.json",
+          "control_pointers": ["/expected_results/0", "/forbidden_results/0"]
+        }
+      ],
+      "regressions": [
+        {
+          "selector": "tests.blackbox.test_public_binary_cli.PublicBinaryCliBlackboxTest.test_public_cli_matches_closed_truth_and_ignores_packaging_noise",
+          "role": "blackbox",
+          "required_profiles": ["quick", "step5", "blackbox", "windows", "release"]
+        },
+        {
+          "selector": "tests.test_binary_trace_engine.BinaryTraceFastPathTest.test_non_final_method_becoming_final_breaks_binary_compatibility",
+          "role": "whitebox",
+          "required_profiles": ["quick", "step5", "release"]
+        }
+      ]
+    },
+    {
+      "id": "nestmate-private-access-rejected",
+      "title": "Java 11+ nestmate 私有访问被误判非法",
+      "risk": "critical",
+      "observed_behavior": "由合法 NestHost/NestMembers 元数据证明的私有调用被报告为非法访问。",
+      "correct_behavior": "同 loader 且双向元数据有效的 nestmate 私有访问必须可链接，损坏元数据必须失败关闭。",
+      "root_cause_family": "target-jvm-nestmate-semantics",
+      "escape_reason": "早期访问矩阵基于 Java 8 语义，没有覆盖 Java 11 nestmate 元数据。",
+      "resolution_scope": "root-cause-model-and-public-regression",
+      "source_evidence": ["docs/developer/testing-strategy.md"],
+      "truth_evidence": [{
+        "path": "tests/fixtures/blackbox/nestmate-private-path-v1/truth.json",
+        "control_pointers": ["/expected_results/0", "/forbidden_results/0"]
+      }],
+      "regressions": [
+        {
+          "selector": "tests.blackbox.test_public_binary_cli.PublicBinaryCliBlackboxTest.test_public_cli_matches_closed_truth_and_ignores_packaging_noise",
+          "role": "blackbox",
+          "required_profiles": ["quick", "step5", "blackbox", "windows", "release"]
+        },
+        {
+          "selector": "tests.test_binary_runtime_reconciler.BinaryRuntimeReconcilerTest.test_private_access_between_validated_nestmates_is_linkage_compatible",
+          "role": "whitebox",
+          "required_profiles": ["quick", "step5", "release"]
+        },
+        {
+          "selector": "tests.test_binary_runtime_reconciler.BinaryRuntimeReconcilerTest.test_nestmate_access_fails_closed_for_invalid_runtime_nest_metadata",
+          "role": "whitebox",
+          "required_profiles": ["quick", "step5", "release"]
+        }
+      ]
+    },
+    {
+      "id": "step3-resource-roots-omitted",
+      "title": "Step3 标准资源目录漏扫",
+      "risk": "critical",
+      "observed_behavior": "业务源码被扫描但标准资源目录未进入 Step3，框架配置事实丢失。",
+      "correct_behavior": "公开 Step3 输出必须同时覆盖代码与标准资源，并保留两侧制品事实。",
+      "root_cause_family": "workflow-input-scope",
+      "escape_reason": "早期工作流测试只检查代码目录和成功状态，没有闭集比较资源输出。",
+      "resolution_scope": "workflow-scope-and-public-regression",
+      "source_evidence": ["docs/developer/testing-strategy.md"],
+      "truth_evidence": [{
+        "path": "tests/fixtures/workflow_blackbox/step3_public_scans_v1.json",
+        "control_pointers": ["/spring_config/0", "/runtime_flags/0"]
+      }],
+      "regressions": [
+        {
+          "selector": "tests.blackbox.test_public_workflow_cli.PublicWorkflowCliBlackboxTest.test_step3_scans_pinned_sources_resources_and_two_sided_artifacts",
+          "role": "blackbox",
+          "required_profiles": ["blackbox", "windows", "release"]
+        },
+        {
+          "selector": "tests.test_step3_source_usage.Step3SourceUsageTest.test_business_scan_roots_include_code_and_standard_resources",
+          "role": "whitebox",
+          "required_profiles": ["quick", "step5", "release"]
+        }
+      ]
+    },
+    {
+      "id": "step4-zero-change-scope-misselected",
+      "title": "Step4 零变化时仍选择了虚假分析范围",
+      "risk": "critical",
+      "observed_behavior": "没有真实变化时仍生成需要用户选择的范围或不一致 checkpoint。",
+      "correct_behavior": "零、一、多依赖及 full/partial 模式必须按公开合同形成互斥且一致的范围。",
+      "root_cause_family": "workflow-scope-state-machine",
+      "escape_reason": "原测试只覆盖非空选择，没有把零变化作为独立边界输入。",
+      "resolution_scope": "state-machine-and-public-regression",
+      "source_evidence": ["docs/developer/testing-strategy.md"],
+      "truth_evidence": [{
+        "path": "tests/fixtures/workflow_blackbox/step4_scope_v1.json",
+        "control_pointers": ["/zero/scope", "/invalid_partial_without_target"]
+      }],
+      "regressions": [
+        {
+          "selector": "tests.blackbox.test_public_workflow_cli.PublicWorkflowCliBlackboxTest.test_step4_scope_zero_one_multiple_full_partial_and_rejections",
+          "role": "blackbox",
+          "required_profiles": ["blackbox", "windows", "release"]
+        },
+        {
+          "selector": "tests.test_run_step_main_state.RunStepMainStateTest.test_step4_scope_checkpoint_is_skipped_when_no_real_scope_choice_exists",
+          "role": "whitebox",
+          "required_profiles": ["quick", "step5", "release"]
+        }
+      ]
+    },
+    {
+      "id": "report-change-fact-loss",
+      "title": "报告聚合时变化事实丢失",
+      "risk": "critical",
+      "observed_behavior": "内部已确认的变化事实没有完整出现在公开人读和机器输出中。",
+      "correct_behavior": "同类型的多条变化事实必须按完整身份保留，公开 CSV 与 Markdown 语义一致。",
+      "root_cause_family": "report-fact-identity-and-aggregation",
+      "escape_reason": "早期报告测试偏重总数和成功状态，没有比较同类多事实的精确身份集合。",
+      "resolution_scope": "aggregation-model-and-public-regression",
+      "source_evidence": ["docs/developer/testing-strategy.md"],
+      "truth_evidence": [{
+        "path": "tests/fixtures/workflow_blackbox/full_public_workflow_v1.json",
+        "control_pointers": ["/expected_api_rows/0", "/expected_report_contract"]
+      }],
+      "regressions": [
+        {
+          "selector": "tests.blackbox.test_public_workflow_cli.PublicWorkflowCliBlackboxTest.test_artifact_workflow_reaches_step6_and_matches_closed_truth",
+          "role": "blackbox",
+          "required_profiles": ["blackbox", "windows", "release"]
+        },
+        {
+          "selector": "tests.test_step6_report.Step6ReportObjectivityTest.test_two_same_type_change_facts_survive_step6_collection",
+          "role": "whitebox",
+          "required_profiles": ["quick", "step5", "release"]
+        }
+      ]
+    },
+    {
+      "id": "runtime-provider-false-change",
+      "title": "等价运行时 provider 被误报发生变化",
+      "risk": "critical",
+      "observed_behavior": "内容寻址抽取位置或单侧平台引用造成虚假的 provider 变化。",
+      "correct_behavior": "provider 结论必须绑定目标运行时选择与物理内容身份，不受临时抽取路径影响。",
+      "root_cause_family": "runtime-provider-identity",
+      "escape_reason": "原测试把路径来源当作 provider 身份，没有加入同内容异路径的变形控制。",
+      "resolution_scope": "identity-model-and-public-regression",
+      "source_evidence": ["docs/developer/testing-strategy.md"],
+      "truth_evidence": [{
+        "path": "tests/fixtures/blackbox_runtime/runtime_topology_v1.json",
+        "control_pointers": ["/cases/parent_first"]
+      }],
+      "regressions": [
+        {
+          "selector": "tests.blackbox.test_public_runtime_topology.PublicRuntimeTopologyBlackboxTest.test_parent_first_realm_shadows_child_provider_like_urlclassloader",
+          "role": "blackbox",
+          "required_profiles": ["blackbox", "windows", "release"]
+        },
+        {
+          "selector": "tests.test_binary_decision_engine.BinaryDecisionEngineTest.test_content_addressed_extraction_origin_is_not_provider_change",
+          "role": "whitebox",
+          "required_profiles": ["quick", "step5", "release"]
+        },
+        {
+          "selector": "tests.test_binary_pipeline.BinaryPipelineTest.test_one_sided_platform_reference_is_not_a_provider_change",
+          "role": "whitebox",
+          "required_profiles": ["step5", "release"]
+        }
+      ]
+    },
+    {
+      "id": "public-cli-traceback-leak",
+      "title": "公开 CLI 向用户泄漏 traceback",
+      "risk": "high",
+      "observed_behavior": "公开命令的参数或运行失败直接输出内部 Python traceback。",
+      "correct_behavior": "公开失败必须返回稳定状态、reason code 和可操作信息，内部诊断与用户输出分离。",
+      "root_cause_family": "public-failure-boundary",
+      "escape_reason": "原测试只断言非零退出，没有把 stderr 禁止项作为外部合同。",
+      "resolution_scope": "public-boundary-and-contract-regression",
+      "source_evidence": ["docs/developer/testing-strategy.md"],
+      "truth_evidence": [{
+        "path": "tests/fixtures/workflow_blackbox/public_cli_surface_v1.json",
+        "control_pointers": ["/invalid_option_contract/forbidden_stderr_markers/0"]
+      }],
+      "regressions": [
+        {
+          "selector": "tests.blackbox.test_public_cli_surface.PublicCliSurfaceBlackboxTest.test_every_public_command_has_exact_help_and_invalid_option_contract",
+          "role": "blackbox",
+          "required_profiles": ["quick", "step5", "blackbox", "windows", "release"]
+        },
+        {
+          "selector": "tests.test_binary_real_project_guard.BinaryRealProjectGuardTest.test_cli_missing_asset_returns_typed_json_without_traceback",
+          "role": "whitebox",
+          "required_profiles": ["step5", "release"]
+        }
+      ]
+    },
+    {
+      "id": "progress-temporary-file-collision",
+      "title": "并发进度发布使用同一个临时文件",
+      "risk": "high",
+      "observed_behavior": "并发分析进程的进度写入临时文件发生碰撞，造成发布失败或部分状态。",
+      "correct_behavior": "每个写者必须使用唯一临时文件，公开并发结果保持确定且可重试。",
+      "root_cause_family": "concurrent-atomic-publication",
+      "escape_reason": "单进程成功测试没有制造两个真实写者的并发时序。",
+      "resolution_scope": "shared-publication-primitive-and-concurrency-regression",
+      "source_evidence": ["docs/developer/testing-strategy.md"],
+      "truth_evidence": [{
+        "path": "tests/fixtures/blackbox_runtime/cache_public_contract_v1.json",
+        "control_pointers": ["/expected_concurrent_failure_reason_code"]
+      }],
+      "regressions": [
+        {
+          "selector": "tests.blackbox.test_public_binary_cli.PublicBinaryCliBlackboxTest.test_cache_repeat_corruption_and_concurrent_runs_are_deterministic",
+          "role": "blackbox",
+          "required_profiles": ["quick", "step5", "blackbox", "windows", "release"]
+        },
+        {
+          "selector": "tests.test_binary_pipeline_input_performance.BinaryPipelineInputPerformanceTest.test_parallel_progress_publishers_use_distinct_atomic_temporary_files",
+          "role": "performance",
+          "required_profiles": ["quick", "step5", "performance", "windows", "release"]
+        }
+      ]
+    },
+    {
+      "id": "concurrent-identical-generation-publication",
+      "title": "相同不可变 generation 并发发布失败",
+      "risk": "high",
+      "observed_behavior": "两个等价写者竞争同一内容寻址 generation 时，合法输家被当成数据损坏。",
+      "correct_behavior": "等价内容并发发布必须幂等，不等价内容必须失败关闭且不移动 active 指针。",
+      "root_cause_family": "concurrent-atomic-publication",
+      "escape_reason": "原子替换只在串行路径验证，没有覆盖同内容写者的竞争窗口。",
+      "resolution_scope": "shared-publication-primitive-and-concurrency-regression",
+      "source_evidence": ["docs/developer/testing-strategy.md"],
+      "truth_evidence": [{
+        "path": "tests/fixtures/blackbox_runtime/cache_public_contract_v1.json",
+        "control_pointers": ["/expected_concurrent_result_identity_count"]
+      }],
+      "regressions": [
+        {
+          "selector": "tests.blackbox.test_public_binary_cli.PublicBinaryCliBlackboxTest.test_cache_repeat_corruption_and_concurrent_runs_are_deterministic",
+          "role": "blackbox",
+          "required_profiles": ["quick", "step5", "blackbox", "windows", "release"]
+        },
+        {
+          "selector": "tests.test_binary_output.BinaryOutputTest.test_concurrent_identical_generation_publication_is_idempotent",
+          "role": "whitebox",
+          "required_profiles": ["quick", "step5", "release"]
+        }
+      ]
+    },
+    {
+      "id": "duplicate-class-entry-accepted",
+      "title": "重复 class 条目被错误放行",
+      "risk": "critical",
+      "observed_behavior": "同一 JAR 中存在重复 class 名时分析继续并可能选择非确定字节。",
+      "correct_behavior": "重复 class 必须在公开边界失败关闭；允许的 Maven 元数据重复必须作为相近控制。",
+      "root_cause_family": "archive-entry-ambiguity",
+      "escape_reason": "原制品测试只验证 ZIP 可读，没有构造重复名称和允许重复元数据的对照。",
+      "resolution_scope": "archive-policy-and-public-regression",
+      "source_evidence": ["docs/developer/testing-strategy.md"],
+      "truth_evidence": [{
+        "path": "tests/fixtures/blackbox_runtime/artifact_safety_public_contract_v1.json",
+        "control_pointers": ["/duplicate_entry_reason", "/blocking_reason"]
+      }],
+      "regressions": [
+        {
+          "selector": "tests.blackbox.test_public_artifact_safety.PublicArtifactSafetyBlackboxTest.test_duplicate_corrupt_unsupported_and_partial_resource_are_public",
+          "role": "blackbox",
+          "required_profiles": ["quick", "step5", "blackbox", "windows", "release"]
+        },
+        {
+          "selector": "tests.test_binary_artifact_safety.BinaryArtifactSafetyTest.test_snapshot_blocks_duplicate_class_entries_but_allows_maven_metadata",
+          "role": "whitebox",
+          "required_profiles": ["quick", "step5", "release"]
+        }
+      ]
+    },
+    {
+      "id": "spring-xml-line-registry-confusion",
+      "title": "Spring XML 被误当作行式注册表",
+      "risk": "critical",
+      "observed_behavior": "Spring 目录下的畸形 XML 被行式属性解析器接受并制造错误语义事实。",
+      "correct_behavior": "资源类型必须先决定解析语义；畸形 XML 只能形成明确 coverage gap。",
+      "root_cause_family": "resource-parser-dispatch",
+      "escape_reason": "原资源案例按路径覆盖但没有加入畸形 XML 与合法 XML 的近邻对照。",
+      "resolution_scope": "parser-dispatch-and-public-regression",
+      "source_evidence": ["docs/developer/testing-strategy.md"],
+      "truth_evidence": [{
+        "path": "tests/fixtures/blackbox_runtime/artifact_safety_public_contract_v1.json",
+        "control_pointers": ["/malformed_xml_gap_suffix"]
+      }],
+      "regressions": [
+        {
+          "selector": "tests.blackbox.test_public_artifact_safety.PublicArtifactSafetyBlackboxTest.test_duplicate_corrupt_unsupported_and_partial_resource_are_public",
+          "role": "blackbox",
+          "required_profiles": ["quick", "step5", "blackbox", "windows", "release"]
+        },
+        {
+          "selector": "tests.test_binary_artifact_safety.BinaryArtifactSafetyTest.test_spring_xml_uses_xml_semantics_before_line_registration_semantics",
+          "role": "whitebox",
+          "required_profiles": ["quick", "step5", "release"]
+        },
+        {
+          "selector": "tests.test_binary_artifact_diff.BinaryArtifactDiffTest.test_spring_and_mybatis_xml_registration_facts_are_preserved",
+          "role": "whitebox",
+          "required_profiles": ["quick", "step5", "release"]
+        }
+      ]
+    },
+    {
+      "id": "primary-failure-masked-by-observability",
+      "title": "进度或结果落盘失败掩盖主失败",
+      "risk": "critical",
+      "observed_behavior": "旧进度阶段或 result sink 异常覆盖了本次分析真正的失败原因。",
+      "correct_behavior": "失败 JSON 必须绑定当前 attempt；非权威观测失败不得替换核心事务失败。",
+      "root_cause_family": "public-failure-boundary",
+      "escape_reason": "早期失败测试没有预置陈旧进度，也没有同时注入主失败和结果落盘失败。",
+      "resolution_scope": "failure-precedence-and-public-regression",
+      "source_evidence": ["docs/developer/testing-strategy.md"],
+      "truth_evidence": [{
+        "path": "tests/fixtures/blackbox_runtime/tool_failure_public_contract_v1.json",
+        "control_pointers": ["/attempt_progress_binding", "/result_sink_failure"]
+      }],
+      "regressions": [
+        {
+          "selector": "tests.blackbox.test_public_failure_contracts.PublicFailureContractsBlackboxTest.test_preflight_failure_never_borrows_stale_progress_phase",
+          "role": "blackbox",
+          "required_profiles": ["quick", "step5", "blackbox", "windows", "release"]
+        },
+        {
+          "selector": "tests.blackbox.test_public_failure_contracts.PublicFailureContractsBlackboxTest.test_result_sink_failure_preserves_the_primary_public_failure",
+          "role": "blackbox",
+          "required_profiles": ["quick", "step5", "blackbox", "windows", "release"]
+        }
+      ]
+    },
+    {
+      "id": "gradle-root-cause-hidden-by-help-footer",
+      "title": "Gradle 根因被通用帮助链接覆盖",
+      "risk": "high",
+      "observed_behavior": "Step0 的 Gradle 前置命令失败时，系统只向用户显示 help.gradle.org，丢失 SocketException 等真正根因。",
+      "correct_behavior": "公开失败摘要必须选择最深的可操作根因，并忽略 Gradle 通用帮助页、stacktrace 提示和标题脚手架。",
+      "root_cause_family": "public-failure-diagnostic-selection",
+      "escape_reason": "原测试只覆盖 Maven 的 JAVA_TOOL_OPTIONS 横幅，没有构造根因位于 Gradle 通用 footer 之前的多行 stderr。",
+      "resolution_scope": "shared-diagnostic-selection-and-public-regression",
+      "source_evidence": [
+        "tests/fixtures/incidents/gradle_preflight_diagnostic_20260821.json"
+      ],
+      "truth_evidence": [{
+        "path": "tests/fixtures/blackbox_runtime/tool_failure_public_contract_v1.json",
+        "control_pointers": [
+          "/gradle_preflight_failure/root_cause_marker",
+          "/gradle_preflight_failure/generic_help_marker"
+        ]
+      }],
+      "regressions": [
+        {
+          "selector": "tests.blackbox.test_public_checkout_builds.PublicCheckoutBuildBlackboxTest.test_gradle_preflight_reports_root_cause_not_generic_help_footer",
+          "role": "blackbox",
+          "required_profiles": ["quick", "step5", "blackbox", "windows", "release"]
+        },
+        {
+          "selector": "tests.test_step0_workflow.Step0WorkflowTest.test_subprocess_failure_detail_prefers_gradle_root_cause_over_help_footer",
+          "role": "whitebox",
+          "required_profiles": ["quick", "step5", "whitebox", "release"]
+        }
+      ]
+    },
+    {
+      "id": "feign-method-annotation-dispatch-omitted",
+      "title": "方法级 Feign 声明被遗漏且 Oracle 同源误判",
+      "risk": "critical",
+      "observed_behavior": "仅在方法声明 @RequestLine 的客户端没有生成 declarative HTTP 调用边；验证 Oracle 因复用了类级前提也错误放行。",
+      "correct_behavior": "方法或类任一层存在受支持的客户端声明时都必须建边，且公开黑盒必须用 JVM 反射与 classfile 事实独立证明方法声明。",
+      "root_cause_family": "declarative-client-annotation-scope",
+      "escape_reason": "原场景只有类级 @FeignClient，生产逻辑与 Oracle 的共同错误假设没有独立的近邻反例。",
+      "resolution_scope": "producer-oracle-and-public-regression",
+      "source_evidence": [
+        "tests/fixtures/incidents/feign_method_annotation_20260822.json"
+      ],
+      "truth_evidence": [{
+        "path": "tests/fixtures/blackbox_runtime/framework_semantics_v1.json",
+        "control_pointers": [
+          "/cases/http_dubbo_service/method_only_annotation_runtime",
+          "/cases/http_dubbo_service/method_only_client",
+          "/cases/http_dubbo_service/forbidden_class_annotation_marker"
+        ]
+      }],
+      "regressions": [
+        {
+          "selector": "tests.blackbox.test_public_framework_semantics.PublicFrameworkSemanticsBlackboxTest.test_http_dubbo_and_service_loader_registrations",
+          "role": "blackbox",
+          "required_profiles": ["quick", "step5", "blackbox", "windows", "release"]
+        },
+        {
+          "selector": "tests.test_binary_semantic_overlay_boundaries.BinarySemanticOverlayBoundaryTest.test_declarative_clients_support_class_and_method_annotations",
+          "role": "whitebox",
+          "required_profiles": ["quick", "step5", "whitebox", "release"]
+        }
+      ]
+    },
+    {
+      "id": "untyped-data-call-global-false-binding",
+      "title": "无类型证据的数据调用被全局绑定到 DTO",
+      "risk": "critical",
+      "observed_behavior": "任意 ObjectMapper 或 EntityManager 直接调用会被复制为所有已知 DTO 字段的精确调用者，制造错误影响路径。",
+      "correct_behavior": "只有方法描述符或等价可验证事实明确指向 DTO 时才能建立精确隐式数据契约边；无类型证据的近邻调用必须保持无边。",
+      "root_cause_family": "implicit-data-owner-association",
+      "escape_reason": "原测试只有真实绑定端点，没有同时放入调用同一框架 API 但处理其他类型的反例。",
+      "resolution_scope": "typed-binding-model-and-public-counterexample",
+      "source_evidence": [
+        "tests/fixtures/incidents/untyped_data_call_false_binding_20260822.json"
+      ],
+      "truth_evidence": [{
+        "path": "tests/fixtures/blackbox_runtime/framework_semantics_v1.json",
+        "control_pointers": [
+          "/cases/implicit_data_contract/target",
+          "/cases/implicit_data_contract/unrelated_caller",
+          "/cases/implicit_data_contract/forbidden_unrelated_type_marker"
+        ]
+      }],
+      "regressions": [
+        {
+          "selector": "tests.blackbox.test_public_framework_semantics.PublicFrameworkSemanticsBlackboxTest.test_web_binding_keeps_removed_field_as_implicit_contract",
+          "role": "blackbox",
+          "required_profiles": ["quick", "step5", "blackbox", "windows", "release"]
+        },
+        {
+          "selector": "tests.test_binary_semantic_overlay_boundaries.BinarySemanticOverlayBoundaryTest.test_implicit_data_contract_existing_symbolic_and_direct_boundaries",
+          "role": "whitebox",
+          "required_profiles": ["quick", "step5", "whitebox", "release"]
+        }
+      ]
+    },
+    {
+      "id": "release-less-jdk-layout-rejected",
+      "title": "合法供应商 JDK 因缺少非必需 release 文件被拒绝",
+      "risk": "critical",
+      "observed_behavior": "具有 java、javac、javap 和 rt.jar 的官方 Corretto 8 完整 JDK 在 Step0 被 JDK_RELEASE_MISSING 提前拒绝。",
+      "correct_behavior": "物理 release 文件缺失时必须由所选 JDK 自身的 java 属性探测版本，并把可执行文件字节与完整探测输出绑定到身份；完整 Step0-Step6 和独立 Oracle 仍须通过。",
+      "root_cause_family": "jdk-vendor-layout-capability-detection",
+      "escape_reason": "原测试 fixture 都人工写入 release 文件，把特定发行版布局误当成完整 JDK 的必要能力，没有使用真实供应商归档及无 release 变形。",
+      "resolution_scope": "shared-jdk-metadata-resolution-and-public-workflow-regression",
+      "source_evidence": [
+        "tests/fixtures/incidents/release_less_jdk_20260823.json"
+      ],
+      "truth_evidence": [{
+        "path": "tests/fixtures/workflow_blackbox/full_public_workflow_v1.json",
+        "control_pointers": [
+          "/expected_jdk_release_metadata_source",
+          "/expected_completion/workflow_status"
+        ]
+      }],
+      "regressions": [
+        {
+          "selector": "tests.blackbox.test_public_workflow_cli.PublicWorkflowCliBlackboxTest.test_artifact_workflow_reaches_step6_and_matches_closed_truth",
+          "role": "blackbox",
+          "required_profiles": ["blackbox", "windows", "release"]
+        },
+        {
+          "selector": "tests.test_jdk_preflight.JdkPreflightBoundaryTest.test_runtime_metadata_probe_supports_a_real_jdk_without_release_file",
+          "role": "whitebox",
+          "required_profiles": ["quick", "step5", "whitebox", "windows", "release"]
+        },
+        {
+          "selector": "tests.test_binary_platform_image.BinaryPlatformImageBoundaryTest.test_release_less_jdk_metadata_is_bound_and_probe_errors_are_wrapped",
+          "role": "whitebox",
+          "required_profiles": ["whitebox", "release"]
+        }
+      ]
+    },
+    {
+      "id": "interface-object-fallback-accepts-nonpublic",
+      "title": "接口解析错误接受 Object 非 public/static 回退",
+      "risk": "critical",
+      "observed_behavior": "接口符号解析沿 classfile 的 Object super_name 递归，错误地把 protected、private 或 static Object 方法视为可链接声明；生产解析器和验证 Oracle 会共同误判。",
+      "correct_behavior": "接口方法只能回退到 java.lang.Object 的 public 且非 static 方法；否则只能继续搜索父接口，无合法声明时必须判为缺失。",
+      "root_cause_family": "jvm-interface-method-resolution",
+      "escape_reason": "原接口案例只覆盖 default 方法移除，没有加入名称和描述符与 Object 非 public 方法重合、且实现类仍有同名 public 方法的近邻反例。",
+      "resolution_scope": "producer-oracle-and-target-jvm-regression",
+      "source_evidence": [
+        "tests/fixtures/incidents/interface_object_fallback_20260822.json"
+      ],
+      "truth_evidence": [{
+        "path": "tests/fixtures/blackbox/interface-dispatch-v1/truth.json",
+        "control_pointers": [
+          "/expected_results/2",
+          "/forbidden_results/0"
+        ]
+      }],
+      "regressions": [
+        {
+          "selector": "tests.blackbox.test_public_binary_cli.PublicBinaryCliBlackboxTest.test_public_cli_matches_closed_truth_and_ignores_packaging_noise",
+          "role": "blackbox",
+          "required_profiles": ["quick", "step5", "blackbox", "windows", "release"]
+        },
+        {
+          "selector": "tests.test_binary_runtime_reconciler_boundaries.RuntimeReconcilerBoundaryTest.test_interface_object_fallback_rejects_static_and_private_methods",
+          "role": "whitebox",
+          "required_profiles": ["quick", "step5", "whitebox", "release"]
+        },
+        {
+          "selector": "tests.test_binary_validation_oracle_boundaries.BinaryValidationOracleBoundaryTest.test_descriptor_member_resolution_annotation_and_subtype_matrix",
+          "role": "whitebox",
+          "required_profiles": ["quick", "step5", "whitebox", "release"]
+        }
+      ]
+    },
+    {
+      "id": "javap-nesthost-attribute-reparsed",
+      "title": "javap NestHost 属性被误当作第二个类声明",
+      "risk": "critical",
+      "observed_behavior": "六个固定真实项目的独立验证都把内部类的 NestHost 属性误判为 owner 不一致并阻断 Release。",
+      "correct_behavior": "只有合法 Java 类声明行可以绑定 javap owner；类体后的 NestHost 属性不得覆盖 raw classfile this_class。",
+      "root_cause_family": "independent-oracle-javap-grammar-boundary",
+      "escape_reason": "原 Oracle 案例覆盖内部类语义但没有保留完整 verbose javap 的类体后属性，文本 fixture 在右花括号处结束。",
+      "resolution_scope": "oracle-parser-boundary-and-public-nested-class-regression",
+      "source_evidence": [
+        "tests/fixtures/incidents/javap_nesthost_owner_misparse_20260823.json"
+      ],
+      "truth_evidence": [{
+        "path": "tests/fixtures/blackbox_runtime/runtime_topology_v1.json",
+        "control_pointers": [
+          "/cases/provider_identity_across_loader_realms/base_class_entries/1",
+          "/cases/provider_identity_across_loader_realms/current_class_entries/0",
+          "/cases/provider_identity_across_loader_realms/expected_current_error"
+        ]
+      }],
+      "regressions": [
+        {
+          "selector": "tests.blackbox.test_public_runtime_topology.PublicRuntimeTopologyBlackboxTest.test_provider_topology_has_one_public_identity_across_loader_realms",
+          "role": "blackbox",
+          "required_profiles": ["quick", "step5", "blackbox", "windows", "release"]
+        },
+        {
+          "selector": "tests.test_final_artifact_edge_oracle_boundaries.FinalArtifactParserBoundaryTest.test_nest_host_attribute_is_not_reparsed_as_a_class_declaration",
+          "role": "whitebox",
+          "required_profiles": ["quick", "step5", "whitebox", "release"]
+        }
+      ]
+    },
+    {
+      "id": "provider-topology-duplicate-public-identity",
+      "title": "跨 loader realm 的 provider 结果产生重复公开身份",
+      "risk": "critical",
+      "observed_behavior": "同一 provider_topology 公开四元身份被输出两次，其中一条把单侧未观察到的 provider 记录误当成权威状态变化。",
+      "correct_behavior": "缺少任一侧 provider 观察时只能形成诊断缺口；完整 realm 事实共享公开身份时必须合并为一条并保留 realm 与贡献事实集合。",
+      "root_cause_family": "public-result-identity-and-asymmetric-provider-evidence",
+      "escape_reason": "单元测试只校验 opaque reported identity 唯一，没有反向检查用户可见四元身份唯一，也没有把 missing 与未观察到放在同一对照中。",
+      "resolution_scope": "decision-evidence-boundary-public-aggregation-and-blackbox-regression",
+      "source_evidence": [
+        "tests/fixtures/incidents/provider_topology_duplicate_identity_20260823.json"
+      ],
+      "truth_evidence": [{
+        "path": "tests/fixtures/blackbox_runtime/runtime_topology_v1.json",
+        "control_pointers": [
+          "/cases/provider_identity_across_loader_realms/expected_public_identity_count",
+          "/cases/provider_identity_across_loader_realms/expected_loader_realms/0",
+          "/cases/provider_identity_across_loader_realms/expected_contributing_fact_count"
+        ]
+      }],
+      "regressions": [
+        {
+          "selector": "tests.blackbox.test_public_runtime_topology.PublicRuntimeTopologyBlackboxTest.test_provider_topology_has_one_public_identity_across_loader_realms",
+          "role": "blackbox",
+          "required_profiles": ["quick", "step5", "blackbox", "windows", "release"]
+        },
+        {
+          "selector": "tests.test_binary_output_boundaries.BinaryOutputPureBoundaryTest.test_aggregate_merges_same_public_provider_identity_across_loader_realms",
+          "role": "whitebox",
+          "required_profiles": ["quick", "step5", "whitebox", "release"]
+        },
+        {
+          "selector": "tests.test_binary_decision_engine_boundaries.DecisionEngineBoundaryTest.test_runtime_outcome_decision_matrix",
+          "role": "whitebox",
+          "required_profiles": ["quick", "step5", "whitebox", "release"]
+        }
+      ]
+    },
+    {
+      "id": "shadowed-caller-dispatch-false-failure",
+      "title": "被遮蔽 caller 的物理调用边被误判为协调遗漏",
+      "risk": "critical",
+      "observed_behavior": "固定 MyBatis annotation 工程中被 BOOT-INF/classes 覆盖的依赖类仍保留 208 条物理调用边；独立验证器要求这些不可执行边也有 dispatch 记录，产生 728 个假失败并阻断正确结果。",
+      "correct_behavior": "完整性检查只覆盖目标加载器实际选中的 caller variant；选中边缺失必须失败，被遮蔽物理边不得要求或接受运行时协调记录。",
+      "root_cause_family": "independent-oracle-shadowed-caller-completeness-domain",
+      "escape_reason": "原 classpath 顺序黑盒使用常量静态方法，被遮蔽类没有虚调用边；内部完整性测试也没有同时放入同名 active/shadowed caller variant。",
+      "resolution_scope": "oracle-selected-caller-domain-and-public-classpath-regression",
+      "source_evidence": [
+        "tests/fixtures/incidents/shadowed_caller_dispatch_false_failure_20260823.json"
+      ],
+      "truth_evidence": [{
+        "path": "tests/fixtures/blackbox_runtime/runtime_topology_v1.json",
+        "control_pointers": [
+          "/cases/classpath_and_resources/shadowed_dispatch_target",
+          "/cases/classpath_and_resources/expected_physical_dispatch_edge_count",
+          "/cases/classpath_and_resources/current_resource_order"
+        ]
+      }],
+      "regressions": [
+        {
+          "selector": "tests.blackbox.test_public_runtime_topology.PublicRuntimeTopologyBlackboxTest.test_classpath_and_resource_order_match_actual_classloader",
+          "role": "blackbox",
+          "required_profiles": ["quick", "step5", "blackbox", "windows", "release"]
+        },
+        {
+          "selector": "tests.test_binary_validation_oracle_boundaries.BinaryValidationOracleBoundaryTest.test_runtime_outcome_dispatch_completeness_ignores_shadowed_callers",
+          "role": "whitebox",
+          "required_profiles": ["quick", "step5", "whitebox", "release"]
+        }
+      ]
+    }
+  ]
+}

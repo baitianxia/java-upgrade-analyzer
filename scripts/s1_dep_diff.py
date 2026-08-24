@@ -96,8 +96,8 @@ def retain_artifact_for_analysis(meta, artifact_cache_dir, side):
     if not artifact_path or not artifact_cache_dir or not Path(artifact_path).is_file():
         return meta
     source_artifact = Path(artifact_path).resolve()
-    worktree_dir = str((meta or {}).get('worktree_dir') or '').strip()
-    if worktree_dir and not str((meta or {}).get('artifact_relative_path') or '').strip():
+    worktree_dir = str(meta.get('worktree_dir') or '').strip()
+    if worktree_dir and not str(meta.get('artifact_relative_path') or '').strip():
         try:
             meta['artifact_relative_path'] = source_artifact.relative_to(
                 Path(worktree_dir).resolve()
@@ -249,7 +249,7 @@ def materialize_changed_dependency_jars(
             'side': side,
             'coord': normalized_coord,
             'classifier': normalized_classifier,
-            'version': str(version or '').strip(),
+            'version': str(version).strip(),
             'scope': str(scope or '').strip(),
             'lib_entry': normalized_entry,
             'identity_source': str(identity_source or '').strip(),
@@ -496,23 +496,21 @@ def materialize_changed_dependency_jars(
         coord = str(item.get('coord') or '').strip()
         coord_parts = coord.split(':', 2)
         classifier = str(item.get('classifier') or '').strip()
-        if not classifier and len(coord_parts) == 3:
-            classifier = coord_parts[2].strip()
         gav_coord = (
             ':'.join(coord_parts[:2])
             if len(coord_parts) >= 2
             else coord
         )
         key = (
-            str(item.get('side') or '').strip(),
+            str(item['side']).strip(),
             gav_coord,
-            str(item.get('version') or '').strip(),
+            str(item['version']).strip(),
             classifier,
         )
         gav_artifacts[key]['hashes'].add(
-            str(item.get('nested_jar_sha256') or '').lower()
+            str(item['nested_jar_sha256']).lower()
         )
-        gav_artifacts[key]['entries'].append(str(item.get('lib_entry') or ''))
+        gav_artifacts[key]['entries'].append(str(item['lib_entry']))
     identity_conflicts = [
         (key, value)
         for key, value in gav_artifacts.items()
@@ -551,10 +549,10 @@ def materialize_changed_dependency_jars(
                 continue
             expected_entries.append(str(entry.get('lib_entry') or ''))
         retained_entries = sorted({
-            str(item.get('lib_entry') or '')
+            str(item['lib_entry'])
             for item in items
             if item.get('side') == side
-            and 'binary_runtime' in set(item.get('purposes') or ())
+            and 'binary_runtime' in set(item['purposes'])
         })
         missing = sorted(set(expected_entries) - set(retained_entries))
         gaps.extend(f"runtime_dependency_not_retained:{item}" for item in missing)
@@ -656,6 +654,17 @@ class Step1RemoteOperationError(RuntimeError):
         )
 
 
+def _step1_ref_candidate_selection_key(side, candidate):
+    payload = {
+        "side": side,
+        "ref": str(candidate.get("ref") or candidate.get("display_ref") or ""),
+        "commit": str(candidate.get("commit") or ""),
+    }
+    return "s1ref:" + hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:16]
+
+
 def build_step1_ref_resolution_interaction(error):
     side = str(error.side or "").strip() or "current"
     field = f"{side}_branch"
@@ -671,14 +680,9 @@ def build_step1_ref_resolution_interaction(error):
         f"只有{other_side_cn}状态明确为 remote_source_resolved，才能认定其远端解析成功。"
     )
     for candidate in candidates:
-        payload = {
-            "side": side,
-            "ref": str(candidate.get("ref") or ""),
-            "commit": str(candidate.get("commit") or ""),
-        }
-        candidate["selection_key"] = "s1ref:" + hashlib.sha256(
-            json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
-        ).hexdigest()[:16]
+        candidate["selection_key"] = _step1_ref_candidate_selection_key(
+            side, candidate,
+        )
     source_only = isinstance(error, SourceRevisionConfirmationRequiredError)
     if source_only:
         reason_code = "step1_source_revision_confirmation_required"
@@ -735,27 +739,20 @@ def build_step1_ref_resolution_interaction(error):
         resolution.get("resolved_commit") or resolution.get("local_candidate_commit") or ""
     ).strip()
     if source_only and detected_commit:
+        detected_candidate = {
+            "ref": detected_commit,
+            "display_ref": str(resolution.get("resolved_ref") or "HEAD"),
+            "commit": detected_commit,
+            "kind": "detected_source_head",
+        }
+        detected_candidate["selection_key"] = _step1_ref_candidate_selection_key(
+            side, detected_candidate,
+        )
         request.update({
             "detected_ref": str(resolution.get("resolved_ref") or "HEAD"),
             "detected_commit": detected_commit,
-            "candidates": [{
-                "ref": detected_commit,
-                "display_ref": str(resolution.get("resolved_ref") or "HEAD"),
-                "commit": detected_commit,
-                "kind": "detected_source_head",
-            }],
+            "candidates": [detected_candidate],
         })
-    for candidate in request.get("candidates") or []:
-        if candidate.get("selection_key"):
-            continue
-        payload = {
-            "side": side,
-            "ref": str(candidate.get("ref") or candidate.get("display_ref") or ""),
-            "commit": str(candidate.get("commit") or ""),
-        }
-        candidate["selection_key"] = "s1ref:" + hashlib.sha256(
-            json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
-        ).hexdigest()[:16]
     required_fields = [] if status == "fetch_failed" else [field]
     question = (
         f"{side_cn}远端操作失败；请在网络或权限恢复后确认重试。"
@@ -814,7 +811,7 @@ def build_step1_ref_resolution_interaction(error):
                 if error.source_project_dir else []
             ),
             *(
-                [f"{side_cn}已配置 remote: {', '.join(request.get('configured_remotes') or [])}"]
+                [f"{side_cn}已配置 remote: {', '.join(request['configured_remotes'])}"]
                 if request.get("configured_remotes") else []
             ),
             *(
@@ -1066,7 +1063,11 @@ def emit_step_interaction(interaction):
 def build_step1_missing_input_interaction(missing_items, unresolved_items=None):
     files_to_review = [item.get("artifact_path") for item in missing_items if item.get("artifact_path")]
     unresolved_items = normalize_unresolved_items(unresolved_items)
-    unresolved_labels = [item.get("label", "") for item in unresolved_items if item.get("label")]
+    unresolved_labels = []
+    for item in unresolved_items:
+        label = item.get("label", "")
+        if label:
+            unresolved_labels.append(label)
     properties = {
         "action": {
             "type": "string",
@@ -1145,6 +1146,7 @@ def build_step1_missing_input_interaction(missing_items, unresolved_items=None):
             for item in fallback_inputs
         )
         question = f"{question}；{fallback_text}。"
+    required_fields = [item["field"] for item in missing_inputs]
     return {
         "schema": "java-upgrade-analyzer.interaction.v2",
         "checkpoint": True,
@@ -1157,7 +1159,7 @@ def build_step1_missing_input_interaction(missing_items, unresolved_items=None):
         "title": "step1 需要补充输入",
         "question": question,
         "files_to_review": files_to_review,
-        "required_fields": [item.get("field") for item in missing_inputs if item.get("field")],
+        "required_fields": required_fields,
         "missing_inputs": missing_inputs,
         "fallback_inputs": fallback_inputs,
         "checklist_lines": checklist_lines,
@@ -1186,7 +1188,7 @@ def build_step1_missing_input_interaction(missing_items, unresolved_items=None):
             "target": "response_json",
             "target_schema_ref": "response_schema",
             "allowed_actions": ["continue", "cancel"],
-            "required_fields": [item.get("field") for item in missing_inputs if item.get("field")],
+            "required_fields": required_fields,
             "rules": [
                 "可以将用户自然语言答复整理为符合 response_schema 的 JSON 对象。",
                 "必须忠实保留用户意图，不得替用户做决定，不得脑补未提供的事实。",
@@ -1218,7 +1220,11 @@ def build_step1_coordinate_followup_interaction(
 ):
     _ = branch_field
     unresolved_items = normalize_unresolved_items(unresolved_items)
-    unresolved_labels = [item.get("label", "") for item in unresolved_items if item.get("label")]
+    unresolved_labels = []
+    for item in unresolved_items:
+        label = item.get("label", "")
+        if label:
+            unresolved_labels.append(label)
     has_unconfirmed_version = any(
         str(item.get("reason_code") or "").strip()
         == "PACKAGED_VERSION_UNCONFIRMED"
@@ -1359,7 +1365,7 @@ def build_step1_coordinate_followup_interaction(
             required_fields.append(source_field)
             checklist_lines.append(f"优先补充: {source_field}")
 
-    kind = "input_request" if missing_inputs or fallback_inputs else "review"
+    kind = "input_request" if missing_inputs else "review"
     question = (
         f"{side_cn}产物里仍有嵌套依赖无法安全确认完整 Maven 身份。"
     )
@@ -1374,8 +1380,6 @@ def build_step1_coordinate_followup_interaction(
         question += " 请先补充 `primary_module`。"
     elif source_field and source_field in required_fields:
         question += f" 请补充 `{source_field}`。"
-    elif source_field and source_field in properties:
-        question += f" 若 branch 口径仍不够，请补充 `{source_field}`，也可补充 `manual_coord_overrides`。"
     else:
         question += " 请先人工确认该产物是否包含大量 filename-only 嵌套 jar，以及当前补全来源是否正确；也可补充 `manual_coord_overrides`。"
 
@@ -1586,7 +1590,7 @@ def parse_manual_coord_overrides(raw_values):
             continue
         left_parts = [part.strip() for part in left.split(":", 2)]
         artifact_id = left_parts[0]
-        version = left_parts[1] if len(left_parts) >= 2 else ""
+        version = left_parts[1]
         classifier = left_parts[2] if len(left_parts) >= 3 else ""
         group_id, target_artifact_id = [part.strip() for part in right.split(":", 1)]
         if not artifact_id or not version or not group_id or not target_artifact_id:
@@ -2259,8 +2263,11 @@ def resolve_primary_module_id(primary_module, work_dir):
                 return tag.split("}", 1)[-1] if "}" in tag else tag
 
             for child in list(root):
-                if strip_ns(child.tag) == "artifactId" and (child.text or "").strip():
-                    return (child.text or "").strip()
+                if strip_ns(child.tag) != "artifactId":
+                    continue
+                artifact_id = (child.text or "").strip()
+                if artifact_id:
+                    return artifact_id
     except (OSError, ET.ParseError, UnicodeError) as exc:
         print(f"⚠️ 无法读取目标模块 POM {pom_path}: {type(exc).__name__}: {exc}", file=sys.stderr)
 
@@ -2294,8 +2301,11 @@ def _read_pom_identity(pom_path):
             artifact_id = value
         elif tag == 'parent':
             for nested in list(child):
-                if _strip_xml_ns(nested.tag) == 'groupId' and (nested.text or '').strip():
-                    parent_group = (nested.text or '').strip()
+                if _strip_xml_ns(nested.tag) != 'groupId':
+                    continue
+                nested_value = (nested.text or '').strip()
+                if nested_value:
+                    parent_group = nested_value
                     break
     return group_id or parent_group, artifact_id
 
@@ -2340,7 +2350,7 @@ def _resolve_module_dir_for_packaging(selector, work_dir):
     if ':' in raw:
         target_group, target_artifact = [item.strip() for item in raw.rsplit(':', 1)]
     else:
-        target_artifact = normalize_primary_module(raw) or ''
+        target_artifact = normalize_primary_module(raw)
 
     matches = []
     for pom_path in root_dir.rglob('pom.xml'):
@@ -2550,7 +2560,7 @@ def _runtime_dependency_for_packaged_filename(packaged_item, runtime_deps):
         if not group_id or not artifact_id or not versions:
             continue
         inventory_filenames = {
-            re.split(r'[\\/]', str(value or ''))[-1]
+            re.split(r'[\\/]', str(value))[-1]
             for value in (
                 list(candidate.get('artifact_file_names') or [])
                 + [candidate.get('artifact_file_name')]
@@ -3169,7 +3179,7 @@ def _observer_packaged_inventory_cache_dir(observer):
 def _require_complete_packaged_archive_scan(cache_stats, artifact_path):
     if (cache_stats or {}).get('scan_complete') is not False:
         return
-    failures = list((cache_stats or {}).get('failures') or [])
+    failures = list(cache_stats.get('failures') or [])
     details = '; '.join(
         ':'.join(filter(None, (
             str(item.get('stage') or ''),
@@ -3255,7 +3265,7 @@ def _normalize_maven_pl_with_workdir(primary_module, work_dir):
         except (OSError, ValueError) as exc:
             print(f"⚠️ 无法解析 Maven 模块选择器 {item}: {type(exc).__name__}: {exc}", file=sys.stderr)
 
-    item = (item or "").strip()
+    item = item.strip()
     if item in (".", "./"):
         return None
     if is_path_selector:
@@ -3367,7 +3377,7 @@ def _split_maven_dependency_artifact_path(value):
 
 
 def _parse_maven_dependency_list_line(raw_line):
-    line = _strip_info_prefix(raw_line).strip()
+    line = _strip_info_prefix(str(raw_line or '')).strip()
     if not line:
         return None
     if line.startswith(('The following files have been resolved:', 'The following dependencies have been resolved:')):
@@ -3376,7 +3386,7 @@ def _parse_maven_dependency_list_line(raw_line):
     left = re.sub(r'\s+--\s+.+$', '', line).strip()
     left = re.sub(r'\s+\((?:optional|omitted[^)]*)\)$', '', left, flags=re.IGNORECASE)
     left, artifact_file_path = _split_maven_dependency_artifact_path(left)
-    if not left or ':' not in left:
+    if ':' not in left:
         return None
 
     parts = [part.strip() for part in left.split(':')]
@@ -3386,12 +3396,8 @@ def _parse_maven_dependency_list_line(raw_line):
     # dependency:list always emits scope as the final coordinate token.  Scope
     # is extensible; using a fixed allow-list silently discarded valid custom
     # scopes.  Structural validation below still rejects Maven log prose.
-    if len(parts) < 4:
-        return None
     scope_idx = len(parts) - 1
     version_idx = scope_idx - 1
-    if version_idx < 2:
-        return None
 
     group_id = (parts[0] or '').strip()
     artifact_id = (parts[1] or '').strip()
@@ -3535,11 +3541,13 @@ def _runtime_artifact_versions(item):
 
 def parse_gradle_artifact_inventory(text, project_modules=None):
     """Parse exact resolved-artifact records emitted by the generated init task."""
-    modules_by_path = {
-        str(item.get('gradle_path') or '').strip(): dict(item)
-        for item in (project_modules or [])
-        if str(item.get('gradle_path') or '').strip()
-    }
+    modules_by_path = {}
+    for item in project_modules or []:
+        if not isinstance(item, dict):
+            continue
+        gradle_path = str(item.get('gradle_path') or '').strip()
+        if gradle_path:
+            modules_by_path[gradle_path] = dict(item)
     deps = {}
     for raw_line in str(text or '').splitlines():
         marker_index = raw_line.find(GRADLE_ARTIFACT_INVENTORY_PREFIX)
@@ -3551,6 +3559,8 @@ def parse_gradle_artifact_inventory(text, project_modules=None):
         try:
             row = json.loads(payload)
         except (TypeError, ValueError):
+            continue
+        if not isinstance(row, dict):
             continue
         project_path = str(row.get('project_path') or '').strip()
         project_model = modules_by_path.get(project_path) or {}
@@ -3605,11 +3615,13 @@ def parse_gradle_artifact_inventory(text, project_modules=None):
 def parse_gradle_dependency_report(text, project_modules=None):
     """Parse resolved external and exact internal-project runtime dependencies."""
     deps = {}
-    modules_by_path = {
-        str(item.get('gradle_path') or '').strip(): dict(item)
-        for item in (project_modules or [])
-        if str(item.get('gradle_path') or '').strip()
-    }
+    modules_by_path = {}
+    for item in project_modules or []:
+        if not isinstance(item, dict):
+            continue
+        gradle_path = str(item.get('gradle_path') or '').strip()
+        if gradle_path:
+            modules_by_path[gradle_path] = dict(item)
     for raw_line in str(text or '').splitlines():
         line = raw_line.strip()
         if not line or ' FAILED' in line or line.startswith(('No dependencies', 'A web-based')):
@@ -3617,11 +3629,7 @@ def parse_gradle_dependency_report(text, project_modules=None):
         match = GRADLE_DEPENDENCY_RE.search(line)
         if not match:
             project_match = GRADLE_PROJECT_DEPENDENCY_RE.search(line)
-            project_path = (
-                str(project_match.group(1) or '').strip()
-                if project_match
-                else ''
-            )
+            project_path = project_match.group(1).strip() if project_match else ''
             project_model = modules_by_path.get(project_path) or {}
             group_id = str(project_model.get('group_id') or '').strip()
             artifact_id = str(project_model.get('artifact_id') or '').strip()
@@ -3654,11 +3662,7 @@ def parse_gradle_dependency_report(text, project_modules=None):
             selected_group, selected_artifact, selected = selected.split(':', 2)
             group_id, artifact_id = selected_group, selected_artifact
         version = (selected or requested_version).rstrip(',')
-        if (
-            not version
-            or version in {'FAILED', '(n)', '(c)'}
-            or any(token in version for token in '{}[]')
-        ):
+        if version == 'FAILED' or any(token in version for token in '{}[]'):
             continue
         key = f"{group_id}:{artifact_id}"
         deps[key] = {
@@ -3712,7 +3716,7 @@ def _enrich_packaged_deps_with_runtime(
         normalized_runtime_deps[item.get('coord') or str(runtime_coord)] = item
         artifact_id = item.get('artifact_id')
         for version in _runtime_artifact_versions(item):
-            if artifact_id and version:
+            if artifact_id:
                 runtime_by_artifact_version[(artifact_id, version)].append(item)
                 runtime_by_filename_artifact_version[(artifact_id, version)].append(item)
                 classifier = (item.get('classifier') or '').strip()
@@ -3760,8 +3764,8 @@ def _enrich_packaged_deps_with_runtime(
                 ('side', packaged_side),
             )
             if any(
-                str(confirmed.get(field) or '').strip()
-                and str(confirmed.get(field) or '').strip() != value
+                (selector := str(confirmed.get(field) or '').strip())
+                and selector != value
                 for field, value in selectors
             ):
                 continue
@@ -3792,7 +3796,7 @@ def _enrich_packaged_deps_with_runtime(
                 'coord': manual_identity.get('coord', ''),
                 'match_source': 'manual_artifact_identity',
             })
-            packaged_version = str(manual_identity.get('version') or '').strip()
+            packaged_version = str(manual_identity['version']).strip()
             version_confirmed = True
         elif len(manual_identity_candidates) > 1:
             anomaly = 'manual_artifact_identity_ambiguous:' + '|'.join(
@@ -3834,8 +3838,6 @@ def _enrich_packaged_deps_with_runtime(
                     [],
                 )
             )
-            if not candidates and not item_classifier:
-                candidates = runtime_by_artifact_version.get((item.get('artifact_id'), item.get('version')), [])
             if len(candidates) == 1:
                 runtime_match = candidates[0]
         if manual_identity is None and not coord and runtime_match is None and item.get('match_source') == 'filename':
@@ -3863,7 +3865,7 @@ def _enrich_packaged_deps_with_runtime(
             enriched['metadata_anomalies'] = list(
                 enriched.get('metadata_anomalies') or []
             ) + [anomaly]
-        if manual_override and runtime_match is None:
+        if manual_override:
             enriched['group_id'] = manual_override.get('group_id') or enriched.get('group_id', '')
             enriched['artifact_id'] = manual_override.get('artifact_id') or enriched.get('artifact_id', '')
             enriched['coord'] = normalize_artifact_coord(
@@ -4028,7 +4030,7 @@ def _enrich_packaged_deps_with_runtime(
                 ),
             })
             continue
-        key = coord or f"{artifact_id}:{version}"
+        key = coord
         resolved_row = {
             'key': key,
             'group_id': group_id,
@@ -4068,11 +4070,14 @@ def _pom_module_values(element):
     for child in list(element):
         if _strip_xml_ns(child.tag) != 'modules':
             continue
-        return tuple(
-            (module.text or '').strip()
-            for module in list(child)
-            if _strip_xml_ns(module.tag) == 'module' and (module.text or '').strip()
-        )
+        values = []
+        for module in list(child):
+            if _strip_xml_ns(module.tag) != 'module':
+                continue
+            value = (module.text or '').strip()
+            if value:
+                values.append(value)
+        return tuple(values)
     return ()
 
 
@@ -4125,9 +4130,10 @@ def _maven_profile_args_for_module(work_dir, target_selector, active_profiles=No
                 continue
             profile_id = ''
             for profile_child in list(profile):
-                if _strip_xml_ns(profile_child.tag) == 'id':
-                    profile_id = (profile_child.text or '').strip()
-                    break
+                if _strip_xml_ns(profile_child.tag) != 'id':
+                    continue
+                profile_id = (profile_child.text or '').strip()
+                break
             if profile_id and any(
                 _module_selector_matches(module, target_selector, work_dir)
                 for module in _pom_module_values(profile)
@@ -4183,11 +4189,11 @@ def build_project_module_runtime_catalog(
         active_profiles=active_profiles,
         build_tool=tool,
     )
-    included_modules = {
-        str(item or '').strip()
-        for item in scope.get('included_modules') or []
-        if str(item or '').strip()
-    }
+    included_modules = set()
+    for item in scope.get('included_modules') or []:
+        module_name = str(item or '').strip()
+        if module_name:
+            included_modules.add(module_name)
     target_module = str(scope.get('target_module') or '').strip()
     if not included_modules or not target_module:
         return {}
@@ -5072,10 +5078,12 @@ def _collect_runtime_deps_for_artifact_input(
     if branch:
         repo_dir = source_dir or str(Path(work_dir).resolve())
         resolution = dict(source_resolution or {})
+        resolved_commit = str(resolution.get("resolved_commit") or "").strip()
+        source_status = str(resolution.get("source_status") or "").strip()
         if not (
             resolution.get("status") == "resolved"
-            and str(resolution.get("resolved_commit") or "").strip()
-            and str(resolution.get("source_status") or "") in {
+            and resolved_commit
+            and source_status in {
                 "remote_source_resolved",
                 "user_confirmed_local_source",
             }
@@ -5091,8 +5099,17 @@ def _collect_runtime_deps_for_artifact_input(
             if str(expected_remote_ref or "").strip():
                 resolve_kwargs["expected_remote_ref"] = str(expected_remote_ref).strip()
             resolution = resolve_step1_ref(repo_dir, branch, **resolve_kwargs)
-        if resolution.get("status") != "resolved":
-            if resolution.get("source_status") in {
+            resolved_commit = str(resolution.get("resolved_commit") or "").strip()
+            source_status = str(resolution.get("source_status") or "").strip()
+        if (
+            resolution.get("status") != "resolved"
+            or not resolved_commit
+            or source_status not in {
+                "remote_source_resolved",
+                "user_confirmed_local_source",
+            }
+        ):
+            if source_status in {
                 "remote_expected_commit_unmaterializable",
                 "remote_ref_moved",
             }:
@@ -5102,7 +5119,12 @@ def _collect_runtime_deps_for_artifact_input(
             raise Step1RefResolutionRequiredError(
                 side, repo_dir, artifact_path, resolution,
             )
-        resolved_commit = str(resolution.get("resolved_commit") or "").strip()
+        requested_ref = str(resolution.get("requested_ref") or branch)
+        resolved_ref = str(resolution.get("resolved_ref") or branch)
+        resolution_mode = str(resolution.get("resolution_mode") or "exact")
+        candidates = list(resolution.get("candidates") or [])
+        remote = str(resolution.get("remote") or "")
+        remote_ref = str(resolution.get("remote_ref") or "")
         if observer is not None:
             observer.event(
                 "ref_resolution",
@@ -5110,14 +5132,14 @@ def _collect_runtime_deps_for_artifact_input(
                 f"{'基准侧' if side == 'base' else '当前侧'}坐标补全源码版本已固定",
                 side=side,
                 details={
-                    "requested_ref": str(resolution.get("requested_ref") or branch),
-                    "resolved_ref": str(resolution.get("resolved_ref") or branch),
+                    "requested_ref": requested_ref,
+                    "resolved_ref": resolved_ref,
                     "resolved_commit": resolved_commit,
-                    "resolution_mode": str(resolution.get("resolution_mode") or "exact"),
-                    "candidate_count": len(resolution.get("candidates") or []),
-                    "source_status": str(resolution.get("source_status") or ""),
-                    "remote": str(resolution.get("remote") or ""),
-                    "remote_ref": str(resolution.get("remote_ref") or ""),
+                    "resolution_mode": resolution_mode,
+                    "candidate_count": len(candidates),
+                    "source_status": source_status,
+                    "remote": remote,
+                    "remote_ref": remote_ref,
                 },
             )
         runtime_deps, meta = get_runtime_deps_by_switching_branch(
@@ -5136,13 +5158,13 @@ def _collect_runtime_deps_for_artifact_input(
         return runtime_deps, {
             **meta,
             'source_mode': 'checkout_branch',
-            'requested_ref': str(resolution.get('requested_ref') or branch),
-            'resolved_ref': str(resolution.get('resolved_ref') or branch),
+            'requested_ref': requested_ref,
+            'resolved_ref': resolved_ref,
             'resolved_commit': resolved_commit,
-            'ref_resolution_mode': str(resolution.get('resolution_mode') or 'exact'),
-            'ref_source_status': str(resolution.get('source_status') or ''),
-            'ref_remote': str(resolution.get('remote') or ''),
-            'ref_remote_ref': str(resolution.get('remote_ref') or ''),
+            'ref_resolution_mode': resolution_mode,
+            'ref_source_status': source_status,
+            'ref_remote': remote,
+            'ref_remote_ref': remote_ref,
             'branch': resolved_commit,
         }
     if source_dir:
@@ -5464,25 +5486,53 @@ def get_runtime_deps_by_switching_branch(
     return result
 
 
-def print_manual_instructions(base_branch, current_branch, primary_module=None, work_dir=None, modules=None):
-    """打印用户需要手动执行的命令，确保按最终打包依赖口径获取结果"""
-    target_selector = _resolve_single_module_selector(primary_module, modules, work_dir)
+def _manual_package_command(build_tool, work_dir, target_selector):
+    """Build a recovery command without letting diagnostics mask the failure."""
+    if build_tool == 'gradle':
+        try:
+            target_model = _gradle_target_model(work_dir, target_selector)
+            task = _gradle_task(target_model, 'build')
+        except Exception as exc:
+            print(
+                "  ⚠️ 无法在失败恢复阶段唯一解析 Gradle 模块，"
+                f"回落到根工程 build：{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            task = 'build'
+        return ' '.join(gradle_cmd(work_dir) + [task, '-x', 'test'])
     pl = _normalize_maven_pl_with_workdir(target_selector, work_dir)
-    package_cmd = (
+    return (
         f"mvn {'-pl ' + pl + ' -am ' if pl else ''}"
         f"{MAVEN_SKIP_TEST_COMPILATION_ARG} package"
     )
+
+
+def print_manual_instructions(
+    base_branch,
+    current_branch,
+    primary_module=None,
+    work_dir=None,
+    modules=None,
+    *,
+    base_tool='maven',
+    current_tool=None,
+):
+    """打印用户需要手动执行的命令，确保按最终打包依赖口径获取结果"""
+    target_selector = _resolve_single_module_selector(primary_module, modules, work_dir)
+    current_tool = current_tool or base_tool
+    base_package_cmd = _manual_package_command(base_tool, work_dir, target_selector)
+    current_package_cmd = _manual_package_command(current_tool, work_dir, target_selector)
 
     sep = "=" * 60
     print(f"\n{sep}", file=sys.stderr)
     print("手工执行 Step1（务必在项目根目录执行）：\n", file=sys.stderr)
     print(f"  # 第1步：基准分支", file=sys.stderr)
     print(f"  git checkout {base_branch}", file=sys.stderr)
-    print(f"  {package_cmd}", file=sys.stderr)
+    print(f"  {base_package_cmd}", file=sys.stderr)
     print(f"", file=sys.stderr)
     print(f"  # 第2步：当前分支", file=sys.stderr)
     print(f"  git checkout {current_branch}", file=sys.stderr)
-    print(f"  {package_cmd}", file=sys.stderr)
+    print(f"  {current_package_cmd}", file=sys.stderr)
     print(f"", file=sys.stderr)
     print(f"  # 第3步：运行分析", file=sys.stderr)
     if IS_WINDOWS:
@@ -5490,11 +5540,15 @@ def print_manual_instructions(base_branch, current_branch, primary_module=None, 
         print(f"  python scripts\\s1_dep_diff.py `", file=sys.stderr)
         print(f"    --base {base_branch} `", file=sys.stderr)
         print(f"    --current {current_branch} `", file=sys.stderr)
+        print(f"    --base-tool {base_tool} `", file=sys.stderr)
+        print(f"    --current-tool {current_tool} `", file=sys.stderr)
         print(f"    --output .upgrade-report\\evidence\\dependencies\\dep_changes.csv", file=sys.stderr)
     else:
         print(f"  python scripts/s1_dep_diff.py \\", file=sys.stderr)
         print(f"    --base {base_branch} \\", file=sys.stderr)
         print(f"    --current {current_branch} \\", file=sys.stderr)
+        print(f"    --base-tool {base_tool} \\", file=sys.stderr)
+        print(f"    --current-tool {current_tool} \\", file=sys.stderr)
         print(f"    --output .upgrade-report/evidence/dependencies/dep_changes.csv", file=sys.stderr)
     print(f"\n依赖遗漏常见原因：", file=sys.stderr)
     print(f"  1. 目标模块无法成功 package", file=sys.stderr)
@@ -5704,6 +5758,397 @@ def _build_step1_change_rows(base_entries, curr_entries):
     return rows
 
 
+def _step1_risk_rank(value):
+    """Stable public-report ordering for every declared risk category."""
+    normalized = (value or '').strip()
+    if '❓' in normalized:
+        return 0
+    if normalized.startswith('高'):
+        return 1
+    if normalized.startswith('中'):
+        return 2
+    return 3
+
+
+def _step1_change_rank(value):
+    """Stable public-report ordering for every declared change category."""
+    normalized = (value or '').strip()
+    ranks = {
+        '大版本升级': 1,
+        '移除': 2,
+        '小版本升级': 3,
+        '补丁升级': 4,
+        '新增': 5,
+        '版本格式不规则': 6,
+        '已变更': 7,
+        '未变': 8,
+    }
+    if '降级' in normalized:
+        return 0
+    return ranks.get(normalized, 9)
+
+
+def _first_nonempty(*values):
+    """Return the first truthy value without coercing the caller's value type."""
+    for value in values:
+        if value:
+            return value
+    return ""
+
+
+def _merge_orchestrated_step1_args(args, orchestrated_input):
+    """Apply persisted orchestration input without overriding explicit CLI values."""
+    if not orchestrated_input:
+        return args
+
+    args.base_branch = _first_nonempty(
+        args.base_branch,
+        orchestrated_input.get("base_resolved_commit", ""),
+        orchestrated_input.get("base_resolved_ref", ""),
+        orchestrated_input.get("base_branch", ""),
+    )
+    args.current_branch = _first_nonempty(
+        args.current_branch,
+        orchestrated_input.get("current_resolved_commit", ""),
+        orchestrated_input.get("current_resolved_ref", ""),
+        orchestrated_input.get("current_branch", ""),
+    )
+    for attr, key in (
+        ("base_tool", "base_tool"),
+        ("current_tool", "current_tool"),
+        ("base_artifact_path", "base_artifact_path"),
+        ("current_artifact_path", "current_artifact_path"),
+        ("base_source_project_dir", "base_source_project_dir"),
+        ("current_source_project_dir", "current_source_project_dir"),
+        ("base_jdk_home", "base_jdk_home"),
+        ("current_jdk_home", "current_jdk_home"),
+        ("primary_module", "primary_module"),
+    ):
+        setattr(
+            args,
+            attr,
+            _first_nonempty(getattr(args, attr), orchestrated_input.get(key, "")),
+        )
+    if args.modules is None:
+        args.modules = orchestrated_input.get("modules")
+    for attr, key in (
+        ("active_maven_profile", "active_maven_profiles"),
+        ("manual_coord_override", "manual_coord_overrides"),
+    ):
+        if not getattr(args, attr):
+            setattr(args, attr, list(orchestrated_input.get(key) or []))
+    if not args.manual_artifact_identity:
+        args.manual_artifact_identity = [
+            json.dumps(item, ensure_ascii=False)
+            for item in (orchestrated_input.get("manual_artifact_identities") or [])
+        ]
+    if not args.confirmed_unresolved_item:
+        args.confirmed_unresolved_item = [
+            json.dumps(item, ensure_ascii=False)
+            for item in (orchestrated_input.get("confirmed_unresolved_items") or [])
+        ]
+    args.allow_unresolved = bool(
+        args.allow_unresolved or orchestrated_input.get("allow_unresolved")
+    )
+    return args
+
+
+def _confirmed_source_resolution(orchestrated_input, side):
+    """Return only a source resolution whose commit and trust source are explicit."""
+    resolved_commit = str(
+        orchestrated_input.get(f"{side}_resolved_commit") or ""
+    ).strip()
+    source_status = str(
+        orchestrated_input.get(f"{side}_ref_source_status") or ""
+    ).strip()
+    if not resolved_commit or source_status not in {
+        "remote_source_resolved",
+        "user_confirmed_local_source",
+    }:
+        return {}
+    return {
+        "status": "resolved",
+        "source_status": source_status,
+        "requested_ref": str(orchestrated_input.get(f"{side}_requested_ref") or ""),
+        "resolved_ref": str(orchestrated_input.get(f"{side}_resolved_ref") or ""),
+        "resolved_commit": resolved_commit,
+        "resolution_mode": str(
+            orchestrated_input.get(f"{side}_ref_resolution_mode") or ""
+        ),
+        "fingerprint": str(
+            orchestrated_input.get(f"{side}_ref_resolution_fingerprint") or ""
+        ),
+        "remote": str(orchestrated_input.get(f"{side}_ref_remote") or ""),
+        "remote_ref": str(orchestrated_input.get(f"{side}_ref_remote_ref") or ""),
+        "candidates": [],
+    }
+
+
+def _apply_runtime_provenance(meta, runtime_meta):
+    """Copy authoritative runtime-resolution provenance into artifact metadata."""
+    if not runtime_meta.get("list_command"):
+        return meta
+    for target, source in (
+        ("list_command", "list_command"),
+        ("runtime_source_mode", "source_mode"),
+        ("requested_ref", "requested_ref"),
+        ("resolved_ref", "resolved_ref"),
+        ("revision", "resolved_commit"),
+        ("ref_resolution_mode", "ref_resolution_mode"),
+        ("ref_source_status", "ref_source_status"),
+        ("ref_remote", "ref_remote"),
+        ("ref_remote_ref", "ref_remote_ref"),
+    ):
+        meta[target] = runtime_meta.get(source, "")
+    return meta
+
+
+def _build_step1_provenance_side(
+    side,
+    meta,
+    branch,
+    configured_jdk,
+    build_tool,
+    primary_module,
+    orchestrated_input,
+    provided_artifact_mode,
+):
+    """Build one side of the externally consumed Step1 provenance document."""
+    meta = meta or {}
+    artifact_path = str(meta.get("artifact_path") or "").strip()
+    artifact_hash = str(meta.get("artifact_sha256") or "").strip()
+    if not artifact_hash and artifact_path and Path(artifact_path).is_file():
+        artifact_hash = sha256_file(artifact_path)
+    artifact_available = bool(artifact_path and Path(artifact_path).is_file())
+    build_executed_by_system = not provided_artifact_mode
+    build_execution_status = (
+        "not_executed"
+        if provided_artifact_mode
+        else ("succeeded" if artifact_available else "failed")
+    )
+    return {
+        "side": side,
+        "source_mode": "provided_artifact" if provided_artifact_mode else "checkout_build",
+        "input_mode": "provided_artifact" if provided_artifact_mode else "checkout_build",
+        "ref": str(_first_nonempty(
+            meta.get("resolved_ref"),
+            orchestrated_input.get(f"{side}_resolved_ref"),
+            branch,
+        )),
+        "requested_ref": str(_first_nonempty(
+            meta.get("requested_ref"),
+            orchestrated_input.get(f"{side}_requested_ref"),
+            branch,
+        )),
+        "ref_resolution_mode": str(_first_nonempty(
+            meta.get("ref_resolution_mode"),
+            orchestrated_input.get(f"{side}_ref_resolution_mode"),
+        )),
+        "ref_source_status": str(_first_nonempty(
+            meta.get("ref_source_status"),
+            orchestrated_input.get(f"{side}_ref_source_status"),
+        )),
+        "ref_remote": str(_first_nonempty(
+            meta.get("ref_remote"),
+            orchestrated_input.get(f"{side}_ref_remote"),
+        )),
+        "ref_remote_ref": str(_first_nonempty(
+            meta.get("ref_remote_ref"),
+            orchestrated_input.get(f"{side}_ref_remote_ref"),
+        )),
+        "revision": str(_first_nonempty(
+            meta.get("revision"),
+            orchestrated_input.get(f"{side}_resolved_commit"),
+        )),
+        "target_module": str(primary_module or ""),
+        "jdk_home": str(_first_nonempty(
+            meta.get("jdk_home"), resolve_effective_jdk_home(configured_jdk),
+        )),
+        "build_command": str(meta.get("build_command") or ""),
+        "build_tool": str(meta.get("build_tool") or build_tool),
+        "artifact_path": artifact_path,
+        "original_artifact_path": str(meta.get("original_artifact_path") or artifact_path),
+        "artifact_relative_path": str(meta.get("artifact_relative_path") or ""),
+        "artifact_sha256": artifact_hash,
+        "artifact_available": artifact_available,
+        "build_executed_by_system": build_executed_by_system,
+        "build_execution_status": build_execution_status,
+        "build_succeeded": artifact_available,
+        "project_scope_hash": str(meta.get("project_scope_hash") or ""),
+        "source_state_hash": str(meta.get("source_state_hash") or ""),
+        "maven_model_hash": str(meta.get("maven_model_hash") or ""),
+        "gradle_model_hash": str(meta.get("gradle_model_hash") or ""),
+        "build_model_hash": str(_first_nonempty(
+            meta.get("build_model_hash"),
+            meta.get("maven_model_hash"),
+            meta.get("gradle_model_hash"),
+        )),
+        "active_maven_profiles": sorted({
+            str(profile).strip()
+            for profile in (meta.get("active_maven_profiles") or [])
+            if str(profile).strip()
+        }),
+    }
+
+
+STEP1_ALERT_FIELDS = (
+    "conclusion", "change_summary", "review_reason", "coord", "old_version",
+    "new_version", "change_type", "risk", "scope", "remark",
+    "current_packaged", "downgrade_confirmed", "resolution_status",
+)
+
+
+def _build_step1_alert_rows(rows):
+    """Build the public alert subset and its independently assertable reasons."""
+    alerts = [
+        row for row in rows
+        if "降级" in row["change_type"] or "❓" in row["risk"]
+    ]
+    alert_rows = []
+    for item in alerts:
+        reasons = []
+        if "降级" in str(item.get("change_type") or ""):
+            reasons.append("依赖版本发生降级")
+        if "❓" in str(item.get("risk") or ""):
+            reasons.append("风险状态不明确")
+        resolution_status = str(item.get("resolution_status") or "").strip()
+        if resolution_status and resolution_status != "resolved":
+            reasons.append(f"依赖坐标解析状态：{resolution_status}")
+        row = {field: item.get(field, "") for field in STEP1_ALERT_FIELDS}
+        row["conclusion"] = "需要人工复核"
+        row["change_summary"] = (
+            f"{item.get('coord', '-')}: {item.get('old_version', '-')} -> "
+            f"{item.get('new_version', '-')}，{item.get('change_type', '-')}"
+        )
+        # Every selected alert necessarily has a downgrade or unknown-risk
+        # reason; a generic fallback here would therefore be unreachable.
+        row["review_reason"] = "；".join(reasons)
+        alert_rows.append(row)
+    return alerts, alert_rows
+
+
+def _build_step1_summary_lines(
+    *,
+    rows,
+    alerts,
+    curr_entries,
+    unresolved_records,
+    base_artifact_path,
+    current_artifact_path,
+    base_branch,
+    current_branch,
+    primary_module,
+    work_dir,
+    base_fmt,
+    packaged_summary,
+    base_meta,
+    curr_meta,
+    counts,
+):
+    """Build the stable human-readable Step1 summary and resolved module id."""
+    summary_lines = [
+        "Step1 依赖变更摘要",
+        "",
+        "一、先看什么",
+    ]
+    if alerts:
+        summary_lines.append("- 先看 dep_alerts.csv：这里列出降级、无法确认或解析异常的依赖。")
+    else:
+        summary_lines.append("- 未生成需要优先复核的依赖；如范围不符合预期，再看 dep_changes.csv。")
+    summary_lines.extend([
+        "- 如怀疑分析范围不对，核对 build_provenance.json 中的 base/current 构建产物来源。",
+        "- Step1 只确认依赖变化范围；是否影响业务，以 Step5 alerts.csv 和 Step6 report.md 为准。",
+        "",
+        "二、本次依赖范围是否可信",
+        f"- 依赖记录总数：{len(rows)}",
+        f"- 需要人工确认：{len(alerts)}",
+    ])
+    if curr_entries:
+        unresolved_count = sum(
+            1 for item in curr_entries
+            if str(item.get("resolution_status") or "").strip() != "resolved"
+        )
+        read_error_count = sum(
+            1 for item in curr_entries
+            if str(item.get("read_error") or "").strip()
+        )
+        summary_lines.extend([
+            f"- 当前打包依赖数：{len(curr_entries)}",
+            f"- 当前打包依赖坐标未解析：{unresolved_count}",
+            f"- 当前打包依赖读取失败：{read_error_count}",
+        ])
+    if alerts:
+        summary_lines.append("- 结论：存在需要优先复核的依赖变化，请先查看 dep_alerts.csv。")
+    else:
+        summary_lines.append("- 结论：未发现需要优先复核的依赖变化。")
+    summary_lines.extend(["", "三、分析范围"])
+    if base_artifact_path and current_artifact_path:
+        summary_lines.extend([
+            "- 输入模式：用户提供 base/current 编译产物",
+            f"- base 编译产物：{str(Path(base_artifact_path).expanduser().resolve())}",
+            f"- current 编译产物：{str(Path(current_artifact_path).expanduser().resolve())}",
+        ])
+    else:
+        summary_lines.extend([
+            "- 输入模式：自动切换 base/current 分支构建",
+            f"- base 分支：{base_branch}",
+            f"- current 分支：{current_branch}",
+        ])
+    want = resolve_primary_module_id(primary_module, work_dir)
+    summary_lines.extend([
+        f"- 目标模块：{want or '未指定'}",
+        f"- 构建产物类型：{base_fmt}",
+        f"- current 打包模式：{packaged_summary.get('mode') or '未知'}",
+        f"- current 可解析打包产物数量：{len(packaged_summary.get('archives') or [])}",
+    ])
+    archives = packaged_summary.get("archives") or []
+    if archives:
+        summary_lines.append("- current 打包产物样例：")
+        for archive_path in archives[:5]:
+            summary_lines.append(f"  - {archive_path}")
+    if base_meta.get("module_dir"):
+        summary_lines.append(f"- base 模块目录：{base_meta.get('module_dir')}")
+    if curr_meta.get("module_dir"):
+        summary_lines.append(f"- current 模块目录：{curr_meta.get('module_dir')}")
+    summary_lines.extend(["", "四、依赖变化统计"])
+    for change_type, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
+        summary_lines.append(f"- {change_type}: {count}")
+    summary_lines.extend([
+        "",
+        "五、复核入口",
+        "- 完整依赖变化：dep_changes.csv",
+        "- 需要优先复核的依赖：dep_alerts.csv",
+        "- 构建产物来源：build_provenance.json",
+        "",
+    ])
+    section_number = 6
+    if unresolved_records:
+        summary_lines.append(
+            f"{section_number}、坐标未解析依赖（前 {min(50, len(unresolved_records))} 项）"
+        )
+        section_number += 1
+        for item in unresolved_records[:50]:
+            summary_lines.append(f"- {item.get('label')}")
+        summary_lines.append("")
+    if alerts:
+        summary_lines.append(
+            f"{section_number}、优先复核依赖（前 {min(50, len(alerts))} 项）"
+        )
+        for row in alerts[:50]:
+            summary_lines.append(
+                f"- {row['coord']}：{row['old_version']} -> {row['new_version']}；"
+                f"变化={row['change_type']}；风险={row['risk']}；范围={row['scope']}；"
+                f"说明={row.get('remark', '')}"
+            )
+        summary_lines.append("")
+    summary_lines.extend([
+        "附：阅读说明",
+        "- Step1 只确定依赖变化范围，不证明业务是否受影响。",
+        "- 是否触达业务代码，以 Step5 的 alerts.csv 和 Step6 的 report.md 为准。",
+    ])
+    return summary_lines, want
+
+
 # ══════════════════════════════════════════════════════════════════
 # 主函数
 # ══════════════════════════════════════════════════════════════════
@@ -5751,51 +6196,8 @@ def main():
                     help='只解析并输出诊断，不写 CSV')
     args = ap.parse_args()
     orchestrated_input = load_orchestrated_step1_input()
-    if orchestrated_input:
-        args.base_branch = (
-            args.base_branch
-            or orchestrated_input.get("base_resolved_commit", "")
-            or orchestrated_input.get("base_resolved_ref", "")
-            or orchestrated_input.get("base_branch", "")
-        )
-        args.current_branch = (
-            args.current_branch
-            or orchestrated_input.get("current_resolved_commit", "")
-            or orchestrated_input.get("current_resolved_ref", "")
-            or orchestrated_input.get("current_branch", "")
-        )
-        args.base_tool = args.base_tool or orchestrated_input.get("base_tool", "")
-        args.current_tool = args.current_tool or orchestrated_input.get("current_tool", "")
-        args.base_artifact_path = args.base_artifact_path or orchestrated_input.get("base_artifact_path", "")
-        args.current_artifact_path = args.current_artifact_path or orchestrated_input.get("current_artifact_path", "")
-        args.base_source_project_dir = args.base_source_project_dir or orchestrated_input.get("base_source_project_dir", "")
-        args.current_source_project_dir = args.current_source_project_dir or orchestrated_input.get("current_source_project_dir", "")
-        args.base_jdk_home = args.base_jdk_home or orchestrated_input.get("base_jdk_home", "")
-        args.current_jdk_home = args.current_jdk_home or orchestrated_input.get("current_jdk_home", "")
-        args.primary_module = args.primary_module or orchestrated_input.get("primary_module", "")
-        if args.modules is None:
-            args.modules = orchestrated_input.get("modules")
-        if not args.active_maven_profile:
-            args.active_maven_profile = list(
-                orchestrated_input.get("active_maven_profiles") or []
-            )
-        if not args.manual_coord_override:
-            args.manual_coord_override = list(orchestrated_input.get("manual_coord_overrides") or [])
-        if not args.manual_artifact_identity:
-            args.manual_artifact_identity = [
-                json.dumps(item, ensure_ascii=False)
-                for item in (
-                    orchestrated_input.get("manual_artifact_identities") or []
-                )
-            ]
-        if not args.confirmed_unresolved_item:
-            args.confirmed_unresolved_item = [
-                json.dumps(item, ensure_ascii=False)
-                for item in (orchestrated_input.get("confirmed_unresolved_items") or [])
-            ]
-        if not args.allow_unresolved and orchestrated_input.get("allow_unresolved"):
-            args.allow_unresolved = True
-    if args.base_tool not in {'maven', 'gradle'} or args.current_tool not in {'maven', 'gradle'}:
+    _merge_orchestrated_step1_args(args, orchestrated_input)
+    if not {args.base_tool, args.current_tool} <= {'maven', 'gradle'}:
         ap.error('--base-tool and --current-tool are required and must be maven or gradle')
 
     manual_coord_overrides, invalid_manual_overrides = parse_manual_coord_overrides(args.manual_coord_override)
@@ -5870,39 +6272,20 @@ def main():
     curr_deps = None
     unresolved_confirmed = bool(args.allow_unresolved)
     unresolved_records = []
+    provided_artifact_mode = False
 
     if args.base_artifact_path or args.current_artifact_path:
         if not (args.base_artifact_path and args.current_artifact_path):
             print("❌ 直接产物模式必须同时提供 --base-artifact-path 和 --current-artifact-path。", file=sys.stderr)
             ap.print_help(sys.stderr)
             sys.exit(1)
+        provided_artifact_mode = True
         print("模式：直接解析用户提供的 base/current 编译产物", file=sys.stderr)
         try:
             base_runtime_deps = {}
             curr_runtime_deps = {}
             base_runtime_meta = {}
             curr_runtime_meta = {}
-
-            def confirmed_source_resolution(side):
-                resolved_commit = str(orchestrated_input.get(f"{side}_resolved_commit") or "").strip()
-                source_status = str(orchestrated_input.get(f"{side}_ref_source_status") or "").strip()
-                if not resolved_commit or source_status not in {
-                    "remote_source_resolved",
-                    "user_confirmed_local_source",
-                }:
-                    return {}
-                return {
-                    "status": "resolved",
-                    "source_status": source_status,
-                    "requested_ref": str(orchestrated_input.get(f"{side}_requested_ref") or ""),
-                    "resolved_ref": str(orchestrated_input.get(f"{side}_resolved_ref") or ""),
-                    "resolved_commit": resolved_commit,
-                    "resolution_mode": str(orchestrated_input.get(f"{side}_ref_resolution_mode") or ""),
-                    "fingerprint": str(orchestrated_input.get(f"{side}_ref_resolution_fingerprint") or ""),
-                    "remote": str(orchestrated_input.get(f"{side}_ref_remote") or ""),
-                    "remote_ref": str(orchestrated_input.get(f"{side}_ref_remote_ref") or ""),
-                    "candidates": [],
-                }
 
             def load_base_runtime_deps():
                 nonlocal base_runtime_deps, base_runtime_meta
@@ -5922,7 +6305,7 @@ def main():
                         observer=observer,
                         active_maven_profiles=args.active_maven_profile,
                         build_tool=args.base_tool,
-                        source_resolution=confirmed_source_resolution("base"),
+                        source_resolution=_confirmed_source_resolution(orchestrated_input, "base"),
                         expected_commit=str(orchestrated_input.get("base_expected_commit") or ""),
                         expected_remote=str(ref_binding.get("remote") or ""),
                         expected_remote_ref=str(ref_binding.get("canonical_ref") or ""),
@@ -5949,7 +6332,7 @@ def main():
                         observer=observer,
                         active_maven_profiles=args.active_maven_profile,
                         build_tool=args.current_tool,
-                        source_resolution=confirmed_source_resolution("current"),
+                        source_resolution=_confirmed_source_resolution(orchestrated_input, "current"),
                         expected_commit=str(orchestrated_input.get("current_expected_commit") or ""),
                         expected_remote=str(ref_binding.get("remote") or ""),
                         expected_remote_ref=str(ref_binding.get("canonical_ref") or ""),
@@ -5982,26 +6365,8 @@ def main():
                 observer=observer,
                 side="current",
             )
-            if base_runtime_meta.get('list_command'):
-                base_meta['list_command'] = base_runtime_meta.get('list_command', '')
-                base_meta['runtime_source_mode'] = base_runtime_meta.get('source_mode', '')
-                base_meta['requested_ref'] = base_runtime_meta.get('requested_ref', '')
-                base_meta['resolved_ref'] = base_runtime_meta.get('resolved_ref', '')
-                base_meta['revision'] = base_runtime_meta.get('resolved_commit', '')
-                base_meta['ref_resolution_mode'] = base_runtime_meta.get('ref_resolution_mode', '')
-                base_meta['ref_source_status'] = base_runtime_meta.get('ref_source_status', '')
-                base_meta['ref_remote'] = base_runtime_meta.get('ref_remote', '')
-                base_meta['ref_remote_ref'] = base_runtime_meta.get('ref_remote_ref', '')
-            if curr_runtime_meta.get('list_command'):
-                curr_meta['list_command'] = curr_runtime_meta.get('list_command', '')
-                curr_meta['runtime_source_mode'] = curr_runtime_meta.get('source_mode', '')
-                curr_meta['requested_ref'] = curr_runtime_meta.get('requested_ref', '')
-                curr_meta['resolved_ref'] = curr_runtime_meta.get('resolved_ref', '')
-                curr_meta['revision'] = curr_runtime_meta.get('resolved_commit', '')
-                curr_meta['ref_resolution_mode'] = curr_runtime_meta.get('ref_resolution_mode', '')
-                curr_meta['ref_source_status'] = curr_runtime_meta.get('ref_source_status', '')
-                curr_meta['ref_remote'] = curr_runtime_meta.get('ref_remote', '')
-                curr_meta['ref_remote_ref'] = curr_runtime_meta.get('ref_remote_ref', '')
+            _apply_runtime_provenance(base_meta, base_runtime_meta)
+            _apply_runtime_provenance(curr_meta, curr_runtime_meta)
         except (Step1RefResolutionRequiredError, SourceRevisionConfirmationRequiredError) as e:
             interaction = build_step1_ref_resolution_interaction(e)
             print(interaction["summary"], file=sys.stderr)
@@ -6009,94 +6374,6 @@ def main():
                 print(f"  - {line}", file=sys.stderr)
             emit_step_interaction(interaction)
             sys.exit(EXIT_AWAITING_USER)
-        except ArtifactCoordinateInputRequiredError as e:
-            base_artifact = str(Path(args.base_artifact_path).expanduser().resolve())
-            current_artifact = str(Path(args.current_artifact_path).expanduser().resolve())
-            unresolved_items = list(e.unresolved_items or [])
-            unresolved_records = normalize_unresolved_items(unresolved_items)
-            has_unconfirmed_version = any(
-                str(item.get("reason_code") or "").strip()
-                == "PACKAGED_VERSION_UNCONFIRMED"
-                for item in unresolved_records
-            )
-            missing_items = []
-            if e.artifact_path == base_artifact and not (args.base_source_project_dir or args.base_branch):
-                missing_items.append(
-                    {
-                        "side_cn": "基准侧",
-                        "artifact_path": e.artifact_path,
-                        "source_field": "base_source_project_dir",
-                        "branch_field": "base_branch",
-                    }
-                )
-            if e.artifact_path == current_artifact and not (args.current_source_project_dir or args.current_branch):
-                missing_items.append(
-                    {
-                        "side_cn": "当前侧",
-                        "artifact_path": e.artifact_path,
-                        "source_field": "current_source_project_dir",
-                        "branch_field": "current_branch",
-                    }
-                )
-            if missing_items and not has_unconfirmed_version:
-                interaction = build_step1_missing_input_interaction(missing_items, unresolved_items=unresolved_items)
-                print("当前输入无法补全最终产物中的全部依赖坐标。", file=sys.stderr)
-                for item in interaction.get("missing_inputs", []) or []:
-                    print(
-                        f"  - 缺失字段: {item.get('field')}（{item.get('label')}）",
-                        file=sys.stderr,
-                    )
-                    print(
-                        f"    原因: {item.get('reason')}",
-                        file=sys.stderr,
-                    )
-                    print(
-                        f"    产物: {item.get('artifact_path')}",
-                        file=sys.stderr,
-                    )
-                for item in interaction.get("fallback_inputs", []) or []:
-                    print(
-                        f"  - 兜底字段: {item.get('field')}（{item.get('label')}）",
-                        file=sys.stderr,
-                    )
-                    print(
-                        f"    说明: {item.get('reason')}",
-                        file=sys.stderr,
-                    )
-                emit_step_interaction(interaction)
-                sys.exit(EXIT_AWAITING_USER)
-            if e.artifact_path == base_artifact:
-                interaction = build_step1_coordinate_followup_interaction(
-                    side="base",
-                    side_cn="基准侧",
-                    artifact_path=e.artifact_path,
-                    unresolved_items=unresolved_items,
-                    branch_field="base_branch",
-                    branch_value=args.base_branch,
-                    source_field="base_source_project_dir",
-                    source_value=args.base_source_project_dir,
-                    primary_module=args.primary_module,
-                )
-            else:
-                interaction = build_step1_coordinate_followup_interaction(
-                    side="current",
-                    side_cn="当前侧",
-                    artifact_path=e.artifact_path,
-                    unresolved_items=unresolved_items,
-                    branch_field="current_branch",
-                    branch_value=args.current_branch,
-                    source_field="current_source_project_dir",
-                    source_value=args.current_source_project_dir,
-                    primary_module=args.primary_module,
-                )
-            print("当前输入已尝试进行坐标补全，但仍不足以安全输出最终依赖。", file=sys.stderr)
-            for line in interaction.get("checklist_lines", []) or []:
-                print(f"  - {line}", file=sys.stderr)
-            if unresolved_confirmed:
-                print("当前已收到人工确认：未补齐的 unresolved 将保留在 Step1 输出中并标记为 unresolved。", file=sys.stderr)
-            else:
-                emit_step_interaction(interaction)
-                sys.exit(EXIT_AWAITING_USER)
         except Step1CommandExecutionBlockedError as e:
             interaction = build_step1_command_blocked_interaction(e)
             print("当前输入已进入执行阶段，但构建工具命令被环境问题阻塞。", file=sys.stderr)
@@ -6118,8 +6395,8 @@ def main():
         curr_fmt = curr_meta.get('mode', 'final_artifact')
         packaged_summary = dict(curr_meta)
         unresolved_records = (
-            attach_unresolved_side(base_meta.get('unresolved_items') or [], 'base')
-            + attach_unresolved_side(curr_meta.get('unresolved_items') or [], 'current')
+            attach_unresolved_side(base_meta.get('unresolved_items'), 'base')
+            + attach_unresolved_side(curr_meta.get('unresolved_items'), 'current')
         )
     elif args.base_branch and args.current_branch:
         print(
@@ -6170,43 +6447,26 @@ def main():
         except Exception as e:
             print(f"❌ 自动执行失败：{e}", file=sys.stderr)
             print("建议人工执行：", file=sys.stderr)
-            target_selector = _resolve_single_module_selector(args.primary_module, args.modules, args.work_dir)
-            print(f"  git checkout {args.base_branch}", file=sys.stderr)
-            if args.current_tool == 'gradle':
-                target_model = _gradle_target_model(args.work_dir, target_selector)
-                command = ' '.join(gradle_cmd(args.work_dir) + [_gradle_task(target_model, 'build'), '-x', 'test'])
-            else:
-                pl = _normalize_maven_pl_with_workdir(target_selector, args.work_dir)
-                command = (
-                    f"mvn {'-pl ' + pl + ' -am ' if pl else ''}"
-                    f"{MAVEN_SKIP_TEST_COMPILATION_ARG} package"
-                )
-            print(f"  {command}", file=sys.stderr)
-            print(f"  git checkout {args.current_branch}", file=sys.stderr)
-            print(f"  {command}", file=sys.stderr)
-            sys.exit(1)
-
-        base_fmt = base_meta.get('mode', 'final_artifact')
-        curr_fmt = curr_meta.get('mode', 'final_artifact')
-        packaged_summary = dict(curr_meta)
-        unresolved_records = (
-            attach_unresolved_side(base_meta.get('unresolved_items') or [], 'base')
-            + attach_unresolved_side(curr_meta.get('unresolved_items') or [], 'current')
-        )
-    else:
-        if args.base_artifact_path or args.current_artifact_path:
-            print("❌ 直接产物模式必须同时提供 --base-artifact-path 和 --current-artifact-path。", file=sys.stderr)
-        elif not (args.base_branch and args.current_branch):
-            print("❌ 必须提供 --base + --current。", file=sys.stderr)
-        else:
-            print("❌ 隔离分支构建模式需要同时提供 --base + --current。", file=sys.stderr)
             print_manual_instructions(
                 args.base_branch,
                 args.current_branch,
                 args.primary_module,
                 args.work_dir,
                 args.modules,
+                base_tool=args.base_tool,
+                current_tool=args.current_tool,
             )
+            sys.exit(1)
+
+        base_fmt = base_meta.get('mode', 'final_artifact')
+        curr_fmt = curr_meta.get('mode', 'final_artifact')
+        packaged_summary = dict(curr_meta)
+        unresolved_records = (
+            attach_unresolved_side(base_meta.get('unresolved_items'), 'base')
+            + attach_unresolved_side(curr_meta.get('unresolved_items'), 'current')
+        )
+    else:
+        print("❌ 必须同时提供 --base + --current。", file=sys.stderr)
         ap.print_help(sys.stderr)
         sys.exit(1)
 
@@ -6243,7 +6503,7 @@ def main():
 
     if args.debug_only:
         print("\n调试模式完成，未写入文件。", file=sys.stderr)
-        if observer is not None and total_token is not None:
+        if observer is not None:
             observer.finish_phase(total_token, status="completed", message="Step1 调试模式完成")
         return
 
@@ -6252,75 +6512,37 @@ def main():
         print("❌ 请指定 --output 参数", file=sys.stderr)
         sys.exit(1)
 
-    diff_token = (
-        observer.start_phase(
-            "dependency_diff",
-            item=args.primary_module or ".",
-            message="开始比较 base/current 最终制品依赖",
-        )
-        if observer is not None else None
+    diff_token = observer.start_phase(
+        "dependency_diff",
+        item=args.primary_module or ".",
+        message="开始比较 base/current 最终制品依赖",
     )
     rows = _build_step1_change_rows(base_entries, curr_entries)
-    if observer is not None and diff_token is not None:
-        observer.finish_phase(
-            diff_token,
-            status="completed",
-            message=f"依赖比较完成，共生成 {len(rows)} 条依赖记录",
-        )
+    observer.finish_phase(
+        diff_token,
+        status="completed",
+        message=f"依赖比较完成，共生成 {len(rows)} 条依赖记录",
+    )
 
-    def _risk_rank(value):
-        v = (value or '').strip()
-        if '❓' in v:
-            return 0
-        if v.startswith('高'):
-            return 1
-        if v.startswith('中'):
-            return 2
-        return 3
-
-    def _change_rank(value):
-        v = (value or '').strip()
-        if '降级' in v:
-            return 0
-        if v == '大版本升级':
-            return 1
-        if v == '移除':
-            return 2
-        if v == '小版本升级':
-            return 3
-        if v == '补丁升级':
-            return 4
-        if v == '新增':
-            return 5
-        if v == '版本格式不规则':
-            return 6
-        if v == '已变更':
-            return 7
-        if v == '未变':
-            return 8
-        return 9
-
-    rows.sort(key=lambda r: (_risk_rank(r.get('risk')), _change_rank(r.get('change_type')), r.get('coord', '')))
+    rows.sort(key=lambda r: (
+        _step1_risk_rank(r.get('risk')),
+        _step1_change_rank(r.get('change_type')),
+        r.get('coord', ''),
+    ))
 
     out_dir = Path(args.output).parent
     out_dir.mkdir(parents=True, exist_ok=True)
-    report_token = (
-        observer.start_phase(
-            "report_write",
-            item=str(out_dir),
-            message="开始写入 Step1 正式结果文件",
-        )
-        if observer is not None else None
+    report_token = observer.start_phase(
+        "report_write",
+        item=str(out_dir),
+        message="开始写入 Step1 正式结果文件",
     )
-    artifact_materialization_token = (
-        observer.start_phase(
-            "dependency_jar_materialization",
-            item=str(out_dir),
-            message="开始留存最终制品并提取 Step4/Step5 所需依赖 JAR",
-        )
-        if observer is not None else None
+    artifact_materialization_token = observer.start_phase(
+        "dependency_jar_materialization",
+        item=str(out_dir),
+        message="开始留存最终制品并提取 Step4/Step5 所需依赖 JAR",
     )
-    if args.base_artifact_path and args.current_artifact_path:
+    if provided_artifact_mode:
         retain_artifact_for_analysis(base_meta, out_dir / STEP1_ARTIFACTS_DIRNAME, 'base')
         retain_artifact_for_analysis(curr_meta, out_dir / STEP1_ARTIFACTS_DIRNAME, 'current')
     materialize_changed_dependency_jars(
@@ -6330,20 +6552,16 @@ def main():
         base_entries=base_entries,
         current_entries=curr_entries,
     )
-    if observer is not None and artifact_materialization_token is not None:
-        observer.finish_phase(
-            artifact_materialization_token,
-            status="completed",
-            message="最终制品留存和依赖 JAR 提取完成",
-        )
+    observer.finish_phase(
+        artifact_materialization_token,
+        status="completed",
+        message="最终制品留存和依赖 JAR 提取完成",
+    )
     # CSV 统一使用 UTF-8 BOM，可直接用 Excel 打开。
-    dependency_csv_token = (
-        observer.start_phase(
-            "write.dependency_changes",
-            item=str(args.output),
-            message=f"开始写入 {len(rows)} 条依赖变更记录",
-        )
-        if observer is not None else None
+    dependency_csv_token = observer.start_phase(
+        "write.dependency_changes",
+        item=str(args.output),
+        message=f"开始写入 {len(rows)} 条依赖变更记录",
     )
     with open_csv_write(args.output) as f:
         fields = ['coord', 'base_coord', 'current_coord', 'old_version', 'new_version', 'change_type',
@@ -6355,21 +6573,17 @@ def main():
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
-    if observer is not None and dependency_csv_token is not None:
-        observer.finish_phase(
-            dependency_csv_token,
-            status="completed",
-            message=f"依赖变更记录写入完成，共 {len(rows)} 条",
-        )
+    observer.finish_phase(
+        dependency_csv_token,
+        status="completed",
+        message=f"依赖变更记录写入完成，共 {len(rows)} 条",
+    )
 
     current_out = str((out_dir / "deps_current_resolved.csv").resolve())
-    current_inventory_token = (
-        observer.start_phase(
-            "write.current_dependency_inventory",
-            item=current_out,
-            message=f"开始写入当前制品依赖清单，共 {len(curr_entries)} 项",
-        )
-        if observer is not None else None
+    current_inventory_token = observer.start_phase(
+        "write.current_dependency_inventory",
+        item=current_out,
+        message=f"开始写入当前制品依赖清单，共 {len(curr_entries)} 项",
     )
     current_rows = []
     for item in sorted(curr_entries, key=_entry_sort_key):
@@ -6397,114 +6611,32 @@ def main():
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         writer.writerows(current_rows)
-    if observer is not None and current_inventory_token is not None:
-        observer.finish_phase(
-            current_inventory_token,
-            status="completed",
-            message=f"当前制品依赖清单写入完成，共 {len(current_rows)} 项",
-        )
+    observer.finish_phase(
+        current_inventory_token,
+        status="completed",
+        message=f"当前制品依赖清单写入完成，共 {len(current_rows)} 项",
+    )
 
-    provenance_token = (
-        observer.start_phase(
-            "write.build_provenance",
-            item=str(out_dir / 'build_provenance.json'),
-            message="开始整理 base/current 构建与制品来源",
-        )
-        if observer is not None else None
+    provenance_token = observer.start_phase(
+        "write.build_provenance",
+        item=str(out_dir / 'build_provenance.json'),
+        message="开始整理 base/current 构建与制品来源",
     )
     provenance_sides = []
-    provided_artifact_mode = bool(
-        args.base_artifact_path and args.current_artifact_path
-    )
-    for side, meta, branch, configured_jdk in (
-        ('base', base_meta, args.base_branch, args.base_jdk_home),
-        ('current', curr_meta, args.current_branch, args.current_jdk_home),
+    for side, meta, branch, configured_jdk, build_tool in (
+        ('base', base_meta, args.base_branch, args.base_jdk_home, args.base_tool),
+        ('current', curr_meta, args.current_branch, args.current_jdk_home, args.current_tool),
     ):
-        artifact_path = str((meta or {}).get('artifact_path') or '').strip()
-        artifact_hash = str((meta or {}).get('artifact_sha256') or '').strip()
-        if not artifact_hash and artifact_path and Path(artifact_path).is_file():
-            artifact_hash = sha256_file(artifact_path)
-        artifact_available = bool(artifact_path and Path(artifact_path).is_file())
-        build_executed_by_system = not provided_artifact_mode
-        build_execution_status = (
-            "not_executed"
-            if provided_artifact_mode
-            else ("succeeded" if artifact_available else "failed")
-        )
-        provenance_sides.append({
-            'side': side,
-            'source_mode': 'provided_artifact' if provided_artifact_mode else 'checkout_build',
-            'input_mode': 'provided_artifact' if provided_artifact_mode else 'checkout_build',
-            'ref': str(
-                (meta or {}).get('resolved_ref')
-                or orchestrated_input.get(f'{side}_resolved_ref')
-                or branch
-                or ''
-            ),
-            'requested_ref': str(
-                (meta or {}).get('requested_ref')
-                or orchestrated_input.get(f'{side}_requested_ref')
-                or branch
-                or ''
-            ),
-            'ref_resolution_mode': str(
-                (meta or {}).get('ref_resolution_mode')
-                or orchestrated_input.get(f'{side}_ref_resolution_mode')
-                or ''
-            ),
-            'ref_source_status': str(
-                (meta or {}).get('ref_source_status')
-                or orchestrated_input.get(f'{side}_ref_source_status')
-                or ''
-            ),
-            'ref_remote': str(
-                (meta or {}).get('ref_remote')
-                or orchestrated_input.get(f'{side}_ref_remote')
-                or ''
-            ),
-            'ref_remote_ref': str(
-                (meta or {}).get('ref_remote_ref')
-                or orchestrated_input.get(f'{side}_ref_remote_ref')
-                or ''
-            ),
-            'revision': str(
-                (meta or {}).get('revision')
-                or orchestrated_input.get(f'{side}_resolved_commit')
-                or ''
-            ),
-            'target_module': str(args.primary_module or ''),
-            'jdk_home': str((meta or {}).get('jdk_home') or resolve_effective_jdk_home(configured_jdk) or ''),
-            'build_command': str((meta or {}).get('build_command') or ''),
-            'build_tool': str(
-                (meta or {}).get('build_tool')
-                or (args.base_tool if side == 'base' else args.current_tool)
-            ),
-            'artifact_path': artifact_path,
-            'original_artifact_path': str((meta or {}).get('original_artifact_path') or artifact_path),
-            'artifact_relative_path': str((meta or {}).get('artifact_relative_path') or ''),
-            'artifact_sha256': artifact_hash,
-            'artifact_available': artifact_available,
-            'build_executed_by_system': build_executed_by_system,
-            'build_execution_status': build_execution_status,
-            # Legacy compatibility only. Consumers must use the three fields
-            # above to distinguish artifact receipt from analyzer execution.
-            'build_succeeded': artifact_available,
-            'project_scope_hash': str((meta or {}).get('project_scope_hash') or ''),
-            'source_state_hash': str((meta or {}).get('source_state_hash') or ''),
-            'maven_model_hash': str((meta or {}).get('maven_model_hash') or ''),
-            'gradle_model_hash': str((meta or {}).get('gradle_model_hash') or ''),
-            'build_model_hash': str(
-                (meta or {}).get('build_model_hash')
-                or (meta or {}).get('maven_model_hash')
-                or (meta or {}).get('gradle_model_hash')
-                or ''
-            ),
-            'active_maven_profiles': sorted({
-                str(profile).strip()
-                for profile in ((meta or {}).get('active_maven_profiles') or [])
-                if str(profile).strip()
-            }),
-        })
+        provenance_sides.append(_build_step1_provenance_side(
+            side,
+            meta,
+            branch,
+            configured_jdk,
+            build_tool,
+            args.primary_module,
+            orchestrated_input,
+            provided_artifact_mode,
+        ))
     provenance_path = out_dir / 'build_provenance.json'
     provenance_path.write_text(
         json.dumps({
@@ -6524,12 +6656,11 @@ def main():
         }, ensure_ascii=False, indent=2) + '\n',
         encoding='utf-8',
     )
-    if observer is not None and provenance_token is not None:
-        observer.finish_phase(
-            provenance_token,
-            status="completed",
-            message="base/current 构建与制品来源写入完成",
-        )
+    observer.finish_phase(
+        provenance_token,
+        status="completed",
+        message="base/current 构建与制品来源写入完成",
+    )
 
     # 统计
     counts = defaultdict(int)
@@ -6538,140 +6669,53 @@ def main():
     for t, c in sorted(counts.items()):
         print(f"  {t}: {c}", file=sys.stderr)
 
-    alerts = [r for r in rows
-              if '降级' in r['change_type'] or '❓' in r['risk']]
+    alerts, alert_rows = _build_step1_alert_rows(rows)
     alerts_out = str((out_dir / "dep_alerts.csv").resolve())
-    alerts_token = (
-        observer.start_phase(
-            "write.dependency_alerts",
-            item=alerts_out,
-            message=f"开始生成依赖告警清单，候选 {len(alerts)} 项",
-        )
-        if observer is not None else None
+    alerts_token = observer.start_phase(
+        "write.dependency_alerts",
+        item=alerts_out,
+        message=f"开始生成依赖告警清单，候选 {len(alerts)} 项",
     )
     with open_csv_write(alerts_out) as f:
-        fields = ['conclusion', 'change_summary', 'review_reason',
-                  'coord', 'old_version', 'new_version', 'change_type',
-                  'risk', 'scope', 'remark', 'current_packaged', 'downgrade_confirmed', 'resolution_status']
-        alert_rows = []
-        for item in alerts:
-            reasons = []
-            if '降级' in str(item.get('change_type') or ''):
-                reasons.append('依赖版本发生降级')
-            if '❓' in str(item.get('risk') or ''):
-                reasons.append('风险状态不明确')
-            resolution_status = str(item.get('resolution_status') or '').strip()
-            if resolution_status and resolution_status != 'resolved':
-                reasons.append(f'依赖坐标解析状态：{resolution_status}')
-            row = {field: item.get(field, '') for field in fields}
-            row['conclusion'] = '需要人工复核'
-            row['change_summary'] = (
-                f"{item.get('coord', '-')}: {item.get('old_version', '-')} -> "
-                f"{item.get('new_version', '-')}，{item.get('change_type', '-')}"
-            )
-            row['review_reason'] = '；'.join(reasons) or str(item.get('remark') or '依赖变化需要确认')
-            alert_rows.append(row)
-        writer = csv.DictWriter(f, fieldnames=fields)
+        writer = csv.DictWriter(f, fieldnames=STEP1_ALERT_FIELDS)
         writer.writeheader()
         writer.writerows(alert_rows)
-    if observer is not None and alerts_token is not None:
-        observer.finish_phase(
-            alerts_token,
-            status="completed",
-            message=f"依赖告警清单写入完成，共 {len(alerts)} 项",
-        )
+    observer.finish_phase(
+        alerts_token,
+        status="completed",
+        message=f"依赖告警清单写入完成，共 {len(alerts)} 项",
+    )
 
     summary_out = str((out_dir / "dep_summary.txt").resolve())
-    summary_token = (
-        observer.start_phase(
-            "write.dependency_summary",
-            item=summary_out,
-            message="开始生成 Step1 可读摘要",
-        )
-        if observer is not None else None
+    summary_token = observer.start_phase(
+        "write.dependency_summary",
+        item=summary_out,
+        message="开始生成 Step1 可读摘要",
     )
-    summary_lines = []
-    summary_lines.append("Step1 依赖变更摘要")
-    summary_lines.append("")
-    summary_lines.append("一、先看什么")
-    if alerts:
-        summary_lines.append("- 先看 dep_alerts.csv：这里列出降级、无法确认或解析异常的依赖。")
-    else:
-        summary_lines.append("- 未生成需要优先复核的依赖；如范围不符合预期，再看 dep_changes.csv。")
-    summary_lines.append("- 如怀疑分析范围不对，核对 build_provenance.json 中的 base/current 构建产物来源。")
-    summary_lines.append("- Step1 只确认依赖变化范围；是否影响业务，以 Step5 alerts.csv 和 Step6 report.md 为准。")
-    summary_lines.append("")
-    summary_lines.append("二、本次依赖范围是否可信")
-    summary_lines.append(f"- 依赖记录总数：{len(rows)}")
-    summary_lines.append(f"- 需要人工确认：{len(alerts)}")
-    if curr_entries:
-        unresolved_count = sum(1 for item in curr_entries if str(item.get('resolution_status') or '').strip() != 'resolved')
-        read_error_count = sum(1 for item in curr_entries if str(item.get('read_error') or '').strip())
-        summary_lines.append(f"- 当前打包依赖数：{len(curr_entries)}")
-        summary_lines.append(f"- 当前打包依赖坐标未解析：{unresolved_count}")
-        summary_lines.append(f"- 当前打包依赖读取失败：{read_error_count}")
-    if alerts:
-        summary_lines.append("- 结论：存在需要优先复核的依赖变化，请先查看 dep_alerts.csv。")
-    else:
-        summary_lines.append("- 结论：未发现需要优先复核的依赖变化。")
-    summary_lines.append("")
-    summary_lines.append("三、分析范围")
-    if args.base_artifact_path and args.current_artifact_path:
-        summary_lines.append("- 输入模式：用户提供 base/current 编译产物")
-        summary_lines.append(f"- base 编译产物：{str(Path(args.base_artifact_path).expanduser().resolve())}")
-        summary_lines.append(f"- current 编译产物：{str(Path(args.current_artifact_path).expanduser().resolve())}")
-    else:
-        summary_lines.append("- 输入模式：自动切换 base/current 分支构建")
-        summary_lines.append(f"- base 分支：{args.base_branch}")
-        summary_lines.append(f"- current 分支：{args.current_branch}")
-    want = resolve_primary_module_id(args.primary_module, args.work_dir)
-    summary_lines.append(f"- 目标模块：{want or '未指定'}")
-    summary_lines.append(f"- 构建产物类型：{base_fmt}")
-    summary_lines.append(f"- current 打包模式：{packaged_summary.get('mode') or '未知'}")
-    summary_lines.append(f"- current 可解析打包产物数量：{len(packaged_summary.get('archives') or [])}")
-    if packaged_summary.get('archives'):
-        summary_lines.append("- current 打包产物样例：")
-        for archive_path in (packaged_summary.get('archives') or [])[:5]:
-            summary_lines.append(f"  - {archive_path}")
-    if base_meta.get('module_dir'):
-        summary_lines.append(f"- base 模块目录：{base_meta.get('module_dir')}")
-    if curr_meta.get('module_dir'):
-        summary_lines.append(f"- current 模块目录：{curr_meta.get('module_dir')}")
-    summary_lines.append("")
-    summary_lines.append("四、依赖变化统计")
-    for t, c in sorted(counts.items(), key=lambda x: (-x[1], x[0])):
-        summary_lines.append(f"- {t}: {c}")
-    summary_lines.append("")
-    summary_lines.append("五、复核入口")
-    summary_lines.append("- 完整依赖变化：dep_changes.csv")
-    summary_lines.append("- 需要优先复核的依赖：dep_alerts.csv")
-    summary_lines.append("- 构建产物来源：build_provenance.json")
-    summary_lines.append("")
-    section_number = 6
-    if unresolved_records:
-        summary_lines.append(f"{section_number}、坐标未解析依赖（前 {min(50, len(unresolved_records))} 项）")
-        section_number += 1
-        for item in unresolved_records[:50]:
-            summary_lines.append(f"- {item.get('label')}")
-        summary_lines.append("")
-    if alerts:
-        summary_lines.append(f"{section_number}、优先复核依赖（前 {min(50, len(alerts))} 项）")
-        for r in alerts[:50]:
-            summary_lines.append(
-                f"- {r['coord']}：{r['old_version']} -> {r['new_version']}；变化={r['change_type']}；风险={r['risk']}；范围={r['scope']}；说明={r.get('remark','')}"
-            )
-        summary_lines.append("")
-    summary_lines.append("附：阅读说明")
-    summary_lines.append("- Step1 只确定依赖变化范围，不证明业务是否受影响。")
-    summary_lines.append("- 是否触达业务代码，以 Step5 的 alerts.csv 和 Step6 的 report.md 为准。")
+    summary_lines, want = _build_step1_summary_lines(
+        rows=rows,
+        alerts=alerts,
+        curr_entries=curr_entries,
+        unresolved_records=unresolved_records,
+        base_artifact_path=args.base_artifact_path,
+        current_artifact_path=args.current_artifact_path,
+        base_branch=args.base_branch,
+        current_branch=args.current_branch,
+        primary_module=args.primary_module,
+        work_dir=args.work_dir,
+        base_fmt=base_fmt,
+        packaged_summary=packaged_summary,
+        base_meta=base_meta,
+        curr_meta=curr_meta,
+        counts=counts,
+    )
     with open(summary_out, 'w', encoding='utf-8', newline='\n') as f:
         f.write("\n".join(summary_lines) + "\n")
-    if observer is not None and summary_token is not None:
-        observer.finish_phase(
-            summary_token,
-            status="completed",
-            message="Step1 可读摘要写入完成",
-        )
+    observer.finish_phase(
+        summary_token,
+        status="completed",
+        message="Step1 可读摘要写入完成",
+    )
     if alerts:
         print(f"\n⚠️  需人工确认（{len(alerts)} 项）：", file=sys.stderr)
         for r in alerts:
@@ -6685,18 +6729,16 @@ def main():
     print(f"✅ 输出：{provenance_path.resolve()}", file=sys.stderr)
     print(f"运行门控：python scripts/gate.py --step step1_scope --report-dir .upgrade-report/",
           file=sys.stderr)
-    if observer is not None and report_token is not None:
-        observer.finish_phase(
-            report_token,
-            status="completed",
-            message="Step1 正式结果文件写入完成",
-        )
-    if observer is not None and total_token is not None:
-        observer.finish_phase(
-            total_token,
-            status="completed",
-            message="Step1 分析完成",
-        )
+    observer.finish_phase(
+        report_token,
+        status="completed",
+        message="Step1 正式结果文件写入完成",
+    )
+    observer.finish_phase(
+        total_token,
+        status="completed",
+        message="Step1 分析完成",
+    )
     if not os.environ.get("JUA_ORCHESTRATED"):
         print(
             "\n⚠️  当前为单脚本直跑模式：下面的人工确认只会输出复核清单，"

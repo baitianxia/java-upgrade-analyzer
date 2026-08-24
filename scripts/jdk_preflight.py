@@ -60,7 +60,9 @@ def _release_values(path: Path) -> dict[str, str]:
 def _java_major(value: str) -> int:
     text = str(value or "").strip()
     legacy = re.match(r"1\.(\d+)", text)
-    modern = re.match(r"(\d+)", text)
+    # Modern Java versions start at 2 for this parser; a bare/incomplete
+    # legacy prefix such as ``1`` or ``1.`` is malformed, not JDK 1.
+    modern = re.match(r"([2-9]\d*|1\d+)", text)
     match = legacy or modern
     if not match:
         raise JdkPreflightError(
@@ -110,16 +112,85 @@ def _run_tool(command, *, stage: str, reason_prefix: str, require_stdout=False):
     return result
 
 
+def _java_properties_from_output(output: str) -> dict[str, str]:
+    properties = {}
+    text = str(output or "")
+    for line in text.splitlines():
+        key, separator, value = line.strip().partition("=")
+        if separator:
+            properties[key.strip()] = value.strip()
+    version = properties.get("java.version", "")
+    if not version:
+        match = re.search(r'\b(?:openjdk|java) version "([^"]+)"', text)
+        version = match.group(1) if match else ""
+    return {
+        key: value
+        for key, value in {
+            "JAVA_VERSION": version,
+            "IMPLEMENTOR": properties.get("java.vendor", ""),
+            "OS_NAME": properties.get("os.name", ""),
+            "OS_ARCH": properties.get("os.arch", ""),
+        }.items()
+        if value
+    }
+
+
+def resolve_jdk_release(jdk_home: str | Path) -> dict[str, Any]:
+    """Return content-bound JDK metadata across valid vendor layouts."""
+    home = Path(jdk_home).expanduser().resolve()
+    release_file = home / "release"
+    if release_file.is_file():
+        return {
+            "values": _release_values(release_file),
+            "source": "release-file",
+            "identity": _sha256_file(release_file),
+        }
+
+    java = jdk_tool_path(home, "java")
+    if not java.is_file():
+        raise JdkPreflightError("JDK_RELEASE_MISSING", str(release_file))
+    result = _run_tool(
+        [str(java), "-XshowSettings:properties", "-version"],
+        stage="jdk.release_metadata_probe",
+        reason_prefix="JDK_RELEASE_METADATA",
+    )
+    output = "\n".join(
+        value
+        for value in (
+            str(result.stdout or "").strip(),
+            str(result.stderr or "").strip(),
+        )
+        if value
+    )
+    values = _java_properties_from_output(output)
+    _java_major(values.get("JAVA_VERSION", ""))
+    identity = hashlib.sha256(
+        json.dumps(
+            {
+                "schema": "java-upgrade-analyzer.jdk-runtime-release.v1",
+                "java_executable_sha256": _sha256_file(java),
+                "probe_output": output,
+                "values": values,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "values": values,
+        "source": "java-properties-probe",
+        "identity": identity,
+    }
+
+
 def _preflight_jdk_home_uncached(jdk_home: str | Path) -> dict[str, Any]:
     """Exercise every JDK tool later used by Step4 and bind the observation."""
     home = Path(jdk_home).expanduser().resolve()
-    release_file = home / "release"
     if not home.is_dir():
         raise JdkPreflightError("JDK_HOME_MISSING", str(home))
-    if not release_file.is_file():
-        raise JdkPreflightError("JDK_RELEASE_MISSING", str(release_file))
-
-    release = _release_values(release_file)
+    release_record = resolve_jdk_release(home)
+    release = release_record["values"]
     major = _java_major(release.get("JAVA_VERSION", ""))
     platform_files: list[Path] = []
     if major == 8:
@@ -238,7 +309,7 @@ def _preflight_jdk_home_uncached(jdk_home: str | Path) -> dict[str, Any]:
         tool_records[name] = _tool_fingerprint(path, version_output)
     identity_payload = {
         "jdk_home": str(home),
-        "release_sha256": _sha256_file(release_file),
+        "release_sha256": release_record["identity"],
         "java_major": major,
         "tools": tool_records,
         "platform": {
@@ -254,6 +325,8 @@ def _preflight_jdk_home_uncached(jdk_home: str | Path) -> dict[str, Any]:
         },
         "probe": "compile-javap-execute-v1",
     }
+    if release_record["source"] != "release-file":
+        identity_payload["release_metadata_source"] = release_record["source"]
     identity = hashlib.sha256(
         json.dumps(
             identity_payload,
@@ -316,4 +389,5 @@ __all__ = [
     "JdkPreflightError",
     "jdk_tool_path",
     "preflight_jdk_home",
+    "resolve_jdk_release",
 ]

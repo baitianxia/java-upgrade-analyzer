@@ -35,6 +35,18 @@ python3 scripts/quality_gate.py --profile performance
 - `whitebox`：内部模型、算法、集成、错误恢复和实现约束；
 - `performance`：小规模性能/守恒测试；Release 另运行固定大规模门。
 
+内部结构充分性单独执行：
+
+```bash
+python3 scripts/whitebox_coverage_gate.py \
+  --suite all-internal --require-complete \
+  --json-out var/quality/whitebox-structure.json
+```
+
+该门从当前 `scripts/` 文件和分析入口 import 闭包自动产生函数、静态内部调用边和条件分支 alternative 分母，再把白盒、性能及 Python 子进程的实际 test owner 合并。它不接受随意覆盖率阈值；存在未执行项时输出完整缺口并失败。原生 Windows 或 Release-only 路径必须由对应 runner 的结构证据合并后才能关闭，不能用 Linux 模拟或 `skip` 代替。普通 `whitebox`/`performance` 执行和结构执行是两份独立证据：观测器改变时序、子进程重入或证据写入失败时，结构证据无效；不得修改产品时间预算来让观测执行通过。
+
+`tests/fixtures/internal_test_scope.json` 还从文件系统反向盘点所有 Python 与 shell 实现文件。未声明但实际存在的模块自动成为未分类错误；非分析运行时工具也必须有可解析的测试 owner，不能靠“不在能力矩阵”逃避测试。
+
 按交付阶段运行：
 
 ```bash
@@ -47,15 +59,34 @@ python3 scripts/quality_gate.py --profile release
 - `step5`：在 quick 上增加 ASM/fact store/cache/source overlay、端到端 pipeline、查询、调度和用户输出契约；
 - `release`：先由 `test_suite_runner.py --suite all` 做可信度审计、全量 discovery 和唯一分类，再运行全部当前测试；随后运行能力/拓扑迁移审计、分支/变异/重复健康门、目录内全部 pinned 真实项目 manifest，以及 400 JAR/10 万 class 性能与范围守恒门。任一阶段失败即阻断。
 
+`quality_gate.py` 的通过条件不再只有子进程返回码。每个 profile 必须产生结构化 `test_execution`，至少包含 selected/unique-selected/run/failure/error/skip/expected-failure/loader-failure、失败测试身份、skip 原因和耗时；证据缺失、明细与计数不一致、selector 重叠、schema 不匹配、运行数为零或证据状态与进程返回码矛盾都使质量门失败。重叠 selector 只执行一次并直接报配置失败，不能靠重复运行同一案例抬高数量。任何 `expectedFailure` 都是未修复缺陷而不是成功；黑盒、性能和 Windows 禁止任何 skip。`quick`、`step5` 与完整白盒只允许策略中精确登记、分别由 Release 和 Windows 原生门替代执行的 skip，其他新增、改名或未登记 skip 都失败。
+
+## 逃逸缺陷闭环
+
+能力矩阵只能证明“已声明能力存在对应测试”，不能证明真实使用中暴露的缺陷仍由合入门禁保护。所有已逃逸产品缺陷还必须登记到 `tests/fixtures/escaped_defect_regressions.json`，并满足：
+
+1. 记录实际错误表现、正确行为、根因族、上一轮逃逸原因和系统性修复范围；
+2. 至少绑定一个只走公开入口的精确黑盒方法和一份 `system_generated=false`、由两个独立机制交叉产生的真值；
+3. 真值必须包含可解析且非空的反例或邻近控制值；
+4. 同时绑定必要的白盒/性能回归及它们应被哪些 profile 实际选中；
+5. 至少一个回归位于合入前 profile。测试改名、删除、真值被系统输出替换、反例丢失或 profile 声明与实际 selector 不符都会由 `defect_regression_gate.py` 阻断；
+6. 同一根因族再次逃逸时必须重新审视模型或架构，不能继续追加同类案例补丁。
+
+当前台账登记 26 个逃逸缺陷、58 个精确回归方法和 27 条真值绑定，绑定到 18 份唯一的独立真值文档。前 18 个旧缺陷没有保存结构化 incident telemetry，因此其 `escape_reason` 明确标为依据随后新增回归重建的测试缺口，不冒充当时已经记录的事实；随后登记的 8 个缺陷均直接保存本轮复现、实际输出或外部事实与根因证据。该数字只是防止既有缺陷被遗忘的基线，不是覆盖充分性结论；新发现的缺陷必须在修复同一变更中登记。
+
+PR 合入前由稳定汇总检查 `pre-merge-quality` 聚合五项必跑结果：Python 3.12/3.13/3.14 的 `quick`、具备 JDK 8/17 和 Gradle 的完整 Linux 黑盒、完整白盒、完整性能回归，以及分支/变异/重复有效性门。三类完整分区的并集等于当次全量 discovery，Step5 仅保留为本地快速反馈，不能代替完整白盒。平台矩阵由稳定检查 `platform-quality` 汇总 12 个 cell。每项均在失败时也上传证据。仓库工作流只能提供这些检查，GitHub 分支保护仍必须把 `pre-merge-quality` 和 `platform-quality` 设为 required；未核实分支保护设置时不能声称这些检查不可绕过。
+
 Windows 不是由 mock 平台分支代替的兼容性声明。平台 CI 显式使用 Windows Server 2022 和 2025（不依赖会漂移的 `windows-latest`），各自的 JDK 11/17/21 cell 在 `quick` 后必须额外运行：
 
 ```powershell
 python scripts/test_suite_runner.py --suite windows
 ```
 
-该原生套件当前固定 89 项（51 可移植黑盒、35 Windows 敏感白盒/原生集成、3 性能/指标合同），覆盖 `pythonw`/无控制台 stdout、Unicode/空格/接近路径预算的路径、真实 Git/worktree、进程树清理、独立 JDK 8/17、真实 CRLF `.cmd`/`.bat` Maven/Gradle wrapper、Git longpaths、并发原子 JSON，以及通过 Win32 API 采集 CPU/峰值内存的 2 JAR/6 class 冷热性能守恒。Windows cell 固定安装 Gradle 8.10.2；1 项依赖 POSIX shebang/mode bit 的公开故障注入器被显式排除，并由“公开失败 JSON/失败关闭 + Windows 原生 missing/nonzero/timeout/empty 分类”组合替代；排除原因或替代 selector 缺失会直接失败。明确的 Unix-only 测试不会被带入 Windows 投影后以 skip 伪装通过。非 Windows 环境调用、任何 skip、selector 缺失、用例数回退或结构化证据缺失都必须失败；未取得对应 Windows runner 结果时不得声明 Windows 通过。
+Windows 原生套件由版本化 selector 清单和 `minimum_windows_test_count=110` 防止静默缩减，而不是由文档中的固定数字定义。2026-08-23 的非执行静态投影选择 142 项（60 黑盒、78 白盒、4 性能），均为唯一选择且 selector 缺口为 0；这只证明选择计划可解析，实际数量与结果必须以对应 Windows runner 的 JSON 为准。套件覆盖 `pythonw`/无控制台 stdout、Unicode/空格/接近路径预算的路径、真实 Git/worktree、进程树清理、独立 JDK 8/17、真实 CRLF `.cmd`/`.bat` Maven/Gradle wrapper、Git longpaths、并发原子 JSON，以及通过 Win32 API 采集 CPU/峰值内存的 2 JAR/6 class 冷热性能守恒。Windows cell 固定安装 Gradle 8.10.2；1 项依赖 POSIX shebang/mode bit 的公开故障注入器被显式排除，并由“公开失败 JSON/失败关闭 + Windows 原生 missing/nonzero/timeout/empty 分类”组合替代；排除原因或替代 selector 缺失会直接失败。明确的 Unix-only 测试不会被带入 Windows 投影后以 skip 伪装通过。非 Windows 环境调用、任何 skip、selector 缺失、用例数回退或结构化证据缺失都必须失败；未取得 Windows Server 2022/2025 × JDK 11/17/21 六个原生 runner 结果时不得声明 Windows 通过。
 
-系统级准出还受 `tests/fixtures/system_test_capability_matrix.json` 和 `tests/fixtures/system_test_scenario_contracts.json` 约束。矩阵从所有登记的公开 CLI、Step0~Step6 和 binary support manifest 反向盘点能力，并区分 `covered`、`partial`、`missing`。当前基线为 89/89 covered、260 个风险场景维度和 22/22 个细粒度框架机制声明；critical 能力至少需要 nominal 加两个不同逆向维度，high 至少需要 nominal 加一个逆向维度，且每一维必须指向非空第三方真值并由该能力登记的具体黑盒证据实际读取。白盒测试存在不等于公开语义已验证，任何新增能力若没有独立黑盒证据和足够场景都会阻断 `--suite all` 的“全面质量通过”声明。局部 profile 通过只说明对应已执行范围没有回归。
+系统级准出还受 `tests/fixtures/system_test_capability_matrix.json` 和 `tests/fixtures/system_test_scenario_contracts.json` 约束。矩阵从所有登记的公开 CLI、Step0~Step6 和 binary support manifest 反向盘点能力，并区分 `covered`、`partial`、`missing`。2026-08-23 的审计快照为 90/90 covered、279 个风险场景维度和 22/22 个细粒度框架机制声明；它只描述该次仓库状态，后续权威数量必须重新由门禁计算。除正常、反例、边界、失败关闭、恢复和变形外，系统级场景集合还必须显式覆盖无效输入、部分失败、状态迁移、并发和资源上限。critical 能力至少需要 nominal 加两个不同逆向维度，high 至少需要 nominal 加一个逆向维度，且每一维必须指向非空第三方真值并由该能力登记的具体黑盒证据实际读取。白盒测试存在不等于公开语义已验证，任何新增能力若没有独立黑盒证据和足够场景都会阻断 `--suite all` 的“全面质量通过”声明。局部 profile 通过只说明对应已执行范围没有回归。
+
+2026-08-23 当前工作树的本地最终 `release` 证据为：3382 项唯一测试全部被选择和裁决（黑盒 61、白盒 3158、性能 163），其中 3380 项实际通过、2 项精确替代执行 skip；0 failure、0 error、0 expected failure、0 unexpected success、0 loader failure、0 非预期 skip。6/6 个固定真实项目通过且各项目 issue 列表为空；测试健康门为 98/98 个登记分支替代、15/15 个登记变异被杀死、84 项健康集连续两轮稳定；400 JAR/100000 class 的 source-bound 记录证据重放通过且 issue_count 为 0。两项精确 skip 分别由该 Release 的真实 MyBatis 探针和 Windows 原生矩阵替代执行；前者已在本次 Release 实际通过，后者尚无本机替代证据。由于当前主机不是 Windows，Windows Server 2022/2025 × JDK 11/17/21 六个原生结果仍必须由对应 CI 产生；远端 GitHub required-check 设置也必须另行核实。
 
 准确性定向门：
 
@@ -131,7 +162,7 @@ Oracle 失败或证据不足时 generation 不得激活。
 
 ## 性能门
 
-性能门必须同时记录输入规模、冷/热 cache、总耗时、阶段耗时、P50/P95、CPU 秒、平均核数和可取得的峰值内存；门禁从原始样本复算分位数与平均核数。固定性能 fixture 位于 `tests/fixtures/binary_first/performance_gate.json`，其内容身份在 support manifest 中固定，当前记录来自 2026-08-20 的实际完整运行并含 CPU 原始证据。大规模 fact-store 门与两条冷启动完整流水线门都覆盖 400 JAR/100000 class：一条比较完全相同的两侧，另一条确定性替换 current 侧的一个 JAR 并校验 250 条实现变化。完整门继续覆盖 runtime reconciliation、trace、generation 和独立 Oracle，从两侧 SQLite 与已落盘 Oracle 结果读取实际类数、变化数量与种类、正式结果状态和问题数，并逐阶段记录累计峰值 RSS、单独限制完整流水线 RSS，避免配置中的理论规模掩盖事实丢失，也避免缩小样本掩盖超线性协调、全表物化、双侧对象重叠或逐 class 子进程退化。任何新结果缺少 CPU 证据或派生关系不一致时失败；历史记录若确实没有 CPU 原始数据只能显式声明，不能补造。
+性能门必须同时记录输入规模、冷/热 cache、总耗时、阶段耗时、P50/P95、CPU 秒、平均核数和可取得的峰值内存；门禁从原始样本复算分位数与平均核数。固定性能 fixture 位于 `tests/fixtures/binary_first/performance_gate.json`，其内容身份在 support manifest 中固定，当前记录来自 2026-08-23 对当前实现的候选采集、独立完整复采和正式回放，并含 CPU 原始证据。大规模 fact-store 门与两条冷启动完整流水线门都覆盖 400 JAR/100000 class：一条比较完全相同的两侧，另一条确定性替换 current 侧的一个 JAR 并校验 250 条实现变化。当前复采 cold 为 122.336 秒，三次 warm 的 P50/P95 为 43.185/43.258 秒；相同两侧完整流水线为 183.227 秒且正式结果/validation issue 均为 0，单 JAR 变化流水线为 267.223 秒且变化事实/正式结果均精确为 250，最大记录 RSS 为 775749632 字节。完整门继续覆盖 runtime reconciliation、trace、generation 和独立 Oracle，从两侧 SQLite 与已落盘 Oracle 结果读取实际类数、变化数量与种类、正式结果状态和问题数，并逐阶段记录累计峰值 RSS、单独限制完整流水线 RSS，避免配置中的理论规模掩盖事实丢失，也避免缩小样本掩盖超线性协调、全表物化、双侧对象重叠或逐 class 子进程退化。任何新结果缺少 CPU 证据或派生关系不一致时失败；历史记录若确实没有 CPU 原始数据只能显式声明，不能补造。
 
 性能证据中的精确字节快照、SHA-256、规范化绑定身份、实现身份和 provisional→recapture 链只建立**内部一致性与失败关闭**：它们用于发现陈旧证据、输入替换、类型别名、读取期间变化和不同执行阶段使用了不同字节。它们不是发布者身份认证，也不提供不可伪造性；拥有证据、源码或执行环境写权限的主体可以重新计算全部摘要，受损的 builder 与被测实现也可能共同产生一致但不可信的结果。叶节点 `lstat`、私有临时文件和原子替换能阻止预置 symlink/hardlink 写穿，但不把同权限恶意并发者纳入安全边界；这类主体仍可能在检查后替换祖先目录或持续改写工作区，因此性能捕获必须独占工作目录，并依赖 CI 文件权限/沙箱隔离并发写者。正式发布若需要抵抗这类主体，必须在本机制之外使用受保护的 CI 身份、隔离执行环境、签名制品和可验证 provenance/attestation，并由独立信任根校验。在外部证明落地前，只能声明“本地内容与实现绑定一致”，不能声明“已由可信发布者进行密码学认证”。
 
@@ -151,7 +182,10 @@ Oracle 失败或证据不足时 generation 不得激活。
 
 ## 提交准出
 
+- PR 的 `pre-merge-quality` 与平台 required checks 实际成功，且下载的质量 JSON 中 `test_execution.counts.run > 0`、failure/error 为零、skip 符合对应策略；
+- 本次修复若来自实际使用缺陷，逃逸缺陷台账、独立真值、精确黑盒回归、内部回归和 escape reason 同步落地；
 - 所有现存测试实际通过；
+- 内部文件责任清单无未分类项，函数、静态调用边和适用分支 alternative 无未关闭缺口；
 - 系统级 Release 声明前，公开能力矩阵必须全部为 `covered`，且每项有独立黑盒 Oracle；
 - 公开文档与代码一致；
 - 人读报告已抽查依赖身份和阅读路径；

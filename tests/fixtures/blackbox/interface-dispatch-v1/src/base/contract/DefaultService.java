@@ -1,6 +1,8 @@
 package contract;
 
 public interface DefaultService {
+    Object clone();
+
     default String removedReachableDefault() {
         return "reachable";
     }

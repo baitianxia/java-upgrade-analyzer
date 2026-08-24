@@ -1,4 +1,6 @@
 import io
+from pathlib import Path
+import tempfile
 import unittest
 
 from scripts import safe_xml
@@ -13,12 +15,25 @@ class SafeXmlTest(unittest.TestCase):
         with self.assertRaises(safe_xml.ParseError):
             safe_xml.parse(io.BytesIO(payload))
 
+        # Exercise the entity guard independently: a DOCTYPE must not be
+        # required for the security boundary to reject an entity declaration.
+        with self.assertRaises(safe_xml.ParseError):
+            safe_xml.fromstring('<!ENTITY boom "expanded"><x/>')
+
     def test_preserves_elementtree_compatible_parse_api(self):
         root = safe_xml.fromstring(b'<project><artifactId>demo</artifactId></project>')
         tree = safe_xml.parse(io.BytesIO(b'<project><groupId>g</groupId></project>'))
 
         self.assertEqual(root.findtext('artifactId'), 'demo')
         self.assertEqual(tree.getroot().findtext('groupId'), 'g')
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "pom.xml"
+            path.write_text("<project><version>1</version></project>", encoding="utf-8")
+            self.assertEqual(
+                safe_xml.parse(path).getroot().findtext("version"),
+                "1",
+            )
 
 
 if __name__ == '__main__':

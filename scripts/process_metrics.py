@@ -189,8 +189,6 @@ def _darwin_available_memory_bytes() -> int | None:
     available_pages = sum(counts.get(name, 0) for name in (
         "free", "inactive", "speculative", "purgeable",
     ))
-    if available_pages < 0:
-        return None
     return available_pages * page_size
 
 

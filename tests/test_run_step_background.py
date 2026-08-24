@@ -797,6 +797,371 @@ class RunStepBackgroundTest(unittest.TestCase):
         self.assertEqual(start.call_args.args[1], argv)
         execute.assert_not_called()
 
+    def test_background_identity_and_legacy_liveness_boundary_matrix(self):
+        identity_keys = (
+            run_step.BACKGROUND_CHILD_ENV,
+            run_step.BACKGROUND_STATUS_PATH_ENV,
+            run_step.BACKGROUND_RUN_ID_ENV,
+            run_step.BACKGROUND_CLAIM_TOKEN_ENV,
+        )
+        complete = {
+            run_step.BACKGROUND_CHILD_ENV: "1",
+            run_step.BACKGROUND_STATUS_PATH_ENV: "/tmp/status.json",
+            run_step.BACKGROUND_RUN_ID_ENV: "run",
+            run_step.BACKGROUND_CLAIM_TOKEN_ENV: "claim",
+        }
+        for missing_key in identity_keys:
+            environment = dict(complete)
+            environment[missing_key] = ""
+            with self.subTest(missing_key=missing_key), patch.dict(
+                os.environ, environment, clear=True
+            ), self.assertRaises(run_step._BackgroundOwnershipError):
+                run_step._background_child_configuration()
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(run_step._background_child_configuration())
+
+        now = 2_000_000.0
+        legacy = {
+            "schema": run_step.BACKGROUND_LEGACY_STATUS_SCHEMA,
+            "status": "running",
+            "pid": 2468,
+            "started_at": datetime.fromtimestamp(now - 1, timezone.utc).isoformat(),
+        }
+        self.assertFalse(run_step._background_legacy_running_is_fresh(None, now_epoch=now))
+        self.assertFalse(
+            run_step._background_legacy_running_is_fresh(
+                {**legacy, "schema": "v2"}, now_epoch=now
+            )
+        )
+        self.assertFalse(
+            run_step._background_legacy_running_is_fresh(
+                {**legacy, "status": "completed"}, now_epoch=now
+            )
+        )
+        self.assertFalse(
+            run_step._background_legacy_running_is_fresh(
+                {**legacy, "started_at": "invalid"}, now_epoch=now
+            )
+        )
+        self.assertFalse(
+            run_step._background_legacy_running_is_fresh(
+                {
+                    **legacy,
+                    "started_at": datetime.fromtimestamp(
+                        now + run_step.BACKGROUND_LEGACY_CLOCK_SKEW_SECONDS + 1,
+                        timezone.utc,
+                    ).isoformat(),
+                },
+                now_epoch=now,
+            )
+        )
+        naive = datetime.fromtimestamp(now - 1, timezone.utc).replace(
+            tzinfo=None
+        ).isoformat()
+        self.assertTrue(
+            run_step._background_legacy_running_is_fresh(
+                {**legacy, "started_at": naive}, now_epoch=now
+            )
+        )
+        zulu = datetime.fromtimestamp(now - 1, timezone.utc).isoformat().replace(
+            "+00:00", "Z"
+        )
+        self.assertTrue(
+            run_step._background_legacy_running_is_fresh(
+                {**legacy, "started_at": zulu}, now_epoch=now
+            )
+        )
+
+        with patch.object(run_step, "_background_active_lease_is_held") as lease, patch.object(
+            run_step, "_pid_is_running", return_value=True
+        ) as pid:
+            self.assertFalse(run_step._background_record_is_live({}, status_path=None))
+            lease.assert_not_called()
+            self.assertTrue(
+                run_step._background_record_is_live(
+                    {
+                        "status": "starting",
+                        "starting_deadline_epoch": now + 1,
+                    },
+                    status_path=None,
+                    now_epoch=now,
+                )
+            )
+            self.assertTrue(
+                run_step._background_record_is_live(
+                    {**legacy, "pid": None, "launcher_pid": 8642},
+                    status_path=None,
+                    now_epoch=now,
+                )
+            )
+            pid.assert_called_with(8642)
+
+    def test_background_process_lock_and_exit_status_boundary_matrix(self):
+        for value in (None, "bad", 0, -1):
+            with self.subTest(pid=value):
+                self.assertFalse(run_step._pid_is_running(value, "posix"))
+        for error, expected in (
+            (ProcessLookupError(), False),
+            (PermissionError(), True),
+            (OSError(), False),
+        ):
+            with self.subTest(error=type(error).__name__), patch.object(
+                run_step.os, "kill", side_effect=error
+            ):
+                self.assertIs(run_step._pid_is_running(123, "posix"), expected)
+        with patch.object(run_step.os, "kill", return_value=None):
+            self.assertTrue(run_step._pid_is_running(123, "posix"))
+        with patch.object(run_step, "_windows_pid_is_running", return_value=False):
+            self.assertFalse(run_step._pid_is_running(123, "nt"))
+
+        class Manager:
+            def __init__(self, *, suppress=False, release_error=None):
+                self.suppress = suppress
+                self.release_error = release_error
+                self.exits = []
+
+            def __enter__(self):
+                return "held"
+
+            def __exit__(self, *args):
+                self.exits.append(args)
+                if self.release_error:
+                    raise self.release_error
+                return self.suppress
+
+        suppressing = Manager(suppress=True)
+        with patch.object(run_step, "exclusive_file_lock", return_value=suppressing):
+            with run_step._acquire_background_lock(
+                "/tmp/lock", timeout_seconds=0, purpose="test"
+            ):
+                raise RuntimeError("suppressed")
+        self.assertEqual(len(suppressing.exits), 1)
+
+        class NoNoteError(BaseException):
+            add_note = None
+
+        release_fails = Manager(release_error=OSError("release"))
+        with patch.object(run_step, "exclusive_file_lock", return_value=release_fails):
+            with self.assertRaises(NoNoteError):
+                with run_step._acquire_background_lock(
+                    "/tmp/lock", timeout_seconds=0, purpose="test"
+                ):
+                    raise NoNoteError("body")
+
+        self.assertEqual(run_step._background_exit_status(0), "completed")
+        self.assertEqual(
+            run_step._background_exit_status(run_step.EXIT_AWAITING_USER),
+            "awaiting_user",
+        )
+        self.assertEqual(
+            run_step._background_exit_status(run_step.EXIT_INTERRUPTED),
+            "interrupted",
+        )
+        self.assertEqual(run_step._background_exit_status(99), "failed")
+
+    def test_background_child_claim_and_finish_rejection_matrix(self):
+        class NullManager:
+            def __enter__(self):
+                return "held"
+
+            def __exit__(self, *_args):
+                return False
+
+        configuration = (Path("/tmp/status.json"), "run", "claim")
+        base_payload = {
+            "run_id": "run",
+            "claim_token": "claim",
+            "status": "starting",
+            "pid": None,
+        }
+        rejection_payloads = (
+            {**base_payload, "run_id": "other"},
+            {**base_payload, "claim_token": "other"},
+            {**base_payload, "status": "running"},
+            {**base_payload, "pid": "not-an-int"},
+            {**base_payload, "pid": os.getpid() + 1},
+        )
+        for payload in rejection_payloads:
+            with self.subTest(payload=payload), patch.object(
+                run_step, "_background_child_configuration", return_value=configuration
+            ), patch.object(
+                run_step, "_acquire_background_lock", return_value=NullManager()
+            ), patch.object(
+                run_step, "_read_background_json", return_value=payload
+            ), self.assertRaises(run_step._BackgroundOwnershipError):
+                with run_step._background_child_lease():
+                    self.fail("rejected child must not enter its body")
+
+        writes = []
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            run_step, "_background_child_configuration", return_value=configuration
+        ), patch.object(
+            run_step, "_acquire_background_lock", return_value=NullManager()
+        ), patch.object(
+            run_step, "_read_background_json", return_value=base_payload
+        ), patch.object(
+            run_step, "_write_background_json", side_effect=lambda _path, value: writes.append(dict(value))
+        ):
+            with run_step._background_child_lease() as owned:
+                self.assertEqual(owned, configuration)
+                for key in (
+                    run_step.BACKGROUND_CHILD_ENV,
+                    run_step.BACKGROUND_STATUS_PATH_ENV,
+                    run_step.BACKGROUND_RUN_ID_ENV,
+                    run_step.BACKGROUND_CLAIM_TOKEN_ENV,
+                ):
+                    self.assertNotIn(key, os.environ)
+        self.assertEqual(writes[-1]["status"], "running")
+
+        running = {
+            "run_id": "run",
+            "claim_token": "claim",
+            "pid": os.getpid(),
+            "status": "running",
+        }
+        finish_rejections = (
+            {**running, "run_id": "other"},
+            {**running, "claim_token": "other"},
+            {**running, "pid": os.getpid() + 1},
+            {**running, "status": "starting"},
+        )
+        for payload in finish_rejections:
+            with self.subTest(finish=payload), patch.object(
+                run_step, "_acquire_background_lock", return_value=NullManager()
+            ), patch.object(
+                run_step, "_read_background_json", return_value=payload
+            ), patch.object(run_step, "_write_background_json") as write:
+                self.assertFalse(
+                    run_step.finish_background_run(0, configuration=configuration)
+                )
+                write.assert_not_called()
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(run_step.finish_background_run(0))
+
+    def test_background_launch_path_fallback_and_launch_error_matrix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            report = project / ".upgrade-report"
+            project.mkdir()
+            args = SimpleNamespace(
+                step=None,
+                project_dir=str(project),
+                report_dir=str(report),
+            )
+            with patch.dict(os.environ, {"PATH": ""}, clear=False), patch.object(
+                run_step.subprocess, "Popen", return_value=SimpleNamespace(pid=101)
+            ), patch.object(sys, "stderr", io.StringIO()):
+                payload = run_step.start_background_run(args, ["--background"])
+            environment = json.loads(
+                Path(payload["environment_path"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual(environment["path"], os.defpath)
+            self.assertEqual(environment["path_source"], "os.defpath_fallback")
+            self.assertEqual(payload["step"], "")
+
+        for error in (OSError("denied"), ValueError("bad spawn")):
+            with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as tmp:
+                project = Path(tmp) / "project"
+                report = project / ".upgrade-report"
+                project.mkdir()
+                args = SimpleNamespace(
+                    step="step1",
+                    project_dir=str(project),
+                    report_dir=str(report),
+                )
+                with patch.object(run_step.subprocess, "Popen", side_effect=error), patch.object(
+                    sys, "stderr", io.StringIO()
+                ), self.assertRaisesRegex(run_step.StepError, "后台任务启动失败"):
+                    run_step.start_background_run(args, ["--background"])
+                status = run_step._read_background_json(
+                    run_step.background_status_path(report)
+                )
+                self.assertEqual(status["status"], "failed")
+                self.assertIn(str(error), status["launch_error"])
+
+    def test_remaining_background_falsey_identity_and_lock_note_matrix(self):
+        with patch.object(run_step.os, "kill", return_value=None):
+            self.assertTrue(run_step._pid_is_running(os.getpid(), None))
+
+        self.assertIsNone(run_step._background_legacy_started_epoch(None))
+        self.assertFalse(
+            run_step._background_legacy_running_is_fresh(
+                {
+                    "schema": run_step.BACKGROUND_LEGACY_STATUS_SCHEMA,
+                    "status": None,
+                },
+                now_epoch=1,
+            )
+        )
+
+        class NullManager:
+            def __enter__(self):
+                return "held"
+
+            def __exit__(self, *_args):
+                return False
+
+        configuration = (Path("/tmp/status.json"), "run", "claim")
+        starting_without_status = {
+            "run_id": "run",
+            "claim_token": "claim",
+            "status": None,
+            "pid": None,
+        }
+        with patch.object(
+            run_step, "_background_child_configuration", return_value=configuration
+        ), patch.object(
+            run_step, "_acquire_background_lock", return_value=NullManager()
+        ), patch.object(
+            run_step, "_read_background_json", return_value=starting_without_status
+        ), self.assertRaises(run_step._BackgroundOwnershipError):
+            with run_step._background_child_lease():
+                self.fail("falsey status must not claim the child lease")
+
+        running_without_status = {
+            "run_id": "run",
+            "claim_token": "claim",
+            "pid": os.getpid(),
+            "status": None,
+        }
+        with patch.object(
+            run_step, "_acquire_background_lock", return_value=NullManager()
+        ), patch.object(
+            run_step, "_read_background_json", return_value=running_without_status
+        ):
+            self.assertFalse(
+                run_step.finish_background_run(0, configuration=configuration)
+            )
+
+        body_error = RuntimeError("body")
+        body_error.add_note = None
+
+        class ReleaseFailureManager:
+            def __enter__(self):
+                return "held"
+
+            def __exit__(self, *_args):
+                raise OSError("unlock")
+
+        manager = ReleaseFailureManager()
+        with patch.object(
+            run_step, "exclusive_file_lock", return_value=manager
+        ), self.assertRaisesRegex(RuntimeError, "body"):
+            with run_step._acquire_background_lock(
+                "/tmp/lock", timeout_seconds=0, purpose="test"
+            ):
+                raise body_error
+
+        noted_error = RuntimeError("noted body")
+        with patch.object(
+            run_step, "exclusive_file_lock", return_value=manager
+        ), self.assertRaisesRegex(RuntimeError, "noted body") as raised:
+            with run_step._acquire_background_lock(
+                "/tmp/lock", timeout_seconds=0, purpose="test"
+            ):
+                raise noted_error
+        self.assertTrue(getattr(raised.exception, "__notes__", []))
+
 
 if __name__ == "__main__":
     unittest.main()

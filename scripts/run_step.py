@@ -677,7 +677,8 @@ def _background_starting_claim_is_fresh(payload, now_epoch=None):
 
 
 def _background_legacy_started_epoch(payload, status_path=None):
-    started_at = str((payload or {}).get("started_at") or "").strip()
+    payload = dict(payload or {})
+    started_at = str(payload.get("started_at") or "").strip()
     if started_at:
         try:
             normalized = started_at[:-1] + "+00:00" if started_at.endswith("Z") else started_at
@@ -696,10 +697,11 @@ def _background_legacy_started_epoch(payload, status_path=None):
 
 
 def _background_legacy_running_is_fresh(payload, status_path=None, now_epoch=None):
+    payload = dict(payload or {})
     if (
-        str((payload or {}).get("schema") or "").strip()
+        str(payload.get("schema") or "").strip()
         != BACKGROUND_LEGACY_STATUS_SCHEMA
-        or str((payload or {}).get("status") or "").strip() != "running"
+        or str(payload.get("status") or "").strip() != "running"
     ):
         return False
     started_epoch = _background_legacy_started_epoch(
@@ -723,7 +725,8 @@ def _background_record_is_live(payload, status_path=None, now_epoch=None):
     parent-crash window.  A bare v2 ``running`` PID is deliberately
     insufficient; v1 records receive only a bounded migration grace period.
     """
-    status = str((payload or {}).get("status") or "").strip()
+    payload = dict(payload or {})
+    status = str(payload.get("status") or "").strip()
     if status_path is not None and _background_active_lease_is_held(status_path):
         return True
     if status == "starting":
@@ -733,9 +736,7 @@ def _background_record_is_live(payload, status_path=None, now_epoch=None):
     if _background_legacy_running_is_fresh(
         payload, status_path=status_path, now_epoch=now_epoch
     ):
-        tracked_pid = (payload or {}).get("pid") or (payload or {}).get(
-            "launcher_pid"
-        )
+        tracked_pid = payload.get("pid") or payload.get("launcher_pid")
         return _pid_is_running(tracked_pid)
     return False
 
@@ -1528,8 +1529,8 @@ def _landing_pending_interaction_lines(report_dir, state):
         if restart_options:
             lines.extend(["需要修正更早输入时：", ""])
             for item in restart_options:
-                label = str((item or {}).get("label") or USER_ACTION_LABELS["restart_from_step"]).strip()
-                description = _humanize_interaction_text((item or {}).get("description") or "").strip()
+                label = str(item.get("label") or USER_ACTION_LABELS["restart_from_step"]).strip()
+                description = _humanize_interaction_text(item.get("description") or "").strip()
                 lines.append(f"- {label}" + (f"：{description}" if description else ""))
             lines.append("")
     selection_options = list(interaction.get("selection_options") or [])
@@ -1607,7 +1608,8 @@ def write_report_landing_docs(
 
 
 def build_user_runtime_message(event, step_id, reason="", completion_summary=None):
-    task_name = USER_TASK_NAMES.get(str(step_id or "").strip(), "当前分析")
+    normalized_step_id = str(step_id or "").strip()
+    task_name = USER_TASK_NAMES.get(normalized_step_id, "当前分析")
     if event == "start":
         return [f"正在分析：{task_name}"]
     if event == "failed":
@@ -1621,7 +1623,7 @@ def build_user_runtime_message(event, step_id, reason="", completion_summary=Non
             ]
         )
         return lines
-    if str(step_id or "").strip() == "step6":
+    if normalized_step_id == "step6":
         summary = dict(completion_summary or {})
         limited = summary.get("status") == "completed_with_limits"
         lines = ["分析已完成，但存在结论限制。" if limited else "分析已完成。"]
@@ -1671,8 +1673,7 @@ def build_user_runtime_message(event, step_id, reason="", completion_summary=Non
         return lines
     next_step = next_step_id_for(step_id)
     lines = [f"{task_name}已完成。"]
-    if next_step:
-        lines.append(f"接下来：{USER_TASK_NAMES.get(next_step, next_step)}")
+    lines.append(f"接下来：{USER_TASK_NAMES.get(next_step, next_step)}")
     return lines
 
 
@@ -1872,11 +1873,14 @@ def next_step_id_for(step_id):
 
 
 def interaction_option_ids(interaction):
-    return {
-        str(item.get("id") or "").strip()
-        for item in (interaction or {}).get("options", []) or []
-        if str(item.get("id") or "").strip()
-    }
+    option_ids = set()
+    for item in (interaction or {}).get("options", []) or []:
+        if not isinstance(item, dict):
+            continue
+        option_id = str(item.get("id") or "").strip()
+        if option_id:
+            option_ids.add(option_id)
+    return option_ids
 
 
 def current_step_for_pending_interaction(step_id, interaction):
@@ -2078,7 +2082,7 @@ def save_interaction_file(report_dir, interaction):
         return
     payload = normalize_diagnostic_payload(
         _sanitize_git_persistence_payload(interaction),
-        origin_step=(interaction or {}).get("step_id"),
+        origin_step=interaction.get("step_id"),
     )
     payload["status"] = normalize_interaction_status(payload.get("status"))
     payload.setdefault(
@@ -2233,7 +2237,7 @@ def build_canonical_user_response(user_response):
     if patch.get("unresolved_slots"):
         raise StepError(
             "当前用户答复仍存在未消解槽位，必须先澄清后再恢复执行："
-            + ", ".join(patch.get("unresolved_slots") or [])
+            + ", ".join(patch["unresolved_slots"])
         )
     response_action = str(response.get("action") or "").strip()
     patch_action = str(patch.get("action") or "").strip()
@@ -2258,7 +2262,7 @@ def build_canonical_user_response(user_response):
     if patch_notes or notes:
         canonical["notes"] = patch_notes or notes
     if patch.get("clear"):
-        canonical["__clear_fields"] = list(patch.get("clear") or [])
+        canonical["__clear_fields"] = list(patch["clear"])
     return canonical
 
 
@@ -2394,16 +2398,17 @@ def _durable_step1_ref_binding_from_failure(
     separate facts.  Losing the former would make a retry follow the moving ref
     again, defeating the Step1 snapshot contract.
     """
-    expected_commit = str((resolution or {}).get("expected_commit") or "").strip()
+    resolution = dict(resolution or {})
+    expected_commit = str(resolution.get("expected_commit") or "").strip()
     if not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", expected_commit):
         return {}
 
     existing_binding = dict(existing_binding or {})
-    remote = str((resolution or {}).get("remote") or "").strip()
-    canonical_ref = str((resolution or {}).get("remote_ref") or "").strip()
+    remote = str(resolution.get("remote") or "").strip()
+    canonical_ref = str(resolution.get("remote_ref") or "").strip()
     candidates = [
         dict(item)
-        for item in ((resolution or {}).get("candidates") or [])
+        for item in (resolution.get("candidates") or [])
         if isinstance(item, dict)
     ]
     matching_candidates = [
@@ -2536,9 +2541,14 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
             updated.setdefault("input_origins", {})[key] = "user"
 
     if response.get("active_maven_profiles") is not None:
+        raw_profiles = response.get("active_maven_profiles")
+        if not isinstance(raw_profiles, list) or any(
+            not isinstance(item, str) for item in raw_profiles
+        ):
+            raise StepError("active_maven_profiles 必须是字符串数组。")
         previous_profiles = list(updated.get("active_maven_profiles") or [])
         updated["active_maven_profiles"] = _dedupe_strings(
-            response.get("active_maven_profiles") or []
+            [item.strip() for item in raw_profiles if item.strip()]
         )
         if updated["active_maven_profiles"] != previous_profiles:
             updated.pop("source_dirs", None)
@@ -2576,11 +2586,32 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
             not isinstance(item, dict) for item in bindings
         ):
             raise StepError("dependency_source_ref_bindings 必须是对象数组。")
-        merged_bindings = {
-            str((item or {}).get("coord") or "").strip(): dict(item)
-            for item in (updated.get("dependency_source_ref_bindings") or [])
-            if str((item or {}).get("coord") or "").strip()
-        }
+        if any(
+            item.get("source_dirs") is not None
+            and (
+                not isinstance(item.get("source_dirs"), list)
+                or any(
+                    not isinstance(source_dir, str)
+                    for source_dir in item.get("source_dirs")
+                )
+            )
+            for item in bindings
+        ):
+            raise StepError(
+                "dependency_source_ref_bindings.source_dirs 必须是字符串数组。"
+            )
+        merged_bindings = {}
+        for existing_binding in (
+            updated.get("dependency_source_ref_bindings") or []
+        ):
+            if not isinstance(existing_binding, dict):
+                continue
+            existing_coord = str(
+                existing_binding.get("coord") or ""
+            ).strip()
+            if not existing_coord:
+                continue
+            merged_bindings[existing_coord] = dict(existing_binding)
         changed_coords = set()
         for item in bindings:
             coord = str(item.get("coord") or "").strip()
@@ -2601,28 +2632,37 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
             if coord not in changed_coords:
                 source_mappings.append(raw_mapping)
         for binding in bindings:
-            coord = str(binding.get("coord") or "").strip()
+            coord = str(binding["coord"]).strip()
             repo_path = str(binding.get("repo_path") or "").strip()
             if repo_path:
                 repo_mappings.append(f"{coord}={repo_path}")
             for source_dir in binding.get("source_dirs") or []:
-                if str(source_dir or "").strip():
-                    source_mappings.append(f"{coord}={source_dir}")
+                normalized_source_dir = str(source_dir or "").strip()
+                if normalized_source_dir:
+                    source_mappings.append(f"{coord}={normalized_source_dir}")
         updated["dependency_repo_mappings"] = _dedupe_strings(repo_mappings)
         updated["dependency_source_mappings"] = _dedupe_strings(source_mappings)
     if response.get("skip_dependency_source_coords") is not None:
         raw_skips = response.get("skip_dependency_source_coords")
         if isinstance(raw_skips, str):
             raw_skips = [raw_skips]
-        if not isinstance(raw_skips, list):
+        if not isinstance(raw_skips, list) or any(
+            not isinstance(item, str) for item in raw_skips
+        ):
             raise StepError("skip_dependency_source_coords 必须是字符串数组。")
-        updated["skip_dependency_source_coords"] = _dedupe_strings(raw_skips)
+        updated["skip_dependency_source_coords"] = _dedupe_strings(
+            [item.strip() for item in raw_skips if item.strip()]
+        )
         skipped = set(updated["skip_dependency_source_coords"])
-        updated["dependency_source_ref_bindings"] = [
-            dict(item)
-            for item in (updated.get("dependency_source_ref_bindings") or [])
-            if str((item or {}).get("coord") or "").strip() not in skipped
-        ]
+        retained_bindings = []
+        for item in updated.get("dependency_source_ref_bindings") or []:
+            if not isinstance(item, dict):
+                continue
+            coord = str(item.get("coord") or "").strip()
+            if not coord or coord in skipped:
+                continue
+            retained_bindings.append(dict(item))
+        updated["dependency_source_ref_bindings"] = retained_bindings
         updated["dependency_repo_mappings"] = [
             item
             for item in (updated.get("dependency_repo_mappings") or [])
@@ -2652,8 +2692,6 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
         "current_artifact_path",
         "base_source_project_dir",
         "current_source_project_dir",
-        "base_jdk_home",
-        "current_jdk_home",
     ):
         value = response.get(key)
         if isinstance(value, str) and value.strip():
@@ -2670,15 +2708,21 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
     ):
         if key in response:
             updated[key] = parse_bool_like(response.get(key), key)
-    if "strict_risk_gate" in response:
-        updated["strict_risk_gate"] = parse_bool_like(response.get("strict_risk_gate"), "strict_risk_gate")
     manual_coord_overrides = response.get("manual_coord_overrides")
     if manual_coord_overrides is not None:
         if isinstance(manual_coord_overrides, str):
-            incoming_coord_overrides = [manual_coord_overrides.strip()] if manual_coord_overrides.strip() else []
+            incoming_coord_overrides = (
+                [manual_coord_overrides.strip()]
+                if manual_coord_overrides.strip()
+                else []
+            )
         elif isinstance(manual_coord_overrides, list):
+            if any(not isinstance(item, str) for item in manual_coord_overrides):
+                raise StepError(
+                    "manual_coord_overrides 仅支持字符串或字符串列表"
+                )
             incoming_coord_overrides = _dedupe_strings(
-                [str(item).strip() for item in manual_coord_overrides if str(item).strip()]
+                [item.strip() for item in manual_coord_overrides if item.strip()]
             )
         else:
             raise StepError("manual_coord_overrides 仅支持字符串或字符串列表")
@@ -2697,14 +2741,14 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
         merged_identities = {
             (
                 item.get("side", ""),
-                item.get("lib_entry") or item.get("entry_id", ""),
+                item["lib_entry"],
             ): dict(item)
             for item in previous_identities
         }
         for item in manual_artifact_identities:
             merged_identities[(
                 item.get("side", ""),
-                item.get("lib_entry") or item.get("entry_id", ""),
+                item["lib_entry"],
             )] = dict(item)
         updated["manual_artifact_identities"] = list(
             merged_identities.values()
@@ -2748,12 +2792,30 @@ def _subprocess_failure_detail(stderr, stdout, *, limit=800):
             lines.append(line)
         return lines
 
+    def actionable_lines(lines):
+        generic_gradle_lines = {
+            "FAILURE: Build failed with an exception.",
+            "* What went wrong:",
+            "* Try:",
+            "* Exception is:",
+        }
+        return [
+            line for line in lines
+            if line not in generic_gradle_lines
+            and not line.startswith("> Run with --")
+            and not line.startswith("> Get more help at ")
+            and not line.startswith("BUILD FAILED in ")
+        ]
+
     # Preserve the historical stderr preference when it contains a real
     # diagnostic, but fall back to stdout after removing launcher boilerplate.
+    # Gradle prints generic help after the nested root cause; selecting the
+    # physical last line would hide errors such as SocketException or an
+    # invalid toolchain behind a documentation URL.
     lines = meaningful_lines(stderr) or meaningful_lines(stdout)
     if not lines:
         return ""
-    detail = _redact_git_sensitive_text(lines[-1])
+    detail = _redact_git_sensitive_text((actionable_lines(lines) or lines)[-1])
     if len(detail) > limit:
         detail = detail[: max(limit - 1, 0)].rstrip() + "…"
     return detail
@@ -2878,6 +2940,11 @@ def run_python(script_name, script_args, cwd, report_dir=None, timeout=None):
         heartbeat_stop.set()
         if heartbeat_thread is not None:
             heartbeat_thread.join(timeout=1)
+    # Execution adapters normally return text, but platform-specific wrappers
+    # may represent an empty captured stream as ``None``. Normalize once before
+    # protocol parsing so diagnostics still flow through the StepError contract.
+    stdout = str(stdout or "")
+    stderr = str(stderr or "")
     interaction_prefix = "JUA_STEP_INTERACTION_JSON:"
     interaction = None
     filtered_stdout_lines = []
@@ -3133,7 +3200,8 @@ def _guess_module_root_from_source_dir(source_dir):
             return str(candidate.resolve())
         if (candidate / "build.gradle").exists() or (candidate / "build.gradle.kts").exists():
             return str(candidate.resolve())
-    return str(path_obj.parent.resolve()) if path_obj.parent else normalized
+    # ``Path.parent`` is always a Path object and therefore always truthy.
+    return str(path_obj.parent.resolve())
 
 
 def _collect_relevant_dependency_coords(report_dir, ctx=None):
@@ -3226,11 +3294,12 @@ def _discover_dependency_source_candidates(
 ):
     candidates = []
     seen = set()
-    relevant_coords = {
-        str(item or "").strip()
-        for item in (relevant_coords or [])
-        if str(item or "").strip()
-    }
+    normalized_relevant_coords = set()
+    for item in relevant_coords or []:
+        value = str(item or "").strip()
+        if value:
+            normalized_relevant_coords.add(value)
+    relevant_coords = normalized_relevant_coords
     relevant_coords_by_ga = {}
     for coord in sorted(relevant_coords):
         coord_ga = artifact_ga(coord)
@@ -3324,13 +3393,14 @@ def _build_dependency_source_plan(dependency_source_dirs, relevant_coords=None):
     unmatched_relevant_coords = [coord for coord in relevant_order if coord not in candidates_by_coord]
 
     for coord in coord_order:
-        coord_candidates = candidates_by_coord.get(coord) or []
+        coord_candidates = candidates_by_coord[coord]
+        repo_path_values = []
+        for item in coord_candidates:
+            raw_repo_path = item.get("repo_path")
+            if raw_repo_path:
+                repo_path_values.append(str(raw_repo_path).strip())
         repo_paths = _dedupe_strings(
-            [
-                str(item.get("repo_path") or "").strip()
-                for item in coord_candidates
-                if item.get("repo_path")
-            ]
+            repo_path_values
         )
         if len(repo_paths) > 1:
             ambiguous_coords.append(
@@ -3343,8 +3413,13 @@ def _build_dependency_source_plan(dependency_source_dirs, relevant_coords=None):
             continue
         if repo_paths:
             dependency_repo_mappings.append(f"{coord}={repo_paths[0]}")
+        source_dir_values = []
+        for item in coord_candidates:
+            raw_source_dir = item.get("source_dir")
+            if raw_source_dir:
+                source_dir_values.append(str(raw_source_dir).strip())
         source_dirs = _dedupe_strings(
-            [str(item.get("source_dir") or "").strip() for item in coord_candidates if item.get("source_dir")]
+            source_dir_values
         )
         for source_dir in source_dirs:
             dependency_source_mappings.append(f"{coord}={source_dir}")
@@ -3380,12 +3455,12 @@ def is_dependency_source_git_url(path_value, project_dir=None):
         return True
     if re.match(r"^[^/@\s]+@[^:\s]+:.+", value):
         return True
-    if re.match(r"^(?![A-Za-z]:[\\/])[^/:\s]+:.+", value):
-        return True
     local_path = Path(value).expanduser()
     if not local_path.is_absolute() and project_dir is not None:
         local_path = Path(project_dir) / local_path
-    return not local_path.exists()
+    if local_path.exists():
+        return False
+    return bool(re.match(r"^(?![A-Za-z]:[\\/])[^/:\s]+:.+", value)) or value.endswith(".git")
 
 
 def _git_clone_transport_url(value):
@@ -3842,11 +3917,12 @@ def materialize_dependency_source_git_url(git_url, report_dir, clone_timeout=300
             if temp_repo.exists() and not temp_repo.is_symlink():
                 shutil.rmtree(temp_repo)
             temp_repo = None
-            if not retryable or attempt_number >= 3 or time.monotonic() >= deadline:
+            if not retryable or time.monotonic() >= deadline:
                 break
-            time.sleep(min(0.25 * (2 ** (attempt_number - 1)), max(0, deadline - time.monotonic())))
+            if attempt_number < 3:
+                time.sleep(min(0.25 * (2 ** (attempt_number - 1)), max(0, deadline - time.monotonic())))
 
-        if temp_repo is None or not valid:
+        if temp_repo is None:
             write_json(
                 metadata_path,
                 {
@@ -3865,10 +3941,18 @@ def materialize_dependency_source_git_url(git_url, report_dir, clone_timeout=300
                     git_url, display_url
                 )
             )
+            deadline_exhausted = (
+                attempts[-1].get("status")
+                == "remote_operation_deadline_exceeded"
+            )
             raise StepError(
                 f"无法克隆依赖源码 Git 地址 {display_url}：{reason[:1000]}。"
                 f"已执行 {len(attempts)} 次受控尝试；已有分析产物不会被修改。",
-                reason_codes=["DEPENDENCY_SOURCE_GIT_CLONE_FAILED"],
+                reason_codes=[
+                    "DEPENDENCY_SOURCE_GIT_OPERATION_DEADLINE_EXCEEDED"
+                    if deadline_exhausted
+                    else "DEPENDENCY_SOURCE_GIT_CLONE_FAILED"
+                ],
             )
 
         if repo_path.exists():
@@ -4039,6 +4123,10 @@ def normalize_dependency_repo_mappings(raw_value, project_dir, config_key="depen
                 path_value = path_value.strip()
             else:
                 path_value = raw
+            if not path_value:
+                raise StepError(
+                    f"当前步骤输入中的 {config_key} 的字符串项必须包含路径"
+                )
         elif isinstance(item, dict):
             coord_hint = str(item.get("coord") or item.get("coord_hint") or item.get("group") or "").strip()
             path_value = str(
@@ -4095,6 +4183,10 @@ def normalize_dependency_source_mappings(raw_value, project_dir, config_key="dep
                 path_value = path_value.strip()
             else:
                 path_value = raw
+            if not path_value:
+                raise StepError(
+                    f"当前步骤输入中的 {config_key} 的字符串项必须包含路径"
+                )
         elif isinstance(item, dict):
             coord_hint = str(item.get("coord") or item.get("coord_hint") or item.get("group") or "").strip()
             path_value = str(
@@ -4230,9 +4322,10 @@ def build_interaction_selection_options(selection_options):
     normalized = []
     seen_keys = set()
     for item in selection_options or []:
-        coord = str((item or {}).get("coord") or "").strip()
-        name = str((item or {}).get("name") or "").strip()
-        selection_key = str((item or {}).get("selection_key") or "").strip()
+        item = item or {}
+        coord = str(item.get("coord") or "").strip()
+        name = str(item.get("name") or "").strip()
+        selection_key = str(item.get("selection_key") or "").strip()
         if not selection_key:
             if coord:
                 selection_key = f"coord:{coord}"
@@ -4249,44 +4342,44 @@ def build_interaction_selection_options(selection_options):
                 selection_key,
                 coord,
                 name,
-                str((item or {}).get("label") or "").strip(),
+                str(item.get("label") or "").strip(),
             ]
-            + list((item or {}).get("aliases") or [])
+            + list(item.get("aliases") or [])
         )
         normalized.append(
             {
                 "selection_key": selection_key,
                 "coord": coord,
                 "name": name,
-                "label": str((item or {}).get("label") or coord or name or selection_key).strip(),
-                "api_count": (item or {}).get("api_count"),
-                "high_risk_api_count": (item or {}).get("high_risk_api_count"),
+                "label": str(item.get("label") or coord or name or selection_key).strip(),
+                "api_count": item.get("api_count"),
+                "high_risk_api_count": item.get("high_risk_api_count"),
                 "business_exact_referenced_api_count": _parse_int_or_zero(
-                    (item or {}).get("business_exact_referenced_api_count")
+                    item.get("business_exact_referenced_api_count")
                 ),
                 "business_candidate_referenced_api_count": _parse_int_or_zero(
-                    (item or {}).get("business_candidate_referenced_api_count")
+                    item.get("business_candidate_referenced_api_count")
                 ),
                 "business_reference_occurrence_count": _parse_int_or_zero(
-                    (item or {}).get("business_reference_occurrence_count")
+                    item.get("business_reference_occurrence_count")
                 ),
                 "business_bytecode_scan_status": str(
-                    (item or {}).get("business_bytecode_scan_status") or ""
+                    item.get("business_bytecode_scan_status") or ""
                 ).strip(),
                 "dependency_source_status": str(
-                    (item or {}).get("dependency_source_status") or "unknown"
+                    item.get("dependency_source_status") or "unknown"
                 ).strip(),
                 "impact_priority_rank": _parse_int_or_zero(
-                    (item or {}).get("impact_priority_rank")
+                    item.get("impact_priority_rank")
                 ),
                 "recommendation_reason": str(
-                    (item or {}).get("recommendation_reason")
-                    or (item or {}).get("review_focus")
+                    item.get("recommendation_reason")
+                    or item.get("review_focus")
                     or ""
                 ).strip(),
-                "recommended": _parse_bool((item or {}).get("recommended")),
-                "change_types": str((item or {}).get("change_types") or "").strip(),
-                "detail": str((item or {}).get("detail") or "").strip(),
+                "recommended": _parse_bool(item.get("recommended")),
+                "change_types": str(item.get("change_types") or "").strip(),
+                "detail": str(item.get("detail") or "").strip(),
                 "aliases": aliases,
             }
         )
@@ -4377,9 +4470,10 @@ def _parse_bool(value):
 
 
 def _is_recommended_selection_target(row):
-    if str((row or {}).get("recommended") or "").strip():
-        return _parse_bool((row or {}).get("recommended"))
-    rank = _parse_int_or_zero((row or {}).get("impact_priority_rank"))
+    row = dict(row or {})
+    if str(row.get("recommended") or "").strip():
+        return _parse_bool(row.get("recommended"))
+    rank = _parse_int_or_zero(row.get("impact_priority_rank"))
     return bool(rank and rank <= 10)
 
 
@@ -4440,7 +4534,7 @@ def build_step5_dependency_selection_summary(report_dir):
             available_targets.append(target)
         available_targets.sort(key=lambda item: (
             _parse_int_or_zero(item.get("impact_priority_rank")) or 10**9,
-            str(item.get("coord") or ""),
+            item["coord"],
         ))
         recommended_targets = [item for item in available_targets if item.get("recommended")]
         return {
@@ -4466,7 +4560,8 @@ def build_step5_selection_summary(all_rows, selected_coords=None, selected_names
     available_targets = []
     per_coord_counts = {}
     for row in all_rows or []:
-        coord = str((row or {}).get("coord") or "").strip()
+        row = dict(row or {})
+        coord = str(row.get("coord") or "").strip()
         if not coord:
             continue
         item = per_coord_counts.setdefault(
@@ -4482,7 +4577,7 @@ def build_step5_selection_summary(all_rows, selected_coords=None, selected_names
         item["api_count"] += 1
         if _is_high_risk_selection_api_row(row):
             item["high_risk_api_count"] += 1
-        change_type = str((row or {}).get("change_type") or "").strip()
+        change_type = str(row.get("change_type") or "").strip()
         if change_type:
             item["change_type_set"].add(change_type)
     for item in per_coord_counts.values():
@@ -4491,7 +4586,7 @@ def build_step5_selection_summary(all_rows, selected_coords=None, selected_names
         per_coord_counts.values(),
         key=lambda item: (
             -_parse_int_or_zero(item.get("api_count")),
-            item.get("coord") or "",
+            item["coord"],
         ),
     )
     for rank, item in enumerate(available_targets, start=1):
@@ -4531,8 +4626,12 @@ def build_step5_selection_summary(all_rows, selected_coords=None, selected_names
             if name_hit and name not in seen_names:
                 matched_names.append(name)
                 seen_names.add(name)
-        available_coord_set = {item.get("coord", "").lower() for item in available_targets if item.get("coord")}
-        available_name_set = {item.get("name", "").lower() for item in available_targets if item.get("name")}
+        available_coord_set = {
+            item["coord"].lower() for item in available_targets
+        }
+        available_name_set = {
+            item["name"].lower() for item in available_targets if item["name"]
+        }
         unmatched_coords = [item for item in selected_coords if item.lower() not in available_coord_set]
         unmatched_names = [item for item in selected_names if item.lower() not in available_name_set]
     return {
@@ -4550,7 +4649,11 @@ def build_step5_selection_summary(all_rows, selected_coords=None, selected_names
 
 
 def _response_value_present(value):
-    return value not in (None, "", [])
+    if value in (None, "", [], {}):
+        return False
+    if isinstance(value, str) and not value.strip():
+        return False
+    return True
 
 
 def has_non_pending_intent_payload(user_response):
@@ -4621,50 +4724,88 @@ def infer_non_pending_target_step_from_payload(user_response):
     for step_id, fields in step_hints:
         if any(_response_value_present(response.get(field)) for field in fields):
             return step_id
-    if list(response.get("__clear_fields") or []):
-        cleared = set(response.get("__clear_fields") or [])
+    clear_fields = list(response.get("__clear_fields") or [])
+    if clear_fields:
+        cleared = set(clear_fields)
         for step_id, fields in step_hints:
             if cleared.intersection(fields):
                 return step_id
     return ""
 
 
+def _normalize_requirement_field_list(raw_value, field_name):
+    if raw_value is None:
+        return []
+    if not isinstance(raw_value, list) or any(
+        not isinstance(field, str) for field in raw_value
+    ):
+        raise StepError(f"{field_name} 必须是字符串数组。")
+    return _dedupe_strings(
+        [field.strip() for field in raw_value if field.strip()]
+    )
+
+
 def normalize_action_requirements(action_requirements, options, required_fields=None):
+    if action_requirements is None:
+        action_requirements = {}
+    if not isinstance(action_requirements, dict):
+        raise StepError("action_requirements 必须是 JSON 对象。")
+    if options is None:
+        options = []
+    if not isinstance(options, list) or any(
+        not isinstance(item, dict) for item in options
+    ):
+        raise StepError("交互 options 必须是对象数组。")
+    normalized_required_fields = _normalize_requirement_field_list(
+        required_fields, "required_fields",
+    )
     normalized = {}
-    known_actions = {
-        str((item or {}).get("id") or "").strip()
-        for item in (options or [])
-        if str((item or {}).get("id") or "").strip()
-    }
-    for action_id, spec in (action_requirements or {}).items():
+    known_actions = set()
+    for option in options:
+        action_id = str(option.get("id") or "").strip()
+        if action_id:
+            known_actions.add(action_id)
+    for action_id, spec in action_requirements.items():
         action_key = str(action_id or "").strip()
         if not action_key:
             continue
         if known_actions and action_key not in known_actions:
             continue
-        item = dict(spec or {})
+        if spec is None:
+            item = {}
+        elif isinstance(spec, dict):
+            item = dict(spec)
+        else:
+            raise StepError(f"action_requirements.{action_key} 必须是 JSON 对象。")
+        requirement_fields = _normalize_requirement_field_list(
+            item.get("required_fields"),
+            f"action_requirements.{action_key}.required_fields",
+        )
+        if (
+            not requirement_fields
+            and action_key == "continue"
+            and normalized_required_fields
+        ):
+            requirement_fields = list(normalized_required_fields)
         normalized[action_key] = {
-            "required_fields": _dedupe_strings(
-                [
-                    str(field).strip()
-                    for field in (
-                        item.get("required_fields")
-                        or (list(required_fields or []) if action_key == "continue" and required_fields else [])
-                    )
-                    if str(field).strip()
-                ]
+            "required_fields": requirement_fields,
+            "at_least_one_of": _normalize_requirement_field_list(
+                item.get("at_least_one_of"),
+                f"action_requirements.{action_key}.at_least_one_of",
             ),
-            "at_least_one_of": _dedupe_strings(
-                [str(field).strip() for field in (item.get("at_least_one_of") or []) if str(field).strip()]
-            ),
-            "recommended_fields": _dedupe_strings(
-                [str(field).strip() for field in (item.get("recommended_fields") or []) if str(field).strip()]
+            "recommended_fields": _normalize_requirement_field_list(
+                item.get("recommended_fields"),
+                f"action_requirements.{action_key}.recommended_fields",
             ),
             "description": str(item.get("description") or "").strip(),
         }
-    if "continue" in known_actions and required_fields and "continue" not in normalized:
+    if (
+        "continue" in known_actions
+        and normalized_required_fields
+        and "continue" not in normalized
+    ):
         normalized["continue"] = {
-            "required_fields": _dedupe_strings([str(field).strip() for field in required_fields if str(field).strip()]),
+            "required_fields": list(normalized_required_fields),
             "at_least_one_of": [],
             "recommended_fields": [],
             "description": "只有补齐当前检查点要求的关键字段后，才能继续执行。",
@@ -4684,34 +4825,63 @@ def resolve_selected_targets(selection_resolution, raw_value):
     if raw_value is None:
         return None
     values = normalize_step5_target_list(raw_value, "selected_targets") or []
-    resolution = dict(selection_resolution or {})
-    options = list(resolution.get("options") or [])
+    if selection_resolution is None:
+        resolution = {}
+    elif isinstance(selection_resolution, dict):
+        resolution = dict(selection_resolution)
+    else:
+        raise StepError("当前检查点的 selection_resolution 必须是 JSON 对象。")
+    raw_options = resolution.get("options")
+    if raw_options is None:
+        raw_options = []
+    if not isinstance(raw_options, list) or any(
+        not isinstance(item, dict) for item in raw_options
+    ):
+        raise StepError("当前检查点的 selection_resolution.options 必须是对象数组。")
+    options = [dict(item) for item in raw_options]
     if not options:
         raise StepError("当前检查点不支持 selected_targets。")
     selection_key_map = {}
     coord_map = {}
     name_map = {}
     alias_map = {}
+    seen_selection_keys = set()
     for item in options:
         selection_key = str(item.get("selection_key") or "").strip()
         coord = str(item.get("coord") or "").strip()
         name = str(item.get("name") or "").strip()
-        if selection_key:
-            selection_key_map.setdefault(selection_key.lower(), []).append(item)
+        if not selection_key:
+            raise StepError("selection_resolution.options 的每项必须包含 selection_key。")
+        selection_key_lower = selection_key.lower()
+        if selection_key_lower in seen_selection_keys:
+            raise StepError(f"selection_resolution.options 的 selection_key 重复：{selection_key}")
+        seen_selection_keys.add(selection_key_lower)
+        if not coord and not name:
+            raise StepError(
+                f"selection_resolution 候选 {selection_key} 必须包含 coord 或 name。"
+            )
+        selection_key_map.setdefault(selection_key_lower, []).append(item)
         if coord:
             coord_map.setdefault(coord.lower(), []).append(item)
         if name:
             name_map.setdefault(name.lower(), []).append(item)
+        raw_aliases = item.get("aliases")
+        if raw_aliases is None:
+            raw_aliases = []
+        if not isinstance(raw_aliases, list) or any(
+            not isinstance(alias, str) for alias in raw_aliases
+        ):
+            raise StepError("selection_resolution.options.aliases 必须是字符串数组。")
         aliases = _dedupe_strings(
             [
                 selection_key,
                 coord,
                 name,
             ]
-            + list(item.get("aliases") or [])
+            + raw_aliases
         )
         for alias in aliases:
-            alias_key = alias.lower()
+            alias_key = alias.strip().lower()
             if not alias_key:
                 continue
             if alias_key in {selection_key.lower(), coord.lower(), name.lower()}:
@@ -4722,7 +4892,7 @@ def resolve_selected_targets(selection_resolution, raw_value):
         resolved = []
         seen_option_keys = set()
         for hit in raw_hits:
-            option_key = str(hit.get("selection_key") or "").strip().lower()
+            option_key = str(hit["selection_key"]).strip().lower()
             if option_key in seen_option_keys:
                 continue
             seen_option_keys.add(option_key)
@@ -4744,8 +4914,8 @@ def resolve_selected_targets(selection_resolution, raw_value):
         hits = unique_hits(raw_hits)
         if not hits:
             return False
-        canonical_name = str(hits[0].get("name") or name_value or "").strip() or str(name_value or "").strip()
-        if canonical_name and canonical_name.lower() not in seen_names:
+        canonical_name = str(hits[0]["name"]).strip()
+        if canonical_name.lower() not in seen_names:
             selected_names.append(canonical_name)
             seen_names.add(canonical_name.lower())
         return True
@@ -4768,7 +4938,7 @@ def resolve_selected_targets(selection_resolution, raw_value):
             direct_hits = unique_hits(coord_map.get(raw_key, []))
         if direct_hits:
             if len(direct_hits) > 1:
-                ambiguous[raw_item] = [str(item.get("selection_key") or "").strip() for item in direct_hits]
+                ambiguous[raw_item] = [str(item["selection_key"]).strip() for item in direct_hits]
                 continue
             append_selected_hit(direct_hits[0])
             continue
@@ -4779,7 +4949,7 @@ def resolve_selected_targets(selection_resolution, raw_value):
             unresolved.append(raw_item)
             continue
         if len(alias_hits) > 1:
-            ambiguous[raw_item] = [str(item.get("selection_key") or "").strip() for item in alias_hits]
+            ambiguous[raw_item] = [str(item["selection_key"]).strip() for item in alias_hits]
             continue
         append_selected_hit(alias_hits[0])
     return {
@@ -4879,14 +5049,22 @@ def materialize_step5_all_changed_apis_input(all_changed_apis_path, report_dir, 
             selected_names=selected_names,
         )
         base_path = write_step5_selected_input(filtered_path, base_selection)
-    all_coords = sorted({str((row or {}).get("coord") or "").strip() for row in all_rows if str((row or {}).get("coord") or "").strip()})
-    included_coords = sorted({
-        str((row or {}).get("coord") or "").strip()
-        for row in selection_summary.get("matched_rows") or []
-        if str((row or {}).get("coord") or "").strip()
-    })
-    included_coord_set = set(included_coords)
-    all_coord_set = set(all_coords)
+    all_coord_set = set()
+    for row in all_rows:
+        if not isinstance(row, dict):
+            continue
+        coord = str(row.get("coord") or "").strip()
+        if coord:
+            all_coord_set.add(coord)
+    included_coord_set = set()
+    for row in selection_summary.get("matched_rows") or []:
+        if not isinstance(row, dict):
+            continue
+        coord = str(row.get("coord") or "").strip()
+        if coord:
+            included_coord_set.add(coord)
+    all_coords = sorted(all_coord_set)
+    included_coords = sorted(included_coord_set)
     effective_scope_mode = (
         "partial"
         if has_selection and included_coord_set != all_coord_set
@@ -5017,10 +5195,10 @@ def _expand_coord_path_by_repo(coord, normalized_path, config_key, expand_all_in
         filtered_coords = _filter_inferred_coords_by_hint(inferred_coords, coord, normalized_path)
         if coord and filtered_coords:
             return _dedupe_strings([f"{item}={normalized_path}" for item in filtered_coords])
-        if coord and not filtered_coords:
+        if coord:
             raise StepError(
                 f"当前步骤输入中的 {config_key} 里，coord={coord} 未能在源码仓库中匹配到实际模块坐标：{normalized_path}。"
-                f"仓库内推断出的坐标有：{', '.join(inferred_coords[:10]) or '(无)'}"
+                f"仓库内推断出的坐标有：{', '.join(inferred_coords[:10])}"
             )
         return _dedupe_strings([f"{item}={normalized_path}" for item in inferred_coords])
     if coord and ":" in coord:
@@ -5154,9 +5332,10 @@ def _normalized_pinned_relative_path(value, *, allow_root=True):
 def _pinned_snapshot_matches_context(snapshot, run_context):
     if not isinstance(snapshot, dict):
         return False
+    run_context = dict(run_context or {})
     commit = str(snapshot.get("commit") or "").strip().lower()
     current_commit = str(
-        (run_context or {}).get("current_resolved_commit") or ""
+        run_context.get("current_resolved_commit") or ""
     ).strip().lower()
     if (
         snapshot.get("schema") != PINNED_SOURCE_SNAPSHOT_SCHEMA
@@ -5169,12 +5348,12 @@ def _pinned_snapshot_matches_context(snapshot, run_context):
     )
     if not project_path:
         return False
-    target_module = str((run_context or {}).get("target_module") or "").strip()
+    target_module = str(run_context.get("target_module") or "").strip()
     snapshot_target = str(snapshot.get("target_module") or "").strip()
     if target_module != snapshot_target:
         return False
     profiles = _dedupe_strings(
-        (run_context or {}).get("active_maven_profiles") or []
+        run_context.get("active_maven_profiles") or []
     )
     snapshot_profiles = _dedupe_strings(snapshot.get("active_maven_profiles") or [])
     return profiles == snapshot_profiles
@@ -5308,6 +5487,14 @@ def load_seed_json_arg(raw_value, project_dir):
 
 
 def build_run_context(args, existing, seed_payload, allow_external_seed=True):
+    if existing is not None and not isinstance(existing, dict):
+        raise StepError("已有运行上下文必须是 JSON 对象。")
+    if (
+        allow_external_seed
+        and seed_payload is not None
+        and not isinstance(seed_payload, dict)
+    ):
+        raise StepError("外部运行配置必须是 JSON 对象。")
     previous = dict(existing or {})
     seed_input = dict(seed_payload or {}) if allow_external_seed else {}
     merged = {**seed_input, **previous}
@@ -5315,40 +5502,66 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
     detected_tool = detect_build_tool(project_dir)
     cli_scalar = (lambda value: value) if allow_external_seed else (lambda _value: None)
     cli_list = (lambda value: value) if allow_external_seed else (lambda _value: [])
-    explicit_cli_branches = {
-        side: str(getattr(args, f"{side}_branch", "") or "").strip()
-        for side in ("base", "current")
-        if allow_external_seed
-        and str(getattr(args, f"{side}_branch", "") or "").strip()
-    }
+    explicit_cli_branches = {}
+    if allow_external_seed:
+        for side in ("base", "current"):
+            branch = str(getattr(args, f"{side}_branch", "") or "").strip()
+            if branch:
+                explicit_cli_branches[side] = branch
+    base_artifact_input = resolve_value(
+        cli_scalar(args.base_artifact_path), merged, "base_artifact_path", "",
+    )
+    current_artifact_input = resolve_value(
+        cli_scalar(args.current_artifact_path),
+        merged,
+        "current_artifact_path",
+        "",
+    )
     artifact_input_mode = bool(
-        resolve_value(cli_scalar(args.base_artifact_path), merged, "base_artifact_path", "")
-        or resolve_value(cli_scalar(args.current_artifact_path), merged, "current_artifact_path", "")
+        str(base_artifact_input or "").strip()
+        or str(current_artifact_input or "").strip()
     )
-    manual_coord_overrides = _dedupe_strings(
-        resolve_value(cli_list(getattr(args, "manual_coord_overrides", [])), merged, "manual_coord_overrides", []) or []
+    raw_manual_coord_overrides = resolve_value(
+        cli_list(getattr(args, "manual_coord_overrides", [])),
+        merged,
+        "manual_coord_overrides",
+        [],
     )
+    if isinstance(raw_manual_coord_overrides, str):
+        raw_manual_coord_overrides = [raw_manual_coord_overrides]
+    if not isinstance(raw_manual_coord_overrides, list) or any(
+        not isinstance(item, str) for item in raw_manual_coord_overrides
+    ):
+        raise StepError("manual_coord_overrides 仅支持字符串或字符串列表")
+    manual_coord_overrides = _dedupe_strings([
+        item.strip() for item in raw_manual_coord_overrides if item.strip()
+    ])
     manual_artifact_identities = normalize_manual_artifact_identities(
         resolve_value(None, merged, "manual_artifact_identities", []) or [],
         "manual_artifact_identities",
     ) or []
     allow_unresolved = resolve_value(cli_scalar(getattr(args, "allow_unresolved", None)), merged, "allow_unresolved", False)
     allow_unresolved = parse_bool_like(allow_unresolved, "allow_unresolved")
-    confirmed_unresolved_items = list(resolve_value(None, merged, "confirmed_unresolved_items", []) or [])
+    raw_confirmed_unresolved_items = resolve_value(
+        None, merged, "confirmed_unresolved_items", [],
+    )
+    if not isinstance(raw_confirmed_unresolved_items, list) or any(
+        not isinstance(item, dict) for item in raw_confirmed_unresolved_items
+    ):
+        raise StepError("confirmed_unresolved_items 必须是对象数组。")
+    confirmed_unresolved_items = [
+        dict(item) for item in raw_confirmed_unresolved_items
+    ]
     base_branch_explicit = _has_explicit_string_value(cli_scalar(args.base_branch), seed_input, previous, "base_branch")
     current_branch_explicit = _has_explicit_string_value(cli_scalar(args.current_branch), seed_input, previous, "current_branch")
     base_cli_tool = getattr(args, "base_tool", "")
     current_cli_tool = getattr(args, "current_tool", "")
     tool_explicit = bool(
-        str(cli_scalar(base_cli_tool) or "").strip()
-        or str(cli_scalar(current_cli_tool) or "").strip()
-        or (
-            isinstance(seed_input.get("base_tool"), str)
-            and str(seed_input.get("base_tool") or "").strip()
+        _has_explicit_string_value(
+            cli_scalar(base_cli_tool), seed_input, {}, "base_tool",
         )
-        or (
-            isinstance(seed_input.get("current_tool"), str)
-            and str(seed_input.get("current_tool") or "").strip()
+        or _has_explicit_string_value(
+            cli_scalar(current_cli_tool), seed_input, {}, "current_tool",
         )
         or previous.get("tool_explicit")
     )
@@ -5357,6 +5570,49 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
     # explicitly provided them in a previous confirmed step.
     default_base_branch = ""
     default_current_branch = ""
+    raw_active_maven_profiles = resolve_value(
+        cli_list(getattr(args, "active_maven_profiles", None)),
+        merged,
+        "active_maven_profiles",
+        [],
+    )
+    if not isinstance(raw_active_maven_profiles, list) or any(
+        not isinstance(item, str) for item in raw_active_maven_profiles
+    ):
+        raise StepError("active_maven_profiles 必须是字符串数组。")
+    active_maven_profiles = _dedupe_strings([
+        item.strip() for item in raw_active_maven_profiles if item.strip()
+    ])
+    raw_dependency_source_ref_bindings = resolve_value(
+        None, merged, "dependency_source_ref_bindings", [],
+    )
+    if not isinstance(raw_dependency_source_ref_bindings, list) or any(
+        not isinstance(item, dict)
+        for item in raw_dependency_source_ref_bindings
+    ):
+        raise StepError("dependency_source_ref_bindings 必须是对象数组。")
+    dependency_source_ref_bindings = [
+        dict(item) for item in raw_dependency_source_ref_bindings
+    ]
+    raw_skip_dependency_source_coords = resolve_value(
+        None, merged, "skip_dependency_source_coords", [],
+    )
+    if isinstance(raw_skip_dependency_source_coords, str):
+        raw_skip_dependency_source_coords = [raw_skip_dependency_source_coords]
+    if not isinstance(raw_skip_dependency_source_coords, list) or any(
+        not isinstance(item, str) for item in raw_skip_dependency_source_coords
+    ):
+        raise StepError("skip_dependency_source_coords 必须是字符串数组。")
+    skip_dependency_source_coords = _dedupe_strings([
+        item.strip()
+        for item in raw_skip_dependency_source_coords
+        if item.strip()
+    ])
+    raw_input_origins = merged.get("input_origins")
+    if raw_input_origins is None:
+        raw_input_origins = {}
+    if not isinstance(raw_input_origins, dict):
+        raise StepError("input_origins 必须是 JSON 对象。")
     result = {
         "project_dir": str(project_dir),
         "report_dir": str(Path(args.report_dir).resolve()),
@@ -5423,12 +5679,7 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
             if "current_allow_dirty_local_source" in merged else False
         ),
         "modules": resolve_value(None, merged, "modules", []),
-        "active_maven_profiles": resolve_value(
-            cli_list(getattr(args, "active_maven_profiles", None)),
-            merged,
-            "active_maven_profiles",
-            [],
-        ),
+        "active_maven_profiles": active_maven_profiles,
         "source_dirs": resolve_value(None, merged, "source_dirs"),
         "source_dirs_status": resolve_value(
             None, merged, "source_dirs_status", ""
@@ -5446,18 +5697,8 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
             "dependency_source_mappings",
             [],
         ),
-        "dependency_source_ref_bindings": [
-            dict(item)
-            for item in (resolve_value(
-                None, merged, "dependency_source_ref_bindings", []
-            ) or [])
-            if isinstance(item, dict)
-        ],
-        "skip_dependency_source_coords": _dedupe_strings(
-            resolve_value(
-                None, merged, "skip_dependency_source_coords", []
-            ) or []
-        ),
+        "dependency_source_ref_bindings": dependency_source_ref_bindings,
+        "skip_dependency_source_coords": skip_dependency_source_coords,
         "dependency_repo_mappings": resolve_value(None, merged, "dependency_repo_mappings", []),
         "step5_selected_coords": resolve_value(None, merged, "step5_selected_coords", []),
         "step5_selected_names": resolve_value(None, merged, "step5_selected_names", []),
@@ -5538,7 +5779,7 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
     target_module = str(result.get("target_module") or "").strip()
     result["primary_module"] = target_module
     result["modules"] = [target_module] if target_module else []
-    result["input_origins"] = dict(merged.get("input_origins") or {})
+    result["input_origins"] = dict(raw_input_origins)
     for field, cli_value in (
         ("base_artifact_path", getattr(args, "base_artifact_path", "")),
         ("current_artifact_path", getattr(args, "current_artifact_path", "")),
@@ -5581,8 +5822,15 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
         "binary_pipeline_config",
     ):
         path_value = result.get(path_key)
-        if isinstance(path_value, str) and path_value.strip():
-            result[path_key] = absolutize_path(path_value.strip(), project_dir)
+        if path_value in (None, ""):
+            continue
+        if not isinstance(path_value, str):
+            raise StepError(f"{path_key} 必须是字符串路径。")
+        normalized_path_value = path_value.strip()
+        if not normalized_path_value:
+            result[path_key] = ""
+            continue
+        result[path_key] = absolutize_path(normalized_path_value, project_dir)
     application_source = str(result.get("application_source") or "").strip()
     remembered_application_repo = str(
         result.get("application_source_repo_path") or ""
@@ -5693,9 +5941,6 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
     )
     modules_value = normalize_modules_value(result.get("modules")) or []
     result["modules"] = modules_value
-    result["active_maven_profiles"] = _dedupe_strings(
-        result.get("active_maven_profiles") or []
-    )
     if result.get("target_module"):
         result["primary_module"] = result["target_module"]
         result["modules"] = [result["target_module"]]
@@ -5736,8 +5981,6 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
     source_plan_input_dirs = list(dependency_source_dirs)
     for item in list(result.get("dependency_repo_mappings") or []):
         coord_hint, repo_path = _split_dependency_repo_mapping_value(item)
-        if not repo_path:
-            continue
         if coord_hint and ":" in coord_hint:
             continue
         source_plan_input_dirs.append(repo_path)
@@ -5753,8 +5996,6 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
         resolved_existing_repo_mappings = []
         for item in list(result.get("dependency_repo_mappings") or []):
             coord_hint, repo_path = _split_dependency_repo_mapping_value(item)
-            if not repo_path:
-                continue
             if coord_hint and ":" in coord_hint:
                 resolved_existing_repo_mappings.append(f"{coord_hint}={repo_path}")
                 continue
@@ -5777,7 +6018,7 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
         current_mapping_map = {}
         for item in list(result.get("dependency_repo_mappings") or []):
             coord, repo_path = _split_dependency_repo_mapping_value(item)
-            if coord and repo_path and coord not in current_mapping_map:
+            if coord not in current_mapping_map:
                 current_mapping_map[coord] = repo_path
         result["unmapped_dependency_coords"] = [
             coord for coord in focus_dependency_coords if coord not in current_mapping_map
@@ -5786,20 +6027,48 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
     binary_config_dependency_source = False
     binary_config_path = str(result.get("binary_pipeline_config") or "").strip()
     if binary_config_path and Path(binary_config_path).is_file():
-        binary_config = read_json(binary_config_path) or {}
-        source_sets = list(
-            (binary_config.get("source_overlay") or {}).get("source_sets") or []
-        )
+        try:
+            binary_config = read_json(binary_config_path)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise StepError(f"binary_pipeline_config 无法读取：{exc}") from exc
+        if not isinstance(binary_config, dict):
+            raise StepError("binary_pipeline_config 顶层必须是 JSON 对象。")
+        source_overlay = binary_config.get("source_overlay")
+        if source_overlay is None:
+            source_overlay = {}
+        if not isinstance(source_overlay, dict):
+            raise StepError("binary_pipeline_config.source_overlay 必须是 JSON 对象。")
+        source_sets = source_overlay.get("source_sets")
+        if source_sets is None:
+            source_sets = []
+        if not isinstance(source_sets, list) or any(
+            not isinstance(source_set, dict) for source_set in source_sets
+        ):
+            raise StepError(
+                "binary_pipeline_config.source_overlay.source_sets 必须是对象数组。"
+            )
+        for source_set in source_sets:
+            owner_type = str(source_set.get("owner_type") or "").strip()
+            raw_source_dirs = source_set.get("source_dirs")
+            if raw_source_dirs is None:
+                raw_source_dirs = []
+            if not isinstance(raw_source_dirs, list) or any(
+                not isinstance(source_dir, str) for source_dir in raw_source_dirs
+            ):
+                raise StepError(
+                    "binary_pipeline_config.source_overlay.source_sets[].source_dirs "
+                    "必须是字符串数组。"
+                )
+            if owner_type == "business":
+                binary_config_business_dirs.extend(
+                    source_dir.strip()
+                    for source_dir in raw_source_dirs
+                    if source_dir.strip()
+                )
+            elif owner_type == "dependency":
+                binary_config_dependency_source = True
         binary_config_business_dirs = _dedupe_strings(
-            str(source_dir)
-            for source_set in source_sets
-            if str((source_set or {}).get("owner_type") or "") == "business"
-            for source_dir in ((source_set or {}).get("source_dirs") or [])
-            if str(source_dir or "").strip()
-        )
-        binary_config_dependency_source = any(
-            str((source_set or {}).get("owner_type") or "") == "dependency"
-            for source_set in source_sets
+            binary_config_business_dirs
         )
     if binary_config_business_dirs or binary_config_dependency_source:
         result["source_overlay_config_provided"] = True
@@ -6048,13 +6317,36 @@ def detect_artifact_application_version(artifact_path):
 def _jdk_major_from_home(jdk_home):
     home = Path(str(jdk_home or "")).expanduser()
     release_file = home / "release"
-    if not release_file.is_file():
-        return ""
-    try:
-        content = release_file.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return ""
-    match = re.search(r'^JAVA_VERSION="?([^"\r\n]+)', content, re.MULTILINE)
+    if release_file.is_file():
+        try:
+            content = release_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+        match = re.search(
+            r'^JAVA_VERSION="?([^"\r\n]+)', content, re.MULTILINE
+        )
+    else:
+        java = next(
+            (
+                home / "bin" / name
+                for name in ("java", "java.exe")
+                if (home / "bin" / name).is_file()
+            ),
+            None,
+        )
+        if java is None:
+            return ""
+        stdout, stderr, rc = run_cmd(
+            [str(java), "-XshowSettings:properties", "-version"], timeout=15,
+        )
+        if rc != 0:
+            return ""
+        output = "\n".join((str(stdout or ""), str(stderr or "")))
+        match = re.search(
+            r"^\s*java\.version\s*=\s*([^\s]+)\s*$", output, re.MULTILINE
+        ) or re.search(
+            r'\b(?:openjdk|java) version "([^"]+)"', output
+        )
     if not match:
         return ""
     raw = match.group(1).strip()
@@ -6088,7 +6380,6 @@ def _java_home_from_executable(java_executable):
     parent = candidate.parent
     if (
         candidate.name.lower() == "jre"
-        and (parent / "release").is_file()
         and any(
             (parent / "bin" / name).is_file()
             for name in ("javac", "javac.exe")
@@ -6137,7 +6428,11 @@ def discover_jdk_homes():
             continue
         seen.add(identity)
         major = _jdk_major_from_home(resolved)
-        if major and (resolved / "bin" / ("java.exe" if os.name == "nt" else "java")).exists():
+        java_available = any(
+            (resolved / "bin" / name).exists()
+            for name in ("java", "java.exe")
+        )
+        if major and java_available:
             by_major.setdefault(major, str(resolved))
     return by_major
 
@@ -6209,7 +6504,7 @@ def _response_payload_example(action_id, required_fields, properties, overrides=
             if field in required_fields:
                 if field in ("source_dirs", "dependency_source_dirs"):
                     payload[field] = [f"<{field} 值>"]
-                elif field not in payload:
+                else:
                     payload[field] = f"<{field} 值>"
         if "selected_targets" in required_fields:
             payload["selected_targets"] = ["<依赖包完整坐标>"]
@@ -6591,15 +6886,9 @@ def _relative_path_inside(root, path, *, label):
             f"{label} 必须位于固定源码项目目录内：{path}（项目目录：{root}）",
             reason_codes=["PINNED_SOURCE_PATH_OUTSIDE_PROJECT"],
         ) from exc
-    normalized = _normalized_pinned_relative_path(
+    return _normalized_pinned_relative_path(
         relative.as_posix(), allow_root=True,
     )
-    if not normalized:
-        raise StepError(
-            f"{label} 无法转换为安全的项目相对路径：{path}",
-            reason_codes=["PINNED_SOURCE_PATH_INVALID"],
-        )
-    return normalized
 
 
 def _logicalize_project_scope_paths(scope, snapshot_project_root):
@@ -6670,7 +6959,7 @@ def materialize_pinned_source_workspace(
         )
     repo_dir = _step1_ref_repository(run_context, "current", project_dir)
     git_root = _pinned_source_git_root(repo_dir)
-    commit = str(snapshot.get("commit") or "").strip().lower()
+    commit = str(snapshot["commit"]).strip().lower()
     project_path = _normalized_pinned_relative_path(
         snapshot.get("project_path"), allow_root=True,
     )
@@ -6760,23 +7049,52 @@ def materialize_pinned_source_workspace(
 def materialize_pinned_dependency_source_workspaces(run_context, report_dir):
     """Expose only dependency source trees fixed to the selected current SHA."""
     updated = dict(run_context or {})
-    bindings = [
-        dict(item)
-        for item in (updated.get("dependency_source_ref_bindings") or [])
-        if str((item or {}).get("coord") or "").strip()
-    ]
-    skipped = set(updated.get("skip_dependency_source_coords") or [])
+    failures = []
+    bindings = []
+    for index, raw_binding in enumerate(
+        updated.get("dependency_source_ref_bindings") or []
+    ):
+        if not raw_binding:
+            continue
+        if not isinstance(raw_binding, dict):
+            failures.append({
+                "status": "dependency_source_ref_binding_invalid",
+                "binding_index": index,
+                "value_type": type(raw_binding).__name__,
+            })
+            continue
+        coord = str(raw_binding.get("coord") or "").strip()
+        if not coord:
+            continue
+        binding = dict(raw_binding)
+        binding["coord"] = coord
+        bindings.append(binding)
+    raw_skipped = updated.get("skip_dependency_source_coords") or []
+    if isinstance(raw_skipped, str):
+        raw_skipped = [raw_skipped]
+    elif not isinstance(raw_skipped, (list, tuple, set)):
+        raw_skipped = []
+    skipped = {
+        value
+        for item in raw_skipped
+        if (value := str(item or "").strip())
+    }
     worktrees = {}
     snapshots = []
-    failures = []
     pinned_source_mappings = []
     pinned_repo_mappings = []
-    clone_timeout = int(updated.get("dependency_source_clone_timeout") or 300)
+    clone_timeout_value = updated.get("dependency_source_clone_timeout", 300)
+    if clone_timeout_value in (None, ""):
+        clone_timeout_value = 300
+    clone_timeout = parse_positive_int_like(
+        clone_timeout_value,
+        "dependency_source_clone_timeout",
+    )
 
     try:
-        for binding in sorted(bindings, key=lambda item: str(item.get("coord") or "")):
-            coord = str(binding.get("coord") or "").strip()
-            if not coord or coord in skipped:
+        for binding in sorted(bindings, key=lambda item: item["coord"]):
+            coord = binding["coord"]
+            if coord in skipped:
                 continue
             commit = str(binding.get("current_commit") or "").strip().lower()
             repo_path = str(binding.get("repo_path") or "").strip()
@@ -6809,8 +7127,17 @@ def materialize_pinned_dependency_source_workspaces(run_context, report_dir):
                 expected_commit=commit,
                 timeout=clone_timeout,
             )
+            if not isinstance(materialized, dict):
+                failures.append({
+                    "coord": coord,
+                    "status": "dependency_source_materialization_invalid",
+                    "repo_path": str(git_root),
+                    "value_type": type(materialized).__name__,
+                })
+                continue
             if materialized.get("status") != "remote_source_resolved":
-                failure = dict(materialized.get("failure") or {})
+                raw_failure = materialized.get("failure")
+                failure = dict(raw_failure) if isinstance(raw_failure, dict) else {}
                 failures.append({
                     "coord": coord,
                     "status": str(materialized.get("status") or "remote_fetch_failed"),
@@ -6843,14 +7170,17 @@ def materialize_pinned_dependency_source_workspaces(run_context, report_dir):
 
             mapped_dirs = []
             logical_dirs = []
+            resolved_git_root = Path(git_root).resolve()
+            resolved_worktree = Path(worktree).resolve()
             for source_dir in binding.get("source_dirs") or []:
                 try:
                     relative = Path(str(source_dir)).expanduser().resolve().relative_to(
-                        git_root
+                        resolved_git_root
                     )
+                    mapped = (resolved_worktree / relative).resolve()
+                    mapped.relative_to(resolved_worktree)
                 except (OSError, ValueError):
                     continue
-                mapped = (worktree / relative).resolve()
                 if mapped.is_dir():
                     mapped_dirs.append(str(mapped))
                     logical_dirs.append(relative.as_posix())
@@ -6858,18 +7188,25 @@ def materialize_pinned_dependency_source_workspaces(run_context, report_dir):
                 for module_root in binding.get("module_roots") or []:
                     try:
                         relative = Path(str(module_root)).expanduser().resolve().relative_to(
-                            git_root
+                            resolved_git_root
                         )
+                        mapped_module = (resolved_worktree / relative).resolve()
+                        mapped_module.relative_to(resolved_worktree)
                     except (OSError, ValueError):
                         continue
-                    mapped_module = (worktree / relative).resolve()
                     if not mapped_module.is_dir():
                         continue
                     source_plan = _resolve_source_dirs_plan(mapped_module)
                     for source_dir in source_plan.get("source_dirs") or []:
                         mapped = Path(source_dir).resolve()
+                        try:
+                            logical = mapped.relative_to(resolved_worktree)
+                        except (OSError, ValueError):
+                            continue
+                        if not mapped.is_dir():
+                            continue
                         mapped_dirs.append(str(mapped))
-                        logical_dirs.append(mapped.relative_to(worktree).as_posix())
+                        logical_dirs.append(logical.as_posix())
             mapped_dirs = _dedupe_strings(mapped_dirs)
             if not mapped_dirs:
                 failures.append({
@@ -7091,15 +7428,6 @@ def _step1_ref_request(
     artifact_path="",
 ):
     candidates = [dict(item) for item in (resolution.get("candidates") or [])]
-    for candidate in candidates:
-        payload = {
-            "side": side,
-            "ref": str(candidate.get("ref") or ""),
-            "commit": str(candidate.get("commit") or ""),
-        }
-        candidate["selection_key"] = "s1ref:" + hashlib.sha256(
-            json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
-        ).hexdigest()[:16]
     request = {
         "side": side,
         "field": field,
@@ -7136,11 +7464,9 @@ def _step1_ref_request(
             }],
         })
     for candidate in request.get("candidates") or []:
-        if candidate.get("selection_key"):
-            continue
         payload = {
             "side": side,
-            "ref": str(candidate.get("ref") or candidate.get("display_ref") or ""),
+            "ref": str(candidate.get("ref") or ""),
             "commit": str(candidate.get("commit") or ""),
         }
         candidate["selection_key"] = "s1ref:" + hashlib.sha256(
@@ -7152,10 +7478,10 @@ def _step1_ref_request(
 def build_step1_ref_confirmation_interaction(run_context, requests):
     requests = [dict(item) for item in (requests or [])]
     required_fields = [
-        str(item.get("field") or "").strip()
+        field
         for item in requests
         if item.get("status") != "fetch_failed"
-        if str(item.get("field") or "").strip()
+        if (field := str(item.get("field") or "").strip())
     ]
     reason_codes = {
         "source_only" if item.get("status") == "confirmation_required" else item.get("status")
@@ -7274,7 +7600,7 @@ def build_step1_ref_confirmation_interaction(run_context, requests):
             )
         if request.get("configured_remotes"):
             checklist_lines.append(
-                f"{side_cn}已配置 remote: {', '.join(request.get('configured_remotes') or [])}"
+                f"{side_cn}已配置 remote: {', '.join(request['configured_remotes'])}"
             )
         if request.get("query_mode"):
             checklist_lines.append(
@@ -7473,7 +7799,7 @@ def resolve_step1_refs_for_execution(
                     updated[f"{side}_ref_binding"] = durable_binding
                 elif resolution.get("expected_commit"):
                     updated[f"{side}_expected_commit"] = str(
-                        resolution.get("expected_commit") or ""
+                        resolution["expected_commit"]
                     )
                 if on_side_resolved is not None:
                     on_side_resolved(dict(updated), side, dict(resolution))
@@ -7939,11 +8265,12 @@ def build_step1_dependency_source_interaction(run_context, report_dir):
         run_context, report_dir,
     )
     skipped = set(run_context.get("skip_dependency_source_coords") or [])
-    confirmed = {
-        str((item or {}).get("coord") or "").strip(): dict(item)
-        for item in (run_context.get("dependency_source_ref_bindings") or [])
-        if str((item or {}).get("coord") or "").strip()
-    }
+    confirmed = {}
+    for raw_item in run_context.get("dependency_source_ref_bindings") or []:
+        item = dict(raw_item or {})
+        coord = str(item.get("coord") or "").strip()
+        if coord:
+            confirmed[coord] = item
     resolved_bindings = []
     ambiguity_items = []
     version_match_cache = {}
@@ -8003,12 +8330,13 @@ def build_step1_dependency_source_interaction(run_context, report_dir):
         elif candidates:
             resolved_bindings.append(candidates[0])
 
+    bindings_by_coord = {}
+    for item in resolved_bindings:
+        coord = str(item.get("coord") or "").strip()
+        if coord:
+            bindings_by_coord[coord] = dict(item)
     run_context["dependency_source_ref_bindings"] = list(
-        {
-            str(item.get("coord") or ""): dict(item)
-            for item in resolved_bindings
-            if str(item.get("coord") or "").strip()
-        }.values()
+        bindings_by_coord.values()
     )
     run_context["dependency_source_unmatched_coords"] = list(
         plan.get("unmatched_relevant_coords") or []
@@ -8071,14 +8399,16 @@ def build_step0_confirmation_interaction(run_context, ref_interaction=None):
 
     def require(field, label, side=""):
         if ctx.get(field) not in (None, "", [], {}):
-            return
-        missing_inputs.append({
+            return None
+        missing_input = {
             "field": field,
             "label": label,
             "side": side,
             "required": True,
             "reason": "正式分析前必须在本次确认中补齐。",
-        })
+        }
+        missing_inputs.append(missing_input)
+        return missing_input
 
     if mode == "artifact_inputs":
         require("base_artifact_path", "Base 最终制品", "base")
@@ -8086,7 +8416,7 @@ def build_step0_confirmation_interaction(run_context, ref_interaction=None):
     require("application_source", "应用源码")
     require("base_branch", "Base 版本分支", "base")
     require("current_branch", "Current 版本分支", "current")
-    require("target_module", "目标模块")
+    target_missing_input = require("target_module", "目标模块")
     require("base_tool", "Base 构建工具", "base")
     require("current_tool", "Current 构建工具", "current")
     require("base_jdk_home", "Base JDK 目录", "base")
@@ -8141,10 +8471,7 @@ def build_step0_confirmation_interaction(run_context, ref_interaction=None):
             else ""
         )
         target_cell = f"请提供（候选：{preview}{suffix}）"
-        for item in missing_inputs:
-            if item.get("field") == "target_module":
-                item["candidates"] = module_candidates
-                break
+        target_missing_input["candidates"] = module_candidates
     rows = [
         {
             "label": "最终制品",
@@ -8526,6 +8853,11 @@ def _preflight_explicit_binary_config(run_context, project_dir):
             f"Step0 无法读取显式 binary pipeline 配置：{config_path}（{error}）",
             reason_codes=["STEP0_BINARY_CONFIG_INVALID"],
         ) from error
+    if not isinstance(config, dict):
+        raise StepError(
+            "Step0 显式 binary pipeline 配置必须是 JSON 对象。",
+            reason_codes=["STEP0_BINARY_CONFIG_INVALID"],
+        )
     if config.get("schema") != "java-upgrade-analyzer.binary-pipeline-input.v1":
         raise StepError(
             "Step0 显式 binary pipeline 配置 schema 不受支持："
@@ -8534,38 +8866,81 @@ def _preflight_explicit_binary_config(run_context, project_dir):
         )
     artifact_records = []
     for side_name in ("base", "current"):
-        side = dict(config.get(side_name) or {})
-        configured_home = Path(
-            str(side.get("jdk_home") or "")
-        ).expanduser().resolve()
-        selected_home = Path(
-            str(run_context.get(f"{side_name}_jdk_home") or "")
-        ).expanduser().resolve()
+        raw_side = config.get(side_name)
+        if not isinstance(raw_side, dict):
+            raise StepError(
+                f"Step0 显式 binary 配置 {side_name} 必须是 JSON 对象。",
+                reason_codes=["STEP0_BINARY_CONFIG_INVALID"],
+            )
+        side = dict(raw_side)
+        configured_home_value = str(side.get("jdk_home") or "").strip()
+        if not configured_home_value:
+            raise StepError(
+                f"Step0 显式 binary 配置 {side_name}.jdk_home 不能为空。",
+                reason_codes=["STEP0_BINARY_CONFIG_INVALID"],
+            )
+        selected_home_value = str(
+            run_context.get(f"{side_name}_jdk_home") or ""
+        ).strip()
+        if not selected_home_value:
+            raise StepError(
+                f"Step0 未选择 {side_name} JDK，无法核对显式 binary 配置。",
+                reason_codes=["STEP0_BINARY_CONFIG_JDK_MISMATCH"],
+            )
+        configured_home = Path(configured_home_value).expanduser().resolve()
+        selected_home = Path(selected_home_value).expanduser().resolve()
         if configured_home != selected_home:
             raise StepError(
                 f"Step0 {side_name} JDK 与显式 binary 配置不一致："
                 f"selected={selected_home}; configured={configured_home}",
                 reason_codes=["STEP0_BINARY_CONFIG_JDK_MISMATCH"],
             )
+        raw_artifacts = side.get("artifacts")
+        if not isinstance(raw_artifacts, list):
+            raise StepError(
+                f"Step0 显式 binary 配置 {side_name}.artifacts 必须是数组。",
+                reason_codes=["STEP0_BINARY_CONFIG_INVALID"],
+            )
         slots = set()
-        for artifact in side.get("artifacts") or ():
-            artifact_path = Path(str((artifact or {}).get("path") or "")).expanduser()
+        for artifact in raw_artifacts:
+            if not isinstance(artifact, dict):
+                raise StepError(
+                    f"Step0 显式 binary 配置 {side_name}.artifacts 的成员必须是对象。",
+                    reason_codes=["STEP0_BINARY_CONFIG_INVALID"],
+                )
+            artifact_path_value = str(artifact.get("path") or "").strip()
+            if not artifact_path_value:
+                raise StepError(
+                    f"Step0 显式 binary 配置 {side_name}.artifacts.path 不能为空。",
+                    reason_codes=["STEP0_BINARY_CONFIG_INVALID"],
+                )
+            artifact_path = Path(artifact_path_value).expanduser()
             if not artifact_path.is_absolute():
                 artifact_path = Path(project_dir) / artifact_path
             artifact_record = _preflight_artifact_input(
                 artifact_path.resolve(), side=side_name,
             )
-            expected = str((artifact or {}).get("content_sha256") or "").lower()
+            expected = str(artifact.get("content_sha256") or "").lower()
             if expected and expected != artifact_record["sha256"]:
                 raise StepError(
                     f"Step0 {side_name} 显式 binary 制品摘要不一致："
                     f"{artifact_path}",
                     reason_codes=["STEP0_BINARY_CONFIG_ARTIFACT_DIGEST_MISMATCH"],
                 )
-            slot_key = (
-                str((artifact or {}).get("loader_realm") or ""),
-                (artifact or {}).get("slot"),
-            )
+            loader_realm = str(artifact.get("loader_realm") or "").strip()
+            slot = artifact.get("slot")
+            if (
+                not loader_realm
+                or isinstance(slot, bool)
+                or not isinstance(slot, int)
+                or slot < 0
+            ):
+                raise StepError(
+                    f"Step0 {side_name} 显式 binary 配置运行时槽位无效："
+                    f"loader_realm={loader_realm!r}; slot={slot!r}",
+                    reason_codes=["STEP0_BINARY_CONFIG_INVALID"],
+                )
+            slot_key = (loader_realm, slot)
             if slot_key in slots:
                 raise StepError(
                     f"Step0 {side_name} 显式 binary 配置存在重复运行时槽位："
@@ -8574,7 +8949,13 @@ def _preflight_explicit_binary_config(run_context, project_dir):
                 )
             slots.add(slot_key)
             artifact_records.append({"side": side_name, **artifact_record})
-    policy = dict(config.get("tool_execution_policy") or {})
+    raw_policy = config.get("tool_execution_policy")
+    if raw_policy is not None and not isinstance(raw_policy, dict):
+        raise StepError(
+            "Step0 显式 binary 工具策略必须是 JSON 对象。",
+            reason_codes=["STEP0_BINARY_CONFIG_TOOL_POLICY_INVALID"],
+        )
+    policy = dict(raw_policy or {})
     unknown_policy = set(policy) - {
         "oracle_compile_timeout_seconds",
         "oracle_runtime_timeout_seconds",
@@ -8842,7 +9223,9 @@ def validate_step0_context(run_context):
         home = str(run_context.get(f"{side}_jdk_home") or "").strip()
         observed_major = _jdk_major_from_home(home)
         if not observed_major:
-            raise StepError(f"{side} JDK 目录无效或缺少 release 文件：{home}")
+            raise StepError(
+                f"{side} JDK 目录无效，无法从 release 或 java 运行时识别版本：{home}"
+            )
         home_path = Path(home)
         missing_executables = [
             name
@@ -9022,10 +9405,10 @@ def apply_interaction_protocol_enhancements(interaction, step_id, project_dir=No
     properties = dict(response_schema.get("properties") or {})
     if step_id in {"step0", "step1"} and payload.get("ref_resolution_requests"):
         requests = [
-            dict(item) for item in (payload.get("ref_resolution_requests") or [])
+            dict(item) for item in payload.get("ref_resolution_requests")
             if isinstance(item, dict)
         ]
-        for request in payload.get("ref_resolution_requests") or []:
+        for request in requests:
             side = str(request.get("side") or "").strip()
             if side not in {"base", "current"}:
                 continue
@@ -9041,7 +9424,7 @@ def apply_interaction_protocol_enhancements(interaction, step_id, project_dir=No
                 },
             )
         artifact_triggered_sides = [
-            str(item.get("side") or "").strip()
+            str(item.get("side")).strip()
             for item in requests
             if str(item.get("side") or "").strip() in {"base", "current"}
             and (
@@ -9087,7 +9470,7 @@ def apply_interaction_protocol_enhancements(interaction, step_id, project_dir=No
                 payload["question"] = f"{question}{scope_note}"
             decision_items = []
             request_by_side = {
-                str(item.get("side") or "").strip(): item
+                str(item.get("side")).strip(): item
                 for item in requests
                 if str(item.get("side") or "").strip()
             }
@@ -9203,12 +9586,11 @@ def apply_interaction_protocol_enhancements(interaction, step_id, project_dir=No
     for list_key in ("rules", "do_not"):
         merged_items = []
         for item in list(existing_normalization.get(list_key) or []) + list(
-            rebuilt_normalization.get(list_key) or []
+            rebuilt_normalization[list_key]
         ):
             if item not in merged_items:
                 merged_items.append(item)
-        if merged_items:
-            rebuilt_normalization[list_key] = merged_items
+        rebuilt_normalization[list_key] = merged_items
     for key, value in existing_normalization.items():
         if key not in rebuilt_normalization:
             rebuilt_normalization[key] = value
@@ -9340,38 +9722,44 @@ def _decision_card_reply_examples(interaction, selection_options, options):
         field = str((item or {}).get("field") or "").strip()
         if field:
             fields.add(field)
-    required_fields = {
-        str(field or "").strip()
-        for field in (interaction.get("required_fields") or [])
-        if str(field or "").strip() and str(field or "").strip() != "action"
-    }
+    required_fields = set()
+    for raw_field in interaction.get("required_fields") or []:
+        field = str(raw_field or "").strip()
+        if field and field != "action":
+            required_fields.add(field)
     continue_requirements = dict(
         ((interaction.get("action_requirements") or {}).get("continue") or {})
     )
-    required_fields.update(
-        str(field or "").strip()
-        for field in (continue_requirements.get("required_fields") or [])
-        if str(field or "").strip() and str(field or "").strip() != "action"
-    )
+    for raw_field in continue_requirements.get("required_fields") or []:
+        field = str(raw_field or "").strip()
+        if field and field != "action":
+            required_fields.add(field)
     examples = []
-    option_ids = {str((item or {}).get("id") or "").strip() for item in options}
+    option_ids = set()
+    for item in options:
+        option_ids.add(str((item or {}).get("id") or "").strip())
     source_ref_items = list(interaction.get("source_ref_decision_items") or [])
     if source_ref_items:
-        choices = [
-            f"{'基准侧' if item.get('side') == 'base' else '当前侧'}选方案 1"
-            for item in source_ref_items
-            if item.get("status") != "fetch_failed" and item.get("candidates")
-        ]
+        choices = []
+        for item in source_ref_items:
+            if (
+                item.get("status") != "fetch_failed"
+                and item.get("candidates")
+            ):
+                side_label = "基准侧" if item.get("side") == "base" else "当前侧"
+                choices.append(f"{side_label}选方案 1")
         if choices:
             examples.append("；".join(choices) + "，确认后继续")
         if any(item.get("status") == "fetch_failed" for item in source_ref_items):
             examples.append("网络已恢复，重试 fetch")
     elif selection_options:
-        visible_targets = [
-            str(item.get("coord") or item.get("name") or "").strip()
-            for item in selection_options[:2]
-            if str(item.get("coord") or item.get("name") or "").strip()
-        ]
+        visible_targets = []
+        for item in selection_options[:2]:
+            visible_target = str(
+                item.get("coord") or item.get("name") or ""
+            ).strip()
+            if visible_target:
+                visible_targets.append(visible_target)
         examples.append("全量分析")
         if visible_targets:
             examples.append("只分析 " + " 和 ".join(visible_targets))
@@ -9393,11 +9781,7 @@ def _decision_card_reply_examples(interaction, selection_options, options):
     if "restart_from_step" in option_ids:
         examples.append("从升级上下文重新分析")
 
-    unique = []
-    for item in examples:
-        if item and item not in unique:
-            unique.append(item)
-    return unique[:5]
+    return examples[:5]
 
 
 def build_user_decision_card(interaction):
@@ -9437,11 +9821,11 @@ def build_user_decision_card(interaction):
             for item in source_ref_decision_items:
                 side_label = "Base" if item.get("side") == "base" else "Current"
                 for index, candidate in enumerate((item.get("candidates") or [])[:6], start=1):
-                    aliases = [
-                        str(alias.get("ref") or "")
-                        for alias in (candidate.get("aliases") or [])
-                        if str(alias.get("ref") or "").strip()
-                    ]
+                    aliases = []
+                    for alias in candidate.get("aliases") or []:
+                        alias_ref = str(alias.get("ref") or "")
+                        if alias_ref.strip():
+                            aliases.append(alias_ref)
                     alias_text = f"；别名：{'、'.join(aliases)}" if aliases else ""
                     lines.append(
                         f"- {side_label} 方案 {index}：`{candidate.get('ref') or '-'}` "
@@ -9694,11 +10078,13 @@ def build_user_decision_card(interaction):
         else:
             lines.append("- 当前没有可展示的影响复核优先项。")
         displayed_candidates = recommended_options[:10]
-        visible_targets = [
-            str(item.get("coord") or item.get("name") or "").strip()
-            for item in displayed_candidates[:2]
-            if str(item.get("coord") or item.get("name") or "").strip()
-        ]
+        visible_targets = []
+        for item in displayed_candidates[:2]:
+            visible_target = str(
+                item.get("coord") or item.get("name") or ""
+            ).strip()
+            if visible_target:
+                visible_targets.append(visible_target)
         if visible_targets:
             lines.append(
                 "- 直接回复依赖名称或完整坐标，例如：只分析 "
@@ -9719,20 +10105,14 @@ def build_user_decision_card(interaction):
             )
 
     if options:
-        primary_options = [
-            option for option in options
-            if (
-                str(option.get("id") or "").strip() != "restart_from_step"
-                and not (
-                    selection_options
-                    and str(option.get("id") or "").strip() == "continue"
-                )
-            )
-        ]
-        advanced_options = [
-            option for option in options
-            if str(option.get("id") or "").strip() == "restart_from_step"
-        ]
+        primary_options = []
+        advanced_options = []
+        for option in options:
+            option_id = str(option.get("id") or "").strip()
+            if option_id == "restart_from_step":
+                advanced_options.append(option)
+            elif not (selection_options and option_id == "continue"):
+                primary_options.append(option)
         if primary_options:
             lines.append("你可以选择：")
         for option in primary_options:
@@ -9762,15 +10142,16 @@ def build_user_decision_card(interaction):
             else:
                 lines.append(f"- `{path}`")
 
-    checklist_lines = [
-        (
-            str(item or "").strip()
+    checklist_lines = []
+    for item in interaction.get("checklist_lines") or []:
+        raw_checklist_line = str(item or "").strip()
+        if not raw_checklist_line:
+            continue
+        checklist_lines.append(
+            raw_checklist_line
             if informational
             else _humanize_interaction_text(item).strip()
         )
-        for item in (interaction.get("checklist_lines") or [])
-        if str(item or "").strip()
-    ]
     if checklist_lines:
         lines.append("结果摘要：" if informational else "复核提示：")
         for item in checklist_lines[:12 if informational else 8]:
@@ -9811,10 +10192,16 @@ def augment_interaction_meta_with_restart_option(step_id, interaction_meta):
     response_schema = dict(base.get("response_schema") or {})
     properties = dict(response_schema.get("properties") or {})
     action_prop = dict(properties.get("action") or {})
-    enums = [str(v) for v in (action_prop.get("enum") or []) if str(v).strip()]
-    if "restart_from_step" not in enums:
-        enums.append("restart_from_step")
+    enums = []
+    for value in list(action_prop.get("enum") or []) + [
+        item.get("id") for item in options
+    ]:
+        normalized = str(value or "").strip()
+        if normalized and normalized not in enums:
+            enums.append(normalized)
+    action_prop.setdefault("type", "string")
     action_prop["enum"] = enums
+    action_prop.setdefault("description", "必须与 options.id 之一完全一致。")
     properties["action"] = action_prop
     properties.setdefault(
         "restart_step_id",
@@ -10210,22 +10597,7 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
                     f"{item.get('api') or item.get('api_name') or '未知 API'} | "
                     f"{item.get('user_reason') or item.get('reason') or '当前静态范围未发现路径，不表示安全'}"
                 )
-    option_values = [item.get("id") for item in (interaction_meta.get("options", []) or []) if item.get("id")]
-    response_schema = interaction_meta.get("response_schema") or {
-        "type": "object",
-        "required": ["action"],
-        "properties": {
-            "action": {
-                "type": "string",
-                "enum": option_values,
-                "description": "必须与 options.id 之一完全一致。",
-            },
-            "notes": {
-                "type": "string",
-                "description": "可选。用于补充用户确认意见、风险说明或后续处理建议。",
-            },
-        },
-    }
+    response_schema = dict(interaction_meta["response_schema"])
     properties = response_schema.setdefault("properties", {})
     if step_id == "step4":
         properties.setdefault(
@@ -10251,14 +10623,14 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
         )
     required_fields = interaction_meta.get("required_fields", []) or []
     resume_examples = build_resume_command_examples(
-        interaction_meta.get("options", []) or [],
+        interaction_meta["options"],
         required_fields,
         properties,
         project_dir,
         report_dir,
     )
     input_normalization = build_input_normalization_contract(
-        interaction_meta.get("options", []) or [],
+        interaction_meta["options"],
         required_fields,
         properties,
     )
@@ -10291,9 +10663,9 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
     if interaction_meta.get("fallback_inputs"):
         payload["fallback_inputs"] = list(interaction_meta["fallback_inputs"])
     if interaction_meta.get("scope_preview"):
-        payload["scope_preview"] = dict(interaction_meta.get("scope_preview") or {})
+        payload["scope_preview"] = dict(interaction_meta["scope_preview"])
     if interaction_meta.get("selection_options"):
-        payload["selection_options"] = list(interaction_meta.get("selection_options") or [])
+        payload["selection_options"] = list(interaction_meta["selection_options"])
     if interaction_meta.get("recommended_selection_options") is not None:
         payload["recommended_selection_options"] = list(
             interaction_meta.get("recommended_selection_options") or []
@@ -10302,7 +10674,7 @@ def build_interaction_payload(step_id, report_dir, manifest_steps, project_dir, 
             interaction_meta.get("recommended_candidate_count") or 0
         )
     if interaction_meta.get("selection_resolution"):
-        payload["selection_resolution"] = dict(interaction_meta.get("selection_resolution") or {})
+        payload["selection_resolution"] = dict(interaction_meta["selection_resolution"])
     if step_id == "step5" and not payload.get("selection_resolution"):
         selection_resolution = build_report_dir_step5_selection_resolution(report_dir)
         if selection_resolution.get("enabled"):
@@ -10326,8 +10698,15 @@ def default_interaction_action(interaction):
     options = option_ids(interaction)
     if "continue" in options:
         return "continue"
-    if options:
-        return options[0]
+    # ``interaction_option_ids`` intentionally returns a set for membership
+    # checks.  Default selection, however, must preserve the order presented
+    # on the decision card and cannot index that set.
+    for item in (interaction or {}).get("options", []) or []:
+        option_id = str(
+            (item if isinstance(item, dict) else {}).get("id") or ""
+        ).strip()
+        if option_id:
+            return option_id
     return "continue"
 
 
@@ -10363,14 +10742,53 @@ def resolve_resume_step_id(current_step_id, pending_interaction, action, user_re
 
 def expand_step1_ref_selections(pending_interaction, user_response):
     """Bind a Step1 ref choice to the commit shown on the current decision card."""
-    response = dict(user_response or {})
-    if str((pending_interaction or {}).get("step_id") or "") not in {"step0", "step1"}:
+    if user_response is None:
+        response = {}
+    elif isinstance(user_response, dict):
+        response = dict(user_response)
+    else:
+        raise StepError("Step1 用户答复必须是 JSON 对象。")
+    if pending_interaction is None:
+        interaction = {}
+    elif isinstance(pending_interaction, dict):
+        interaction = dict(pending_interaction)
+    else:
+        raise StepError("Step1 待确认信息必须是 JSON 对象。")
+    if str(interaction.get("step_id") or "") not in {"step0", "step1"}:
         return response
-    decision_items = {
-        str(item.get("side") or "").strip(): dict(item)
-        for item in ((pending_interaction or {}).get("source_ref_decision_items") or [])
-        if str(item.get("side") or "").strip()
-    }
+    raw_decision_items = interaction.get("source_ref_decision_items")
+    if raw_decision_items is None:
+        raw_decision_items = []
+    if not isinstance(raw_decision_items, list):
+        raise StepError("Step1 源码 ref 确认项必须是对象数组。")
+    decision_items = {}
+    for raw_item in raw_decision_items:
+        if not isinstance(raw_item, dict):
+            raise StepError("Step1 源码 ref 确认项的每一项都必须是对象。")
+        item = dict(raw_item)
+        side = str(item.get("side") or "").strip()
+        if side not in {"base", "current"}:
+            raise StepError("Step1 源码 ref 确认项的 side 必须是 base 或 current。")
+        if side in decision_items:
+            raise StepError(f"Step1 的 {side} 侧存在重复的源码 ref 确认项。")
+        raw_candidates = item.get("candidates")
+        if raw_candidates is None:
+            raw_candidates = []
+        if not isinstance(raw_candidates, list) or any(
+            not isinstance(candidate, dict) for candidate in raw_candidates
+        ):
+            raise StepError(f"Step1 {side} 侧的源码 ref 候选必须是对象数组。")
+        candidates = [dict(candidate) for candidate in raw_candidates]
+        selection_keys = set()
+        for candidate in candidates:
+            selection_key = str(candidate.get("selection_key") or "").strip()
+            if not selection_key:
+                continue
+            if selection_key in selection_keys:
+                raise StepError(f"Step1 {side} 侧存在重复的 selection_key。")
+            selection_keys.add(selection_key)
+        item["candidates"] = candidates
+        decision_items[side] = item
     raw_selections = response.get("source_ref_selections")
     if raw_selections not in (None, "", []):
         if isinstance(raw_selections, dict):
@@ -10389,27 +10807,42 @@ def expand_step1_ref_selections(pending_interaction, user_response):
             if side in seen_sides:
                 raise StepError(f"Step1 的 {side} 侧只能选择一个 ref 方案。")
             seen_sides.add(side)
-            candidates = list(decision_items[side].get("candidates") or [])
+            candidates = decision_items[side]["candidates"]
             selection_key = str(selection.get("selection_key") or "").strip()
             raw_option = selection.get("option", selection.get("rank"))
             chosen = None
             if selection_key:
-                chosen = next(
-                    (item for item in candidates if str(item.get("selection_key") or "") == selection_key),
-                    None,
-                )
+                for candidate in candidates:
+                    candidate_key = str(
+                        candidate.get("selection_key") or ""
+                    ).strip()
+                    if candidate_key == selection_key:
+                        chosen = candidate
+                        break
             elif raw_option not in (None, ""):
-                try:
+                if isinstance(raw_option, bool):
+                    raise StepError(f"Step1 {side} 侧的 ref 方案编号必须是正整数。")
+                if isinstance(raw_option, int):
+                    option_number = raw_option
+                elif isinstance(raw_option, str) and raw_option.strip().isdigit():
                     option_number = int(raw_option)
-                except (TypeError, ValueError) as exc:
-                    raise StepError(f"Step1 {side} 侧的 ref 方案编号必须是正整数。") from exc
+                else:
+                    raise StepError(f"Step1 {side} 侧的 ref 方案编号必须是正整数。")
                 if 1 <= option_number <= len(candidates):
                     chosen = candidates[option_number - 1]
-            if not chosen:
+            if chosen is None:
                 raise StepError(f"Step1 {side} 侧选择的 ref 方案不存在或已过期。")
             field = str(decision_items[side].get("field") or f"{side}_branch")
-            response[field] = str(chosen.get("ref") or chosen.get("display_ref") or "")
-            response[f"{side}_expected_commit"] = str(chosen.get("commit") or "")
+            chosen_ref = str(
+                chosen.get("ref") or chosen.get("display_ref") or ""
+            ).strip()
+            chosen_commit = str(chosen.get("commit") or "").strip()
+            if not chosen_ref or not chosen_commit:
+                raise StepError(
+                    f"Step1 {side} 侧选择的 ref 方案缺少 ref 或 commit。"
+                )
+            response[field] = chosen_ref
+            response[f"{side}_expected_commit"] = chosen_commit
 
     if response.get("retry_remote_fetch") is True:
         for side, item in decision_items.items():
@@ -10419,9 +10852,16 @@ def expand_step1_ref_selections(pending_interaction, user_response):
                 "remote_expected_commit_unmaterializable",
             }:
                 continue
-            candidates = list(item.get("candidates") or [])
-            commits = {str(candidate.get("commit") or "") for candidate in candidates if candidate.get("commit")}
-            refs = {str(candidate.get("ref") or "") for candidate in candidates if candidate.get("ref")}
+            candidates = item["candidates"]
+            commits = set()
+            refs = set()
+            for candidate in candidates:
+                commit = str(candidate.get("commit") or "").strip()
+                ref = str(candidate.get("ref") or "").strip()
+                if commit:
+                    commits.add(commit)
+                if ref:
+                    refs.add(ref)
             if len(commits) != 1 or len(refs) != 1:
                 continue
             field = str(item.get("field") or f"{side}_branch")
@@ -10433,17 +10873,24 @@ def expand_step1_ref_selections(pending_interaction, user_response):
     for side, item in decision_items.items():
         field = str(item.get("field") or f"{side}_branch")
         selected_ref = str(response.get(field) or "").strip()
-        if not selected_ref or response.get(f"{side}_expected_commit"):
+        existing_expected_commit = str(
+            response.get(f"{side}_expected_commit") or ""
+        ).strip()
+        if not selected_ref or existing_expected_commit:
             continue
-        matches = [
-            candidate for candidate in (item.get("candidates") or [])
+        matches = []
+        for candidate in item["candidates"]:
             if selected_ref in {
                 str(candidate.get("ref") or ""),
                 str(candidate.get("canonical_ref") or ""),
                 str(candidate.get("display_ref") or ""),
-            }
-        ]
-        commits = {str(candidate.get("commit") or "") for candidate in matches if candidate.get("commit")}
+            }:
+                matches.append(candidate)
+        commits = set()
+        for candidate in matches:
+            commit = str(candidate.get("commit") or "").strip()
+            if commit:
+                commits.add(commit)
         if len(commits) == 1:
             response[f"{side}_expected_commit"] = next(iter(commits))
 
@@ -10455,15 +10902,19 @@ def expand_step1_ref_selections(pending_interaction, user_response):
         ).strip()
         if not selected_ref or not expected_commit:
             continue
-        matches = [
-            candidate for candidate in (item.get("candidates") or [])
-            if str(candidate.get("commit") or "").lower() == expected_commit.lower()
-            and selected_ref in {
+        matches = []
+        for candidate in item["candidates"]:
+            candidate_commit = str(candidate.get("commit") or "").strip()
+            candidate_refs = {
                 str(candidate.get("ref") or ""),
                 str(candidate.get("canonical_ref") or ""),
                 str(candidate.get("display_ref") or ""),
             }
-        ]
+            if (
+                candidate_commit.lower() == expected_commit.lower()
+                and selected_ref in candidate_refs
+            ):
+                matches.append(candidate)
         if len(matches) != 1:
             continue
         chosen = matches[0]
@@ -10489,34 +10940,76 @@ def expand_step1_ref_selections(pending_interaction, user_response):
 
 
 def expand_dependency_source_ref_selections(pending_interaction, user_response):
-    response = dict(user_response or {})
-    if str((pending_interaction or {}).get("reason_code") or "").lower() != "step1_dependency_source_ambiguity":
+    if user_response is None:
+        response = {}
+    elif isinstance(user_response, dict):
+        response = dict(user_response)
+    else:
+        raise StepError("依赖源码用户答复必须是 JSON 对象。")
+    if pending_interaction is None:
+        interaction = {}
+    elif isinstance(pending_interaction, dict):
+        interaction = dict(pending_interaction)
+    else:
+        raise StepError("依赖源码待确认信息必须是 JSON 对象。")
+    if str(interaction.get("reason_code") or "").lower() != "step1_dependency_source_ambiguity":
         return response
     raw = response.get("dependency_source_ref_selections")
     if raw in (None, "", []):
         return response
-    selections = [raw] if isinstance(raw, dict) else raw
-    if not isinstance(selections, list):
+    if isinstance(raw, dict):
+        selections = [raw]
+    elif isinstance(raw, list):
+        selections = raw
+    else:
         raise StepError("dependency_source_ref_selections 必须是对象数组。")
+    if any(not isinstance(selection, dict) for selection in selections):
+        raise StepError("dependency_source_ref_selections 的每项必须是对象。")
+    raw_ambiguities = interaction.get("dependency_source_ambiguities")
+    if raw_ambiguities is None:
+        raw_ambiguities = []
+    if not isinstance(raw_ambiguities, list) or any(
+        not isinstance(ambiguity, dict) for ambiguity in raw_ambiguities
+    ):
+        raise StepError("dependency_source_ambiguities 必须是对象数组。")
     candidate_index = {}
-    for ambiguity in (pending_interaction or {}).get("dependency_source_ambiguities") or []:
+    binding_coords = set()
+    for ambiguity in raw_ambiguities:
         if ambiguity.get("kind") != "binding":
             continue
-        for candidate in ambiguity.get("candidates") or []:
+        coord = str(ambiguity.get("coord") or "").strip()
+        if not coord:
+            raise StepError("依赖源码绑定歧义项必须包含 coord。")
+        if coord in binding_coords:
+            raise StepError(f"依赖源码绑定歧义项重复：{coord}")
+        binding_coords.add(coord)
+        raw_candidates = ambiguity.get("candidates")
+        if raw_candidates is None:
+            raw_candidates = []
+        if not isinstance(raw_candidates, list) or any(
+            not isinstance(candidate, dict) for candidate in raw_candidates
+        ):
+            raise StepError(f"依赖源码 {coord} 的 candidates 必须是对象数组。")
+        for candidate in raw_candidates:
             key = str(candidate.get("selection_key") or "").strip()
-            if key:
-                candidate_index[key] = (dict(ambiguity), dict(candidate))
+            if not key:
+                raise StepError(f"依赖源码 {coord} 的候选缺少 selection_key。")
+            if key in candidate_index:
+                raise StepError(f"依赖源码候选 selection_key 重复：{key}")
+            candidate_coord = str(candidate.get("coord") or "").strip()
+            if candidate_coord and candidate_coord != coord:
+                raise StepError(
+                    f"依赖源码候选 {key} 的 coord 与歧义项不一致。"
+                )
+            candidate_index[key] = (coord, dict(candidate))
     bindings = []
     seen_coords = set()
     for selection in selections:
-        if not isinstance(selection, dict):
-            raise StepError("dependency_source_ref_selections 的每项必须是对象。")
         key = str(selection.get("selection_key") or "").strip()
         match = candidate_index.get(key)
         if not match:
             raise StepError(f"依赖源码版本方案不存在或已过期：{key or '(空)'}")
-        ambiguity, candidate = match
-        coord = str(ambiguity.get("coord") or "").strip()
+        coord, candidate = match
         if coord in seen_coords:
             raise StepError(f"依赖源码 {coord} 只能选择一个版本方案。")
         seen_coords.add(coord)
@@ -10579,35 +11072,121 @@ def validate_step5_scope_response(pending_interaction, user_response):
 
 
 def validate_pending_interaction_response(pending_interaction, user_response):
-    pending_interaction = dict(pending_interaction or {})
+    if pending_interaction is None:
+        pending_interaction = {}
+    elif isinstance(pending_interaction, dict):
+        pending_interaction = dict(pending_interaction)
+    else:
+        raise StepError("待确认信息必须是 JSON 对象。")
     user_response = expand_step1_ref_selections(pending_interaction, user_response)
     step_id = str(pending_interaction.get("step_id") or "").strip()
     reason_code = canonical_reason_code(
         pending_interaction.get("reason_code") or "UNKNOWN"
     )
     action = str(user_response.get("action") or "").strip()
-    response_schema = dict(pending_interaction.get("response_schema") or {})
-    properties = dict(response_schema.get("properties") or {})
+    raw_response_schema = pending_interaction.get("response_schema")
+    if raw_response_schema is None:
+        raw_response_schema = {}
+    if not isinstance(raw_response_schema, dict):
+        raise StepError("当前检查点的 response_schema 必须是 JSON 对象。")
+    response_schema = dict(raw_response_schema)
+    raw_properties = response_schema.get("properties")
+    if raw_properties is None:
+        raw_properties = {}
+    if not isinstance(raw_properties, dict):
+        raise StepError("当前检查点的 response_schema.properties 必须是 JSON 对象。")
+    properties = dict(raw_properties)
     if properties:
-        unknown_fields = sorted(
-            key for key in user_response.keys()
-            if not key.startswith("__") and key not in properties
-        )
+        unknown_fields = []
+        for key in user_response:
+            if not key.startswith("__") and key not in properties:
+                unknown_fields.append(key)
+        unknown_fields.sort()
         if unknown_fields:
             raise StepError("用户答复包含当前检查点未定义的字段：" + ", ".join(unknown_fields))
-    for field in response_schema.get("required", []) or []:
-        if user_response.get(field) in (None, "", []):
+    raw_required_fields = response_schema.get("required")
+    if raw_required_fields is None:
+        raw_required_fields = []
+    if not isinstance(raw_required_fields, list) or any(
+        not isinstance(field, str) for field in raw_required_fields
+    ):
+        raise StepError("当前检查点的 response_schema.required 必须是字符串数组。")
+    for field in raw_required_fields:
+        if not _response_value_present(user_response.get(field)):
             raise StepError(f"当前检查点要求字段 {field} 必填，不能为空。")
-    action_requirements = dict(pending_interaction.get("action_requirements") or {})
-    requirement = dict(action_requirements.get(action) or {})
+    for field, value in user_response.items():
+        if field.startswith("__") or field not in properties:
+            continue
+        property_schema = properties[field]
+        if not isinstance(property_schema, dict):
+            raise StepError(f"当前检查点字段 {field} 的 schema 必须是 JSON 对象。")
+        expected_type = property_schema.get("type")
+        type_matches = True
+        if expected_type == "string":
+            type_matches = isinstance(value, str)
+        elif expected_type == "array":
+            type_matches = isinstance(value, list)
+        elif expected_type == "object":
+            type_matches = isinstance(value, dict)
+        elif expected_type == "boolean":
+            type_matches = type(value) is bool
+        elif expected_type == "integer":
+            type_matches = type(value) is int
+        elif expected_type == "number":
+            type_matches = type(value) in {int, float}
+        elif expected_type == "null":
+            type_matches = value is None
+        if not type_matches:
+            raise StepError(
+                f"当前检查点字段 {field} 的类型必须是 {expected_type}。"
+            )
+        if "enum" in property_schema:
+            enum_values = property_schema.get("enum")
+            if not isinstance(enum_values, list):
+                raise StepError(f"当前检查点字段 {field} 的 enum 必须是数组。")
+            if value not in enum_values:
+                raise StepError(
+                    f"当前检查点字段 {field} 的值不在允许范围内。"
+                )
+    raw_action_requirements = pending_interaction.get("action_requirements")
+    if raw_action_requirements is None:
+        raw_action_requirements = {}
+    if not isinstance(raw_action_requirements, dict):
+        raise StepError("当前检查点的 action_requirements 必须是 JSON 对象。")
+    raw_requirement = raw_action_requirements.get(action)
+    if raw_requirement is None:
+        raw_requirement = {}
+    if not isinstance(raw_requirement, dict):
+        raise StepError(f"当前动作 {action} 的要求必须是 JSON 对象。")
+    requirement = dict(raw_requirement)
+    raw_requirement_fields = requirement.get("required_fields")
+    if raw_requirement_fields is None:
+        raw_requirement_fields = []
+    if not isinstance(raw_requirement_fields, list) or any(
+        not isinstance(field, str) for field in raw_requirement_fields
+    ):
+        raise StepError(f"当前动作 {action} 的 required_fields 必须是字符串数组。")
+    requirement_fields = [
+        field.strip() for field in raw_requirement_fields if field.strip()
+    ]
+    raw_ref_requests = pending_interaction.get("ref_resolution_requests")
+    if raw_ref_requests is None:
+        raw_ref_requests = []
+    if not isinstance(raw_ref_requests, list) or any(
+        not isinstance(item, dict) for item in raw_ref_requests
+    ):
+        raise StepError("当前检查点的 ref_resolution_requests 必须是对象数组。")
+    ref_requests = [dict(item) for item in raw_ref_requests]
     retry_remote_fetch = user_response.get("retry_remote_fetch") is True
-    step1_remote_retry_fields = {
-        str(item.get("field") or "").strip()
-        for item in (pending_interaction.get("ref_resolution_requests") or [])
-        if item.get("status") in {"fetch_failed", "not_found", "ref_moved"}
-        if str(item.get("field") or "").strip()
-    }
-    for field in requirement.get("required_fields") or []:
+    step1_remote_retry_fields = set()
+    for item in ref_requests:
+        field = str(item.get("field") or "").strip()
+        if (
+            item.get("status") in {"fetch_failed", "not_found", "ref_moved"}
+            and field
+        ):
+            step1_remote_retry_fields.add(field)
+    for field in requirement_fields:
         if (
             step_id in {"step0", "step1"}
             and retry_remote_fetch
@@ -10617,23 +11196,21 @@ def validate_pending_interaction_response(pending_interaction, user_response):
         if not _response_value_present(user_response.get(field)):
             raise StepError(f"当前动作 {action} 要求字段 {field} 必填，不能为空。")
     if step_id in {"step0", "step1"} and action == "confirm_local_source":
-        confirmation_fields = [
-            str(field or "").strip()
-            for field in (requirement.get("required_fields") or [])
-            if str(field or "").strip().endswith(
+        confirmation_fields = []
+        for field in requirement_fields:
+            if field.endswith(
                 ("_allow_local_source", "_allow_dirty_local_source")
-            )
-        ]
+            ):
+                confirmation_fields.append(field)
         for field in confirmation_fields:
             if user_response.get(field) is not True:
                 raise StepError(f"当前动作 confirm_local_source 要求 {field}=true，不能隐式确认本地源码。")
-    if step_id in {"step0", "step1"} and action == "continue" and pending_interaction.get("ref_resolution_requests"):
-        remote_retry_sides = {
-            str(item.get("side") or "")
-            for item in (pending_interaction.get("ref_resolution_requests") or [])
-            if item.get("status") in {"fetch_failed", "not_found", "ref_moved"}
-        }
-        for request in pending_interaction.get("ref_resolution_requests") or []:
+    if step_id in {"step0", "step1"} and action == "continue" and ref_requests:
+        remote_retry_sides = set()
+        for item in ref_requests:
+            if item.get("status") in {"fetch_failed", "not_found", "ref_moved"}:
+                remote_retry_sides.add(str(item.get("side") or ""))
+        for request in ref_requests:
             side = str(request.get("side") or "")
             field = str(request.get("field") or "").strip()
             if retry_remote_fetch and side in remote_retry_sides:
@@ -10642,7 +11219,16 @@ def validate_pending_interaction_response(pending_interaction, user_response):
                 raise StepError(f"请一次性处理全部待确认侧；本次仍缺少：{field}")
         if retry_remote_fetch and not remote_retry_sides:
             raise StepError("当前确认项中没有可显式重查的远端 ref 失败侧。")
-    at_least_one_of = [str(field).strip() for field in (requirement.get("at_least_one_of") or []) if str(field).strip()]
+    raw_at_least_one_of = requirement.get("at_least_one_of")
+    if raw_at_least_one_of is None:
+        raw_at_least_one_of = []
+    if not isinstance(raw_at_least_one_of, list) or any(
+        not isinstance(field, str) for field in raw_at_least_one_of
+    ):
+        raise StepError(f"当前动作 {action} 的 at_least_one_of 必须是字符串数组。")
+    at_least_one_of = [
+        field.strip() for field in raw_at_least_one_of if field.strip()
+    ]
     if (
         at_least_one_of
         and not any(_response_value_present(user_response.get(field)) for field in at_least_one_of)
@@ -10662,28 +11248,89 @@ def validate_pending_interaction_response(pending_interaction, user_response):
         and reason_code == "STEP1_DEPENDENCY_SOURCE_AMBIGUITY"
         and action == "continue"
     ):
-        ambiguities = list(
-            pending_interaction.get("dependency_source_ambiguities") or []
-        )
-        skipped = set(user_response.get("skip_dependency_source_coords") or [])
-        selections = list(user_response.get("dependency_source_ref_selections") or [])
-        selected_keys = {
-            str((item or {}).get("selection_key") or "").strip()
-            for item in selections
-            if isinstance(item, dict)
+        raw_ambiguities = pending_interaction.get("dependency_source_ambiguities")
+        if raw_ambiguities is None:
+            raw_ambiguities = []
+        if not isinstance(raw_ambiguities, list) or any(
+            not isinstance(item, dict) for item in raw_ambiguities
+        ):
+            raise StepError("dependency_source_ambiguities 必须是对象数组。")
+        ambiguities = [dict(item) for item in raw_ambiguities]
+        raw_skipped = user_response.get("skip_dependency_source_coords")
+        if raw_skipped is None:
+            raw_skipped = []
+        if isinstance(raw_skipped, str):
+            raw_skipped = [raw_skipped]
+        if not isinstance(raw_skipped, list) or any(
+            not isinstance(coord, str) for coord in raw_skipped
+        ):
+            raise StepError("skip_dependency_source_coords 必须是字符串数组。")
+        skipped = {
+            coord.strip() for coord in raw_skipped if coord.strip()
         }
-        unresolved = []
+        raw_selections = user_response.get("dependency_source_ref_selections")
+        if raw_selections is None:
+            raw_selections = []
+        if isinstance(raw_selections, dict):
+            raw_selections = [raw_selections]
+        if not isinstance(raw_selections, list) or any(
+            not isinstance(item, dict) for item in raw_selections
+        ):
+            raise StepError("dependency_source_ref_selections 必须是对象数组。")
+        selections = [dict(item) for item in raw_selections]
+        ambiguity_coords = set()
+        candidate_owner = {}
         for item in ambiguities:
             coord = str(item.get("coord") or "").strip()
-            if coord in skipped:
-                continue
-            candidate_keys = {
-                str(candidate.get("selection_key") or "").strip()
-                for candidate in (item.get("candidates") or [])
-            }
-            if candidate_keys & selected_keys:
-                continue
-            unresolved.append(coord)
+            if not coord:
+                raise StepError("dependency_source_ambiguities 的每项必须包含 coord。")
+            if coord in ambiguity_coords:
+                raise StepError(f"依赖源码歧义项重复：{coord}")
+            ambiguity_coords.add(coord)
+            raw_candidates = item.get("candidates")
+            if raw_candidates is None:
+                raw_candidates = []
+            if not isinstance(raw_candidates, list) or any(
+                not isinstance(candidate, dict) for candidate in raw_candidates
+            ):
+                raise StepError(f"依赖源码 {coord} 的 candidates 必须是对象数组。")
+            for candidate in raw_candidates:
+                selection_key = str(
+                    candidate.get("selection_key") or ""
+                ).strip()
+                if not selection_key:
+                    raise StepError(f"依赖源码 {coord} 的候选缺少 selection_key。")
+                if selection_key in candidate_owner:
+                    raise StepError(f"依赖源码候选 selection_key 重复：{selection_key}")
+                candidate_owner[selection_key] = coord
+        selected_coords = set()
+        selected_keys = set()
+        for selection in selections:
+            selection_key = str(
+                selection.get("selection_key") or ""
+            ).strip()
+            if not selection_key or selection_key not in candidate_owner:
+                raise StepError(
+                    f"依赖源码版本方案不存在或已过期：{selection_key or '(空)'}"
+                )
+            coord = candidate_owner[selection_key]
+            if selection_key in selected_keys or coord in selected_coords:
+                raise StepError(f"依赖源码 {coord} 只能选择一个版本方案。")
+            selected_keys.add(selection_key)
+            selected_coords.add(coord)
+        unknown_skips = skipped - ambiguity_coords
+        if unknown_skips:
+            raise StepError(
+                "跳过列表包含当前确认项不存在的依赖源码："
+                + "、".join(sorted(unknown_skips))
+            )
+        conflicts = skipped & selected_coords
+        if conflicts:
+            raise StepError(
+                "同一依赖源码不能同时选择候选并跳过："
+                + "、".join(sorted(conflicts))
+            )
+        unresolved = sorted(ambiguity_coords - skipped - selected_coords)
         if unresolved:
             raise StepError(
                 "以下依赖包源码歧义尚未选择或明确跳过："
@@ -10696,7 +11343,7 @@ def validate_pending_interaction_response(pending_interaction, user_response):
         "STEP1_REMOTE_SOURCE_UNAVAILABLE",
         "STEP1_DIRTY_LOCAL_SOURCE_CONFIRMATION_REQUIRED",
     } and action == "continue":
-        for request in pending_interaction.get("ref_resolution_requests") or []:
+        for request in ref_requests:
             side = str(request.get("side") or "").strip()
             field = str(request.get("field") or "").strip()
             previous = str(request.get("requested_ref") or "").strip()
@@ -10726,9 +11373,10 @@ def apply_user_response_to_main_state(main_state, pending_interaction, user_resp
     user_response = expand_dependency_source_ref_selections(
         pending_interaction, user_response,
     )
+    pending = pending_interaction or {}
     if user_response.get("selected_targets") is not None:
         selection_result = resolve_selected_targets(
-            (pending_interaction or {}).get("selection_resolution") or {},
+            pending.get("selection_resolution") or {},
             user_response.get("selected_targets"),
         ) or {}
         user_response["step5_selected_coords"] = list(
@@ -10737,12 +11385,12 @@ def apply_user_response_to_main_state(main_state, pending_interaction, user_resp
         user_response["step5_selected_names"] = list(
             selection_result.get("step5_selected_names") or []
         )
-    pending_step_id = str((pending_interaction or {}).get("step_id") or "").strip()
-    pending_kind = str((pending_interaction or {}).get("kind") or "").strip()
+    pending_step_id = str(pending.get("step_id") or "").strip()
+    pending_kind = str(pending.get("kind") or "").strip()
     step_id = str(target_step_id or pending_step_id or "").strip()
     if not step_id:
         return main_state, {}
-    action = str((user_response or {}).get("action") or "").strip()
+    action = user_response["action"]
     scope_mode = normalize_step5_scope_mode(
         user_response.get("scope_mode"),
         "scope_mode",
@@ -10801,7 +11449,7 @@ def apply_user_response_to_main_state(main_state, pending_interaction, user_resp
         # 种入下一步输入，不能继续沿用当前步骤执行时保存的旧 output。
         seed_next_step_input(main_state, step_id, updated)
     if action == "confirm_unresolved":
-        pending_unresolved_items = list((pending_interaction or {}).get("unresolved_items") or [])
+        pending_unresolved_items = list(pending.get("unresolved_items") or [])
         if pending_unresolved_items:
             main_state[step_id]["input"]["confirmed_unresolved_items"] = pending_unresolved_items
     record_last_user_response(main_state, pending_interaction, action, user_response)
@@ -10844,13 +11492,14 @@ def build_restore_context(main_state, step_id):
 
 
 def resolve_non_pending_structured_response_step(args, main_state, user_response):
-    action = str((user_response or {}).get("action") or "").strip()
+    response = dict(user_response or {})
+    action = str(response.get("action") or "").strip()
     if action not in NON_PENDING_BRIDGE_ALLOWED_ACTIONS:
         raise StepError(
             "当前没有 pending interaction 时，结构化用户意图仅支持以下 action："
             + ", ".join(sorted(NON_PENDING_BRIDGE_ALLOWED_ACTIONS))
         )
-    restart_step_id = str((user_response or {}).get("restart_step_id") or "").strip()
+    restart_step_id = str(response.get("restart_step_id") or "").strip()
     if action == "restart_from_step":
         if restart_step_id not in STEP_SEQUENCE:
             raise StepError("action=restart_from_step 时，必须提供合法的 restart_step_id。")
@@ -10878,7 +11527,7 @@ def build_non_pending_structured_response_interaction(target_step_id, report_dir
     }
     if user_response.get("selected_targets") is not None:
         selection_resolution = build_report_dir_step5_selection_resolution(report_dir)
-        if not (selection_resolution.get("options") or []):
+        if not selection_resolution.get("options"):
             raise StepError(
                 "当前无法解析 selected_targets：缺少可用的 Step5 候选目标。"
                 "请先完成依赖 API 变化分析，生成 changed_dependencies.md 后再选择依赖包。"
@@ -10973,7 +11622,8 @@ def apply_non_pending_structured_response(args, project_dir, report_dir, main_st
 
 
 def apply_structured_user_response_if_present(args, project_dir, report_dir, main_state, step_id, user_response=None):
-    pending_interaction = (main_state.get("state") or {}).get("pending_interaction")
+    state_meta = main_state.get("state") or {}
+    pending_interaction = state_meta.get("pending_interaction")
     has_structured_response = bool(args.response_json or args.response_file)
     resumed_interaction_step_id = ""
     response_action = ""
@@ -10983,17 +11633,21 @@ def apply_structured_user_response_if_present(args, project_dir, report_dir, mai
     if pending_interaction and has_structured_response:
         if not user_response:
             user_response = resolve_user_response(args, project_dir)
-        response_action = str(user_response.get("action") or "").strip()
-        resumed_interaction_step_id = str((pending_interaction or {}).get("step_id") or "").strip()
+        response_action = str(user_response.get("action", "")).strip()
+        resumed_interaction_step_id = str(
+            pending_interaction.get("step_id", "")
+        ).strip()
         available_actions = option_ids(pending_interaction)
         if available_actions and response_action not in available_actions:
             allowed_labels = []
-            for option in (pending_interaction or {}).get("options") or []:
+            # A non-empty ``available_actions`` is derived from this exact list,
+            # so the invalid-action branch cannot observe a missing/empty list.
+            for option in pending_interaction["options"]:
                 option_id = str((option or {}).get("id") or "").strip()
                 if option_id not in available_actions:
                     continue
                 allowed_labels.append(
-                    str((option or {}).get("label") or USER_ACTION_LABELS.get(option_id) or option_id)
+                    str(option.get("label") or USER_ACTION_LABELS.get(option_id) or option_id)
                 )
             print(
                 "当前回复无法与本次确认项的可选操作对应。"
@@ -11011,8 +11665,8 @@ def apply_structured_user_response_if_present(args, project_dir, report_dir, mai
                 update_main_state_state(
                     main_state,
                     current_step=paused_step_id
-                    or (main_state.get("state") or {}).get("current_step"),
-                    completed_step=(main_state.get("state") or {}).get("completed_step"),
+                    or state_meta.get("current_step"),
+                    completed_step=state_meta.get("completed_step"),
                     status="paused_by_user",
                     blocking_reason="用户选择稍后处理",
                     pending_interaction=dict(pending_interaction),
@@ -11042,7 +11696,9 @@ def apply_structured_user_response_if_present(args, project_dir, report_dir, mai
                         preserve_current_input=preserved_input,
                     )
                 save_main_state(report_dir, main_state)
-                pending_interaction = (main_state.get("state") or {}).get("pending_interaction")
+                pending_interaction = main_state.get("state", {}).get(
+                    "pending_interaction"
+                )
     elif has_structured_response:
         if not user_response:
             user_response = resolve_user_response(args, project_dir)
@@ -11142,8 +11798,8 @@ def handle_step4_resume_followups(
 ):
     if resumed_interaction_step_id != "step4" or response_action != "continue":
         return
-    step4_input = dict((main_state.get("step4") or {}).get("input") or {})
-    step5_input = dict((main_state.get("step5") or {}).get("input") or {})
+    step4_input = dict(main_state["step4"]["input"])
+    step5_input = dict(main_state["step5"]["input"])
     for key in ("step5_selected_coords", "step5_selected_names"):
         values = normalize_step5_target_list(step4_input.get(key), key) or []
         if values:
@@ -11184,13 +11840,14 @@ def handle_step4_resume_followups(
         if _is_high_risk_selection_api_row(row)
     )
     if has_partial_request:
-        matched_coord_count = len(
-            {
-                str((row or {}).get("coord") or "").strip()
-                for row in (selection.get("matched_rows") or [])
-                if str((row or {}).get("coord") or "").strip()
-            }
-        )
+        matched_coords = set()
+        for row in selection.get("matched_rows") or []:
+            if not isinstance(row, dict):
+                continue
+            coord = str(row.get("coord") or "").strip()
+            if coord:
+                matched_coords.add(coord)
+        matched_coord_count = len(matched_coords)
         print(
             "已按你的选择确定部分分析范围："
             f"纳入 {matched_coord_count}/{selection.get('available_target_count', 0)} 个变化依赖，"
@@ -11328,11 +11985,14 @@ def build_final_completion_summary(report_dir):
     ).strip()
     probable_items = list(findings.get("probable_impact") or [])
     probable_count = len(probable_items)
-    probable_dependency_count = len({
-        str(item.get("coord") or "").strip()
-        for item in probable_items
-        if isinstance(item, dict) and str(item.get("coord") or "").strip()
-    })
+    probable_dependency_coords = set()
+    for item in probable_items:
+        if not isinstance(item, dict):
+            continue
+        coord = str(item.get("coord") or "").strip()
+        if coord:
+            probable_dependency_coords.add(coord)
+    probable_dependency_count = len(probable_dependency_coords)
     uncertain_count = len(findings.get("uncertain") or [])
     uncertain_candidate_count = sum(
         1
@@ -11551,6 +12211,7 @@ def persist_completed_step(main_state, step_id, report_dir, run_context):
 def should_auto_continue_success_review(step_id, interaction, manifest_steps):
     """Skip routine success reviews when a safe default preserves full scope."""
     step_meta = (manifest_steps or {}).get(step_id) or {}
+    interaction = dict(interaction or {})
     # Step4 的范围选择会改变覆盖率、耗时和最终结论边界，不属于例行成功复核。
     # 即使未来误配 auto_continue_on_success，也必须保留该确认点。
     if step_meta.get("requires_scope_confirmation"):
@@ -11559,11 +12220,11 @@ def should_auto_continue_success_review(step_id, interaction, manifest_steps):
         return False
     # A producer-supplied reason code represents a real decision or evidence
     # blocker. Only generic post-success review cards are auto-continued.
-    if str((interaction or {}).get("reason_code") or "").strip():
+    if str(interaction.get("reason_code") or "").strip():
         return False
     option_ids = {
         str(item.get("id") or "").strip()
-        for item in (interaction or {}).get("options") or []
+        for item in interaction.get("options") or []
     }
     return "continue" in option_ids
 
@@ -11629,8 +12290,8 @@ def print_auto_continue_success_review(step_id, run_context):
 
 
 def persist_interaction_required_error(main_state, step_id, report_dir, interaction):
-    runtime_view = dict(previous_step_output(main_state or {}, step_id) or {})
-    runtime_view.update((main_state or {}).get(step_id, {}).get("input") or {})
+    runtime_view = dict(previous_step_output(main_state, step_id) or {})
+    runtime_view.update(main_state.get(step_id, {}).get("input") or {})
     interaction = apply_interaction_protocol_enhancements(
         interaction,
         step_id,
@@ -11874,7 +12535,12 @@ def _remove_step_output_without_following_parent_links(report_dir, path):
     """
 
     report = Path(report_dir).resolve()
-    target = Path(os.path.abspath(str(path)))
+    lexical_target = Path(os.path.abspath(str(path)))
+    # Canonicalize parent aliases such as macOS /var -> /private/var while
+    # deliberately not following the leaf itself.  The descriptor-relative
+    # deletion below must still be able to inspect and safely unlink a leaf
+    # symlink without accepting a path outside the report root.
+    target = lexical_target.parent.resolve() / lexical_target.name
     try:
         relative = target.relative_to(report)
     except ValueError as error:
@@ -11923,10 +12589,10 @@ def _secure_step_output_cleanup_supported():
 def _cleanup_directory_open_flags():
     return (
         os.O_RDONLY
-        | int(getattr(os, "O_DIRECTORY", 0) or 0)
-        | int(getattr(os, "O_NOFOLLOW", 0) or 0)
-        | int(getattr(os, "O_CLOEXEC", 0) or 0)
-        | int(getattr(os, "O_BINARY", 0) or 0)
+        | int(getattr(os, "O_DIRECTORY", 0))
+        | int(getattr(os, "O_NOFOLLOW", 0))
+        | int(getattr(os, "O_CLOEXEC", 0))
+        | int(getattr(os, "O_BINARY", 0))
     )
 
 
@@ -12073,9 +12739,9 @@ def _remove_step_output_with_directory_descriptors(
 
 def _windows_cleanup_directory_stat(path):
     observed = os.lstat(path)
-    attributes = int(getattr(observed, "st_file_attributes", 0) or 0)
+    attributes = int(getattr(observed, "st_file_attributes", 0))
     reparse_attribute = int(
-        getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0) or 0
+        getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
     )
     is_junction = getattr(path, "is_junction", None)
     if (
@@ -12243,10 +12909,10 @@ def _read_private_step4_checkpoint(entry, *, parent_fd=None):
         raise OSError("checkpoint is not a bounded private regular file")
     flags = (
         os.O_RDONLY
-        | int(getattr(os, "O_NOFOLLOW", 0) or 0)
-        | int(getattr(os, "O_NONBLOCK", 0) or 0)
-        | int(getattr(os, "O_CLOEXEC", 0) or 0)
-        | int(getattr(os, "O_BINARY", 0) or 0)
+        | int(getattr(os, "O_NOFOLLOW", 0))
+        | int(getattr(os, "O_NONBLOCK", 0))
+        | int(getattr(os, "O_CLOEXEC", 0))
+        | int(getattr(os, "O_BINARY", 0))
     )
     if parent_fd is None:
         descriptor = os.open(entry, flags)
@@ -12369,8 +13035,6 @@ def _read_step4_validation_checkpoint(report_dir, *, missing_ok=False):
     for _part in relative.parts:
         report = report.parent
     try:
-        if report / relative != path:
-            raise OSError("checkpoint path is outside its fixed report location")
         if _secure_step_output_cleanup_supported():
             raw = _read_step4_checkpoint_with_directory_descriptors(
                 report, relative
@@ -12510,22 +13174,31 @@ def _revalidate_binary_step4_deferred_handoff(report_dir, result):
 
     report = Path(report_dir).resolve()
     binary_root = report / BINARY_OUTPUT_RELATIVE_PATH
-    payload = dict(result or {})
+    if not isinstance(result, dict):
+        raise StepError(
+            "Step4 子进程 deferred handoff 结果必须是对象。",
+            reason_codes=[
+                "BINARY_STEP4_DEFERRED_HANDOFF_REVALIDATION_FAILED"
+            ],
+        )
+    payload = dict(result)
     identity_fields = (
         "result_generation_identity",
         "analysis_context_identity",
         "validation_run_identity",
         "activation_identity",
     )
-    invalid_fields = [
-        field
-        for field in identity_fields
-        if not isinstance(payload.get(field), str)
-        or re.fullmatch(r"[0-9a-f]{64}", payload[field]) is None
-    ]
+    invalid_fields = []
+    for field in identity_fields:
+        identity = payload.get(field)
+        if not isinstance(identity, str):
+            invalid_fields.append(field)
+            continue
+        if re.fullmatch(r"[0-9a-f]{64}", identity) is None:
+            invalid_fields.append(field)
     expected_checkpoint_path = _step4_validation_checkpoint_path(report)
     declared_checkpoint_path = Path(
-        str(payload.get("validation_checkpoint_path") or "")
+        str(payload.get("validation_checkpoint_path", ""))
     )
     try:
         declared_checkpoint_path = declared_checkpoint_path.resolve(
@@ -12541,13 +13214,28 @@ def _revalidate_binary_step4_deferred_handoff(report_dir, result):
                 "BINARY_STEP4_DEFERRED_HANDOFF_REVALIDATION_FAILED"
             ],
         ) from error
+    observed_contract = {
+        "schema": payload.get("schema"),
+        "validation_status": payload.get("validation_status"),
+        "validation_checkpoint_retained": payload.get(
+            "validation_checkpoint_retained"
+        ),
+        "activation_candidate_private": payload.get(
+            "activation_candidate_private"
+        ),
+        "activation_predecessor_declared": (
+            "activation_predecessor" in payload
+        ),
+    }
+    expected_contract = {
+        "schema": "java-upgrade-analyzer.binary-pipeline-result.v1",
+        "validation_status": "passed",
+        "validation_checkpoint_retained": True,
+        "activation_candidate_private": True,
+        "activation_predecessor_declared": True,
+    }
     if (
-        payload.get("schema")
-        != "java-upgrade-analyzer.binary-pipeline-result.v1"
-        or payload.get("validation_status") != "passed"
-        or payload.get("validation_checkpoint_retained") is not True
-        or payload.get("activation_candidate_private") is not True
-        or "activation_predecessor" not in payload
+        observed_contract != expected_contract
         or invalid_fields
         or declared_checkpoint_path != resolved_checkpoint_path
     ):
@@ -12577,7 +13265,7 @@ def _revalidate_binary_step4_deferred_handoff(report_dir, result):
                 list(error.reason_codes)
                 + ["BINARY_STEP4_DEFERRED_HANDOFF_REVALIDATION_FAILED"]
             ),
-            diagnostic=dict(error.diagnostic or {}),
+            diagnostic=dict(error.diagnostic),
         ) from error
     except BinaryOutputError as error:
         raise StepError(
@@ -12586,7 +13274,7 @@ def _revalidate_binary_step4_deferred_handoff(report_dir, result):
                 "BINARY_STEP4_DEFERRED_HANDOFF_REVALIDATION_FAILED"
             ],
             diagnostic={
-                "cause_reason_code": str(error.reason_code or ""),
+                "cause_reason_code": str(error.reason_code),
             },
         ) from error
 
@@ -12604,20 +13292,30 @@ def _revalidate_binary_step4_deferred_handoff(report_dir, result):
         "activation_predecessor": public_active,
     }
     observed_pending = {
-        key: (pending or {}).get(key)
+        key: pending.get(key)
         for key in expected_pending
     }
-    if (
-        observed_pending != expected_pending
-        or re.fullmatch(
-            r"[0-9a-f]{64}",
-            str(checkpoint_validation_sha256 or ""),
-        )
-        is None
-        or checkpoint.get("analysis_context_identity")
-        != payload["analysis_context_identity"]
-        or payload.get("activation_predecessor") != public_active
-    ):
+    validation_sha256_valid = (
+        isinstance(checkpoint_validation_sha256, str)
+        and re.fullmatch(
+            r"[0-9a-f]{64}", checkpoint_validation_sha256,
+        ) is not None
+    )
+    observed_binding = {
+        "pending": observed_pending,
+        "validation_sha256_valid": validation_sha256_valid,
+        "analysis_context_identity": checkpoint.get(
+            "analysis_context_identity"
+        ),
+        "activation_predecessor": payload.get("activation_predecessor"),
+    }
+    expected_binding = {
+        "pending": expected_pending,
+        "validation_sha256_valid": True,
+        "analysis_context_identity": payload["analysis_context_identity"],
+        "activation_predecessor": public_active,
+    }
+    if observed_binding != expected_binding:
         raise StepError(
             "Step4 子进程结果、private candidate 与 public active predecessor "
             "在 writer-lock handoff 时不一致。",
@@ -12630,19 +13328,24 @@ def _revalidate_binary_step4_deferred_handoff(report_dir, result):
                 ],
                 "activation_identity": payload["activation_identity"],
                 "pending_activation_state": str(
-                    (pending or {}).get("activation_state") or ""
+                    pending.get("activation_state") or ""
                 ),
                 "public_predecessor_matches": (
-                    (pending or {}).get("activation_predecessor")
-                    == public_active
+                    pending.get("activation_predecessor") == public_active
                 ),
             },
         )
     return {
         "checkpoint_path": str(resolved_checkpoint_path),
-        "pending": dict(pending or {}),
+        "pending": dict(pending),
         "public_active": dict(public_active or {}),
     }
+
+
+def _step4_rollback_failure_status(error):
+    reason_code = str(getattr(error, "reason_code", "") or "")
+    suffix = f":{reason_code}" if reason_code else ""
+    return f"rollback_failed:{error.__class__.__name__}{suffix}"
 
 
 def _rollback_binary_step4_transaction(report_dir, result=None):
@@ -12663,19 +13366,23 @@ def _rollback_binary_step4_transaction(report_dir, result=None):
         expectation = _step4_report_publication_expectation(result)
         if expectation is None and state != "absent":
             observed_binding = dict(metadata.get("binding") or {})
+            result_payload = result if isinstance(result, dict) else {}
             declared_generation = str(
-                (result or {}).get("result_generation_identity") or ""
+                result_payload.get("result_generation_identity") or ""
             )
             declared_activation = str(
-                (result or {}).get("activation_identity") or ""
+                result_payload.get("activation_identity") or ""
             )
+            declared_binding = {
+                "result_generation_identity": declared_generation,
+                "activation_identity": declared_activation,
+            }
+            observed_identity_binding = {
+                key: observed_binding.get(key) for key in declared_binding
+            }
             if (
-                not declared_generation
-                or not declared_activation
-                or observed_binding.get("result_generation_identity")
-                != declared_generation
-                or observed_binding.get("activation_identity")
-                != declared_activation
+                "" in declared_binding.values()
+                or observed_identity_binding != declared_binding
             ):
                 raise BinaryReportError(
                     "BINARY_REPORT_PUBLICATION_TRANSACTION_BINDING_MISMATCH",
@@ -12714,14 +13421,15 @@ def _rollback_binary_step4_transaction(report_dir, result=None):
             report_rollback_succeeded = True
     except Exception as error:
         statuses["report_publication_rollback"] = (
-            "rollback_failed:"
-            + error.__class__.__name__
-            + (
-                ":" + str(getattr(error, "reason_code", "") or "")
-                if getattr(error, "reason_code", "",) else ""
-            )
+            _step4_rollback_failure_status(error)
         )
-    binding = _step4_activation_binding(report_dir, result)
+    try:
+        binding = _step4_activation_binding(report_dir, result)
+    except Exception as error:
+        statuses["active_generation_rollback"] = (
+            _step4_rollback_failure_status(error)
+        )
+        return statuses
     if report_already_committed:
         statuses["active_generation_rollback"] = (
             "not_attempted_after_report_commit"
@@ -12746,12 +13454,7 @@ def _rollback_binary_step4_transaction(report_dir, result=None):
             )
         except Exception as error:
             statuses["active_generation_rollback"] = (
-                "rollback_failed:"
-                + error.__class__.__name__
-                + (
-                    ":" + str(getattr(error, "reason_code", "") or "")
-                    if getattr(error, "reason_code", "",) else ""
-                )
+                _step4_rollback_failure_status(error)
             )
     else:
         statuses["active_generation_rollback"] = (
@@ -12775,7 +13478,18 @@ def _checkpoint_result_for_recovery(report_dir, checkpoint):
 
 
 def _require_successful_binary_step4_recovery_rollback(statuses):
-    observed = dict(statuses or {})
+    if statuses is None:
+        observed = {}
+    elif not isinstance(statuses, dict):
+        raise StepError(
+            "Step4 中断事务回滚状态必须是对象。",
+            reason_codes=["BINARY_STEP4_TRANSACTION_RECOVERY_FAILED"],
+            diagnostic={
+                "rollback_status_type": type(statuses).__name__,
+            },
+        )
+    else:
+        observed = dict(statuses)
     allowed = {
         "report_publication_rollback": {
             "restored_previous_reports",
@@ -12789,14 +13503,12 @@ def _require_successful_binary_step4_recovery_rollback(statuses):
             "not_attempted_without_bound_activation",
         },
     }
-    failures = {
-        key: value
-        for key, value in observed.items()
-        if key in allowed and value not in allowed[key]
-    }
-    for key in allowed:
+    failures = {}
+    for key, allowed_values in allowed.items():
         if key not in observed:
             failures[key] = "missing_rollback_status"
+        elif observed[key] not in allowed_values:
+            failures[key] = observed[key]
     if failures:
         raise StepError(
             "Step4 中断事务无法安全回滚；已停止继续执行。",
@@ -12820,30 +13532,81 @@ def _finalize_stale_committed_step4_checkpoint(
     published = _read_background_json(
         step4_api_changes_dir(report) / "summary.json"
     )
-    binding = dict(publication_receipt.get("binding") or {})
     if (
-        publication_receipt.get("state") != "committed"
-        or checkpoint.get("schema")
-        != "java-upgrade-analyzer.binary-generation-validation-checkpoint.v3"
-        or checkpoint.get("status")
-        != "independent_validation_passed_pending_activation"
-        or checkpoint.get("result_generation_identity")
-        != binding.get("result_generation_identity")
-        or checkpoint.get("validation_run_identity")
-        != binding.get("validation_run_identity")
-        or checkpoint.get("activation_identity")
-        != binding.get("activation_identity")
-        or active.get("result_generation_identity")
-        != binding.get("result_generation_identity")
-        or active.get("validation_run_identity")
-        != binding.get("validation_run_identity")
-        or active.get("validation_result_sha256")
-        != binding.get("validation_result_sha256")
-        or active.get("activation_identity")
-        or "activation_predecessor" in active
-        or published.get("result_generation_identity")
-        != binding.get("result_generation_identity")
+        not isinstance(checkpoint, dict)
+        or not isinstance(publication_receipt, dict)
+        or not isinstance(active, dict)
+        or not isinstance(published, dict)
     ):
+        raise StepError(
+            "committed Step4 checkpoint、回执、active 与报告摘要必须是对象。",
+            reason_codes=["BINARY_STEP4_TRANSACTION_BINDING_MISMATCH"],
+        )
+    raw_binding = publication_receipt.get("binding")
+    if not isinstance(raw_binding, dict):
+        raise StepError(
+            "committed Step4 报告事务 binding 必须是对象。",
+            reason_codes=["BINARY_STEP4_TRANSACTION_BINDING_MISMATCH"],
+        )
+    binding = dict(raw_binding)
+    observed_state = {
+        "receipt_state": publication_receipt.get("state"),
+        "checkpoint_schema": checkpoint.get("schema"),
+        "checkpoint_status": checkpoint.get("status"),
+        "checkpoint_binding": {
+            key: checkpoint.get(key)
+            for key in (
+                "result_generation_identity",
+                "validation_run_identity",
+                "activation_identity",
+            )
+        },
+        "active_binding": {
+            key: active.get(key)
+            for key in (
+                "result_generation_identity",
+                "validation_run_identity",
+                "validation_result_sha256",
+            )
+        },
+        "active_is_sealed": (
+            "activation_identity" not in active
+            and "activation_predecessor" not in active
+        ),
+        "published_generation": published.get(
+            "result_generation_identity"
+        ),
+    }
+    expected_state = {
+        "receipt_state": "committed",
+        "checkpoint_schema": (
+            "java-upgrade-analyzer.binary-generation-validation-checkpoint.v3"
+        ),
+        "checkpoint_status": (
+            "independent_validation_passed_pending_activation"
+        ),
+        "checkpoint_binding": {
+            key: binding.get(key)
+            for key in (
+                "result_generation_identity",
+                "validation_run_identity",
+                "activation_identity",
+            )
+        },
+        "active_binding": {
+            key: binding.get(key)
+            for key in (
+                "result_generation_identity",
+                "validation_run_identity",
+                "validation_result_sha256",
+            )
+        },
+        "active_is_sealed": True,
+        "published_generation": binding.get(
+            "result_generation_identity"
+        ),
+    }
+    if observed_state != expected_state:
         raise StepError(
             "committed 报告事务、残留 checkpoint 与已封存 active generation 不一致。",
             reason_codes=["BINARY_STEP4_TRANSACTION_BINDING_MISMATCH"],
@@ -12962,11 +13725,13 @@ def _commit_binary_step4_activation_receipt(report_dir, result):
 
 
 def _step4_activation_recovery_state(report_dir, binding):
+    if not isinstance(binding, dict):
+        return "unbound"
     generation_identity = str(
-        (binding or {}).get("result_generation_identity") or ""
+        binding.get("result_generation_identity") or ""
     )
     activation_identity = str(
-        (binding or {}).get("activation_identity") or ""
+        binding.get("activation_identity") or ""
     )
     if not generation_identity or not activation_identity:
         return "unbound"
@@ -12981,9 +13746,9 @@ def _step4_activation_recovery_state(report_dir, binding):
     if (
         active.get("result_generation_identity") == generation_identity
         and active.get("validation_run_identity")
-        == (binding or {}).get("validation_run_identity")
+        == binding.get("validation_run_identity")
         and active.get("validation_result_sha256")
-        == (binding or {}).get("validation_result_sha256")
+        == binding.get("validation_result_sha256")
         and not active.get("activation_identity")
         and "activation_predecessor" not in active
     ):
@@ -13732,20 +14497,27 @@ _BINARY_RUNTIME_OVERRIDE_KEYS = (
 
 
 def _binary_runtime_overrides(run_context):
+    context = run_context or {}
     return {
-        key: (run_context or {}).get(key)
+        key: context.get(key)
         for key in _BINARY_RUNTIME_OVERRIDE_KEYS
-        if (run_context or {}).get(key) not in (None, "", [], ())
+        if context.get(key) not in (None, "", [], ())
     }
 
 
 def _binary_pipeline_config_path(run_context, project_dir, report_dir):
-    value = str(run_context.get("binary_pipeline_config") or "").strip()
+    if run_context is not None and not isinstance(run_context, dict):
+        raise StepError(
+            "BINARY_PIPELINE_CONTEXT_INVALID: binary pipeline 上下文必须是对象。",
+            reason_codes=["BINARY_PIPELINE_CONTEXT_INVALID"],
+        )
+    context = run_context or {}
+    value = str(context.get("binary_pipeline_config") or "").strip()
     if not value:
         try:
             generated = materialize_binary_pipeline_config(
                 report_dir,
-                runtime_overrides=_binary_runtime_overrides(run_context),
+                runtime_overrides=_binary_runtime_overrides(context),
             )
         except BinaryRuntimeMaterializationError as error:
             raise StepError(
@@ -13773,27 +14545,75 @@ def _binary_pipeline_config_path(run_context, project_dir, report_dir):
 def _resolved_binary_pipeline_config_path(
     run_context, project_dir, report_dir,
 ):
+    if run_context is not None and not isinstance(run_context, dict):
+        raise StepError(
+            "BINARY_PIPELINE_CONTEXT_INVALID: binary pipeline 上下文必须是对象。",
+            reason_codes=["BINARY_PIPELINE_CONTEXT_INVALID"],
+        )
+    context = run_context or {}
     source_path = _binary_pipeline_config_path(
-        run_context, project_dir, report_dir
+        context, project_dir, report_dir
     )
-    config = read_json(source_path)
-    if config.get("source_overlay") and not _pinned_snapshot_matches_context(
-        (run_context or {}).get("pinned_source_snapshot"),
-        run_context or {},
+    try:
+        config = read_json(source_path)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise StepError(
+            f"BINARY_PIPELINE_CONFIG_INVALID: 无法读取 binary pipeline 配置：{source_path}（{error}）",
+            reason_codes=["BINARY_PIPELINE_CONFIG_INVALID"],
+        ) from error
+    if not isinstance(config, dict):
+        raise StepError(
+            "BINARY_PIPELINE_CONFIG_INVALID: binary pipeline 配置必须是 JSON 对象。",
+            reason_codes=["BINARY_PIPELINE_CONFIG_INVALID"],
+        )
+    raw_pinned_snapshot = context.get("pinned_source_snapshot")
+    if raw_pinned_snapshot is not None and not isinstance(
+        raw_pinned_snapshot, dict,
     ):
-        if not list((config.get("source_overlay") or {}).get("source_sets") or []):
+        raise StepError(
+            "BINARY_PIPELINE_CONTEXT_INVALID: pinned_source_snapshot 必须是对象。",
+            reason_codes=["BINARY_PIPELINE_CONTEXT_INVALID"],
+        )
+    raw_overlay = config.get("source_overlay")
+    if raw_overlay not in (None, {}):
+        if not isinstance(raw_overlay, dict):
+            raise StepError(
+                "BINARY_SOURCE_OVERLAY_INVALID: source_overlay 必须是对象。",
+                reason_codes=["BINARY_SOURCE_OVERLAY_INVALID"],
+            )
+        raw_source_sets = raw_overlay.get("source_sets")
+        if not isinstance(raw_source_sets, list) or not raw_source_sets:
             raise StepError(
                 "BINARY_SOURCE_SETS_REQUIRED: source_overlay 必须按业务系统或依赖包分别提供 source_sets。",
                 reason_codes=["BINARY_SOURCE_SETS_REQUIRED"],
             )
+        if any(not isinstance(item, dict) for item in raw_source_sets):
+            raise StepError(
+                "BINARY_SOURCE_SET_INVALID: source_overlay.source_sets 的成员必须是对象。",
+                reason_codes=["BINARY_SOURCE_SET_INVALID"],
+            )
+    else:
+        raw_source_sets = []
+    if raw_source_sets and not _pinned_snapshot_matches_context(
+        raw_pinned_snapshot, context,
+    ):
+        pass
     else:
         # Orchestrated runs rebuild source overlays from temporary immutable
         # worktrees. A caller-provided overlay must not reintroduce mutable
         # application/dependency checkout paths after Step0/Step1 pinning.
         source_sets = []
+        raw_source_dirs = context.get("source_dirs")
+        if raw_source_dirs not in (None, [], ()) and not isinstance(
+            raw_source_dirs, (list, tuple),
+        ):
+            raise StepError(
+                "BINARY_PIPELINE_CONTEXT_INVALID: source_dirs 必须是数组。",
+                reason_codes=["BINARY_PIPELINE_CONTEXT_INVALID"],
+            )
         source_dirs = [
             absolutize_path(str(item), project_dir)
-            for item in ((run_context or {}).get("source_dirs") or [])
+            for item in (raw_source_dirs or [])
             if str(item or "").strip()
         ]
         if source_dirs:
@@ -13809,25 +14629,31 @@ def _resolved_binary_pipeline_config_path(
                 "source_root": source_root,
                 "owner_type": "business",
                 "owner_coord": str(
-                    (run_context or {}).get("target_module")
-                    or (run_context or {}).get("primary_module")
+                    context.get("target_module")
+                    or context.get("primary_module")
                     or "BUSINESS"
                 ),
                 "module": str(
-                    (run_context or {}).get("target_module")
-                    or (run_context or {}).get("primary_module")
+                    context.get("target_module")
+                    or context.get("primary_module")
                     or "root"
                 ),
                 "snapshot_revision": str(
-                    ((run_context or {}).get("pinned_source_snapshot") or {}).get(
-                        "commit"
-                    )
-                    or (run_context or {}).get("current_resolved_commit")
+                    (raw_pinned_snapshot or {}).get("commit")
+                    or context.get("current_resolved_commit")
                     or "content-addressed-only"
                 ),
             })
+        raw_mappings = context.get("dependency_source_mappings")
+        if raw_mappings not in (None, [], ()) and not isinstance(
+            raw_mappings, (list, tuple),
+        ):
+            raise StepError(
+                "BINARY_PIPELINE_CONTEXT_INVALID: dependency_source_mappings 必须是数组。",
+                reason_codes=["BINARY_PIPELINE_CONTEXT_INVALID"],
+            )
         dependency_sets = {}
-        for raw_mapping in (run_context or {}).get("dependency_source_mappings") or []:
+        for raw_mapping in raw_mappings or []:
             coord, source_dir = _split_dependency_repo_mapping_value(raw_mapping)
             if not coord or not source_dir:
                 continue
@@ -13835,31 +14661,57 @@ def _resolved_binary_pipeline_config_path(
             module_root = _guess_module_root_from_source_dir(normalized_dir)
             key = (coord, module_root)
             dependency_sets.setdefault(key, []).append(normalized_dir)
-        dependency_snapshot_by_coord = {
-            str((item or {}).get("coord") or "").strip(): dict(item)
-            for item in ((run_context or {}).get("dependency_source_snapshots") or [])
-            if str((item or {}).get("coord") or "").strip()
-        }
+        raw_snapshots = context.get("dependency_source_snapshots")
+        if raw_snapshots in (None, {}, []):
+            snapshots = []
+        elif not isinstance(raw_snapshots, list) or any(
+            not isinstance(item, dict) for item in raw_snapshots
+        ):
+            raise StepError(
+                "BINARY_PIPELINE_CONTEXT_INVALID: dependency_source_snapshots 必须是对象数组。",
+                reason_codes=["BINARY_PIPELINE_CONTEXT_INVALID"],
+            )
+        else:
+            snapshots = raw_snapshots
+        dependency_snapshot_by_coord = {}
+        for item in snapshots:
+            snapshot_coord = str(item.get("coord") or "").strip()
+            if snapshot_coord:
+                dependency_snapshot_by_coord[snapshot_coord] = dict(item)
+        raw_materializations = context.get(
+            "dependency_source_git_materializations"
+        )
+        if raw_materializations in (None, {}, []):
+            materializations = []
+        elif not isinstance(raw_materializations, list) or any(
+            not isinstance(item, dict) for item in raw_materializations
+        ):
+            raise StepError(
+                "BINARY_PIPELINE_CONTEXT_INVALID: dependency_source_git_materializations 必须是对象数组。",
+                reason_codes=["BINARY_PIPELINE_CONTEXT_INVALID"],
+            )
+        else:
+            materializations = raw_materializations
         for (coord, module_root), mapped_dirs in sorted(dependency_sets.items()):
             snapshot_revision = str(
                 (dependency_snapshot_by_coord.get(coord) or {}).get("commit")
                 or ""
             ).strip().lower() or "content-addressed-only"
-            for materialization in (
-                (run_context or {}).get("dependency_source_git_materializations")
-                or []
-            ):
+            for materialization in materializations:
                 if snapshot_revision != "content-addressed-only":
                     break
+                raw_repo_path = str(materialization.get("repo_path") or "").strip()
+                if not raw_repo_path:
+                    continue
                 repo_path = Path(
-                    str((materialization or {}).get("repo_path") or "")
+                    raw_repo_path
                 ).expanduser().resolve()
                 try:
                     Path(module_root).expanduser().resolve().relative_to(repo_path)
                 except ValueError:
                     continue
                 resolved_commit = str(
-                    (materialization or {}).get("resolved_commit") or ""
+                    materialization.get("resolved_commit") or ""
                 ).strip().lower()
                 if resolved_commit:
                     snapshot_revision = resolved_commit
@@ -13884,14 +14736,14 @@ def _resolved_binary_pipeline_config_path(
             config.pop("source_overlay", None)
     source_sets = list((config.get("source_overlay") or {}).get("source_sets") or [])
     has_business_source = any(
-        str((item or {}).get("owner_type") or "") == "business"
+        str(item.get("owner_type") or "") == "business"
         for item in source_sets
     )
     has_dependency_source = any(
-        str((item or {}).get("owner_type") or "") == "dependency"
+        str(item.get("owner_type") or "") == "dependency"
         for item in source_sets
     )
-    analysis_mode = infer_step1_mode_fields(run_context or {}).get("analysis_mode")
+    analysis_mode = infer_step1_mode_fields(context).get("analysis_mode")
     config["source_inputs"] = {
         "purpose_version": SOURCE_INPUT_PURPOSE_VERSION,
         "business": {
@@ -13907,17 +14759,57 @@ def _resolved_binary_pipeline_config_path(
             "origin": "provided" if has_dependency_source else "not_provided",
         },
     }
-    preflight_sides = (
-        ((run_context or {}).get("step0_preflight") or {}).get("sides") or {}
-    )
+    raw_preflight = context.get("step0_preflight")
+    if raw_preflight in (None, {}, []):
+        preflight = {}
+    elif not isinstance(raw_preflight, dict):
+        raise StepError(
+            "BINARY_PIPELINE_CONTEXT_INVALID: step0_preflight 必须是对象。",
+            reason_codes=["BINARY_PIPELINE_CONTEXT_INVALID"],
+        )
+    else:
+        preflight = raw_preflight
+    raw_preflight_sides = preflight.get("sides")
+    if raw_preflight_sides in (None, {}, []):
+        preflight_sides = {}
+    elif not isinstance(raw_preflight_sides, dict):
+        raise StepError(
+            "BINARY_PIPELINE_CONTEXT_INVALID: step0_preflight.sides 必须是对象。",
+            reason_codes=["BINARY_PIPELINE_CONTEXT_INVALID"],
+        )
+    else:
+        preflight_sides = raw_preflight_sides
     for side_name in ("base", "current"):
+        raw_side_preflight = preflight_sides.get(side_name)
+        if raw_side_preflight is not None and not isinstance(
+            raw_side_preflight, dict,
+        ):
+            raise StepError(
+                f"BINARY_PIPELINE_CONTEXT_INVALID: step0_preflight.sides.{side_name} 必须是对象。",
+                reason_codes=["BINARY_PIPELINE_CONTEXT_INVALID"],
+            )
+        side_preflight = raw_side_preflight or {}
+        raw_jdk_preflight = side_preflight.get("jdk")
+        if raw_jdk_preflight is not None and not isinstance(
+            raw_jdk_preflight, dict,
+        ):
+            raise StepError(
+                f"BINARY_PIPELINE_CONTEXT_INVALID: step0_preflight.sides.{side_name}.jdk 必须是对象。",
+                reason_codes=["BINARY_PIPELINE_CONTEXT_INVALID"],
+            )
         expected_identity = str(
-            (((preflight_sides.get(side_name) or {}).get("jdk") or {}).get(
-                "jdk_preflight_identity"
-            ) or "")
+            (raw_jdk_preflight or {}).get("jdk_preflight_identity") or ""
         )
         if expected_identity:
-            side_config = dict(config.get(side_name) or {})
+            raw_side_config = config.get(side_name)
+            if raw_side_config is not None and not isinstance(
+                raw_side_config, dict,
+            ):
+                raise StepError(
+                    f"BINARY_PIPELINE_CONFIG_INVALID: {side_name} 配置必须是对象。",
+                    reason_codes=["BINARY_PIPELINE_CONFIG_INVALID"],
+                )
+            side_config = dict(raw_side_config or {})
             side_config["jdk_preflight_identity"] = expected_identity
             config[side_name] = side_config
     resolved = runtime_state_dir(report_dir) / "binary_pipeline_config.resolved.json"
@@ -14258,12 +15150,12 @@ def _prepare_binary_report_publication_candidate_in_process(
     except BinaryReportError as error:
         raise StepError(
             f"binary_report in-process prepare 失败：{error}",
-            reason_codes=[str(error.reason_code or "")],
+            reason_codes=[str(error.reason_code)],
             diagnostic={
                 "script": "binary_report.py",
                 "execution_mode": "lock_owning_parent_process",
                 "phase": normalized_phase,
-                "cause_reason_code": str(error.reason_code or ""),
+                "cause_reason_code": str(error.reason_code),
             },
         ) from error
     finally:
@@ -14291,9 +15183,18 @@ def _prepare_binary_step4_deferred_handoff(
         candidate_activation_identity=str(result["activation_identity"]),
     )
     report_seconds = round(time.perf_counter() - report_started, 6)
-    creator_transaction = dict(
-        report_result.get("publication_transaction") or {}
-    )
+    if not isinstance(report_result, dict):
+        raise StepError(
+            "Step4 报告候选创建结果必须是对象。",
+            reason_codes=["BINARY_STEP4_REPORT_TRANSACTION_MISSING"],
+        )
+    raw_creator_transaction = report_result.get("publication_transaction")
+    if not isinstance(raw_creator_transaction, dict):
+        raise StepError(
+            "Step4 报告创建者事务必须是对象。",
+            reason_codes=["BINARY_STEP4_REPORT_TRANSACTION_MISSING"],
+        )
+    creator_transaction = dict(raw_creator_transaction)
     creator_expectation = _step4_report_publication_expectation(
         {"publication_transaction": creator_transaction},
         required=True,
@@ -14313,6 +15214,11 @@ def _prepare_binary_step4_deferred_handoff(
             "Step4 报告创建者事务已被替换或无法验证。",
             reason_codes=["BINARY_STEP4_REPORT_TRANSACTION_MISSING"],
         ) from error
+    if not isinstance(publication_receipt, dict):
+        raise StepError(
+            "Step4 报告创建者事务回执必须是对象。",
+            reason_codes=["BINARY_STEP4_REPORT_TRANSACTION_MISSING"],
+        )
     active_for_publication = _read_step4_active_descriptor(report_dir)
     expected_publication_binding = {
         "result_generation_identity": result[
@@ -14325,24 +15231,49 @@ def _prepare_binary_step4_deferred_handoff(
         "activation_identity": result["activation_identity"],
         "report_implementation_identity": report_implementation_identity(),
     }
-    if (
-        report_result.get("phase") != "step4"
-        or active_for_publication.get("result_generation_identity")
-        != result["result_generation_identity"]
-        or active_for_publication.get("validation_run_identity")
-        != result["validation_run_identity"]
-        or active_for_publication.get("activation_identity")
-        != result["activation_identity"]
-        or publication_receipt.get("state") != "pending_gate"
-        or publication_receipt.get("binding")
-        != expected_publication_binding
-        or creator_transaction.get("published_content_identity")
-        != publication_receipt.get("published_content_identity")
-        or creator_transaction.get("destinations")
-        != publication_receipt.get("destinations")
-        or creator_transaction.get("candidate_destinations")
-        != publication_receipt.get("candidate_destinations")
-    ):
+    observed_publication_state = {
+        "phase": report_result.get("phase"),
+        "active_binding": {
+            "result_generation_identity": active_for_publication.get(
+                "result_generation_identity"
+            ),
+            "validation_run_identity": active_for_publication.get(
+                "validation_run_identity"
+            ),
+            "activation_identity": active_for_publication.get(
+                "activation_identity"
+            ),
+        },
+        "receipt_state": publication_receipt.get("state"),
+        "receipt_binding": publication_receipt.get("binding"),
+        "published_content_identity": publication_receipt.get(
+            "published_content_identity"
+        ),
+        "destinations": publication_receipt.get("destinations"),
+        "candidate_destinations": publication_receipt.get(
+            "candidate_destinations"
+        ),
+    }
+    expected_publication_state = {
+        "phase": "step4",
+        "active_binding": {
+            "result_generation_identity": result[
+                "result_generation_identity"
+            ],
+            "validation_run_identity": result["validation_run_identity"],
+            "activation_identity": result["activation_identity"],
+        },
+        "receipt_state": "pending_gate",
+        "receipt_binding": expected_publication_binding,
+        "published_content_identity": creator_transaction.get(
+            "published_content_identity"
+        ),
+        "destinations": creator_transaction.get("destinations"),
+        "candidate_destinations": creator_transaction.get(
+            "candidate_destinations"
+        ),
+    }
+    if observed_publication_state != expected_publication_state:
         raise StepError(
             "Step4 报告未进入创建者绑定的 pending-gate 事务状态。",
             reason_codes=["BINARY_STEP4_REPORT_TRANSACTION_MISSING"],
@@ -14484,15 +15415,28 @@ def _finalize_binary_step4_transaction(
 ):
     """Delete a retained checkpoint only after report publication and its gate."""
 
-    if not bool((result or {}).get("validation_checkpoint_retained")):
+    if result is None:
         return False
+    if not isinstance(result, dict):
+        raise StepError(
+            "Step4 事务结果必须是对象。",
+            reason_codes=["BINARY_STEP4_TRANSACTION_CHECKPOINT_INVALID"],
+        )
+    retained = result.get("validation_checkpoint_retained")
+    if retained in (None, False):
+        return False
+    if retained is not True:
+        raise StepError(
+            "Step4 事务 checkpoint retained 标记必须是布尔值。",
+            reason_codes=["BINARY_STEP4_TRANSACTION_CHECKPOINT_INVALID"],
+        )
     report = Path(report_dir).resolve()
     binary_root = report / BINARY_OUTPUT_RELATIVE_PATH
     checkpoint_path = (
         binary_root / "binary_observability" / "validation_checkpoint.json"
     )
     declared_path = Path(
-        str((result or {}).get("validation_checkpoint_path") or "")
+        str(result.get("validation_checkpoint_path", ""))
     )
     transaction_expectation = _step4_report_publication_expectation(
         result, required=True
@@ -14515,43 +15459,75 @@ def _finalize_binary_step4_transaction(
             f"Step4 事务 checkpoint 无法完成提交：{error}",
             reason_codes=["BINARY_STEP4_TRANSACTION_CHECKPOINT_INVALID"],
         ) from error
-    generation_identity = str(
-        (result or {}).get("result_generation_identity") or ""
-    )
-    validation_identity = str((result or {}).get("validation_run_identity") or "")
-    activation_identity = str((result or {}).get("activation_identity") or "")
+    if (
+        not isinstance(checkpoint, dict)
+        or not isinstance(active, dict)
+        or not isinstance(publication_receipt, dict)
+        or not isinstance(published, dict)
+    ):
+        raise StepError(
+            "Step4 事务 checkpoint、active、报告回执及已发布摘要必须是对象。",
+            reason_codes=["BINARY_STEP4_TRANSACTION_CHECKPOINT_INVALID"],
+        )
+    generation_identity = str(result.get("result_generation_identity") or "")
+    validation_identity = str(result.get("validation_run_identity") or "")
+    activation_identity = str(result.get("activation_identity") or "")
     expected_publication_binding = {
         "result_generation_identity": generation_identity,
         "validation_run_identity": validation_identity,
         "validation_result_sha256": active.get("validation_result_sha256"),
         "activation_identity": activation_identity,
     }
-    actual_publication_binding = dict(
-        publication_receipt.get("binding") or {}
-    )
-    actual_publication_binding.pop("report_implementation_identity", None)
-    if (
-        declared_path != expected_path
-        or checkpoint.get("schema")
-        != "java-upgrade-analyzer.binary-generation-validation-checkpoint.v3"
-        or checkpoint.get("status")
-        != "independent_validation_passed_pending_activation"
-        or checkpoint.get("result_generation_identity") != generation_identity
-        or checkpoint.get("validation_run_identity") != validation_identity
-        or checkpoint.get("activation_identity") != activation_identity
-        or active.get("result_generation_identity") != generation_identity
-        or (
-            active.get("activation_identity")
-            and active.get("activation_identity") != activation_identity
+    raw_publication_binding = publication_receipt.get("binding")
+    if not isinstance(raw_publication_binding, dict):
+        raise StepError(
+            "Step4 事务报告回执 binding 必须是对象。",
+            reason_codes=["BINARY_STEP4_TRANSACTION_CHECKPOINT_INVALID"],
         )
-        or published.get("result_generation_identity") != generation_identity
-        or publication_receipt.get("state") not in {
+    actual_publication_binding = dict(raw_publication_binding)
+    actual_publication_binding.pop("report_implementation_identity", None)
+    active_activation_identity = active.get("activation_identity")
+    if active_activation_identity is None:
+        active_activation_identity = activation_identity
+    observed_binding = {
+        "declared_path": declared_path,
+        "checkpoint_schema": checkpoint.get("schema"),
+        "checkpoint_status": checkpoint.get("status"),
+        "checkpoint_generation": checkpoint.get(
+            "result_generation_identity"
+        ),
+        "checkpoint_validation": checkpoint.get("validation_run_identity"),
+        "checkpoint_activation": checkpoint.get("activation_identity"),
+        "active_generation": active.get("result_generation_identity"),
+        "active_activation": active_activation_identity,
+        "published_generation": published.get(
+            "result_generation_identity"
+        ),
+        "publication_state_accepted": publication_receipt.get("state") in {
             "gate_passed", "published"
-        }
-        or actual_publication_binding != expected_publication_binding
-        or publication_receipt.get("gate_receipt")
-        != (result or {}).get("report_publication_gate_receipt")
-    ):
+        },
+        "publication_binding": actual_publication_binding,
+        "gate_receipt": publication_receipt.get("gate_receipt"),
+    }
+    expected_binding = {
+        "declared_path": expected_path,
+        "checkpoint_schema": (
+            "java-upgrade-analyzer.binary-generation-validation-checkpoint.v3"
+        ),
+        "checkpoint_status": (
+            "independent_validation_passed_pending_activation"
+        ),
+        "checkpoint_generation": generation_identity,
+        "checkpoint_validation": validation_identity,
+        "checkpoint_activation": activation_identity,
+        "active_generation": generation_identity,
+        "active_activation": activation_identity,
+        "published_generation": generation_identity,
+        "publication_state_accepted": True,
+        "publication_binding": expected_publication_binding,
+        "gate_receipt": result.get("report_publication_gate_receipt"),
+    }
+    if observed_binding != expected_binding:
         raise StepError(
             "Step4 事务 checkpoint、active generation 与已发布报告身份不一致。",
             reason_codes=["BINARY_STEP4_TRANSACTION_BINDING_MISMATCH"],
@@ -14604,6 +15580,11 @@ def _complete_binary_step4_after_gate(
     strict_risk_gate,
     result,
 ):
+    if not isinstance(result, dict):
+        raise StepError(
+            "Step4 待提交事务结果必须是对象。",
+            reason_codes=["BINARY_STEP4_TRANSACTION_COMMIT_FAILED"],
+        )
     destinations = _step4_report_publication_destinations(report_dir)
     transaction_expectation = _step4_report_publication_expectation(
         result, required=True
@@ -14614,11 +15595,11 @@ def _complete_binary_step4_after_gate(
             report_dir,
             project_dir,
             strict_risk_gate=bool(strict_risk_gate),
-            publication_transaction=(
-                result or {}
-            ).get("report_publication_transaction"),
+            publication_transaction=result.get(
+                "report_publication_transaction"
+            ),
             candidate_activation_identity=str(
-                (result or {}).get("activation_identity") or ""
+                result.get("activation_identity") or ""
             ),
         )
         gate_receipt = mark_report_publication_gate_passed(
@@ -14652,7 +15633,7 @@ def _complete_binary_step4_after_gate(
                 str(error),
                 reason_codes=list(error.reason_codes),
                 diagnostic={
-                    **dict(error.diagnostic or {}),
+                    **dict(error.diagnostic),
                     **rollback,
                 },
             ) from error
@@ -14677,11 +15658,25 @@ def _complete_binary_step4_after_gate(
     global_release = reconcile_current_release(
         report_dir, workflow_lock_held=True
     )
-    if (
-        (global_release.get("step4") or {}).get("status") != "current"
-        or (global_release.get("step5") or {}).get("status") != "stale"
-        or (global_release.get("step6") or {}).get("status") != "stale"
-    ):
+    if not isinstance(global_release, dict):
+        raise StepError(
+            "Step4 提交后全局 release 必须是对象。",
+            reason_codes=["BINARY_GLOBAL_RELEASE_STATE_INVALID"],
+        )
+    release_statuses = {}
+    for step_id in ("step4", "step5", "step6"):
+        step_release = global_release.get(step_id)
+        if not isinstance(step_release, dict):
+            raise StepError(
+                f"Step4 提交后全局 release.{step_id} 必须是对象。",
+                reason_codes=["BINARY_GLOBAL_RELEASE_STATE_INVALID"],
+            )
+        release_statuses[step_id] = step_release.get("status")
+    if release_statuses != {
+        "step4": "current",
+        "step5": "stale",
+        "step6": "stale",
+    }:
         raise StepError(
             "Step4 提交后全局 release 未将下游阶段标记为 stale。",
             reason_codes=["BINARY_GLOBAL_RELEASE_STATE_INVALID"],
@@ -14841,14 +15836,27 @@ def _republish_current_binary_step4_reports(
                 workflow_lock_held=True,
                 active_lock_held=True,
             )
-            if (
-                (global_release.get("step4") or {}).get("status")
-                != "current"
-                or (global_release.get("step5") or {}).get("status")
-                != "stale"
-                or (global_release.get("step6") or {}).get("status")
-                != "stale"
-            ):
+            if not isinstance(global_release, dict):
+                raise StepError(
+                    "Step4 重发布后全局 release 必须是对象。",
+                    reason_codes=["BINARY_GLOBAL_RELEASE_STATE_INVALID"],
+                )
+            release_statuses = {}
+            for step_id in ("step4", "step5", "step6"):
+                step_release = global_release.get(step_id)
+                if not isinstance(step_release, dict):
+                    raise StepError(
+                        f"Step4 重发布后全局 release.{step_id} 必须是对象。",
+                        reason_codes=[
+                            "BINARY_GLOBAL_RELEASE_STATE_INVALID"
+                        ],
+                    )
+                release_statuses[step_id] = step_release.get("status")
+            if release_statuses != {
+                "step4": "current",
+                "step5": "stale",
+                "step6": "stale",
+            }:
                 raise StepError(
                     "Step4 重发布后全局 release 未将下游阶段标记为 stale。",
                     reason_codes=["BINARY_GLOBAL_RELEASE_STATE_INVALID"],
@@ -15139,18 +16147,34 @@ def _run_downstream_report_publication(
             strict_risk_gate=bool(strict_risk_gate),
             workflow_lock_held=True,
         )
-        release = dict(completion.get("global_release") or {})
+        raw_release = completion.get("global_release")
+        if not isinstance(raw_release, dict):
+            raise StepError(
+                f"{stage.capitalize()} 提交后的全局 release 必须是对象。",
+                reason_codes=["BINARY_GLOBAL_RELEASE_STATE_INVALID"],
+            )
+        release = dict(raw_release)
         expected_current = (
             ("step4", "step5")
             if stage == "step5"
             else ("step4", "step5", "step6")
         )
         expected_stale = ("step6",) if stage == "step5" else ()
+        release_statuses = {}
+        for item in (*expected_current, *expected_stale):
+            stage_release = release.get(item)
+            if not isinstance(stage_release, dict):
+                raise StepError(
+                    f"{stage.capitalize()} 提交后的全局 release.{item} "
+                    "必须是对象。",
+                    reason_codes=["BINARY_GLOBAL_RELEASE_STATE_INVALID"],
+                )
+            release_statuses[item] = stage_release.get("status")
         if any(
-            (release.get(item) or {}).get("status") != "current"
+            release_statuses[item] != "current"
             for item in expected_current
         ) or any(
-            (release.get(item) or {}).get("status") != "stale"
+            release_statuses[item] != "stale"
             for item in expected_stale
         ):
             raise StepError(
@@ -15265,8 +16289,6 @@ def _execute_step_unlocked(
     dep_current = step1_current_resolved_path(report_dir)
     context_json = step2_context_path(report_dir)
     s4_dir = step4_api_changes_dir(report_dir)
-    binary_step4_result = None
-    binary_step4_handoff_completed = False
     downstream_publication_result = None
 
     if step_id == "step0":
@@ -15449,7 +16471,7 @@ def _execute_step_unlocked(
                     if "strict_risk_gate" in run_context
                     else bool(getattr(args, "strict_risk_gate", False))
                 )
-                binary_step4_result = _run_binary_step4(
+                _run_binary_step4(
                     run_context=fully_pinned_context,
                     project_dir=project_dir,
                     report_dir=report_dir,
@@ -15458,7 +16480,6 @@ def _execute_step_unlocked(
                     gate_name=manifest_steps[step_id].get("gate"),
                     strict_risk_gate=step4_strict_risk_gate,
                 )
-                binary_step4_handoff_completed = True
 
     elif step_id == "step5":
         validate_run_context_for_step(step_id, run_context)
@@ -15537,23 +16558,12 @@ def _execute_step_unlocked(
 
     refreshed_run_context = build_run_context(args, run_context, {}, allow_external_seed=False)
     gate_name = manifest_steps[step_id].get("gate")
-    if step_id == "step4" and binary_step4_handoff_completed:
-        pass
-    elif (
-        step_id == "step4"
-        and binary_step4_result is not None
-        and binary_step4_result.get("validation_checkpoint_retained")
-    ):
-        _complete_binary_step4_after_gate(
-            report_dir=report_dir,
-            project_dir=project_dir,
-            gate_name=gate_name,
-            strict_risk_gate=bool(
-                refreshed_run_context.get("strict_risk_gate")
-            ),
-            result=binary_step4_result,
-        )
-    elif downstream_publication_result is None:
+    # Step4's current implementation completes its deferred handoff, gate and
+    # checkpoint finalization inside ``_run_binary_step4``.  The former
+    # post-return completion branches were unreachable: every successful
+    # Step4 return had already completed that handoff.  Other steps retain the
+    # ordinary gate path below.
+    if step_id != "step4" and downstream_publication_result is None:
         run_gate(
             gate_name,
             report_dir,
@@ -15562,10 +16572,6 @@ def _execute_step_unlocked(
                 refreshed_run_context.get("strict_risk_gate")
             ),
         )
-        if step_id == "step4" and binary_step4_result is not None:
-            _finalize_binary_step4_transaction(
-                report_dir, binary_step4_result
-            )
     if step_id == "step1":
         dependency_source_interaction = build_step1_dependency_source_interaction(
             refreshed_run_context,
@@ -16052,7 +17058,8 @@ def _apply_step4_startup_recovery(
 ):
     """Apply one classified recovery before any workflow fast path."""
 
-    action = str((decision or {}).get("action") or "").strip()
+    decision_payload = dict(decision or {})
+    action = str(decision_payload.get("action") or "").strip()
     result = {
         "action": action,
         "applied": False,
@@ -16072,10 +17079,10 @@ def _apply_step4_startup_recovery(
         raise StepError(
             "Step4 中断事务状态无法安全归属，已拒绝继续。",
             reason_codes=[
-                str((decision or {}).get("reason_code") or "")
+                str(decision_payload.get("reason_code") or "")
                 or "BINARY_STEP4_TRANSACTION_RECOVERY_FAILED"
             ],
-            diagnostic={"step4_recovery": dict(decision or {})},
+            diagnostic={"step4_recovery": dict(decision_payload)},
         )
     if action not in {
         _STEP4_RELEASE_CURRENT,
@@ -16085,7 +17092,7 @@ def _apply_step4_startup_recovery(
         raise StepError(
             "Step4 恢复分类返回了未知动作。",
             reason_codes=["BINARY_STEP4_TRANSACTION_RECOVERY_FAILED"],
-            diagnostic={"step4_recovery": dict(decision or {})},
+            diagnostic={"step4_recovery": dict(decision_payload)},
         )
     if (
         not _workflow_has_reached_step4(main_state, report_dir)
@@ -16523,9 +17530,10 @@ def _main_with_workflow_lock_held(argv=None, _skip_environment_contract=False):
         help="输出 Step0 的统一信息确认协议（JSON）。",
     )
     args = ap.parse_args(argv_values)
-    args.active_maven_profiles = _dedupe_strings(
-        args.active_maven_profiles or []
-    ) if args.active_maven_profiles is not None else None
+    if args.active_maven_profiles is not None:
+        args.active_maven_profiles = _dedupe_strings(
+            args.active_maven_profiles
+        )
     args.dependency_source_dirs = _dedupe_strings(flatten_cli_values(args.dependency_source_dirs))
 
     if args.describe_step0_contract:
@@ -16634,8 +17642,9 @@ def _main_with_workflow_lock_held(argv=None, _skip_environment_contract=False):
         if "strict_risk_gate" in step4_recovery_context
         else bool(args.strict_risk_gate)
     )
+    step4_manifest = dict(manifest_steps.get("step4") or {})
     expected_step4_gate_name = str(
-        (manifest_steps.get("step4") or {}).get("gate") or ""
+        step4_manifest.get("gate") or ""
     )
     try:
         step4_startup_recovery = (
@@ -16770,7 +17779,7 @@ def _main_with_workflow_lock_held(argv=None, _skip_environment_contract=False):
             file=sys.stderr,
         )
 
-    pending_interaction = (main_state.get("state") or {}).get("pending_interaction")
+    pending_interaction = main_state["state"].get("pending_interaction")
     if pending_interaction:
         original_pending_interaction = pending_interaction
         pending_interaction = _sanitize_git_persistence_payload(
@@ -16795,7 +17804,8 @@ def _main_with_workflow_lock_held(argv=None, _skip_environment_contract=False):
         args.step == "auto"
         and not has_structured_response
         and not pending_interaction
-        and str(((main_state or {}).get("state") or {}).get("current_step") or "").strip() == "done"
+        and str(main_state["state"].get("current_step") or "").strip()
+        == "done"
     ):
         try:
             require_current_release_stage(
@@ -16861,14 +17871,14 @@ def _main_with_workflow_lock_held(argv=None, _skip_environment_contract=False):
     if response_result["early_exit_code"] is not None:
         return response_result["early_exit_code"]
 
-    forced_recovery_steps = [
-        str(value or "").strip()
-        for value in (
-            step4_startup_recovery.get("forced_step_id"),
-            downstream_startup_state.get("forced_step_id"),
-        )
-        if str(value or "").strip() in STEP_SEQUENCE
-    ]
+    forced_recovery_steps = []
+    for value in (
+        step4_startup_recovery.get("forced_step_id"),
+        downstream_startup_state.get("forced_step_id"),
+    ):
+        normalized_value = str(value or "").strip()
+        if normalized_value in STEP_SEQUENCE:
+            forced_recovery_steps.append(normalized_value)
     forced_recovery_step = (
         min(forced_recovery_steps, key=step_index)
         if forced_recovery_steps
@@ -16983,6 +17993,7 @@ def _main_with_workflow_lock_held(argv=None, _skip_environment_contract=False):
         run_context = build_run_context(args, run_context, {}, allow_external_seed=False)
         auto_continued_success_review = False
         informational_interaction = None
+        step_meta = dict(manifest_steps.get(step_id) or {})
         if should_auto_continue_success_review(step_id, interaction, manifest_steps):
             if step_id == "step5":
                 informational_interaction = build_informational_success_interaction(
@@ -16992,8 +18003,8 @@ def _main_with_workflow_lock_held(argv=None, _skip_environment_contract=False):
             auto_continued_success_review = True
         elif (
             not interaction
-            and (manifest_steps.get(step_id) or {}).get("auto_continue_on_success")
-            and not (manifest_steps.get(step_id) or {}).get("requires_scope_confirmation")
+            and step_meta.get("auto_continue_on_success")
+            and not step_meta.get("requires_scope_confirmation")
         ):
             auto_continued_success_review = True
         if auto_continued_success_review:

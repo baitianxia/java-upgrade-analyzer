@@ -55,6 +55,7 @@ from binary_first_model import (
     RuntimeProfile,
 )
 from binary_output import (
+    BinaryOutputError,
     _discard_release_recapture_activation,
     _release_recapture_publication,
     activate_binary_generation,
@@ -96,7 +97,11 @@ from binary_validation_contract import (
     validator_source_identity,
 )
 import enhanced_source_analyzer as source_analyzer
-from enhanced_source_analyzer import analyze_file, extract_call_edges_enhanced
+from enhanced_source_analyzer import (
+    analyze_file,
+    extract_call_edges_enhanced,
+    install_global_type_knowledge,
+)
 from path_runtime import short_temporary_directory
 from jdk_preflight import JdkPreflightError, preflight_jdk_home
 from process_lock import exclusive_file_lock
@@ -379,7 +384,6 @@ def _write_non_authoritative_json(
         if (
             requested.parent.name != "binary_observability"
             or requested.name in {"", ".", ".."}
-            or Path(requested.name).name != requested.name
         ):
             raise OSError(
                 "observability destination is outside its physical directory"
@@ -889,7 +893,7 @@ def _runtime_distribution_record(
             continue
         if "__pycache__" in parts or relative_path.suffix in {".pyc", ".pyo"}:
             continue
-        if relative_path.is_absolute() or ".." in parts:
+        if ".." in parts:
             raise BinaryPipelineError(
                 "BINARY_GENERATION_RUNTIME_IDENTITY_UNAVAILABLE",
                 f"{distribution_name}: unsafe installed path {raw_relative}",
@@ -1166,7 +1170,7 @@ def _resume_config_identity(config: Mapping[str, Any]) -> str:
                 logical_dirs.append(str(source_dir))
                 continue
             try:
-                logical_dirs.append(source_dir.relative_to(root).as_posix() or ".")
+                logical_dirs.append(source_dir.relative_to(root).as_posix())
             except ValueError:
                 # Invalid/out-of-snapshot paths must not accidentally become
                 # resumable merely because a physical prefix was removed.
@@ -1210,7 +1214,7 @@ def _resume_source_input_identity(config: Mapping[str, Any]) -> str:
                     "BINARY_RESUME_SOURCE_ROOT_MISSING", str(root)
                 )
             try:
-                logical_dirs.append(root.relative_to(common).as_posix() or ".")
+                logical_dirs.append(root.relative_to(common).as_posix())
             except ValueError as error:
                 raise BinaryPipelineError(
                     "BINARY_RESUME_SOURCE_ROOT_OUTSIDE_SNAPSHOT", str(root)
@@ -1297,7 +1301,6 @@ def _physical_observability_directory(
             stat.S_ISLNK(observed.st_mode)
             or not stat.S_ISDIR(observed.st_mode)
             or observability.resolve(strict=True) != observability
-            or observability.parent != root
         ):
             raise OSError(
                 "binary_observability is not a physical child directory"
@@ -2425,8 +2428,7 @@ def _resume_generation_integrity_valid(
             or "/" in name
             or "\\" in name
             or "\x00" in name
-            or Path(name).name != name
-            or not re.fullmatch(r"[0-9a-f]{64}", str(expected_sha256 or ""))
+            or not re.fullmatch(r"[0-9a-f]{64}", str(expected_sha256))
         ):
             return False
         sidecar = generation / name
@@ -2524,17 +2526,8 @@ def _resume_checkpoint_metadata(
         expected_fields.add("activation_identity")
     if set(checkpoint) != expected_fields:
         return "BINARY_RESUME_CHECKPOINT_FIELDS_INVALID", {}
-    validation_fields_present = {
-        key for key in ("validation_run_identity", "validation_result_sha256")
-        if key in checkpoint
-    }
-    if status == _RESUME_AWAITING_VALIDATION:
-        if validation_fields_present:
-            return "BINARY_RESUME_VALIDATION_STATE_INVALID", {}
-    elif (
-        validation_fields_present
-        != {"validation_run_identity", "validation_result_sha256"}
-        or not _is_sha256_identity(checkpoint.get("validation_run_identity"))
+    if status != _RESUME_AWAITING_VALIDATION and (
+        not _is_sha256_identity(checkpoint.get("validation_run_identity"))
         or not _is_sha256_identity(checkpoint.get("validation_result_sha256"))
     ):
         return "BINARY_RESUME_VALIDATION_STATE_INVALID", {}
@@ -2855,8 +2848,6 @@ def _checkpoint_validation_attachment(
         if (
             validation_dir_resolved != validation_dir
             or path_resolved != path
-            or path_resolved.parent != validation_dir_resolved
-            or path.is_symlink()
             or not path.is_file()
         ):
             raise OSError("validation attachment is not a bound regular file")
@@ -2923,8 +2914,6 @@ def _checkpoint_validator_attachment_is_stale(
         if (
             validation_dir_resolved != validation_dir
             or path_resolved != path
-            or path_resolved.parent != validation_dir_resolved
-            or path.is_symlink()
             or not path.is_file()
         ):
             return False
@@ -2999,8 +2988,6 @@ def _discover_current_validation_attachment(
             resolved = path.resolve(strict=True)
             if (
                 resolved != path
-                or resolved.parent != validation_dir
-                or path.is_symlink()
                 or not path.is_file()
             ):
                 continue
@@ -3476,8 +3463,7 @@ def _resume_generation_validation(
     )
     manifest_path = generation / "result_generation.json"
     if (
-        not generation_identity
-        or generation != expected_generation
+        generation != expected_generation
         or not generation.is_dir()
     ):
         _record_resume_decision(
@@ -4319,6 +4305,8 @@ def _performance_authority_gate_binding(
                 evidence,
                 _current_source_implementation=live_runtime_implementation,
             )
+        except BinaryPipelineError:
+            raise
         except Exception as error:
             raise BinaryPipelineError(
                 "BINARY_PERFORMANCE_PROVISIONAL_VERIFICATION_UNAVAILABLE",
@@ -5103,7 +5091,9 @@ def _validate_static_artifact_inputs(config: Mapping[str, Any]) -> None:
             lineage = str(
                 raw.get("lineage") or raw.get("coord") or logical
             ).strip()
-            if not lineage or lineage in lineages:
+            # logical_location is already required and is the final fallback,
+            # so an empty lineage is impossible after the checks above.
+            if lineage in lineages:
                 raise BinaryPipelineError(
                     "BINARY_ARTIFACT_LINEAGE_AMBIGUOUS", lineage
                 )
@@ -5764,7 +5754,11 @@ def _runtime_profile(
         "version": platform.release.get("JAVA_VERSION", "unknown"),
         "major": platform.java_major,
     }
-    if int((raw["target_jvm"] or {}).get("major") or 0) != platform.java_major:
+    target_jvm = raw["target_jvm"]
+    if (
+        not isinstance(target_jvm, Mapping)
+        or int(target_jvm.get("major") or 0) != platform.java_major
+    ):
         raise BinaryPipelineError(
             "BINARY_PIPELINE_TARGET_JVM_MISMATCH", str(raw["target_jvm"])
         )
@@ -6007,6 +6001,7 @@ def _source_methods(source_config: Mapping[str, Any]):
                 if any(item.get("language") == language for item in set_manifest)
             }.items())),
         })
+    methods = install_global_type_knowledge(methods)
     snapshot_identity = _identity("source_snapshot_identity", {"files": manifest})
     return (
         methods,
@@ -6031,20 +6026,28 @@ def _source_explanations(
     *,
     analysis_context_identity: str,
 ) -> dict[str, Any]:
-    mapped_by_symbol = {
-        str((row.get("source_location") or {}).get("source_symbol_id") or ""): row
-        for row in source_overlay.rows
-        if row.get("mapping_status") == "mapped"
-        and (row.get("source_location") or {}).get("source_symbol_id")
-    }
+    mapped_by_symbol = {}
+    for row in source_overlay.rows:
+        if not isinstance(row, Mapping) or row.get("mapping_status") != "mapped":
+            continue
+        raw_location = row.get("source_location")
+        if not isinstance(raw_location, Mapping):
+            continue
+        source_symbol_id = str(raw_location.get("source_symbol_id") or "")
+        if not source_symbol_id:
+            continue
+        mapped_by_symbol[source_symbol_id] = (row, dict(raw_location))
     declarations = []
     candidates = []
     for method in methods:
-        overlay = mapped_by_symbol.get(str(getattr(method, "symbol_id", "") or ""))
-        if not overlay:
+        mapped = mapped_by_symbol.get(
+            str(getattr(method, "symbol_id", "") or "")
+        )
+        if mapped is None:
             continue
-        location = dict(overlay.get("source_location") or {})
-        member = dict(overlay.get("binary_member") or {})
+        overlay, location = mapped
+        raw_member = overlay.get("binary_member")
+        member = dict(raw_member) if isinstance(raw_member, Mapping) else {}
         declared_signature = str(
             getattr(method, "declared_signature", "") or ""
         ).strip()
@@ -6129,6 +6132,42 @@ def _source_explanations(
         "declarations": declarations,
         "candidate_relationships": candidates,
     }
+
+
+def _source_mapping_status_counts(
+    rows: Iterable[Mapping[str, Any]],
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        status = str(row.get("mapping_status") or "unknown")
+        counts[status] = counts.get(status, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _nonempty_first_column(rows: Iterable[Sequence[Any]]) -> set[Any]:
+    return {row[0] for row in rows if row[0]}
+
+
+def _single_parser_identity(parser_identities: Iterable[str]) -> str:
+    observed = sorted(set(parser_identities))
+    if len(observed) != 1:
+        raise BinaryPipelineError(
+            "BINARY_PIPELINE_PARSER_IDENTITY_SET_INVALID",
+            str(observed),
+        )
+    return observed[0]
+
+
+def _should_prune_generation_after_result(
+    *,
+    performance_measurement_run: bool,
+    checkpoint_receipt: Mapping[str, Any],
+    candidate_discarded: bool,
+) -> bool:
+    return bool(
+        not performance_measurement_run
+        and (not checkpoint_receipt or candidate_discarded)
+    )
 
 
 def _run_pipeline_under_lock(
@@ -6721,20 +6760,17 @@ def _run_pipeline_under_lock(
             common_runtime_classes = set()
             for store in (base_store, current_store):
                 common_runtime_classes.update(
-                    row[0]
-                    for row in store.connection.execute(
+                    _nonempty_first_column(store.connection.execute(
                         "SELECT DISTINCT class_name FROM classes"
-                    )
-                    if row[0]
+                    ))
                 )
                 common_runtime_classes.update(
-                    row[0]
-                    for row in store.connection.execute(
+                    _nonempty_first_column(store.connection.execute(
                         """
                         SELECT DISTINCT symbolic_owner FROM direct_edges
                         WHERE symbolic_owner<>''
                         """
-                    )
+                    ))
                 )
             base_retained_kinds = {
                 "resource_selection",
@@ -6812,12 +6848,11 @@ def _run_pipeline_under_lock(
                     source_overlay,
                     analysis_context_identity=context.identity,
                 )
-                mapping_status_counts: dict[str, int] = {}
-                for row in source_overlay.rows:
-                    status = str(row.get("mapping_status") or "unknown")
-                    mapping_status_counts[status] = mapping_status_counts.get(status, 0) + 1
-                source_attestation["mapping_status_counts"] = dict(
-                    sorted(mapping_status_counts.items())
+                mapping_status_counts = _source_mapping_status_counts(
+                    source_overlay.rows
+                )
+                source_attestation["mapping_status_counts"] = (
+                    mapping_status_counts
                 )
                 source_attestation["mapped_binary_member_count"] = int(
                     mapping_status_counts.get("mapped", 0)
@@ -6909,13 +6944,7 @@ def _run_pipeline_under_lock(
             })
             base_store.connection.commit()
             current_store.connection.commit()
-            parser_identities = sorted(parser_identities)
-            if len(parser_identities) != 1:
-                raise BinaryPipelineError(
-                    "BINARY_PIPELINE_PARSER_IDENTITY_SET_INVALID",
-                    str(parser_identities),
-                )
-            parser_identity = parser_identities[0]
+            parser_identity = _single_parser_identity(parser_identities)
             base_input_slice = FactBuildInputSlice(
                 base_build.provenance_identity,
                 tuple(
@@ -7266,18 +7295,20 @@ def _run_pipeline_under_lock(
                 pairings,
             )
             store_cleanup_actions = []
-            if base_store_open:
-                base_store_open = False
-                store_cleanup_actions.append((
+            # Reaching immutable generation validation proves both stores were
+            # constructed successfully and neither flag has been cleared yet.
+            base_store_open = False
+            current_store_open = False
+            store_cleanup_actions.extend((
+                (
                     "close base binary fact store before validation",
                     base_store.close,
-                ))
-            if current_store_open:
-                current_store_open = False
-                store_cleanup_actions.append((
+                ),
+                (
                     "close current binary fact store before validation",
                     current_store.close,
-                ))
+                ),
+            ))
             _attempt_cleanups(store_cleanup_actions, primary=None)
             gc.collect()
             validation, validation_checkpoint = (
@@ -7299,7 +7330,7 @@ def _run_pipeline_under_lock(
                     manifest,
                     validation,
                     activation_identity=str(
-                        validation_checkpoint.get("activation_identity") or ""
+                        validation_checkpoint["activation_identity"]
                     ),
                     activation_record=activation_record,
                     defer_publication=retain_validation_checkpoint,
@@ -7426,9 +7457,10 @@ def _run_pipeline_under_lock(
             # returns. Its private root is removed as a whole by the harness,
             # so generation GC here would both race that read and save no
             # persistent disk space.
-            if (
-                not performance_measurement_run
-                and (not checkpoint_receipt or candidate_discarded)
+            if _should_prune_generation_after_result(
+                performance_measurement_run=performance_measurement_run,
+                checkpoint_receipt=checkpoint_receipt,
+                candidate_discarded=candidate_discarded,
             ):
                 _prune_unreferenced_generations_best_effort(output_root)
             return result

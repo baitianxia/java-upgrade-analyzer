@@ -42,7 +42,8 @@ VERSIONED_CLASS_RE = re.compile(
 MIN_MULTI_RELEASE_VERSION = 8
 ACC_MODULE = 0x8000
 CLASS_DECLARATION_RE = re.compile(
-    r"^(?:\S+\s+)*(?:class|interface|enum|record)\s+"
+    r"^(?:(?:public|protected|private|abstract|static|final|strictfp|sealed|"
+    r"non-sealed)\s+)*(?:class|interface|enum|record)\s+"
     r'("(?:\\.|[^"\\])*"|[^\s<{]+)(?=\s|<|\{|$)'
 )
 HEADER_LINE_RE = re.compile(r"^ {2}(?! )(?P<header>.+);\s*$")
@@ -244,10 +245,10 @@ def _decode_modified_utf8(value: bytes) -> str:
             if second & 0xC0 != 0x80:
                 raise invalid(index + 1, index + 2, "invalid continuation byte")
             code_unit = ((first & 0x1F) << 6) | (second & 0x3F)
-            if code_unit == 0:
-                if first != 0xC0 or second != 0x80:
-                    raise invalid(index, index + 2, "invalid NUL encoding")
-            elif code_unit < 0x80:
+            # Given a two-byte leading byte and a valid continuation byte,
+            # zero can only be encoded as C0 80.  Every other value below 0x80
+            # is an overlong encoding.
+            if code_unit != 0 and code_unit < 0x80:
                 raise invalid(index, index + 2, "overlong two-byte sequence")
             code_units.append(code_unit)
             index += 2
@@ -295,7 +296,7 @@ def _classfile_member_inventory(content: bytes) -> ClassfileMemberInventory:
 
     def take(size: int) -> bytes:
         nonlocal cursor
-        if size < 0 or cursor + size > len(data):
+        if cursor + size > len(data):
             raise ValueError("truncated classfile")
         result = bytes(data[cursor:cursor + size])
         cursor += size
@@ -303,7 +304,7 @@ def _classfile_member_inventory(content: bytes) -> ClassfileMemberInventory:
 
     def skip(size: int) -> None:
         nonlocal cursor
-        if size < 0 or cursor + size > len(data):
+        if cursor + size > len(data):
             raise ValueError("truncated classfile")
         cursor += size
 
@@ -538,9 +539,11 @@ def _oracle_cache_key(
 def _normalize_selected_targets(selected_targets: list[dict] | None) -> tuple[tuple[str, str, str], ...]:
     normalized = set()
     for target in selected_targets or []:
-        owner = str((target or {}).get("owner") or "").strip().replace("/", ".")
-        member = str((target or {}).get("member") or "").strip()
-        descriptor = str((target or {}).get("descriptor") or "").strip()
+        if not isinstance(target, dict):
+            continue
+        owner = str(target.get("owner") or "").strip().replace("/", ".")
+        member = str(target.get("member") or "").strip()
+        descriptor = str(target.get("descriptor") or "").strip()
         if owner and member:
             normalized.add((owner, member, descriptor))
     return tuple(sorted(normalized))
@@ -682,46 +685,44 @@ def _is_multi_release_archive(archive: zipfile.ZipFile) -> bool:
     ]
     if len(manifests) != 1:
         return False
-    for info in manifests:
-        try:
-            manifest = archive.read(info).decode("utf-8", errors="replace")
-        except (OSError, zipfile.BadZipFile):
-            return False
-        attributes: dict[str, str] = {}
-        continued: dict[str, bool] = {}
-        physical_header_valid: dict[str, bool] = {}
-        current_key: str | None = None
-        # JAR manifests have CR/LF physical lines. ``str.splitlines()`` also
-        # treats Unicode NEL/VT/LS/PS as separators and can manufacture a
-        # Multi-Release header out of an ordinary attribute value, diverging
-        # from java.util.jar and the production archive scanner.
-        physical_lines = (
-            manifest.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    try:
+        manifest = archive.read(manifests[0]).decode("utf-8", errors="replace")
+    except (OSError, zipfile.BadZipFile):
+        return False
+    attributes: dict[str, str] = {}
+    continued: dict[str, bool] = {}
+    physical_header_valid: dict[str, bool] = {}
+    current_key: str | None = None
+    # JAR manifests have CR/LF physical lines. ``str.splitlines()`` also
+    # treats Unicode NEL/VT/LS/PS as separators and can manufacture a
+    # Multi-Release header out of an ordinary attribute value, diverging
+    # from java.util.jar and the production archive scanner.
+    physical_lines = (
+        manifest.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    )
+    for line in physical_lines:
+        if not line:
+            break
+        if line.startswith(" "):
+            if current_key is not None:
+                attributes[current_key] += line[1:]
+                continued[current_key] = True
+            continue
+        key, separator, value = line.partition(":")
+        if not separator:
+            current_key = None
+            continue
+        current_key = key.strip().lower()
+        attributes[current_key] = value.strip()
+        continued[current_key] = False
+        physical_header_valid[current_key] = bool(
+            key.lower() == current_key and value.lower() == " true"
         )
-        for line in physical_lines:
-            if not line:
-                break
-            if line.startswith(" "):
-                if current_key is not None:
-                    attributes[current_key] += line[1:]
-                    continued[current_key] = True
-                continue
-            key, separator, value = line.partition(":")
-            if not separator:
-                current_key = None
-                continue
-            current_key = key.strip().lower()
-            attributes[current_key] = value.strip()
-            continued[current_key] = False
-            physical_header_valid[current_key] = bool(
-                key.lower() == current_key and value.lower() == " true"
-            )
-        return bool(
-            attributes.get("multi-release", "").strip().lower() == "true"
-            and not continued.get("multi-release", False)
-            and physical_header_valid.get("multi-release", False)
-        )
-    return False
+    return bool(
+        attributes.get("multi-release", "").strip().lower() == "true"
+        and not continued.get("multi-release", False)
+        and physical_header_valid.get("multi-release", False)
+    )
 
 
 def _multi_release_manifest_failures(
@@ -800,7 +801,7 @@ def _classfile_header_facts(content: bytes) -> tuple[bool, int | None]:
 
     def skip(size: int) -> None:
         nonlocal cursor
-        if size < 0 or cursor + size > len(data):
+        if cursor + size > len(data):
             raise ValueError("truncated classfile")
         cursor += size
 
@@ -869,12 +870,12 @@ def _extract_packaged_classes(
         nonlocal entries, staging_enabled
         materialized: list[PackagedClass] = []
         for entry in entries:
-            if entry.content is None:
-                materialized.append(entry)
-                continue
+            # This helper is only reached while staging is enabled; staged
+            # entries always retain their exact bytes until this spill.
+            content = entry.content
             try:
                 path = _write_extracted_class(
-                    destination, len(materialized), entry.content
+                    destination, len(materialized), content
                 )
             except OSError as error:
                 failures.append(
@@ -1046,9 +1047,9 @@ def _unquote_javap_identifier(value: str) -> str | None:
         return None
     try:
         decoded = json.loads(value)
-    except (TypeError, json.JSONDecodeError):
+    except json.JSONDecodeError:
         return None
-    return decoded if isinstance(decoded, str) and decoded else None
+    return decoded or None
 
 
 def _strip_leading_type_parameters(value: str) -> str:
@@ -1070,8 +1071,7 @@ def _strip_member_modifiers(prefix: str) -> str:
     remaining = prefix.strip()
     while remaining:
         token = re.match(r"(?P<token>\S+)(?:\s+|$)", remaining)
-        if token is None:
-            break
+        # ``remaining`` is stripped and non-empty, so ``\S+`` always matches.
         modifier = token.group("token")
         if modifier not in _MEMBER_MODIFIERS:
             break
@@ -1236,7 +1236,8 @@ def _is_method_descriptor(value: str) -> bool:
         if end is None:
             return False
         index = end
-    if index >= len(value) or value[index] != ")":
+    # The loop only stops at ')' or at the end of the descriptor.
+    if index >= len(value):
         return False
     index += 1
     if index < len(value) and value[index] == "V":
@@ -1293,7 +1294,8 @@ def _method_type_reference_owners(value: str) -> tuple[str, ...] | None:
         parameter_slots += slots
         if parameter_slots > 255:
             return None
-    if cursor >= length or descriptor[cursor] != ")":
+    # The loop only stops at ')' or at the end of the descriptor.
+    if cursor >= length:
         return None
     cursor += 1
     if cursor >= length:
@@ -1535,10 +1537,8 @@ def _bootstrap_references(
             if (
                 start
                 and raw_constant_tags
-                and (
-                    constant_text is None
-                    or raw_constant_tags.get(int(constant_text)) != 15
-                )
+                # BOOTSTRAP_REFERENCE_RE requires a ``#constant`` group.
+                and raw_constant_tags.get(int(constant_text)) != 15
             ):
                 invalid_bootstraps.add(current_bootstrap)
                 continue
@@ -2122,7 +2122,8 @@ def _parse_javap_output(
             parsed_descriptor = stripped.partition(":")[2].strip()
             if declaration_state == "field":
                 continue
-            if declaration_state != "method" or caller_member is None:
+            # A parsed/raw method state always binds a non-null member name.
+            if declaration_state != "method":
                 failures.append(f"{artifact_entry}: descriptor without a valid header")
                 caller_descriptor = ""
             else:
@@ -2139,7 +2140,7 @@ def _parse_javap_output(
             in_code_block = False
             continue
         if stripped == "Code:":
-            if declaration_state != "method" or caller_member is None or not caller_descriptor:
+            if declaration_state != "method" or not caller_descriptor:
                 failures.append(f"{artifact_entry}: Code block without a valid header and descriptor")
                 in_code_block = False
             else:
@@ -2153,9 +2154,9 @@ def _parse_javap_output(
         offset, opcode, rest = instruction_match.groups()
         if opcode not in EDGE_OPCODES and opcode not in LDC_OPCODES:
             continue
-        if not caller_owner or declaration_state != "method" or caller_member is None or not caller_descriptor:
-            failures.append(f"{artifact_entry}: missing caller context for {opcode} at {offset}")
-            continue
+        # ``in_code_block`` is activated only after all four caller-context
+        # fields have been validated, and every state transition that clears
+        # one of them also clears the block flag.
         _, separator, comment = rest.partition("//")
         comment = comment.strip()
         if opcode in LDC_OPCODES:
@@ -2181,9 +2182,11 @@ def _parse_javap_output(
                         bootstrap_references,
                     )
                 )
-                if dynamic_failure or bootstrap is None:
+                # The helper's success contract always returns a bootstrap;
+                # every unresolved bootstrap is accompanied by a failure.
+                if dynamic_failure:
                     failures.append(
-                        f"{artifact_entry}: {dynamic_failure or 'unresolved ConstantDynamic'} "
+                        f"{artifact_entry}: {dynamic_failure} "
                         f"at {offset}"
                     )
                     continue
@@ -2328,7 +2331,9 @@ def _parse_class_reference(comment: str) -> str | None:
                 closing = index
                 quoted = False
                 break
-        if quoted or closing < 0 or value[closing + 1:].strip():
+        # Leaving quoted mode is only possible after recording its closing
+        # quote, so ``closing < 0`` is implied by ``quoted``.
+        if quoted or value[closing + 1:].strip():
             return None
         value = value[:closing + 1]
     elif any(character.isspace() for character in value):
@@ -2636,7 +2641,8 @@ def parse_structural_javap(
             parsed_member, parsed_state = _parse_member_header(
                 line, owner.replace("/", ".")
             )
-            if parsed_member == "<clinit>" and parsed_state == "method":
+            # ``_parse_member_header`` emits ``<clinit>`` only as a method.
+            if parsed_member == "<clinit>":
                 member_name = "<clinit>"
                 descriptor = "()V"
                 clinit_classes.add(owner)
@@ -2644,11 +2650,11 @@ def parse_structural_javap(
                     (owner, "method", member_name, descriptor, 0x0008)
                 )
                 pending_member = None
-            elif parsed_state == "method" and parsed_member:
+            elif parsed_state == "method":
                 member_name = parsed_member
                 descriptor = ""
                 pending_member = ("method", member_name, access_flags(value))
-            elif parsed_state == "field" and parsed_member:
+            elif parsed_state == "field":
                 member_name = ""
                 descriptor = ""
                 pending_member = (
@@ -2677,8 +2683,10 @@ def parse_structural_javap(
         if not in_code_block:
             continue
         instruction = INSTRUCTION_RE.match(line)
-        if not instruction or not owner or not member_name or not descriptor:
+        if not instruction:
             continue
+        # As in the direct-edge parser, reaching an active Code block proves
+        # that owner/member/descriptor context has already been bound.
         bci = int(instruction.group(1))
         opcode = instruction.group(2)
         rest = instruction.group(3)
@@ -3011,7 +3019,7 @@ def _parse_entry_with_javap(
         }
     per_class_deadline = time.perf_counter() + 30.0
     deadline = min(deadline, per_class_deadline) if deadline is not None else per_class_deadline
-    if cancellation_event.is_set() or (deadline is not None and time.perf_counter() >= deadline):
+    if cancellation_event.is_set() or time.perf_counter() >= deadline:
         return {"rows": [], "failures": [], "completed": False, "parsed": False}
     try:
         command = _javap_command(javap)
@@ -3036,11 +3044,11 @@ def _parse_entry_with_javap(
 
     try:
         while True:
-            remaining = deadline - time.perf_counter() if deadline is not None else None
-            if cancellation_event.is_set() or (remaining is not None and remaining <= 0):
+            remaining = deadline - time.perf_counter()
+            if cancellation_event.is_set() or remaining <= 0:
                 _cancel_process(process)
                 return {"rows": [], "failures": [], "completed": False, "parsed": False}
-            wait_seconds = min(0.1, remaining) if remaining is not None else 0.1
+            wait_seconds = min(0.1, remaining)
             try:
                 stdout, stderr = process.communicate(timeout=wait_seconds)
                 break
@@ -3110,6 +3118,8 @@ def _parse_entry_group_with_javap(
     *,
     force_verbose: bool | None = None,
 ) -> list[dict]:
+    if not entries:
+        return []
     if force_verbose is None:
         verbose_entries = []
         plain_entries = []
@@ -3164,8 +3174,6 @@ def _parse_entry_group_with_javap(
     def parse_smaller_batches(candidates: list[PackagedClass]) -> list[dict]:
         """Bisect a failed aggregate invocation until its bad class is isolated."""
 
-        if len(candidates) <= 1:
-            return parse_separately(candidates)
         midpoint = len(candidates) // 2
         return [
             *_parse_entry_group_with_javap(
@@ -3226,7 +3234,8 @@ def _parse_entry_group_with_javap(
             errors="replace",
         )
     except OSError as error:
-        if len(entries) > 1 and _command_line_too_long(error):
+        # The single-entry path returned above, so every group here can bisect.
+        if _command_line_too_long(error):
             midpoint = len(entries) // 2
             return [
                 *_parse_entry_group_with_javap(
@@ -3724,11 +3733,24 @@ def _scan_final_artifact_snapshot(
             cache_misses=1,
             complete=False,
         )
+    if not version:
+        return _base_result(
+            digest,
+            elapsed_seconds=time.perf_counter() - started_at,
+            failures=["oracle_javap_version_empty"],
+            cache_misses=1,
+            complete=False,
+        )
     normalized_targets = _normalize_selected_targets(selected_targets)
-    normalized_exclusions = tuple(sorted({
-        str(item or "").strip() for item in (excluded_nested_jars or set())
-        if str(item or "").strip()
-    }))
+    normalized_exclusion_set: set[str] = set()
+    for item in excluded_nested_jars or set():
+        if item:
+            normalized_item = str(item).strip()
+        else:
+            normalized_item = ""
+        if normalized_item:
+            normalized_exclusion_set.add(normalized_item)
+    normalized_exclusions = tuple(sorted(normalized_exclusion_set))
     cache_key = _oracle_cache_key(
         digest,
         version,
@@ -3792,7 +3814,11 @@ def _scan_final_artifact_snapshot(
                 frontier = set(normalized_targets)
                 expanded_targets: set[tuple[str, str, str]] = set()
                 closure_rows: list[dict] = []
-                while frontier and not timed_out and not interrupted:
+                # ``normalized_targets`` is non-empty at this point and
+                # ``frontier`` only grows. Completion is therefore expressed
+                # by the explicit ``pending_targets`` check below, not by an
+                # unreachable natural exhaustion of ``frontier``.
+                while True:
                     pending_targets = frontier - expanded_targets
                     if not pending_targets:
                         break
@@ -3831,8 +3857,9 @@ def _scan_final_artifact_snapshot(
                     )
                     results.extend(batch_results)
                     worker_count = max(worker_count, batch_workers)
-                    timed_out = timed_out or batch_timed_out
-                    interrupted = interrupted or batch_interrupted
+                    # A prior timeout/interruption exits this loop below.
+                    timed_out = batch_timed_out
+                    interrupted = batch_interrupted
                     batch_rows = [
                         row
                         for result in batch_results if result is not None
@@ -3924,13 +3951,9 @@ def _scan_final_artifact_snapshot(
         failures=failures,
         complete=complete,
     )
-    if (
-        cache_result
-        and complete
-        and not timed_out
-        and not interrupted
-        and completed_class_count == len(entries)
-    ):
+    # ``complete`` already proves there are no timeout/interruption failures
+    # and that every selected entry completed.
+    if cache_result and complete:
         serialized = json.dumps(
             {
                 "class_count": len(entries),

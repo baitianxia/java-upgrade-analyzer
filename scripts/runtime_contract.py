@@ -126,7 +126,12 @@ def _jdk_major(text):
         version = _version_tuple(candidates[-1]) if candidates else ()
     if not version:
         return None
-    return version[1] if version[0] == 1 and len(version) > 1 else version[0]
+    if version[0] == 1:
+        # Legacy Java versions are written as 1.<feature>.  A bare ``1`` is
+        # incomplete; returning the parser's synthetic zero would fabricate
+        # a JDK major that never existed.
+        return version[1] or None
+    return version[0]
 
 
 def validate_runtime_contract(

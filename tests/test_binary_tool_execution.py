@@ -37,6 +37,15 @@ class BinaryToolExecutionTest(unittest.TestCase):
         self.assertTrue(result.succeeded)
         self.assertEqual(result.stdout, "21")
 
+    def test_empty_argv_is_rejected_before_runner_selection(self):
+        with self.assertRaisesRegex(ValueError, "must not be empty"):
+            execute_binary_tool(
+                [],
+                stage="binary.test",
+                reason_prefix="BINARY_TOOL",
+                timeout_seconds=1,
+            )
+
     def test_timeout_missing_permission_nonzero_and_empty_fail_closed(self):
         def raising(error):
             def run(_command, **_kwargs):
@@ -64,6 +73,60 @@ class BinaryToolExecutionTest(unittest.TestCase):
                     result.failure.to_mapping()["command"], ["tool"]
                 )
 
+    def test_start_exceptions_preserve_binary_empty_output_types(self):
+        exception_cases = (
+            subprocess.TimeoutExpired(["tool"], 1),
+            FileNotFoundError("missing"),
+            PermissionError("denied"),
+            OSError("start failed"),
+            TypeError("invalid runner arguments"),
+            ValueError("invalid runner value"),
+        )
+        for error in exception_cases:
+            for text, empty in ((True, ""), (False, b"")):
+                with self.subTest(
+                    error=type(error).__name__,
+                    text=text,
+                ):
+                    result = execute_binary_tool(
+                        ["tool"],
+                        stage="binary.test",
+                        reason_prefix="BINARY_TOOL",
+                        timeout_seconds=1,
+                        text=text,
+                        runner=lambda *_args, _error=error, **_kwargs: (
+                            (_ for _ in ()).throw(_error)
+                        ),
+                    )
+                    self.assertEqual(result.stdout, empty)
+                    self.assertEqual(result.stderr, empty)
+                    self.assertEqual(result.returncode, -1)
+
+    def test_completed_none_and_nonstandard_stdout_cover_normalization_boundaries(self):
+        for text, empty in ((True, ""), (False, b"")):
+            with self.subTest(text=text):
+                result = execute_binary_tool(
+                    ["tool"],
+                    stage="binary.test",
+                    reason_prefix="BINARY_TOOL",
+                    timeout_seconds=1,
+                    text=text,
+                    runner=self.runner(stdout=None, stderr=None),
+                )
+                self.assertTrue(result.succeeded)
+                self.assertEqual(result.stdout, empty)
+                self.assertEqual(result.stderr, empty)
+
+        result = execute_binary_tool(
+            ["tool"],
+            stage="binary.test",
+            reason_prefix="BINARY_TOOL",
+            timeout_seconds=1,
+            require_stdout=True,
+            runner=self.runner(stdout=[], stderr=""),
+        )
+        self.assertEqual(result.failure.failure_kind, "output_empty")
+
     def test_only_transient_process_failures_are_retryable(self):
         timeout = execute_binary_tool(
             ["tool"], stage="test", reason_prefix="TOOL", timeout_seconds=1,
@@ -80,6 +143,7 @@ class BinaryToolExecutionTest(unittest.TestCase):
 
         self.assertTrue(tool_failure_is_retryable(timeout.failure))
         self.assertFalse(tool_failure_is_retryable(missing.failure))
+        self.assertFalse(tool_failure_is_retryable(None))
 
     def test_bytes_input_and_output_preserve_protocol_payload(self):
         result = execute_binary_tool(

@@ -11,7 +11,7 @@ from pathlib import Path
 import re
 import sys
 import tempfile
-from typing import Any, Callable, Iterable, Iterator, Mapping, TextIO
+from typing import Any, Callable, Iterable, Iterator, TextIO
 
 
 _DIRECTORY_FSYNC_UNSUPPORTED_ERRNOS = frozenset(
@@ -149,15 +149,15 @@ def prime_canonical_json_fields(
                     )
                     structure_cursor = match.start()
                     colon = mapped.find(b":", match.start(), match.end())
-                    if colon < 0:
-                        continue
                     encoded_key = bytes(mapped[match.start():colon]).rstrip()
-                    key = encoded_to_key.get(encoded_key)
-                    if (
-                        key is not None
-                        and not bool(structure_state[1])
-                        and int(structure_state[0]) == 1
-                    ):
+                    # ``pattern`` is built only from ``encoded_to_key`` values
+                    # and includes the trailing colon, so both lookups are
+                    # construction invariants rather than input decisions.
+                    key = encoded_to_key[encoded_key]
+                    # Escaped quotes inside JSON strings cannot match the
+                    # unescaped canonical key pattern.  The remaining input
+                    # decision is whether the match is a direct root child.
+                    if int(structure_state[0]) == 1:
                         found[key].append(match.end())
         if len(_CANONICAL_VALUE_START_CACHE) > 512:
             _CANONICAL_VALUE_START_CACHE.clear()
@@ -272,10 +272,8 @@ def iter_canonical_json_object_array(
                         except (UnicodeDecodeError, json.JSONDecodeError):
                             candidate = boundary
                             continue
-                        if not isinstance(value, Mapping):
-                            raise StreamingJsonReadError(
-                                f"non-object item in {key!r}: {source}"
-                            )
+                        # The cursor was required to start at ``{`` above; a
+                        # successful JSON decode therefore has object shape.
                         yield dict(value)
                         cursor = boundary + 1
                         if (

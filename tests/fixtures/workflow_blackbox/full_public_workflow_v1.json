@@ -87,6 +87,7 @@
     "jdk_upgraded": false,
     "changed_deps": 1
   },
+  "expected_jdk_release_metadata_source": "java-properties-probe",
   "expected_checkpoints": [
     {"step_id": "step0", "kind": "input_request"}
   ],

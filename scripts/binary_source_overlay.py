@@ -124,7 +124,7 @@ def _normalized_binary_owner(value: str) -> str:
 def _source_method_name(method: Any) -> str:
     name = str(getattr(method, "method_name", "") or "")
     class_simple = str(getattr(method, "class_name", "") or "").split(".")[-1]
-    return "<init>" if name == class_simple else name
+    return "<init>" if name and name == class_simple else name
 
 
 @dataclass(frozen=True)
@@ -243,11 +243,15 @@ def _instruction_constants(store: BinaryFactStore, member: Mapping[str, Any]) ->
     if len(class_rows) != 1:
         return Counter()
     fact = json.loads(class_rows[0]["fact_json"])
-    method_fact = next((
-        item for item in fact.get("methods") or ()
-        if (item.get("contract") or {}).get("name") == member["member_name"]
-        and (item.get("contract") or {}).get("descriptor") == member["descriptor"]
-    ), None)
+    method_fact = None
+    for item in fact.get("methods") or ():
+        contract = item.get("contract") or {}
+        if (
+            contract.get("name") == member["member_name"]
+            and contract.get("descriptor") == member["descriptor"]
+        ):
+            method_fact = item
+            break
     constants: Counter = Counter()
     for instruction in (method_fact or {}).get("instructions") or ():
         if not isinstance(instruction, list) or len(instruction) < 3:

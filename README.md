@@ -96,6 +96,7 @@ Claude Code 会负责：
 - Maven 项目优先使用对应 base/current revision 内的 `mvnw` / `mvnw.cmd`，没有 Wrapper 时才使用系统 `mvn`；分析器不规定 Maven 最低版本。
 - Gradle 项目同时支持 Groovy DSL 与 Kotlin DSL；优先使用仓库内 `gradlew` / `gradlew.bat`，没有 Wrapper 时才使用系统 `gradle`。多模块选择既可写 `app`，也可写 `:app`。
 - JDK、Maven、Gradle 均以用户工程为准。base/current 可分别使用不同 JDK；实际工具链不兼容时按真实构建命令失败原因阻塞，不会因分析器预设版本白名单提前拒绝。
+- 完整 JDK 优先用 `release` 读取版本与供应商元数据；合法供应商归档没有该文件时，系统执行所选 JDK 自身的 `java -XshowSettings:properties -version`，并把可执行文件、完整探测输出和规范化元数据绑定到 JDK 身份。两种布局都必须继续通过 java/javac/javap、编译运行探针及 JDK 8 `rt.jar` 或 JDK 9+ modules/jmods 完整性检查，不能靠目录名称猜测版本。
 - Gradle 自动构建执行目标模块的 `build -x test`；缺失嵌套 JAR 坐标时，优先从 `runtimeClasspath` 的 resolved artifacts 采集“组件坐标 ↔ 物理文件”清单。不支持 artifact inventory 的旧 Gradle/插件才回退到组件依赖树；文件锁冲突只对原命令按 1 秒、3 秒退避重试，不触发组件树回退、不删除锁，也不停止其他 Gradle daemon。Maven 同样保留 `dependency:list` 输出的绝对 artifact 文件。
 - Maven `dependency:list` 漏掉 reactor 内部模块，或 Gradle 只返回 `ProjectComponentIdentifier` 时，Step1 会从目标模块的实际运行时闭包补齐内部模块坐标：Maven 解析继承和 `${revision}`、`${project.version}` 等有效属性，Gradle 按精确 project path 读取实际 group、artifact、version。只补目标闭包中的依赖模块，不把目标模块自身或无关 sibling 纳入依赖；构建工具已经给出的坐标和版本优先，源码模型不能覆盖它们。若内部模块存在唯一主归档，还会用该物理文件匹配自定义 `finalName`。
 - 物理文件精确匹配优先于文件名解释；构建工具未报告 classifier 时，才以清单中的完整 version 为锚唯一推导，例如将 `jffi-1.2.23-native.jar` 解析为 `com.github.jnr:jffi:native`。多个最终身份同时匹配时才保留歧义，不按文件名猜选。项目模型只帮助识别最终制品中实际存在的内部 JAR，不能扩展制品范围。最终依赖版本与内容仍以实际 Fat JAR、Spring Boot JAR 或 WAR 为准。Thin JAR 本身不包含运行时依赖，不能作为正式比较结果。

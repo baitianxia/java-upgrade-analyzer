@@ -1,0 +1,15 @@
+{
+  "schema": "java-upgrade-analyzer.test-incident-evidence.v1",
+  "incident_id": "untyped-data-call-false-binding-20260822",
+  "observed_at": "2026-08-22T00:00:00+08:00",
+  "platform": "macOS aarch64 local JVM black-box fixture",
+  "trigger": "an unrelated business method calls ObjectMapper.readValue for java.lang.String while another controller endpoint binds a changed DTO",
+  "actual_pre_fix_behavior": "the semantic overlay attached the unrelated ObjectMapper caller as an exact caller of every DTO owner already present in the binding map",
+  "expected_behavior": "the unrelated caller has no lib.Dto descriptor or bytecode evidence and must not receive an implicit_data_contract_dispatch edge to lib.Dto.removed",
+  "root_cause": "a direct ObjectMapper or EntityManager call was globally copied into every existing binding-owner bucket without recovering a target type",
+  "reproduction": [
+    "Compile a controller endpoint whose descriptor binds lib.Dto and a separate method that deserializes only java.lang.String.",
+    "Use javap -c -s to prove the separate method contains the ObjectMapper call but no lib.Dto reference.",
+    "Run the public binary pipeline and reject any implicit DTO edge whose caller is the unrelated method."
+  ]
+}

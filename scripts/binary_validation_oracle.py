@@ -52,7 +52,12 @@ from binary_validation_contract import (
     validator_implementation_identity,
 )
 from binary_tool_execution import execute_binary_tool, tool_failure_is_retryable
-from jdk_preflight import JdkPreflightError, jdk_tool_path, preflight_jdk_home
+from jdk_preflight import (
+    JdkPreflightError,
+    jdk_tool_path,
+    preflight_jdk_home,
+    resolve_jdk_release,
+)
 from progress_logging import emit_progress
 from process_metrics import system_available_memory_bytes
 from streaming_json import (
@@ -910,15 +915,10 @@ def _prime_large_sidecar_fields(
 
 
 def _release_values(jdk_home: Path) -> dict[str, str]:
-    release = {}
     try:
-        for line in (jdk_home / "release").read_text(encoding="utf-8").splitlines():
-            key, separator, value = line.partition("=")
-            if separator:
-                release[key.strip()] = value.strip().strip('"')
-    except OSError as error:
+        return dict(resolve_jdk_release(jdk_home)["values"])
+    except (JdkPreflightError, OSError) as error:
         raise BinaryValidationError("BINARY_ORACLE_JDK_RELEASE_MISSING", str(error)) from error
-    return release
 
 
 def _release_major(jdk_home: Path) -> int:
@@ -979,7 +979,8 @@ def _independent_class_access_flags(content: bytes) -> int | None:
 
     def skip(size: int) -> None:
         nonlocal cursor
-        if size < 0 or cursor + size > len(data):
+        # Callers pass constants or unsigned classfile lengths only.
+        if cursor + size > len(data):
             raise ValueError("truncated classfile")
         cursor += size
 
@@ -1097,7 +1098,8 @@ def _independent_is_valid_module_descriptor(content: bytes) -> bool:
 
     def take(size: int) -> bytes:
         nonlocal cursor
-        if size < 0 or cursor + size > len(data):
+        # Callers pass constants or unsigned classfile lengths only.
+        if cursor + size > len(data):
             raise ValueError("truncated classfile")
         result = bytes(data[cursor:cursor + size])
         cursor += size
@@ -1105,7 +1107,8 @@ def _independent_is_valid_module_descriptor(content: bytes) -> bool:
 
     def skip(size: int) -> None:
         nonlocal cursor
-        if size < 0 or cursor + size > len(data):
+        # Callers pass constants or unsigned classfile lengths only.
+        if cursor + size > len(data):
             raise ValueError("truncated classfile")
         cursor += size
 
@@ -1480,7 +1483,11 @@ def _independent_xml_facts(content: bytes) -> list[list[str]]:
         return [["xml_parse_gap", "malformed_xml"]]
 
     def local(tag: Any) -> str:
-        return str(tag or "").split("}")[-1].split(":")[-1]
+        # ElementTree parsed nodes always carry a tag (a string for normal
+        # elements, or a callable marker for retained comments/PIs).  The
+        # former ``tag or \"\"`` therefore created an unexecutable bytecode
+        # branch without representing an input state accepted by this parser.
+        return str(tag).split("}")[-1].split(":")[-1]
 
     def nested_attribute(node: Any, child_tag: str, *names: str) -> str:
         for name in names:
@@ -1880,7 +1887,9 @@ def _ordered_artifacts_for_realm(
     for values in by_realm.values():
         values.sort(key=lambda item: (int(item.get("slot") or 0), item["path"]))
     realms = {
-        str(item.get("identity") or ""): dict(item)
+        # The comprehension filter below already proves a non-empty identity.
+        # Avoid advertising an input branch that cannot reach this expression.
+        str(item.get("identity")): dict(item)
         for item in topology.get("realms") or ()
         if isinstance(item, Mapping) and item.get("identity")
     }
@@ -1986,9 +1995,10 @@ def _compile_oracle(
 ) -> str:
     destination.mkdir(parents=True, exist_ok=True)
     javac = jdk_tool_path(jdk_home, "javac")
-    completed = None
     attempt_limit = max(int(max_attempts), 1)
     attempts_made = 0
+    # attempt_limit is always at least one, so the loop always assigns the
+    # result before it is inspected below.
     for attempt in range(1, attempt_limit + 1):
         remaining = (
             phase_deadline - time.perf_counter()
@@ -2013,7 +2023,6 @@ def _compile_oracle(
             break
         if not tool_failure_is_retryable(completed.failure):
             break
-    assert completed is not None
     if not completed.succeeded:
         failure = completed.failure.to_mapping()
         failure.update({
@@ -2033,9 +2042,15 @@ def _compile_oracle(
             ),
             json.dumps(failure, ensure_ascii=False),
         )
+    try:
+        release_identity = resolve_jdk_release(jdk_home)["identity"]
+    except (JdkPreflightError, OSError) as error:
+        raise BinaryValidationError(
+            "BINARY_ORACLE_JDK_RELEASE_MISSING", str(error)
+        ) from error
     return _identity("runtime_outcome_oracle_helper_identity", {
         "source_sha256": _sha256_file(ORACLE_SOURCE),
-        "target_jdk_release_sha256": _sha256_file(jdk_home / "release"),
+        "target_jdk_release_sha256": release_identity,
         "policy_version": POLICY_VERSION,
     })
 
@@ -2105,7 +2120,9 @@ def _observe_classes(
                         json.dumps({
                             "completed_observation_count": len(observations),
                             "pending_observation_count": len(pending),
-                            "batch_first_class": batch[0] if batch else "",
+                            # observe_batch is submitted only from a non-empty
+                            # pending frontier, so every batch has a first row.
+                            "batch_first_class": batch[0],
                             "phase_time_budget_seconds": (
                                 phase_time_budget_seconds
                             ),
@@ -2215,8 +2232,8 @@ def _observe_classes(
             batch = []
             while pending_heap and len(batch) < batch_size:
                 class_name = heapq.heappop(pending_heap)
-                if class_name not in pending:
-                    continue
+                # Heap and set entries are inserted together and are removed
+                # only here; duplicate heap entries are never admitted.
                 pending.remove(class_name)
                 batch.append(class_name)
             return tuple(batch)
@@ -2243,7 +2260,7 @@ def _observe_classes(
                 f"{progress_label or '目标运行时'}：已完成 JVM 观察批次 {round_number}",
                 len(observations),
                 len(observations) + len(pending) + in_flight,
-                f"{batch[0]} … {batch[-1]}" if batch else "",
+                f"{batch[0]} … {batch[-1]}",
             )
 
         if workers == 1:
@@ -2445,7 +2462,9 @@ def _production_structural_truth_for_artifact(
             edge["caller_descriptor"], int(edge["bytecode_offset"]),
         )
         payload = json.loads(edge["edge_json"])
-        edge_kind = str(edge["edge_kind"] or "")
+        # direct_edges.edge_kind is NOT NULL and this query only admits
+        # explicit edge kinds/prefixes, so an empty fallback cannot occur.
+        edge_kind = str(edge["edge_kind"])
         if edge_kind == "type":
             production_type.add((
                 *caller, edge["symbolic_owner"],
@@ -2740,8 +2759,7 @@ def _validate_structural_edges(
                     ),
                 )
             elif (
-                direct_scan
-                and direct_scan.complete
+                direct_scan is not None
                 and direct_scan.structural_class_names
                 == set(inventory["classes"])
             ):
@@ -3605,13 +3623,15 @@ def _normalize_oracle_scan(
             (
                 _pooled_string(
                     compact_text(
-                        str(row.get("callee_owner") or "")
+                        # The generator filter below guarantees this value is
+                        # truthy before either projection branch executes.
+                        str(row.get("callee_owner"))
                     ).replace(".", "/"),
                     string_pool,
                 )
                 if string_pool is not None
                 else compact_text(
-                    str(row.get("callee_owner") or "")
+                    str(row.get("callee_owner"))
                 ).replace(".", "/")
             )
             for row in rows if row.get("callee_owner")
@@ -3821,12 +3841,13 @@ def _attach_provider_declared_members_from_scan_cache(
                     f"{kind}|{member_name}|{descriptor}|{int(flags)}"
                 )
     for class_name, values in members_by_class.items():
-        observation = observations.get(class_name)
-        if observation is not None and values:
-            observation["javap_declared_members"] = tuple(
-                _pooled_string(value, string_pool)
-                for value in sorted(set(values))
-            )
+        # A class enters members_by_class only after membership in the
+        # observation-derived selected_classes set, and only via append().
+        observation = observations[class_name]
+        observation["javap_declared_members"] = tuple(
+            _pooled_string(value, string_pool)
+            for value in sorted(set(values))
+        )
 
 
 def _share_equal_observation_values(
@@ -3913,7 +3934,8 @@ def _descriptor_parameters(descriptor: str) -> tuple[str, ...] | None:
         else:
             index += 1
         result.append(value[start:index])
-    return tuple(result) if index < len(value) and value[index] == ")" else None
+    # The loop stops before the end only when it encounters ``)``.
+    return tuple(result) if index < len(value) else None
 
 
 def _descriptor_return_class(descriptor: str) -> str:
@@ -4025,7 +4047,10 @@ def _resolve_member(
             return owner, member
     if name == "<init>":
         return None
-    if kind == "method" and int(observation.get("modifiers") or 0) & 0x0200:
+    is_interface_method = bool(
+        kind == "method" and int(observation.get("modifiers") or 0) & 0x0200
+    )
+    if is_interface_method:
         # JVM interface method resolution may select a matching public
         # instance method declared by Object before searching superinterfaces.
         object_member = _resolve_member(
@@ -4039,7 +4064,14 @@ def _resolve_member(
     parents = (
         [*(observation.get("interfaces") or ()), observation.get("super_name")]
         if kind == "field"
-        else [observation.get("super_name"), *(observation.get("interfaces") or ())]
+        else (
+            [*(observation.get("interfaces") or ())]
+            if is_interface_method
+            else [
+                observation.get("super_name"),
+                *(observation.get("interfaces") or ()),
+            ]
+        )
     )
     for parent in parents:
         if not parent:
@@ -4072,7 +4104,9 @@ def _is_subtype(
 def _oracle_annotation_closure(
     observations: Mapping[str, Mapping[str, Any]], descriptors: Iterable[str],
 ) -> set[str]:
-    result = {str(value) for value in descriptors if str(value)}
+    result = {
+        normalized for value in descriptors if (normalized := str(value))
+    }
     pending = list(result)
     while pending:
         descriptor = pending.pop()
@@ -4245,7 +4279,7 @@ def _validate_entrypoint_discovery(
             declared_coverage_gaps.add(invalid_gap)
             return
         declared_coverage_gaps.update(
-            str(value or "").strip()
+            str(value).strip()
             for value in raw
             if str(value or "").strip()
         )
@@ -4268,7 +4302,7 @@ def _validate_entrypoint_discovery(
         declared_coverage_gaps.add("entrypoint_profile_invalid")
     topology = runtime_profile.get("loader_topology") or {}
     non_platform_realms = sorted({
-        str(item.get("identity") or "")
+        str(item["identity"])
         for item in topology.get("realms") or ()
         if item.get("kind") != "platform" and item.get("identity")
     })
@@ -4401,7 +4435,7 @@ def _validate_entrypoint_discovery(
         "Ljakarta/persistence/MappedSuperclass;",
     }
     activated_entity_classes = {
-        str(value or "").replace(".", "/")
+        str(value).replace(".", "/")
         for value in profile.get("activated_entity_classes") or ()
         if str(value or "").strip()
     }
@@ -4752,7 +4786,7 @@ def _validate_entrypoint_discovery(
         del instructions_by_member
 
     activated_resource_names = {
-        str(value or "").removeprefix("classpath:").lstrip("/")
+        str(value).removeprefix("classpath:").lstrip("/")
         for value in profile.get("activated_resource_names") or ()
         if str(value or "").strip()
     }
@@ -4871,7 +4905,7 @@ def _validate_entrypoint_discovery(
             extra=sorted(actual_exact - expected_exact),
         ))
     attested_coverage_gaps = {
-        str(value or "").strip()
+        str(value).strip()
         for value in (
             _sidecar_top_level_value(
                 generation, "binary_entrypoints.json", "coverage_gaps"
@@ -5200,12 +5234,15 @@ def _production_direct_truth_for_artifact(
         """,
         (artifact_instance_identity,),
     ):
-        edge_kind = str(edge["edge_kind"] or "")
+        # direct_edges.edge_kind is NOT NULL and this query only admits
+        # explicit edge kinds/prefixes, so an empty fallback cannot occur.
+        edge_kind = str(edge["edge_kind"])
         edge_payload: Any = None
         edge_payload_loaded = False
         if include_structural:
             try:
-                edge_payload = json.loads(str(edge["edge_json"] or ""))
+                # direct_edges.edge_json is NOT NULL in the fact-store schema.
+                edge_payload = json.loads(str(edge["edge_json"]))
             except (TypeError, ValueError, json.JSONDecodeError):
                 edge_payload = None
             edge_payload_loaded = True
@@ -5321,7 +5358,7 @@ def _production_direct_truth_for_artifact(
         ):
             if not edge_payload_loaded:
                 try:
-                    edge_payload = json.loads(str(edge["edge_json"] or ""))
+                    edge_payload = json.loads(str(edge["edge_json"]))
                 except (TypeError, ValueError, json.JSONDecodeError):
                     edge_payload = None
             handle_payload = edge_payload
@@ -5375,7 +5412,7 @@ def _production_direct_truth_for_artifact(
         if edge_kind == "method":
             if not edge_payload_loaded:
                 try:
-                    edge_payload = json.loads(str(edge["edge_json"] or ""))
+                    edge_payload = json.loads(str(edge["edge_json"]))
                 except (TypeError, ValueError, json.JSONDecodeError):
                     edge_payload = None
             reference_interface = (
@@ -5459,7 +5496,8 @@ def _validate_direct_edges(
             if not spooled_scan_results:
                 normalized = _normalize_oracle_scan(cached, string_pool)
                 scan_results[scan_key] = normalized
-                if scan_cache is not None and normalized is not cached:
+                # cached can be non-None only after reading scan_cache above.
+                if normalized is not cached:
                     scan_cache[scan_key] = normalized
         else:
             scan_requests.setdefault(scan_key, Path(artifact["path"]))
@@ -5610,7 +5648,8 @@ def _validate_direct_edges(
                         f"{progress_label or '当前侧'}：独立 javap 制品扫描中",
                         len(available_scan_keys),
                         scan_total,
-                        str(scan_requests.get(scan_key) or ""),
+                        # Every completed key was submitted from this map.
+                        str(scan_requests[scan_key]),
                     )
                     del result
     for scan_key in scan_requests:
@@ -6051,6 +6090,27 @@ def _validate_runtime_outcomes(
             ))
 
     provider_count = len(provider_by_key)
+    selected_caller_artifact_classes = frozenset(
+        (str(selected), str(class_name))
+        for (_realm, class_name), (status, selected) in provider_by_key.items()
+        if status == "resolved"
+        and selected
+        and not str(selected).startswith("platform-image:")
+    )
+    # A runtime reconciliation intentionally excludes bytecode owned by a
+    # physically present but shadowed class variant.  Completeness therefore
+    # has to be measured over selected caller definitions, not every row in
+    # the physical fact store.  Older/in-memory boundary harnesses may expose
+    # only the columns used by the individual check; full production fact
+    # stores always expose the caller artifact binding and use this filter.
+    direct_edge_columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(direct_edges)")
+    }
+    can_filter_selected_callers = (
+        "caller_artifact_instance_identity" in direct_edge_columns
+        and "caller_member_identity" in direct_edge_columns
+    )
     # Provider/definition validation is complete. Release those decoded
     # reconciliation graphs before constructing member/edge indexes so the two
     # largest Oracle views do not overlap at peak RSS.
@@ -6081,16 +6141,17 @@ def _validate_runtime_outcomes(
 
     def direct_edge_batch(edge_ids: Iterable[str]):
         identities = tuple(dict.fromkeys(str(item) for item in edge_ids))
-        if not identities:
-            return {}
+        # Every caller passes one non-empty reconciliation batch.  The queried
+        # identity/kind/symbol columns are NOT NULL in BinaryFactStore; only
+        # opcode is nullable for non-bytecode semantic edges.
         placeholders = ",".join("?" for _item in identities)
         return {
             str(row["direct_edge_identity"]): (
-                str(row["edge_kind"] or ""),
-                str(row["symbolic_owner"] or ""),
-                str(row["symbolic_name"] or ""),
-                str(row["symbolic_descriptor"] or ""),
-                int(row["opcode"] or 0),
+                str(row["edge_kind"]),
+                str(row["symbolic_owner"]),
+                str(row["symbolic_name"]),
+                str(row["symbolic_descriptor"]),
+                int(row["opcode"]) if row["opcode"] is not None else 0,
             )
             for row in connection.execute(
                 "SELECT direct_edge_identity,edge_kind,symbolic_owner,"
@@ -6109,9 +6170,9 @@ def _validate_runtime_outcomes(
         placeholders = ",".join("?" for _item in identities)
         return {
             str(row["member_identity"]): (
-                str(row["class_name"] or ""),
-                str(row["member_name"] or ""),
-                str(row["descriptor"] or ""),
+                str(row["class_name"]),
+                str(row["member_name"]),
+                str(row["descriptor"]),
             )
             for row in connection.execute(
                 "SELECT member_identity,class_name,member_name,descriptor "
@@ -6282,7 +6343,9 @@ def _validate_runtime_outcomes(
             missing_query = """
                 SELECT e.direct_edge_identity,e.edge_kind,e.symbolic_owner,
                        e.symbolic_name,e.symbolic_descriptor,e.opcode
+                       {caller_columns}
                 FROM {schema}.direct_edges AS e
+                {caller_join}
                 {seen_join}
                 WHERE e.edge_kind='method' AND e.opcode IN (182,185)
                 {missing_predicate}
@@ -6295,6 +6358,16 @@ def _validate_runtime_outcomes(
                 )
                 missing_rows = seen_connection.execute(missing_query.format(
                     schema="facts",
+                    caller_columns=(
+                        ",e.caller_artifact_instance_identity,"
+                        "caller.class_name AS caller_class_name"
+                        if can_filter_selected_callers else ""
+                    ),
+                    caller_join=(
+                        "JOIN facts.members AS caller "
+                        "ON caller.member_identity=e.caller_member_identity"
+                        if can_filter_selected_callers else ""
+                    ),
                     seen_join=(
                         "LEFT JOIN seen AS s "
                         "ON s.evidence=e.direct_edge_identity"
@@ -6310,18 +6383,35 @@ def _validate_runtime_outcomes(
                 }
                 missing_rows = (
                     row for row in connection.execute(missing_query.format(
-                        schema="main", seen_join="", missing_predicate="",
+                        schema="main",
+                        caller_columns=(
+                            ",e.caller_artifact_instance_identity,"
+                            "caller.class_name AS caller_class_name"
+                            if can_filter_selected_callers else ""
+                        ),
+                        caller_join=(
+                            "JOIN main.members AS caller "
+                            "ON caller.member_identity=e.caller_member_identity"
+                            if can_filter_selected_callers else ""
+                        ),
+                        seen_join="", missing_predicate="",
                     ))
                     if str(row["direct_edge_identity"]) not in seen_ids
                 )
             for row in missing_rows:
+                if can_filter_selected_callers and (
+                    str(row["caller_artifact_instance_identity"]),
+                    str(row["caller_class_name"]),
+                ) not in selected_caller_artifact_classes:
+                    continue
                 edge_id = str(row["direct_edge_identity"])
                 edge = (
-                    str(row["edge_kind"] or ""),
-                    str(row["symbolic_owner"] or ""),
-                    str(row["symbolic_name"] or ""),
-                    str(row["symbolic_descriptor"] or ""),
-                    int(row["opcode"] or 0),
+                    str(row["edge_kind"]),
+                    str(row["symbolic_owner"]),
+                    str(row["symbolic_name"]),
+                    str(row["symbolic_descriptor"]),
+                    # The missing-row query restricts this column to 182/185.
+                    int(row["opcode"]),
                 )
                 validate_dispatch(edge_id, edge, "", set())
         finally:
@@ -6370,7 +6460,6 @@ def _validate_resource_selections(
             mechanism = (
                 "ordered_all"
                 if category == "runtime_topology"
-                or name.startswith("META-INF/services/")
                 else "classloader_first"
             )
             candidates = []
@@ -6498,10 +6587,12 @@ def _iter_validated_direct_edges(database: Path) -> Iterable[tuple[Any, ...]]:
             WHERE e.edge_kind IN ('method','field')
             """
         ):
-            edge_kind = str(edge["edge_kind"] or "")
+            # All selected text columns are NOT NULL in the validated fact
+            # store. Empty strings remain observable; SQL NULL is impossible.
+            edge_kind = str(edge["edge_kind"])
             if edge_kind == "method":
                 try:
-                    payload = json.loads(str(edge["edge_json"] or ""))
+                    payload = json.loads(str(edge["edge_json"]))
                 except (TypeError, ValueError, json.JSONDecodeError) as error:
                     raise BinaryValidationError(
                         "BINARY_VALIDATED_DIRECT_EDGE_REPLAY_INVALID",
@@ -6522,12 +6613,12 @@ def _iter_validated_direct_edges(database: Path) -> Iterable[tuple[Any, ...]]:
             else:
                 reference_kind = "field"
             yield (
-                str(edge["caller_class_name"] or "").replace("/", "."),
-                str(edge["caller_member_name"] or ""),
-                str(edge["caller_descriptor"] or ""),
-                str(edge["symbolic_owner"] or "").replace("/", "."),
-                str(edge["symbolic_name"] or ""),
-                str(edge["symbolic_descriptor"] or ""),
+                str(edge["caller_class_name"]).replace("/", "."),
+                str(edge["caller_member_name"]),
+                str(edge["caller_descriptor"]),
+                str(edge["symbolic_owner"]).replace("/", "."),
+                str(edge["symbolic_name"]),
+                str(edge["symbolic_descriptor"]),
                 _opcode_name(edge["opcode"]),
                 int(edge["bytecode_offset"]),
                 reference_kind,
@@ -6552,13 +6643,13 @@ def _iter_validated_type_edges(database: Path) -> Iterable[tuple[Any, ...]]:
             WHERE e.edge_kind='type'
             """
         ):
-            payload = json.loads(str(edge["edge_json"] or ""))
+            payload = json.loads(str(edge["edge_json"]))
             yield (
-                str(edge["caller_class_name"] or ""),
-                str(edge["caller_member_name"] or ""),
-                str(edge["caller_descriptor"] or ""),
+                str(edge["caller_class_name"]),
+                str(edge["caller_member_name"]),
+                str(edge["caller_descriptor"]),
                 int(edge["bytecode_offset"]),
-                str(edge["symbolic_owner"] or ""),
+                str(edge["symbolic_owner"]),
                 str(payload.get("type_use_kind") or "type_instruction"),
             )
     finally:
@@ -6582,7 +6673,8 @@ def _iter_common_validated_direct_edges(
         None
         if target_owners is None
         else {
-            str(owner or "").replace(".", "/")
+            # The trailing filter proves owner is non-empty before projection.
+            str(owner).replace(".", "/")
             for owner in target_owners
             if str(owner or "")
         }
@@ -6746,10 +6838,10 @@ def _reachable_validated_current_methods(
             ):
                 target = _resolve_member(
                     observations,
-                    str(edge["symbolic_owner"] or "").replace(".", "/"),
+                    str(edge["symbolic_owner"]).replace(".", "/"),
                     "method",
-                    str(edge["symbolic_name"] or ""),
-                    str(edge["symbolic_descriptor"] or ""),
+                    str(edge["symbolic_name"]),
+                    str(edge["symbolic_descriptor"]),
                     declared_members_cache=declared_members_cache,
                 )
                 if not target:
@@ -7007,20 +7099,24 @@ def _validate_cross_version_semantics(
         if base_resources[key] == current_resources[key]:
             continue
         changed_services[name] = name.removeprefix("META-INF/services/")
-    load_callers = {
-        (str(edge[0]), str(edge[1]), str(edge[2])): int(edge[7])
-        for edge in current_edge_factory()
-        if len(edge) == _ORACLE_DIRECT_EDGE_TUPLE_SIZE
-        and str(edge[8]) in _ORACLE_DIRECT_METHOD_REFERENCE_KINDS
-        and str(edge[3]) == "java.util.ServiceLoader"
-        and str(edge[4]) == "load"
-        and str(edge[5]).startswith("(Ljava/lang/Class;")
-    } if changed_services else {}
+    load_callers: dict[tuple[str, str, str], set[int]] = defaultdict(set)
+    if changed_services:
+        for edge in current_edge_factory():
+            if (
+                len(edge) == _ORACLE_DIRECT_EDGE_TUPLE_SIZE
+                and str(edge[8]) in _ORACLE_DIRECT_METHOD_REFERENCE_KINDS
+                and str(edge[3]) == "java.util.ServiceLoader"
+                and str(edge[4]) == "load"
+                and str(edge[5]).startswith("(Ljava/lang/Class;")
+            ):
+                load_callers[(
+                    str(edge[0]), str(edge[1]), str(edge[2]),
+                )].add(int(edge[7]))
     resources_by_service: dict[str, set[str]] = defaultdict(set)
     for resource_name, service in changed_services.items():
         resources_by_service[service].add(resource_name)
     activated_resources: set[str] = set()
-    if load_callers and resources_by_service:
+    if load_callers:
         for raw_literal in current_type_edge_factory():
             literal = tuple(raw_literal)
             caller = (
@@ -7032,7 +7128,10 @@ def _validate_cross_version_semantics(
                 literal[5] == "class_literal"
                 and literal_owner in resources_by_service
                 and caller in load_callers
-                and 0 <= load_callers[caller] - int(literal[3]) <= 4
+                and any(
+                    0 <= load_offset - int(literal[3]) <= 4
+                    for load_offset in load_callers[caller]
+                )
                 and caller in reached
             ):
                 activated_resources.update(
@@ -7078,8 +7177,9 @@ def _javap_reference(comment: str) -> tuple[str, str, str]:
         return "", "", ""
     return (
         str(match.group("owner") or ""),
-        str(match.group("name") or ""),
-        str(match.group("descriptor") or ""),
+        # Both groups are mandatory and non-empty in the successful regex.
+        str(match.group("name")),
+        str(match.group("descriptor")),
     )
 
 
@@ -7234,7 +7334,7 @@ def _validate_runtime_semantic_overlay(
         "implicit_data_contract_dispatch",
     }
     artifact_paths = {
-        Path(str(item.get("path") or "")).resolve()
+        Path(str(item["path"])).resolve()
         for item in current_artifacts
         if item.get("path")
     }
@@ -7754,7 +7854,9 @@ def _validate_runtime_semantic_overlay(
                 )
             )
         }
-        bean_observation = observations.get(bean_method[0]) or {}
+        # bean_methods is derived from observations.items(), so its owner is
+        # guaranteed to exist and carry the annotation evidence used above.
+        bean_observation = observations[bean_method[0]]
         for filter_type in filter_types:
             for kind, callback_name, callback_descriptor, _flags in (
                 current_declared_members(filter_type)
@@ -7784,15 +7886,20 @@ def _validate_runtime_semantic_overlay(
             if kind == "method" and name == "invoke"
         )
     for client_name, observation in observations.items():
-        if not feign_annotations.intersection(
+        class_declares_client = bool(feign_annotations.intersection(
             set(observation.get("class_annotations") or ())
-        ):
-            continue
+        ))
+        member_annotations = _oracle_member_annotations(observation)
         certainty = "exact" if spring_active and feign_targets else "possible"
         for kind, client_method, client_descriptor, _flags in (
             current_declared_members(client_name)
         ):
             if kind != "method":
+                continue
+            method_declares_client = bool(feign_annotations.intersection(
+                member_annotations.get((client_method, client_descriptor), ())
+            ))
+            if not class_declares_client and not method_declares_client:
                 continue
             for target_owner, target_name, target_descriptor in feign_targets:
                 expected.add((
@@ -7980,7 +8087,8 @@ def _validate_runtime_semantic_overlay(
         if row.get("semantic_edge_kind") not in supported_kinds:
             continue
         actual.add((
-            str(row.get("semantic_edge_kind") or ""),
+            # The membership guard admits only non-empty supported strings.
+            str(row.get("semantic_edge_kind")),
             str(row.get("caller_class_name") or ""),
             str(row.get("caller_member_name") or ""),
             str(row.get("caller_descriptor") or ""),
@@ -8600,49 +8708,18 @@ def _load_closed_world_graph(
     relation_by_evidence: dict[str, list[tuple[str, str, str]]] = defaultdict(list)
 
     def admit(caller: str, target: str, certainty: str, evidence: str) -> None:
-        if not caller or not target or certainty not in {"exact", "possible"}:
+        # Every call site below constructs certainty from a closed exact /
+        # possible choice; only missing relation endpoints can reject a row.
+        if not caller or not target:
             return
         record = (target, certainty, evidence)
         transitions[caller].append(record)
         relation_by_evidence[evidence].append((caller, target, certainty))
 
-    decision_payload = _load_json(generation / "binary_decisions.json")
-    paired_artifact_missing_targets = set()
-    unresolved_edge_alias_targets: dict[str, set[str]] = defaultdict(set)
-    for decision in decision_payload.get("authoritative_change_facts") or ():
-        scope = decision.get("fact_scope") or {}
-        kind = str(scope.get("member_kind") or decision.get("fact_kind") or "")
-        artifact_sides = {
-            str(artifact.get("side") or "")
-            for artifact in decision.get("dependency_artifacts") or ()
-        }
-        if (
-            scope.get("member_change_kind") == "removed"
-            and kind in {"method", "field"}
-            and {"base", "current"}.issubset(artifact_sides)
-        ):
-            paired_artifact_missing_targets.add(_identity(
-                "binary_symbolic_trace_target", {
-                    "owner": str(scope.get("class_name") or "").replace(".", "/"),
-                    "name": str(scope.get("member_name") or ""),
-                    "descriptor": str(scope.get("descriptor") or ""),
-                    "member_kind": kind,
-                },
-            ))
-        if kind in {"method", "field"}:
-            target = _identity("binary_symbolic_trace_target", {
-                "owner": str(scope.get("class_name") or "").replace(".", "/"),
-                "name": str(scope.get("member_name") or ""),
-                "descriptor": str(scope.get("descriptor") or ""),
-                "member_kind": kind,
-            })
-            for edge_id in (
-                (decision.get("evidence") or {}).get(
-                    "current_unresolved_direct_edge_identities"
-                )
-                or ()
-            ):
-                unresolved_edge_alias_targets[str(edge_id)].add(target)
+    (
+        paired_artifact_missing_targets,
+        unresolved_edge_alias_targets,
+    ) = _closed_world_decision_aliases(generation)
 
     def unresolved_certainty(status: str, symbolic: str) -> str:
         # A direct bytecode reference to a definitively missing member/class is
@@ -8662,7 +8739,8 @@ def _load_closed_world_graph(
         edge = edges.get(edge_id)
         if edge is None:
             continue
-        edge_kind = str(edge["edge_kind"] or "")
+        # direct_edges.edge_kind is NOT NULL in the fact-store schema.
+        edge_kind = str(edge["edge_kind"])
         dynamic_handle = edge_kind.startswith("invokedynamic_handle_")
         executable_linkage = edge_kind in {
             "invokedynamic_bootstrap", "ldc_constant_dynamic_bootstrap",
@@ -9055,7 +9133,7 @@ def _validate_closed_world_results_in_workspace(
         "reachable": 3, "uncertain": 2,
         "not_found_in_static_analysis": 1, "not_analyzed": 0,
     }
-    grouped: dict[tuple[Any, Any, Any, Any, Any], dict[str, Any]] = {}
+    grouped: dict[tuple[Any, Any, Any, Any], dict[str, Any]] = {}
     result_projection_ids: set[str] = set()
     formal_result_count = 0
     runtime_profile_identity: Any = None
@@ -9070,7 +9148,6 @@ def _validate_closed_world_results_in_workspace(
             return
         scope = decision_for_change.get("fact_scope") or {}
         key = (
-            scope.get("initiating_loader_realm_identity"),
             scope.get("class_name"),
             scope.get("member_kind") or decision_for_change.get("fact_kind"),
             scope.get("member_name"),
@@ -9091,8 +9168,12 @@ def _validate_closed_world_results_in_workspace(
                 "change_ids": [],
                 "base_coords": set(),
                 "current_coords": set(),
+                "loader_realms": set(),
             }
             grouped[key] = aggregate
+        realm = str(scope.get("initiating_loader_realm_identity") or "")
+        if realm:
+            aggregate["loader_realms"].add(realm)
         status = str(result.get("reachability_status") or "")
         if priority.get(status, -1) > priority.get(
             str(aggregate["reachability_status"]), -1
@@ -9331,16 +9412,15 @@ def _validate_closed_world_results_in_workspace(
         )
     )
     for key, aggregate in grouped.items():
-        realm, owner, kind, name, descriptor = key
+        owner, kind, name, descriptor = key
         identity = _identity("reported_api_identity", {
             "analysis_context_identity": analysis_context,
             "current_runtime_profile_identity": runtime_profile_identity,
-            "initiating_loader_realm_identity": realm,
             "class_name": owner,
             "member_kind": kind,
             "member_name": name,
             "descriptor": descriptor,
-            "grouping_rule_version": "binary-reported-api-v1",
+            "grouping_rule_version": "binary-reported-api-v2",
         })
         status = str(aggregate["reachability_status"])
         expected_api[identity] = {
@@ -9349,6 +9429,7 @@ def _validate_closed_world_results_in_workspace(
             "display_member": name,
             "display_descriptor": descriptor,
             "display_member_kind": kind,
+            "initiating_loader_realms": sorted(aggregate["loader_realms"]),
             "reachability_status": status,
             "is_reachable": bool(aggregate["is_reachable"]),
             "impact_conclusion": (
@@ -10074,18 +10155,17 @@ def _write_validation_attachment_portable(
             raise _validation_attachment_path_error(
                 destination, "generation path is a symbolic link"
             )
+        # Canonicalize ancestor aliases before publication.  Rejecting every
+        # lexical ancestor link would falsely block standard platform aliases
+        # such as macOS /var -> /private/var; the generation entry itself was
+        # checked above and all subsequent checks bind to this physical path.
         generation = requested_generation.resolve(strict=True)
         validation_dir = generation / "validation"
         destination = validation_dir / destination_name
-        if generation.resolve(strict=True) != generation:
-            raise _validation_attachment_path_error(
-                destination, "generation path contains a symbolic link"
-            )
         validation_dir.mkdir(exist_ok=True)
         if (
             validation_dir.is_symlink()
             or validation_dir.resolve(strict=True) != validation_dir
-            or validation_dir.resolve(strict=True).parent != generation
         ):
             raise _validation_attachment_path_error(
                 destination, "validation directory is not bound to generation"
@@ -10657,8 +10737,6 @@ def validate_generation(
     # only the artifact it is actively comparing. Focused callers can still
     # pass ordinary dict caches to the helpers for compatibility.
     direct_scan_cache = _OracleScanSpoolCache()
-    structural_scan_cache = None
-    direct_truth_cache = None
     validated_projection_cache: dict[
         tuple[Any, ...], dict[str, Any]
     ] = {}
@@ -10783,7 +10861,7 @@ def validate_generation(
                 artifacts,
                 javap=javap,
                 scan_cache=direct_scan_cache,
-                truth_cache=direct_truth_cache,
+                truth_cache=None,
                 string_pool=validation_string_pool,
                 progress_callback=progress_callback,
                 progress_label=side_name,
@@ -10799,7 +10877,7 @@ def validate_generation(
                 artifacts,
                 inventories,
                 javap=javap,
-                scan_cache=structural_scan_cache,
+                scan_cache=None,
                 direct_scan_cache=direct_scan_cache,
                 string_pool=validation_string_pool,
                 progress_callback=progress_callback,
@@ -10821,10 +10899,6 @@ def validate_generation(
             production_structural_cache.clear()
             connection.close()
 
-    if direct_truth_cache is not None:
-        direct_truth_cache.clear()
-    if structural_scan_cache is not None:
-        structural_scan_cache.clear()
     validated_projection_cache.clear()
     foundational_validation_cache.clear()
     clear_immutable_oracle_cache()
@@ -11105,10 +11179,6 @@ def validate_generation(
     observations_by_side.clear()
     side_validation_cache.clear()
     direct_scan_cache.clear()
-    if direct_truth_cache is not None:
-        direct_truth_cache.clear()
-    if structural_scan_cache is not None:
-        structural_scan_cache.clear()
     inventory_cache.clear()
     validation_string_pool.clear()
     clear_immutable_oracle_cache()

@@ -1439,6 +1439,161 @@ class BinaryPipelineTest(unittest.TestCase):
         )
         return binding
 
+    def test_parent_checkpoint_operations_execute_portable_windows_fallbacks(self):
+        class WindowsOsProxy:
+            name = "nt"
+
+            def __getattr__(self, name):
+                return getattr(os, name)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "output"
+            root.mkdir(mode=0o700)
+            proxy = WindowsOsProxy()
+            with patch.object(
+                binary_pipeline,
+                "_secure_resume_checkpoint_dirfd_supported",
+                return_value=False,
+            ), patch.object(binary_pipeline, "os", proxy):
+                written = binary_pipeline._write_resume_checkpoint(
+                    root,
+                    {"schema": binary_pipeline.RESUME_CHECKPOINT_SCHEMA},
+                )
+                checkpoint = binary_pipeline._read_resume_checkpoint(root)
+                optional = binary_pipeline._write_non_authoritative_json(
+                    root / "binary_observability" / "latest_failure.json",
+                    {"status": "failed"},
+                    durable=True,
+                )
+                removed = binary_pipeline._delete_resume_checkpoint_durable(root)
+
+        self.assertEqual(written.name, "validation_checkpoint.json")
+        self.assertEqual(checkpoint["schema"], binary_pipeline.RESUME_CHECKPOINT_SCHEMA)
+        self.assertTrue(optional)
+        self.assertTrue(removed)
+
+    def test_measurement_and_recapture_cleanup_remove_only_bound_private_state(self):
+        candidate_binding = self._synthetic_performance_authority_binding(
+            "candidate-cleanup",
+            authority_mode=binary_pipeline._PERFORMANCE_CANDIDATE_AUTHORITY_MODE,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "candidate"
+            root.mkdir(mode=0o700)
+            binary_pipeline._write_resume_checkpoint(root, {
+                "schema": binary_pipeline.RESUME_CHECKPOINT_SCHEMA,
+                "performance_authority_gate_binding": candidate_binding,
+            })
+            token = binary_pipeline._PERFORMANCE_MEASUREMENT_BOOTSTRAP_CONTEXT.set(
+                binary_pipeline._PERFORMANCE_MEASUREMENT_BOOTSTRAP_CAPABILITY,
+            )
+            try:
+                binary_pipeline._cleanup_performance_measurement_state(root)
+            finally:
+                binary_pipeline._PERFORMANCE_MEASUREMENT_BOOTSTRAP_CONTEXT.reset(token)
+            self.assertFalse(binary_pipeline._resume_checkpoint_path(root).exists())
+
+        recapture_binding = self._synthetic_performance_authority_binding(
+            "recapture-cleanup",
+            authority_mode=binary_pipeline._PERFORMANCE_RECAPTURE_AUTHORITY_MODE,
+        )
+        generation_identity = "a" * 64
+        activation_identity = "b" * 64
+        active = {
+            "schema": binary_output._ACTIVE_DESCRIPTOR_SCHEMA,
+            "result_generation_identity": generation_identity,
+            "generation_directory": f"binary_generations/{generation_identity}",
+            "validation_run_identity": "c" * 64,
+            "validation_result_sha256": "d" * 64,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = (Path(temporary) / "recapture").resolve()
+            root.mkdir(mode=0o700)
+            binary_output._write_active_descriptor(
+                root, active, expect_missing=True,
+            )
+            binary_pipeline._write_resume_checkpoint(root, {
+                "schema": binary_pipeline.RESUME_CHECKPOINT_SCHEMA,
+                "performance_authority_gate_binding": recapture_binding,
+                "result_generation_identity": generation_identity,
+                "activation_identity": activation_identity,
+            })
+            context_token = (
+                binary_pipeline._PERFORMANCE_RELEASE_RECAPTURE_CONTEXT.set(
+                    binary_pipeline._PERFORMANCE_RELEASE_RECAPTURE_CAPABILITY,
+                )
+            )
+            root_token = (
+                binary_pipeline._PERFORMANCE_RELEASE_RECAPTURE_ROOT_CONTEXT.set(root)
+            )
+            try:
+                with patch.object(
+                    binary_output,
+                    "_require_generation_identity_publication_allowed",
+                    return_value={
+                        "authority_mode": (
+                            binary_output._RELEASE_RECAPTURE_AUTHORITY_MODE
+                        ),
+                    },
+                ):
+                    binary_pipeline._cleanup_performance_recapture_state(root)
+            finally:
+                binary_pipeline._PERFORMANCE_RELEASE_RECAPTURE_ROOT_CONTEXT.reset(
+                    root_token,
+                )
+                binary_pipeline._PERFORMANCE_RELEASE_RECAPTURE_CONTEXT.reset(
+                    context_token,
+                )
+
+            self.assertFalse((root / "active_binary_generation.json").exists())
+            self.assertFalse(binary_pipeline._resume_checkpoint_path(root).exists())
+
+    def test_rebind_rejects_invalid_checkpoint_content_identity_with_path_evidence(self):
+        old_binding = self._synthetic_performance_authority_binding("old-binding")
+        current_binding = self._synthetic_performance_authority_binding(
+            "current-binding",
+        )
+        checkpoint = {
+            "schema": binary_pipeline.RESUME_CHECKPOINT_SCHEMA,
+            "performance_authority_gate_binding": old_binding,
+            "checkpoint_content_identity": "0" * 64,
+        }
+
+        with self.assertRaises(BinaryPipelineError) as raised:
+            binary_pipeline._rebind_resume_checkpoint_performance_authority(
+                Path("output"), checkpoint, current_binding,
+            )
+
+        self.assertEqual(
+            raised.exception.reason_code,
+            "BINARY_RESUME_CHECKPOINT_INTEGRITY_INVALID",
+        )
+        self.assertIn("validation_checkpoint.json", str(raised.exception))
+
+    def test_cli_receipts_bound_mapping_failures_and_structured_error_details(self):
+        class BrokenReceipt(dict):
+            def __contains__(self, key):
+                if key == "schema":
+                    raise LookupError("receipt unavailable")
+                return super().__contains__(key)
+
+        receipt = binary_pipeline._cli_core_result_receipt(BrokenReceipt())
+        self.assertEqual(
+            receipt["schema"]["failure_type"], "LookupError",
+        )
+        self.assertEqual(
+            receipt["activation_disposition"],
+            "core_completed_without_active_descriptor_receipt",
+        )
+
+        payload = binary_pipeline._cli_failure_payload(
+            RuntimeError('{"nested":[1,2,3]}'),
+            diagnostic_root=None,
+            attempt_identity="attempt-1",
+        )
+        self.assertEqual(payload["cause"], {"nested": [1, 2, 3]})
+        self.assertEqual(payload["failure_type"], "RuntimeError")
+
     def _real_performance_binder_fixture(self):
         """Build a small valid byte/support pair for binder integration tests."""
 
@@ -8676,8 +8831,20 @@ public class demo.ArrayCasts {
         ))
 
     def test_dependency_source_set_is_published_with_dependency_dimension(self):
-        base = self._jar("source-base", 1)
-        current = self._jar("source-current", 2, uses_system_out=True)
+        base = self._compile_sources_jar("source-base", {
+            "demo/Api.java": (
+                "package demo; public class Api { "
+                "public int value(){ return helper(); } "
+                "private int helper(){ return 1; } }"
+            ),
+        })
+        current = self._compile_sources_jar("source-current", {
+            "demo/Api.java": (
+                "package demo; public class Api { "
+                "public int value(){ System.out.print(\"\"); return helper(); } "
+                "private int helper(){ return 2; } }"
+            ),
+        })
         current_source = self.root / "source-current" / "src"
         kotlin_source = current_source / "demo" / "KotlinConsumer.kt"
         kotlin_source.write_text(
@@ -8762,6 +8929,16 @@ public class demo.ArrayCasts {
         ) as handle:
             candidate_rows = list(csv.DictReader(handle))
         self.assertTrue(candidate_rows)
+        self.assertTrue(any(
+            row["候选目标"] == "demo.Api.helper()"
+            and row["置信度"] == "high"
+            for row in candidate_rows
+        ))
+        self.assertFalse(any(
+            row["候选目标"].endswith(".print")
+            or row["置信度"] == "low"
+            for row in candidate_rows
+        ))
         self.assertTrue(all(
             row["源码归属"] == "com.acme:api:2"
             and row["权威边界"] == "源码候选关系，不是可执行调用边"

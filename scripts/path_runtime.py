@@ -105,22 +105,26 @@ def bounded_path_component(
     digest = _digest(value)
     if not always_hash and len(safe) <= max_length:
         return safe
-    prefix_length = max(1, max_length - len(digest) - 1)
-    return f"{safe[:prefix_length].rstrip(' .-_') or default}-{digest}"
+    # ``max_length`` is at least 16 and the digest is 10 characters, so the
+    # prefix always has at least five characters. ``_sanitize_component`` also
+    # guarantees a non-empty first character outside the stripped set.
+    prefix_length = max_length - len(digest) - 1
+    return f"{safe[:prefix_length].rstrip(' .-_')}-{digest}"
 
 
 def bounded_filename(value, max_length=64, default="artifact"):
     """Bound a file name while retaining its final suffix and stable identity."""
+    max_length = max(16, int(max_length))
     name = _sanitize_component(Path(str(value or "")).name, default=default)
     if len(name) <= max_length:
         return name
     suffix = Path(name).suffix
     digest = _digest(value)
-    suffix_budget = min(len(suffix), 12)
+    suffix_budget = min(len(suffix), 12, max_length - len(digest) - 2)
     suffix = suffix[-suffix_budget:] if suffix_budget else ""
-    stem_budget = max(1, int(max_length) - len(digest) - len(suffix) - 1)
+    stem_budget = max_length - len(digest) - len(suffix) - 1
     stem = name[:-len(Path(name).suffix)] if Path(name).suffix else name
-    return f"{stem[:stem_budget].rstrip(' .-_') or default}-{digest}{suffix}"
+    return f"{stem[:stem_budget].rstrip(' .-_')}-{digest}{suffix}"
 
 
 def named_temporary_file(*, prefix="jua-", **kwargs):
@@ -222,7 +226,7 @@ def make_short_temp_dir(
 
 
 def _remove_short_temp_dir(path: Path) -> None:
-    cleanup_error = None
+    cleanup_error = OSError(f"failed to remove temporary directory: {path}")
     # Windows virus scanners and recently reaped JVMs can retain a directory
     # entry briefly after every application handle is closed. Keep the wait
     # bounded, but give those transient owners enough time to release it.
@@ -236,8 +240,7 @@ def _remove_short_temp_dir(path: Path) -> None:
             return
         except OSError as error:
             cleanup_error = error
-    if cleanup_error is not None:
-        raise cleanup_error
+    raise cleanup_error
 
 
 @contextmanager
@@ -582,7 +585,8 @@ def _run_worktree_mutation(command, *, repo_dir, runner, timeout, deadline=None)
         else time.monotonic() + max(1, int(timeout or 1))
     )
     history = []
-    for attempt in range(len(_WORKTREE_LOCK_RETRY_DELAYS) + 1):
+    attempt = 0
+    while True:
         remaining = _remaining_timeout(deadline)
         if remaining <= 0:
             history.append({
@@ -617,7 +621,7 @@ def _run_worktree_mutation(command, *, repo_dir, runner, timeout, deadline=None)
         if delay <= 0:
             return stdout, stderr, rc, history
         time.sleep(delay)
-    return stdout, stderr, rc, history
+        attempt += 1
 
 
 def _registered_worktree_path_values(stdout):
@@ -1075,7 +1079,7 @@ def create_detached_worktree(
                 attempts.append(
                     f"root={root}:predicted_longest_path={predicted_longest}:"
                     f"exceeds_windows_safe_budget={WINDOWS_SAFE_PATH_LENGTH}:"
-                    f"longest_entry={longest_entry[:200] or '<unknown>'}"
+                    f"longest_entry={longest_entry[:200]}"
                 )
                 continue
             _stdout, stderr, rc, history = _run_worktree_mutation(
@@ -1155,10 +1159,8 @@ def create_detached_worktree(
                     "git worktree add 失败且本次注册无法安全清理，"
                     "为避免破坏 Git worktree 元数据已停止自动重试：" + attempt
                 )
-            if not any(
-                marker in f"{_stdout or ''}\n{stderr or ''}".lower()
-                for marker in _WORKTREE_PATH_ERROR_MARKERS
-            ):
+            failure_text = f"{_stdout or ''}\n{stderr or ''}".lower()
+            if not any(map(failure_text.__contains__, _WORKTREE_PATH_ERROR_MARKERS)):
                 # Changing the temp root only helps path-length/path-collision
                 # failures.  Retrying auth, object, permission, or repository
                 # errors at more roots merely multiplies the same failure.

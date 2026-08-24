@@ -181,7 +181,7 @@
     "definition_ready_claims_allowed": true,
     "implementation": "scripts/java/ClassDefinitionVerifier.java",
     "requirements": [
-      "full exact target JDK with release, java and javac plus JDK 8 embedded JRE platform archives (including rt.jar) or JDK 9+ lib/modules and jmods",
+      "full exact target JDK with java and javac; metadata comes from release when present or a content-bound java properties probe otherwise, plus JDK 8 embedded JRE platform archives (including rt.jar) or JDK 9+ lib/modules and jmods",
       "machine-global Java extension directories are excluded from JDK 8 verification",
       "-Xverify:all",
       "initialize=false",
@@ -294,8 +294,8 @@
   "performance_gate": {
     "status": "passed",
     "path": "tests/fixtures/binary_first/performance_gate.json",
-    "sha256": "fb8960ad7122031b3e5befd173cf22ae211fda6de938783e2f995851ade9e2fe",
-    "source_implementation_identity": "62b0b4a1fccd1856a5401655a42215abfebb9afefa029ee96f15aef096085252",
+    "sha256": "7f18ddd524458c2d2591a57b409cef10a6912916ddfacd75b9f7888a26a8ca0d",
+    "source_implementation_identity": "80120a132f9f7092634cbf68b9c7dc6e1843a699089fe13ec73cebe2e293611d",
     "dataset": "400 JAR / 100000 class store + identical and one-JAR-changed full 400 JAR / 100000 class pipelines",
     "warm_parser_invocations": 0,
     "blocks_binary_authority_switch": false

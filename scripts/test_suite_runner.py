@@ -33,6 +33,34 @@ def iter_tests(suite: unittest.TestSuite) -> Iterable[unittest.TestCase]:
             yield item
 
 
+def _test_id(test: Any) -> str:
+    try:
+        return str(test.id())
+    except Exception:  # noqa: BLE001 - evidence must survive broken test objects
+        return f"{type(test).__module__}.{type(test).__qualname__}"
+
+
+def _unique_selection(
+    tests: Iterable[unittest.TestCase],
+) -> tuple[list[unittest.TestCase], list[str]]:
+    unique: dict[str, unittest.TestCase] = {}
+    duplicates: list[str] = []
+    for test in tests:
+        test_id = _test_id(test)
+        if test_id in unique:
+            duplicates.append(test_id)
+        else:
+            unique[test_id] = test
+    return list(unique.values()), duplicates
+
+
+def _outcomes(rows: Iterable[tuple[Any, str]]) -> list[dict[str, str]]:
+    return [
+        {"test_id": _test_id(test), "detail": str(detail)[-8000:]}
+        for test, detail in rows
+    ]
+
+
 def blackbox_prefixes(policy: Mapping[str, Any]) -> tuple[str, ...]:
     return tuple(
         str(root).strip("/").replace("/", ".")
@@ -205,10 +233,16 @@ def skipped_test_is_forbidden(
 ) -> bool:
     if skips_are_forbidden(suite_name):
         return True
-    return (
-        suite_name == "all"
-        and classify_test_id(test_id, policy) in {"blackbox", "performance"}
-    )
+    classification = classify_test_id(test_id, policy)
+    if suite_name == "all" and classification in {"blackbox", "performance"}:
+        return True
+    if suite_name in {"whitebox", "all"} and classification == "whitebox":
+        allowed = {
+            str(selector).strip()
+            for selector in policy.get("allowed_whitebox_skip_selectors") or ()
+        }
+        return test_id not in allowed
+    return False
 
 
 def public_capability_readiness_blocks(
@@ -220,6 +254,17 @@ def public_capability_readiness_blocks(
         and (trust_result.get("capability_readiness") or {}).get("status")
         != "complete"
     )
+
+
+def emit_payload(payload: Mapping[str, Any], json_out: str = "") -> None:
+    if json_out:
+        target = Path(json_out).resolve()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    print(json.dumps(payload, ensure_ascii=False))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -249,7 +294,7 @@ def main(argv: list[str] | None = None) -> int:
             "started_at": started_at.isoformat(),
             "completed_at": datetime.now(timezone.utc).isoformat(),
         }
-        print(json.dumps(payload, ensure_ascii=False))
+        emit_payload(payload, args.json_out)
         return 2
     trust = run_trust_gate(root, policy_path)
     if trust.get("status") != "passed":
@@ -262,7 +307,7 @@ def main(argv: list[str] | None = None) -> int:
             "started_at": started_at.isoformat(),
             "completed_at": datetime.now(timezone.utc).isoformat(),
         }
-        print(json.dumps(payload, ensure_ascii=False))
+        emit_payload(payload, args.json_out)
         return 2
 
     try:
@@ -286,7 +331,7 @@ def main(argv: list[str] | None = None) -> int:
             "detail": f"{type(error).__name__}: {error}",
             "trust": trust,
         }
-        print(json.dumps(payload, ensure_ascii=False))
+        emit_payload(payload, args.json_out)
         return 2
 
     selector_gaps = (
@@ -327,11 +372,14 @@ def main(argv: list[str] | None = None) -> int:
             "counts": {key: len(value) for key, value in partitions.items()},
             "trust": trust,
         }
-        print(json.dumps(payload, ensure_ascii=False))
+        emit_payload(payload, args.json_out)
         return 2
 
+    selected_count = len(selected)
+    selected, duplicate_selections = _unique_selection(selected)
     print(
-        f"[test-suite] suite={args.suite} selected={len(selected)} "
+        f"[test-suite] suite={args.suite} selected={selected_count} "
+        f"unique_selected={len(selected)} "
         f"blackbox={len(partitions['blackbox'])} "
         f"whitebox={len(partitions['whitebox'])} "
         f"performance={len(partitions['performance'])}",
@@ -340,6 +388,10 @@ def main(argv: list[str] | None = None) -> int:
     result = unittest.TextTestRunner(verbosity=args.verbosity).run(
         unittest.TestSuite(selected)
     )
+    loader_failures = [
+        _test_id(test) for test in selected
+        if test.__class__.__name__ == "_FailedTest"
+    ]
     skips = [
         {"test_id": test.id(), "reason": reason}
         for test, reason in result.skipped
@@ -353,6 +405,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     successful = (
         result.wasSuccessful()
+        and not duplicate_selections
+        and not result.expectedFailures
         and not unexpected_skips
         and not capability_readiness_blocked
     )
@@ -361,24 +415,37 @@ def main(argv: list[str] | None = None) -> int:
         "suite": args.suite,
         "status": "passed" if successful else "failed",
         "reason_code": (
+            "TEST_SUITE_SELECTION_OVERLAP"
+            if duplicate_selections else
+            "TEST_SUITE_EXPECTED_FAILURE"
+            if result.expectedFailures else
             "TEST_SUITE_UNEXPECTED_SKIP"
             if unexpected_skips else
             "PUBLIC_CAPABILITY_MATRIX_INCOMPLETE"
             if capability_readiness_blocked else
+            "TEST_SUITE_LOAD_FAILED" if loader_failures else
             "TEST_SUITE_FAILED" if not result.wasSuccessful() else
             "TEST_SUITE_PASSED"
         ),
         "counts": {
             **{key: len(value) for key, value in partitions.items()},
             "discovered": len(discovered),
-            "selected": len(selected),
+            "selected": selected_count,
+            "unique_selected": len(selected),
+            "duplicate_selections": len(duplicate_selections),
             "run": result.testsRun,
             "failures": len(result.failures),
             "errors": len(result.errors),
             "skipped": len(result.skipped),
             "expected_failures": len(result.expectedFailures),
             "unexpected_successes": len(result.unexpectedSuccesses),
+            "loader_failures": len(loader_failures),
         },
+        "duplicate_selections": duplicate_selections,
+        "loader_failures": loader_failures,
+        "failures": _outcomes(result.failures),
+        "errors": _outcomes(result.errors),
+        "expected_failures": _outcomes(result.expectedFailures),
         "discovery_scope": (
             "tests/blackbox" if args.suite == "blackbox"
             else "performance_selectors" if args.suite == "performance"
@@ -387,11 +454,16 @@ def main(argv: list[str] | None = None) -> int:
         ),
         "skip_policy": (
             "forbidden" if skips_are_forbidden(args.suite)
-            else "blackbox_and_performance_forbidden" if args.suite == "all"
+            else "allowlisted_only" if args.suite == "whitebox"
+            else "blackbox_performance_and_unallowlisted_whitebox_forbidden"
+            if args.suite == "all"
             else "reported"
         ),
         "skips": skips,
         "unexpected_skips": unexpected_skips,
+        "unexpected_successes": [
+            _test_id(test) for test in result.unexpectedSuccesses
+        ],
         "capability_readiness_blocked": capability_readiness_blocked,
         "capability_readiness": trust.get("capability_readiness"),
         "trust": trust,
@@ -399,14 +471,7 @@ def main(argv: list[str] | None = None) -> int:
         "started_at": started_at.isoformat(),
         "completed_at": datetime.now(timezone.utc).isoformat(),
     }
-    if args.json_out:
-        target = Path(args.json_out).resolve()
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-    print(json.dumps(payload, ensure_ascii=False))
+    emit_payload(payload, args.json_out)
     return 0 if successful else 1
 
 

@@ -13,7 +13,7 @@ import zipfile
 
 from binary_asm_helper import BinaryClassInput, BinaryFactRun, extract_class_facts
 from binary_first_contract import BinaryFirstContractError, canonical_identity
-from jdk_preflight import jdk_tool_path
+from jdk_preflight import JdkPreflightError, jdk_tool_path, resolve_jdk_release
 
 
 class PlatformImageError(BinaryFirstContractError):
@@ -43,7 +43,10 @@ def _parse_release(path: Path) -> dict[str, str]:
 
 
 def _java_major(version: str) -> int:
-    match = re.match(r"(?:1\.)?(\d+)", str(version or ""))
+    text = str(version or "").strip()
+    legacy = re.match(r"1\.(\d+)", text)
+    modern = re.match(r"([2-9]\d*|1\d+)", text)
+    match = legacy or modern
     if not match:
         raise PlatformImageError("PLATFORM_JAVA_VERSION_INVALID", str(version))
     return int(match.group(1))
@@ -86,13 +89,22 @@ class JdkPlatformImage:
         self.modules_file = self.jdk_home / "lib" / "modules"
         self.java_executable = jdk_tool_path(self.jdk_home, "java")
         self.jmods_dir = self.jdk_home / "jmods"
-        required = (self.release_file, self.java_executable)
+        required = (self.java_executable,)
         missing = [str(path) for path in required if not path.is_file()]
         if missing:
             raise PlatformImageError(
                 "PLATFORM_IMAGE_FILE_MISSING", f"missing target JDK files: {missing}"
             )
-        self.release = _parse_release(self.release_file)
+        try:
+            release_record = resolve_jdk_release(self.jdk_home)
+        except (JdkPreflightError, OSError) as error:
+            reason = getattr(error, "reason_code", type(error).__name__)
+            raise PlatformImageError(
+                "PLATFORM_JDK_METADATA_INVALID",
+                f"cannot resolve target JDK metadata ({reason}): {error}",
+            ) from error
+        self.release = release_record["values"]
+        self.release_metadata_source = release_record["source"]
         self.java_major = _java_major(self.release.get("JAVA_VERSION", ""))
         if self.java_major < 8:
             raise PlatformImageError(
@@ -161,10 +173,8 @@ class JdkPlatformImage:
                     "a full target JDK with jmods is required for closed platform facts",
                 )
             self.module_image_sha256 = _sha256_file(self.modules_file)
-        self.identity = _identity(
-            "runtime_platform_image_identity",
-            {
-                "release_sha256": _sha256_file(self.release_file),
+        identity_payload = {
+                "release_sha256": release_record["identity"],
                 "platform_image_format": self.platform_image_format,
                 "module_image_sha256": self.module_image_sha256,
                 "java_launcher_sha256": _sha256_file(self.java_executable),
@@ -172,7 +182,14 @@ class JdkPlatformImage:
                 "implementor": self.release.get("IMPLEMENTOR", "unknown"),
                 "os_arch": self.release.get("OS_ARCH", "unknown"),
                 "modules": self.release.get("MODULES", "unknown"),
-            },
+            }
+        if self.release_metadata_source != "release-file":
+            identity_payload["release_metadata_source"] = (
+                self.release_metadata_source
+            )
+        self.identity = _identity(
+            "runtime_platform_image_identity",
+            identity_payload,
         )
         self._class_index: dict[str, _PlatformClassLocation] | None = None
         self._module_exports: dict[str, frozenset[str]] | None = None
@@ -258,9 +275,11 @@ class JdkPlatformImage:
             ) from error
 
     def ensure_classes(self, class_names: Iterable[str]) -> dict[str, PlatformClassFact]:
-        pending = {
-            str(name or "").replace(".", "/") for name in class_names if str(name or "").strip()
-        }
+        pending = set()
+        for name in class_names:
+            normalized = str(name or "").strip().replace(".", "/")
+            if normalized:
+                pending.add(normalized)
         while True:
             batch_names = sorted(
                 name for name in pending

@@ -41,7 +41,9 @@ def _pom_model(
     parent = root.find("{*}parent")
 
     def resolve_inherited(value):
-        result = str(value or "").strip()
+        # This resolver is called only after a non-empty parent field was
+        # observed; an empty sentinel is handled by the caller's short circuit.
+        result = str(value).strip()
         replacements = {
             **{
                 str(key): str(val)
@@ -96,17 +98,15 @@ def _pom_model(
     ]
     active_profile_nodes = explicitly_active or default_active
     properties = dict(inherited_properties or {}) if inherits_reactor_parent else {}
-    properties.update({
-        str(child.tag).rsplit('}', 1)[-1]: (child.text or '').strip()
-        for child in root.findall('{*}properties/*')
-        if (child.text or '').strip()
-    })
+    for child in root.findall('{*}properties/*'):
+        property_value = (child.text or '').strip()
+        if property_value:
+            properties[str(child.tag).rsplit('}', 1)[-1]] = property_value
     for profile in active_profile_nodes:
-        properties.update({
-            str(child.tag).rsplit('}', 1)[-1]: (child.text or '').strip()
-            for child in profile.findall('{*}properties/*')
-            if (child.text or '').strip()
-        })
+        for child in profile.findall('{*}properties/*'):
+            property_value = (child.text or '').strip()
+            if property_value:
+                properties[str(child.tag).rsplit('}', 1)[-1]] = property_value
     builtin_properties = {
         "project.groupId": group_id,
         "pom.groupId": group_id,
@@ -145,11 +145,11 @@ def _pom_model(
     module_nodes = list(root.findall("{*}modules/{*}module"))
     for profile in active_profile_nodes:
         module_nodes.extend(profile.findall("{*}modules/{*}module"))
-    module_paths = list(dict.fromkeys(
-        (item.text or "").strip()
-        for item in module_nodes
-        if (item.text or "").strip()
-    ))
+    module_paths = []
+    for item in module_nodes:
+        module_path = (item.text or "").strip()
+        if module_path and module_path not in module_paths:
+            module_paths.append(module_path)
     dependency_nodes = list(root.findall("{*}dependencies/{*}dependency"))
     for profile in active_profile_nodes:
         dependency_nodes.extend(
@@ -201,7 +201,11 @@ def _pom_model(
         if _text(plugin, 'artifactId') != 'build-helper-maven-plugin':
             continue
         for execution in plugin.findall('{*}executions/{*}execution'):
-            goals = {_text(goal, '') or (goal.text or '').strip() for goal in execution.findall('{*}goals/{*}goal')}
+            goals = set()
+            for goal in execution.findall('{*}goals/{*}goal'):
+                goal_name = (goal.text or '').strip()
+                if goal_name:
+                    goals.add(goal_name)
             configuration = execution.find('{*}configuration')
             if configuration is None:
                 continue
@@ -457,9 +461,8 @@ def _gradle_main_source_block(text):
     )
     if not match:
         return ""
+    # Every accepted pattern includes the opening brace itself.
     brace = text.find("{", start_at + match.start())
-    if brace < 0:
-        return ""
     depth = 1
     quote = ""
     index = brace + 1
@@ -513,9 +516,14 @@ def _gradle_project_dependencies(text):
         if gradle_path in seen:
             continue
         seen.add(gradle_path)
+        module = gradle_path.strip(":").replace(":", "/")
+        if not module:
+            # A path consisting only of separators is not a Gradle project
+            # path and must not be reinterpreted as the root project.
+            continue
         edges.append({
             "coord": "",
-            "module": gradle_path.strip(":").replace(":", "/") or ".",
+            "module": module,
             "optional": False,
             "scope": "runtime",
         })
@@ -605,7 +613,6 @@ def discover_gradle_modules(project_dir):
         specs.append((module, gradle_path, (root / relative).resolve()))
 
     modules = []
-    problems = []
     for module, gradle_path, module_dir in specs:
         build_path = next(
             (module_dir / name for name in _GRADLE_BUILD_FILES if (module_dir / name).is_file()),
@@ -679,8 +686,8 @@ def discover_gradle_modules(project_dir):
     }
     canonical = json.dumps(model_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return {
-        "status": "partial" if problems else "complete",
-        "reason_codes": problems,
+        "status": "complete",
+        "reason_codes": [],
         "modules": modules,
         "gradle_model_hash": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
         "root_config_hash": model_payload["root_config_hash"],
@@ -790,7 +797,7 @@ def build_project_scope(project_dir, target_module, *, active_profiles=None, bui
             'pom.basedir': str(module_dir),
             **{str(key): str(val) for key, val in (properties or {}).items()},
         }
-        text = str(value or '').strip()
+        text = str(value).strip()
         for _ in range(5):
             updated = re.sub(
                 r'\$\{([^}]+)\}',
@@ -805,7 +812,10 @@ def build_project_scope(project_dir, target_module, *, active_profiles=None, bui
 
     for item in included:
         module_dir = Path(item["module_dir"])
-        declared_sources = list(item.get('declared_source_paths') or [])
+        declared_sources = [
+            value for value in (item.get('declared_source_paths') or [])
+            if str(value or '').strip()
+        ]
         source_candidates = [module_dir / relative for relative in ('src/main/java', 'src/main/kotlin', 'src/main/groovy')]
         source_candidates.extend(
             resolve_declared(module_dir, value, item.get('properties')) for value in declared_sources
@@ -817,10 +827,12 @@ def build_project_scope(project_dir, target_module, *, active_profiles=None, bui
             elif candidate in declared_source_candidates:
                 missing_declared_roots.append(str(candidate))
         resource_candidates = [module_dir / 'src/main/resources']
-        resource_candidates.extend(
-            resolve_declared(module_dir, value, item.get('properties'))
-            for value in (item.get('declared_resource_paths') or [])
-        )
+        for value in (item.get('declared_resource_paths') or []):
+            if not str(value or '').strip():
+                continue
+            resource_candidates.append(
+                resolve_declared(module_dir, value, item.get('properties'))
+            )
         for resources in resource_candidates:
             if resources.is_dir():
                 resource_roots.append(str(resources.resolve()))
@@ -1044,10 +1056,13 @@ def derive_coverage_report(
     components = []
 
     scope = dict(project_scope or {})
+    scope_reason_codes = list(scope.get("reason_codes") or ())
+    if not scope:
+        scope_reason_codes = ["project_scope_missing"]
     components.append({
         "id": "project_scope",
         "status": scope.get("status") or "insufficient",
-        "reason_codes": list(scope.get("reason_codes") or ["project_scope_missing"]),
+        "reason_codes": scope_reason_codes,
         "evidence": [".runtime/state/main_state.json#project_scope"],
     })
 
@@ -1075,10 +1090,11 @@ def derive_coverage_report(
         provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
         both_ok = bool(provenance.get("both_builds_succeeded"))
         complete_hashes = all(item.get("artifact_sha256") for item in provenance.get("sides") or [])
-        current_side = next((
-            item for item in (provenance.get("sides") or [])
-            if str(item.get("side") or "") == "current"
-        ), {})
+        current_side = {}
+        for item in (provenance.get("sides") or []):
+            if str(item.get("side") or "") == "current":
+                current_side = item
+                break
         binding_errors = project_scope_provenance_errors(scope, current_side)
         if not both_ok:
             provenance_status = "insufficient"
@@ -1190,9 +1206,16 @@ def derive_coverage_report(
         completed = sum(int(step5_payload.get(key) or 0) for key in (
             'reachable', 'uncertain', 'not_analyzed', 'not_found_in_static_analysis'
         ))
-        reachability_status = 'complete' if total == completed and not int(step5_payload.get('not_analyzed') or 0) else (
-            'partial' if completed else ('not_applicable' if total == 0 else 'insufficient')
-        )
+        if total == 0:
+            reachability_status = 'not_applicable'
+        elif total == completed and not int(
+            step5_payload.get('not_analyzed') or 0
+        ):
+            reachability_status = 'complete'
+        elif completed:
+            reachability_status = 'partial'
+        else:
+            reachability_status = 'insufficient'
         reachability_reasons = []
         if total != completed:
             reachability_reasons.append('step5_target_count_mismatch')

@@ -23,25 +23,64 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Setup Reference Java 8
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "8"
+
+      - name: Record Reference Java 8 Home
+        shell: bash
+        run: echo "JAVA8_HOME=${JAVA_HOME}" >> "${GITHUB_ENV}"
+
+      - name: Setup Reference Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Record Reference Java 17 Home
+        shell: bash
+        run: echo "JAVA17_HOME=${JAVA_HOME}" >> "${GITHUB_ENV}"
+
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: "temurin"
           java-version: ${{ matrix.java }}
 
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: "8.10.2"
+
       - name: Install Runtime Dependencies
         run: python scripts/bootstrap_runtime.py
 
       - name: Run Independent Black-box Contract
-        run: python scripts/quality_gate.py --profile blackbox
+        run: >-
+          python scripts/quality_gate.py --profile blackbox
+          --json-out "${{ runner.temp }}/jua-blackbox-jdk${{ matrix.java }}.json"
 
       - name: Run Artifact Topology Matrix
         run: >-
-          python -m unittest -q
+          python scripts/unittest_evidence_runner.py
+          --suite-label artifact-topology-jdk${{ matrix.java }}
+          --forbid-skips
+          --json-out "${{ runner.temp }}/jua-artifact-topology-jdk${{ matrix.java }}.json"
           tests.test_binary_generated_regression
           tests.test_binary_artifact_diff
           tests.test_binary_artifact_safety
           tests.test_database_contract_scan
+
+      - name: Upload Artifact Topology Evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jua-artifact-topology-jdk${{ matrix.java }}
+          path: |
+            ${{ runner.temp }}/jua-blackbox-jdk${{ matrix.java }}.json
+            ${{ runner.temp }}/jua-artifact-topology-jdk${{ matrix.java }}.json
 
   release-regression:
     runs-on: ubuntu-latest
@@ -57,12 +96,30 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Setup Java
+      - name: Setup Reference Java 8
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "8"
+
+      - name: Record Reference Java 8 Home
+        shell: bash
+        run: echo "JAVA8_HOME=${JAVA_HOME}" >> "${GITHUB_ENV}"
+
+      - name: Setup Reference Java 17
         uses: actions/setup-java@v4
         with:
           distribution: "temurin"
           java-version: "17"
-          cache: "maven"
+
+      - name: Record Reference Java 17 Home
+        shell: bash
+        run: echo "JAVA17_HOME=${JAVA_HOME}" >> "${GITHUB_ENV}"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: "8.10.2"
 
       - name: Install Runtime Dependencies
         run: python scripts/bootstrap_runtime.py
@@ -74,6 +131,7 @@ jobs:
           javap -version
           jdeps -version
           mvn -version
+          gradle --version
 
       - name: Run Release Quality Gate
         run: >-

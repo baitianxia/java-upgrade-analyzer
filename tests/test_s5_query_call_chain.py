@@ -13,6 +13,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 from enhanced_source_analyzer import CallEdge
+import s5_query_call_chain as s5
 from s5_query_call_chain import (
     build_query_index,
     build_target_keys,
@@ -65,6 +66,91 @@ def edge(caller, callee, owner_type="dependency", owner_coord="com.example:dep",
 
 
 class S5QueryCallChainTest(unittest.TestCase):
+    def test_internal_query_helpers_preserve_exact_scope_and_clean_paths(self):
+        self.assertEqual(
+            s5._format_path([], {}, "  org.example.Api.changed()  "),
+            "org.example.Api.changed()",
+        )
+        matched, mode, warnings = s5._resolve_coord_query(
+            "g:a", ["g:a:linux", "g:b:linux"],
+        )
+        self.assertEqual(matched, ["g:a:linux"])
+        self.assertEqual(mode, "coord_ga_unique")
+        self.assertEqual(warnings, [])
+
+        scoped = query_alert_chains_by_scope(
+            "unused",
+            "org.example.api",
+            "package",
+            alert_rows=[{
+                "path_status": "reachable",
+                "path_text": "app.Main.run() -> org.example.api.Client.changed()",
+                "target_coord": "g:a（2.0）",
+                "changed_symbol": "org.example.api.Client.changed()",
+                "api_signature": "()",
+            }],
+        )
+        self.assertEqual(scoped["matched_coords"], ["g:a"])
+        self.assertEqual(scoped["match_mode"], "package_prefix")
+        self.assertEqual(scoped["matched_target_count"], 1)
+
+    def test_direct_index_loads_sibling_alerts_with_csv_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            index_path = root / "standalone-index.json"
+            index_path.write_text(
+                json.dumps({
+                    "schema": s5.SCHEMA,
+                    "methods": {},
+                    "reverse_edges": {},
+                    "lookup_keys": {},
+                }),
+                encoding="utf-8",
+            )
+            alerts = root / "evidence" / "call_chain" / "alerts.csv"
+            alerts.parent.mkdir(parents=True)
+            alerts.write_text(
+                "path_status,path_text,target_coord,changed_symbol,api_signature\n"
+                "reachable,app.Main.run() -> org.example.Api.changed(),g:a,"
+                "org.example.Api.changed(),()\n",
+                encoding="utf-8",
+            )
+
+            index, alert_rows, loaded_path = s5.load_query_inputs(index_path)
+
+        self.assertEqual(index["schema"], s5.SCHEMA)
+        self.assertEqual(loaded_path, index_path)
+        self.assertEqual(len(alert_rows), 1)
+        self.assertEqual(alert_rows[0]["target_coord"], "g:a")
+
+    def test_cli_method_query_renders_human_result(self):
+        app = method(
+            "app", "com.app.App.run", owner_type="business",
+            owner_coord="BUSINESS", module="app",
+        )
+        target = "org.example.Api.changed()"
+        graph = SimpleNamespace(
+            methods_by_id={"app": app},
+            lookup_keys_by_symbol={"app": [app.qualified_key]},
+            reverse_edges={target: [edge(
+                app, target, owner_type="business",
+                owner_coord="BUSINESS", module="app",
+            )]},
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            index_path = Path(tmp) / "standalone-index.json"
+            write_query_index(graph, index_path, target_apis=[])
+            output = io.StringIO()
+            with redirect_stdout(output):
+                exit_code = main([
+                    "--report-dir", str(index_path),
+                    "--method", target,
+                ])
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("com.app.App.run", output.getvalue())
+        self.assertIn(target, output.getvalue())
+
     def test_query_index_is_stable_when_reverse_edge_input_order_changes(self):
         first = method("first", "com.app.First.run", owner_type="business", owner_coord="BUSINESS", module="app")
         second = method("second", "com.app.Second.run", owner_type="business", owner_coord="BUSINESS", module="app")

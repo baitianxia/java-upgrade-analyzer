@@ -1332,6 +1332,7 @@ class PublicFrameworkSemanticsBlackboxTest(unittest.TestCase):
             def framework(label: str, digit: int, provider: str) -> Path:
                 jar = compile_jar(root, label, {
                     "org/springframework/cloud/openfeign/FeignClient.java": "package org.springframework.cloud.openfeign; import java.lang.annotation.*; @Retention(RetentionPolicy.RUNTIME) @Target(ElementType.TYPE) public @interface FeignClient { String value(); }",
+                    "feign/RequestLine.java": "package feign; import java.lang.annotation.*; @Retention(RetentionPolicy.RUNTIME) @Target(ElementType.METHOD) public @interface RequestLine { String value(); }",
                     "feign/SynchronousMethodHandler.java": (
                         "package feign; public class SynchronousMethodHandler { "
                         f"public Object invoke(Object[] args) {{ return Integer.valueOf({digit}); }} }}"
@@ -1358,13 +1359,31 @@ class PublicFrameworkSemanticsBlackboxTest(unittest.TestCase):
             current = framework("http-dubbo-current", 2, "demo.Alternate")
             business = compile_jar(root, "http-dubbo-business", {
                 "biz/RemoteClient.java": "package biz; @org.springframework.cloud.openfeign.FeignClient(\"remote\") public interface RemoteClient { int call(); }",
+                "biz/MethodRemoteClient.java": "package biz; public interface MethodRemoteClient { @feign.RequestLine(\"GET /value\") int call(); }",
                 "biz/Entry.java": "package biz; public class Entry { public int run(RemoteClient client){ org.apache.dubbo.common.extension.ExtensionLoader loader=new org.apache.dubbo.common.extension.ExtensionLoader(); demo.DubboService service=(demo.DubboService)loader.getExtension(\"fast\"); java.util.ServiceLoader.load(demo.DubboService.class); return client.call()+service.execute(); } }",
             }, self.javac, classpath=(base,))
             oracle = compile_jar(root, "http-dubbo-oracle", {
                 "oracle/Main.java": "package oracle; public class Main { public static void main(String[] args){ Object http=new feign.SynchronousMethodHandler().invoke(null); int spi=new demo.Provider().execute(); System.out.print(http.toString()+spi); } }",
+                "oracle/MethodAnnotationMain.java": "package oracle; public class MethodAnnotationMain { public static void main(String[] args) throws Exception { System.out.print(biz.MethodRemoteClient.class.getMethod(\"call\").isAnnotationPresent(feign.RequestLine.class)); } }",
             }, self.javac, classpath=(business, base))
             self.assertEqual(self.run_main(oracle, business, (base,)), truth["expected_base_stdout"])
             self.assertEqual(self.run_main(oracle, business, (current,)), truth["expected_current_stdout"])
+            method_classpath = os.pathsep.join(map(str, (oracle, business, base)))
+            self.assertEqual(
+                execute([
+                    self.java, "-cp", method_classpath,
+                    "oracle.MethodAnnotationMain",
+                ]).stdout,
+                truth["method_only_annotation_runtime"],
+            )
+            method_bytecode = execute([
+                self.javap, "-classpath", os.pathsep.join((str(business), str(base))),
+                "-v", "biz.MethodRemoteClient",
+            ]).stdout
+            self.assertIn(truth["method_annotation_marker"], method_bytecode)
+            self.assertNotIn(
+                truth["forbidden_class_annotation_marker"], method_bytecode,
+            )
             with zipfile.ZipFile(base) as archive:
                 self.assertEqual(
                     archive.read("META-INF/dubbo/demo.DubboService").decode("utf-8"),
@@ -1389,6 +1408,14 @@ class PublicFrameworkSemanticsBlackboxTest(unittest.TestCase):
             self.assertTrue(set(truth["required_semantic_kinds"]).issubset({
                 row["semantic_edge_kind"] for row in overlay["rows"]
             }))
+            self.assertTrue(any(
+                row["semantic_edge_kind"] == "declarative_http_client_dispatch"
+                and row["caller_class_name"] == truth["method_only_client"][0]
+                and row["caller_member_name"] == truth["method_only_client"][1]
+                and row["caller_descriptor"] == truth["method_only_client"][2]
+                and row["path_certainty"] == "exact"
+                for row in overlay["rows"]
+            ), overlay["rows"])
             service_results = formal["resource_activation_results"]
             matching = [
                 row for row in service_results
@@ -1528,7 +1555,9 @@ class PublicFrameworkSemanticsBlackboxTest(unittest.TestCase):
             }, self.javac)
             business = compile_jar(root, "dto-business", {
                 "org/springframework/web/bind/annotation/GetMapping.java": "package org.springframework.web.bind.annotation; import java.lang.annotation.*; @Retention(RetentionPolicy.RUNTIME) @Target(ElementType.METHOD) public @interface GetMapping {}",
+                "com/fasterxml/jackson/databind/ObjectMapper.java": "package com.fasterxml.jackson.databind; public class ObjectMapper { public Object readValue(String value, Class<?> type){ return null; } }",
                 "biz/Controller.java": "package biz; public class Controller { @org.springframework.web.bind.annotation.GetMapping public lib.Dto endpoint(lib.Dto request){return request;} }",
+                "biz/UnrelatedJson.java": "package biz; public class UnrelatedJson { public Object parse(){ return new com.fasterxml.jackson.databind.ObjectMapper().readValue(\"{}\", String.class); } }",
             }, self.javac, classpath=(base,))
             base_contract = execute([
                 self.javap, "-classpath", str(base), "-public", "-s", "lib.Dto",
@@ -1538,6 +1567,16 @@ class PublicFrameworkSemanticsBlackboxTest(unittest.TestCase):
             ]).stdout
             self.assertIn("removed;", base_contract)
             self.assertNotIn("removed;", current_contract)
+            unrelated_contract = execute([
+                self.javap, "-classpath", str(business), "-c", "-s",
+                truth["unrelated_caller"][0].replace("/", "."),
+            ]).stdout
+            self.assertIn(
+                truth["unrelated_direct_call_marker"], unrelated_contract,
+            )
+            self.assertNotIn(
+                truth["forbidden_unrelated_type_marker"], unrelated_contract,
+            )
 
             entrypoint = ("biz/Controller", "endpoint", "(Llib/Dto;)Llib/Dto;")
             sides = [side_with_artifacts(
@@ -1562,6 +1601,14 @@ class PublicFrameworkSemanticsBlackboxTest(unittest.TestCase):
                 and row["path_certainty"] == "exact"
                 for row in overlay["rows"]
             ))
+            self.assertFalse(any(
+                row["semantic_edge_kind"] == truth["semantic_edge_kind"]
+                and (
+                    row["caller_class_name"], row["caller_member_name"],
+                    row["caller_descriptor"],
+                ) == tuple(truth["unrelated_caller"])
+                for row in overlay["rows"]
+            ), overlay["rows"])
 
 
 if __name__ == "__main__":

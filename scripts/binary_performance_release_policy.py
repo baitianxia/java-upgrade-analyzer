@@ -175,12 +175,12 @@ def _policy_payload() -> dict[str, Any]:
             # combines them with the live source identity and the source-bound
             # reference JDK identity to derive the complete runtime identity.
             "pipeline_generation_implementation_identity": (
-                "3b7cd9d6f3629a113a7be90253987e07203a8c74be7ca99d075a"
-                "36edc7719772"
+                "ce89ad99c296e8a47295db3e2be244490e787c332d73000bd9752"
+                "89abc64c805"
             ),
             "validator_implementation_identity": (
-                "7e65982b5397ff74d4a67d05288d71a840bc4e20b6514ce41fe96"
-                "d91cd49b425"
+                "1676fc8e4a481ef8946f1c5326042f57238d1988b5b49e88627b4"
+                "7486b8f4be5"
             ),
         },
         "thresholds": {

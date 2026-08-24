@@ -7,6 +7,7 @@
   "oracle_contract": "removed_member_linkage_closed_set",
   "capabilities": [
     "interface_default_dispatch",
+    "interface_object_method_resolution",
     "method_removal",
     "not_found_negative",
     "reachable_positive",
@@ -23,6 +24,11 @@
       "class_name": "contract/DispatchApp",
       "member_name": "entryDefault",
       "descriptor": "(Lcontract/DefaultService;)Ljava/lang/String;"
+    },
+    {
+      "class_name": "contract/DispatchApp",
+      "member_name": "entryClone",
+      "descriptor": "(Lcontract/DefaultService;)Ljava/lang/Object;"
     }
   ],
   "linkage_probes": [
@@ -31,6 +37,14 @@
       "owner": "contract/DefaultService",
       "member": "removedReachableDefault",
       "descriptor": "()Ljava/lang/String;",
+      "member_kind": "method",
+      "linkage_error": "NoSuchMethodError"
+    },
+    {
+      "mode": "objectFallback",
+      "owner": "contract/DefaultService",
+      "member": "clone",
+      "descriptor": "()Ljava/lang/Object;",
       "member_kind": "method",
       "linkage_error": "NoSuchMethodError"
     },

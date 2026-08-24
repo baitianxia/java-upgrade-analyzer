@@ -1288,6 +1288,62 @@ class RemoteSourceRefRetryTest(unittest.TestCase):
         self.assertEqual(result["status"], "remote_fetch_failed")
         self.assertEqual(result["candidates"][0]["commit"], self.commit)
 
+    def test_broad_inventory_requires_two_matching_empty_observations(self):
+        with patch.object(
+            refs, "_remote_names", return_value=(["origin"], []),
+        ), patch.object(
+            refs, "_git", side_effect=[("", "", 0), ("", "", 0)],
+        ) as git_mock, patch.object(refs.time, "sleep"):
+            result = refs.query_live_remote_refs(
+                "/repo", retry_attempts=2, retry_delays=(0,),
+            )
+
+        self.assertEqual(result["refs"], [])
+        self.assertEqual(result["failures"], [])
+        self.assertEqual(git_mock.call_count, 2)
+
+    def test_compat_inventory_retries_then_accepts_proven_absence(self):
+        with patch.object(
+            refs, "_git", side_effect=[("", "", 0), ("", "", 0)],
+        ) as git_mock, patch.object(refs.time, "sleep") as sleep_mock:
+            result = refs._compat_advertised_commit_inventory(
+                "/repo",
+                "origin",
+                self.commit,
+                retry_attempts=2,
+                retry_delays=(0.01,),
+            )
+
+        self.assertEqual(result["refs"], [])
+        self.assertEqual(result["failures"], [])
+        self.assertEqual(git_mock.call_count, 2)
+        sleep_mock.assert_called_once()
+
+    def test_explicit_commit_fetch_retries_classified_transport_failure(self):
+        with patch.object(
+            refs,
+            "_git",
+            side_effect=[
+                ("", "connection reset by peer", 128),
+                ("", "", 0),
+            ],
+        ) as git_mock, patch.object(
+            refs, "_verify_commit_object", return_value=self.commit,
+        ), patch.object(refs.time, "sleep") as sleep_mock:
+            result = refs._materialize_explicit_commit_from_remote(
+                "/repo",
+                "origin",
+                self.commit,
+                retry_attempts=2,
+                retry_delays=(0.01,),
+            )
+
+        self.assertEqual(result["status"], "remote_source_resolved")
+        self.assertEqual(result["resolved_commit"], self.commit)
+        self.assertEqual(git_mock.call_count, 2)
+        self.assertEqual(result["attempts"][0]["status"], "transient_network_failure")
+        sleep_mock.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

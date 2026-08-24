@@ -304,7 +304,7 @@ def _canonical_value(value):
                 item, ensure_ascii=False, sort_keys=True, separators=(",", ":")
             ),
         )
-    if value is None or isinstance(value, (str, int, float, bool)):
+    if isinstance(value, (str, int, float, bool)):
         return value
     raise BinaryFirstContractError(
         "BINARY_IDENTITY_VALUE_UNSUPPORTED",
@@ -465,7 +465,7 @@ def _iter_canonical_json(value):
         yield ",".join(sorted(items))
         yield "]"
         return
-    if value is None or isinstance(value, (str, int, float, bool)):
+    if isinstance(value, (str, int, float, bool)):
         yield _surrogate_safe_text(_CANONICAL_JSON_ENCODER.encode(value))
         return
     raise BinaryFirstContractError(
@@ -587,7 +587,7 @@ def _update_canonical_digest(digest, value):
             append(",".join(sorted(texts)))
             append("]")
             return
-        if item is None or isinstance(item, (str, int, float, bool)):
+        if isinstance(item, (str, int, float, bool)):
             append(_surrogate_safe_text(_CANONICAL_JSON_ENCODER.encode(item)))
             return
         raise BinaryFirstContractError(
@@ -602,12 +602,10 @@ def _update_canonical_digest(digest, value):
 
 def artifact_content_identity(content_sha256, byte_length, *, schema_version="1"):
     content_sha256 = str(content_sha256 or "").strip().lower()
-    try:
-        byte_length = int(byte_length)
-    except (TypeError, ValueError) as exc:
+    if type(byte_length) is not int:
         raise BinaryFirstContractError(
             "ARTIFACT_CONTENT_LENGTH_INVALID", "byte_length must be a non-negative integer"
-        ) from exc
+        )
     if not _SHA256_RE.fullmatch(content_sha256):
         raise BinaryFirstContractError(
             "ARTIFACT_CONTENT_SHA256_INVALID", "content_sha256 must be 64 lowercase hex characters"

@@ -10,6 +10,7 @@ import tempfile
 import unittest
 import zipfile
 
+from tests.blackbox.harness import jdk_major_from_home
 from tests.blackbox.managed_process import managed_run
 
 
@@ -17,6 +18,10 @@ ROOT = Path(__file__).resolve().parents[2]
 TRUTH = json.loads((
     ROOT / "tests" / "fixtures" / "workflow_blackbox"
     / "checkout_builds_v1.json"
+).read_text(encoding="utf-8"))
+FAILURE_TRUTH = json.loads((
+    ROOT / "tests" / "fixtures" / "blackbox_runtime"
+    / "tool_failure_public_contract_v1.json"
 ).read_text(encoding="utf-8"))
 
 
@@ -119,18 +124,6 @@ def full_jdk_home(java: str) -> Path:
             if path.is_dir() and (path / "jmods").is_dir():
                 return path
     raise AssertionError("full JDK home not found")
-
-
-def jdk_major_from_home(home: Path) -> str:
-    release = home / "release"
-    if not release.is_file():
-        return ""
-    for line in release.read_text(encoding="utf-8", errors="replace").splitlines():
-        if not line.startswith("JAVA_VERSION="):
-            continue
-        version = line.split("=", 1)[1].strip().strip('"')
-        return version.split(".", 2)[1] if version.startswith("1.") else version.split(".", 1)[0]
-    return ""
 
 
 def find_jdk_home(java: str, major: int) -> Path | None:
@@ -301,6 +294,40 @@ def gradle_files(gradle: Path) -> dict[str, str | bytes]:
     }
 
 
+def failing_gradle_files() -> dict[str, str | bytes]:
+    files = gradle_files(Path("unused-system-gradle"))
+    python = str(Path(sys.executable).resolve())
+    files.update({
+        "build.gradle": """
+            plugins { id 'java' }
+            group = 'blackbox'
+            version = '1.0.0'
+        """,
+        "fake_gradle.py": (
+            "import sys\n\n"
+            "if 'help' in sys.argv[1:]:\n"
+            "    print('FAILURE: Build failed with an exception.', file=sys.stderr)\n"
+            "    print('* What went wrong:', file=sys.stderr)\n"
+            "    print('Gradle could not start your build.', file=sys.stderr)\n"
+            "    print('> Could not create service of type FileLockContentionHandler.', file=sys.stderr)\n"
+            "    print('   > java.net.SocketException: Operation not permitted', file=sys.stderr)\n"
+            "    print('* Try:', file=sys.stderr)\n"
+            "    print('> Run with --stacktrace option to get the stack trace.', file=sys.stderr)\n"
+            "    print('> Get more help at https://help.gradle.org.', file=sys.stderr)\n"
+            "    raise SystemExit(17)\n"
+            "print('Gradle 8.10.2 independent failure fixture')\n"
+        ),
+        "gradlew": f"""
+            #!/bin/sh
+            exec {python!r} "$(dirname "$0")/fake_gradle.py" "$@"
+        """,
+        "gradlew.bat": (
+            f'@"{python}" "%~dp0fake_gradle.py" %*\n'
+        ),
+    })
+    return files
+
+
 class PublicCheckoutBuildBlackboxTest(unittest.TestCase):
     def exercise(self, *, tool: str, files: dict[str, str | bytes]) -> None:
         expected = TRUTH[tool]
@@ -358,7 +385,22 @@ class PublicCheckoutBuildBlackboxTest(unittest.TestCase):
                 "--response-json", json.dumps({"action": "continue"}),
                 environment=environment,
             )
-            self.assertEqual(confirmed.returncode, 0, confirmed.stderr)
+            confirmed_diagnostic = ""
+            if confirmed.returncode != 0:
+                try:
+                    confirmed_diagnostic = (
+                        report / ".runtime" / "state" / "last_step_summary.json"
+                    ).read_text(encoding="utf-8")
+                except (OSError, UnicodeError) as error:
+                    confirmed_diagnostic = (
+                        f"step failure diagnostic unavailable: "
+                        f"{type(error).__name__}: {error}"
+                    )
+            self.assertEqual(
+                confirmed.returncode,
+                0,
+                f"{confirmed.stderr}\nstep_failure={confirmed_diagnostic}",
+            )
             completed = run_workflow(
                 "--step", "step1", *common, environment=environment,
             )
@@ -415,6 +457,56 @@ class PublicCheckoutBuildBlackboxTest(unittest.TestCase):
     def test_gradle_checkout_build_matches_independent_artifact_truth(self):
         gradle = find_gradle()
         self.exercise(tool="gradle", files=gradle_files(gradle))
+
+    def test_gradle_preflight_reports_root_cause_not_generic_help_footer(self):
+        expected = FAILURE_TRUTH["gradle_preflight_failure"]
+        git = shutil.which("git") or ""
+        java = shutil.which("java") or ""
+        self.assertTrue(git and java)
+        jdk_home = full_jdk_home(java)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project, _base_commit, _current_commit = git_repository(
+                root, git, failing_gradle_files(),
+            )
+            report = root / "report"
+            common = (
+                "--project-dir", str(project),
+                "--report-dir", str(report),
+            )
+            first = run_workflow(
+                "--step", "step0", *common,
+                "--base-branch", "origin/base",
+                "--current-branch", "origin/current",
+                "--application-source", str(project),
+                "--base-jdk-home", str(jdk_home),
+                "--current-jdk-home", str(jdk_home),
+                "--target-module", ".",
+                "--base-tool", "gradle",
+                "--current-tool", "gradle",
+            )
+            self.assertEqual(first.returncode, TRUTH["checkpoint"]["exit_code"])
+
+            confirmed = run_workflow(
+                "--step", "step0", *common,
+                "--response-json", json.dumps({"action": "continue"}),
+            )
+
+            self.assertEqual(confirmed.returncode, expected["exit_code"])
+            self.assertIn(expected["root_cause_marker"], confirmed.stderr)
+            self.assertNotIn(expected["generic_help_marker"], confirmed.stderr)
+            self.assertNotIn("Traceback", confirmed.stderr)
+            summary = json.loads((
+                report / ".runtime" / "state" / "last_step_summary.json"
+            ).read_text(encoding="utf-8"))
+            self.assertEqual(
+                summary["workflow_state"]["blocking_reason_codes"],
+                [expected["reason_code"]],
+            )
+            self.assertIn(
+                expected["root_cause_marker"],
+                summary["last_step"]["summary"],
+            )
 
 
 if __name__ == "__main__":

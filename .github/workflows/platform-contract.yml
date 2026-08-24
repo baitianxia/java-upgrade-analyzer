@@ -106,24 +106,32 @@ jobs:
           python scripts/test_suite_runner.py --suite windows
           --json-out "${{ runner.temp }}/windows-native-suite.json"
 
+      - name: Record Windows Structural Evidence
+        id: windows_structure
+        if: ${{ runner.os == 'Windows' }}
+        run: >-
+          python scripts/whitebox_coverage_gate.py --suite windows
+          --json-out "${{ runner.temp }}/windows-structure.json"
+          --verbosity 0
+
       - name: Diagnose artifact facts
         id: diag_artifact_facts
-        if: ${{ always() && runner.os == 'Windows' && (steps.quality_gate.outcome == 'failure' || steps.windows_suite.outcome == 'failure') }}
+        if: ${{ always() && runner.os == 'Windows' && (steps.quality_gate.outcome == 'failure' || steps.windows_suite.outcome == 'failure' || steps.windows_structure.outcome == 'failure') }}
         run: python scripts/accuracy_benchmark.py --category artifact_facts
 
       - name: Diagnose runtime bytecode reachability
         id: diag_runtime_bytecode
-        if: ${{ always() && runner.os == 'Windows' && (steps.quality_gate.outcome == 'failure' || steps.windows_suite.outcome == 'failure') }}
+        if: ${{ always() && runner.os == 'Windows' && (steps.quality_gate.outcome == 'failure' || steps.windows_suite.outcome == 'failure' || steps.windows_structure.outcome == 'failure') }}
         run: python scripts/accuracy_benchmark.py --category runtime_bytecode_reachability
 
       - name: Diagnose runtime reconciliation
         id: diag_runtime_reconciliation
-        if: ${{ always() && runner.os == 'Windows' && (steps.quality_gate.outcome == 'failure' || steps.windows_suite.outcome == 'failure') }}
+        if: ${{ always() && runner.os == 'Windows' && (steps.quality_gate.outcome == 'failure' || steps.windows_suite.outcome == 'failure' || steps.windows_structure.outcome == 'failure') }}
         run: python scripts/accuracy_benchmark.py --category runtime_reconciliation
 
       - name: Diagnose decision projection
         id: diag_decision_projection
-        if: ${{ always() && runner.os == 'Windows' && (steps.quality_gate.outcome == 'failure' || steps.windows_suite.outcome == 'failure') }}
+        if: ${{ always() && runner.os == 'Windows' && (steps.quality_gate.outcome == 'failure' || steps.windows_suite.outcome == 'failure' || steps.windows_structure.outcome == 'failure') }}
         run: python scripts/accuracy_benchmark.py --category decision_projection
 
       - name: Record Platform Cell Result
@@ -136,6 +144,7 @@ jobs:
           CELL_RESULT_PATH: ${{ runner.temp }}/platform-cell-${{ matrix.os }}-jdk${{ matrix.java }}.txt
           QUALITY_GATE_JSON: ${{ runner.temp }}/platform-contract.json
           WINDOWS_SUITE_JSON: ${{ runner.temp }}/windows-native-suite.json
+          WINDOWS_STRUCTURE_JSON: ${{ runner.temp }}/windows-structure.json
           CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
           SETUP_PYTHON_OUTCOME: ${{ steps.setup_python.outcome }}
           SETUP_WINDOWS_JAVA8_OUTCOME: ${{ steps.setup_windows_java8.outcome }}
@@ -147,6 +156,7 @@ jobs:
           INSTALL_DEPENDENCIES_OUTCOME: ${{ steps.install_dependencies.outcome }}
           QUALITY_GATE_OUTCOME: ${{ steps.quality_gate.outcome }}
           WINDOWS_SUITE_OUTCOME: ${{ steps.windows_suite.outcome }}
+          WINDOWS_STRUCTURE_OUTCOME: ${{ steps.windows_structure.outcome }}
           ARTIFACT_FACTS_OUTCOME: ${{ steps.diag_artifact_facts.outcome }}
           RUNTIME_BYTECODE_OUTCOME: ${{ steps.diag_runtime_bytecode.outcome }}
           RUNTIME_RECONCILIATION_OUTCOME: ${{ steps.diag_runtime_reconciliation.outcome }}
@@ -167,6 +177,7 @@ jobs:
           printf 'step|quality-gate|%s\n' "${QUALITY_GATE_OUTCOME}" >> "${CELL_RESULT_PATH}"
           if [[ "${MATRIX_OS}" == windows-* ]]; then
             printf 'step|windows-native-suite|%s\n' "${WINDOWS_SUITE_OUTCOME}" >> "${CELL_RESULT_PATH}"
+            printf 'step|windows-structure|%s\n' "${WINDOWS_STRUCTURE_OUTCOME}" >> "${CELL_RESULT_PATH}"
           fi
           if [[ "${ARTIFACT_FACTS_OUTCOME}" != "skipped" ]]; then
             printf 'benchmark|artifact_facts|%s\n' "${ARTIFACT_FACTS_OUTCOME}" >> "${CELL_RESULT_PATH}"
@@ -176,6 +187,7 @@ jobs:
           fi
           python - "${QUALITY_GATE_JSON}" "${CELL_RESULT_PATH}" "${WINDOWS_SUITE_JSON}" "${MATRIX_OS}" <<'PY'
           import json
+          import os
           import sys
           from pathlib import Path
 
@@ -199,6 +211,17 @@ jobs:
                           "gate|windows-native-suite|"
                           f"{windows_payload.get('status') or 'missing'}\n"
                       )
+                  structure_source = Path(os.environ["WINDOWS_STRUCTURE_JSON"])
+                  if not structure_source.is_file():
+                      handle.write("gate|windows-structure-report|missing\n")
+                  else:
+                      structure_payload = json.loads(
+                          structure_source.read_text(encoding="utf-8")
+                      )
+                      handle.write(
+                          "gate|windows-structure|"
+                          f"{structure_payload.get('status') or 'missing'}\n"
+                      )
           PY
 
       - name: Upload Platform Evidence
@@ -209,7 +232,19 @@ jobs:
           path: |
             ${{ runner.temp }}/platform-contract.json
             ${{ runner.temp }}/windows-native-suite.json
+            ${{ runner.temp }}/windows-structure.json
             ${{ runner.temp }}/platform-cell-${{ matrix.os }}-jdk${{ matrix.java }}.txt
+
+  platform-quality:
+    needs: platform-contract
+    if: ${{ always() && github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require Every Platform Cell
+        shell: bash
+        env:
+          PLATFORM_MATRIX_RESULT: ${{ needs.platform-contract.result }}
+        run: test "${PLATFORM_MATRIX_RESULT}" = "success"
 
   platform-evidence:
     needs: platform-contract

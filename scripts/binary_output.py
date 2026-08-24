@@ -574,7 +574,6 @@ def _physical_generation_namespace(
         stat.S_ISLNK(observed.st_mode)
         or not stat.S_ISDIR(observed.st_mode)
         or resolved != generations
-        or generations.parent != root
     ):
         raise BinaryOutputError(
             reason_code,
@@ -606,7 +605,6 @@ def _physical_generation_directory(
         stat.S_ISLNK(observed.st_mode)
         or not stat.S_ISDIR(observed.st_mode)
         or resolved != generation
-        or generation.parent != generations
     ):
         raise BinaryOutputError(
             reason_code,
@@ -1431,9 +1429,7 @@ def _verify_pending_generation_integrity(
         if (
             generations.resolve(strict=True) != generations
             or generation.resolve(strict=True) != generation
-            or generation.parent != generations
             or validation_directory.resolve(strict=True) != validation_directory
-            or validation_directory.parent != generation
         ):
             raise OSError("generation path escaped its content-addressed root")
     except (OSError, RuntimeError) as error:
@@ -1840,14 +1836,6 @@ def _active_descriptor_destination(
             stat.S_ISLNK(parent_stat.st_mode)
             or not stat.S_ISDIR(parent_stat.st_mode)
             or parent.resolve(strict=True) != parent
-            or (
-                relative.parent != Path(".")
-                and parent.parent != lexical_root
-            )
-            or (
-                relative.parent == Path(".")
-                and parent != lexical_root
-            )
         ):
             raise OSError("descriptor parent is not a physical child directory")
     except (OSError, RuntimeError) as error:
@@ -1928,7 +1916,8 @@ _PENDING_ACTIVE_DESCRIPTOR_RELATIVE_PATH = Path(
 
 def _pending_active_descriptor(value: Any) -> dict[str, Any] | None:
     core = _active_descriptor_core(value)
-    if core is None or not isinstance(value, Mapping):
+    # A non-None core has already proved that ``value`` is a Mapping.
+    if core is None:
         return None
     predecessor_value = value.get("activation_predecessor")
     predecessor = _active_descriptor_core(predecessor_value)
@@ -3369,12 +3358,11 @@ def _reported_api_identity(
     return _identity("reported_api_identity", {
         "analysis_context_identity": analysis_context_identity,
         "current_runtime_profile_identity": runtime_profile_identity,
-        "initiating_loader_realm_identity": scope.get("initiating_loader_realm_identity"),
         "class_name": scope.get("class_name"),
         "member_kind": scope.get("member_kind") or decision.get("fact_kind"),
         "member_name": scope.get("member_name"),
         "descriptor": scope.get("descriptor"),
-        "grouping_rule_version": "binary-reported-api-v1",
+        "grouping_rule_version": "binary-reported-api-v2",
     })
 
 
@@ -3410,6 +3398,10 @@ def _aggregate_by_api(
         "compatible_or_not_applicable": 0,
         "undetermined": 1,
         "incompatible_if_executed": 2,
+    }
+    assessment_by_identity = {
+        item["projection_assessment_identity"]: item
+        for item in decisions.projection_assessments
     }
     output = []
     for reported, items in sorted(groups.items()):
@@ -3457,7 +3449,7 @@ def _aggregate_by_api(
                     nodes.append(target_label)
                 entrypoint_records = list(path.get("entrypoint_records") or ())
                 entry_kinds = sorted({
-                    str(item.get("entry_kind") or "")
+                    str(item.get("entry_kind"))
                     for item in entrypoint_records
                     if item.get("entry_kind")
                 })
@@ -3476,12 +3468,12 @@ def _aggregate_by_api(
                         ENTRY_KIND_LABELS.get(item, item) for item in entry_kinds
                     ],
                     "entrypoint_dependency_coords": sorted({
-                        str(item.get("dependency_coord") or "")
+                        str(item.get("dependency_coord"))
                         for item in entrypoint_records
                         if item.get("dependency_coord")
                     }),
                     "entrypoint_activation_reasons": sorted({
-                        str(item.get("activation_reason") or "")
+                        str(item.get("activation_reason"))
                         for item in entrypoint_records
                         if item.get("activation_reason")
                     }),
@@ -3502,12 +3494,29 @@ def _aggregate_by_api(
                 if key not in dependency_keys:
                     dependency_keys.add(key)
                     dependency_artifacts.append(dict(artifact))
+        projection_coverage_statuses = set()
+        for item in results:
+            assessment_identity = item["projection_assessment_identity"]
+            assessment = assessment_by_identity.get(assessment_identity)
+            if assessment is None:
+                raise BinaryOutputError(
+                    "BINARY_OUTPUT_PROJECTION_ASSESSMENT_UNBOUND",
+                    str(assessment_identity),
+                )
+            projection_coverage_statuses.add(
+                assessment["projection_coverage_status"]
+            )
         output.append({
             "reported_api_identity": reported,
             "display_owner": scopes[0].get("class_name"),
             "display_member": scopes[0].get("member_name"),
             "display_descriptor": scopes[0].get("descriptor"),
             "display_member_kind": scopes[0].get("member_kind") or items[0]["decision"].get("fact_kind"),
+            "initiating_loader_realms": sorted({
+                str(scope.get("initiating_loader_realm_identity"))
+                for scope in scopes
+                if scope.get("initiating_loader_realm_identity")
+            }),
             "reachability_status": primary["reachability_status"],
             "is_reachable": any(item["is_reachable"] for item in results),
             "impact_conclusion": (
@@ -3543,32 +3552,24 @@ def _aggregate_by_api(
             "contributing_change_fact_ids": sorted(item["change_fact_identity"] for item in results),
             "dependency_artifacts": dependency_artifacts,
             "dependency_lineages": sorted({
-                str(item.get("logical_dependency_lineage") or "")
+                str(item.get("logical_dependency_lineage"))
                 for item in dependency_artifacts
                 if item.get("logical_dependency_lineage")
             }),
             "base_dependency_coords": sorted({
-                str(item.get("coord") or "")
+                str(item.get("coord"))
                 for item in dependency_artifacts
                 if item.get("side") == "base" and item.get("coord")
             }),
             "current_dependency_coords": sorted({
-                str(item.get("coord") or "")
+                str(item.get("coord"))
                 for item in dependency_artifacts
                 if item.get("side") == "current" and item.get("coord")
             }),
             "target_jvm_identities": [profile.identity],
             "primary_projection_id": primary["projection_identity"],
             "primary_projection_selection_reason": "highest_reachability_then_stable_input_order_v1",
-            "projection_coverage_statuses": sorted({
-                next(
-                    assessment["projection_coverage_status"]
-                    for assessment in decisions.projection_assessments
-                    if assessment["projection_assessment_identity"]
-                    == item["projection_assessment_identity"]
-                )
-                for item in results
-            }),
+            "projection_coverage_statuses": sorted(projection_coverage_statuses),
         })
     return output
 
@@ -3597,14 +3598,15 @@ def build_output_payloads(
     ]
     by_api = _aggregate_by_api(decisions, traces, profile)
     exact_entrypoints = {
-        str(item.get("member_identity") or "")
+        str(item.get("member_identity"))
         for item in traces.entrypoint_records
         if item.get("path_certainty") == "exact" and item.get("member_identity")
     }
     possible_entrypoints = {
-        str(item.get("member_identity") or "")
+        str(item.get("member_identity"))
         for item in traces.entrypoint_records
         if item.get("path_certainty") == "possible"
+        and item.get("member_identity")
         and item.get("member_identity") not in exact_entrypoints
     }
     summary = {
@@ -3983,7 +3985,6 @@ def activate_binary_generation(
     if (
         generations_resolved != generations
         or destination_resolved != destination
-        or destination_resolved.parent != generations_resolved
         or not destination_resolved.is_dir()
     ):
         raise BinaryOutputError(
@@ -4110,7 +4111,6 @@ def activate_binary_generation(
     if (
         validation_dir_resolved != validation_dir
         or validation_path_resolved != validation_path
-        or validation_path_resolved.parent != validation_dir_resolved
         or validation_path.is_symlink()
         or not validation_path.is_file()
     ):
@@ -4169,9 +4169,7 @@ def activate_binary_generation(
         "schema": _ACTIVE_DESCRIPTOR_SCHEMA,
         "result_generation_identity": generation_identity,
         "generation_directory": f"binary_generations/{generation_identity}",
-        "validation_run_identity": (
-            str((validation_result or {}).get("validation_run_identity") or "")
-        ),
+        "validation_run_identity": str(validation_result["validation_run_identity"]),
         "validation_result_sha256": validation_result_sha256,
     }
     requested_activation_identity = str(activation_identity or "")

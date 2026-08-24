@@ -42,6 +42,48 @@ def required_tools() -> dict[str, str]:
     return tools
 
 
+def _java_major(version: str) -> str:
+    normalized = version.strip().strip('"')
+    if normalized.startswith("1."):
+        parts = normalized.split(".", 2)
+        return parts[1] if len(parts) > 1 else ""
+    return normalized.split(".", 1)[0]
+
+
+def jdk_major_from_home(home: Path) -> str:
+    """Resolve a real JDK's major without assuming a vendor metadata layout."""
+    release = home / "release"
+    if release.is_file():
+        for line in release.read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines():
+            if line.startswith("JAVA_VERSION="):
+                return _java_major(line.split("=", 1)[1])
+
+    java_name = "java.exe" if os.name == "nt" else "java"
+    java = home / "bin" / java_name
+    if not java.is_file():
+        return ""
+    completed = managed_run(
+        [str(java), "-version"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        timeout=30,
+    )
+    if completed.returncode != 0:
+        return ""
+    for line in (*completed.stderr.splitlines(), *completed.stdout.splitlines()):
+        marker = 'version "'
+        if marker not in line:
+            continue
+        version = line.split(marker, 1)[1].split('"', 1)[0]
+        return _java_major(version)
+    return ""
+
+
 def _run(command: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess:
     completed = managed_run(
         command,

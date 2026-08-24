@@ -1,6 +1,12 @@
+import json
+import io
+import subprocess
 import sys
+import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -62,11 +68,25 @@ class TestSuiteRunnerTest(unittest.TestCase):
             "tests.test_binary_performance_gate.BinaryPerformanceGateTest.test_probe"
         )
         whitebox_id = "tests.test_binary_output.BinaryOutputTest.test_contract"
+        allowed_whitebox_id = (
+            "tests.test_platform_contract.PlatformContractTest."
+            "test_pythonw_parent_repeatedly_captures_real_git_stdout"
+        )
         self.assertTrue(
             runner.skipped_test_is_forbidden("all", performance_id, self.policy)
         )
-        self.assertFalse(
+        self.assertTrue(
             runner.skipped_test_is_forbidden("all", whitebox_id, self.policy)
+        )
+        self.assertFalse(
+            runner.skipped_test_is_forbidden(
+                "whitebox", allowed_whitebox_id, self.policy
+            )
+        )
+        self.assertTrue(
+            runner.skipped_test_is_forbidden(
+                "whitebox", whitebox_id, self.policy
+            )
         )
 
     def test_isolated_suite_discovery_loads_only_its_own_tests(self):
@@ -143,6 +163,25 @@ class TestSuiteRunnerTest(unittest.TestCase):
             "WINDOWS_SUITE_REQUIRES_NATIVE_WINDOWS",
         )
 
+    @unittest.skipIf(sys.platform == "win32", "requires a non-Windows host")
+    def test_early_suite_failure_is_still_written_as_execution_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            evidence = Path(temporary) / "windows.json"
+            completed = subprocess.run(
+                [
+                    sys.executable, str(ROOT / "scripts" / "test_suite_runner.py"),
+                    "--suite", "windows", "--json-out", str(evidence),
+                ],
+                cwd=ROOT, capture_output=True, text=True, check=False,
+            )
+            payload = json.loads(evidence.read_text(encoding="utf-8"))
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(payload["status"], "failed")
+        self.assertEqual(
+            payload["reason_code"], "WINDOWS_SUITE_REQUIRES_NATIVE_WINDOWS"
+        )
+
     def test_only_full_release_claim_is_blocked_by_incomplete_capability_matrix(self):
         incomplete = {"capability_readiness": {"status": "incomplete"}}
         complete = {"capability_readiness": {"status": "complete"}}
@@ -162,6 +201,103 @@ class TestSuiteRunnerTest(unittest.TestCase):
         self.assertFalse(
             runner.public_capability_readiness_blocks("all", complete)
         )
+
+    def test_execution_evidence_records_failure_identity_and_selection_counts(self):
+        class EvidencePassCase(unittest.TestCase):
+            def runTest(self):
+                pass
+
+        class EvidenceFailCase(unittest.TestCase):
+            def runTest(self):
+                self.fail("independent synthetic failure")
+
+        trust = {"status": "passed", "capability_readiness": {"status": "complete"}}
+        policy = {"blackbox_test_roots": [], "performance_test_selectors": []}
+        selected = [EvidencePassCase(), EvidenceFailCase()]
+        failure_id = selected[1].id()
+        with tempfile.TemporaryDirectory() as temporary:
+            evidence = Path(temporary) / "suite.json"
+            with (
+                mock.patch.object(runner, "run_trust_gate", return_value=trust),
+                mock.patch.object(runner, "load_policy", return_value=policy),
+                mock.patch.object(runner, "discover_tests", return_value=selected),
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(io.StringIO()),
+            ):
+                returncode = runner.main([
+                    "--suite", "all", "--root", str(ROOT),
+                    "--json-out", str(evidence), "--verbosity", "0",
+                ])
+            payload = json.loads(evidence.read_text(encoding="utf-8"))
+
+        self.assertEqual(returncode, 1)
+        self.assertEqual(payload["reason_code"], "TEST_SUITE_FAILED")
+        self.assertEqual(payload["counts"]["selected"], 2)
+        self.assertEqual(payload["counts"]["unique_selected"], 2)
+        self.assertEqual(payload["counts"]["duplicate_selections"], 0)
+        self.assertEqual(payload["counts"]["run"], 2)
+        self.assertEqual(payload["counts"]["failures"], 1)
+        self.assertEqual(payload["failures"][0]["test_id"], failure_id)
+        self.assertIn("independent synthetic failure", payload["failures"][0]["detail"])
+
+    def test_overlapping_suite_selection_runs_once_and_fails_contract(self):
+        class EvidencePassCase(unittest.TestCase):
+            def runTest(self):
+                pass
+
+        trust = {"status": "passed", "capability_readiness": {"status": "complete"}}
+        policy = {"blackbox_test_roots": [], "performance_test_selectors": []}
+        selected = [EvidencePassCase(), EvidencePassCase()]
+        with tempfile.TemporaryDirectory() as temporary:
+            evidence = Path(temporary) / "suite.json"
+            with (
+                mock.patch.object(runner, "run_trust_gate", return_value=trust),
+                mock.patch.object(runner, "load_policy", return_value=policy),
+                mock.patch.object(runner, "discover_tests", return_value=selected),
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(io.StringIO()),
+            ):
+                returncode = runner.main([
+                    "--suite", "all", "--root", str(ROOT),
+                    "--json-out", str(evidence), "--verbosity", "0",
+                ])
+            payload = json.loads(evidence.read_text(encoding="utf-8"))
+
+        self.assertEqual(returncode, 1)
+        self.assertEqual(payload["reason_code"], "TEST_SUITE_SELECTION_OVERLAP")
+        self.assertEqual(payload["counts"]["selected"], 2)
+        self.assertEqual(payload["counts"]["unique_selected"], 1)
+        self.assertEqual(payload["counts"]["duplicate_selections"], 1)
+        self.assertEqual(payload["counts"]["run"], 1)
+
+    def test_expected_failure_is_never_a_passing_governed_suite(self):
+        class EvidenceExpectedFailureCase(unittest.TestCase):
+            @unittest.expectedFailure
+            def runTest(self):
+                self.fail("known defect must remain merge-blocking")
+
+        trust = {"status": "passed", "capability_readiness": {"status": "complete"}}
+        policy = {"blackbox_test_roots": [], "performance_test_selectors": []}
+        selected = [EvidenceExpectedFailureCase()]
+        with tempfile.TemporaryDirectory() as temporary:
+            evidence = Path(temporary) / "suite.json"
+            with (
+                mock.patch.object(runner, "run_trust_gate", return_value=trust),
+                mock.patch.object(runner, "load_policy", return_value=policy),
+                mock.patch.object(runner, "discover_tests", return_value=selected),
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(io.StringIO()),
+            ):
+                returncode = runner.main([
+                    "--suite", "all", "--root", str(ROOT),
+                    "--json-out", str(evidence), "--verbosity", "0",
+                ])
+            payload = json.loads(evidence.read_text(encoding="utf-8"))
+
+        self.assertEqual(returncode, 1)
+        self.assertEqual(payload["reason_code"], "TEST_SUITE_EXPECTED_FAILURE")
+        self.assertEqual(payload["counts"]["expected_failures"], 1)
+        self.assertEqual(len(payload["expected_failures"]), 1)
 
 if __name__ == "__main__":
     unittest.main()

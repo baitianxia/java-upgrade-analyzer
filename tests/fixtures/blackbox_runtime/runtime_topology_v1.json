@@ -37,6 +37,16 @@
       "class_name": "dup/Provider",
       "first_resource_name": "config/value.txt",
       "resource_name": "META-INF/services/example.Service",
+      "provider_class_entries": [
+        "dup/Provider$Helper.class",
+        "dup/Provider.class"
+      ],
+      "shadowed_dispatch_target": [
+        "dup/Provider$Helper",
+        "value",
+        "()I"
+      ],
+      "expected_physical_dispatch_edge_count": 2,
       "base_selected_lineage": "blackbox:provider-a",
       "current_selected_lineage": "blackbox:provider-b",
       "base_resource_order": ["blackbox:provider-a", "blackbox:provider-b"],
@@ -59,6 +69,34 @@
       ],
       "expected_definition_status": "definition_ready",
       "expected_target_verification_status": "definition_ready"
+    },
+    "provider_identity_across_loader_realms": {
+      "class_name": "lib/Outer$Removed",
+      "expected_base_stdout": "1:7",
+      "expected_current_error": "NoClassDefFoundError",
+      "base_class_entries": [
+        "lib/Outer$Control.class",
+        "lib/Outer$Removed.class",
+        "lib/Outer.class"
+      ],
+      "current_class_entries": [
+        "lib/Outer$Control.class",
+        "lib/Outer.class"
+      ],
+      "expected_public_identity_count": 1,
+      "expected_loader_realms": [
+        "application-loader"
+      ],
+      "expected_contributing_fact_count": 1,
+      "expected_state": {
+        "reachability_status": "not_found_in_static_analysis",
+        "static_linkage_status": "undetermined",
+        "impact_conclusion": "inconclusive",
+        "runtime_verification_status": "undetermined",
+        "exact_path_exists": false,
+        "possible_path_exists": false,
+        "path_set_complete": true
+      }
     }
   }
 }

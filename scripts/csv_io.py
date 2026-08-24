@@ -49,9 +49,10 @@ def _ensure_leading_bom(path):
         shutil.copymode(target, temporary_path)
         os.replace(temporary_path, target)
         temporary_path = None
-    finally:
+    except BaseException:
         if temporary_path is not None and temporary_path.exists():
             temporary_path.unlink()
+        raise
 
 
 def open_csv_append(path):

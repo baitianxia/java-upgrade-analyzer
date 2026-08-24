@@ -1,0 +1,47 @@
+{
+  "schema": "java-upgrade-analyzer.test-incident-evidence.v1",
+  "incident_id": "provider-topology-duplicate-identity-20260823",
+  "observed_at": "2026-08-23T10:24:00Z",
+  "platform": "macOS aarch64 fixed gs-managing-transactions Release project",
+  "trigger": "a Spring class exists through the application loader on the base side, is removed on the current side, and only the base reconciliation contains an explicit platform-loader missing observation",
+  "actual_pre_fix_behavior": "binary_formal_results.json published two provider_topology rows with the same public owner/member/descriptor/kind identity; one came from the real application-loader change and one from comparing platform-loader missing with an absent current observation",
+  "expected_behavior": "an absent provider observation is not a provider state and cannot create an authoritative change; independently complete realm-specific changes that share one public identity must be aggregated once while retaining every contributing loader realm and fact",
+  "root_cause": "the decision engine treated an unobserved side as a provider outcome change, while the opaque reported identity included loader realm but the public identity exposed to users and truth comparison did not",
+  "observed_duplicate": {
+    "owner": "org/springframework/transaction/reactive/TransactionalOperatorExtensionsKt$executeAndAwait$3",
+    "member": "",
+    "descriptor": "",
+    "member_kind": "provider_topology",
+    "count": 2,
+    "change_fact_identities": [
+      "8d340a418da5c46434bdf3ed5b4bfdd6938247347f5c7be436a1090cdff3b80b",
+      "946c3d0828e85c148f82c1f027a1fff27eb0b3ca64c05f726ed1e07f8d62543f"
+    ],
+    "loader_realms": [
+      "application-loader",
+      "platform-loader"
+    ]
+  },
+  "independent_evidence": {
+    "pre_fix_truth_reason": "BINARY_TRUTH_DUPLICATE_ACTUAL_IDENTITY",
+    "pre_fix_duplicate_count": 2,
+    "linkage_oracle_status": "passed",
+    "minimal_base_jvm_stdout": "1:7",
+    "minimal_current_jvm_error": "NoClassDefFoundError",
+    "minimal_base_class_entries": [
+      "lib/Outer$Control.class",
+      "lib/Outer$Removed.class",
+      "lib/Outer.class"
+    ],
+    "minimal_current_class_entries": [
+      "lib/Outer$Control.class",
+      "lib/Outer.class"
+    ]
+  },
+  "reproduction": [
+    "Compile the nested lib.Outer.Removed provider only into the base dependency and keep lib.Outer.Control on both sides.",
+    "Use an isolated JVM and ZIP inventory to prove base execution succeeds, current execution raises NoClassDefFoundError, and only the declared nested class is removed.",
+    "Run the public binary pipeline with application-loader parented by platform-loader and require one unique provider_topology public identity.",
+    "Run the fixed gs-managing-transactions manifest and require the independent truth evaluator to report no duplicate identity."
+  ]
+}

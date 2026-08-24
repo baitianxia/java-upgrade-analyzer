@@ -120,7 +120,9 @@ def load_orchestrated_step3_input(report_dir):
         try:
             with open(state_path, "r", encoding="utf-8") as f:
                 main_state = json.load(f)
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            if not isinstance(main_state, dict):
+                raise TypeError('orchestrated main_state must be a JSON object')
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError) as exc:
             record_scan_diagnostic(
                 stage='orchestrated_state_load', path=state_path, error=exc,
             )
@@ -129,13 +131,30 @@ def load_orchestrated_step3_input(report_dir):
         try:
             with open(context_file, "r", encoding="utf-8") as f:
                 context = json.load(f)
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            if not isinstance(context, dict):
+                raise TypeError('orchestrated context must be a JSON object')
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError) as exc:
             record_scan_diagnostic(
                 stage='orchestrated_context_load', path=context_file, error=exc,
             )
             context = {}
-    step_input = dict((((main_state or {}).get("step3") or {}).get("input")) or {})
-    return step_input, dict(context or {})
+    step3_state = main_state.get("step3") or {}
+    if not isinstance(step3_state, dict):
+        record_scan_diagnostic(
+            stage='orchestrated_state_load',
+            path=state_path,
+            error=TypeError('main_state.step3 must be a JSON object'),
+        )
+        step3_state = {}
+    step_input = step3_state.get("input") or {}
+    if not isinstance(step_input, dict):
+        record_scan_diagnostic(
+            stage='orchestrated_state_load',
+            path=state_path,
+            error=TypeError('main_state.step3.input must be a JSON object'),
+        )
+        step_input = {}
+    return dict(step_input), dict(context)
 
 
 DEP_COMPAT_INCLUDE_TEST_SCOPE = False
@@ -342,6 +361,8 @@ def load_current_deps(csv_path):
                 if is_current_list and physical_entry:
                     deps.append(normalized)
                     continue
+                if normalized.get('resolution_status') == 'unresolved':
+                    continue
                 if not coord or not version or version == '-':
                     continue
                 deps.append({
@@ -386,13 +407,21 @@ def resolve_current_final_artifact_path(dep_list_path):
         return '', 'current_final_artifact_provenance_missing'
     try:
         payload = json.loads(provenance_path.read_text(encoding='utf-8'))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        if not isinstance(payload, dict):
+            raise TypeError('build_provenance must be a JSON object')
+        raw_sides = payload.get('sides')
+        sides = [] if raw_sides is None else raw_sides
+        if not isinstance(sides, list) or any(
+            not isinstance(item, dict) for item in sides
+        ):
+            raise TypeError('build_provenance.sides must be an array of objects')
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError) as exc:
         record_scan_diagnostic(
             stage='current_final_artifact_provenance_load', path=provenance_path, error=exc,
         )
         return '', 'current_final_artifact_provenance_unreadable'
     current = next(
-        (item for item in payload.get('sides') or [] if item.get('side') == 'current'),
+        (item for item in sides if item.get('side') == 'current'),
         {},
     )
     artifact_path = str(current.get('artifact_path') or '').strip()
@@ -526,7 +555,7 @@ def _iter_candidate_scan_files(source_dirs):
             dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
             for fname in files:
                 ext = os.path.splitext(fname)[1].lower()
-                if ext in exts or fname in {'spring.factories', 'AutoConfiguration.imports'}:
+                if ext in exts:
                     yield os.path.join(root, fname)
 
 
@@ -570,11 +599,12 @@ def _build_coord_scan_tokens(dep_row, report_dir):
             dependency = scan_input.get('dependency') or {}
             if str(dependency.get('coord') or '').strip() != coord:
                 continue
-            if not scan_input.get('error_code'):
-                class_names = _iter_jar_class_names(scan_input.get('jar_bytes'))
-                artifact_entry = str(
-                    dependency.get('lib_entry') or dependency.get('entry_id') or ''
-                ).strip()
+            if scan_input.get('error_code'):
+                continue
+            class_names = _iter_jar_class_names(scan_input.get('jar_bytes'))
+            artifact_entry = str(
+                dependency.get('lib_entry') or dependency.get('entry_id') or ''
+            ).strip()
             break
     package_prefixes = []
     for fqcn in class_names:
@@ -609,8 +639,8 @@ def _class_usage_match_kind(file_path, line_text, fqcn, simple_name):
     if re.search(r'Class\.forName\s*\(\s*"[^"]*' + re.escape(fqcn) + r'[^"]*"', text):
         return 'reflection_string', 'RESOURCE_OR_REFLECTION', 'weak'
     identifier_boundary = r'[A-Za-z0-9_$]'
-    source_fqcn = str(fqcn or '').replace('$', '.')
-    source_simple = str(simple_name or '').replace('$', '.')
+    source_fqcn = str(fqcn).replace('$', '.')
+    source_simple = str(simple_name).replace('$', '.')
     fqcn_pattern = '(?:' + '|'.join({re.escape(fqcn), re.escape(source_fqcn)}) + ')'
     simple_pattern = '(?:' + '|'.join({re.escape(simple_name), re.escape(source_simple)}) + ')'
     if re.search(r'\bimport\s+static\s+' + fqcn_pattern + r'\.', text):
@@ -813,11 +843,13 @@ def build_per_dependency_candidate_outputs(source_dirs, dep_changes_path, report
         if summary_path.exists():
             try:
                 summary = json.loads(summary_path.read_text(encoding='utf-8'))
+                if not isinstance(summary, dict):
+                    summary = {}
             except Exception:
                 summary = {}
         bucket_counts = {}
         for item in row_hits:
-            bucket = str(item.get('candidate_bucket') or '').strip()
+            bucket = str(item.get('candidate_bucket', '')).strip()
             bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
         summary['coord'] = coord
         summary['step3'] = {
@@ -829,7 +861,8 @@ def build_per_dependency_candidate_outputs(source_dirs, dep_changes_path, report
                 'candidate_hits_csv': str(candidate_hits_path),
             },
         }
-        summary.setdefault('artifacts', {})
+        if not isinstance(summary.get('artifacts'), dict):
+            summary['artifacts'] = {}
         summary['artifacts']['candidate_hits_csv'] = str(candidate_hits_path)
         write_text(summary_path, json.dumps(summary, ensure_ascii=False, indent=2) + '\n')
         aggregate_rows.extend(row_hits)
@@ -903,13 +936,20 @@ def load_rule_pack(pack_id):
     path = RULE_PACK_DIR / f'{pack_id}.json'
     with open(path, 'r', encoding='utf-8') as handle:
         payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError(f'规则包 {pack_id} 必须是 JSON 对象')
     if payload.get('schema') != 'java-upgrade-analyzer.rule-pack.v1':
         raise ValueError(f'不支持的规则包 schema：{payload.get("schema")}')
     for field in ('id', 'version', 'source', 'last_verified', 'rules'):
         if not payload.get(field):
             raise ValueError(f'规则包 {pack_id} 缺少字段：{field}')
+    rules = payload.get('rules')
+    if not isinstance(rules, list):
+        raise ValueError(f'规则包 {pack_id} 的 rules 必须是数组')
     seen = set()
-    for rule in payload.get('rules') or []:
+    for rule in rules:
+        if not isinstance(rule, dict):
+            raise ValueError(f'规则包 {pack_id} 的规则必须是对象')
         if not rule.get('id') or rule.get('id') in seen or not rule.get('kind') or not rule.get('pattern'):
             raise ValueError(f'规则包 {pack_id} 存在无效或重复规则：{rule.get("id")}')
         seen.add(rule['id'])
@@ -1040,6 +1080,7 @@ def scan_thread_lifecycle_calls(source_dir):
     decl_re = re.compile(
         r'\b(?:java\.lang\.)?Thread\b\s*(?:<[^>;]+>\s*)?(?:\[\]\s*)?([A-Za-z_]\w*)\b'
     )
+    class_re = re.compile(r'\bclass\b[^{]*\{')
     extends_re = re.compile(r'\bclass\b[^{]*\bextends\b\s+(?:java\.lang\.)?Thread\b')
 
     for fpath in walk_files(source_dir, {'.java'}):
@@ -1050,21 +1091,36 @@ def scan_thread_lifecycle_calls(source_dir):
             continue
 
         full_text = ''.join(line for _, line in lines)
-        extends_thread = bool(extends_re.search(full_text))
-        thread_vars = set()
+        declarations_by_line = {}
         for m in decl_re.finditer(full_text):
-            name = (m.group(1) or '').strip()
-            if name:
-                thread_vars.add(name)
+            declaration_line = full_text.count('\n', 0, m.end()) + 1
+            declarations_by_line.setdefault(declaration_line, set()).add(
+                m.group(1).strip()
+            )
 
+        brace_depth = 0
+        class_stack = []
         for lineno, ln in lines:
-            raw = (ln or '').rstrip('\r\n')
+            raw = ln.rstrip('\r\n')
+            for class_match in class_re.finditer(raw):
+                body_depth = brace_depth + raw[:class_match.end()].count('{')
+                class_stack.append({
+                    'body_depth': body_depth,
+                    'extends_thread': bool(extends_re.search(class_match.group(0))),
+                    'thread_vars': set(),
+                })
+            if class_stack:
+                class_stack[-1]['thread_vars'].update(
+                    declarations_by_line.get(lineno, set())
+                )
             stripped = raw.strip()
             if stripped.startswith('//') or stripped.startswith('*') or stripped.startswith('/*'):
-                continue
-            for m in call_re.finditer(raw):
-                recv = (m.group('recv') or '').strip()
-                meth = (m.group('meth') or '').strip().lower()
+                matches = ()
+            else:
+                matches = call_re.finditer(raw)
+            for m in matches:
+                recv = m.group('recv').strip()
+                meth = m.group('meth').strip().lower()
                 api_name = f"java.lang.Thread.{meth}"
                 removed_ver = 'JDK20'
 
@@ -1080,10 +1136,11 @@ def scan_thread_lifecycle_calls(source_dir):
                     evidence = 'cast_to_Thread'
                 else:
                     ident = recv.split('.')[-1]
-                    if ident == 'this' and extends_thread:
+                    current_class = class_stack[-1] if class_stack else {}
+                    if ident == 'this' and current_class.get('extends_thread'):
                         confidence = 'CONFIRMED'
                         evidence = 'extends_Thread_this'
-                    elif ident in thread_vars:
+                    elif ident in current_class.get('thread_vars', set()):
                         confidence = 'CONFIRMED'
                         evidence = f'declared_as_Thread:{ident}'
 
@@ -1102,6 +1159,10 @@ def scan_thread_lifecycle_calls(source_dir):
                     '置信度': confidence,
                     '证据': evidence,
                 })
+
+            brace_depth += raw.count('{') - raw.count('}')
+            while class_stack and brace_depth < class_stack[-1]['body_depth']:
+                class_stack.pop()
 
     return rows
 
@@ -1675,6 +1736,7 @@ def scan_dependency_compat(_source_dir, output_path, dep_changes_path=None):
                     (b'java/lang/SecurityManager', 'security_manager'),
                     (b'setAccessible', 'deep_reflection'),
                 ]
+                expected_risk_types = {risk_type for _, risk_type in binary_needles}
 
                 def iter_class_entries():
                     for n in names:
@@ -1700,7 +1762,7 @@ def scan_dependency_compat(_source_dir, output_path, dep_changes_path=None):
 
                 found_types = set()
                 for entry in iter_class_entries():
-                    if len(found_types) == len(binary_needles):
+                    if found_types == expected_risk_types:
                         break
                     data = read_prefix(entry)
                     if not data:
@@ -1796,6 +1858,12 @@ def scan_dependency_classfile_versions(_source_dir, output_path, dep_changes_pat
                         continue
                     major = parse_class_major_version(data)
                     if major is None:
+                        class_read_failures += 1
+                        record_scan_diagnostic(
+                            stage='dependency_classfile_header_parse',
+                            path=f'{lib_entry}!/{name}',
+                            error=ValueError('invalid or incomplete Class header'),
+                        )
                         continue
                     if name.startswith('META-INF/versions/'):
                         if max_major_mr is None or major > max_major_mr:
@@ -2113,9 +2181,7 @@ def main():
             to_run += ['javax', 'sb_config', 'sb_autoconfig']
         if dep_list_path:
             to_run += ['dep_compat', 'dep_classfile']
-        if to_run == ['database_contract'] and not (
-            args.jdk_upgraded or args.sb_major_upgrade or dep_list_path
-        ):
+        if to_run == ['database_contract']:
             # 没有指定升级类型，运行全部
             to_run = list(SCAN_FUNCS.keys())
         to_run = list(dict.fromkeys(to_run))

@@ -470,6 +470,51 @@ class BinaryDecisionIdentityRegressionTest(unittest.TestCase):
             "application-loader", "demo/Child", "demo/ReplacedParent"
         ))
 
+    def test_member_resolution_delta_uses_retained_base_declaration_in_hierarchy(self):
+        engine = BinaryDecisionEngine.__new__(BinaryDecisionEngine)
+        key = (
+            "logical-lineage", "unused", "demo/Caller", "call", "()V", 3, 8,
+        )
+        base_edge = {
+            "direct_edge_identity": "base-edge",
+            "symbolic_owner": "demo/Child",
+            "symbolic_name": "inherited",
+            "symbolic_descriptor": "()V",
+            "edge_kind": "method",
+        }
+        current_edge = {**base_edge, "direct_edge_identity": "current-edge"}
+        base_resolution = {
+            "member_resolution_status": "resolved",
+            "resolved_owner": "demo/Parent",
+            "resolved_defining_loader_realm_identity": "application-loader",
+            "initiating_loader_realm_identity": "application-loader",
+        }
+        current_resolution = {
+            "member_resolution_status": "no_such_member",
+            "initiating_loader_realm_identity": "application-loader",
+        }
+        engine._paired_semantic_member_outcome_deltas = lambda: [(
+            key, base_edge, base_resolution, current_edge, current_resolution,
+        )]
+        engine._current_class_parents = lambda _realm, child: (
+            ("demo/Parent",) if child == "demo/Child" else ()
+        )
+        engine.runtime_comparison_identity = "runtime-comparison"
+        engine._base_providers = {}
+        engine._current_providers = {}
+        engine._member_target = lambda *_args: "member-target"
+        engine._dependency_artifacts = lambda *_args: ()
+        decisions = []
+        engine._decision = lambda **payload: decisions.append(payload)
+
+        engine._process_member_resolution_deltas()
+
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0]["fact_scope"]["class_name"], "demo/Parent")
+        self.assertEqual(
+            decisions[0]["reason_code"], "RUNTIME_MEMBER_RESOLUTION_CHANGED",
+        )
+
 
 class BinaryDecisionEngineTest(unittest.TestCase):
     @classmethod

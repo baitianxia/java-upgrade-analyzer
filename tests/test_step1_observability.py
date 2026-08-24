@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -20,6 +21,148 @@ import step1_observability
 
 
 class Step1ObservabilityTest(unittest.TestCase):
+    def test_peak_rss_covers_zero_failure_linux_and_darwin_units(self):
+        def resource(raw):
+            return SimpleNamespace(
+                RUSAGE_SELF=1,
+                getrusage=lambda _scope: SimpleNamespace(ru_maxrss=raw),
+            )
+
+        with patch.dict(sys.modules, {"resource": resource(0)}):
+            self.assertEqual(step1_observability.peak_rss_mb(), 0.0)
+        with patch.dict(sys.modules, {"resource": resource(2048)}), patch.object(
+            step1_observability.sys,
+            "platform",
+            "linux",
+        ):
+            self.assertEqual(step1_observability.peak_rss_mb(), 2.0)
+        with patch.dict(
+            sys.modules,
+            {"resource": resource(2 * 1024 * 1024)},
+        ), patch.object(step1_observability.sys, "platform", "darwin"):
+            self.assertEqual(step1_observability.peak_rss_mb(), 2.0)
+
+        failing = SimpleNamespace(
+            RUSAGE_SELF=1,
+            getrusage=lambda _scope: (_ for _ in ()).throw(OSError("missing")),
+        )
+        with patch.dict(sys.modules, {"resource": failing}):
+            self.assertEqual(step1_observability.peak_rss_mb(), 0.0)
+
+    def test_observer_sparse_event_counter_and_invalid_token_boundaries(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            step1_observability,
+            "emit_progress",
+        ) as emit:
+            output = Path(tmp) / "custom/dep_changes.csv"
+            observer = step1_observability.Step1Observer(output)
+            self.assertEqual(observer.report_dir, output.parent.resolve())
+
+            partial_contract_output = (
+                Path(tmp) / "not-evidence/dependencies/dep_changes.csv"
+            )
+            partial = step1_observability.Step1Observer(partial_contract_output)
+            self.assertEqual(
+                partial.report_dir,
+                partial_contract_output.parent.resolve(),
+            )
+
+            with self.assertRaisesRegex(KeyError, "unsupported Step1 counter"):
+                observer.increment_counter("unknown")
+            observer.increment_counter("cache_hits", 0)
+            self.assertEqual(observer._counters["cache_hits"], 0)
+
+            event = observer.event(
+                None,
+                None,
+                None,
+                item="only-item",
+                details=None,
+            )
+            self.assertEqual(event["phase"], "")
+            self.assertEqual(event["status"], "")
+            self.assertEqual(event["message"], "")
+            self.assertEqual(event["details"], {})
+            emit.assert_called_with(
+                "step1",
+                "",
+                "",
+                elapsed=None,
+                item="only-item",
+            )
+
+            sparse_token = observer.start_phase(
+                None,
+                side=None,
+                item=None,
+                command=None,
+                message=None,
+            )
+            self.assertEqual(
+                (sparse_token.side, sparse_token.phase, sparse_token.item),
+                ("", "", ""),
+            )
+
+            token = step1_observability.PhaseToken(
+                row_index=99,
+                side="",
+                phase="manual",
+                item="",
+                command="",
+                started_at="now",
+                started_perf=10.0,
+            )
+            with patch.object(
+                step1_observability.time,
+                "perf_counter",
+                return_value=12.0,
+            ):
+                elapsed = observer.finish_phase(token, status="completed")
+            self.assertEqual(elapsed, 2.0)
+            self.assertEqual(observer._timing_rows[-1]["message"], "manual completed")
+
+            negative_token = step1_observability.PhaseToken(
+                row_index=-1,
+                side="",
+                phase="negative",
+                item="",
+                command="",
+                started_at="now",
+                started_perf=10.0,
+            )
+            with patch.object(
+                step1_observability.time,
+                "perf_counter",
+                return_value=11.0,
+            ):
+                observer.finish_phase(negative_token, status="completed")
+            self.assertEqual(observer._timing_rows[-1]["phase"], "negative")
+
+            empty = observer._timing_row(
+                token,
+                status=None,
+                message=None,
+            )
+            self.assertEqual(empty["status"], "")
+            self.assertEqual(empty["message"], "")
+
+    def test_phase_success_supports_explicit_start_and_completion_messages(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            step1_observability,
+            "emit_progress",
+        ):
+            observer = step1_observability.Step1Observer(
+                Path(tmp) / "dep_changes.csv"
+            )
+            with observer.phase(
+                "scan",
+                start_message="begin explicitly",
+                complete_message="done explicitly",
+            ):
+                pass
+
+            self.assertEqual(observer._timing_rows[-1]["message"], "done explicitly")
+
     def test_ref_resolution_event_records_requested_and_resolved_revision(self):
         with tempfile.TemporaryDirectory() as tmp:
             observer = step1_observability.Step1Observer(

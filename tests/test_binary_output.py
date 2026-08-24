@@ -47,6 +47,53 @@ from signature_utils import jvm_method_parameter_signature  # noqa: E402
 
 
 class BinaryOutputTest(unittest.TestCase):
+    def test_release_recapture_cleanup_restores_declared_predecessor_atomically(self):
+        current_identity = "a" * 64
+        activation_identity = "b" * 64
+        predecessor = {
+            "schema": binary_output._ACTIVE_DESCRIPTOR_SCHEMA,
+            "result_generation_identity": "c" * 64,
+            "generation_directory": f"binary_generations/{'c' * 64}",
+            "validation_run_identity": "d" * 64,
+            "validation_result_sha256": "e" * 64,
+        }
+        current = {
+            "schema": binary_output._ACTIVE_DESCRIPTOR_SCHEMA,
+            "result_generation_identity": current_identity,
+            "generation_directory": f"binary_generations/{current_identity}",
+            "validation_run_identity": "f" * 64,
+            "validation_result_sha256": "1" * 64,
+            "activation_identity": activation_identity,
+            "activation_predecessor": predecessor,
+        }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "output"
+            root.mkdir(mode=0o700)
+            binary_output._write_active_descriptor(
+                root, current, expect_missing=True,
+            )
+            with patch.object(
+                binary_output,
+                "_require_generation_identity_publication_allowed",
+                return_value={
+                    "authority_mode": (
+                        binary_output._RELEASE_RECAPTURE_AUTHORITY_MODE
+                    ),
+                },
+            ), binary_output._release_recapture_publication(root):
+                restored = binary_output._discard_release_recapture_activation(
+                    root,
+                    expected_current_identity=current_identity,
+                    expected_activation_identity=activation_identity,
+                    previous_active=predecessor,
+                )
+
+            active, _identity = binary_output._read_active_descriptor(root)
+
+        self.assertTrue(restored)
+        self.assertEqual(active, predecessor)
+
     def test_windows_regular_file_fsync_uses_read_write_descriptor(self):
         opened = Mock(st_mode=stat.S_IFREG | 0o600)
         with patch.object(binary_output.os, "name", "nt"), patch.object(

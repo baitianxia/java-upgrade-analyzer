@@ -7,9 +7,9 @@
   "human_review": {"status": "not_claimed", "reviewer": ""},
   "input_evidence": {
     "algorithm": "sha256-path-nul-content-nul-v1",
-    "source_tree_sha256": "476c6cd8565a29fe868383fe9cdeb9a6c64ba002baec6046f48ddb816daee120",
+    "source_tree_sha256": "50aa7d5d4512d6967fdb26c02a48ce144059ee35aa820c30ddfbca805c225c1e",
     "case_algorithm": "sha256-canonical-json-v1",
-    "case_sha256": "86e78fe5bfcc27f7cce324578ee030b50dd81d2d1d9392c48cc9456531e472a2",
+    "case_sha256": "253ed670fddef99c72d9dcbea0685e399cfb9a60ef318e2df4556d457174b42a",
     "source_files": [
       "src/base/contract/DefaultService.java",
       "src/base/contract/DefaultServiceImpl.java",
@@ -30,18 +30,18 @@
       "id": "openjdk-jvm-interface-linker",
       "organization": "OpenJDK",
       "mechanism": "actual_jvm_execution",
-      "verifies": ["base_default_dispatch_succeeds", "current_no_such_method_error"]
+      "verifies": ["base_default_dispatch_succeeds", "interface_object_fallback_rules", "current_no_such_method_error"]
     }
   ],
   "oracle_implementations": [
     {"path": "tests/blackbox/oracles/openjdk_oracle.py", "sha256": "6413dec752291d5bf7068a94c249e096d26490c64ddb5f7d3c278887ca9eae72"}
   ],
   "completeness": {
-    "argument": "javap inventories every public default method on the only changed interface and independently reads every invokeinterface instruction in the complete business class. The isolated JVM runner instantiates an implementation and proves both base default dispatches succeed while the current runtime raises NoSuchMethodError for each removed interface method.",
+    "argument": "javap inventories every public method on the only changed interface and independently reads every invokeinterface instruction in the complete business class. The isolated JVM runner instantiates an implementation and proves every base dispatch succeeds while the current runtime raises NoSuchMethodError for each removed interface method, including clone() when a public implementation method exists but java.lang.Object offers only a protected declaration.",
     "verified_dimensions": ["api_identity", "jvm_descriptor", "closed_result_set", "entrypoint_reachability", "static_linkage"],
     "known_limits": []
   },
-  "expected_result_count": 2,
+  "expected_result_count": 3,
   "expected_results": [
     {
       "owner": "contract/DefaultService", "member": "removedReachableDefault", "descriptor": "()Ljava/lang/String;", "member_kind": "method",
@@ -55,6 +55,13 @@
       "dependency_lineages": ["blackbox:interface-dispatch-lib"], "base_dependency_coords": ["blackbox:interface-dispatch-lib:1.0"], "current_dependency_coords": ["blackbox:interface-dispatch-lib:2.0"],
       "reachability_status": "not_found_in_static_analysis", "static_linkage_status": "incompatible_if_executed", "impact_conclusion": "inconclusive", "runtime_verification_status": "undetermined",
       "exact_path_exists": false, "possible_path_exists": false, "path_set_complete": true, "paths": []
+    },
+    {
+      "owner": "contract/DefaultService", "member": "clone", "descriptor": "()Ljava/lang/Object;", "member_kind": "method",
+      "dependency_lineages": ["blackbox:interface-dispatch-lib"], "base_dependency_coords": ["blackbox:interface-dispatch-lib:1.0"], "current_dependency_coords": ["blackbox:interface-dispatch-lib:2.0"],
+      "reachability_status": "reachable", "static_linkage_status": "incompatible_if_executed", "impact_conclusion": "probable_impact", "runtime_verification_status": "required_not_executed",
+      "exact_path_exists": true, "possible_path_exists": false, "path_set_complete": true,
+      "paths": [{"certainty": "exact", "text": "contract.DispatchApp.entryClone(contract.DefaultService) → contract.DefaultService.clone()"}]
     }
   ],
   "forbidden_results": [

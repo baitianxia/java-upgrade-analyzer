@@ -24,6 +24,52 @@
   "conflict_reason_code": "SOURCE_BINARY_DESCRIPTOR_MISMATCH",
   "explanation_authority": "explanatory_source_overlay_only",
   "candidate_authority": "source_candidate_only_not_executable_edge",
+  "expected_candidate_targets": ["biz.Base.inherited()"],
+  "literal_overload": {
+    "expected_base_stdout": "68",
+    "expected_current_stdout": "680",
+    "javap_invocation_descriptors": {
+      "(I)I": 6,
+      "(J)I": 3,
+      "(F)I": 3,
+      "(D)I": 3,
+      "(C)I": 3,
+      "(Ljava/lang/String;)I": 1,
+      "(Llib/Factory;)I": 2
+    },
+    "source_candidate_keys": {
+      "lib.Target.pick(int)": 6,
+      "lib.Target.pick(long)": 3,
+      "lib.Target.pick(float)": 3,
+      "lib.Target.pick(double)": 3,
+      "lib.Target.pick(char)": 3,
+      "lib.Target.pick(String)": 1,
+      "lib.Target.pick(Factory)": 2
+    },
+    "nested_expression": {
+      "javap_invocations": {
+        "lib/Factory.key:(Ljava/lang/String;)Ljava/lang/String;": 1,
+        "lib/Target.pick:(Ljava/lang/String;)I": 1,
+        "lib/Target.pick:(Llib/Factory;)I": 2
+      },
+      "source_candidate_keys": {
+        "lib.Factory.key(String)": 1,
+        "lib.Target.pick(String)": 1,
+        "lib.Target.pick(Factory)": 2
+      }
+    },
+    "malformed_expression": {
+      "source_arguments": [
+        "()",
+        "condition ? unknown : \"fallback\"",
+        "condition ? \"fallback\" : unknown"
+      ],
+      "expected_validation_status": "passed",
+      "expected_untyped_candidate": "lib.Target.pick",
+      "forbidden_typed_candidate_prefix": "lib.Target.pick(",
+      "binary_formal_results_unchanged": true
+    }
+  },
   "present_source_inputs": {
     "business": "available",
     "dependencies": "available"

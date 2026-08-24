@@ -897,6 +897,96 @@ class Step1PackagedDepsTest(unittest.TestCase):
             "successful Gradle builds must not be blocked by a post-build scope recheck",
         )
 
+    def test_collect_gradle_deps_resolves_coordinate_less_entries_from_runtime_inventory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "settings.gradle").write_text(
+                "rootProject.name = 'app'\n", encoding="utf-8",
+            )
+            (root / "build.gradle").write_text(
+                "plugins { id 'java' }\n", encoding="utf-8",
+            )
+            wrapper = root / ("gradlew.bat" if os.name == "nt" else "gradlew")
+            wrapper.write_text(
+                "@echo off\r\n" if os.name == "nt" else "#!/bin/sh\n",
+                encoding="utf-8",
+            )
+            if os.name != "nt":
+                wrapper.chmod(0o755)
+            artifact = root / "build" / "libs" / "app.jar"
+            artifact.parent.mkdir(parents=True)
+            artifact.write_bytes(b"artifact")
+            packaged = s1_dep_diff._build_packaged_entry(
+                "BOOT-INF/lib/demo-1.0.jar",
+            )
+            resolved_entry = {
+                **packaged,
+                "coord": "org.example:demo",
+                "group_id": "org.example",
+                "artifact_id": "demo",
+                "version": "1.0",
+                "match_source": "runtime_inventory",
+            }
+            runtime = {
+                "org.example:demo": {
+                    "coord": "org.example:demo", "version": "1.0",
+                },
+            }
+            with patch.object(
+                s1_dep_diff, "_run_gradle_command_with_lock_retry",
+                return_value=("", "", 0, 1),
+            ), patch.object(
+                s1_dep_diff, "_discover_packaged_archives",
+                return_value=[artifact],
+            ), patch.object(
+                s1_dep_diff, "_detect_archive_packaging_type",
+                return_value="boot_jar",
+            ), patch.object(
+                s1_dep_diff, "_inspect_packaged_archive",
+                return_value=[packaged],
+            ), patch.object(
+                s1_dep_diff, "collect_runtime_deps_for_workspace",
+                return_value=(runtime, "gradle dependencies"),
+            ) as runtime_collect, patch.object(
+                s1_dep_diff, "_enrich_packaged_deps_with_runtime",
+                return_value=(
+                    [resolved_entry], runtime, [],
+                ),
+            ):
+                deps, meta = s1_dep_diff.collect_gradle_deps_for_workspace(root)
+
+        runtime_collect.assert_called_once()
+        self.assertEqual(deps, runtime)
+        self.assertEqual(meta["list_command"], "gradle dependencies")
+
+    def test_collect_gradle_deps_maps_nonzero_build_to_structured_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "settings.gradle").write_text(
+                "rootProject.name = 'app'\n", encoding="utf-8",
+            )
+            (root / "build.gradle").write_text(
+                "plugins { id 'java' }\n", encoding="utf-8",
+            )
+            wrapper = root / ("gradlew.bat" if os.name == "nt" else "gradlew")
+            wrapper.write_text(
+                "@echo off\r\n" if os.name == "nt" else "#!/bin/sh\n",
+                encoding="utf-8",
+            )
+            if os.name != "nt":
+                wrapper.chmod(0o755)
+            with patch.object(
+                s1_dep_diff, "_run_gradle_command_with_lock_retry",
+                return_value=("stdout", "build failed", 17, 2),
+            ):
+                with self.assertRaises(s1_dep_diff.GradleCommandFailure) as raised:
+                    s1_dep_diff.collect_gradle_deps_for_workspace(root)
+
+        self.assertEqual(raised.exception.stage, "gradle_build")
+        self.assertEqual(raised.exception.return_code, 17)
+        self.assertEqual(raised.exception.attempts, 2)
+        self.assertIn("build failed", str(raised.exception))
+
     def test_explicit_profile_is_used_even_when_target_module_is_unprofiled(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3132,6 +3222,7 @@ class Step1PackagedDepsTest(unittest.TestCase):
                  "resolve_step1_ref",
                  return_value={
                      "status": "resolved",
+                     "source_status": "remote_source_resolved",
                      "requested_ref": "current-release",
                      "resolved_ref": "origin/current-release",
                      "resolved_commit": "a" * 40,
@@ -3451,11 +3542,14 @@ class Step1PackagedDepsTest(unittest.TestCase):
                 archive.writestr(base_entry["lib_entry"], nested_jar)
             with zipfile.ZipFile(current_artifact, "w") as archive:
                 archive.writestr(current_entry["lib_entry"], nested_jar)
+            expected_artifact_hashes = [
+                hashlib.sha256(base_artifact.read_bytes()).hexdigest(),
+                hashlib.sha256(current_artifact.read_bytes()).hexdigest(),
+            ]
             base_meta = {
                 "mode": "final_artifact",
                 "archives": [str(base_artifact)],
                 "artifact_path": str(base_artifact),
-                "artifact_sha256": hashlib.sha256(base_artifact.read_bytes()).hexdigest(),
                 "deps": [base_entry],
                 "dep_entries": [base_entry],
                 "matched_count": 1,
@@ -3467,7 +3561,6 @@ class Step1PackagedDepsTest(unittest.TestCase):
                 "mode": "final_artifact",
                 "archives": [str(current_artifact)],
                 "artifact_path": str(current_artifact),
-                "artifact_sha256": hashlib.sha256(current_artifact.read_bytes()).hexdigest(),
                 "deps": [current_entry],
                 "dep_entries": [current_entry],
                 "matched_count": 1,
@@ -3506,6 +3599,9 @@ class Step1PackagedDepsTest(unittest.TestCase):
             self.assertTrue(alerts_path.exists())
             self.assertTrue(summary_path.exists())
             summary_text = summary_path.read_text(encoding="utf-8")
+            provenance = json.loads(
+                (work_dir / "build_provenance.json").read_text(encoding="utf-8")
+            )
             with alerts_path.open("r", encoding="utf-8-sig", newline="") as f:
                 rows = list(csv.DictReader(f))
 
@@ -3525,6 +3621,10 @@ class Step1PackagedDepsTest(unittest.TestCase):
         self.assertEqual(rows[0]["conclusion"], "需要人工复核")
         self.assertIn("org.example:demo-lib: 2.0.0 -> 1.0.0", rows[0]["change_summary"])
         self.assertIn("依赖版本发生降级", rows[0]["review_reason"])
+        self.assertEqual(
+            [item["artifact_sha256"] for item in provenance["sides"]],
+            expected_artifact_hashes,
+        )
         self.assertTrue(
             {
                 "coord",

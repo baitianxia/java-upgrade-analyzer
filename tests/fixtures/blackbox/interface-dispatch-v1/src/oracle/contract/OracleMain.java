@@ -9,6 +9,9 @@ public final class OracleMain {
             case "reachableDefault":
                 DispatchApp.entryDefault(service);
                 return;
+            case "objectFallback":
+                DispatchApp.entryClone(service);
+                return;
             case "unreachableDefault":
                 DispatchApp.deadDefault(service);
                 return;

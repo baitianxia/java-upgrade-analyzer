@@ -106,10 +106,14 @@ class BinaryFirstContractTest(unittest.TestCase):
         self.assertNotEqual(first, reordered_list)
 
     def test_artifact_content_identity_rejects_non_sha_input(self):
-        with self.assertRaises(contract.BinaryFirstContractError) as error:
-            contract.artifact_content_identity("not-a-sha", 10)
-
-        self.assertEqual(error.exception.reason_code, "ARTIFACT_CONTENT_SHA256_INVALID")
+        for value in (None, "", "not-a-sha"):
+            with self.subTest(value=value), self.assertRaises(
+                contract.BinaryFirstContractError
+            ) as error:
+                contract.artifact_content_identity(value, 10)
+            self.assertEqual(
+                error.exception.reason_code, "ARTIFACT_CONTENT_SHA256_INVALID"
+            )
 
     def test_canonical_identity_rejects_non_string_object_keys(self):
         with self.assertRaises(contract.BinaryFirstContractError) as error:
@@ -329,6 +333,138 @@ class BinaryFirstContractTest(unittest.TestCase):
             list(values),
         )
 
+    def test_jvm_transport_covers_empty_nested_and_mixed_container_trees(self):
+        surrogate = json.loads('"\\ud800"')
+        ordinary_values = (
+            None,
+            "plain",
+            {},
+            [],
+            (),
+            {"key": "value", 7: False},
+            ["value", {"nested": ()}],
+        )
+        for value in ordinary_values:
+            with self.subTest(value=value):
+                self.assertFalse(contract._jvm_value_requires_transport(value))
+                self.assertIs(contract.transport_jvm_value(value), value)
+
+        value = {
+            "surrogate-key-" + surrogate: "key-value",
+            7: "non-string-key",
+            "text": surrogate,
+            "empty_dict": {},
+            "empty_list": [],
+            "empty_tuple": (),
+            "list": [surrogate, "ordinary"],
+            "tuple": ("ordinary", surrogate),
+            "scalar": 3,
+        }
+        transported = contract.transport_jvm_value(value)
+        self.assertIsNot(transported, value)
+        self.assertEqual(transported[7], "non-string-key")
+        self.assertEqual(transported["scalar"], 3)
+        self.assertEqual(
+            contract.restore_jvm_text(transported["text"]), surrogate
+        )
+        transported_key = next(
+            key for key in transported if isinstance(key, str) and "surrogate-key" not in key
+        )
+        self.assertEqual(
+            contract.restore_jvm_text(transported_key), "surrogate-key-" + surrogate
+        )
+        self.assertTrue(contract._jvm_value_requires_transport([{}, surrogate]))
+        self.assertTrue(contract._jvm_value_requires_transport((surrogate,)))
+
+    def test_jvm_transport_rejects_malformed_base64_and_odd_utf16_length(self):
+        malformed = (
+            contract.JVM_TEXT_TRANSPORT_PREFIX + "!",
+            contract.JVM_TEXT_TRANSPORT_PREFIX + "YQ==",
+            contract.JVM_TEXT_TRANSPORT_PREFIX + json.loads('"\\ud800"'),
+        )
+        for value in malformed:
+            with self.subTest(value=repr(value)), self.assertRaises(
+                contract.BinaryFirstContractError
+            ) as raised:
+                contract.restore_jvm_text(value)
+            self.assertEqual(
+                raised.exception.reason_code,
+                "BINARY_JVM_TEXT_TRANSPORT_INVALID",
+            )
+
+    def test_surrogate_escape_handles_empty_plain_and_mixed_text_directly(self):
+        surrogate = json.loads('"\\ud800"')
+        self.assertEqual(contract._escape_json_surrogates(""), "")
+        self.assertEqual(contract._escape_json_surrogates("plain"), "plain")
+        self.assertEqual(
+            contract._escape_json_surrogates("a" + surrogate + "b"),
+            "a\\ud800b",
+        )
+
+    def test_identity_entrypoints_reject_each_missing_namespace_component(self):
+        for identity in (
+            contract.canonical_identity,
+            contract.canonical_identity_native_json,
+            contract.canonical_identity_streaming,
+        ):
+            cases = (
+                (None, "1"),
+                ("", "1"),
+                ("   ", "1"),
+                ("namespace", None),
+                ("namespace", ""),
+                ("namespace", "   "),
+            )
+            for namespace, schema_version in cases:
+                with self.subTest(
+                    identity=identity.__name__,
+                    namespace=namespace,
+                    schema_version=schema_version,
+                ), self.assertRaises(contract.BinaryFirstContractError) as raised:
+                    identity(
+                        namespace,
+                        {"payload": True},
+                        schema_version=schema_version,
+                    )
+                self.assertEqual(
+                    raised.exception.reason_code,
+                    "BINARY_IDENTITY_NAMESPACE_MISSING",
+                )
+
+    def test_streaming_factory_and_digest_empty_buffer_boundaries(self):
+        with self.assertRaises(contract.BinaryFirstContractError) as raised:
+            contract.StreamingCanonicalSequence(None)
+        self.assertEqual(
+            raised.exception.reason_code,
+            "BINARY_STREAMING_SEQUENCE_FACTORY_INVALID",
+        )
+
+        # One scalar chunk larger than the flush threshold leaves no tail for
+        # the final flush while preserving byte-for-byte identity equivalence.
+        payload = "x" * contract._STREAMING_DIGEST_BUFFER_CHARS
+        self.assertEqual(
+            contract.canonical_identity_streaming(
+                "flush-boundary", payload, schema_version="1"
+            ),
+            contract.canonical_identity(
+                "flush-boundary", payload, schema_version="1"
+            ),
+        )
+        digest = hashlib.sha256()
+        contract._update_canonical_digest(digest, payload)
+        self.assertEqual(
+            digest.digest(),
+            hashlib.sha256(contract.canonical_payload_bytes(payload)).digest(),
+        )
+
+    def test_contract_error_uses_stable_default_reason_for_empty_codes(self):
+        for value in (None, "", 0):
+            with self.subTest(value=value):
+                error = contract.BinaryFirstContractError(value, "message")
+                self.assertEqual(
+                    error.reason_code, "BINARY_FIRST_CONTRACT_VIOLATION"
+                )
+
     def test_native_type_fast_paths_preserve_the_frozen_identity(self):
         class DictSubclass(dict):
             pass
@@ -444,13 +580,85 @@ class BinaryFirstContractTest(unittest.TestCase):
 
     def test_artifact_content_identity_rejects_invalid_lengths(self):
         digest = "a" * 64
-        for value in ("not-an-int", -1):
+        for value in (None, "not-an-int", "1", 1.0, True, -1):
             with self.subTest(value=value), self.assertRaises(
                 contract.BinaryFirstContractError
             ) as error:
                 contract.artifact_content_identity(digest, value)
             self.assertEqual(
                 error.exception.reason_code, "ARTIFACT_CONTENT_LENGTH_INVALID"
+            )
+
+        self.assertEqual(
+            contract.artifact_content_identity("A" * 64, 0),
+            contract.artifact_content_identity("a" * 64, 0),
+        )
+
+    def test_identity_builders_reject_every_independently_missing_field(self):
+        context_cases = (
+            (None, "scope"),
+            ("", "scope"),
+            ("   ", "scope"),
+            ("runtime", None),
+            ("runtime", ""),
+            ("runtime", "   "),
+        )
+        for runtime, scope in context_cases:
+            with self.subTest(kind="context", runtime=runtime, scope=scope), \
+                    self.assertRaises(contract.BinaryFirstContractError) as raised:
+                contract.analysis_context_identity(runtime, scope)
+            self.assertEqual(
+                raised.exception.reason_code, "ANALYSIS_CONTEXT_INPUT_MISSING"
+            )
+
+        for observed, context in (
+            (None, "context"),
+            ("", "context"),
+            ("   ", "context"),
+            ("observed", None),
+            ("observed", ""),
+            ("observed", "   "),
+        ):
+            with self.subTest(kind="disposition", observed=observed, context=context), \
+                    self.assertRaises(contract.BinaryFirstContractError) as raised:
+                contract.disposition_obligation_identity(observed, context)
+            self.assertEqual(
+                raised.exception.reason_code,
+                "DISPOSITION_OBLIGATION_INPUT_MISSING",
+            )
+
+        projection_fields = ["rule", "target", "family"]
+        for index in range(len(projection_fields)):
+            values = list(projection_fields)
+            values[index] = None
+            with self.subTest(kind="projection", missing=index), self.assertRaises(
+                contract.BinaryFirstContractError
+            ) as raised:
+                contract.projection_obligation_key(*values)
+            self.assertEqual(
+                raised.exception.reason_code,
+                "PROJECTION_OBLIGATION_INPUT_MISSING",
+            )
+        self.assertEqual(
+            len(contract.projection_obligation_key(*projection_fields)), 64
+        )
+
+        observed_fields = {
+            "delta_source_kind": "artifact_local",
+            "comparison_or_runtime_scope": {"runtime": "pair"},
+            "fact_or_mechanism_scope": {"member": "run()V"},
+            "base_fingerprint": "base",
+            "current_fingerprint": "current",
+        }
+        for field in tuple(observed_fields):
+            values = dict(observed_fields)
+            values[field] = {} if field.endswith("scope") else None
+            with self.subTest(kind="observed", missing=field), self.assertRaises(
+                contract.BinaryFirstContractError
+            ) as raised:
+                contract.observed_delta_identity(**values)
+            self.assertEqual(
+                raised.exception.reason_code, "OBSERVED_DELTA_INPUT_MISSING"
             )
 
     def test_observed_delta_is_shared_across_analysis_scopes(self):
@@ -521,6 +729,8 @@ class BinaryFirstContractTest(unittest.TestCase):
 
     def test_formal_truth_table_rejects_invalid_status_certainty_and_possible_path(self):
         cases = (
+            ((None,), {}, "FORMAL_REACHABILITY_STATUS_INVALID"),
+            (("",), {}, "FORMAL_REACHABILITY_STATUS_INVALID"),
             (("unknown",), {}, "FORMAL_REACHABILITY_STATUS_INVALID"),
             (("reachable",), {"best_path_certainty": "possible"},
              "FORMAL_BEST_PATH_CERTAINTY_INVALID"),
@@ -537,12 +747,19 @@ class BinaryFirstContractTest(unittest.TestCase):
             "not_found_in_static_analysis"
         )["possible_path_exists"])
 
+        self.assertFalse(contract.derive_formal_result_state(
+            "not_analyzed"
+        )["possible_path_exists"])
+
     def test_formal_validation_requires_confirmed_change_fact(self):
-        with self.assertRaises(contract.BinaryFirstContractError) as error:
-            contract.validate_formal_result_state({"change_fact_status": "candidate"})
-        self.assertEqual(
-            error.exception.reason_code, "FORMAL_CHANGE_FACT_NOT_CONFIRMED"
-        )
+        for payload in (None, {}, {"change_fact_status": "candidate"}):
+            with self.subTest(payload=payload), self.assertRaises(
+                contract.BinaryFirstContractError
+            ) as error:
+                contract.validate_formal_result_state(payload)
+            self.assertEqual(
+                error.exception.reason_code, "FORMAL_CHANGE_FACT_NOT_CONFIRMED"
+            )
 
     def test_static_v2_rejects_confirmed_impact(self):
         result = contract.derive_formal_result_state("reachable")
@@ -552,6 +769,23 @@ class BinaryFirstContractTest(unittest.TestCase):
             contract.validate_formal_result_state(result)
 
         self.assertEqual(error.exception.reason_code, "FORMAL_STATIC_V2_FORBIDDEN_STATE")
+
+    def test_formal_validation_rejects_each_empty_observed_state_field(self):
+        for field in (
+            "impact_conclusion",
+            "decision_bucket",
+            "runtime_verification_status",
+        ):
+            result = contract.derive_formal_result_state("reachable")
+            result[field] = None
+            with self.subTest(field=field), self.assertRaises(
+                contract.BinaryFirstContractError
+            ) as raised:
+                contract.validate_formal_result_state(result)
+            self.assertEqual(
+                raised.exception.reason_code,
+                "FORMAL_STATE_TRUTH_TABLE_VIOLATION",
+            )
 
     def test_projection_assessment_requires_obligation_conservation(self):
         self.assertTrue(contract.validate_projection_assessment({
@@ -607,6 +841,45 @@ class BinaryFirstContractTest(unittest.TestCase):
                 contract.validate_projection_assessment(payload)
             self.assertEqual(error.exception.reason_code, reason)
 
+    def test_projection_assessment_covers_short_circuit_and_valid_boundaries(self):
+        self.assertTrue(contract.validate_projection_assessment({
+            "analysis_projection_status": "targetable",
+            "projection_coverage_status": "complete",
+            "target_count": 1,
+            "projection_obligation_count": 1,
+            "projection_count": 1,
+            "partial_scopes": [],
+        }))
+        self.assertTrue(contract.validate_projection_assessment({
+            "analysis_projection_status": "targetable",
+            "projection_coverage_status": "partial",
+            "target_count": 1,
+            "projection_obligation_count": 1,
+            "projection_count": 1,
+            "partial_scopes": ["scope"],
+        }))
+        invalid = (
+            (None, "PROJECTION_ASSESSMENT_STATUS_INVALID"),
+            ({}, "PROJECTION_ASSESSMENT_STATUS_INVALID"),
+            ({
+                "analysis_projection_status": "unsupported",
+                "projection_coverage_status": "unsupported",
+                "target_count": 1,
+            }, "UNSUPPORTED_PROJECTION_ASSESSMENT_INVALID"),
+            ({
+                "analysis_projection_status": "targetable",
+                "projection_coverage_status": "complete",
+                "target_count": 1,
+                "projection_obligation_count": 0,
+            }, "TARGETABLE_PROJECTION_OBLIGATION_MISSING"),
+        )
+        for payload, reason in invalid:
+            with self.subTest(payload=payload), self.assertRaises(
+                contract.BinaryFirstContractError
+            ) as raised:
+                contract.validate_projection_assessment(payload)
+            self.assertEqual(raised.exception.reason_code, reason)
+
     def test_possible_layer_controls_compatibility_completeness(self):
         self.assertTrue(contract.derive_path_set_complete(
             exact_path_set_complete=True,
@@ -617,6 +890,16 @@ class BinaryFirstContractTest(unittest.TestCase):
             exact_path_set_complete=True,
             possible_path_layer_applicable=True,
             possible_path_set_complete=False,
+        ))
+        self.assertFalse(contract.derive_path_set_complete(
+            exact_path_set_complete=False,
+            possible_path_layer_applicable=False,
+            possible_path_set_complete=True,
+        ))
+        self.assertTrue(contract.derive_path_set_complete(
+            exact_path_set_complete=True,
+            possible_path_layer_applicable=True,
+            possible_path_set_complete=True,
         ))
 
     def test_phase_manifest_is_one_way_and_digest_bound(self):
@@ -664,6 +947,45 @@ class BinaryFirstContractTest(unittest.TestCase):
             ) as error:
                 contract.validate_phase_manifest(records)
             self.assertEqual(error.exception.reason_code, reason)
+
+    def test_phase_manifest_covers_empty_fields_output_digest_and_full_completion(self):
+        self.assertEqual(
+            contract.validate_phase_manifest(None),
+            {"completed_phase_count": 0, "next_phase": contract.PHASE_ORDER[0]},
+        )
+        invalid = (
+            ([None], "BINARY_PHASE_MANIFEST_INVALID"),
+            ([{"phase": "", "status": "pending"}],
+             "BINARY_PHASE_MANIFEST_INVALID"),
+            ([{"phase": contract.PHASE_ORDER[0], "status": ""}],
+             "BINARY_PHASE_STATUS_INVALID"),
+            ([{
+                "phase": contract.PHASE_ORDER[0],
+                "status": "completed",
+                "input_digest": "input",
+                "output_digest": None,
+            }], "BINARY_PHASE_DIGEST_MISSING"),
+        )
+        for records, reason in invalid:
+            with self.subTest(reason=reason), self.assertRaises(
+                contract.BinaryFirstContractError
+            ) as raised:
+                contract.validate_phase_manifest(records)
+            self.assertEqual(raised.exception.reason_code, reason)
+
+        complete = [
+            {
+                "phase": phase,
+                "status": "completed",
+                "input_digest": f"input-{index}",
+                "output_digest": f"output-{index}",
+            }
+            for index, phase in enumerate(contract.PHASE_ORDER)
+        ]
+        self.assertEqual(
+            contract.validate_phase_manifest(complete),
+            {"completed_phase_count": len(contract.PHASE_ORDER), "next_phase": ""},
+        )
 
 
 if __name__ == "__main__":

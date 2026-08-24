@@ -1,3 +1,4 @@
+from collections import Counter
 import json
 import os
 from pathlib import Path
@@ -454,10 +455,18 @@ class PublicRuntimeDispatchBlackboxTest(unittest.TestCase):
                 ),
             }, self.javac)
             business = compile_jar(root, "source-business", {
+                "biz/Base.java": """
+                    package biz;
+                    public class Base {
+                        protected int inherited() { return 0; }
+                    }
+                """,
                 "biz/Entry.java": """
                     package biz;
-                    public class Entry {
-                        public int run() { return new lib.Target().changed(); }
+                    public class Entry extends Base {
+                        public int run() {
+                            return super.inherited() + new lib.Target().changed();
+                        }
                         public static void main(String[] args) {
                             System.out.print(new Entry().run());
                         }
@@ -569,6 +578,12 @@ class PublicRuntimeDispatchBlackboxTest(unittest.TestCase):
                 row["authority"] == truth["candidate_authority"]
                 for row in explanations["candidate_relationships"]
             ))
+            self.assertTrue(
+                set(truth["expected_candidate_targets"]).issubset({
+                    row["callee_key"]
+                    for row in explanations["candidate_relationships"]
+                })
+            )
 
             without_source = {
                 **common,
@@ -622,6 +637,251 @@ class PublicRuntimeDispatchBlackboxTest(unittest.TestCase):
                 target_projection(absent_formal),
                 "source overlay changed binary-authoritative public semantics",
             )
+
+    def test_source_literal_overloads_match_openjdk_descriptors(self):
+        truth = SOURCE_TRUTH["literal_overload"]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target_template = """
+                package lib;
+                public class Target {
+                    public int pick(int value) { return %d; }
+                    public int pick(long value) { return %d; }
+                    public int pick(float value) { return %d; }
+                    public int pick(double value) { return %d; }
+                    public int pick(char value) { return %d; }
+                    public int pick(String value) { return %d; }
+                    public int pick(Factory value) { return %d; }
+                }
+            """
+            base = compile_jar(root, "literal-base", {
+                "lib/Target.java": target_template % (1, 2, 3, 4, 5, 6, 7),
+                "lib/Factory.java": """
+                    package lib;
+                    public class Factory {
+                        public static final Factory DEFAULT = new Factory();
+                        public String key(String value) { return value; }
+                        public String key(String left, String right) {
+                            return left + right;
+                        }
+                    }
+                """,
+            }, self.javac)
+            current = compile_jar(root, "literal-current", {
+                "lib/Target.java": target_template % (
+                    10, 20, 30, 40, 50, 60, 70,
+                ),
+                "lib/Factory.java": """
+                    package lib;
+                    public class Factory {
+                        public static final Factory DEFAULT = new Factory();
+                        public String key(String value) { return value; }
+                        public String key(String left, String right) {
+                            return left + right;
+                        }
+                    }
+                """,
+            }, self.javac)
+            business = compile_jar(root, "literal-business", {
+                "biz/Entry.java": r"""
+                    package biz;
+                    import lib.Factory;
+                    import lib.Target;
+                    public class Entry {
+                        public int run() {
+                            Target target = new Target();
+                            int result = target.pick(-12);
+                            result += target.pick(+12);
+                            result += target.pick(1_000);
+                            result += target.pick(0xff);
+                            result += target.pick(0b1010);
+                            result += target.pick(077);
+                            result += target.pick(12L);
+                            result += target.pick(0xffL);
+                            result += target.pick(1F);
+                            result += target.pick(1.5f);
+                            result += target.pick(1.5);
+                            result += target.pick(1e3);
+                            result += target.pick(0x1.fp3);
+                            result += target.pick('a');
+                            result += target.pick('\n');
+                            Factory factory = new Factory();
+                            result += target.pick(factory.key ("last, first"));
+                            result += target.pick(new Factory());
+                            result += target.pick(Factory.DEFAULT);
+                            var inferredLong = 12L;
+                            var inferredFloat = 1F;
+                            var inferredChar = 'a';
+                            result += target.pick(inferredLong);
+                            result += target.pick(inferredFloat);
+                            result += target.pick(inferredChar);
+                            return result;
+                        }
+                        public static void main(String[] args) {
+                            System.out.print(new Entry().run());
+                        }
+                    }
+                """,
+            }, self.javac, classpath=(base,))
+
+            for dependency, expected in (
+                (base, truth["expected_base_stdout"]),
+                (current, truth["expected_current_stdout"]),
+            ):
+                observed = execute([
+                    self.java, "-cp",
+                    os.pathsep.join((str(business), str(dependency))),
+                    "biz.Entry",
+                ])
+                self.assertEqual(observed.stdout, expected)
+
+            bytecode = execute([
+                self.javap, "-classpath", str(business), "-c", "-s", "-p",
+                "biz.Entry",
+            ]).stdout
+            for descriptor, expected_count in truth[
+                "javap_invocation_descriptors"
+            ].items():
+                self.assertEqual(
+                    bytecode.count(f"lib/Target.pick:{descriptor}"),
+                    expected_count,
+                    bytecode,
+                )
+            for token, expected_count in truth[
+                "nested_expression"
+            ]["javap_invocations"].items():
+                self.assertEqual(bytecode.count(token), expected_count, bytecode)
+
+            entrypoint = ("biz/Entry", "run", "()I")
+            config = {
+                "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+                "source_usage": {
+                    "decision": "use_source", "decision_source": "explicit_config",
+                },
+                "source_inputs": {
+                    "business": {"status": "available", "origin": "provided"},
+                    "dependencies": {"status": "available", "origin": "provided"},
+                },
+                "source_overlay": {
+                    "source_sets": [
+                        {
+                            "source_dirs": [str(root / "literal-business" / "src")],
+                            "source_root": str(root / "literal-business" / "src"),
+                            "owner_type": "business",
+                            "owner_coord": "blackbox:business:1",
+                            "module": "business",
+                        },
+                        {
+                            "source_dirs": [str(root / "literal-current" / "src")],
+                            "source_root": str(root / "literal-current" / "src"),
+                            "owner_type": "dependency",
+                            "owner_coord": "blackbox:runtime-api:2",
+                            "module": "runtime-api",
+                        },
+                    ],
+                },
+                "base": side(self.home, business, base, "1", entrypoint),
+                "current": side(self.home, business, current, "2", entrypoint),
+                "runtime_comparison": {
+                    "controlled_profile_fields": ["loader_topology"],
+                    "declared_upgrade_payload_scope": ["artifact-bytes"],
+                },
+            }
+            result, formal, _overlay = public_pipeline(
+                root / "run-literal-overloads", config,
+            )
+            self.assertEqual(result["validation_status"], "passed")
+            explanations = json.loads((
+                Path(result["generation_directory"])
+                / "binary_source_explanations.json"
+            ).read_text(encoding="utf-8"))
+            candidates = Counter(
+                row["callee_key"]
+                for row in explanations["candidate_relationships"]
+                if row["callee_key"].startswith("lib.Target.pick(")
+            )
+            self.assertEqual(
+                candidates,
+                Counter(truth["source_candidate_keys"]),
+                explanations["candidate_relationships"],
+            )
+            nested_candidates = Counter(
+                row["callee_key"]
+                for row in explanations["candidate_relationships"]
+                if row["callee_key"] in truth[
+                    "nested_expression"
+                ]["source_candidate_keys"]
+            )
+            self.assertEqual(
+                nested_candidates,
+                Counter(truth["nested_expression"]["source_candidate_keys"]),
+            )
+
+            # Keep the compiled business JAR authoritative, then replace only
+            # its explanatory source with a Tree-sitter recovery case.  The
+            # invalid argument has no defensible type and must not abort the
+            # public pipeline or inherit a typed overload from nearby source.
+            malformed_truth = truth["malformed_expression"]
+            business_source = (
+                root / "literal-business" / "src" / "biz" / "Entry.java"
+            )
+            for index, source_argument in enumerate(
+                malformed_truth["source_arguments"], start=1,
+            ):
+                with self.subTest(source_argument=source_argument):
+                    business_source.write_text(
+                        f"""
+                        package biz;
+                        import lib.Target;
+                        public class Entry {{
+                            public int run() {{
+                                Target target = new Target();
+                                return target.pick({source_argument});
+                            }}
+                            public static void main(String[] args) {{
+                                System.out.print(new Entry().run());
+                            }}
+                        }}
+                        """.strip() + "\n",
+                        encoding="utf-8",
+                    )
+                    malformed_result, malformed_formal, _malformed_overlay = (
+                        public_pipeline(
+                            root / f"run-malformed-expression-{index}", config,
+                        )
+                    )
+                    self.assertEqual(
+                        malformed_result["validation_status"],
+                        malformed_truth["expected_validation_status"],
+                    )
+                    if malformed_truth["binary_formal_results_unchanged"]:
+                        self.assertEqual(
+                            malformed_formal["results"], formal["results"],
+                        )
+                        self.assertEqual(
+                            malformed_formal["by_api"], formal["by_api"],
+                        )
+                    malformed_explanations = json.loads((
+                        Path(malformed_result["generation_directory"])
+                        / "binary_source_explanations.json"
+                    ).read_text(encoding="utf-8"))
+                    malformed_candidates = {
+                        row["callee_key"]
+                        for row in malformed_explanations[
+                            "candidate_relationships"
+                        ]
+                        if "Target.pick" in row["callee_key"]
+                    }
+                    self.assertIn(
+                        malformed_truth["expected_untyped_candidate"],
+                        malformed_candidates,
+                    )
+                    self.assertFalse(any(
+                        candidate.startswith(
+                            malformed_truth["forbidden_typed_candidate_prefix"]
+                        )
+                        for candidate in malformed_candidates
+                    ))
 
     def test_incomplete_entrypoint_inventory_yields_not_analyzed(self):
         with tempfile.TemporaryDirectory() as temporary:

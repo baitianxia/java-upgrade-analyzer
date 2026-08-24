@@ -29,6 +29,12 @@
     "result_json_persisted": false,
     "persist_failure_type": "FileExistsError"
   },
+  "gradle_preflight_failure": {
+    "exit_code": 1,
+    "reason_code": "STEP0_BUILD_TOOL_PREFLIGHT_FAILED",
+    "root_cause_marker": "java.net.SocketException: Operation not permitted",
+    "generic_help_marker": "Get more help at https://help.gradle.org."
+  },
   "cases": {
     "missing": {
       "phase": "static_preflight",

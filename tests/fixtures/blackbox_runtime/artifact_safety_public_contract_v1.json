@@ -40,6 +40,8 @@
   ],
   "failure_schema": "java-upgrade-analyzer.binary-pipeline-failure.v1",
   "blocking_reason": "ARTIFACT_SAFETY_POLICY_BLOCKED",
+  "duplicate_entry_reason": "ARCHIVE_DUPLICATE_ENTRY",
+  "unsupported_class_reason": "BINARY_INDEPENDENT_VALIDATION_FAILED",
   "limit_cases": {
     "max_archive_entries": "ARCHIVE_ENTRY_COUNT_EXCEEDED",
     "max_total_uncompressed_bytes": "ARCHIVE_UNCOMPRESSED_SIZE_EXCEEDED",

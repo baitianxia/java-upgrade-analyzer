@@ -47,6 +47,14 @@ class Step3RulePacksTest(unittest.TestCase):
             (source / "Demo.java").write_text(
                 "import javax.servlet.Filter; class Demo {}", encoding="utf-8"
             )
+            service = (
+                source
+                / "META-INF"
+                / "services"
+                / "javax.servlet.ServletContainerInitializer"
+            )
+            service.parent.mkdir(parents=True)
+            service.write_text("javax.servlet.ExampleInitializer\n", encoding="utf-8")
             output = root / "javax.csv"
 
             s3_scan.scan_javax(str(source), str(output))
@@ -56,17 +64,39 @@ class Step3RulePacksTest(unittest.TestCase):
             self.assertEqual(rows[0]["规则ID"], "jakarta-servlet")
             self.assertEqual(rows[0]["规则包"], "jakarta-namespace@2026.07")
             self.assertEqual(rows[0]["建议命名空间"], "jakarta.servlet")
+            spi_rows = [row for row in rows if row["引用类型"] == "spi"]
+            self.assertEqual(len(spi_rows), 1)
+            self.assertIn("ExampleInitializer", spi_rows[0]["内容"])
 
     def test_spring_boot_scan_records_rule_pack_provenance(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             source = root / "src"
             source.mkdir()
+            factories = source / "META-INF" / "spring.factories"
+            factories.parent.mkdir(parents=True)
+            factories.write_text(
+                "org.springframework.boot.autoconfigure.EnableAutoConfiguration="
+                "example.LegacyConfiguration\n",
+                encoding="utf-8",
+            )
+            imports = (
+                source
+                / "META-INF"
+                / "spring"
+                / "org.springframework.boot.autoconfigure.AutoConfiguration.imports"
+            )
+            imports.parent.mkdir(parents=True)
+            imports.write_text("example.ModernConfiguration\n", encoding="utf-8")
             output = root / "spring.txt"
 
             s3_scan.scan_sb_autoconfig(str(source), str(output))
 
-            self.assertIn("spring-boot-migration@2026.07", output.read_text(encoding="utf-8"))
+            rendered = output.read_text(encoding="utf-8")
+            self.assertIn("spring-boot-migration@2026.07", rendered)
+            self.assertIn("example.LegacyConfiguration", rendered)
+            self.assertIn("AutoConfiguration.imports", rendered)
+            self.assertIn("（1 条）", rendered)
 
 
 if __name__ == "__main__":

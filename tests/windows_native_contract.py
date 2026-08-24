@@ -154,6 +154,35 @@ class WindowsNativeContractTest(unittest.TestCase):
         )
         self.assertEqual(persisted["schema"], payload["schema"])
 
+    def test_run_step_native_checkpoint_dispatch_uses_windows_safe_leaf_operations(self):
+        """Exercise callers whose POSIX branches rely on descriptor-relative APIs."""
+
+        with tempfile.TemporaryDirectory(prefix="jua run-step checkpoint ") as tmp:
+            report = Path(tmp).resolve()
+            checkpoint = run_step._step4_validation_checkpoint_path(report)
+            checkpoint.parent.mkdir(parents=True)
+            payload = {"schema": "fixture", "status": "ready"}
+            checkpoint.write_text(
+                json.dumps(payload, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                run_step._read_step4_validation_checkpoint(report), payload,
+            )
+            run_step._delete_step4_validation_checkpoint_durable(checkpoint)
+            self.assertFalse(checkpoint.exists())
+
+            ordinary = report / "evidence" / "owned.txt"
+            ordinary.parent.mkdir(parents=True)
+            ordinary.write_text("owned", encoding="utf-8")
+            self.assertTrue(
+                run_step._remove_step_output_without_following_parent_links(
+                    report, ordinary,
+                )
+            )
+            self.assertFalse(ordinary.exists())
+
     def test_native_path_and_descriptor_checkpoint_identity_match(self):
         with tempfile.TemporaryDirectory(prefix="jua checkpoint stat ") as tmp:
             target = Path(tmp) / "checkpoint.json"

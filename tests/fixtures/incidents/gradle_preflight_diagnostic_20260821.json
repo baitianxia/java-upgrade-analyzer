@@ -1,0 +1,18 @@
+{
+  "schema": "java-upgrade-analyzer.test-incident-evidence.v1",
+  "incident_id": "gradle-preflight-diagnostic-20260821",
+  "observed_at": "2026-08-21T04:34:21Z",
+  "platform": "macOS aarch64 restricted local test sandbox",
+  "trigger": "public Step0 checkout-build confirmation using a real Gradle 9.2.1 distribution and JDK 17",
+  "actual_public_failure": "base 固定源码的 gradle 前置命令失败：> Get more help at https://help.gradle.org.",
+  "independently_captured_tool_failure": "java.net.SocketException: Operation not permitted",
+  "reproduction": [
+    "Run the public checkout-build Step0 flow with a Gradle project.",
+    "Allow the version probe to succeed and make the subsequent Gradle help command emit a nested root cause followed by the standard Gradle help footer.",
+    "Confirm that the public failure contains the nested root cause and does not promote the generic help URL to the primary reason."
+  ],
+  "classification": {
+    "environment_failure": "The local sandbox denied Gradle's file-lock coordination socket.",
+    "implementation_failure": "The shared diagnostic selector chose the physical last stderr line and therefore hid the actionable cause."
+  }
+}

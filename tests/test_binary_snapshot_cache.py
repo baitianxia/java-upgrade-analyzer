@@ -7,6 +7,7 @@ from unittest.mock import patch
 from pathlib import Path
 import zipfile
 import json
+import zlib
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +20,231 @@ from binary_snapshot_cache import (  # noqa: E402
     SnapshotTemplateMemo,
     cached_snapshot_archive,
 )
+
+
+class BinarySnapshotCacheBoundaryTest(unittest.TestCase):
+    @staticmethod
+    def _snapshot(content_sha="a" * 64, parser_id="parser"):
+        return binary_artifact_diff.ArtifactSnapshot(
+            artifact_instance_identity="template",
+            artifact_content_sha256=content_sha,
+            artifact_byte_length=0,
+            archive_comment_sha256="b" * 64,
+            entries=(),
+            class_records=(),
+            class_payloads=(),
+            safety_reason_codes=(),
+            parse_failure_count=0,
+            unknown_attribute_scopes=(),
+            unknown_resource_scopes=(),
+            inventory_digest="c" * 64,
+            parser_identity=parser_id,
+            comparison_coverage_status="complete",
+            runtime_semantics_diagnostic_codes=(),
+        )
+
+    @staticmethod
+    def _write_envelope(path, envelope):
+        path.write_bytes(zlib.compress(binary_snapshot_cache._json_bytes(envelope)))
+
+    def test_decode_template_rejects_schema_key_payload_and_digest_boundaries(self):
+        payload = {"class_payloads": []}
+        digest = binary_snapshot_cache.hashlib.sha256(
+            binary_snapshot_cache._json_bytes(payload)
+        ).hexdigest()
+        valid = {
+            "schema": binary_snapshot_cache.CACHE_SCHEMA,
+            "cache_key": "expected",
+            "payload": payload,
+            "payload_sha256": digest,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "cache.zlib"
+            cases = (
+                (dict(valid, schema="wrong"), "IDENTITY_MISMATCH"),
+                (dict(valid, cache_key="wrong"), "IDENTITY_MISMATCH"),
+                (dict(valid, payload=[]), "DIGEST_MISMATCH"),
+                (dict(valid, payload_sha256="0" * 64), "DIGEST_MISMATCH"),
+            )
+            for envelope, reason in cases:
+                with self.subTest(reason=reason):
+                    self._write_envelope(path, envelope)
+                    with self.assertRaises(
+                        binary_snapshot_cache.BinarySnapshotCacheError
+                    ) as raised:
+                        binary_snapshot_cache._decode_template(path, "expected")
+                    self.assertIn(reason, raised.exception.reason_code)
+
+            self._write_envelope(path, valid)
+            self.assertEqual(
+                binary_snapshot_cache._decode_template(path, "expected"),
+                payload,
+            )
+
+    def test_write_template_removes_private_file_after_replace_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            destination = root / "cache/template.zlib"
+            with patch.object(
+                binary_snapshot_cache.os,
+                "replace",
+                side_effect=OSError("replace failed"),
+            ), self.assertRaisesRegex(OSError, "replace failed"):
+                binary_snapshot_cache._write_template(
+                    destination,
+                    "key",
+                    {"class_payloads": []},
+                )
+            self.assertEqual(list(destination.parent.glob(".snapshot-cache-*")), [])
+
+    def test_rebind_normalizes_absent_entry_sequences(self):
+        raw_entry = {
+            "physical_entry_identity": "old",
+            "name": "resource.txt",
+            "name_ordinal": 0,
+            "archive_ordinal": 0,
+            "kind": "resource",
+            "content_sha256": "a" * 64,
+            "byte_length": 1,
+            "crc32": 1,
+            "compression_method": 0,
+            "compressed_size": 1,
+            "timestamp": None,
+            "external_attributes": 0,
+            "extra_sha256": "b" * 64,
+            "comment_sha256": "c" * 64,
+            "logical_resource_entry": "resource.txt",
+            "resource_semantic_facts": None,
+        }
+        payload = binary_snapshot_cache._template_payload(self._snapshot())
+        payload["entries"] = [raw_entry]
+        template = binary_snapshot_cache._decoded_template(
+            payload,
+            class_payloads=(),
+        )
+
+        rebound = binary_snapshot_cache._rebind(template, "instance")
+
+        self.assertEqual(rebound.entries[0].timestamp, ())
+        self.assertEqual(rebound.entries[0].resource_semantic_facts, ())
+        self.assertNotEqual(
+            rebound.entries[0].physical_entry_identity,
+            "old",
+        )
+
+    def test_cached_snapshot_rejects_invalid_expected_hash_before_tool_resolution(self):
+        for expected in (None, "short", "g" * 64):
+            with self.subTest(expected=expected), patch.object(
+                binary_snapshot_cache,
+                "resolve_asm_jar",
+            ) as resolve, self.assertRaises(
+                binary_snapshot_cache.BinarySnapshotCacheError
+            ) as raised:
+                cached_snapshot_archive(
+                    "/unused.jar",
+                    artifact_instance_identity="instance",
+                    expected_sha256=expected,
+                    cache_root="/unused-cache",
+                )
+            self.assertEqual(
+                raised.exception.reason_code,
+                "BINARY_SNAPSHOT_CACHE_EXPECTED_SHA256_INVALID",
+            )
+            resolve.assert_not_called()
+
+    def test_cached_snapshot_rejects_changed_artifact_on_prospective_hit(self):
+        expected = "a" * 64
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            artifact = root / "artifact.jar"
+            artifact.write_bytes(b"changed")
+            cache_file = root / "cache/artifact_snapshots/parser/key.json.zlib"
+            cache_file.parent.mkdir(parents=True)
+            cache_file.write_bytes(b"prospective")
+            with patch.object(
+                binary_snapshot_cache,
+                "resolve_asm_jar",
+                return_value=Path("asm.jar"),
+            ), patch.object(
+                binary_snapshot_cache,
+                "parser_identity",
+                return_value=("parser", "helper"),
+            ), patch.object(
+                binary_snapshot_cache,
+                "_cache_key",
+                return_value="key",
+            ), patch.object(
+                binary_snapshot_cache,
+                "_sha256_file",
+                return_value="b" * 64,
+            ), self.assertRaises(
+                binary_snapshot_cache.BinarySnapshotCacheError
+            ) as raised:
+                cached_snapshot_archive(
+                    artifact,
+                    artifact_instance_identity="instance",
+                    expected_sha256=expected,
+                    cache_root=root / "cache",
+                )
+        self.assertEqual(
+            raised.exception.reason_code,
+            "BINARY_SNAPSHOT_CACHE_ARTIFACT_SHA_MISMATCH",
+        )
+
+    def test_disk_content_identity_mismatches_are_rebuilt(self):
+        expected = "a" * 64
+        for decoded in (
+            {
+                "artifact_content_sha256": "b" * 64,
+                "parser_identity": "parser",
+            },
+            {
+                "artifact_content_sha256": expected,
+                "parser_identity": "wrong-parser",
+            },
+        ):
+            with self.subTest(decoded=decoded), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                artifact = root / "artifact.jar"
+                artifact.write_bytes(b"artifact")
+                cache_file = root / "cache/artifact_snapshots/parser/key.json.zlib"
+                cache_file.parent.mkdir(parents=True)
+                cache_file.write_bytes(b"prospective")
+                snapshot = self._snapshot(expected, "parser")
+                with patch.object(
+                    binary_snapshot_cache,
+                    "resolve_asm_jar",
+                    return_value=Path("asm.jar"),
+                ), patch.object(
+                    binary_snapshot_cache,
+                    "parser_identity",
+                    return_value=("parser", "helper"),
+                ), patch.object(
+                    binary_snapshot_cache,
+                    "_cache_key",
+                    return_value="key",
+                ), patch.object(
+                    binary_snapshot_cache,
+                    "_sha256_file",
+                    return_value=expected,
+                ), patch.object(
+                    binary_snapshot_cache,
+                    "_decode_template",
+                    return_value=decoded,
+                ), patch.object(
+                    binary_snapshot_cache,
+                    "snapshot_archive",
+                    return_value=snapshot,
+                ):
+                    outcome = cached_snapshot_archive(
+                        artifact,
+                        artifact_instance_identity="instance",
+                        expected_sha256=expected,
+                        cache_root=root / "cache",
+                        safety_policy={"maximum_entries": 100},
+                    )
+                self.assertEqual(outcome.cache_status, "corrupt_rebuilt")
+                self.assertEqual(outcome.parser_invocation_count, 1)
 
 
 class BinarySnapshotCacheTest(unittest.TestCase):

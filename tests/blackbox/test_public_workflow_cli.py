@@ -11,6 +11,7 @@ import tempfile
 import unittest
 import zipfile
 
+from tests.blackbox.harness import jdk_major_from_home
 from tests.blackbox.managed_process import managed_run
 
 
@@ -134,20 +135,6 @@ def full_jdk_home(java: str) -> Path:
     raise AssertionError("a full JDK home with jmods is required")
 
 
-def jdk_major_from_home(home: Path) -> str:
-    release = home / "release"
-    if not release.is_file():
-        return ""
-    for line in release.read_text(encoding="utf-8", errors="replace").splitlines():
-        if not line.startswith("JAVA_VERSION="):
-            continue
-        version = line.split("=", 1)[1].strip().strip('"')
-        if version.startswith("1."):
-            return version.split(".", 2)[1]
-        return version.split(".", 1)[0]
-    return ""
-
-
 def find_full_jdk_home(java: str, major: int) -> Path | None:
     """Find a real version-matched JDK; never relabel another JDK for a test."""
     candidates: list[Path] = []
@@ -210,6 +197,26 @@ def find_full_jdk_home(java: str, major: int) -> Path | None:
         ):
             return resolved
     return None
+
+
+def release_less_jdk_mirror(source: Path, target: Path) -> Path:
+    """Mirror real JDK bytes while exercising a vendor layout without release."""
+    def link_or_copy(source_path: str, target_path: str) -> str:
+        try:
+            return os.link(source_path, target_path)
+        except OSError:
+            return shutil.copy2(source_path, target_path)
+
+    shutil.copytree(
+        source,
+        target,
+        symlinks=True,
+        copy_function=link_or_copy,
+        ignore=shutil.ignore_patterns("release"),
+    )
+    if (target / "release").exists():
+        raise AssertionError("release-less JDK mirror retained release metadata")
+    return target
 
 
 def write_java(path: Path, content: str) -> None:
@@ -1926,6 +1933,9 @@ class PublicWorkflowCliBlackboxTest(unittest.TestCase):
         self.assertIsNotNone(jdk_home, "the closed public workflow fixture requires a real JDK 8 home")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            jdk_home = release_less_jdk_mirror(
+                jdk_home, root / "release-less-jdk8"
+            )
             project = create_pinned_source_repository(root, tools["git"])
             report = root / "report"
             artifacts = build_full_workflow_artifacts(root, tools["javac"])
@@ -2027,6 +2037,16 @@ class PublicWorkflowCliBlackboxTest(unittest.TestCase):
                 expected["expected_completion"]["process_exit_code"],
                 completed.stderr,
             )
+            preflight = json.loads((
+                report / ".runtime" / "state" / "step0_preflight.json"
+            ).read_text(encoding="utf-8"))
+            for side in ("base", "current"):
+                self.assertEqual(
+                    preflight["sides"][side]["jdk"].get(
+                        "release_metadata_source"
+                    ),
+                    expected["expected_jdk_release_metadata_source"],
+                )
             state = json.loads((
                 report / ".runtime" / "state" / "main_state.json"
             ).read_text(encoding="utf-8"))["state"]

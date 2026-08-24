@@ -270,6 +270,175 @@ class BinaryPerformanceGateTest(unittest.TestCase):
             }
         return gate
 
+    def test_recorded_and_provisional_replay_resolve_live_implementation(self):
+        recorded = binary_performance_gate._evaluate_recorded_gate(
+            {},
+            current_source_implementation=None,
+            require_live_runtime_implementation=True,
+        )
+        self.assertEqual(recorded["status"], "failed")
+
+        protocol = {
+            "implementation": {},
+            "source_implementation_identity": "a" * 64,
+            "runtime_implementation_identity": "b" * 64,
+            "dataset_identity": "c" * 64,
+        }
+        provisional = binary_performance_gate.evaluate_provisional_gate({
+            "measurement_protocol": protocol,
+            "measurement_provisional": {
+                "schema": (
+                    "java-upgrade-analyzer.binary-performance-provisional.v1"
+                ),
+                "purpose": "isolated_release_path_recapture_only",
+                "source_implementation_identity": "a" * 64,
+                "runtime_implementation_identity": "b" * 64,
+                "dataset_identity": "c" * 64,
+                "candidate_probe_authority_mode": (
+                    binary_performance_gate._CANDIDATE_PROBE_AUTHORITY_MODE
+                ),
+                "candidate_result_sha256": "d" * 64,
+                "public_activation_allowed": False,
+            },
+        })
+        malformed = binary_performance_gate.evaluate_provisional_gate([])
+
+        self.assertEqual(provisional["status"], "failed")
+        self.assertTrue(provisional["provisional_recapture_only"])
+        self.assertEqual(malformed["status"], "failed")
+        self.assertEqual(
+            malformed["issues"][0]["reason_code"],
+            "BINARY_PERFORMANCE_PROVISIONAL_ROOT_INVALID",
+        )
+
+    def test_completed_benchmark_recovery_handles_encoding_and_fallback_file(self):
+        cyclic = {}
+        cyclic["self"] = cyclic
+        encoding = binary_performance_gate._persist_completed_benchmark_recovery(
+            Path("/unused"), cyclic,
+        )
+        self.assertIn("result_encoding_error", encoding)
+
+        with tempfile.TemporaryDirectory() as temporary, patch(
+            "binary_pipeline._write_non_authoritative_json",
+            return_value=False,
+        ):
+            receipt = (
+                binary_performance_gate._persist_completed_benchmark_recovery(
+                    Path(temporary), {"status": "passed", "value": 1},
+                )
+            )
+            recovery_path = Path(receipt["recovery_path"])
+            try:
+                self.assertTrue(receipt["recovery_is_temporary"])
+                self.assertEqual(
+                    json.loads(recovery_path.read_text(encoding="utf-8")),
+                    {"status": "passed", "value": 1},
+                )
+            finally:
+                recovery_path.unlink(missing_ok=True)
+
+    def test_probe_artifact_verifier_rejects_non_regular_input(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "artifact.jar"
+            directory.mkdir()
+            with self.assertRaises(
+                binary_performance_gate.PerformanceGateError,
+            ) as raised:
+                binary_performance_gate._verify_probe_worker_artifact_file(
+                    directory,
+                    expected_size=0,
+                    expected_sha256=hashlib.sha256(b"").hexdigest(),
+                    field="artifacts[0]",
+                )
+
+        self.assertEqual(
+            raised.exception.failure["reason_code"],
+            "BINARY_PERFORMANCE_PROBE_INPUT_INVALID",
+        )
+
+    def test_cli_uses_real_recorded_verifier_and_bounds_structured_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            gate = root / "recorded.json"
+            verification = root / "verification.json"
+            gate.write_text("{}\n", encoding="utf-8")
+            verify_code = self._run_performance_cli([
+                "--verify-recorded-gate", str(gate),
+                "--output", str(verification),
+            ])
+            self.assertEqual(verify_code, 1)
+            self.assertEqual(
+                json.loads(verification.read_text(encoding="utf-8"))["status"],
+                "failed",
+            )
+
+            output = root / "failure.json"
+            failure = binary_performance_gate.PerformanceGateError(
+                "benchmark rejected",
+                failure={
+                    "reason_code": "SYNTHETIC_BENCHMARK_REJECTED",
+                    "detail": "x" * 20_000,
+                },
+            )
+            with patch.object(
+                binary_performance_gate, "run_benchmark", side_effect=failure,
+            ):
+                benchmark_code = self._run_performance_cli([
+                    "--output", str(output),
+                    "--jar-count", "1",
+                    "--classes-per-jar", "1",
+                    "--warm-samples", "1",
+                    "--skip-legacy",
+                ])
+
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(benchmark_code, 1)
+            self.assertEqual(
+                payload["failure"]["reason_code"],
+                "SYNTHETIC_BENCHMARK_REJECTED",
+            )
+            self.assertTrue(payload["failure"]["detail"].endswith("...[truncated]"))
+
+    def test_release_capture_rejects_mismatched_live_implementation_early(self):
+        reference_runtime = {"runtime": "synthetic"}
+        implementation = {
+            "pipeline_generation_implementation_identity": "a" * 64,
+            "validator_implementation_identity": "b" * 64,
+        }
+        policy = {
+            "reference_runtime": reference_runtime,
+            "reference_implementation": {
+                "pipeline_generation_implementation_identity": "c" * 64,
+                "validator_implementation_identity": "d" * 64,
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            binary_performance_gate,
+            "_performance_implementation_protocol",
+            return_value=implementation,
+        ), patch.object(
+            binary_performance_gate,
+            "_reference_runtime_protocol",
+            return_value=reference_runtime,
+        ), patch.object(
+            binary_performance_gate, "release_policy", return_value=policy,
+        ), self.assertRaises(
+            binary_performance_gate.PerformanceGateError,
+        ) as raised:
+            binary_performance_gate.run_benchmark(
+                Path(temporary),
+                jar_count=400,
+                classes_per_jar=250,
+                warm_samples=3,
+                include_legacy=True,
+            )
+
+        self.assertEqual(
+            raised.exception.failure["reason_code"],
+            "BINARY_PERFORMANCE_REFERENCE_IMPLEMENTATION_MISMATCH",
+        )
+
     def _synthetic_builder_raw_result(
         self,
         *,
@@ -1851,7 +2020,7 @@ class BinaryPerformanceGateTest(unittest.TestCase):
                 jar_count=2,
                 classes_per_jar=3,
                 warm_samples=1,
-                include_legacy=False,
+                include_legacy=True,
             )
 
         self.assertEqual(result["measurement_protocol"]["class_count"], 6)
@@ -1874,6 +2043,13 @@ class BinaryPerformanceGateTest(unittest.TestCase):
         )
         self.assertGreater(result["measurements"]["total_measured_cpu_seconds"], 0)
         self.assertGreater(result["measurements"]["average_cpu_cores"], 0)
+        self.assertEqual(
+            result["measurements"]["legacy"]["class_count"], 6,
+        )
+        self.assertEqual(
+            result["measurements"]["legacy"]["implementation"],
+            "legacy-javap-c-s-p-batched-per-artifact",
+        )
         full_pipeline = result["measurements"]["full_pipeline_probe"]
         self.assertEqual(full_pipeline["status"], "passed")
         self.assertEqual(full_pipeline["jar_count"], 2)
@@ -2059,9 +2235,9 @@ class BinaryPerformanceGateTest(unittest.TestCase):
                 },
             },
         }
-        # The small unit fixture intentionally skips the legacy comparator;
-        # evaluation must fail rather than interpreting missing relative data as pass.
-        self.assertEqual(evaluate_gate(result, gate)["status"], "failed")
+        # This fixture now executes the independent legacy comparator as well,
+        # so the relative thresholds have a measured denominator.
+        self.assertEqual(evaluate_gate(result, gate)["status"], "passed")
         lost_edge = json.loads(json.dumps(result))
         lost_edge["measurements"]["cold"]["counts"]["edges"] -= 1
         lost_evaluation = evaluate_gate(lost_edge, gate)
@@ -2192,8 +2368,8 @@ class BinaryPerformanceGateTest(unittest.TestCase):
                         "--gate", str(gate_path),
                     ])
             persisted = json.loads(output.read_text(encoding="utf-8"))
-        self.assertEqual(returncode, 1)
-        self.assertEqual(persisted["gate_evaluation"]["status"], "failed")
+        self.assertEqual(returncode, 0)
+        self.assertEqual(persisted["gate_evaluation"]["status"], "passed")
 
     def test_fixed_dataset_identity_does_not_depend_on_ambient_javac(self):
         with tempfile.TemporaryDirectory() as first_tmp, \

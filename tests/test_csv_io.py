@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -67,6 +68,62 @@ class CsvIoTest(unittest.TestCase):
             raw = path.read_bytes()
             self.assertTrue(raw.startswith(codecs.BOM_UTF8))
             self.assertEqual(raw.count(codecs.BOM_UTF8), 1)
+
+    def test_bom_upgrade_boundaries_and_failure_cleanup_are_atomic(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            missing = root / "missing.csv"
+            csv_io._ensure_leading_bom(missing)
+            self.assertFalse(missing.exists())
+
+            empty = root / "empty.csv"
+            empty.touch()
+            csv_io._ensure_leading_bom(empty)
+            self.assertEqual(empty.read_bytes(), b"")
+
+            encoded = root / "encoded.csv"
+            encoded.write_bytes(codecs.BOM_UTF8 + "值\n".encode("utf-8"))
+            csv_io._ensure_leading_bom(encoded)
+            self.assertEqual(encoded.read_bytes().count(codecs.BOM_UTF8), 1)
+
+            with csv_io.open_csv_append(missing) as handle:
+                csv.writer(handle).writerow(["created"])
+            self.assertEqual(missing.read_bytes().count(codecs.BOM_UTF8), 1)
+
+            plain = root / "plain.csv"
+            plain.write_text("name\nvalue\n", encoding="utf-8")
+            with patch.object(
+                csv_io,
+                "named_temporary_file",
+                side_effect=OSError("create failed"),
+            ):
+                with self.assertRaisesRegex(OSError, "create failed"):
+                    csv_io._ensure_leading_bom(plain)
+            self.assertEqual(list(root.glob(".jua-bom-*.tmp")), [])
+
+            with patch.object(
+                csv_io.shutil,
+                "copyfileobj",
+                side_effect=OSError("copy failed"),
+            ):
+                with self.assertRaisesRegex(OSError, "copy failed"):
+                    csv_io._ensure_leading_bom(plain)
+            self.assertEqual(plain.read_text(encoding="utf-8"), "name\nvalue\n")
+            self.assertEqual(list(root.glob(".jua-bom-*.tmp")), [])
+
+            def remove_temporary_then_fail(source, _target):
+                Path(source).unlink()
+                raise OSError("replace failed")
+
+            with patch.object(
+                csv_io.os,
+                "replace",
+                side_effect=remove_temporary_then_fail,
+            ):
+                with self.assertRaisesRegex(OSError, "replace failed"):
+                    csv_io._ensure_leading_bom(plain)
+            self.assertEqual(plain.read_text(encoding="utf-8"), "name\nvalue\n")
+            self.assertEqual(list(root.glob(".jua-bom-*.tmp")), [])
 
 
 if __name__ == "__main__":

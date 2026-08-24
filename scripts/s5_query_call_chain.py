@@ -266,35 +266,37 @@ def build_target_keys(method, *, fuzzy=False):
     # key. That key mixes every overload and can make an exact Object[] query
     # return a String,Object call. Unsigned lookup remains available when the
     # user omitted a signature or explicitly requested fuzzy mode.
-    if (not signature or fuzzy) and method_name not in keys:
+    # Signed candidates always include their signature, so the unsigned method
+    # name cannot already be present when this mode explicitly permits it.
+    if not signature or fuzzy:
         keys.append(method_name)
     class_key = f"class:{method_name}"
-    if not signature and "." in method_name and class_key not in keys:
+    if not signature and "." in method_name:
         keys.append(class_key)
     if not fuzzy:
         return keys
     simple_name = method_name.rsplit(".", 1)[-1]
-    if simple_name and signature:
+    # ``method_name`` was validated above, so ``simple_name`` is non-empty.
+    if signature:
         for sig in [signature, normalize_signature_for_lookup(signature)]:
             if sig:
                 candidate = f"method:{simple_name}{sig}"
                 if candidate not in keys:
                     keys.append(candidate)
-    simple_key = f"method:{simple_name}" if simple_name else ""
-    if simple_key and simple_key not in keys:
-        keys.append(simple_key)
-    fuzzy_class_key = f"class:{simple_name}" if simple_name and not signature else ""
-    if fuzzy_class_key and fuzzy_class_key not in keys:
+    simple_key = f"method:{simple_name}"
+    # This key has a dedicated ``method:`` namespace and cannot equal any
+    # owner-preserving key already emitted above.
+    keys.append(simple_key)
+    fuzzy_class_key = f"class:{simple_name}" if not signature else ""
+    if fuzzy_class_key:
         keys.append(fuzzy_class_key)
     return keys
 
 
 def _target_match_prefixes(method):
     method_name, signature = _split_method_and_signature(method)
-    prefixes = []
-    for key in build_target_keys(method, fuzzy=False):
-        if key not in prefixes:
-            prefixes.append(key)
+    # ``build_target_keys`` already guarantees insertion-order uniqueness.
+    prefixes = build_target_keys(method, fuzzy=False)
     if method_name and not signature:
         prefixes.append(f"{method_name}(")
     return tuple(prefixes)
@@ -335,7 +337,9 @@ def _resolve_target_keys(index, method, *, fuzzy=False):
         overload_prefix = f"{method_name}("
         overload_keys = []
         for key in sorted(reverse_edges):
-            if key.startswith(overload_prefix) and reverse_edges.get(key) and key not in exact_keys:
+            # For an unsigned query ``exact_keys`` contains only the unsigned
+            # and class keys, never a signed overload key.
+            if key.startswith(overload_prefix) and reverse_edges.get(key):
                 overload_keys.append(key)
         # Prefer signed keys so duplicate unsigned aggregate edges do not use
         # up the result limit before distinct overload paths are considered.
@@ -346,7 +350,9 @@ def _resolve_target_keys(index, method, *, fuzzy=False):
     # adding simple-name keys would contaminate an otherwise exact result.
     if fuzzy and not exact_keys:
         for key in build_target_keys(method, fuzzy=True):
-            if reverse_edges.get(key) and key not in matched_keys:
+            # Fuzzy expansion runs only when ``exact_keys`` (and therefore
+            # ``matched_keys``) is empty; build_target_keys is unique.
+            if reverse_edges.get(key):
                 matched_keys.append(key)
     return exact_keys, matched_keys
 
@@ -407,7 +413,10 @@ def _edge_sort_key(edge):
 
 def _format_node(method):
     if not method:
-        return "?"
+        # Let the caller fall back to the edge's qualified key/symbol id before
+        # emitting an unknown marker. Returning "?" here made those richer
+        # fallbacks permanently unreachable whenever a method record was absent.
+        return ""
     qualified = _clean(method.get("qualified_key"))
     coord = _clean(method.get("owner_coord"))
     owner_type = _clean(method.get("owner_type"))
@@ -477,7 +486,9 @@ def query_call_chains(index, method, max_depth=5, limit=20, max_visits=50000, *,
         if state in visited:
             continue
         visited.add(state)
-        for edge in sorted(reverse_edges.get(current_key) or [], key=_edge_sort_key):
+        # Target and expansion keys enter the queue only after their reverse
+        # edge collection has been proven non-empty.
+        for edge in sorted(reverse_edges[current_key], key=_edge_sort_key):
             if edge.get("is_test"):
                 continue
             caller_id = edge.get("caller_symbol_id") or ""
@@ -488,7 +499,7 @@ def query_call_chains(index, method, max_depth=5, limit=20, max_visits=50000, *,
                 continue
             next_path = path + [edge]
             if method_record.get("owner_type") == "business":
-                if next_path and _edge_contains_exact_target(
+                if _edge_contains_exact_target(
                     next_path[0],
                     exact_target_keys,
                     target_prefixes,
@@ -583,7 +594,9 @@ def _coord_without_versions(value):
 
 def _coord_ga(coord):
     group_id, artifact_id, _classifier = split_artifact_coord(coord)
-    return f"{group_id}:{artifact_id}" if group_id and artifact_id else ""
+    # Coordinate parsing either returns a complete group/artifact pair or two
+    # empty fields; a half-coordinate is rejected by that shared parser.
+    return f"{group_id}:{artifact_id}" if group_id else ""
 
 
 def _coord_artifact_id(coord):
@@ -882,7 +895,8 @@ def query_scope_call_chain_result(
         matched_coords = alert_result["matched_coords"]
         match_mode = f"alerts_{alert_result['match_mode']}"
         warnings = alert_result["warnings"]
-    if (targets or not has_scope_metadata) and match_mode != "coord_ambiguous":
+    # Ambiguous coordinates returned above before any query work begins.
+    if targets or not has_scope_metadata:
         for chain in alert_result["_all_chains"]:
             _merge_chain(chains, chain, limit=limit, groups=chain_groups)
 

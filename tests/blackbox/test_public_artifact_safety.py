@@ -151,7 +151,8 @@ class PublicArtifactSafetyBlackboxTest(unittest.TestCase):
         )
         self.assert_failed(
             completed, public, output,
-            reason=TRUTH["blocking_reason"], detail_marker="ARCHIVE_DUPLICATE_ENTRY",
+            reason=TRUTH["blocking_reason"],
+            detail_marker=TRUTH["duplicate_entry_reason"],
         )
 
         corrupt_bytes = b"\xca\xfe\xba\xbe\x00\x00\x00\x3d" + b"broken-classfile"
@@ -201,7 +202,7 @@ class PublicArtifactSafetyBlackboxTest(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 1, completed.stderr[-4000:])
         self.assertEqual(
-            public["reason_code"], "BINARY_INDEPENDENT_VALIDATION_FAILED"
+            public["reason_code"], TRUTH["unsupported_class_reason"]
         )
         self.assertTrue(public["fail_closed"])
         self.assertTrue(public["cause"])
@@ -280,7 +281,14 @@ class PublicArtifactSafetyBlackboxTest(unittest.TestCase):
     def test_helper_heap_and_deadline_are_applied_by_the_public_cli(self):
         log_pattern = Path("jvm-arguments-%p.log")
         environment = dict(os.environ)
-        logging_option = f"-Xlog:arguments=trace:file={log_pattern}"
+        # Ask the JVM itself to report the effective heap and loaded classes.
+        # Command-line argument logging is not a stable public diagnostic:
+        # multiple supported JDK patch releases omit both ``java_command``
+        # and ``-Xmx``.  The GC heap report proves the resulting maximum heap,
+        # while class-load logging independently proves the real helper ran.
+        logging_option = (
+            f"-Xlog:gc+heap=debug,class+load=info:file={log_pattern}"
+        )
         environment["JAVA_TOOL_OPTIONS"] = " ".join(filter(None, (
             environment.get("JAVA_TOOL_OPTIONS", ""), logging_option,
         )))
@@ -295,9 +303,16 @@ class PublicArtifactSafetyBlackboxTest(unittest.TestCase):
             path.read_text(encoding="utf-8", errors="replace")
             for path in self.root.glob("jvm-arguments-*.log")
         )
-        self.assertIn("java_command: BinaryFactExtractor", jvm_logs)
-        self.assertIn(
-            f"-Xmx{TRUTH['minimum_helper_heap_megabytes']}m", jvm_logs
+        self.assertRegex(
+            jvm_logs,
+            r"\[class,load\]\s+BinaryFactExtractor\s+source:",
+        )
+        expected_heap_bytes = (
+            int(TRUTH["minimum_helper_heap_megabytes"]) * 1024 * 1024
+        )
+        self.assertRegex(
+            jvm_logs,
+            rf"Maximum heap\s+{expected_heap_bytes}\b",
         )
         self.assertEqual(
             public["artifact_safety_policy"]["helper_max_heap"],

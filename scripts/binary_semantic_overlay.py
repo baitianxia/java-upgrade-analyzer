@@ -121,8 +121,9 @@ def _annotations(payload: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
 
 def _annotation_descriptors(payload: Mapping[str, Any]) -> set[str]:
     return {
-        str(item.get("descriptor") or "") for item in _annotations(payload)
-        if str(item.get("descriptor") or "")
+        descriptor
+        for item in _annotations(payload)
+        if (descriptor := str(item.get("descriptor") or ""))
     }
 
 
@@ -200,7 +201,8 @@ def _descriptor_parameters(descriptor: str) -> tuple[str, ...] | None:
         else:
             index += 1
         result.append(value[start:index])
-    return tuple(result) if index < len(value) and value[index] == ")" else None
+    # The loop stops before the end only when it encounters ``)``.
+    return tuple(result) if index < len(value) else None
 
 
 def _descriptor_return(descriptor: str) -> str:
@@ -428,11 +430,11 @@ class _Builder:
                 if prefix and not prefix.endswith("."):
                     prefix += "."
                 declared = tuple(
-                    str(value or "").strip()
+                    normalized
                     for value in (
                         attributes.get("name") or attributes.get("value") or ()
                     )
-                    if str(value or "").strip()
+                    if (normalized := str(value or "").strip())
                 )
                 names = tuple(prefix + value for value in declared)
                 having = str(
@@ -723,9 +725,9 @@ class _Builder:
             for value in entry_profile.get("activated_resource_names") or ()
         }
         scan_prefixes = {
-            str(value or "").replace(".", "/")
+            normalized.replace(".", "/")
             for value in entry_profile.get("activated_component_scan_packages") or ()
-            if str(value or "").strip()
+            if (normalized := str(value or "").strip())
         }
         main_class = str(entry_profile.get("main_class") or "").replace(".", "/")
         if spring_active and "/" in main_class:
@@ -939,12 +941,12 @@ class _Builder:
                                     str(candidate.get("member_name") or "")
                                 ):
                                     continue
-                                candidate_selected = self.selected.get(
+                                candidate_selected = self.selected[
                                     (candidate_realm, candidate_class)
-                                )
+                                ]
                                 class_annotations = self._class_annotations(
                                     candidate_selected
-                                ) if candidate_selected else set()
+                                )
                                 member_annotations = _annotation_descriptors(
                                     _loads(candidate.get("contract_json") or "{}")
                                 )
@@ -1027,10 +1029,16 @@ class _Builder:
         for realm, class_name in sorted(self.selected):
             selected = self.selected[(realm, class_name)]
             class_annotations = self._class_annotations(selected)
-            if not class_annotations.intersection(FEIGN_ANNOTATIONS):
-                continue
+            class_declares_client = bool(
+                class_annotations.intersection(FEIGN_ANNOTATIONS)
+            )
             for client_method in self._members_for(realm, class_name):
-                if not _annotation_descriptors(_loads(client_method.get("contract_json") or "{}")) and not class_annotations:
+                method_declares_client = bool(
+                    _annotation_descriptors(
+                        _loads(client_method.get("contract_json") or "{}")
+                    ).intersection(FEIGN_ANNOTATIONS)
+                )
+                if not class_declares_client and not method_declares_client:
                     continue
                 certainty = "exact" if spring_active and runtime_targets else "possible"
                 for target in runtime_targets:
@@ -1088,21 +1096,6 @@ class _Builder:
                     owner = _descriptor_class(descriptor)
                     if owner:
                         binding_callers[owner].append(member)
-        for edge in self.direct_edges:
-            if edge.get("edge_kind") != "method":
-                continue
-            if (str(edge.get("symbolic_owner") or ""), str(edge.get("symbolic_name") or "")) not in {
-                ("com/fasterxml/jackson/databind/ObjectMapper", "readValue"),
-                ("com/fasterxml/jackson/databind/ObjectMapper", "writeValue"),
-                ("com/fasterxml/jackson/databind/ObjectMapper", "writeValueAsString"),
-                ("jakarta/persistence/EntityManager", "persist"),
-                ("javax/persistence/EntityManager", "persist"),
-            }:
-                continue
-            caller = self.members.get(edge.get("caller_member_identity"))
-            if caller:
-                for owner in binding_callers:
-                    binding_callers[owner].append(caller)
         decisions = [
             *getattr(self.decisions, "authoritative_decisions", ()),
             *getattr(self.decisions, "diagnostic_decisions", ()),

@@ -33,7 +33,14 @@ def _jvm_descriptor_type(descriptor, offset):
         terminator = descriptor.find(';', offset)
         if terminator < 0:
             raise ValueError('invalid_jvm_descriptor')
-        type_name = descriptor[offset + 1:terminator].replace('/', '.').replace('$', '.')
+        internal_name = descriptor[offset + 1:terminator]
+        if (
+            not internal_name
+            or any(char in internal_name for char in '.;[')
+            or any(not part for part in internal_name.split('/'))
+        ):
+            raise ValueError('invalid_jvm_descriptor')
+        type_name = internal_name.replace('/', '.').replace('$', '.')
         offset = terminator + 1
     else:
         raise ValueError('invalid_jvm_descriptor')
@@ -53,10 +60,8 @@ def jvm_method_parameter_signature(descriptor):
         if parameter == 'void' or offset > parameter_end:
             raise ValueError('invalid_method_descriptor')
         parameters.append(parameter)
-    if offset != parameter_end:
-        raise ValueError('invalid_method_descriptor')
     return_type, return_end = _jvm_descriptor_type(value, parameter_end + 1)
-    if return_end != len(value) or return_type.endswith('[]') and return_type.startswith('void'):
+    if return_end != len(value):
         raise ValueError('invalid_method_descriptor')
     return '(' + ','.join(parameters) + ')'
 
@@ -115,8 +120,6 @@ def normalize_signature_for_lookup(signature):
     normalized = []
     for param in params:
         type_name = param.strip()
-        if not type_name:
-            return ''
         type_name = type_name.replace('...', '[]')
         if '<' in type_name:
             type_name = type_name.split('<', 1)[0].strip()
@@ -157,7 +160,7 @@ def signatures_match_identity(left, right):
         return False
     left_params = split_signature_params(left_normalized)
     right_params = split_signature_params(right_normalized)
-    if left_params is None or right_params is None or len(left_params) != len(right_params):
+    if len(left_params) != len(right_params):
         return False
     return all(
         left_param == right_param

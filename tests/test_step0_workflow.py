@@ -317,6 +317,26 @@ class Step0WorkflowTest(unittest.TestCase):
             "[ERROR] java.nio.file.FileSystemException: resolver denied",
         )
 
+    def test_subprocess_failure_detail_prefers_gradle_root_cause_over_help_footer(self):
+        detail = run_step._subprocess_failure_detail(
+            "\n".join((
+                "FAILURE: Build failed with an exception.",
+                "* What went wrong:",
+                "Gradle could not start your build.",
+                "> Could not create service of type FileLockContentionHandler.",
+                "   > java.net.SocketException: Operation not permitted",
+                "* Try:",
+                "> Run with --stacktrace option to get the stack trace.",
+                "> Get more help at https://help.gradle.org.",
+            )),
+            "",
+        )
+
+        self.assertEqual(
+            detail,
+            "> java.net.SocketException: Operation not permitted",
+        )
+
     def test_step1_validates_newly_discovered_runtime_jars_immediately(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

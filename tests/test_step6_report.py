@@ -2087,8 +2087,7 @@ class Step6ReportObjectivityTest(unittest.TestCase):
         self.assertIn("1.0.0 → 2.0.0", detail)
         self.assertNotIn("<a ", detail)
 
-    def test_large_confirmed_markdown_is_bounded_and_keeps_full_csv(self):
-        total = 1920
+    def _confirmed_detail_findings(self, total):
         alert_rows = []
         confirmed_items = []
         for index in range(total):
@@ -2119,7 +2118,7 @@ class Step6ReportObjectivityTest(unittest.TestCase):
                 "path_text": f"{entry} -> {api}()",
                 "path_occurrence_count": "1",
             })
-        findings = {
+        return {
             "coverage": {"overall_status": "complete"},
             "analysis_scope": {"mode": "full"},
             "impact_overview": s6_report.build_impact_overview(
@@ -2136,6 +2135,31 @@ class Step6ReportObjectivityTest(unittest.TestCase):
             "not_found": [],
             "artifacts": {},
         }
+
+    def test_profile_safe_confirmed_markdown_boundary_keeps_full_csv(self):
+        total = s6_report.S6_DETAIL_MD_FULL_LIMIT + 1
+        findings = self._confirmed_detail_findings(total)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            artifacts = s6_report.write_s6_detail_artifacts(tmp, findings)
+            detail = (
+                Path(tmp) / artifacts["confirmed_md"]
+            ).read_text(encoding="utf-8")
+            with (Path(tmp) / artifacts["confirmed_csv"]).open(
+                encoding="utf-8-sig", newline="",
+            ) as source:
+                csv_rows = list(csv.DictReader(source))
+
+        self.assertEqual(total, len(csv_rows))
+        self.assertIn(f"本文件展示 50/{total} 项", detail)
+        self.assertEqual(
+            s6_report.S6_DETAIL_MD_SAMPLE_LIMIT,
+            detail.count("`com.acme.Api.method"),
+        )
+
+    def test_large_confirmed_markdown_is_bounded_and_keeps_full_csv(self):
+        total = 1920
+        findings = self._confirmed_detail_findings(total)
 
         with tempfile.TemporaryDirectory() as tmp:
             artifacts = s6_report.write_s6_detail_artifacts(tmp, findings)

@@ -1,4 +1,5 @@
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
@@ -14,6 +15,165 @@ import runtime_contract  # noqa: E402
 
 
 class RuntimeContractTest(unittest.TestCase):
+    def test_requirement_parser_covers_empty_comments_and_each_invalid_pin(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "requirements.txt"
+            path.write_text("\n# comment\nalpha==1.2.3\n", encoding="utf-8")
+            self.assertEqual(
+                runtime_contract._load_required_packages(path),
+                {"alpha": "1.2.3"},
+            )
+
+            for declaration in ("alpha", "==1.2.3", "alpha=="):
+                with self.subTest(declaration=declaration):
+                    path.write_text(declaration + "\n", encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "exact == pin"):
+                        runtime_contract._load_required_packages(path)
+
+            path.write_text("", encoding="utf-8")
+            self.assertEqual(runtime_contract._load_required_packages(path), {})
+
+    def test_check_and_runtime_policy_cover_default_and_failure_projections(self):
+        passed = runtime_contract._check("component", True, "value", "expected")
+        failed = runtime_contract._check(
+            "component", False, "", "expected", "reason"
+        )
+        self.assertEqual((passed.status, passed.reason), ("passed", ""))
+        self.assertEqual(
+            (failed.status, failed.observed, failed.reason),
+            ("failed", "missing", "reason"),
+        )
+
+        with patch.object(
+            runtime_contract.platform,
+            "python_implementation",
+            return_value="CPython",
+        ), patch.object(runtime_contract.sys, "version_info", (3, 14, 1)):
+            self.assertTrue(runtime_contract.is_python_runtime_compatible())
+            self.assertIsNone(runtime_contract.python_runtime_warning())
+
+        self.assertIsNone(
+            runtime_contract.python_runtime_warning("PyPy", (3, 14), "3.14")
+        )
+        self.assertIsNone(
+            runtime_contract.python_runtime_warning("CPython", (3, 9), "3.9")
+        )
+        warning = runtime_contract.python_runtime_warning("CPython", (3, 15))
+        self.assertIn("CPython", warning["observed"])
+
+    def test_command_probe_covers_missing_failure_and_combined_output(self):
+        with patch.object(runtime_contract, "find_executable", return_value=None), \
+                patch.object(runtime_contract, "run_cmd") as run:
+            self.assertEqual(runtime_contract._run(["missing"]), (None, ""))
+            run.assert_not_called()
+
+        for result, expected in (
+            ((" stdout ", " stderr ", 0), (True, "stdout\nstderr")),
+            (("", " failure ", 7), (False, "failure")),
+            (("", "", 0), (True, "")),
+        ):
+            with self.subTest(result=result), patch.object(
+                runtime_contract, "find_executable", return_value="/tool"
+            ), patch.object(runtime_contract, "run_cmd", return_value=result):
+                self.assertEqual(runtime_contract._run(["tool", "--version"]), expected)
+
+    def test_version_parsers_cover_absent_partial_fallback_and_legacy_shapes(self):
+        cases = (
+            ("", ()),
+            ("version 21", (21, 0, 0)),
+            ("version 17.0", (17, 0, 0)),
+            ("version 8.0.402", (8, 0, 402)),
+        )
+        for text, expected in cases:
+            with self.subTest(text=text):
+                self.assertEqual(runtime_contract._version_tuple(text), expected)
+
+        jdk_cases = (
+            (None, None),
+            ("no version here", None),
+            ("noise 8 then 21.0.2", 21),
+            ('java version "1"', None),
+            ("jdeps 17", 17),
+        )
+        for text, expected in jdk_cases:
+            with self.subTest(text=text):
+                self.assertEqual(runtime_contract._jdk_major(text), expected)
+
+    def test_runtime_validation_reports_every_dependency_and_tool_failure_class(self):
+        def missing_distribution(_name):
+            raise runtime_contract.metadata.PackageNotFoundError
+
+        def failed_command(command, timeout=15):
+            del timeout
+            return False, "" if command[0] == "git" else f"{command[0]} failed"
+
+        with patch.object(runtime_contract, "_run", side_effect=failed_command), \
+                patch.object(runtime_contract, "mvn_cmd", return_value=["mvn"]), \
+                patch.object(runtime_contract, "gradle_cmd", return_value=["gradle"]), \
+                patch.object(runtime_contract.metadata, "version", side_effect=missing_distribution), \
+                patch.object(runtime_contract.importlib, "import_module", side_effect=ImportError("missing parser")), \
+                patch.object(runtime_contract.platform, "python_implementation", return_value="PyPy"), \
+                patch.object(runtime_contract.platform, "python_version", return_value="3.14.0"), \
+                patch.object(runtime_contract.platform, "system", return_value="Plan9"), \
+                patch.object(runtime_contract.sys, "version_info", (3, 14, 0)):
+            checks = runtime_contract.validate_runtime_contract(
+                require_java_tools=True,
+                require_maven=True,
+                require_gradle=True,
+                project_dir="/project",
+            )
+
+        by_component = {item.component: item for item in checks}
+        self.assertEqual(by_component["python"].reason, "unsupported_python_implementation; use CPython")
+        self.assertEqual(by_component["platform"].reason, "unsupported_platform")
+        self.assertTrue(all(
+            by_component[f"python_package:{name}"].status == "failed"
+            for name in runtime_contract.REQUIRED_PACKAGES
+        ))
+        self.assertTrue(all(
+            by_component[f"python_import:{name}"].status == "failed"
+            for name in ("tree_sitter", "tree_sitter_java")
+        ))
+        self.assertTrue(all(
+            by_component[f"tool:{name}"].status == "failed"
+            for name in ("git", "java", "javac", "javap", "jdeps", "mvn", "gradle")
+        ))
+
+        with patch.object(runtime_contract, "_run", return_value=(True, "git ok")), \
+                patch.object(runtime_contract.metadata, "version", side_effect=lambda name: runtime_contract.REQUIRED_PACKAGES[name]), \
+                patch.object(runtime_contract.importlib, "import_module", return_value=object()), \
+                patch.object(runtime_contract.platform, "python_implementation", return_value="CPython"), \
+                patch.object(runtime_contract.platform, "python_version", return_value="3.9.9"), \
+                patch.object(runtime_contract.platform, "system", return_value="Linux"), \
+                patch.object(runtime_contract.sys, "version_info", (3, 9, 9)):
+            below_minimum = runtime_contract.validate_runtime_contract()
+        self.assertEqual(
+            below_minimum[0].reason,
+            "python_below_minimum; use CPython 3.10 or newer",
+        )
+
+    def test_contract_payload_failure_has_no_spurious_warning(self):
+        failed = runtime_contract.ContractCheck(
+            component="tool:git",
+            status="failed",
+            observed="missing",
+            expected="installed",
+            reason="missing",
+        )
+        with patch.object(
+            runtime_contract,
+            "validate_runtime_contract",
+            return_value=[failed],
+        ), patch.object(
+            runtime_contract,
+            "python_runtime_warning",
+            return_value=None,
+        ):
+            payload = runtime_contract.contract_payload()
+
+        self.assertEqual(payload["status"], "failed")
+        self.assertEqual(payload["warnings"], [])
+
     def test_python_policy_separates_minimum_from_ci_verified_matrix(self):
         self.assertEqual(runtime_contract.MINIMUM_PYTHON, (3, 10))
         self.assertEqual(

@@ -200,6 +200,19 @@ class DatabaseContractScanTest(unittest.TestCase):
         self.assertEqual(len(facts), 1)
         self.assertEqual(facts[0].confidence, "需复核")
 
+    def test_mapper_result_map_normalizes_qualified_quoted_column(self):
+        facts = facts_from_mapper_xml(
+            b'''<mapper namespace="sample.Mapper"><resultMap id="order">
+              <id property="id" column="[orders].[order_id]"/>
+            </resultMap></mapper>''',
+            "sample.xml",
+        )
+
+        mapping = next(fact for fact in facts if fact.kind == "MyBatis ResultMap 映射")
+        self.assertEqual(mapping.columns, ("order_id",))
+        self.assertEqual(mapping.normalized, "orders.order_id->id")
+        self.assertEqual(mapping.confidence, "需复核")
+
     def test_sql_value_change_without_table_or_column_change_is_not_schema_contract_change(self):
         base_fact = facts_from_mapper_xml(
             b'<mapper namespace="sample.Mapper"><select id="find">'
@@ -253,6 +266,26 @@ class DatabaseContractScanTest(unittest.TestCase):
         self.assertTrue(any(fact.columns == ("new_code",) for fact in jpa))
         self.assertTrue(any(fact.columns == ("new_code",) for fact in hibernate))
         self.assertTrue(all(fact.confidence == "确认" for fact in jpa + hibernate))
+
+    def test_artifact_scan_dispatches_packaged_orm_xml(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "data.jar"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr(
+                    "META-INF/orm.xml",
+                    b'''<entity-mappings><entity class="com.acme.Order">
+                      <table name="orders"/><attributes><basic name="code">
+                      <column name="order_code"/></basic></attributes>
+                    </entity></entity-mappings>''',
+                )
+
+            result = scan_artifact("com.acme:data", "2", "current", artifact)
+
+        self.assertEqual(result.gaps, [])
+        self.assertTrue(any(
+            fact.kind == "JPA XML 持久化属性" and fact.columns == ("order_code",)
+            for fact in result.facts.values()
+        ))
 
     def test_jpa_property_access_does_not_treat_backing_fields_as_persistent_contract(self):
         record = {
@@ -358,6 +391,51 @@ class DatabaseContractScanTest(unittest.TestCase):
             self.assertEqual(summary["coverage_status"], "partial")
             self.assertTrue(any("artifact_missing:base" in gap for gap in summary["coverage_gaps"]))
             self.assertTrue(any("artifact_missing:current" in gap for gap in summary["coverage_gaps"]))
+
+    def test_identical_retained_artifacts_are_hash_verified_before_scan_skip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dependencies = root / "evidence" / "dependencies"
+            dependencies.mkdir(parents=True)
+            content = b"same-retained-artifact"
+            digest = hashlib.sha256(content).hexdigest()
+            items = []
+            for side in ("base", "current"):
+                artifact = root / f"{side}.jar"
+                artifact.write_bytes(content)
+                items.append({
+                    "side": side,
+                    "coord": "com.acme:data",
+                    "version": "1",
+                    "retained_path": str(artifact),
+                    "nested_jar_sha256": digest,
+                    "purposes": ["binary_runtime"],
+                })
+            manifest = {
+                "schema": "java-upgrade-analyzer.step1-dependency-jars.v3",
+                "items": items,
+                "business_artifacts": [],
+                "runtime_closure": {
+                    "base": {"coverage_status": "complete"},
+                    "current": {"coverage_status": "complete"},
+                },
+            }
+            (dependencies / "dependency_jars.json").write_text(
+                json.dumps(manifest), encoding="utf-8",
+            )
+
+            with patch.object(
+                database_contract_scan,
+                "scan_artifact",
+                side_effect=AssertionError("identical verified artifacts must not be rescanned"),
+            ):
+                summary = scan_database_contracts(
+                    root, root / "evidence" / "static_scan",
+                )
+
+        self.assertEqual(summary["coverage_status"], "complete")
+        self.assertEqual(summary["change_count"], 0)
+        self.assertEqual(summary["coverage_gaps"], [])
 
     @unittest.skipUnless(shutil.which("javac") and shutil.which("java"), "JDK required")
     def test_compiled_orm_and_mapper_annotations_are_extracted_from_jar(self):

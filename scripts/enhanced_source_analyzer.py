@@ -47,7 +47,7 @@ def source_set_role(file_path):
     """
     parts = [part for part in str(file_path or '').replace('\\', '/').split('/') if part]
     for index, part in enumerate(parts[:-1]):
-        if part.lower() != 'src' or index + 1 >= len(parts):
+        if part.lower() != 'src':
             continue
         source_set = parts[index + 1].lower()
         if source_set in {'testfixtures', 'tests'} or source_set.endswith('test'):
@@ -114,9 +114,6 @@ def _strip_balanced_outer_parens(expr):
                 depth += 1
             elif ch == ')':
                 depth -= 1
-                if depth < 0:
-                    balanced = False
-                    break
                 if depth == 0 and idx != len(text) - 1:
                     balanced = False
                     break
@@ -144,7 +141,7 @@ def split_trailing_method_call(expr):
     if open_index <= 0:
         return None
 
-    method_end = open_index
+    method_end = len(text[:open_index].rstrip())
     method_start = method_end
     while method_start > 0 and (text[method_start - 1].isalnum() or text[method_start - 1] == '_'):
         method_start -= 1
@@ -168,6 +165,130 @@ def split_trailing_method_call(expr):
     }
 
 
+def split_java_argument_expressions(args_text):
+    """Split a Java argument list without treating nested commas as separators.
+
+    The caller passes text inside the outer invocation parentheses.  ``None``
+    means parser-recovery text is structurally incomplete; an empty list means
+    a valid zero-argument invocation.
+    """
+    text = str(args_text or '')
+    if not text.strip():
+        return []
+
+    parts = []
+    current = []
+    delimiters = []
+    angle_depth = 0
+    quote = ''
+    escaped = False
+    line_comment = False
+    block_comment = False
+    index = 0
+
+    def generic_open_at(position):
+        prefix = text[:position].rstrip()
+        if prefix.endswith('.'):
+            return True
+        token_match = re.search(r'([A-Za-z_$][\w$]*)$', prefix)
+        if not token_match:
+            return False
+        token = token_match.group(1)
+        before_token = prefix[:token_match.start()].rstrip()
+        return bool(token[0].isupper() or before_token.endswith('new'))
+
+    while index < len(text):
+        ch = text[index]
+        following = text[index + 1] if index + 1 < len(text) else ''
+
+        if line_comment:
+            current.append(ch)
+            if ch in {'\n', '\r'}:
+                line_comment = False
+            index += 1
+            continue
+        if block_comment:
+            current.append(ch)
+            if ch == '*' and following == '/':
+                current.append(following)
+                index += 2
+                block_comment = False
+            else:
+                index += 1
+            continue
+        if quote:
+            if quote == '"""':
+                if text.startswith('"""', index):
+                    current.extend(('"', '"', '"'))
+                    index += 3
+                    quote = ''
+                else:
+                    current.append(ch)
+                    index += 1
+                continue
+            current.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == '\\':
+                escaped = True
+            elif ch == quote:
+                quote = ''
+            index += 1
+            continue
+
+        if text.startswith('"""', index):
+            current.extend(('"', '"', '"'))
+            index += 3
+            quote = '"""'
+            continue
+        if ch in {'"', "'"}:
+            quote = ch
+            current.append(ch)
+            index += 1
+            continue
+        if ch == '/' and following == '/':
+            current.extend((ch, following))
+            index += 2
+            line_comment = True
+            continue
+        if ch == '/' and following == '*':
+            current.extend((ch, following))
+            index += 2
+            block_comment = True
+            continue
+
+        if ch in '([{':
+            delimiters.append(ch)
+        elif ch in ')]}':
+            expected = {')': '(', ']': '[', '}': '{'}[ch]
+            if not delimiters or delimiters[-1] != expected:
+                return None
+            delimiters.pop()
+        elif ch == '<' and generic_open_at(index):
+            angle_depth += 1
+        elif ch == '>' and angle_depth:
+            angle_depth -= 1
+        elif ch == ',' and not delimiters and angle_depth == 0:
+            part = ''.join(current).strip()
+            if not part:
+                return None
+            parts.append(part)
+            current = []
+            index += 1
+            continue
+
+        current.append(ch)
+        index += 1
+
+    if quote or block_comment or delimiters or angle_depth:
+        return None
+    final = ''.join(current).strip()
+    if not final:
+        return None
+    parts.append(final)
+    return parts
+
+
 def _normalize_type_hint(type_name):
     text = re.sub(r'<.*?>', '', str(type_name or '').strip())
     if not text:
@@ -180,18 +301,27 @@ def _normalize_type_hint(type_name):
 
 def _collect_candidate_signatures_for_receiver(receiver_type, method_name, method_def):
     signatures = set()
-    if receiver_type == getattr(method_def, 'class_fqcn', ''):
+
+    def add_method_bucket(method_map):
+        if not isinstance(method_map, dict):
+            return
+        bucket = method_map.get(method_name)
+        if not isinstance(bucket, dict):
+            return
         signatures.update(
-            (getattr(method_def, 'local_method_return_types', {}) or {}).get(method_name, {}).keys()
+            signature
+            for signature in bucket
+            if isinstance(signature, str) and signature.strip()
         )
-    signatures.update(
-        (
-            ((getattr(method_def, 'known_method_return_types_by_signature', {}) or {}).get(receiver_type, {}) or {})
-            .get(method_name, {})
-            .keys()
-        )
+
+    if receiver_type == getattr(method_def, 'class_fqcn', ''):
+        add_method_bucket(getattr(method_def, 'local_method_return_types', {}))
+    known_by_signature = getattr(
+        method_def, 'known_method_return_types_by_signature', {},
     )
-    return {sig for sig in signatures if str(sig or '').strip()}
+    if isinstance(known_by_signature, dict):
+        add_method_bucket(known_by_signature.get(receiver_type))
+    return signatures
 
 
 def resolve_invocation_signature_from_partial_hints(receiver_type, method_name, arg_type_hints, method_def):
@@ -225,24 +355,23 @@ def resolve_invocation_signature_from_partial_hints(receiver_type, method_name, 
         )
         return compatible[0]
 
-    if candidate_signatures and any(normalized_hints):
-        _step5_debug(
+    _step5_debug(
+        'signature_partial_resolution',
+        'unable to resolve unique signature from partial argument hints',
+        receiver_type=receiver_type,
+        method_name=method_name,
+        arg_type_hints=normalized_hints,
+        candidate_signatures=candidate_signatures,
+        compatible_signatures=compatible,
+    )
+    if len(compatible) > 1:
+        _step5_debug_break(
             'signature_partial_resolution',
-            'unable to resolve unique signature from partial argument hints',
             receiver_type=receiver_type,
             method_name=method_name,
             arg_type_hints=normalized_hints,
-            candidate_signatures=candidate_signatures,
             compatible_signatures=compatible,
         )
-        if len(compatible) > 1:
-            _step5_debug_break(
-                'signature_partial_resolution',
-                receiver_type=receiver_type,
-                method_name=method_name,
-                arg_type_hints=normalized_hints,
-                compatible_signatures=compatible,
-            )
     return ''
 
 # tree-sitter 由显式 bootstrap 安装；运行时绝不联网修改环境。
@@ -493,7 +622,8 @@ LAMBDA_RE = re.compile(
 
 # 方法引用识别（新增）
 METHOD_REF_RE = re.compile(
-    r"([A-Z][A-Za-z0-9_]*(?:\.[A-Z][A-Za-z0-9_]*)*)\s*::\s*([a-zA-Z_]\w*)"
+    r"([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)"
+    r"\s*::\s*([a-zA-Z_]\w*)"
 )
 
 # 泛型类型提取（新增）
@@ -746,7 +876,11 @@ class EnhancedRegexAnalyzer:
                 field_name = fm.group(2)
                 suffix_arrays = fm.group(3) or ''
                 raw_type = raw_type + ('[]' * suffix_arrays.count('['))
-                resolved = self._resolve_simple_type(raw_type)
+                # Keep the generic declaration in ``field_declared_types`` and
+                # resolve only the runtime/base type here.  Calling
+                # ``_resolve_simple_type`` directly with ``List<String>`` used
+                # to manufacture the invalid FQN ``<package>.List<String>``.
+                resolved = self._resolve_type(raw_type)
                 self.field_types[field_name] = resolved
                 self.field_declared_types[field_name] = raw_type
                 continue
@@ -778,7 +912,7 @@ class EnhancedRegexAnalyzer:
                                 param_name = parts[-1]
 
                                 # 解析类型
-                                resolved_type = self._resolve_simple_type(type_expr)
+                                resolved_type = self._resolve_type(type_expr)
 
                                 # 只有当字段未声明时才从构造器推断
                                 # 避免覆盖已有的字段声明
@@ -985,7 +1119,9 @@ class EnhancedRegexAnalyzer:
     def _extract_return_type(self, line, method_name):
         """提取返回值类型（增强：处理泛型）"""
         # 提取方法签名部分
-        before_method = line.split(method_name, 1)[0] if method_name in line else line
+        if not method_name or method_name not in line:
+            return ""
+        before_method = line.split(method_name, 1)[0]
 
         # 去除注解和修饰符
         before_method = re.sub(r'@\w+[^(]*\([^)]*\)\s*', '', before_method)
@@ -1038,6 +1174,11 @@ class EnhancedRegexAnalyzer:
 
         for param in params:
             # 分离类型和参数名
+            param = re.sub(
+                r'@(?:[A-Za-z_]\w*\.)*[A-Za-z_]\w*(?:\([^)]*\))?\s*',
+                '',
+                param,
+            ).strip()
             parts = param.split()
             if len(parts) >= 2:
                 type_expr = ' '.join(parts[:-1])  # 类型部分
@@ -1082,9 +1223,13 @@ class EnhancedRegexAnalyzer:
         # 去除泛型参数（保留FQN）
         if '<' in type_expr:
             base_type = type_expr.split('<')[0].strip()
-            # 解析base_type
-            resolved = self._resolve_simple_type(base_type)
-            return (resolved + array_suffix) if resolved else ''
+            if not base_type:
+                return ''
+            # Resolve the erased base through the full type path.  Calling the
+            # simple-name resolver directly would prefix an already-qualified
+            # declaration such as `java.util.List<T>` with the current package.
+            resolved = self._resolve_type(base_type)
+            return resolved + array_suffix
 
         # 嵌套类
         if '.' in type_expr:
@@ -1105,10 +1250,26 @@ class EnhancedRegexAnalyzer:
 
         # 简单类型名
         resolved = self._resolve_simple_type(type_expr)
-        return (resolved + array_suffix) if resolved else ''
+        return resolved + array_suffix
 
     def _resolve_simple_type(self, simple_name):
         """解析简单类型名"""
+        if self.language == 'kotlin':
+            kotlin_jvm_types = {
+                'Int': 'int',
+                'Long': 'long',
+                'Double': 'double',
+                'Float': 'float',
+                'Boolean': 'boolean',
+                'Char': 'char',
+                'Byte': 'byte',
+                'Short': 'short',
+                'Unit': 'void',
+                'Any': 'java.lang.Object',
+            }
+            if simple_name in kotlin_jvm_types:
+                return kotlin_jvm_types[simple_name]
+
         # 从imports查找
         if simple_name in self.imports:
             return self.imports[simple_name]
@@ -1163,7 +1324,10 @@ class EnhancedRegexAnalyzer:
         annotations = []
         max_search = min(max_search, anchor_idx)  # 最多回溯10行
 
-        for i in range(anchor_idx - 1, max(anchor_idx - max_search, -1), -1):
+        # ``range`` excludes its stop value.  Include the full ``max_search``
+        # window so an annotation at index 0 is not silently dropped.
+        stop_index = max(anchor_idx - max_search - 1, -1)
+        for i in range(anchor_idx - 1, stop_index, -1):
             line = lines[i].strip()
 
             # 遇到空行停止（注解之间不应有空行）
@@ -1173,7 +1337,7 @@ class EnhancedRegexAnalyzer:
             # 检查是否是注解
             if line.startswith('@'):
                 # 提取注解名
-                match = re.match(r'@(\w+)', line)
+                match = re.match(r'@([A-Za-z_]\w*)', line)
                 if match:
                     annotations.insert(0, match.group(1))
             else:
@@ -1267,6 +1431,9 @@ class TreeSitterAnalyzer:
         tree = self.parser.parse(source_code)
         self.error_nodes = self._count_error_nodes(tree.root_node)
         self._merge_ast_field_types(tree.root_node, source_code)
+        known_type_metadata = self._collect_type_metadata(
+            tree.root_node, source_code, lines,
+        )
 
         # 提取方法定义
         methods = self._extract_methods_from_ast(tree.root_node, source_code, lines)
@@ -1306,6 +1473,7 @@ class TreeSitterAnalyzer:
             }
             method.known_method_return_types = known_method_return_types
             method.known_method_return_types_by_signature = known_method_return_types_by_signature
+            method.known_type_metadata = known_type_metadata
             method.local_var_types = resolve_ast_local_var_types(method)
 
         return methods
@@ -1316,7 +1484,12 @@ class TreeSitterAnalyzer:
 
         # 遍历AST节点
         for node in self._walk_ast(root_node):
-            if node.type in {'method_declaration', 'constructor_declaration'}:
+            if node.type in {
+                'method_declaration',
+                'constructor_declaration',
+                'compact_constructor_declaration',
+                'annotation_type_element_declaration',
+            }:
                 method_def = self._parse_method_node(node, source_code, lines)
                 if method_def:
                     methods.append(method_def)
@@ -1352,6 +1525,53 @@ class TreeSitterAnalyzer:
                     self.helper.field_types[field_name] = resolved_type
                     self.helper.field_declared_types[field_name] = raw_type
 
+    def _collect_type_metadata(self, root_node, source_code, lines):
+        """Build the same-file inheritance model used by call resolution."""
+
+        type_nodes = {
+            'type_identifier', 'scoped_type_identifier', 'generic_type',
+        }
+
+        def clause_types(clause):
+            if clause is None:
+                return []
+            values = []
+
+            def collect(node):
+                if node.type in type_nodes:
+                    raw = self._node_text(node, source_code).strip()
+                    if raw:
+                        values.append(self.helper._resolve_type(raw))
+                    return
+                for child in node.children:
+                    collect(child)
+
+            collect(clause)
+            return list(dict.fromkeys(value for value in values if value))
+
+        metadata = {}
+        declarations = {
+            'class_declaration', 'interface_declaration', 'enum_declaration',
+            'annotation_type_declaration', 'record_declaration',
+        }
+        for node in self._walk_ast(root_node):
+            if node.type not in declarations:
+                continue
+            class_nodes = [*self._find_enclosing_types(node), node]
+            class_fqcn, _name, _annotations, _interface = (
+                self._build_class_context(class_nodes, source_code, lines)
+            )
+            extends = clause_types(node.child_by_field_name('superclass'))
+            implements = clause_types(node.child_by_field_name('interfaces'))
+            for child in node.children:
+                if child.type == 'extends_interfaces':
+                    extends.extend(clause_types(child))
+            metadata[class_fqcn] = {
+                'extends': list(dict.fromkeys(extends)),
+                'implements': list(dict.fromkeys(implements)),
+            }
+        return metadata
+
     def _count_error_nodes(self, root_node):
         return sum(1 for node in self._walk_ast(root_node) if node.type == 'ERROR')
 
@@ -1370,7 +1590,10 @@ class TreeSitterAnalyzer:
             return None
 
         method_name = self._field_text(node, 'name', source_code)
-        if node.type == 'constructor_declaration':
+        is_constructor = node.type in {
+            'constructor_declaration', 'compact_constructor_declaration',
+        }
+        if is_constructor:
             method_name = method_name or class_name
             raw_return_type = ""
             return_type = ""
@@ -1398,8 +1621,18 @@ class TreeSitterAnalyzer:
                     if declared_type:
                         throws_declared_types.append(declared_type)
 
+        parameters_node = node.child_by_field_name('parameters')
+        if node.type == 'compact_constructor_declaration' and parameters_node is None:
+            # Compact record constructors declare their parameters on the
+            # enclosing record header rather than on the constructor node.
+            enclosing_record = next(
+                (item for item in reversed(class_nodes) if item.type == 'record_declaration'),
+                None,
+            )
+            if enclosing_record is not None:
+                parameters_node = enclosing_record.child_by_field_name('parameters')
         param_types, param_declared_types = self._parse_params(
-            node.child_by_field_name('parameters'), source_code
+            parameters_node, source_code
         )
 
         symbol_id = f"{class_fqcn}#{method_name}@{self.file_path}:{node.start_point.row + 1}"
@@ -1523,34 +1756,54 @@ class TreeSitterAnalyzer:
 
         for child in params_node.children:
             if child.type in {'formal_parameter', 'spread_parameter'}:
-                # 提取参数类型
                 type_node = child.child_by_field_name('type')
                 name_node = child.child_by_field_name('name')
+                if child.type == 'spread_parameter':
+                    # tree-sitter-java does not expose type/name fields for a
+                    # varargs parameter.  Read its structural children instead
+                    # of reparsing annotation text with a regex.
+                    if type_node is None:
+                        type_node = next(
+                            (
+                                item for item in child.children
+                                if item.type not in {'modifiers', '...', 'variable_declarator'}
+                            ),
+                            None,
+                        )
+                    if name_node is None:
+                        declarator = next(
+                            (item for item in child.children if item.type == 'variable_declarator'),
+                            None,
+                        )
+                        if declarator is not None:
+                            name_node = declarator.child_by_field_name('name')
 
-                if type_node and name_node:
-                    raw_type = source_code[type_node.start_byte:type_node.end_byte].decode('utf-8')
-                    param_name = source_code[name_node.start_byte:name_node.end_byte].decode('utf-8')
-                    param_types[param_name] = self.helper._resolve_type(raw_type)
-                    param_declared_types[param_name] = raw_type.strip()
-                elif child.type == 'spread_parameter':
-                    raw_param = self._node_text(child, source_code).strip()
-                    spread_match = re.match(
-                        r'(?:@\w+(?:\([^)]*\))?\s+)*(?P<type>[A-Za-z_][\w.<>, ?\[\]]*)\s*\.\.\.\s*(?P<name>[A-Za-z_]\w*)$',
-                        raw_param,
+                if type_node is None or name_node is None:
+                    continue
+                raw_type = self._node_text(type_node, source_code).strip()
+                param_name = self._node_text(name_node, source_code).strip()
+                if not raw_type or not param_name:
+                    continue
+                dimensions = next(
+                    (item for item in child.children if item.type == 'dimensions'),
+                    None,
+                )
+                if dimensions is not None:
+                    raw_type += '[]' * sum(
+                        1 for item in dimensions.children if item.type == '['
                     )
-                    if spread_match:
-                        raw_type = spread_match.group('type').strip() + '...'
-                        param_name = spread_match.group('name').strip()
-                        param_types[param_name] = self.helper._resolve_type(raw_type.replace('...', '[]'))
-                        param_declared_types[param_name] = raw_type
-            elif child.type == 'receiver_parameter':
-                type_node = child.child_by_field_name('type')
-                name_node = child.child_by_field_name('name')
-                if type_node and name_node:
-                    raw_type = source_code[type_node.start_byte:type_node.end_byte].decode('utf-8')
-                    param_name = source_code[name_node.start_byte:name_node.end_byte].decode('utf-8')
-                    param_types[param_name] = self.helper._resolve_type(raw_type)
-                    param_declared_types[param_name] = raw_type.strip()
+                if child.type == 'spread_parameter':
+                    declared_type = raw_type + '...'
+                    resolved_input = raw_type + '[]'
+                else:
+                    declared_type = raw_type
+                    resolved_input = raw_type
+                param_types[param_name] = self.helper._resolve_type(resolved_input)
+                param_declared_types[param_name] = declared_type
+
+            # A Java receiver parameter (`Owner this` / `Outer Outer.this`) is
+            # declaration metadata, not an invocation argument and therefore
+            # must not be included in a JVM method descriptor.
 
         return param_types, param_declared_types
 
@@ -1561,30 +1814,36 @@ class TreeSitterAnalyzer:
             if node.type != 'local_variable_declaration':
                 continue
             type_node = node.child_by_field_name('type')
-            declarator = node.child_by_field_name('declarator')
-            if not type_node or not declarator:
+            declarators = [
+                child for child in node.children
+                if child.type == 'variable_declarator'
+            ]
+            if type_node is None or not declarators:
                 continue
-            name_node = declarator.child_by_field_name('name')
-            value_node = declarator.child_by_field_name('value')
-            if not name_node:
-                continue
-            var_name = self._node_text(name_node, source_code).strip()
             declared_type = self._node_text(type_node, source_code).strip()
-            initializer_expr = self._node_text(value_node, source_code).strip() if value_node is not None else ''
-            resolved_type = None
-            if _is_inferred_local_decl_type(declared_type, method_def):
-                if value_node is not None:
-                    resolved_type = self._infer_expression_type(value_node, source_code, method_def, local_var_types)
-            else:
-                resolved_type = self.helper._resolve_type(declared_type)
-            local_var_sites.append({
-                'name': var_name,
-                'declared_type': declared_type,
-                'initializer_expr': initializer_expr,
-                'resolved_declared_type': resolved_type or '',
-            })
-            if resolved_type:
-                local_var_types[var_name] = resolved_type
+            for declarator in declarators:
+                name_node = declarator.child_by_field_name('name')
+                value_node = declarator.child_by_field_name('value')
+                if name_node is None:
+                    continue
+                var_name = self._node_text(name_node, source_code).strip()
+                if not var_name:
+                    continue
+                initializer_expr = self._node_text(value_node, source_code).strip() if value_node is not None else ''
+                resolved_type = None
+                if _is_inferred_local_decl_type(declared_type, method_def):
+                    if value_node is not None:
+                        resolved_type = self._infer_expression_type(value_node, source_code, method_def, local_var_types)
+                else:
+                    resolved_type = self.helper._resolve_type(declared_type)
+                local_var_sites.append({
+                    'name': var_name,
+                    'declared_type': declared_type,
+                    'initializer_expr': initializer_expr,
+                    'resolved_declared_type': resolved_type or '',
+                })
+                if resolved_type:
+                    local_var_types[var_name] = resolved_type
         return local_var_types, local_var_sites
 
     def _collect_call_sites(self, body_node, source_code, method_def, local_var_types):
@@ -1676,23 +1935,24 @@ class TreeSitterAnalyzer:
                 type_node = node.child_by_field_name('type')
                 if type_node is not None:
                     resolved_type = self.helper._resolve_type(self._node_text(type_node, source_code).strip())
-                    arguments_node = node.child_by_field_name('arguments')
-                    arg_exprs = []
-                    if arguments_node:
-                        for child in arguments_node.children:
-                            if child.type in {',', '(', ')'}:
-                                continue
-                            arg_exprs.append(self._node_text(child, source_code).strip())
-                    call_sites.append({
-                        'kind': 'constructor_invocation',
-                        'receiver_expr': '',
-                        'receiver_type': resolved_type,
-                        'method_name': resolved_type.rsplit('.', 1)[-1] if resolved_type else '',
-                        'arg_exprs': arg_exprs,
-                        'line': node.start_point.row + 1,
-                        'content': self._node_text(node, source_code).strip()[:200],
-                        'scope_local_var_types': dict(scoped_local_types),
-                    })
+                    if resolved_type:
+                        arguments_node = node.child_by_field_name('arguments')
+                        arg_exprs = []
+                        if arguments_node:
+                            for child in arguments_node.children:
+                                if child.type in {',', '(', ')'}:
+                                    continue
+                                arg_exprs.append(self._node_text(child, source_code).strip())
+                        call_sites.append({
+                            'kind': 'constructor_invocation',
+                            'receiver_expr': '',
+                            'receiver_type': resolved_type,
+                            'method_name': resolved_type.rsplit('.', 1)[-1],
+                            'arg_exprs': arg_exprs,
+                            'line': node.start_point.row + 1,
+                            'content': self._node_text(node, source_code).strip()[:200],
+                            'scope_local_var_types': dict(scoped_local_types),
+                        })
             elif node.type == 'explicit_constructor_invocation':
                 constructor_node = node.child_by_field_name('constructor')
                 arguments_node = node.child_by_field_name('arguments')
@@ -1727,8 +1987,10 @@ class TreeSitterAnalyzer:
         def walk(node):
             yield node
             for child in node.children:
-                if child is not method_node and child.type in {
+                if child.type in {
                     'method_declaration', 'constructor_declaration',
+                    'compact_constructor_declaration',
+                    'annotation_type_element_declaration',
                 }:
                     continue
                 yield from walk(child)
@@ -1768,7 +2030,10 @@ class TreeSitterAnalyzer:
                     'identifier', 'type_identifier', 'scoped_identifier',
                     'scoped_type_identifier', 'field_access',
                 }:
-                    add('static_qualified_type', object_node, node)
+                    candidate = self._node_text(object_node, source_code).strip()
+                    simple_candidate = candidate.rsplit('.', 1)[-1]
+                    if simple_candidate[:1].isupper():
+                        add('static_qualified_type', object_node, node)
             elif node.type in {'marker_annotation', 'annotation'}:
                 annotation_text = self._node_text(node, source_code).strip()
                 match = re.match(r'@([A-Za-z_][\w.]*)', annotation_text)
@@ -1798,8 +2063,6 @@ class TreeSitterAnalyzer:
             parameter_nodes = [child for child in parameters_node.children if child.type not in {',', '(', ')'}]
 
         for child in parameter_nodes:
-            if child.type in {',', '(', ')'}:
-                continue
             if child.type in {'formal_parameter', 'spread_parameter'}:
                 type_node = child.child_by_field_name('type')
                 name_node = child.child_by_field_name('name')
@@ -1891,16 +2154,10 @@ class TreeSitterAnalyzer:
                 field_name = self._node_text(field_node, source_code).strip()
                 if field_name in method_def.field_declared_types:
                     return method_def.field_declared_types[field_name]
-            if object_node is not None:
-                return self._infer_expression_declared_type(object_node, source_code, method_def, scoped_declared_types)
-            text = self._node_text(node, source_code).strip()
-            base = text.split('.', 1)[0]
-            if base in scoped_declared_types:
-                return scoped_declared_types[base]
-            if base in method_def.param_declared_types:
-                return method_def.param_declared_types[base]
-            if base in method_def.field_declared_types:
-                return method_def.field_declared_types[base]
+            # The type of `receiver.field` is the field's declared type, not
+            # the receiver's type.  Without metadata for arbitrary external
+            # fields, propagating the receiver would fabricate a wrong owner.
+            return None
         return None
 
     def _infer_expression_type(self, node, source_code, method_def, local_var_types):
@@ -1964,11 +2221,11 @@ class TreeSitterAnalyzer:
 
         if node_type == 'field_access':
             object_node = node.child_by_field_name('object')
-            if object_node is not None:
-                return self._infer_expression_type(object_node, source_code, method_def, local_var_types)
-            text = self._node_text(node, source_code).strip()
-            base = text.split('.', 1)[0]
-            return local_var_types.get(base) or method_def.param_types.get(base) or method_def.field_types.get(base)
+            field_node = node.child_by_field_name('field')
+            if object_node is not None and object_node.type == 'this' and field_node is not None:
+                field_name = self._node_text(field_node, source_code).strip()
+                return method_def.field_types.get(field_name)
+            return None
 
         if node_type == 'parenthesized_expression':
             for child in node.children:
@@ -1984,10 +2241,15 @@ class TreeSitterAnalyzer:
 
         if node_type == 'string_literal':
             return 'java.lang.String'
-        if node_type in {'decimal_integer_literal', 'hex_integer_literal', 'binary_integer_literal', 'octal_integer_literal'}:
-            return 'int'
-        if node_type in {'decimal_floating_point_literal', 'hex_floating_point_literal'}:
-            return 'double'
+        if node_type in {
+            'decimal_integer_literal', 'hex_integer_literal',
+            'binary_integer_literal', 'octal_integer_literal',
+            'decimal_floating_point_literal', 'hex_floating_point_literal',
+            'character_literal',
+        }:
+            return _infer_java_numeric_or_character_literal_type(
+                self._node_text(node, source_code)
+            )
         if node_type in {'true', 'false', 'boolean_literal'}:
             return 'boolean'
 
@@ -2098,7 +2360,7 @@ def analyze_file(file_path, source_root, prefer_tree_sitter=True, return_diagnos
         elif not TREE_SITTER_AVAILABLE and prefer_tree_sitter:
             parser_info['actual_parser'] = 'skipped'
             parser_info['fallback_reason'] = 'tree_sitter_unavailable'
-        elif not prefer_tree_sitter:
+        else:
             parser_info['actual_parser'] = 'skipped'
             parser_info['fallback_reason'] = 'prefer_tree_sitter_disabled'
 
@@ -2171,9 +2433,7 @@ def extract_call_edges_enhanced(method_def, include_low_confidence=False):
     """
     edges = []
     if method_def.language == 'java' and method_def.ast_call_sites:
-        ast_edges = extract_ast_call_edges(method_def, include_low_confidence)
-        if ast_edges:
-            return ast_edges
+        return extract_ast_call_edges(method_def, include_low_confidence)
 
     # 【优化】支持延迟加载：优先使用已缓存的 body_text
     body_text = method_def.body_text or method_def.body_text_lazy
@@ -2192,6 +2452,8 @@ def extract_call_edges_enhanced(method_def, include_low_confidence=False):
     normal_calls = extract_normal_calls_enhanced(cleaned, method_def, include_low_confidence)
     edges.extend(normal_calls)
 
+    # Normal-call extraction applies the low-confidence policy itself; lambda
+    # and method-reference extraction never emit low-confidence edges.
     return edges
 
 
@@ -2214,11 +2476,26 @@ def extract_ast_call_edges(method_def, include_low_confidence=False):
 
         resolved_receiver_type = ''
         if kind == 'constructor_invocation':
-            receiver_type = site.get('receiver_type', '')
+            receiver_type = str(site.get('receiver_type', '') or '').strip()
+            if not re.fullmatch(
+                r'[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*', receiver_type,
+            ):
+                receiver_type = ''
             resolved_receiver_type = receiver_type
-            confidence = 'high' if receiver_type else 'medium'
-            callee_key = f"{receiver_type}.{method_name}" if receiver_type and method_name else f"method:{method_name}"
-            callee_simple_key = f"method:{method_name}"
+            if receiver_type:
+                method_name = method_name or receiver_type.rsplit('.', 1)[-1]
+                confidence = 'high'
+                callee_key = f"{receiver_type}.{method_name}"
+            else:
+                confidence = 'medium'
+                callee_key = (
+                    f"method:{method_name}" if method_name
+                    else 'constructor:unknown'
+                )
+            callee_simple_key = (
+                f"method:{method_name}" if method_name
+                else 'constructor:unknown'
+            )
             evidence_type = 'constructor_invocation'
         elif kind == 'constructor_delegation':
             receiver_type = (
@@ -2229,8 +2506,8 @@ def extract_ast_call_edges(method_def, include_low_confidence=False):
             resolved_receiver_type = receiver_type or ''
             method_name = receiver_type.rsplit('.', 1)[-1] if receiver_type else ''
             confidence = 'high' if receiver_type else 'medium'
-            callee_key = f"{receiver_type}.{method_name}" if receiver_type and method_name else 'constructor:unknown'
-            callee_simple_key = f"method:{method_name}" if method_name else 'constructor:unknown'
+            callee_key = f"{receiver_type}.{method_name}" if receiver_type else 'constructor:unknown'
+            callee_simple_key = f"method:{method_name}" if receiver_type else 'constructor:unknown'
             evidence_type = 'constructor_delegation'
         elif kind == 'method_reference':
             if receiver_expr == 'this':
@@ -2240,9 +2517,6 @@ def extract_ast_call_edges(method_def, include_low_confidence=False):
                 resolved_receiver = _resolve_super_type(method_def)
                 confidence = 'high' if resolved_receiver else 'medium'
             elif _looks_like_static_receiver_expr(receiver_expr, method_def, site_local_var_types):
-                resolved_receiver = resolve_type_fqn(receiver_expr, method_def)
-                confidence = 'high'
-            elif receiver_expr and receiver_expr[0].isupper():
                 resolved_receiver = resolve_type_fqn(receiver_expr, method_def)
                 confidence = 'high'
             else:
@@ -2302,7 +2576,7 @@ def extract_ast_call_edges(method_def, include_low_confidence=False):
                 callee_param_types,
                 method_def,
             )
-        if not sig_str and kind != 'method_reference' and arg_exprs:
+        if not sig_str and arg_exprs:
             _step5_debug(
                 'call_edge_signature',
                 'signature missing after argument inference',
@@ -2317,6 +2591,9 @@ def extract_ast_call_edges(method_def, include_low_confidence=False):
         if sig_str:
             callee_key = f"{callee_key}{sig_str}"
             callee_simple_key = f"{callee_simple_key}{sig_str}"
+
+        if confidence == 'low' and not include_low_confidence:
+            continue
 
         edge_key = (callee_key, callee_simple_key, site.get('line'), evidence_type)
         if edge_key in seen:
@@ -2353,13 +2630,17 @@ def build_invocation_signature(arg_exprs, inferred_param_types):
         return '()'
     if len(inferred_param_types or []) != arg_count:
         return ''
-    if any(not str(item or '').strip() for item in (inferred_param_types or [])):
+    if any(not str(item or '').strip() for item in inferred_param_types):
         return ''
     return '(' + ', '.join(inferred_param_types) + ')'
 
 
 def _build_signature_from_param_values(param_values):
-    values = [str(item or '').strip() for item in (param_values or []) if str(item or '').strip()]
+    values = []
+    for item in param_values or []:
+        text = str(item or '').strip()
+        if text:
+            values.append(text)
     if not values:
         return '()'
     normalized = []
@@ -2373,6 +2654,126 @@ def _build_signature_from_param_values(param_values):
     return '(' + ', '.join(normalized) + ')'
 
 
+def install_global_type_knowledge(methods):
+    """Install fail-closed cross-file type knowledge on parsed methods.
+
+    ``analyze_file`` can only see declarations in one source file.  Candidate
+    call edges are extracted after all authorized source sets have been read,
+    so this pass joins method returns, fields, inheritance and class names
+    across files.  Conflicting duplicate declarations are omitted rather than
+    letting source order choose a type.
+    """
+    method_rows = list(methods or ())
+    return_candidates = defaultdict(
+        lambda: defaultdict(lambda: defaultdict(set))
+    )
+    field_candidates = defaultdict(lambda: defaultdict(set))
+    metadata_candidates = defaultdict(set)
+    known_classes = set()
+
+    for method in method_rows:
+        class_fqcn = str(getattr(method, 'class_fqcn', '') or '').strip()
+        if class_fqcn:
+            known_classes.add(class_fqcn)
+        method_name = str(getattr(method, 'method_name', '') or '').strip()
+        return_type = str(getattr(method, 'return_type', '') or '').strip()
+        if class_fqcn and method_name and return_type:
+            declared_params = (
+                getattr(method, 'param_declared_types', {}) or {}
+            )
+            resolved_params = getattr(method, 'param_types', {}) or {}
+            signature = _build_signature_from_param_values(
+                (declared_params or resolved_params).values()
+            )
+            return_candidates[class_fqcn][method_name][signature].add(
+                return_type
+            )
+
+        for field_name, field_type in (
+            getattr(method, 'field_types', {}) or {}
+        ).items():
+            normalized_name = str(field_name or '').strip()
+            normalized_type = str(field_type or '').strip()
+            if class_fqcn and normalized_name and normalized_type:
+                field_candidates[class_fqcn][normalized_name].add(
+                    normalized_type
+                )
+
+        for type_name, raw_metadata in (
+            getattr(method, 'known_type_metadata', {}) or {}
+        ).items():
+            normalized_name = str(type_name or '').strip()
+            if not normalized_name:
+                continue
+            metadata = dict(raw_metadata or {})
+            identity = (
+                tuple(map(str, metadata.get('extends') or ())),
+                tuple(map(str, metadata.get('implements') or ())),
+            )
+            metadata_candidates[normalized_name].add(identity)
+            known_classes.add(normalized_name)
+
+    known_returns_by_signature = {}
+    for class_fqcn, method_map in sorted(return_candidates.items()):
+        normalized_methods = {}
+        for method_name, signature_map in sorted(method_map.items()):
+            normalized_signatures = {
+                signature: next(iter(return_types))
+                for signature, return_types in sorted(signature_map.items())
+                if len(return_types) == 1
+            }
+            if normalized_signatures:
+                normalized_methods[method_name] = normalized_signatures
+        if normalized_methods:
+            known_returns_by_signature[class_fqcn] = normalized_methods
+
+    known_fields = {}
+    for class_fqcn, fields in sorted(field_candidates.items()):
+        normalized_fields = {
+            field_name: next(iter(field_types))
+            for field_name, field_types in sorted(fields.items())
+            if len(field_types) == 1
+        }
+        if normalized_fields:
+            known_fields[class_fqcn] = normalized_fields
+
+    known_metadata = {}
+    for class_fqcn, candidates in sorted(metadata_candidates.items()):
+        if len(candidates) != 1:
+            continue
+        extends, implements = next(iter(candidates))
+        known_metadata[class_fqcn] = {
+            'extends': list(extends),
+            'implements': list(implements),
+        }
+
+    classes_by_simple = defaultdict(list)
+    for class_fqcn in sorted(known_classes):
+        classes_by_simple[class_fqcn.rsplit('.', 1)[-1]].append(class_fqcn)
+    known_classes_by_simple = {
+        simple_name: values
+        for simple_name, values in sorted(classes_by_simple.items())
+    }
+
+    for method in method_rows:
+        class_fqcn = str(getattr(method, 'class_fqcn', '') or '').strip()
+        method.local_method_return_types = {
+            method_name: dict(signatures)
+            for method_name, signatures in (
+                known_returns_by_signature.get(class_fqcn, {})
+            ).items()
+        }
+        method.known_method_return_types = known_returns_by_signature
+        method.known_method_return_types_by_signature = (
+            known_returns_by_signature
+        )
+        method.known_field_types = known_fields
+        method.known_type_metadata = known_metadata
+        method.known_class_fqcns = known_classes
+        method.known_classes_by_simple = known_classes_by_simple
+    return method_rows
+
+
 def _is_inferred_local_decl_type(declared_type, method_def=None):
     declared_type = (declared_type or '').strip()
     if not declared_type:
@@ -2384,11 +2785,18 @@ def _is_inferred_local_decl_type(declared_type, method_def=None):
 
 
 def _resolve_super_type(method_def):
-    type_metadata = getattr(method_def, 'known_type_metadata', {}) or {}
-    class_meta = type_metadata.get(getattr(method_def, 'class_fqcn', ''), {}) or {}
-    extends = class_meta.get('extends', []) or []
-    if extends:
-        return extends[0]
+    type_metadata = getattr(method_def, 'known_type_metadata', {})
+    if not isinstance(type_metadata, dict):
+        return None
+    class_meta = type_metadata.get(getattr(method_def, 'class_fqcn', ''))
+    if not isinstance(class_meta, dict):
+        return None
+    extends = class_meta.get('extends')
+    if isinstance(extends, str):
+        return extends.strip() or None
+    if isinstance(extends, (list, tuple)) and len(extends) == 1:
+        value = extends[0]
+        return value.strip() if isinstance(value, str) and value.strip() else None
     return None
 
 
@@ -2400,7 +2808,7 @@ def _looks_like_static_receiver_expr(receiver_expr, method_def, local_var_types=
     local_var_types = local_var_types or {}
     root = expr.split('.', 1)[0]
     leaf = expr.rsplit('.', 1)[-1]
-    if not leaf or not leaf[0].isupper():
+    if not leaf[0].isupper():
         return False
     if root in local_var_types:
         return False
@@ -2409,6 +2817,30 @@ def _looks_like_static_receiver_expr(receiver_expr, method_def, local_var_types=
     if root in getattr(method_def, 'param_types', {}):
         return False
     return True
+
+
+def _known_static_field_type(expr, method_def, local_var_types=None):
+    match = re.fullmatch(
+        r'(?P<owner>[A-Z][A-Za-z0-9_$.]*)\.'
+        r'(?P<field>[A-Za-z_][A-Za-z0-9_]*)',
+        (expr or '').strip(),
+    )
+    if not match:
+        return None
+    owner_expr = match.group('owner')
+    root = owner_expr.split('.', 1)[0]
+    if (
+        root in (local_var_types or {})
+        or root in (getattr(method_def, 'field_types', {}) or {})
+        or root in (getattr(method_def, 'param_types', {}) or {})
+    ):
+        return None
+    owner_type = resolve_type_fqn(owner_expr, method_def)
+    known_field_types = getattr(method_def, 'known_field_types', {}) or {}
+    field_type = (known_field_types.get(owner_type, {}) or {}).get(
+        match.group('field')
+    )
+    return str(field_type).strip() if field_type else None
 
 
 def extract_lambda_calls(body_text, method_def):
@@ -2592,7 +3024,7 @@ def extract_method_refs(body_text, method_def):
         # 判断置信度
         # 类方法引用（ClassName::method）: high
         # 实例方法引用（obj::method）: medium（取决于是否推断出类型）
-        if target_fqn and ('.' in target_fqn or target_fqn[0].isupper()):
+        if '.' in target_fqn or target_fqn[0].isupper():
             confidence = 'high'
         else:
             confidence = 'medium'
@@ -2637,17 +3069,21 @@ def extract_normal_calls_enhanced(body_text, method_def, include_low_confidence)
     for m in call_pattern.finditer(body_text):
         receiver_expr = m.group(1)
         callee_method = m.group(2)
-        params_str = m.group(3).strip() if m.lastindex >= 3 else ''
+        params_str = m.group(3).strip()
 
         # Extract parameter types for signature matching
         callee_param_types = []
+        arg_exprs = []
         if params_str:
-            # Parse argument expressions to infer types
-            for param in params_str.split(','):
-                param = param.strip()
-                if param:
-                    # Try to infer type from the expression
-                    inferred_type = infer_param_type_from_expression(param, method_def)
+            parsed_args = split_java_argument_expressions(params_str)
+            if parsed_args is None:
+                arg_exprs = None
+            else:
+                arg_exprs = parsed_args
+                for param in arg_exprs:
+                    inferred_type = infer_param_type_from_expression(
+                        param, method_def,
+                    )
                     callee_param_types.append(inferred_type or '')
 
         # Key fix: detect static call ClassName.staticMethod()
@@ -2682,18 +3118,18 @@ def extract_normal_calls_enhanced(body_text, method_def, include_low_confidence)
                 confidence = "low"
 
         # 仅在签名完整时生成签名 key，避免半截类型误导重载匹配
-        sig_str = build_invocation_signature(
-            [p.strip() for p in params_str.split(',') if p.strip()] if params_str else [],
-            callee_param_types,
+        sig_str = (
+            build_invocation_signature(arg_exprs, callee_param_types)
+            if arg_exprs is not None else ''
         )
-        if not sig_str and params_str:
+        if not sig_str and arg_exprs is not None:
             sig_str = resolve_invocation_signature_from_partial_hints(
                 resolved_receiver_type,
                 callee_method,
                 callee_param_types,
                 method_def,
             )
-        if not sig_str and params_str:
+        if not sig_str:
             _step5_debug(
                 'call_edge_signature',
                 'regex path signature missing after argument inference',
@@ -2711,6 +3147,9 @@ def extract_normal_calls_enhanced(body_text, method_def, include_low_confidence)
         else:
             callee_key_with_sig = callee_key
             callee_simple_key_with_sig = f"method:{callee_method}"
+
+        if confidence == 'low' and not include_low_confidence:
+            continue
 
         edges.append(CallEdge(
             caller_symbol_id=method_def.symbol_id,
@@ -2820,92 +3259,146 @@ def infer_invocation_return_type(receiver_type, method_name, method_def, invocat
     if not method_name:
         return None
 
-    known_method_return_types = getattr(method_def, 'known_method_return_types', {}) or {}
-    known_method_return_types_by_signature = (
-        getattr(method_def, 'known_method_return_types_by_signature', {}) or {}
+    known_method_return_types = getattr(method_def, 'known_method_return_types', {})
+    if not isinstance(known_method_return_types, dict):
+        known_method_return_types = {}
+    known_method_return_types_by_signature = getattr(
+        method_def, 'known_method_return_types_by_signature', {},
     )
+    if not isinstance(known_method_return_types_by_signature, dict):
+        known_method_return_types_by_signature = {}
     invocation_signature = (invocation_signature or '').strip()
     normalized_signature = normalize_signature_for_lookup(invocation_signature)
 
     def _match_from_bucket(bucket):
-        if not bucket:
-            return None
+        """Return ``(declared, resolved_type)`` for one method bucket.
+
+        ``declared`` remains true for malformed or ambiguous buckets so a
+        subclass declaration can never silently fall through to an unrelated
+        parent overload.
+        """
+        if bucket is None:
+            return True, None
         if isinstance(bucket, str):
-            return bucket
+            return True, bucket.strip() or None
         if not isinstance(bucket, dict):
-            return None
-        if invocation_signature and bucket.get(invocation_signature):
-            return bucket.get(invocation_signature)
-        if normalized_signature and bucket.get(normalized_signature):
-            return bucket.get(normalized_signature)
-        if len(bucket) == 1:
-            return next(iter(bucket.values()))
-        unique_return_types = {
-            str(return_type or '').strip()
-            for return_type in bucket.values()
-            if str(return_type or '').strip()
-        }
+            return True, None
+        if invocation_signature:
+            matching_values = []
+            for signature, return_type in bucket.items():
+                if not isinstance(signature, str):
+                    continue
+                signature = signature.strip()
+                signature_normalized = normalize_signature_for_lookup(signature)
+                if (
+                    signature == invocation_signature
+                    or normalized_signature
+                    and signature_normalized == normalized_signature
+                ):
+                    matching_values.append(return_type)
+            if not matching_values or any(
+                not isinstance(return_type, str) or not return_type.strip()
+                for return_type in matching_values
+            ):
+                return True, None
+            unique_return_types = {
+                return_type.strip() for return_type in matching_values
+            }
+            return (
+                True,
+                next(iter(unique_return_types))
+                if len(unique_return_types) == 1 else None,
+            )
+        if not bucket or any(
+            not isinstance(signature, str)
+            or not normalize_signature_for_lookup(signature)
+            or not isinstance(return_type, str)
+            or not return_type.strip()
+            for signature, return_type in bucket.items()
+        ):
+            return True, None
+        unique_return_types = {return_type.strip() for return_type in bucket.values()}
         if len(unique_return_types) == 1:
-            return next(iter(unique_return_types))
-        return None
+            return True, next(iter(unique_return_types))
+        return True, None
+
+    def _match_from_method_map(method_map):
+        if not isinstance(method_map, dict):
+            return (True, None) if method_map is not None else (False, None)
+        if method_name not in method_map:
+            return False, None
+        return _match_from_bucket(method_map.get(method_name))
+
+    def _declared_on_type(type_name):
+        signature_owner = known_method_return_types_by_signature.get(type_name)
+        declared, matched = _match_from_method_map(signature_owner)
+        if declared:
+            return declared, matched
+        legacy_owner = known_method_return_types.get(type_name)
+        return _match_from_method_map(legacy_owner)
+
+    def _parent_names(raw):
+        if isinstance(raw, str):
+            return [raw] if raw else []
+        if isinstance(raw, (list, tuple, set)):
+            return list(raw)
+        return []
 
     if receiver_type == method_def.class_fqcn:
-        matched = _match_from_bucket(method_def.local_method_return_types.get(method_name))
-        if matched:
-            return matched
-    if receiver_type and receiver_type in known_method_return_types_by_signature:
-        matched = _match_from_bucket(
-            known_method_return_types_by_signature.get(receiver_type, {}).get(method_name)
+        declared, matched = _match_from_method_map(
+            getattr(method_def, 'local_method_return_types', None)
         )
-        if matched:
+        if declared:
             return matched
-    if receiver_type and receiver_type in known_method_return_types:
-        bucket = known_method_return_types.get(receiver_type, {})
-        if isinstance(bucket, dict):
-            direct = bucket.get(method_name)
-            if isinstance(direct, str):
-                return direct
-            if isinstance(direct, dict):
-                matched = _match_from_bucket(direct)
-                if matched:
-                    return matched
 
-    type_metadata = getattr(method_def, 'known_type_metadata', {}) or {}
-    visited = set()
+    type_metadata = getattr(method_def, 'known_type_metadata', {})
+    if not isinstance(type_metadata, dict):
+        type_metadata = {}
+    visiting = set()
 
-    def _lookup_in_supertypes(type_name):
-        if not type_name or type_name in visited:
-            return None
-        visited.add(type_name)
-        meta = type_metadata.get(type_name, {}) or {}
-        for parent in (meta.get('extends') or []) + (meta.get('implements') or []):
-            if not parent or parent in visited:
+    def _merge_parent_resolutions(parents):
+        values = set()
+        declared_any = False
+        for parent in parents:
+            parent = str(parent or '').strip()
+            if not parent:
                 continue
-            if parent in known_method_return_types_by_signature:
-                matched = _match_from_bucket(
-                    known_method_return_types_by_signature.get(parent, {}).get(method_name)
-                )
-                if matched:
-                    return matched
-            if parent in known_method_return_types:
-                bucket = known_method_return_types.get(parent, {})
-                if isinstance(bucket, dict):
-                    direct = bucket.get(method_name)
-                    if isinstance(direct, str):
-                        return direct
-                    if isinstance(direct, dict):
-                        matched = _match_from_bucket(direct)
-                        if matched:
-                            return matched
-            inherited = _lookup_in_supertypes(parent)
-            if inherited:
-                return inherited
-        return None
+            declared, resolved = _resolve_type(parent)
+            if not declared:
+                continue
+            declared_any = True
+            if not resolved:
+                return True, None
+            values.add(resolved)
+        if not declared_any:
+            return False, None
+        return True, next(iter(values)) if len(values) == 1 else None
 
-    inherited_return = _lookup_in_supertypes(receiver_type)
-    if inherited_return:
-        return inherited_return
-    return None
+    def _resolve_type(type_name):
+        type_name = str(type_name or '').strip()
+        if not type_name or type_name in visiting:
+            return False, None
+        visiting.add(type_name)
+        try:
+            declared, matched = _declared_on_type(type_name)
+            if declared:
+                return declared, matched
+            meta = type_metadata.get(type_name, {}) or {}
+            if not isinstance(meta, dict):
+                return True, None
+            declared, matched = _merge_parent_resolutions(
+                _parent_names(meta.get('extends'))
+            )
+            if declared:
+                return declared, matched
+            return _merge_parent_resolutions(
+                _parent_names(meta.get('implements'))
+            )
+        finally:
+            visiting.remove(type_name)
+
+    _declared, inherited_return = _resolve_type(receiver_type)
+    return inherited_return
 
 
 def resolve_ast_local_var_types(method_def):
@@ -2929,7 +3422,8 @@ def infer_expression_type_from_text(expr, method_def, local_var_types=None):
     expr = _strip_balanced_outer_parens((expr or '').strip())
     if not expr:
         return None
-    local_var_types = local_var_types or getattr(method_def, 'local_var_types', {}) or {}
+    if local_var_types is None:
+        local_var_types = method_def.local_var_types
 
     if expr.startswith('"') and expr.endswith('"'):
         return 'java.lang.String'
@@ -2947,7 +3441,9 @@ def infer_expression_type_from_text(expr, method_def, local_var_types=None):
     if bare_method_call_match:
         method_name = bare_method_call_match.group('method').strip()
         args_text = bare_method_call_match.group('args').strip()
-        arg_exprs = [part.strip() for part in args_text.split(',') if part.strip()] if args_text else []
+        arg_exprs = split_java_argument_expressions(args_text)
+        if arg_exprs is None:
+            return None
         inferred_param_types = []
         for arg_expr in arg_exprs:
             inferred_type = infer_param_type_from_expression(arg_expr, method_def, local_var_types)
@@ -2966,7 +3462,9 @@ def infer_expression_type_from_text(expr, method_def, local_var_types=None):
         receiver_expr = method_call['receiver']
         method_name = method_call['method']
         args_text = method_call['args']
-        arg_exprs = [part.strip() for part in args_text.split(',') if part.strip()] if args_text else []
+        arg_exprs = split_java_argument_expressions(args_text)
+        if arg_exprs is None:
+            return None
         inferred_param_types = []
         for arg_expr in arg_exprs:
             inferred_type = infer_param_type_from_expression(arg_expr, method_def, local_var_types)
@@ -2984,9 +3482,6 @@ def infer_expression_type_from_text(expr, method_def, local_var_types=None):
             return_type = infer_known_library_method_return_type(receiver_type, method_name)
         if return_type:
             return return_type
-
-    if expr[0].isupper():
-        return resolve_type_fqn(expr, method_def)
 
     return None
 
@@ -3092,10 +3587,60 @@ def infer_known_library_method_return_type(receiver_type, method_name):
     }:
         return 'boolean'
 
-    if receiver_candidates & {'java.lang.Class', 'Class'}:
-        if method_name in {'getCanonicalName', 'getName', 'getSimpleName', 'getTypeName'}:
-            return 'java.lang.String'
+    return None
 
+
+_JAVA_DECIMAL_DIGITS = r'[0-9](?:_*[0-9])*'
+_JAVA_HEX_DIGITS = r'[0-9a-fA-F](?:_*[0-9a-fA-F])*'
+_JAVA_BINARY_DIGITS = r'[01](?:_*[01])*'
+_JAVA_INTEGER_LITERAL_RE = re.compile(
+    rf'^[+-]?(?:'
+    rf'0[xX]{_JAVA_HEX_DIGITS}'
+    rf'|0[bB]{_JAVA_BINARY_DIGITS}'
+    rf'|0(?:_*[0-7])*'
+    rf'|[1-9](?:_*[0-9])*'
+    rf')(?P<suffix>[lL])?$'
+)
+_JAVA_DECIMAL_EXPONENT = rf'[eE][+-]?{_JAVA_DECIMAL_DIGITS}'
+_JAVA_DECIMAL_FLOAT_LITERAL_RE = re.compile(
+    rf'^[+-]?(?:'
+    rf'{_JAVA_DECIMAL_DIGITS}\.(?:{_JAVA_DECIMAL_DIGITS})?'
+    rf'(?:{_JAVA_DECIMAL_EXPONENT})?[fFdD]?'
+    rf'|\.{_JAVA_DECIMAL_DIGITS}(?:{_JAVA_DECIMAL_EXPONENT})?[fFdD]?'
+    rf'|{_JAVA_DECIMAL_DIGITS}{_JAVA_DECIMAL_EXPONENT}[fFdD]?'
+    rf'|{_JAVA_DECIMAL_DIGITS}[fFdD]'
+    rf')$'
+)
+_JAVA_HEX_FLOAT_LITERAL_RE = re.compile(
+    rf'^[+-]?0[xX](?:'
+    rf'{_JAVA_HEX_DIGITS}(?:\.(?:{_JAVA_HEX_DIGITS})?)?'
+    rf'|\.{_JAVA_HEX_DIGITS}'
+    rf')[pP][+-]?{_JAVA_DECIMAL_DIGITS}[fFdD]?$'
+)
+_JAVA_CHAR_LITERAL_RE = re.compile(
+    r"^'(?:[^'\\\r\n]|\\(?:[btnfrs\"'\\]|u+[0-9a-fA-F]{4}|[0-7]{1,3}))'$"
+)
+
+
+def _infer_java_numeric_or_character_literal_type(expr):
+    """Return the Java lexical type for a valid numeric or char literal.
+
+    Unary ``+``/``-`` are accepted because parameter inference sees the whole
+    expression rather than the literal token alone.  The patterns deliberately
+    reject malformed underscore, radix, exponent and escape forms so parser
+    recovery cannot turn invalid source into a confident overload signature.
+    """
+    text = (expr or '').strip()
+    if _JAVA_CHAR_LITERAL_RE.fullmatch(text):
+        return 'char'
+    integer_match = _JAVA_INTEGER_LITERAL_RE.fullmatch(text)
+    if integer_match:
+        return 'long' if integer_match.group('suffix') else 'int'
+    if (
+        _JAVA_DECIMAL_FLOAT_LITERAL_RE.fullmatch(text)
+        or _JAVA_HEX_FLOAT_LITERAL_RE.fullmatch(text)
+    ):
+        return 'float' if text[-1] in {'f', 'F'} else 'double'
     return None
 
 
@@ -3110,14 +3655,17 @@ def infer_param_type_from_expression(expr, method_def, local_var_types=None):
       - Class references: ClassName.class → Class
       - Stable method-call expressions: clazz.getCanonicalName() → String
     """
-    expr = _strip_balanced_outer_parens(expr.strip())
-    local_var_types = local_var_types or getattr(method_def, 'local_var_types', {}) or {}
+    expr = _strip_balanced_outer_parens((expr or '').strip())
+    if not expr:
+        return None
+    if local_var_types is None:
+        local_var_types = method_def.local_var_types
 
     def split_top_level_ternary(text):
         paren_depth = bracket_depth = brace_depth = 0
         question_index = -1
         nested_ternary_depth = 0
-        for idx, ch in enumerate(text or ''):
+        for idx, ch in enumerate(text):
             if ch == '(':
                 paren_depth += 1
             elif ch == ')':
@@ -3150,20 +3698,25 @@ def infer_param_type_from_expression(expr, method_def, local_var_types=None):
     ternary_parts = split_top_level_ternary(expr)
     if ternary_parts:
         _condition_expr, true_expr, false_expr = ternary_parts
+        # Parser recovery can surface incomplete ternaries while a source file
+        # is being edited.  A missing operand has no defensible Java type, so
+        # fail closed instead of inferring from the surviving arm.
+        if not all(ternary_parts):
+            return None
         true_type = infer_param_type_from_expression(true_expr, method_def, local_var_types)
         false_type = infer_param_type_from_expression(false_expr, method_def, local_var_types)
         if true_type and false_type and true_type == false_type:
             return true_type
-        if true_type in {'Object', 'null', None} and false_type:
+        if true_type in {'Object', 'null'} and false_type:
             return false_type
-        if false_type in {'Object', 'null', None} and true_type:
+        if false_type in {'Object', 'null'} and true_type:
             return true_type
 
     cast_match = re.match(r'^\(\s*([A-Za-z_][\w.]*)\s*\)\s*(.+)$', expr)
     if cast_match:
         cast_type = cast_match.group(1).strip()
         resolved = resolve_type_fqn(cast_type, method_def)
-        return resolved.rsplit('.', 1)[-1] if resolved else cast_type.rsplit('.', 1)[-1]
+        return resolved.rsplit('.', 1)[-1]
 
     # An explicit array passed to a varargs method is one argument whose type
     # is `T[]`; it must not be treated as an unknown expression (or as the
@@ -3178,8 +3731,17 @@ def infer_param_type_from_expression(expr, method_def, local_var_types=None):
         raw_type = re.sub(r'\s*<.*>\s*$', '', array_creation_match.group('type')).strip()
         dimensions = re.sub(r'\[[^\]]*\]', '[]', array_creation_match.group('dimensions'))
         resolved = resolve_type_fqn(raw_type, method_def)
-        simple_type = resolved.rsplit('.', 1)[-1] if resolved else raw_type.rsplit('.', 1)[-1]
+        simple_type = resolved.rsplit('.', 1)[-1]
         return f"{simple_type}{dimensions}"
+
+    object_creation_match = re.match(
+        r'^new\s+(?P<type>[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)'
+        r'(?:\s*<[^{}()]+>)?\s*\(',
+        expr,
+    )
+    if object_creation_match:
+        resolved = resolve_type_fqn(object_creation_match.group('type'), method_def)
+        return resolved.rsplit('.', 1)[-1]
 
     # String literal
     if expr.startswith('"') and expr.endswith('"'):
@@ -3189,12 +3751,9 @@ def infer_param_type_from_expression(expr, method_def, local_var_types=None):
     if '+' in expr and '"' in expr:
         return 'String'
 
-    # Numeric literal
-    if expr.isdigit() or (expr.replace('.', '').isdigit() and expr.count('.') == 1):
-        if '.' in expr:
-            return 'double'
-        else:
-            return 'int'
+    literal_type = _infer_java_numeric_or_character_literal_type(expr)
+    if literal_type:
+        return literal_type
 
     # Boolean literal
     if expr in ('true', 'false'):
@@ -3210,7 +3769,7 @@ def infer_param_type_from_expression(expr, method_def, local_var_types=None):
         return 'boolean'
     if '&&' in expr or '||' in expr:
         return 'boolean'
-    if expr.startswith('!') and not expr.startswith('!='):
+    if expr.startswith('!'):
         return 'boolean'
 
     # Null literal
@@ -3229,14 +3788,12 @@ def infer_param_type_from_expression(expr, method_def, local_var_types=None):
             return fqn.rsplit('.', 1)[-1] if '.' in fqn else fqn
 
     def infer_map_get_value_type(receiver_expr):
-        receiver_expr = (receiver_expr or '').strip()
-        if not receiver_expr:
-            return None
+        receiver_expr = receiver_expr.strip()
         declared_type = ''
-        if receiver_expr in (getattr(method_def, 'param_declared_types', {}) or {}):
-            declared_type = (method_def.param_declared_types or {}).get(receiver_expr, '')
+        if receiver_expr in method_def.param_declared_types:
+            declared_type = method_def.param_declared_types.get(receiver_expr, '')
         if not declared_type:
-            for site in getattr(method_def, 'ast_local_var_sites', []) or []:
+            for site in method_def.ast_local_var_sites:
                 if site.get('name') == receiver_expr:
                     declared_type = site.get('declared_type') or ''
                     break
@@ -3248,7 +3805,7 @@ def infer_param_type_from_expression(expr, method_def, local_var_types=None):
             return None
         value_type = parts[1]
         resolved = resolve_type_fqn(value_type, method_def)
-        return resolved.rsplit('.', 1)[-1] if resolved else value_type.rsplit('.', 1)[-1]
+        return resolved.rsplit('.', 1)[-1]
 
     # Parameter reference
     if expr in method_def.param_types:
@@ -3265,42 +3822,42 @@ def infer_param_type_from_expression(expr, method_def, local_var_types=None):
         base = array_access_match.group('base')
         base_type = (
             local_var_types.get(base)
-            or (getattr(method_def, 'param_declared_types', {}) or {}).get(base)
-            or (getattr(method_def, 'param_types', {}) or {}).get(base)
-            or (getattr(method_def, 'field_declared_types', {}) or {}).get(base)
-            or (getattr(method_def, 'field_types', {}) or {}).get(base)
+            or method_def.param_declared_types.get(base)
+            or method_def.param_types.get(base)
+            or method_def.field_declared_types.get(base)
+            or method_def.field_types.get(base)
         )
         if base_type:
             element_type = str(base_type).strip()
             element_type = element_type.replace('...', '[]')
-            if element_type.endswith('[]'):
-                element_type = element_type[:-2].strip()
+            if not element_type.endswith('[]'):
+                return None
+            element_type = element_type[:-2].strip()
             resolved = resolve_type_fqn(element_type, method_def)
-            return resolved.rsplit('.', 1)[-1] if resolved else element_type.rsplit('.', 1)[-1]
+            return resolved.rsplit('.', 1)[-1]
 
-    body_text = method_def.get_body_text() if hasattr(method_def, 'get_body_text') else getattr(method_def, 'body_text', '')
+    body_text = method_def.get_body_text()
     enhanced_for_match = re.search(
         rf'for\s*\(\s*([A-Za-z_][\w.<>, ?\[\]]*)\s+{re.escape(expr)}\s*:',
         body_text or '',
     )
     if enhanced_for_match:
         resolved = resolve_type_fqn(enhanced_for_match.group(1).strip(), method_def)
-        return resolved.rsplit('.', 1)[-1] if resolved else enhanced_for_match.group(1).strip().rsplit('.', 1)[-1]
+        return resolved.rsplit('.', 1)[-1]
 
     # Field reference
     if expr in method_def.field_types:
         fqn = method_def.field_types[expr]
         return fqn.rsplit('.', 1)[-1] if '.' in fqn else fqn
 
-    static_field_match = re.match(r'^(?P<owner>[A-Z][A-Za-z0-9_$.]*)\.(?P<field>[A-Za-z_][A-Za-z0-9_]*)$', expr)
-    if static_field_match:
-        owner_expr = static_field_match.group('owner').strip()
-        field_name = static_field_match.group('field').strip()
-        owner_type = resolve_type_fqn(owner_expr, method_def)
-        known_field_types = getattr(method_def, 'known_field_types', {}) or {}
-        field_type = (known_field_types.get(owner_type, {}) or {}).get(field_name)
-        if field_type:
-            return field_type.rsplit('.', 1)[-1] if '.' in field_type else field_type
+    static_field_type = _known_static_field_type(
+        expr, method_def, local_var_types,
+    )
+    if static_field_type:
+        return (
+            static_field_type.rsplit('.', 1)[-1]
+            if '.' in static_field_type else static_field_type
+        )
 
     # Method invocation (receiver.method(...))
     method_call = split_trailing_method_call(expr)
@@ -3312,9 +3869,9 @@ def infer_param_type_from_expression(expr, method_def, local_var_types=None):
             map_value_type = infer_map_get_value_type(receiver_expr)
             if map_value_type:
                 return map_value_type
-        arg_exprs = []
-        if args_text:
-            arg_exprs = [part.strip() for part in args_text.split(',') if part.strip()]
+        arg_exprs = split_java_argument_expressions(args_text)
+        if arg_exprs is None:
+            return None
         inferred_param_types = []
         for arg_expr in arg_exprs:
             inferred_type = infer_param_type_from_expression(arg_expr, method_def, local_var_types)
@@ -3324,11 +3881,6 @@ def infer_param_type_from_expression(expr, method_def, local_var_types=None):
         receiver_type = infer_expression_type_from_text(receiver_expr, method_def, local_var_types)
         if method_name == 'getParameter' and len(arg_exprs) == 1:
             return 'String'
-        if method_name == 'getParameter' and (receiver_type or '').rsplit('.', 1)[-1] == 'URL':
-            if len(arg_exprs) >= 2:
-                second_arg_type = infer_param_type_from_expression(arg_exprs[1], method_def, local_var_types)
-                if second_arg_type == 'String':
-                    return 'String'
         return_type = infer_invocation_return_type(
             receiver_type,
             method_name,
@@ -3355,7 +3907,9 @@ def infer_param_type_from_expression(expr, method_def, local_var_types=None):
     if bare_method_call_match:
         method_name = bare_method_call_match.group('method').strip()
         args_text = bare_method_call_match.group('args').strip()
-        arg_exprs = [part.strip() for part in args_text.split(',') if part.strip()] if args_text else []
+        arg_exprs = split_java_argument_expressions(args_text)
+        if arg_exprs is None:
+            return None
         inferred_param_types = []
         for arg_expr in arg_exprs:
             inferred_type = infer_param_type_from_expression(arg_expr, method_def, local_var_types)
@@ -3384,17 +3938,6 @@ def infer_param_type_from_expression(expr, method_def, local_var_types=None):
         parts = expr.split('.')
         return parts[0]  # Use class name as type hint
 
-    # Variable name starting with lowercase - try to match param/field
-    if expr[0].islower():
-        # Try parameter names first
-        if expr in method_def.param_types:
-            fqn = method_def.param_types[expr]
-            return fqn.rsplit('.', 1)[-1] if '.' in fqn else fqn
-        # Try field names
-        if expr in method_def.field_types:
-            fqn = method_def.field_types[expr]
-            return fqn.rsplit('.', 1)[-1] if '.' in fqn else fqn
-
     return None
 
 
@@ -3408,7 +3951,8 @@ def infer_receiver_type_enhanced(expr, method_def, local_var_types=None):
       - param → 参数类型
       - method() → 返回值类型
     """
-    local_var_types = local_var_types or getattr(method_def, 'local_var_types', {}) or {}
+    if local_var_types is None:
+        local_var_types = getattr(method_def, 'local_var_types', {}) or {}
     expr = (expr or '').strip()
 
     if expr == 'this':
@@ -3436,6 +3980,12 @@ def infer_receiver_type_enhanced(expr, method_def, local_var_types=None):
     if expr in method_def.param_types:
         return method_def.param_types[expr]
 
+    static_field_type = _known_static_field_type(
+        expr, method_def, local_var_types,
+    )
+    if static_field_type:
+        return static_field_type
+
     if _looks_like_static_receiver_expr(expr, method_def, local_var_types):
         return resolve_type_fqn(expr, method_def)
 
@@ -3451,11 +4001,10 @@ def infer_receiver_type_enhanced(expr, method_def, local_var_types=None):
     # 支持 getClient().call() / this.getClient().call() 这类常见零参数工厂调用
     if expr.endswith('()'):
         base_call = expr.rsplit('.', 1)[-1]
-        if base_call.endswith('()'):
-            callee = base_call[:-2]
-            receiver_root = expr.rsplit('.', 1)[0] if '.' in expr else ''
-            receiver_type = infer_receiver_type_enhanced(receiver_root, method_def, local_var_types) if receiver_root else method_def.class_fqcn
-            return infer_invocation_return_type(receiver_type, callee, method_def, invocation_signature='()')
+        callee = base_call[:-2]
+        receiver_root = expr.rsplit('.', 1)[0] if '.' in expr else ''
+        receiver_type = infer_receiver_type_enhanced(receiver_root, method_def, local_var_types) if receiver_root else method_def.class_fqcn
+        return infer_invocation_return_type(receiver_type, callee, method_def, invocation_signature='()')
 
     # 方法返回值（简化版）
     # 注：更深层的类型传播仍需要全局类型图

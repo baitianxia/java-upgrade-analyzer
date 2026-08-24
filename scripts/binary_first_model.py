@@ -10,6 +10,7 @@ can guard JSON sidecars, SQLite rows, and tests.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import PureWindowsPath
 from typing import Any, Iterable, Mapping
 
 from binary_first_contract import (
@@ -256,7 +257,11 @@ class RuntimeProfile:
                     "RUNTIME_PROFILE_PATH_INVALID", "runtime path entry must be an object"
                 )
             location = str(item.get("logical_location") or "").strip()
-            if not location or location.startswith(("/", "~")) or ":\\" in location:
+            if (
+                not location
+                or location.startswith(("/", "~"))
+                or bool(PureWindowsPath(location).drive)
+            ):
                 raise BinaryFirstContractError(
                     "RUNTIME_PROFILE_PATH_NOT_REPRODUCIBLE",
                     "runtime path logical locations must be relative and reproducible",
@@ -420,7 +425,10 @@ class ArtifactInstance:
             raise BinaryFirstContractError(
                 "ARTIFACT_INSTANCE_PATH_KIND_INVALID", self.runtime_path_kind
             )
-        if self.runtime_classpath_index < 0:
+        if (
+            type(self.runtime_classpath_index) is not int
+            or self.runtime_classpath_index < 0
+        ):
             raise BinaryFirstContractError(
                 "ARTIFACT_INSTANCE_SLOT_INVALID", "runtime classpath index must be non-negative"
             )
@@ -436,7 +444,9 @@ class ArtifactInstance:
             "runtime_code_source_origin_identity": self.runtime_code_source_origin_identity,
         }
         for key, value in payload.items():
-            if value in {None, ""}:
+            if value is None or (
+                isinstance(value, str) and not value.strip()
+            ):
                 raise BinaryFirstContractError(
                     "ARTIFACT_INSTANCE_FIELD_MISSING", f"{key} is required"
                 )

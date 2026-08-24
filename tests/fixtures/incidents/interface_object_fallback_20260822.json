@@ -1,0 +1,16 @@
+{
+  "schema": "java-upgrade-analyzer.test-incident-evidence.v1",
+  "incident_id": "interface-object-fallback-20260822",
+  "observed_at": "2026-08-22T00:00:00+08:00",
+  "platform": "macOS aarch64 local white-box reproduction cross-checked by an isolated OpenJDK JVM fixture",
+  "trigger": "an interface method reference names clone(), the current interface no longer declares it, java.lang.Object exposes only protected clone(), and the concrete implementation still has a public clone() method",
+  "actual_pre_fix_behavior": "both the runtime reconciler and the independent validation oracle recursively traversed an interface classfile's java/lang/Object super_name and accepted protected, private, or static Object declarations as ordinary inherited interface methods",
+  "expected_behavior": "JVMS interface method resolution may use a java.lang.Object fallback only when that declaration is public and non-static; otherwise resolution must continue through superinterfaces and fail when no legal declaration exists",
+  "root_cause": "the shared conceptual model treated the synthetic Object superclass recorded on an interface classfile as a normal superclass edge instead of applying the interface-specific Object fallback constraints",
+  "reproduction": [
+    "Compile a base interface that explicitly declares Object clone() and a business entrypoint whose bytecode uses invokeinterface for that symbol.",
+    "Remove clone() from the current interface while retaining public clone() on the concrete implementation.",
+    "Run the same business and oracle classes with the base and current libraries; the base succeeds and the current target JVM raises NoSuchMethodError.",
+    "Cross-check javap public-member inventory and require the public binary pipeline to report the removed reachable interface method as incompatible."
+  ]
+}

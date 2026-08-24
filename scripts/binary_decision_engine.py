@@ -590,7 +590,7 @@ class BinaryDecisionEngine:
                 ):
                     continue
                 key = (
-                    str(raw["logical_dependency_lineage"] or ""),
+                    str(raw["logical_dependency_lineage"]),
                     str(raw["runtime_path_kind"] or ""),
                     str(raw["caller_class_name"] or ""),
                     str(raw["caller_member_name"] or ""),
@@ -1167,7 +1167,7 @@ class BinaryDecisionEngine:
             "fact_kind": fact_kind,
             "fact_scope": dict(fact_scope),
             "dependency_lineages": sorted({
-                str(item.get("logical_dependency_lineage") or "")
+                str(item["logical_dependency_lineage"])
                 for item in payload["dependency_artifacts"]
                 if item.get("logical_dependency_lineage")
             }),
@@ -1586,9 +1586,10 @@ class BinaryDecisionEngine:
             new_fp = self._resource_fingerprint(current)
             if old_fp == new_fp:
                 continue
-            category = str(
-                (current or base or {}).get("resource_category") or "unknown"
-            )
+            # ``keys`` is the union of both indexes, so at least one record is
+            # present for every iteration.
+            record = current or base
+            category = str(record.get("resource_category") or "unknown")
             scope = {
                 "initiating_loader_realm_identity": realm,
                 "resource_name": name,
@@ -1673,6 +1674,10 @@ class BinaryDecisionEngine:
                 gaps.extend(self.base_runtime.coverage_gaps)
             if self.current_runtime.coverage_status != "complete":
                 gaps.extend(self.current_runtime.coverage_gaps)
+            if base is None:
+                gaps.append("base_provider_observation_missing")
+            if current is None:
+                gaps.append("current_provider_observation_missing")
             if (base or {}).get("class_provider_status") in {"ambiguous", "unresolved"}:
                 gaps.append("base_provider_unresolved")
             if (current or {}).get("class_provider_status") in {"ambiguous", "unresolved"}:

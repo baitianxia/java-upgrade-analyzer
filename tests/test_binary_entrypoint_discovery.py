@@ -7,7 +7,10 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR / "scripts"))
 
-from binary_entrypoint_discovery import discover_binary_entrypoints  # noqa: E402
+from binary_entrypoint_discovery import (  # noqa: E402
+    _annotation_imports,
+    discover_binary_entrypoints,
+)
 
 
 def annotation(descriptor, *, values=()):
@@ -71,6 +74,32 @@ class FakeProfile:
 
 
 class BinaryEntrypointDiscoveryTest(unittest.TestCase):
+    def test_spring_import_annotation_extracts_nested_type_descriptors(self):
+        imported = _annotation_imports(
+            "application-loader",
+            (annotation(
+                "Lorg/springframework/context/annotation/Import;",
+                values=((
+                    "value",
+                    "array",
+                    [
+                        {"kind": "type", "descriptor": "Ldemo/FirstConfig;"},
+                        {
+                            "nested": {
+                                "kind": "type",
+                                "descriptor": "Ldemo/SecondConfig;",
+                            },
+                        },
+                    ],
+                ),),
+            ),),
+            {},
+        )
+
+        self.assertEqual(
+            imported, {"demo/FirstConfig", "demo/SecondConfig"},
+        )
+
     def fixture(
         self,
         *,

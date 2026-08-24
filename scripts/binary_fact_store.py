@@ -585,7 +585,10 @@ class BinaryFactStore:
                     record, record_fact_json = _json_and_transport_jvm_value(
                         source_record
                     )
-                    label = str(record.get("class_entry") or "")
+                    # The lookup above proves this required binding is present;
+                    # retain its transported representation without inventing a
+                    # second empty-label state.
+                    label = str(record["class_entry"])
                     parse_status = (
                         "parsed" if record.get("frame_type") == "class_fact" else "failed"
                     )
@@ -1106,16 +1109,14 @@ class BinaryFactStore:
             )
 
         def field_type(offset: int) -> tuple[int, int]:
-            if offset >= length:
-                raise invalid()
             dimensions = 0
-            while offset < length and value[offset] == "[":
+            while value[offset] == "[":
                 dimensions += 1
                 if dimensions > 255:
                     raise invalid()
                 offset += 1
-            if offset >= length:
-                raise invalid()
+                if offset >= length:
+                    raise invalid()
             marker = value[offset]
             if marker in "BCDFIJSZ":
                 slots = 1 if dimensions or marker not in "JD" else 2
@@ -1146,7 +1147,8 @@ class BinaryFactStore:
             parameter_slots += slots
             if parameter_slots > 255:
                 raise invalid()
-        if cursor >= length or value[cursor] != ")":
+        # The loop exits only at ')' or at the end of the descriptor.
+        if cursor >= length:
             raise invalid()
         cursor += 1
         if cursor >= length:
@@ -2056,14 +2058,17 @@ class BinaryFactStore:
             )
             if value
         )
-        has_main_method = include_main_method and any(
-            str(((method or {}).get("contract") or {}).get("name") or "")
-            == "main"
-            and str(
-                ((method or {}).get("contract") or {}).get("descriptor") or ""
-            ) == "([Ljava/lang/String;)V"
-            for method in methods
-        )
+        has_main_method = False
+        if include_main_method:
+            for method in methods:
+                contract = (method or {}).get("contract") or {}
+                if (
+                    str(contract.get("name") or "") == "main"
+                    and str(contract.get("descriptor") or "")
+                    == "([Ljava/lang/String;)V"
+                ):
+                    has_main_method = True
+                    break
         return has_runtime_annotations, hierarchy_types, has_main_method
 
     def runtime_trigger_summary(self) -> dict[str, Any]:

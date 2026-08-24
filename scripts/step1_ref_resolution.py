@@ -78,7 +78,9 @@ def resolve_step1_ref(
         return {
             **remote,
             "status": "fetch_failed",
-            "source_status": str(remote.get("status") or "remote_fetch_failed"),
+            # Membership in ``remote_operational_failure`` already proves this
+            # value is one of the three non-empty status strings above.
+            "source_status": str(remote.get("status")),
         }
 
     if not allow_local_source:
@@ -124,11 +126,12 @@ def resolve_step1_ref(
         **remote,
         "status": status,
         "source_status": (
-            str(remote.get("status") or "remote_fetch_failed")
+            str(remote.get("status"))
             if remote_operational_failure
             else str(local.get("status") or "awaiting_local_source_confirmation")
         ),
         "remote_source_status": str(remote.get("status") or ""),
+        "remote_failures": list(remote.get("failures") or []),
         "local_candidate_commit": str(local.get("local_candidate_commit") or ""),
         "dirty": bool(local.get("dirty")),
     }

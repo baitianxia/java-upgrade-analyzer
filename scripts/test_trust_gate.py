@@ -10,6 +10,8 @@ import json
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from whitebox_call_coverage import audit_internal_test_scope
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_POLICY = ROOT / "tests" / "fixtures" / "test_suite_policy.json"
@@ -32,10 +34,17 @@ SKIP_NAMES = {
     "skip", "skipIf", "skipUnless", "skipTest", "SkipTest", "expectedFailure",
 }
 MOCK_NAMES = {"mock", "patch", "patch.object"}
-SCENARIO_DIMENSIONS = {
+BASE_SCENARIO_DIMENSIONS = {
     "nominal", "counterexample", "boundary", "failure_closed", "recovery",
     "metamorphic",
 }
+REQUIRED_FAULT_SCENARIO_DIMENSIONS = {
+    "invalid_input", "partial_failure", "state_transition", "concurrency",
+    "resource_limit",
+}
+SCENARIO_DIMENSIONS = (
+    BASE_SCENARIO_DIMENSIONS | REQUIRED_FAULT_SCENARIO_DIMENSIONS
+)
 ADVERSE_SCENARIO_DIMENSIONS = SCENARIO_DIMENSIONS - {"nominal"}
 
 
@@ -994,6 +1003,14 @@ def _scenario_contract_for_capabilities(
         issues.append(_issue(
             "PUBLIC_SCENARIO_DIMENSION_VOCABULARY_INVALID", location,
         ))
+    required_fault_dimensions = set(
+        contract.get("required_fault_dimensions") or ()
+    )
+    if required_fault_dimensions != REQUIRED_FAULT_SCENARIO_DIMENSIONS:
+        issues.append(_issue(
+            "PUBLIC_SCENARIO_REQUIRED_FAULT_DIMENSIONS_INVALID", location,
+        ))
+        required_fault_dimensions = REQUIRED_FAULT_SCENARIO_DIMENSIONS
     floors = contract.get("risk_minimum_dimensions")
     expected_floors = {"critical": 3, "high": 2, "medium": 2, "low": 1}
     if floors != expected_floors:
@@ -1158,6 +1175,17 @@ def _scenario_contract_for_capabilities(
                 f"risk={risk},required={minimum},actual={len(dimensions)}",
             ))
         coverage[capability_id] = tuple(sorted(dimensions))
+    observed_dimensions = {
+        dimension for dimensions in coverage.values() for dimension in dimensions
+    }
+    missing_fault_dimensions = sorted(
+        required_fault_dimensions - observed_dimensions
+    )
+    if missing_fault_dimensions:
+        issues.append(_issue(
+            "PUBLIC_SCENARIO_REQUIRED_FAULT_DIMENSION_MISSING", location,
+            ",".join(missing_fault_dimensions),
+        ))
     return issues, coverage
 
 
@@ -1563,6 +1591,58 @@ def run_trust_gate(
     if policy.get("schema") != "java-upgrade-analyzer.test-suite-policy.v1":
         issues.append(_issue("TEST_SUITE_POLICY_SCHEMA_INVALID", str(policy_file)))
 
+    internal_scope_relative = str(
+        policy.get("internal_test_scope") or ""
+    ).strip()
+    internal_scope_audit: dict[str, Any] = {
+        "status": "failed", "issues": [],
+    }
+    internal_scope_path = (root / internal_scope_relative).resolve()
+    if (
+        not internal_scope_relative
+        or not internal_scope_path.is_relative_to(root)
+        or not internal_scope_path.is_file()
+    ):
+        issues.append(_issue(
+            "INTERNAL_TEST_SCOPE_POLICY_INVALID", str(policy_file),
+            internal_scope_relative,
+        ))
+    else:
+        try:
+            internal_scope = _load_json(internal_scope_path)
+            internal_scope_audit = audit_internal_test_scope(
+                root,
+                internal_scope if isinstance(internal_scope, Mapping) else {},
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            issues.append(_issue(
+                "INTERNAL_TEST_SCOPE_UNREADABLE",
+                str(internal_scope_path),
+                f"{type(error).__name__}: {error}",
+            ))
+        else:
+            for row in internal_scope_audit.get("issues") or ():
+                issues.append(_issue(
+                    str(row.get("code") or "INTERNAL_TEST_SCOPE_INVALID"),
+                    str(internal_scope_path),
+                    str(row.get("detail") or ""),
+                ))
+            policy_entries = {
+                str(value).strip()
+                for value in policy.get("whitebox_entry_modules") or ()
+                if str(value).strip()
+            }
+            scope_entries = {
+                str(value).strip()
+                for value in internal_scope.get("analysis_entry_modules") or ()
+                if str(value).strip()
+            }
+            if not policy_entries or policy_entries != scope_entries:
+                issues.append(_issue(
+                    "POLICY_ANALYSIS_ENTRY_MODULES_MISMATCH",
+                    str(policy_file),
+                ))
+
     blackbox_sources: list[Path] = []
     for relative_root in policy.get("blackbox_test_roots") or ():
         source_root = (root / str(relative_root)).resolve()
@@ -1781,6 +1861,74 @@ def run_trust_gate(
                 "PERFORMANCE_SELECTOR_MODULE_MISSING", str(policy_file), selector,
             ))
 
+    raw_allowed_whitebox_skips = policy.get("allowed_whitebox_skip_selectors")
+    if (
+        not isinstance(raw_allowed_whitebox_skips, list)
+        or any(
+            not isinstance(value, str) or not value.strip()
+            for value in raw_allowed_whitebox_skips
+        )
+    ):
+        issues.append(_issue(
+            "WHITEBOX_SKIP_ALLOWLIST_INVALID", str(policy_file),
+        ))
+        raw_allowed_whitebox_skips = []
+    allowed_whitebox_skips = [
+        str(value).strip() for value in raw_allowed_whitebox_skips
+    ]
+    if len(allowed_whitebox_skips) != len(set(allowed_whitebox_skips)):
+        issues.append(_issue(
+            "WHITEBOX_SKIP_ALLOWLIST_DUPLICATE", str(policy_file),
+        ))
+    raw_required_whitebox_skips = policy.get(
+        "required_allowed_whitebox_skip_selectors"
+    )
+    if (
+        not isinstance(raw_required_whitebox_skips, list)
+        or any(
+            not isinstance(value, str) or not value.strip()
+            for value in raw_required_whitebox_skips
+        )
+    ):
+        issues.append(_issue(
+            "WHITEBOX_REQUIRED_SKIP_ALLOWLIST_INVALID", str(policy_file),
+        ))
+        raw_required_whitebox_skips = []
+    required_whitebox_skips = {
+        str(value).strip() for value in raw_required_whitebox_skips
+    }
+    if set(allowed_whitebox_skips) != required_whitebox_skips:
+        issues.append(_issue(
+            "WHITEBOX_SKIP_ALLOWLIST_POLICY_MISMATCH", str(policy_file),
+            "missing=" + ",".join(sorted(
+                required_whitebox_skips - set(allowed_whitebox_skips)
+            )) + ";undeclared=" + ",".join(sorted(
+                set(allowed_whitebox_skips) - required_whitebox_skips
+            )),
+        ))
+    for selector in allowed_whitebox_skips:
+        if (
+            selector == "tests.blackbox"
+            or selector.startswith("tests.blackbox.")
+            or any(
+                selector == performance
+                or selector.startswith(performance.rstrip(".") + ".")
+                for performance in selectors
+            )
+            or not selector.rsplit(".", 1)[-1].startswith("test_")
+        ):
+            issues.append(_issue(
+                "WHITEBOX_SKIP_ALLOWLIST_SELECTOR_INVALID",
+                str(policy_file), selector,
+            ))
+        module = _selector_module(selector)
+        module_path = root / (module.replace(".", "/") + ".py")
+        if not module_path.is_file():
+            issues.append(_issue(
+                "WHITEBOX_SKIP_ALLOWLIST_MODULE_MISSING",
+                str(policy_file), selector,
+            ))
+
     raw_windows_selectors = policy.get("windows_test_selectors")
     if (
         not isinstance(raw_windows_selectors, list)
@@ -1971,6 +2119,7 @@ def run_trust_gate(
                 "missing", 0
             ),
             "performance_selectors": len(selectors),
+            "allowed_whitebox_skips": len(allowed_whitebox_skips),
             "windows_selectors": len(windows_selectors),
             "windows_excluded_selectors": len(windows_exclusions),
             "public_scenario_contracts": capability_readiness.get(
@@ -1982,8 +2131,18 @@ def run_trust_gate(
             "public_support_claims": capability_readiness.get(
                 "support_claims", 0
             ),
+            "internal_analysis_modules": internal_scope_audit.get(
+                "analysis_module_count", 0
+            ),
+            "internal_support_modules": internal_scope_audit.get(
+                "support_module_count", 0
+            ),
+            "internal_shell_entrypoints": internal_scope_audit.get(
+                "shell_entrypoint_count", 0
+            ),
         },
         "capability_readiness": capability_readiness,
+        "internal_test_scope": internal_scope_audit,
         "classification": {
             "blackbox": list(policy.get("blackbox_test_roots") or ()),
             "performance": selectors,

@@ -958,7 +958,7 @@ class BinaryTraceEngine:
             payload["decision_bucket"] = "diagnostic_inconclusive"
         payload["trace_result_identity"] = _identity(
             "binary_trace_result_identity",
-            {key: value for key, value in payload.items() if key != "trace_result_identity"},
+            payload,
         )
         return payload
 

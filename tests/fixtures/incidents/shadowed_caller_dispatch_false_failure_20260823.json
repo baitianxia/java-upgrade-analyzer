@@ -1,0 +1,37 @@
+{
+  "schema": "java-upgrade-analyzer.test-incident-evidence.v1",
+  "incident_id": "shadowed-caller-dispatch-false-failure-20260823",
+  "observed_at": "2026-08-23T11:22:13Z",
+  "platform": "macOS aarch64 fixed mybatis-sample-annotation Release project with OpenJDK 21.0.8",
+  "trigger": "the executable BOOT-INF/classes layer overrides MybatisAutoConfiguration$AutoConfiguredMapperScannerRegistrar while the same class remains physically present in the nested autoconfigure JAR",
+  "actual_pre_fix_behavior": "the independent validator scanned all physical invokevirtual/invokeinterface rows when checking missing dispatch evidence, including edges owned by the shadowed nested-JAR class, and rejected the generation with 728 dispatch issues",
+  "expected_behavior": "dispatch completeness is defined over caller variants selected by the target class-loader topology; an active caller edge must have reconciliation evidence, while a physically present shadowed caller edge must not be required or reconciled",
+  "root_cause": "the missing-dispatch query subtracted observed edge identities from the entire direct_edges table but did not join caller members to the independently cross-checked selected provider artifact",
+  "observed_real_project_evidence": {
+    "case": "mybatis-sample-annotation",
+    "application_sha256": "898f440dd1ff83071855523ec1efb174e5d69ac6fff04f669141d53866bb2b8f",
+    "generation_identity": "28dca563f9b7686cefd692967f645c5647b5a775256309743afe443590a393fa",
+    "overridden_class": "org/mybatis/spring/boot/autoconfigure/MybatisAutoConfiguration$AutoConfiguredMapperScannerRegistrar",
+    "selected_business_class_variant_identity": "90f5e69ecf2e2bc6ab96d10f131a223063f35a0816734fa1b7aba2eb316f77a5",
+    "shadowed_dependency_class_variant_identity": "63ff133689be0ac8b7ae8e56f8afcdf1bdb6052d75132da237563dda62bd808a",
+    "missing_physical_dispatch_edges_per_side": 208,
+    "oracle_target_mismatches": 364,
+    "oracle_status_mismatches": 364,
+    "total_validation_issues": 728
+  },
+  "independent_evidence": {
+    "oracle": "OpenJDK classpath execution plus ordered ZIP inventory",
+    "base_stdout": "1:A:AB",
+    "current_stdout": "2:B:BA",
+    "physical_duplicate_dispatch_edge_count": 2,
+    "selected_dispatch_edge_count": 1,
+    "shadowed_dispatch_edge_count": 1,
+    "expected_reconciled_dispatch_edge_count": 1
+  },
+  "reproduction": [
+    "Place two JARs containing dup.Provider and dup.Provider$Helper on the classpath, with Provider.value invoking Helper.value, then swap their order between base and current.",
+    "Use an actual JVM to prove the first provider wins and ordered resource enumeration remains unchanged.",
+    "Run the public binary pipeline and inspect the immutable fact store: both physical dispatch edges exist, exactly the selected caller edge is reconciled, and independent validation passes.",
+    "Run the fixed mybatis-sample-annotation manifest and require independent validation plus the pinned JVM linkage Oracle to pass."
+  ]
+}

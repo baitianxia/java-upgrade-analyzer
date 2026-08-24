@@ -550,7 +550,9 @@ class FinalArtifactEdgeOraclePerformanceTest(unittest.TestCase):
                 spilled_root,
                 target_major=21,
                 stage_javap_archive=True,
-                max_staged_class_bytes=0,
+                # Keep the first class in memory, then force the second class
+                # to spill both staged and subsequent entries to disk.
+                max_staged_class_bytes=len(payloads["odd/EntryOne.class"]),
             )
             self.assertEqual(spill_failures, [])
             self.assertTrue(all(not entry.javap_argument for entry in spilled))
@@ -558,6 +560,66 @@ class FinalArtifactEdgeOraclePerformanceTest(unittest.TestCase):
             self.assertTrue(all(
                 entry.extracted_path.is_file() for entry in spilled
             ))
+
+    def test_member_header_field_initializer_ignores_quoted_assignment_markers(self):
+        member, kind = oracle._parse_member_header(
+            '  public static final java.lang.String VALUE = "left=right";',
+            "fixture.Constants",
+        )
+
+        self.assertEqual((member, kind), ("VALUE", "field"))
+
+    def test_javap_archive_staging_failure_falls_back_to_exact_class_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifact = root / "fixture.jar"
+            content = _minimal_static_edge_class("fixture/Fallback", "call")
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("fixture/Fallback.class", content)
+            extracted = root / "extracted"
+            extracted.mkdir()
+
+            with patch.object(
+                oracle,
+                "_stage_javap_archive",
+                side_effect=OSError("staging unavailable"),
+            ):
+                entries, failures = oracle._extract_packaged_classes(
+                    artifact,
+                    extracted,
+                    target_major=21,
+                    stage_javap_archive=True,
+                )
+            extracted_bytes = entries[0].extracted_path.read_bytes()
+
+        self.assertEqual(failures, [])
+        self.assertEqual(len(entries), 1)
+        self.assertIsNone(entries[0].content)
+        self.assertEqual(extracted_bytes, content)
+
+    @unittest.skipUnless(JDK_TOOLS, "JDK tools are required")
+    def test_single_entry_parser_selects_verbose_mode_from_class_bytes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            content = _minimal_static_edge_class("fixture/Plain", "call")
+            entry = oracle.PackagedClass(
+                "fixture/Plain.class",
+                root / "Plain.class",
+                content,
+            )
+            javap = str(shutil.which("javap"))
+
+            result = oracle._parse_entry_with_javap(
+                entry,
+                "a" * 64,
+                javap,
+                oracle._javap_version(javap, timeout=5.0),
+                oracle.Event(),
+                time.perf_counter() + 10,
+            )
+
+        self.assertTrue(result["completed"])
+        self.assertTrue(result["parsed"], result["failures"])
 
     def test_boot_archive_can_exclude_external_target_provider_from_consumer_oracle(self):
         with tempfile.TemporaryDirectory() as temp_dir:

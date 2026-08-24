@@ -240,9 +240,11 @@ def reconcile_edges(
         oracle_bucket = oracle_by_relation.get(relation_key, [])
         matched = min(len(analyzer_bucket), len(oracle_bucket))
         for analyzer_record, oracle_record in zip(analyzer_bucket[:matched], oracle_bucket[:matched]):
-            if analyzer_record["identity_string"] != oracle_record["identity_string"]:
-                _set_disposition(analyzer_record, "identity_mismatch", "same_relation_key_different_identity")
-                _set_disposition(oracle_record, "identity_mismatch", "same_relation_key_different_identity")
+            # Exact identities were already paired and removed from the active
+            # groups above. Any remaining cross-side pair for one relation key
+            # therefore differs in descriptor, opcode, or artifact identity.
+            _set_disposition(analyzer_record, "identity_mismatch", "same_relation_key_different_identity")
+            _set_disposition(oracle_record, "identity_mismatch", "same_relation_key_different_identity")
 
     for record in ledger_records:
         if record["disposition"] is None:

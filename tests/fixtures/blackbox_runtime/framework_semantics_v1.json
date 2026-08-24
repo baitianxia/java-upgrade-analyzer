@@ -233,6 +233,10 @@
     "http_dubbo_service": {
       "expected_base_stdout": "11",
       "expected_current_stdout": "22",
+      "method_only_annotation_runtime": "true",
+      "method_only_client": ["biz/MethodRemoteClient", "call", "()I"],
+      "method_annotation_marker": "feign.RequestLine",
+      "forbidden_class_annotation_marker": "org.springframework.cloud.openfeign.FeignClient",
       "targets": [
         ["feign/SynchronousMethodHandler", "invoke", "([Ljava/lang/Object;)Ljava/lang/Object;", "method"],
         ["demo/Provider", "execute", "()I", "method"]
@@ -277,6 +281,9 @@
     "implicit_data_contract": {
       "target": ["lib/Dto", "removed", "Ljava/lang/String;", "field"],
       "semantic_edge_kind": "implicit_data_contract_dispatch",
+      "unrelated_caller": ["biz/UnrelatedJson", "parse", "()Ljava/lang/Object;"],
+      "unrelated_direct_call_marker": "com/fasterxml/jackson/databind/ObjectMapper.readValue",
+      "forbidden_unrelated_type_marker": "lib/Dto",
       "expected_state": {
         "reachability_status": "reachable",
         "impact_conclusion": "probable_impact",

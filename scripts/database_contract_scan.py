@@ -193,8 +193,9 @@ def extract_sql_references(sql: str) -> tuple[tuple[str, ...], tuple[str, ...], 
         flags=re.I,
     ):
         name = _clean_identifier(match.group(1))
-        if name and not name.startswith(("$", "#")):
-            tables.add(name)
+        # IDENTIFIER cannot match an empty name or a bind-expression prefix;
+        # cleaning only removes optional identifier quoting.
+        tables.add(name)
 
     columns = set()
 
@@ -202,7 +203,8 @@ def extract_sql_references(sql: str) -> tuple[tuple[str, ...], tuple[str, ...], 
         candidate = re.sub(r"\s+(?:as\s+)?[A-Za-z_]\w*$", "", candidate.strip(), flags=re.I)
         if re.fullmatch(IDENTIFIER, candidate):
             name = _simple_column(candidate)
-            if name and name.lower() not in SQL_KEYWORDS and name != "*":
+            # IDENTIFIER excludes both an empty value and '*'.
+            if name.lower() not in SQL_KEYWORDS:
                 columns.add(name)
 
     select_match = re.search(r"\bselect\s+(.*?)\s+from\b", normalized, flags=re.I | re.S)
@@ -226,6 +228,15 @@ def extract_sql_references(sql: str) -> tuple[tuple[str, ...], tuple[str, ...], 
         flags=re.I,
     ):
         add_column(match.group(1))
+    # A column-to-column predicate is a contract on both operands. The first
+    # pass above retains the left side; retain an explicit identifier on the
+    # right side as well (literals and bind expressions do not match).
+    for match in re.finditer(
+        rf"(?:=|<>|!=|<=|>=|<|>)\s*({IDENTIFIER})",
+        normalized,
+        flags=re.I,
+    ):
+        add_column(match.group(1))
     return tuple(sorted(tables)), tuple(sorted(columns)), dynamic or not bool(tables or columns)
 
 
@@ -238,7 +249,9 @@ def extract_sql_fragment_references(
     # A common MyBatis <sql> fragment is only an explicit comma-separated
     # projection list, without SELECT/FROM keywords.
     candidates = [_simple_column(item.strip()) for item in _normalize_sql(sql).split(',')]
-    if candidates and all(
+    # str.split always produces at least one candidate. An empty fragment is
+    # represented by one empty candidate and is rejected by ``all``.
+    if all(
         candidate and re.fullmatch(r"[A-Za-z_][\w$]*", candidate)
         and candidate.lower() not in SQL_KEYWORDS
         for candidate in candidates
@@ -263,7 +276,7 @@ def _annotation_values(annotation: dict[str, Any]) -> dict[str, Any]:
 
 def _annotations_by_descriptor(values: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return {
-        str(item.get("descriptor") or "").split("@", 1)[0]: item
+        str(item["descriptor"]).split("@", 1)[0]: item
         for item in values or ()
         if isinstance(item, dict) and item.get("descriptor")
     }
@@ -289,6 +302,19 @@ def _sql_from_annotation(annotation: dict[str, Any]) -> str:
     if isinstance(value, list):
         return " ".join(str(item) for item in value if isinstance(item, str))
     return str(value or "")
+
+
+def _bean_property_name(method_name: str, prefix_length: int) -> str:
+    """Apply java.beans.Introspector.decapitalize to a getter suffix."""
+    suffix = method_name[prefix_length:]
+    if len(suffix) > 1 and suffix[:2].isupper():
+        return suffix
+    return suffix[:1].lower() + suffix[1:]
+
+
+def _mapping_confidence(*conditions: Any) -> str:
+    """Return confirmed only when every independently required fact exists."""
+    return ("需复核", "确认")[all(conditions)]
 
 
 def facts_from_class_record(
@@ -411,10 +437,8 @@ def facts_from_class_record(
             columns=(column,),
             normalized=f"{table}.{column}:{field_value.get('descriptor') or ''}",
             evidence=f"{entry}#{field_name}",
-            confidence=(
-                "确认"
-                if explicit_table and explicit_column and field_access_certain
-                else "需复核"
+            confidence=_mapping_confidence(
+                explicit_table, explicit_column, field_access_certain
             ),
         ))
     for method_value in method_values if is_jpa else ():
@@ -441,9 +465,9 @@ def facts_from_class_record(
         if not explicit_column and not property_candidate:
             continue
         if method_name.startswith('get'):
-            property_name = method_name[3:4].lower() + method_name[4:]
+            property_name = _bean_property_name(method_name, 3)
         elif method_name.startswith('is'):
-            property_name = method_name[2:3].lower() + method_name[3:]
+            property_name = _bean_property_name(method_name, 2)
         else:
             property_name = method_name
         column = explicit_column or property_name
@@ -456,11 +480,11 @@ def facts_from_class_record(
             columns=(column,),
             normalized=f"{table}.{column}:{descriptor}",
             evidence=f"{entry}#{method_name}{descriptor}",
-            confidence=(
-                "确认"
-                if explicit_table and explicit_column
-                and method_id_present and not field_id_present
-                else "需复核"
+            confidence=_mapping_confidence(
+                explicit_table,
+                explicit_column,
+                method_id_present,
+                not field_id_present,
             ),
         ))
     return facts
@@ -489,7 +513,9 @@ def facts_from_mapper_xml(content: bytes, entry: str) -> list[ContractFact]:
         tag = _local_name(element.tag)
         if tag in {"select", "insert", "update", "delete"}:
             statement_id = str(element.attrib.get("id") or "<anonymous>")
-            sql = " ".join(text for text in element.itertext() if text and text.strip())
+            # ElementTree.itertext() yields strings only; empty/whitespace
+            # strings are the sole values that need filtering.
+            sql = " ".join(filter(None, map(str.strip, element.itertext())))
             tables, columns, ambiguous = extract_sql_references(sql)
             dynamic = ambiguous or any(child is not element for child in element.iter())
             facts.append(ContractFact(
@@ -507,7 +533,7 @@ def facts_from_mapper_xml(content: bytes, entry: str) -> list[ContractFact]:
             ))
         elif tag == 'sql':
             fragment_id = str(element.attrib.get('id') or '<anonymous>')
-            sql = " ".join(text for text in element.itertext() if text and text.strip())
+            sql = " ".join(filter(None, map(str.strip, element.itertext())))
             tables, columns, ambiguous = extract_sql_fragment_references(sql)
             facts.append(ContractFact(
                 key=f"mybatis-fragment:{namespace}:{fragment_id}",
@@ -603,7 +629,7 @@ def facts_from_orm_xml(content: bytes, entry: str) -> list[ContractFact]:
                 columns=(_simple_column(effective_column),),
                 normalized=f"{effective_table}.{effective_column}",
                 evidence=f"{entry}#{class_name}.{property_name}",
-                confidence='确认' if table and column else '需复核',
+            confidence=_mapping_confidence(table, column),
             ))
     return facts
 
@@ -657,11 +683,8 @@ def scan_artifact(
                 except ET.ParseError:
                     # Most packaged XML files are not MyBatis mappers. Only flag
                     # files that look like one, avoiding unrelated XML noise.
-                    try:
-                        if b"<mapper" in content[:4096]:
-                            result.gaps.append(f"mapper_xml_unreadable:{info.filename}")
-                    except UnboundLocalError:
-                        pass
+                    if b"<mapper" in content[:4096]:
+                        result.gaps.append(f"mapper_xml_unreadable:{info.filename}")
                 except (OSError, UnicodeError, ValueError) as error:
                     result.gaps.append(f"mapper_xml_unreadable:{info.filename}:{type(error).__name__}")
             try:
@@ -676,7 +699,7 @@ def scan_artifact(
         try:
             run = extract_class_facts(class_inputs, jdk_home=jdk_home)
             class_records = {
-                str(record.get('class_name') or ''): record
+                str(record['class_name']): record
                 for record in run.records
                 if record.get('frame_type') == 'class_fact'
             }
@@ -846,20 +869,24 @@ def _scan_side_rows(
     if not path.is_file():
         gaps.append(f"artifact_missing:{side}:{coord}:{path}")
         return None
-    expected = str(row.get("nested_jar_sha256") or row.get("sha256") or "").lower()
-    if expected:
-        try:
-            digest_value = hashlib.sha256()
-            with path.open('rb') as handle:
-                for block in iter(lambda: handle.read(1024 * 1024), b''):
-                    digest_value.update(block)
-            digest = digest_value.hexdigest()
-        except OSError as error:
-            gaps.append(f"artifact_digest_unreadable:{side}:{coord}:{type(error).__name__}")
-            return None
-        if digest != expected:
-            gaps.append(f"artifact_digest_mismatch:{side}:{coord}")
-            return None
+    expected = str(
+        row.get("nested_jar_sha256") or row.get("sha256") or ""
+    ).strip()
+    if re.fullmatch(r"[0-9a-f]{64}", expected) is None:
+        gaps.append(f"artifact_identity_invalid:{side}:{coord}")
+        return None
+    try:
+        digest_value = hashlib.sha256()
+        with path.open('rb') as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b''):
+                digest_value.update(block)
+        digest = digest_value.hexdigest()
+    except OSError as error:
+        gaps.append(f"artifact_digest_unreadable:{side}:{coord}:{type(error).__name__}")
+        return None
+    if digest != expected:
+        gaps.append(f"artifact_digest_mismatch:{side}:{coord}")
+        return None
     result = scan_artifact(
         coord,
         str(row.get("version") or side),
@@ -948,6 +975,7 @@ def scan_database_contracts(
             raise ValueError("unsupported dependency_jars schema")
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
         gaps.append(f"dependency_jars_manifest_unavailable:{type(error).__name__}")
+        manifest = {}
 
     if manifest:
         for side in ("base", "current"):
@@ -959,12 +987,15 @@ def scan_database_contracts(
                 base_hash = str(
                     sides['base'][0].get('nested_jar_sha256')
                     or sides['base'][0].get('sha256') or ''
-                ).lower()
+                ).strip()
                 current_hash = str(
                     sides['current'][0].get('nested_jar_sha256')
                     or sides['current'][0].get('sha256') or ''
-                ).lower()
-                if base_hash and base_hash == current_hash:
+                ).strip()
+                if (
+                    re.fullmatch(r"[0-9a-f]{64}", base_hash) is not None
+                    and base_hash == current_hash
+                ):
                     base_path = Path(str(sides['base'][0].get('retained_path') or ''))
                     current_path = Path(str(sides['current'][0].get('retained_path') or ''))
                     try:

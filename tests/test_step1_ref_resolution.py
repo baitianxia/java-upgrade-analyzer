@@ -332,6 +332,231 @@ class Step1RefResolutionTest(unittest.TestCase):
         self.assertEqual(result["status"], "dirty_confirmation_required")
         self.assertTrue(result["dirty"])
 
+    def test_head_clean_candidate_without_authorization_is_not_found(self):
+        local = {
+            "status": "awaiting_local_source_confirmation",
+            "local_candidate_commit": "f" * 40,
+            "dirty": False,
+        }
+        with patch(
+            "step1_ref_resolution.resolve_local_source_ref",
+            return_value=local,
+        ), patch("step1_ref_resolution.resolve_remote_source_ref") as remote_resolver:
+            result = resolve_step1_ref("/repo", "HEAD")
+
+        self.assertEqual(result["status"], "not_found")
+        self.assertEqual(
+            result["source_status"], "awaiting_local_source_confirmation"
+        )
+        remote_resolver.assert_not_called()
+
+    def test_head_dirty_candidate_without_authorization_requires_confirmation(self):
+        local = {
+            "status": "awaiting_dirty_local_source_confirmation",
+            "local_candidate_commit": "f" * 40,
+            "dirty": True,
+        }
+        with patch(
+            "step1_ref_resolution.resolve_local_source_ref",
+            return_value=local,
+        ):
+            result = resolve_step1_ref("/repo", "HEAD")
+
+        self.assertEqual(result["status"], "dirty_confirmation_required")
+        self.assertEqual(
+            result["source_status"],
+            "awaiting_dirty_local_source_confirmation",
+        )
+
+    def test_head_missing_local_status_uses_explicit_confirmation_default(self):
+        with patch(
+            "step1_ref_resolution.resolve_local_source_ref",
+            return_value={},
+        ):
+            result = resolve_step1_ref("/repo", "HEAD")
+
+        self.assertEqual(result["status"], "not_found")
+        self.assertEqual(
+            result["source_status"], "awaiting_local_source_confirmation"
+        )
+
+    def test_blank_ref_and_authorized_head_use_remote_resolution(self):
+        remote = {
+            "status": "remote_source_resolved",
+            "resolved_ref": "origin/main",
+            "resolved_commit": "a" * 40,
+        }
+        for requested_ref, allow_local_source in ((None, False), ("", False), ("HEAD", True)):
+            with self.subTest(
+                requested_ref=requested_ref,
+                allow_local_source=allow_local_source,
+            ), patch(
+                "step1_ref_resolution.resolve_remote_source_ref",
+                return_value=remote,
+            ) as remote_resolver:
+                result = resolve_step1_ref(
+                    "/repo",
+                    requested_ref,
+                    allow_local_source=allow_local_source,
+                )
+
+            self.assertEqual(result["status"], "resolved")
+            remote_resolver.assert_called_once_with(
+                "/repo", requested_ref, expected_commit=""
+            )
+
+    def test_expected_remote_constraints_are_forwarded_only_when_present(self):
+        remote = {
+            "status": "remote_source_resolved",
+            "resolved_ref": "upstream/refs/tags/v2",
+            "resolved_commit": "b" * 40,
+        }
+        with patch(
+            "step1_ref_resolution.resolve_remote_source_ref",
+            return_value=remote,
+        ) as resolver:
+            result = resolve_step1_ref(
+                "/repo",
+                "v2",
+                expected_remote="upstream",
+                expected_remote_ref="refs/tags/v2",
+            )
+
+        self.assertEqual(result["status"], "resolved")
+        resolver.assert_called_once_with(
+            "/repo",
+            "v2",
+            expected_commit="",
+            expected_remote="upstream",
+            expected_remote_ref="refs/tags/v2",
+        )
+
+    def test_missing_remote_status_has_stable_not_found_defaults(self):
+        with patch(
+            "step1_ref_resolution.resolve_remote_source_ref",
+            return_value={},
+        ), patch("step1_ref_resolution.resolve_local_source_ref") as local_resolver:
+            result = resolve_step1_ref("/repo", "release")
+
+        self.assertEqual(result["status"], "not_found")
+        self.assertEqual(result["source_status"], "remote_ref_not_found")
+        self.assertEqual(result["remote_source_status"], "")
+        self.assertEqual(result["local_candidate_commit"], "")
+        self.assertFalse(result["dirty"])
+        local_resolver.assert_not_called()
+
+    def test_local_operational_failure_preserves_missing_remote_defaults(self):
+        failure = {"stage": "probe", "reason": "unclassified remote response"}
+        local = {"status": "local_status_unavailable"}
+        with patch(
+            "step1_ref_resolution.resolve_remote_source_ref",
+            return_value={"failures": [failure]},
+        ), patch(
+            "step1_ref_resolution.resolve_local_source_ref",
+            return_value=local,
+        ):
+            result = resolve_step1_ref(
+                "/repo", "release", allow_local_source=True
+            )
+
+        self.assertEqual(result["status"], "fetch_failed")
+        self.assertEqual(result["source_status"], "local_status_unavailable")
+        self.assertEqual(result["remote_source_status"], "")
+        self.assertEqual(result["remote_failures"], [failure])
+
+    def test_confirmed_local_source_preserves_empty_remote_defaults(self):
+        local = {
+            "status": "user_confirmed_local_source",
+            "resolved_commit": "c" * 40,
+        }
+        with patch(
+            "step1_ref_resolution.resolve_remote_source_ref",
+            return_value={},
+        ), patch(
+            "step1_ref_resolution.resolve_local_source_ref",
+            return_value=local,
+        ):
+            result = resolve_step1_ref(
+                "/repo", "release", allow_local_source=True
+            )
+
+        self.assertEqual(result["status"], "resolved")
+        self.assertEqual(result["source_status"], "user_confirmed_local_source")
+        self.assertEqual(result["remote_source_status"], "")
+        self.assertEqual(result["remote_failures"], [])
+
+    def test_operational_remote_failure_with_unconfirmed_local_source_stays_failed(self):
+        remote = {"status": "remote_fetch_failed"}
+        local = {"status": "awaiting_local_source_confirmation"}
+        with patch(
+            "step1_ref_resolution.resolve_remote_source_ref",
+            return_value=remote,
+        ), patch(
+            "step1_ref_resolution.resolve_local_source_ref",
+            return_value=local,
+        ):
+            result = resolve_step1_ref(
+                "/repo", "release", allow_local_source=True
+            )
+
+        self.assertEqual(result["status"], "fetch_failed")
+        self.assertEqual(result["source_status"], "remote_fetch_failed")
+        self.assertEqual(result["remote_failures"], [])
+        self.assertEqual(result["local_candidate_commit"], "")
+        self.assertFalse(result["dirty"])
+
+    def test_nonoperational_remote_miss_preserves_local_candidate(self):
+        remote = {
+            "status": "remote_ref_not_found",
+            "failures": [{"stage": "lookup", "reason": "missing"}],
+        }
+        local = {
+            "status": "awaiting_local_source_confirmation",
+            "local_candidate_commit": "d" * 40,
+            "dirty": False,
+        }
+        with patch(
+            "step1_ref_resolution.resolve_remote_source_ref",
+            return_value=remote,
+        ), patch(
+            "step1_ref_resolution.resolve_local_source_ref",
+            return_value=local,
+        ):
+            result = resolve_step1_ref(
+                "/repo", "release", allow_local_source=True
+            )
+
+        self.assertEqual(result["status"], "not_found")
+        self.assertEqual(
+            result["source_status"], "awaiting_local_source_confirmation"
+        )
+        self.assertEqual(result["remote_source_status"], "remote_ref_not_found")
+        self.assertEqual(
+            result["remote_failures"],
+            [{"stage": "lookup", "reason": "missing"}],
+        )
+        self.assertEqual(result["local_candidate_commit"], "d" * 40)
+        self.assertFalse(result["dirty"])
+
+    def test_unclassified_local_response_uses_safe_defaults(self):
+        with patch(
+            "step1_ref_resolution.resolve_remote_source_ref",
+            return_value={},
+        ), patch(
+            "step1_ref_resolution.resolve_local_source_ref",
+            return_value={},
+        ):
+            result = resolve_step1_ref(
+                "/repo", "release", allow_local_source=True
+            )
+
+        self.assertEqual(result["status"], "not_found")
+        self.assertEqual(
+            result["source_status"], "awaiting_local_source_confirmation"
+        )
+        self.assertEqual(result["local_candidate_commit"], "")
+        self.assertFalse(result["dirty"])
+
 
 if __name__ == "__main__":
     unittest.main()

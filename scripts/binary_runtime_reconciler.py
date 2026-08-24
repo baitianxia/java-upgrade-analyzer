@@ -636,7 +636,9 @@ class RuntimeReconciler:
         shared_strings.clear()
         self.realms, self.entrypoint_realms, topology_gaps = self._loader_topology(payload)
         self.coverage_gaps = set(topology_gaps)
-        profile_coverage = dict(payload.get("field_coverage") or {})
+        # RuntimeProfile validates that every required field has an explicit
+        # coverage value before reconciliation can be constructed.
+        profile_coverage = dict(payload["field_coverage"])
         for field_name in RuntimeProfile.REQUIRED_FIELDS:
             if profile_coverage.get(field_name) == "unknown":
                 self.coverage_gaps.add(f"runtime_profile_field_unknown:{field_name}")
@@ -727,6 +729,11 @@ class RuntimeReconciler:
         if not entrypoints:
             entrypoints = sorted(artifact_realms)
         for identity, realm in realms.items():
+            declared_parent = str(realm.get("parent") or "")
+            if declared_parent and declared_parent not in realms:
+                gaps.append(
+                    f"loader_parent_undeclared:{identity}:{declared_parent}"
+                )
             if realm.get("delegation", "parent_first") not in self.capability.supported_delegation_modes:
                 gaps.append(f"loader_delegation_unsupported:{identity}")
             if (
@@ -1179,7 +1186,10 @@ class RuntimeReconciler:
                     supported_parent_first = False
                     break
                 seen.add(current)
-                realm_config = self.realms.get(current, {})
+                realm_config = self.realms.get(current)
+                if realm_config is None:
+                    supported_parent_first = False
+                    break
                 if (
                     realm_config.get("delegation", "parent_first")
                     != "parent_first"
@@ -1284,10 +1294,7 @@ class RuntimeReconciler:
             self.definition_records[(realm, name)] = record
             if "class_definition" not in accumulator.retained_kinds:
                 self.definition_records[(realm, name)] = _DefinitionRuntimeRow(
-                    (
-                        record[field]
-                        if field in record else _MISSING_COMPACT_VALUE
-                    )
+                    record[field]
                     for field in _DefinitionRuntimeRow.FIELDS
                 )
 
@@ -1477,13 +1484,30 @@ class RuntimeReconciler:
             ):
                 return member, provider
         next_visited = visited + ((initiating_realm, owner),)
+        defining = info["defining_loader_realm_identity"]
         if kind == "field":
             parents = [*info["interfaces"], info["super_name"]]
         elif name == "<init>":
             parents = []
+        elif int(info.get("access_flags") or 0) & ACC_INTERFACE:
+            # JVMS 5.4.3.4 admits an Object fallback only for a public,
+            # non-static method. Do not traverse the interface classfile's
+            # ``super_name=java/lang/Object`` as an ordinary superclass.
+            object_member, object_provider = self._resolve_symbolic_member_uncached(
+                defining,
+                "java/lang/Object",
+                kind,
+                name,
+                descriptor,
+                next_visited,
+            )
+            if object_member:
+                flags = int(object_member.get("access_flags") or 0)
+                if flags & ACC_PUBLIC and not flags & ACC_STATIC:
+                    return object_member, object_provider
+            parents = [*info["interfaces"]]
         else:
             parents = [info["super_name"], *info["interfaces"]]
-        defining = info["defining_loader_realm_identity"]
         for parent in parents:
             if not parent:
                 continue
@@ -1687,7 +1711,7 @@ class RuntimeReconciler:
         )
         if not provider_owner:
             status = "primitive_or_array_type"
-        elif not provider or provider["class_provider_status"] != "resolved":
+        elif provider["class_provider_status"] != "resolved":
             status = "unresolved"
         elif not self._class_load_ready(definition):
             status = "class_definition_failed"
@@ -1788,7 +1812,7 @@ class RuntimeReconciler:
             super_complete = self._append_class_initialization_chain(
                 defining, info["super_name"], visited, chain
             )
-            complete = complete and super_complete
+            complete = super_complete
         for interface in info["interfaces"]:
             interface_targets, interface_complete = (
                 self._default_interface_initializers(
@@ -2076,7 +2100,7 @@ class RuntimeReconciler:
                     self._class_initialization_resolution(
                         edge,
                         caller_realm,
-                        str((caller or {}).get("class_name") or ""),
+                        str(caller.get("class_name") or ""),
                     ),
                 )
                 continue
@@ -2177,7 +2201,7 @@ class RuntimeReconciler:
                     if array_clone:
                         payload["jvm_array_member_semantics"] = "public_clone"
                     if not array_clone and not self._member_accessible(
-                        str((caller or {}).get("class_name") or ""),
+                        str(caller.get("class_name") or ""),
                         caller_realm,
                         member,
                         member_provider,

@@ -92,6 +92,176 @@ class BinaryAsmHelperTest(unittest.TestCase):
             self.class_file.read_bytes() if payload is None else payload,
         )
 
+    @staticmethod
+    def _frame(payload):
+        encoded = helper._canonical_json(payload)
+        return len(encoded).to_bytes(4, "big") + encoded
+
+    def _run_fake_protocol(
+        self,
+        records=(),
+        *,
+        header_override=None,
+        footer_override=None,
+        omit_header=False,
+        omit_footer=False,
+        trailing=b"",
+        returncode=0,
+        max_records=helper.DEFAULT_MAX_RECORDS,
+        stdout_override=Ellipsis,
+        timer_type=None,
+        process_poll=None,
+        inputs=None,
+        record_consumer=None,
+        retain_records=True,
+        raw_records_override=None,
+        extract_options=None,
+    ):
+        identity = "identity"
+        helper_sha = "helper-sha"
+        asm = Path(self.temp.name) / "fake-protocol-asm.jar"
+        asm.write_bytes(b"asm")
+        classes = Path(self.temp.name) / "fake-protocol-classes"
+        classes.mkdir(exist_ok=True)
+        compiled = SimpleNamespace(output=classes, java="java")
+
+        class PassiveTimer:
+            daemon = False
+
+            def __init__(self, _seconds, callback):
+                self.callback = callback
+
+            def start(self):
+                pass
+
+            def cancel(self):
+                pass
+
+            def join(self):
+                pass
+
+        selected_timer = timer_type or PassiveTimer
+
+        def popen(_command, *, stdin, stdout, stderr):
+            del stdout, stderr
+            first_raw, first_present = helper._read_frame(
+                stdin, max_frame_bytes=helper.DEFAULT_MAX_FRAME_BYTES
+            )
+            self.assertTrue(first_present)
+            input_header = json.loads(first_raw)
+            output_header = {
+                "frame_type": "output_header",
+                "protocol_schema": helper.PROTOCOL_SCHEMA,
+                "output_schema": helper.OUTPUT_SCHEMA,
+                "parser_identity": identity,
+                "helper_sha256": helper_sha,
+                "asm_version": helper.ASM_VERSION,
+                "max_supported_class_major": helper.MAX_SUPPORTED_CLASS_MAJOR,
+            }
+            if header_override:
+                output_header.update(header_override)
+            raw_records = (
+                list(raw_records_override)
+                if raw_records_override is not None
+                else [helper._canonical_json(record) for record in records]
+            )
+            record_digest = hashlib.sha256()
+            for raw in raw_records:
+                helper._framed_digest_update(record_digest, raw)
+            fact_count = sum(
+                record.get("frame_type") == "class_fact" for record in records
+            )
+            failure_count = sum(
+                record.get("frame_type") == "class_failure" for record in records
+            )
+            output_footer = {
+                "frame_type": "output_footer",
+                "input_record_count": int(input_header["class_input_count"]),
+                "fact_record_count": fact_count,
+                "failure_record_count": failure_count,
+                "output_record_count": len(records),
+                "class_input_digest": input_header["class_input_digest"],
+                "fact_output_digest": record_digest.hexdigest(),
+                "coverage_status": "complete" if failure_count == 0 else "partial",
+            }
+            if footer_override:
+                output_footer.update(footer_override)
+            stream = bytearray()
+            if not omit_header:
+                stream.extend(self._frame(output_header))
+            for raw in raw_records:
+                stream.extend(len(raw).to_bytes(4, "big"))
+                stream.extend(raw)
+            if not omit_footer:
+                stream.extend(self._frame(output_footer))
+            stream.extend(trailing)
+            actual_stdout = (
+                io.BytesIO(bytes(stream))
+                if stdout_override is Ellipsis
+                else stdout_override
+            )
+            process = SimpleNamespace(
+                pid=12345,
+                stdout=actual_stdout,
+                returncode=None,
+                poll=process_poll or (lambda: 0),
+            )
+
+            def wait():
+                callback = getattr(process, "wait_callback", None)
+                if callback:
+                    callback()
+                process.returncode = returncode
+                return returncode
+
+            process.wait = wait
+            self._last_fake_process = process
+            return process
+
+        with patch.object(helper, "resolve_asm_jar", return_value=asm), patch.object(
+            helper, "parser_identity", return_value=(identity, helper_sha)
+        ), patch.object(
+            helper, "_compile_helper", return_value=compiled
+        ), patch.object(
+            helper, "managed_popen", side_effect=popen
+        ), patch.object(
+            helper.threading, "Timer", selected_timer
+        ), patch.object(
+            helper, "terminate_process_tree"
+        ), patch.object(
+            helper, "release_process_tree"
+        ):
+            options = {"max_records": max_records}
+            options.update(extract_options or {})
+            return helper.extract_class_facts(
+                list(inputs) if inputs is not None else [self.class_input(b"class")],
+                record_consumer=record_consumer,
+                retain_records=retain_records,
+                **options,
+            )
+
+    @staticmethod
+    def _valid_fact_record(
+        *,
+        artifact="artifact-instance-1",
+        entry="demo/Sample.class",
+        payload=b"class",
+    ):
+        return {
+            "frame_type": "class_fact",
+            "artifact_instance_identity": artifact,
+            "class_entry": entry,
+            "class_bytes_sha256": hashlib.sha256(payload).hexdigest(),
+            "class_name": entry.removesuffix(".class"),
+            "class_major": 52,
+            "class_access": 1,
+            "fields": [],
+            "methods": [],
+            "attribute_inventory": [],
+            "attribute_inventory_digest": "attributes",
+            "class_contract_digest": "contract",
+        }
+
     def test_helper_source_remains_java8_source_and_api_compatible(self):
         javac = shutil.which("javac")
         version = subprocess.run(
@@ -319,6 +489,58 @@ class BinaryAsmHelperTest(unittest.TestCase):
         self.assertTrue(timers[0].cancelled)
         self.assertTrue(timers[0].joined)
         terminate.assert_not_called()
+
+    def test_live_deadline_callback_invokes_real_process_tree_termination(self):
+        class ImmediateTimer:
+            daemon = False
+
+            def __init__(self, _seconds, callback):
+                self.callback = callback
+
+            def start(self):
+                self.callback()
+
+            def cancel(self):
+                pass
+
+            def join(self):
+                pass
+
+        process = SimpleNamespace(
+            pid=987_654_321,
+            stdin=None,
+            stdout=io.BytesIO(),
+            stderr=None,
+            returncode=None,
+            poll=lambda: None,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            asm = root / "asm.jar"
+            asm.write_bytes(b"asm")
+            classes = root / "classes"
+            classes.mkdir()
+            compiled = SimpleNamespace(output=classes, java=sys.executable)
+            with patch.object(
+                helper, "resolve_asm_jar", return_value=asm,
+            ), patch.object(
+                helper, "parser_identity", return_value=("identity", "helper-sha"),
+            ), patch.object(
+                helper, "_compile_helper", return_value=compiled,
+            ), patch.object(
+                helper, "managed_popen", return_value=process,
+            ), patch.object(
+                helper.threading, "Timer", ImmediateTimer,
+            ):
+                with self.assertRaises(helper.BinaryAsmError) as raised:
+                    helper.extract_class_facts([
+                        helper.BinaryClassInput(
+                            "artifact", "Sample.class", b"class",
+                        ),
+                    ])
+
+        self.assertEqual(raised.exception.reason_code, "ASM_HELPER_TIMEOUT")
+        self.assertTrue(process.stdout.closed)
 
     def test_cleanup_does_not_remove_directory_owned_by_another_process(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(
@@ -595,6 +817,347 @@ print(json.dumps([
             raised.exception.reason_code,
             "ASM_IMPLEMENTATION_CHANGED_DURING_RUN",
         )
+
+    def test_input_value_object_rejects_every_missing_and_type_boundary(self):
+        cases = (
+            ((None, "Entry.class", b"x"), "ASM_ARTIFACT_IDENTITY_MISSING"),
+            (("", "Entry.class", b"x"), "ASM_ARTIFACT_IDENTITY_MISSING"),
+            (("   ", "Entry.class", b"x"), "ASM_ARTIFACT_IDENTITY_MISSING"),
+            (("artifact", None, b"x"), "ASM_CLASS_ENTRY_MISSING"),
+            (("artifact", "", b"x"), "ASM_CLASS_ENTRY_MISSING"),
+            (("artifact", "   ", b"x"), "ASM_CLASS_ENTRY_MISSING"),
+            (("artifact", "Entry.class", bytearray(b"x")), "ASM_CLASS_BYTES_INVALID"),
+            (("artifact", "Entry.class", None), "ASM_CLASS_BYTES_INVALID"),
+        )
+        for arguments, reason in cases:
+            with self.subTest(arguments=arguments), self.assertRaises(
+                helper.BinaryAsmError
+            ) as raised:
+                helper.BinaryClassInput(*arguments)
+            self.assertEqual(raised.exception.reason_code, reason)
+
+    def test_artifact_diff_support_manifest_rejects_every_external_shape(self):
+        root = Path(self.temp.name)
+        cases = (
+            (root / "missing-support.json", "missing"),
+            (root / "invalid-utf.json", b"\xff"),
+            (root / "invalid-json.json", b"{"),
+            (root / "missing-key.json", b"{}"),
+            (
+                root / "wrong-shape.json",
+                b'{"artifact_diff_support_manifest":[]}',
+            ),
+        )
+        for path, content in cases:
+            if content != "missing":
+                path.write_bytes(content)
+            with self.subTest(path=path.name), patch.object(
+                helper, "SUPPORT_MANIFEST", path
+            ), self.assertRaises(helper.BinaryAsmError) as raised:
+                helper._artifact_diff_support_identity()
+            self.assertEqual(
+                raised.exception.reason_code,
+                "ASM_ARTIFACT_DIFF_SUPPORT_MANIFEST_INVALID",
+            )
+
+    def test_parser_identity_rejects_missing_and_extra_source_members(self):
+        complete = dict(helper._CAPTURED_PARSER_IMPLEMENTATION_SOURCE_DIGESTS)
+        variants = (dict(complete), dict(complete))
+        variants[0].pop(next(iter(variants[0])))
+        variants[1]["unowned.py"] = "0" * 64
+        for values in variants:
+            with self.subTest(paths=sorted(values)), self.assertRaises(
+                helper.BinaryAsmError
+            ) as raised:
+                helper._parser_identity_from_inputs(
+                    values, helper._CAPTURED_ARTIFACT_DIFF_SUPPORT_IDENTITY
+                )
+            self.assertEqual(
+                raised.exception.reason_code,
+                "ASM_IMPLEMENTATION_SOURCE_SET_INVALID",
+            )
+
+    def test_compile_requires_java_and_javac_independently(self):
+        cases = (
+            ({"javac": None, "java": "java"},),
+            ({"javac": "javac", "java": None},),
+        )
+        for (tools,) in cases:
+            with self.subTest(tools=tools), patch.object(
+                helper.shutil, "which", side_effect=tools.get
+            ), self.assertRaises(helper.BinaryAsmError) as raised:
+                helper._compile_helper.__wrapped__("asm.jar", "helper-sha")
+            self.assertEqual(
+                raised.exception.reason_code, "ASM_JAVA_TOOLCHAIN_MISSING"
+            )
+
+    def test_frame_primitives_cover_eof_chunking_truncation_and_length_bounds(self):
+        class OneByteReader:
+            def __init__(self, payload):
+                self.payload = bytearray(payload)
+
+            def read(self, _size):
+                if not self.payload:
+                    return b""
+                return bytes((self.payload.pop(0),))
+
+        self.assertEqual(helper._read_exact(OneByteReader(b"abc"), 3), b"abc")
+        with self.assertRaises(helper.BinaryAsmError) as truncated:
+            helper._read_exact(OneByteReader(b"a"), 2)
+        self.assertEqual(truncated.exception.reason_code, "ASM_PROTOCOL_TRUNCATED")
+        self.assertEqual(
+            helper._read_frame(io.BytesIO(), max_frame_bytes=10), (b"", False)
+        )
+        for length in (0, 1):
+            with self.subTest(length=length), self.assertRaises(
+                helper.BinaryAsmError
+            ) as invalid:
+                helper._read_frame(
+                    io.BytesIO(length.to_bytes(4, "big")), max_frame_bytes=10
+                )
+            self.assertEqual(
+                invalid.exception.reason_code,
+                "ASM_PROTOCOL_FRAME_LENGTH_INVALID",
+            )
+        payload = b"{}"
+        framed = len(payload).to_bytes(4, "big") + payload
+        self.assertEqual(
+            helper._read_frame(io.BytesIO(framed), max_frame_bytes=10),
+            (payload, True),
+        )
+
+    def test_resolver_covers_environment_and_missing_pinned_jar(self):
+        env_jar = Path(self.temp.name) / "env-asm.jar"
+        env_jar.write_bytes(b"asm")
+        with patch.dict(
+            os.environ, {"JUA_ASM_JAR": str(env_jar)}, clear=False
+        ), patch.object(
+            helper, "_sha256_file", return_value=helper.ASM_SHA256
+        ):
+            self.assertEqual(helper.resolve_asm_jar(), env_jar.resolve())
+
+        missing = Path(self.temp.name) / "absent-asm.jar"
+        with patch.dict(os.environ, {}, clear=True), self.assertRaises(
+            helper.BinaryAsmError
+        ) as raised:
+            helper.resolve_asm_jar(missing)
+        self.assertEqual(raised.exception.reason_code, "ASM_PINNED_JAR_MISSING")
+
+    def test_class_record_validator_covers_identity_failure_and_method_matrix(self):
+        digest = hashlib.sha256(b"class").hexdigest()
+        expected = {("artifact-instance-1", "demo/Sample.class"): digest}
+        valid = self._valid_fact_record()
+        helper._validate_class_record(valid, expected)
+
+        empty_key = dict(valid)
+        empty_key.update(
+            artifact_instance_identity=None,
+            class_entry=None,
+            class_bytes_sha256=digest,
+        )
+        helper._validate_class_record(empty_key, {("", ""): digest})
+
+        cases = []
+        unknown = dict(valid, artifact_instance_identity="unknown")
+        cases.append((unknown, expected, "ASM_PROTOCOL_UNKNOWN_CLASS_RECORD"))
+        cases.append((dict(valid, class_bytes_sha256="wrong"), expected,
+                      "ASM_PROTOCOL_CLASS_SHA_MISMATCH"))
+        cases.append((dict(valid, frame_type="class_failure"), expected,
+                      "ASM_PROTOCOL_FAILURE_INCOMPLETE"))
+        incomplete = dict(valid)
+        incomplete.pop("class_name")
+        cases.append((incomplete, expected, "ASM_PROTOCOL_CLASS_FACT_INCOMPLETE"))
+        cases.append((dict(valid, methods=[None]), expected,
+                      "ASM_PROTOCOL_METHOD_FACT_INCOMPLETE"))
+        cases.append((dict(valid, methods=[{"contract": {}}]), expected,
+                      "ASM_PROTOCOL_METHOD_FACT_INCOMPLETE"))
+        for record, known, reason in cases:
+            with self.subTest(reason=reason), self.assertRaises(
+                helper.BinaryAsmError
+            ) as raised:
+                helper._validate_class_record(record, known)
+            self.assertEqual(raised.exception.reason_code, reason)
+
+        failure = dict(
+            valid,
+            frame_type="class_failure",
+            failure_kind="UnsupportedClassVersionError",
+        )
+        helper._validate_class_record(failure, expected)
+        no_methods = dict(valid, methods=None)
+        helper._validate_class_record(no_methods, expected)
+        complete_method = dict(
+            valid,
+            methods=[{
+                "contract": {},
+                "instructions": [],
+                "try_catch": [],
+                "implementation_digest": "digest",
+            }],
+        )
+        helper._validate_class_record(complete_method, expected)
+
+    def test_extract_rejects_all_resource_and_input_boundaries_before_launch(self):
+        direct_cases = (
+            ({"max_heap_megabytes": 15}, "ASM_HELPER_HEAP_LIMIT_INVALID"),
+            (
+                {"max_heap_megabytes": helper.DEFAULT_MAX_HEAP_MEGABYTES + 1},
+                "ASM_HELPER_HEAP_LIMIT_INVALID",
+            ),
+            ({"timeout_seconds": 0}, "ASM_HELPER_TIMEOUT_INVALID"),
+            ({"timeout_seconds": -0.1}, "ASM_HELPER_TIMEOUT_INVALID"),
+        )
+        for options, reason in direct_cases:
+            with self.subTest(options=options), self.assertRaises(
+                helper.BinaryAsmError
+            ) as raised:
+                helper.extract_class_facts([], **options)
+            self.assertEqual(raised.exception.reason_code, reason)
+
+        launch_cases = (
+            ([object()], {}, "ASM_INPUT_TYPE_INVALID"),
+            ([self.class_input(b"class")], {"max_records": 0},
+             "ASM_INPUT_RECORD_LIMIT_EXCEEDED"),
+            ([self.class_input(b"class")], {"max_class_bytes": 4},
+             "ASM_CLASS_SIZE_LIMIT_EXCEEDED"),
+            ([self.class_input(b"class")], {"max_frame_bytes": 2},
+             "ASM_INPUT_FRAME_LIMIT_EXCEEDED"),
+        )
+        for inputs, options, reason in launch_cases:
+            with self.subTest(reason=reason), self.assertRaises(
+                helper.BinaryAsmError
+            ) as raised:
+                self._run_fake_protocol(
+                    inputs=inputs,
+                    max_records=options.pop("max_records", helper.DEFAULT_MAX_RECORDS),
+                    extract_options=options,
+                )
+            self.assertEqual(raised.exception.reason_code, reason)
+
+    def test_extract_uses_bound_jdk_tools_when_home_is_supplied(self):
+        record = self._valid_fact_record()
+        with patch.object(
+            helper,
+            "jdk_tool_path",
+            side_effect=(Path("/jdk/bin/javac"), Path("/jdk/bin/java")),
+        ) as tool_path:
+            run = self._run_fake_protocol(
+                [record], extract_options={"jdk_home": "/jdk"}
+            )
+        self.assertEqual(run.fact_record_count, 1)
+        self.assertEqual(
+            tool_path.call_args_list,
+            [unittest.mock.call("/jdk", "javac"), unittest.mock.call("/jdk", "java")],
+        )
+
+    def test_extract_rejects_each_protocol_header_frame_and_footer_violation(self):
+        valid = self._valid_fact_record()
+
+        def assert_reason(reason, **options):
+            with self.subTest(reason=reason), self.assertRaises(
+                helper.BinaryAsmError
+            ) as raised:
+                self._run_fake_protocol(**options)
+            self.assertEqual(raised.exception.reason_code, reason)
+
+        assert_reason(
+            "ASM_PROTOCOL_HEADER_MISSING",
+            omit_header=True,
+            omit_footer=True,
+        )
+        assert_reason(
+            "ASM_PROTOCOL_HEADER_INVALID",
+            header_override={"parser_identity": "wrong"},
+        )
+        assert_reason(
+            "ASM_PROTOCOL_FOOTER_MISSING",
+            omit_footer=True,
+        )
+        assert_reason(
+            "ASM_PROTOCOL_JSON_INVALID",
+            records=(),
+            raw_records_override=[b"\xff\xff"],
+        )
+        assert_reason(
+            "ASM_PROTOCOL_FRAME_TYPE_INVALID",
+            records=({"frame_type": "unexpected"},),
+        )
+        assert_reason(
+            "ASM_OUTPUT_RECORD_LIMIT_EXCEEDED",
+            records=(valid, valid),
+            max_records=1,
+        )
+        assert_reason(
+            "ASM_PROTOCOL_CLASS_RECORD_DUPLICATE",
+            records=(valid, valid),
+            max_records=2,
+        )
+        assert_reason(
+            "ASM_PROTOCOL_STRAY_BYTES",
+            records=(valid,),
+            trailing=b"x",
+        )
+        assert_reason(
+            "ASM_HELPER_FAILED",
+            records=(valid,),
+            returncode=7,
+        )
+        assert_reason(
+            "ASM_PROTOCOL_FOOTER_CONSERVATION_FAILED",
+            records=(valid,),
+            footer_override={"fact_record_count": 9},
+        )
+        assert_reason(
+            "ASM_PROTOCOL_INPUT_OUTPUT_SET_MISMATCH",
+            records=(),
+        )
+
+    def test_extract_cleans_up_when_process_has_no_stdout(self):
+        with self.assertRaises(AssertionError):
+            self._run_fake_protocol(stdout_override=None)
+        self.assertIsNone(self._last_fake_process.stdout)
+
+    def test_deadline_distinguishes_stopped_poll_failure_and_live_after_wait(self):
+        owner = self
+
+        class ImmediateStoppedTimer:
+            daemon = False
+
+            def __init__(self, _seconds, callback):
+                self.callback = callback
+
+            def start(self):
+                self.callback()
+
+            def cancel(self):
+                pass
+
+            def join(self):
+                pass
+
+        class AfterWaitTimer(ImmediateStoppedTimer):
+            def start(self):
+                owner._last_fake_process.wait_callback = self.callback
+
+        valid = self._valid_fact_record()
+        stopped = self._run_fake_protocol(
+            [valid], timer_type=ImmediateStoppedTimer, process_poll=lambda: 0
+        )
+        self.assertEqual(stopped.fact_record_count, 1)
+
+        def broken_poll():
+            raise OSError("process handle closed")
+
+        poll_failed = self._run_fake_protocol(
+            [valid], timer_type=ImmediateStoppedTimer, process_poll=broken_poll
+        )
+        self.assertEqual(poll_failed.fact_record_count, 1)
+
+        with self.assertRaises(helper.BinaryAsmError) as timed_out:
+            self._run_fake_protocol(
+                [valid], timer_type=AfterWaitTimer, process_poll=lambda: None
+            )
+        self.assertEqual(timed_out.exception.reason_code, "ASM_HELPER_TIMEOUT")
 
     def test_extracts_contract_ir_dynamic_and_raw_attribute_inventory(self):
         run = helper.extract_class_facts([self.class_input()], asm_jar=self.asm_jar)

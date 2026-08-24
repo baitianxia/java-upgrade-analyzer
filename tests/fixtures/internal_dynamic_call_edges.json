@@ -1,0 +1,3179 @@
+{
+  "schema": "java-upgrade-analyzer.internal-dynamic-call-edges.v1",
+  "source_identity": "c2edf3a5601e601304deeb1c5275b6af91c8769b2b5853db459d5c8c1c87b239",
+  "inventory_rule": "Every production-to-production edge observed at runtime but unresolved by the static call graph is retained as a required implementation-dependent white-box relationship. New, removed, or source-stale edges require explicit review.",
+  "edges": [
+    {
+      "caller": "analysis_contract::build_project_scope.<locals>.include",
+      "callee": "analysis_contract::build_project_scope.<locals>.include"
+    },
+    {
+      "caller": "analysis_contract::discover_maven_modules.<locals>.visit",
+      "callee": "analysis_contract::discover_maven_modules.<locals>.visit"
+    },
+    {
+      "caller": "artifact_safety::_inspect_archive_source.<locals>.inspect",
+      "callee": "artifact_safety::_inspect_archive_source.<locals>.cancelled"
+    },
+    {
+      "caller": "artifact_safety::_inspect_archive_source.<locals>.inspect",
+      "callee": "artifact_safety::_inspect_archive_source.<locals>.inspect"
+    },
+    {
+      "caller": "binary_artifact_diff::_private_archive_snapshot",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_artifact_diff::_reject_ambiguous_multi_release_manifest",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_artifact_diff::_snapshot_private_archive",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_artifact_diff::_source_changed_error",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_artifact_diff::_validate_expected_sha",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_artifact_diff::_xml_runtime_semantic_facts.<locals>.nested_attribute",
+      "callee": "binary_artifact_diff::_xml_runtime_semantic_facts.<locals>.local"
+    },
+    {
+      "caller": "binary_artifact_diff::compare_artifact_snapshots",
+      "callee": "binary_artifact_diff::ArchiveEntryFact.alignment_key"
+    },
+    {
+      "caller": "binary_artifact_diff::compare_artifact_snapshots",
+      "callee": "binary_artifact_diff::ArtifactSnapshot.class_records_by_entry"
+    },
+    {
+      "caller": "binary_artifact_diff::select_runtime_resource_entries",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_asm_helper::BinaryClassInput.__post_init__",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_asm_helper::_artifact_diff_support_identity",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_asm_helper::_compile_helper",
+      "callee": "binary_asm_helper::_OwnedHelperDirectory.__init__"
+    },
+    {
+      "caller": "binary_asm_helper::_compile_helper",
+      "callee": "binary_asm_helper::_OwnedHelperDirectory.cleanup"
+    },
+    {
+      "caller": "binary_asm_helper::_compile_helper",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_asm_helper::_compile_helper",
+      "callee": "binary_tool_execution::BinaryToolResult.succeeded"
+    },
+    {
+      "caller": "binary_asm_helper::_parser_identity_from_inputs",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_asm_helper::_read_exact",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_asm_helper::_read_frame",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_asm_helper::_validate_class_record",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_asm_helper::extract_class_facts",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_asm_helper::parser_identity",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_asm_helper::resolve_asm_jar",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_decision_engine::BinaryDecisionEngine._artifact_lineages",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_decision_engine::BinaryDecisionEngine._artifact_reference",
+      "callee": "binary_fact_store::BinaryFactStore.rows"
+    },
+    {
+      "caller": "binary_decision_engine::BinaryDecisionEngine._compact_records_by_key",
+      "callee": "binary_decision_engine::_CompactDecisionRecord.__init__"
+    },
+    {
+      "caller": "binary_decision_engine::BinaryDecisionEngine._compact_records_by_key",
+      "callee": "binary_fact_store::BinaryFactStore.reconciliation_payloads"
+    },
+    {
+      "caller": "binary_decision_engine::BinaryDecisionEngine._decision",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_decision_engine::BinaryDecisionEngine._definition_payload",
+      "callee": "binary_decision_engine::_CompactDecisionRecord.__getitem__"
+    },
+    {
+      "caller": "binary_decision_engine::BinaryDecisionEngine._iter_semantic_member_edges",
+      "callee": "binary_decision_engine::_CompactDecisionRecord.__len__"
+    },
+    {
+      "caller": "binary_decision_engine::BinaryDecisionEngine._iter_semantic_member_edges",
+      "callee": "binary_fact_store::BinaryFactStore.reconciliation_payloads"
+    },
+    {
+      "caller": "binary_decision_engine::BinaryDecisionEngine._iter_semantic_member_edges",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_decision_engine::BinaryDecisionEngine._process_artifact_diffs",
+      "callee": "binary_decision_engine::_CompactDecisionRecord.__getitem__"
+    },
+    {
+      "caller": "binary_decision_engine::BinaryDecisionEngine._process_artifact_diffs",
+      "callee": "binary_decision_engine::_CompactDecisionRecord.__len__"
+    },
+    {
+      "caller": "binary_decision_engine::BinaryDecisionEngine._process_member_resolution_deltas",
+      "callee": "binary_decision_engine::_CompactDecisionRecord.__len__"
+    },
+    {
+      "caller": "binary_decision_engine::BinaryDecisionEngine._process_runtime_outcome_deltas",
+      "callee": "binary_decision_engine::_CompactDecisionRecord.__len__"
+    },
+    {
+      "caller": "binary_decision_engine::BinaryDecisionEngine._provider_outcome_payload",
+      "callee": "binary_decision_engine::_CompactDecisionRecord.__len__"
+    },
+    {
+      "caller": "binary_decision_engine::BinaryDecisionEngine._provider_payload",
+      "callee": "binary_decision_engine::_CompactDecisionRecord.__getitem__"
+    },
+    {
+      "caller": "binary_decision_engine::BinaryDecisionEngine._resolution_payloads_for_edges",
+      "callee": "binary_fact_store::BinaryFactStore.reconciliation_payloads"
+    },
+    {
+      "caller": "binary_decision_engine::BinaryDecisionEngine._resolution_payloads_for_edges",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_decision_engine::BinaryDecisionEngine._semantic_member_edges",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_decision_engine::BinaryDecisionEngine._unique_index",
+      "callee": "binary_fact_store::BinaryFactStore.reconciliation_payloads"
+    },
+    {
+      "caller": "binary_decision_engine::BinaryDecisionEngine._unique_index",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_decision_engine::BinaryDecisionEngine._upstream_observed_identity",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_decision_engine::BinaryDecisionEngine._validate_shared_runtime_evidence",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_definition_verifier::_compile_helper",
+      "callee": "binary_definition_verifier::_CompiledDefinitionHelper.__init__"
+    },
+    {
+      "caller": "binary_definition_verifier::_compile_helper",
+      "callee": "binary_definition_verifier::_OwnedHelperDirectory.__init__"
+    },
+    {
+      "caller": "binary_definition_verifier::_compile_helper",
+      "callee": "binary_definition_verifier::_OwnedHelperDirectory.cleanup"
+    },
+    {
+      "caller": "binary_definition_verifier::_compile_helper",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_definition_verifier::_compile_helper",
+      "callee": "binary_tool_execution::BinaryToolResult.succeeded"
+    },
+    {
+      "caller": "binary_definition_verifier::_write_class_bundle",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_definition_verifier::_write_class_bundle",
+      "callee": "binary_runtime_reconciler::_StoreClassBytes.__getitem__"
+    },
+    {
+      "caller": "binary_definition_verifier::verify_class_definitions",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_definition_verifier::verify_class_definitions",
+      "callee": "binary_runtime_reconciler::_StoreClassBytes.__iter__"
+    },
+    {
+      "caller": "binary_definition_verifier::verify_class_definitions",
+      "callee": "binary_runtime_reconciler::_StoreClassBytes.__len__"
+    },
+    {
+      "caller": "binary_definition_verifier::verify_class_definitions",
+      "callee": "binary_tool_execution::BinaryToolResult.succeeded"
+    },
+    {
+      "caller": "binary_entrypoint_discovery::_spring_boot_activation_status",
+      "callee": "binary_fact_store::BinaryFactStore.rows"
+    },
+    {
+      "caller": "binary_entrypoint_discovery::discover_binary_entrypoints",
+      "callee": "binary_fact_store::BinaryFactStore.rows"
+    },
+    {
+      "caller": "binary_entrypoint_discovery::discover_binary_entrypoints",
+      "callee": "binary_fact_store::BinaryFactStore.runtime_trigger_summary"
+    },
+    {
+      "caller": "binary_fact_store::BinaryFactStore._add_normalized_reconciliation_records",
+      "callee": "binary_fact_store::BinaryFactStore.add_reconciliation_records.<locals>.normalized_records"
+    },
+    {
+      "caller": "binary_fact_store::BinaryFactStore._add_normalized_reconciliation_records",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_fact_store::BinaryFactStore._create_schema",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_fact_store::BinaryFactStore._field_descriptor_reference_owner.<locals>.invalid",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_fact_store::BinaryFactStore._member_reference_descriptor_owners",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_fact_store::BinaryFactStore._method_descriptor_reference_owners.<locals>.field_type",
+      "callee": "binary_fact_store::BinaryFactStore._method_descriptor_reference_owners.<locals>.invalid"
+    },
+    {
+      "caller": "binary_fact_store::BinaryFactStore._method_descriptor_reference_owners.<locals>.invalid",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_fact_store::BinaryFactStore._method_handle_type_edges",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_fact_store::BinaryFactStore._method_handle_with_loading_constraint_types",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_fact_store::BinaryFactStore._runtime_trigger_data_version",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_fact_store::BinaryFactStore._validated_runtime_trigger_summary",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_fact_store::BinaryFactStore.add_artifact_snapshot",
+      "callee": "binary_artifact_diff::ArtifactSnapshot.class_fact_coverage_status"
+    },
+    {
+      "caller": "binary_fact_store::BinaryFactStore.add_artifact_snapshot",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_fact_store::BinaryFactStore.add_artifact_snapshot.<locals>.flush_fact_rows_if_full",
+      "callee": "binary_fact_store::BinaryFactStore.add_artifact_snapshot.<locals>.flush_fact_rows"
+    },
+    {
+      "caller": "binary_fact_store::BinaryFactStore.add_inline_overlay",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_fact_store::BinaryFactStore.add_reconciliation_payloads",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_fact_store::BinaryFactStore.add_source_overlay",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_fact_store::BinaryFactStore.adopt_runtime_trigger_summary_from_exact_backup",
+      "callee": "binary_fact_store::BinaryFactStore.runtime_trigger_summary"
+    },
+    {
+      "caller": "binary_fact_store::BinaryFactStore.adopt_runtime_trigger_summary_from_exact_backup",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_fact_store::BinaryFactStore.class_bytes",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_fact_store::BinaryFactStore.content_identity",
+      "callee": "binary_fact_store::_json"
+    },
+    {
+      "caller": "binary_fact_store::BinaryFactStore.reconciliation_payloads",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_fact_store::BinaryFactStore.rows",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_fact_store::BinaryFactStore.runtime_trigger_summary",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_contract::StreamingCanonicalSequence.__init__",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_contract::_canonical_value",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_contract::_canonical_value",
+      "callee": "binary_first_contract::surrogate_safe_json_dumps"
+    },
+    {
+      "caller": "binary_first_contract::_iter_canonical_json",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_contract::_iter_canonical_json",
+      "callee": "binary_first_contract::StreamingCanonicalSequence.__iter__"
+    },
+    {
+      "caller": "binary_first_contract::_update_canonical_digest.<locals>.write",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_contract::_update_canonical_digest.<locals>.write",
+      "callee": "binary_first_contract::StreamingCanonicalSequence.__iter__"
+    },
+    {
+      "caller": "binary_first_contract::_update_canonical_digest.<locals>.write",
+      "callee": "binary_first_contract::_update_canonical_digest.<locals>.append"
+    },
+    {
+      "caller": "binary_first_contract::_update_canonical_digest.<locals>.write",
+      "callee": "binary_first_contract::_update_canonical_digest.<locals>.write"
+    },
+    {
+      "caller": "binary_first_contract::_update_canonical_digest.<locals>.write",
+      "callee": "binary_runtime_reconciler::_CompactIdentitySequence._iter_identities"
+    },
+    {
+      "caller": "binary_first_contract::_update_canonical_digest.<locals>.write",
+      "callee": "binary_validation_oracle::_CompactObservation.__getitem__"
+    },
+    {
+      "caller": "binary_first_contract::_update_canonical_digest.<locals>.write",
+      "callee": "binary_validation_oracle::_CompactObservation.__iter__"
+    },
+    {
+      "caller": "binary_first_contract::_update_canonical_digest.<locals>.write",
+      "callee": "binary_validation_oracle::_CompactObservation.__len__"
+    },
+    {
+      "caller": "binary_first_contract::analysis_context_identity",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_contract::artifact_content_identity",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_contract::canonical_identity",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_contract::canonical_identity_native_json",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_contract::canonical_identity_streaming",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_contract::canonical_json_string",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_contract::derive_formal_result_state",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_contract::disposition_obligation_identity",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_contract::observed_delta_identity",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_contract::projection_obligation_key",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_contract::restore_jvm_text",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_contract::transport_jvm_value.<locals>.convert",
+      "callee": "binary_first_contract::transport_jvm_value.<locals>.convert"
+    },
+    {
+      "caller": "binary_first_contract::validate_formal_result_state",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_contract::validate_phase_manifest",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_contract::validate_projection_assessment",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_model::ActiveSnapshot.__post_init__",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_model::AnalysisScope.__post_init__",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_model::ArtifactInstance.__post_init__",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_model::BuildIdentityBundle.__post_init__",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_model::CrossVersionArtifactPairing.__post_init__",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_model::Decision.__post_init__",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_model::FactBuildInputSlice.__post_init__",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_model::ProjectionAssessment.__post_init__",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_model::ResultGeneration.__post_init__",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_model::RuntimeComparison.__post_init__",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_model::RuntimeProfile.__post_init__",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_model::RuntimeProfile.__post_init__.<locals>.require_string_sequence",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_model::_coverage",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_model::_required_text",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_model::_validate_member_resolution_payload",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_model::_validated_class_definition_payload",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_model::_validated_dispatch_resolution_payload",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_model::_validated_provider_binding_payload",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_model::validate_decision_conservation",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_model::validate_projection_conservation",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_first_model::validate_snapshot_supersession",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_output::_active_descriptor_destination",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_output::_active_generation_lock",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_output::_aggregate_by_api",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_output::_assert_descriptor_reproof_unchanged",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_output::_assert_generation_snapshot_unchanged",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_output::_canonical_physical_output_root",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_output::_directory_snapshot",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_output::_discard_release_recapture_activation",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_output::_fsync_regular_file",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_output::_generation_publication_authority",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_output::_make_generation_durable",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_output::_physical_generation_directory",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_output::_physical_generation_namespace",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_output::_post_guard_generation_integrity_recheck",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_output::_read_active_descriptor",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_output::_read_stable_generation_file",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_output::_require_generation_identity_publication_allowed",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_output::_require_generation_publication_allowed",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_output::_run_publication_guard",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_output::_stable_reprove_transaction_descriptor",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_output::_verify_candidate_generation_integrity_with_proof",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_output::_verify_pending_generation_integrity",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_output::_write_active_descriptor",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_output::activate_binary_generation",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_output::binary_publication_reauthorization_receipt",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_output::commit_pending_binary_generation",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_output::compare_and_restore_active_binary_generation",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_output::prune_unreferenced_binary_generations",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_output::publish_pending_binary_generation",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_output::read_active_binary_generation",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_output::read_binary_generation_publication_authority_binding",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_output::read_pending_binary_generation",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_output::seal_active_binary_generation",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_output::write_binary_generation",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_output::write_binary_generation",
+      "callee": "binary_output::_rmtree_missing_ok"
+    },
+    {
+      "caller": "binary_performance_gate::_analyze_once",
+      "callee": "binary_fact_store::BinaryFactStore.__init__"
+    },
+    {
+      "caller": "binary_performance_gate::_analyze_once",
+      "callee": "binary_fact_store::BinaryFactStore.add_artifact_snapshot"
+    },
+    {
+      "caller": "binary_performance_gate::_analyze_once",
+      "callee": "binary_fact_store::BinaryFactStore.close"
+    },
+    {
+      "caller": "binary_performance_gate::_analyze_once",
+      "callee": "binary_performance_gate::PerformanceGateError.__init__"
+    },
+    {
+      "caller": "binary_performance_gate::_atomic_zip_archive",
+      "callee": "binary_performance_gate::PerformanceGateError.__init__"
+    },
+    {
+      "caller": "binary_performance_gate::_candidate_performance_authority",
+      "callee": "binary_performance_gate::PerformanceGateError.__init__"
+    },
+    {
+      "caller": "binary_performance_gate::_changed_artifact_derivation_identity",
+      "callee": "binary_performance_gate::PerformanceGateError.__init__"
+    },
+    {
+      "caller": "binary_performance_gate::_compile_template",
+      "callee": "binary_performance_gate::PerformanceGateError.__init__"
+    },
+    {
+      "caller": "binary_performance_gate::_full_pipeline_probe",
+      "callee": "binary_performance_gate::PerformanceGateError.__init__"
+    },
+    {
+      "caller": "binary_performance_gate::_java_major",
+      "callee": "binary_performance_gate::PerformanceGateError.__init__"
+    },
+    {
+      "caller": "binary_performance_gate::_jdk_home",
+      "callee": "binary_performance_gate::PerformanceGateError.__init__"
+    },
+    {
+      "caller": "binary_performance_gate::_json_object_from_exact_bytes",
+      "callee": "binary_performance_gate::PerformanceGateError.__init__"
+    },
+    {
+      "caller": "binary_performance_gate::_legacy_javap",
+      "callee": "binary_performance_gate::PerformanceGateError.__init__"
+    },
+    {
+      "caller": "binary_performance_gate::_percentile",
+      "callee": "binary_performance_gate::PerformanceGateError.__init__"
+    },
+    {
+      "caller": "binary_performance_gate::_performance_implementation_protocol",
+      "callee": "binary_performance_gate::PerformanceGateError.__init__"
+    },
+    {
+      "caller": "binary_performance_gate::_performance_recovery_bytes",
+      "callee": "binary_performance_gate::PerformanceGateError.__init__"
+    },
+    {
+      "caller": "binary_performance_gate::_physical_directory_identity",
+      "callee": "binary_performance_gate::PerformanceGateError.__init__"
+    },
+    {
+      "caller": "binary_performance_gate::_preflight_performance_authority",
+      "callee": "binary_performance_gate::PerformanceGateError.__init__"
+    },
+    {
+      "caller": "binary_performance_gate::_probe_worker_input_error",
+      "callee": "binary_performance_gate::PerformanceGateError.__init__"
+    },
+    {
+      "caller": "binary_performance_gate::_raw_result_contract_error",
+      "callee": "binary_performance_gate::PerformanceGateError.__init__"
+    },
+    {
+      "caller": "binary_performance_gate::_recorded_measurements_from_result",
+      "callee": "binary_performance_gate::PerformanceGateError.__init__"
+    },
+    {
+      "caller": "binary_performance_gate::_remove_existing_regular_or_link_leaf",
+      "callee": "binary_performance_gate::PerformanceGateError.__init__"
+    },
+    {
+      "caller": "binary_performance_gate::_require_provisional_probe_binding",
+      "callee": "binary_performance_gate::PerformanceGateError.__init__"
+    },
+    {
+      "caller": "binary_performance_gate::_rss_bytes",
+      "callee": "binary_performance_gate::PerformanceGateError.__init__"
+    },
+    {
+      "caller": "binary_performance_gate::_run_isolated_full_pipeline_probe",
+      "callee": "binary_performance_gate::PerformanceGateError.__init__"
+    },
+    {
+      "caller": "binary_performance_gate::_run_probe_worker",
+      "callee": "binary_performance_gate::PerformanceGateError.__init__"
+    },
+    {
+      "caller": "binary_performance_gate::_snapshot_provisional_gate",
+      "callee": "binary_performance_gate::PerformanceGateError.__init__"
+    },
+    {
+      "caller": "binary_performance_gate::_validate_probe_worker_result_contract.<locals>.reject",
+      "callee": "binary_performance_gate::PerformanceGateError.__init__"
+    },
+    {
+      "caller": "binary_performance_gate::_validate_raw_analysis_run",
+      "callee": "binary_performance_gate::_raw_positive_number"
+    },
+    {
+      "caller": "binary_performance_gate::_validate_raw_probe",
+      "callee": "binary_performance_gate::_raw_positive_number"
+    },
+    {
+      "caller": "binary_performance_gate::_validate_raw_release_result",
+      "callee": "binary_performance_gate::_raw_nonnegative_number"
+    },
+    {
+      "caller": "binary_performance_gate::_validate_raw_release_result",
+      "callee": "binary_performance_gate::_raw_positive_number"
+    },
+    {
+      "caller": "binary_performance_gate::_write_exact_bytes",
+      "callee": "binary_performance_gate::PerformanceGateError.__init__"
+    },
+    {
+      "caller": "binary_performance_gate::build_changed_current_artifacts",
+      "callee": "binary_performance_gate::PerformanceGateError.__init__"
+    },
+    {
+      "caller": "binary_performance_gate::build_dataset",
+      "callee": "binary_performance_gate::PerformanceGateError.__init__"
+    },
+    {
+      "caller": "binary_performance_gate::build_recorded_gate_from_result",
+      "callee": "binary_performance_gate::PerformanceGateError.__init__"
+    },
+    {
+      "caller": "binary_performance_gate::evaluate_recorded_gate.<locals>.finite_json_numbers",
+      "callee": "binary_performance_gate::evaluate_recorded_gate.<locals>.finite_json_numbers"
+    },
+    {
+      "caller": "binary_performance_gate::run_benchmark",
+      "callee": "binary_performance_gate::PerformanceGateError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_ArtifactDigestSession._expected_sha256",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_ArtifactDigestSession._hash_stable_record",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_ArtifactDigestSession.digest",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_ArtifactDigestSession.prime",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_ArtifactDigestSession.revalidate_marked",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_activate_validated_generation_with_authority_binding",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_activate_validated_generation_with_authority_binding",
+      "callee": "binary_pipeline::_activation_publication_guard_value"
+    },
+    {
+      "caller": "binary_pipeline::_activation_publication_guard_value",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_artifact_descriptors",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_artifact_descriptors",
+      "callee": "binary_pipeline::_ArtifactDigestSession.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_artifact_descriptors",
+      "callee": "binary_pipeline::_ArtifactDigestSession.digest"
+    },
+    {
+      "caller": "binary_pipeline::_artifact_hash_worker_count",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_artifact_instances",
+      "callee": "binary_pipeline::_ArtifactDigestSession.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_artifact_instances",
+      "callee": "binary_pipeline::_ArtifactDigestSession.digest"
+    },
+    {
+      "caller": "binary_pipeline::_artifact_safety_policy",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_artifact_snapshot_worker_count",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_attempt_cleanups",
+      "callee": "binary_fact_store::BinaryFactStore.close"
+    },
+    {
+      "caller": "binary_pipeline::_attempt_cleanups",
+      "callee": "binary_pipeline::_preflight_output_root.<locals>.remove_probe"
+    },
+    {
+      "caller": "binary_pipeline::_attempt_cleanups",
+      "callee": "binary_pipeline::_write_observability_text_windows_compat.<locals>.safe_cleanup"
+    },
+    {
+      "caller": "binary_pipeline::_canonical_output_root_preserving_leaf",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_checkpoint_validation_attachment",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_cleanup_performance_measurement_state",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_cleanup_performance_recapture_state",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_cli_bounded_json_value.<locals>.visit",
+      "callee": "binary_pipeline::_cli_bounded_json_value.<locals>.bounded_text"
+    },
+    {
+      "caller": "binary_pipeline::_cli_bounded_json_value.<locals>.visit",
+      "callee": "binary_pipeline::_cli_bounded_json_value.<locals>.visit"
+    },
+    {
+      "caller": "binary_pipeline::_definition_verification_summary",
+      "callee": "binary_fact_store::BinaryFactStore.reconciliation_payloads"
+    },
+    {
+      "caller": "binary_pipeline::_definition_verification_summary",
+      "callee": "binary_platform_image::JdkPlatformImage.manifest"
+    },
+    {
+      "caller": "binary_pipeline::_delete_resume_checkpoint_durable",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_discard_measurement_candidate_activation",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_discover_current_validation_attachment",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_generation_runtime_identity",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_generation_support_manifest_identity",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_load_json",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_performance_authority_gate_binding",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_persist_validation_checkpoint",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_physical_observability_directory",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_pipeline_jvm_argument_tokens",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_pipeline_output_run_lock",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_positive_pipeline_limit",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_preflight_output_root",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_preflight_output_root.<locals>.remove_probe",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_rebind_resume_checkpoint_performance_authority",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_resume_generation_source_records",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_resume_generation_validation",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_resume_generation_validation",
+      "callee": "binary_pipeline::_PhaseTimingRecorder.append"
+    },
+    {
+      "caller": "binary_pipeline::_resume_generation_validation.<locals>.reject_corrupt_generation",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_resume_input_artifact_identity",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_resume_source_input_identity",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_run_pipeline_under_lock",
+      "callee": "binary_decision_engine::BinaryDecisionEngine.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_run_pipeline_under_lock",
+      "callee": "binary_fact_store::BinaryFactStore.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_run_pipeline_under_lock",
+      "callee": "binary_fact_store::BinaryFactStore.adopt_runtime_trigger_summary_from_exact_backup"
+    },
+    {
+      "caller": "binary_pipeline::_run_pipeline_under_lock",
+      "callee": "binary_fact_store::BinaryFactStore.ensure_secondary_indexes"
+    },
+    {
+      "caller": "binary_pipeline::_run_pipeline_under_lock",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_run_pipeline_under_lock",
+      "callee": "binary_pipeline::_ArtifactDigestSession.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_run_pipeline_under_lock",
+      "callee": "binary_pipeline::_ArtifactDigestSession.metrics"
+    },
+    {
+      "caller": "binary_pipeline::_run_pipeline_under_lock",
+      "callee": "binary_pipeline::_ArtifactDigestSession.prime"
+    },
+    {
+      "caller": "binary_pipeline::_run_pipeline_under_lock",
+      "callee": "binary_pipeline::_ArtifactDigestSession.revalidate_marked"
+    },
+    {
+      "caller": "binary_pipeline::_run_pipeline_under_lock",
+      "callee": "binary_pipeline::_PhaseTimingRecorder.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_run_pipeline_under_lock",
+      "callee": "binary_pipeline::_PhaseTimingRecorder.append"
+    },
+    {
+      "caller": "binary_pipeline::_run_pipeline_under_lock",
+      "callee": "binary_pipeline::_PhaseTimingRecorder.start"
+    },
+    {
+      "caller": "binary_pipeline::_run_pipeline_under_lock",
+      "callee": "binary_platform_image::JdkPlatformImage.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_run_pipeline_under_lock",
+      "callee": "binary_runtime_reconciler::RuntimeReconciler.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_run_pipeline_under_lock",
+      "callee": "binary_semantic_overlay::BinarySemanticOverlay.as_payload"
+    },
+    {
+      "caller": "binary_pipeline::_run_pipeline_under_lock.<locals>.build_lineage_snapshot",
+      "callee": "binary_snapshot_cache::SnapshotTemplateMemo.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_run_pipeline_under_lock.<locals>.build_lineage_snapshot",
+      "callee": "binary_snapshot_cache::SnapshotTemplateMemo.clear"
+    },
+    {
+      "caller": "binary_pipeline::_run_pipeline_under_lock.<locals>.record_lineage_snapshot",
+      "callee": "binary_fact_store::BinaryFactStore.add_artifact_snapshot"
+    },
+    {
+      "caller": "binary_pipeline::_runtime_capability_policy",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_runtime_distribution_record",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_runtime_profile",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_runtime_requirement_pins",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_seal_and_finalize_measured_activation",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_seal_and_finalize_measured_activation",
+      "callee": "binary_pipeline::_activation_publication_guard_value"
+    },
+    {
+      "caller": "binary_pipeline::_single_parser_identity",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_source_inputs_contract",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_source_methods",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_stable_runtime_file_record",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_static_pipeline_preflight",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_validate_generation_source_import_closure",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_validate_multi_release_runtime_contract",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_validate_or_reuse_checkpoint_attachment",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_validate_or_reuse_checkpoint_attachment",
+      "callee": "binary_pipeline::_PhaseTimingRecorder.append"
+    },
+    {
+      "caller": "binary_pipeline::_validate_or_reuse_checkpoint_attachment",
+      "callee": "binary_pipeline::_PhaseTimingRecorder.fail"
+    },
+    {
+      "caller": "binary_pipeline::_validate_or_reuse_checkpoint_attachment",
+      "callee": "binary_pipeline::_PhaseTimingRecorder.start"
+    },
+    {
+      "caller": "binary_pipeline::_validate_or_reuse_checkpoint_attachment",
+      "callee": "binary_validation_oracle::_ProductionStructuralSpoolCache.__del__"
+    },
+    {
+      "caller": "binary_pipeline::_validate_static_artifact_inputs",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_validate_static_build_identity_inputs",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_validate_static_runtime_profile_inputs",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_validate_static_source_overlay",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_validation_checkpoint_result_receipt",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_verify_captured_generation_sources",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_verify_performance_authority_gate_binding",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_write_bound_observability_text_posix",
+      "callee": "binary_pipeline::_unlink_checkpoint_name_missing_ok"
+    },
+    {
+      "caller": "binary_pipeline::_write_resume_checkpoint",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_write_resume_checkpoint_roundtrip",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_write_text_atomic_durable",
+      "callee": "binary_pipeline::_unlink_missing_ok"
+    },
+    {
+      "caller": "binary_platform_image::JdkPlatformImage.__init__",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_platform_image::JdkPlatformImage._build_index",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_platform_image::JdkPlatformImage._read_class",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_platform_image::_java_major",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_active_release_core",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_atomic_json",
+      "callee": "binary_report::_unlink_missing_ok"
+    },
+    {
+      "caller": "binary_report::_atomic_text",
+      "callee": "binary_report::_unlink_missing_ok"
+    },
+    {
+      "caller": "binary_report::_classified_report_lock",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_committed_publication_receipt_path",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_consume_report_publication_prepare_capability",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_copy_report_directory_secure",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_copy_report_file_secure",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_directory_content_identity",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_directory_content_identity.<locals>.visit",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_directory_content_identity.<locals>.visit",
+      "callee": "binary_report::_directory_content_identity.<locals>.visit"
+    },
+    {
+      "caller": "binary_report::_ensure_publication_protocol_marker",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_generation_within_root",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_load_json",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_load_publication_transaction",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_loaded_step4_publication_binding",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_new_publication_binding",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_new_report_gate_receipt",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_normalize_publication_destination",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_normalized_step6_upstream_evidence_path",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_prepare_physical_publication_parent",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_publication_transaction_action",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_publish_step4_with_lock",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_publish_step4_with_lock",
+      "callee": "binary_report::_publish_step4_with_lock.<locals>.write"
+    },
+    {
+      "caller": "binary_report::_publish_step5_from_snapshot",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_publish_step5_from_snapshot",
+      "callee": "binary_report::_publish_step5_from_snapshot.<locals>.write"
+    },
+    {
+      "caller": "binary_report::_publish_step5_with_lock",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_publish_step6_with_lock",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_publish_transaction_record",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_raise_step6_internal_input_failure",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_read_private_publication_json",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_read_step6_contract_csv",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_reconcile_current_release_with_workflow_lock",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_recover_publication_transaction",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_release_stage_from_receipt",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_render_and_publish_step6_from_snapshots",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_render_and_publish_step6_from_snapshots",
+      "callee": "binary_report::_copy_report_directory_secure"
+    },
+    {
+      "caller": "binary_report::_report_file_sha256",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_report_publication_prepare_capability",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_report_publication_prepare_capability",
+      "callee": "binary_report::_ReportPrepareCapability.__init__"
+    },
+    {
+      "caller": "binary_report::_require_formal_publication_gate",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_require_pending_publication_candidate",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_require_step5_snapshot_binding",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_require_step6_upstream_regular_file",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_stage_directory_group",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_stage_directory_group",
+      "callee": "binary_report::_publish_step4_with_lock.<locals>.publish_source"
+    },
+    {
+      "caller": "binary_report::_stage_directory_group",
+      "callee": "binary_report::_publish_step5_from_snapshot.<locals>.write_binary_review"
+    },
+    {
+      "caller": "binary_report::_stage_directory_group",
+      "callee": "binary_report::_publish_step5_from_snapshot.<locals>.write_query_index"
+    },
+    {
+      "caller": "binary_report::_step6_upstream_evidence_files",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_stored_publication_binding",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_validate_committed_publication_receipt",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_validate_global_release",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_validate_publication_transaction",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_validate_report_gate_receipt",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_validate_step6_candidate_under_parent_workflow_lock",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_validate_step6_deliverable_semantics",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_validate_step6_deliverable_semantics.<locals>.dimension_totals",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::_validate_step6_internal_json_input",
+      "callee": "binary_report::_augment_step6_internal_input_diagnostics.<locals>.context_contract"
+    },
+    {
+      "caller": "binary_report::_validate_step6_internal_json_input",
+      "callee": "binary_report::_augment_step6_internal_input_diagnostics.<locals>.database_summary_contract"
+    },
+    {
+      "caller": "binary_report::_validate_step6_internal_json_input",
+      "callee": "binary_report::_augment_step6_internal_input_diagnostics.<locals>.dependency_jars_contract"
+    },
+    {
+      "caller": "binary_report::_validate_step6_internal_json_input",
+      "callee": "binary_report::_augment_step6_internal_input_diagnostics.<locals>.provenance_contract"
+    },
+    {
+      "caller": "binary_report::_validate_step6_internal_json_input",
+      "callee": "binary_report::_augment_step6_internal_input_diagnostics.<locals>.step3_coverage_contract"
+    },
+    {
+      "caller": "binary_report::_verify_published_transaction_content",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::complete_downstream_report_publication_after_gate",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::complete_step4_report_publication_after_gate",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::load_consistent_step5_query_inputs",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::load_consistent_step6_publication",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::load_validated_generation",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::load_validated_generation.<locals>.optional_bound_sidecar",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::main",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::materialize_report_publication_committed_snapshot",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::publish_step4",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::publish_step5",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::report_publication_committed_receipt",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::require_current_release_stage",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_report::verify_current_step4_release",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_runtime_materializer::_archive_security_markers",
+      "callee": "binary_runtime_materializer::BinaryRuntimeMaterializationError.__init__"
+    },
+    {
+      "caller": "binary_runtime_materializer::_container_entry_digests",
+      "callee": "binary_runtime_materializer::BinaryRuntimeMaterializationError.__init__"
+    },
+    {
+      "caller": "binary_runtime_materializer::_coord_with_version",
+      "callee": "binary_runtime_materializer::BinaryRuntimeMaterializationError.__init__"
+    },
+    {
+      "caller": "binary_runtime_materializer::_existing_sha",
+      "callee": "binary_runtime_materializer::BinaryRuntimeMaterializationError.__init__"
+    },
+    {
+      "caller": "binary_runtime_materializer::_jvm_argument_tokens",
+      "callee": "binary_runtime_materializer::BinaryRuntimeMaterializationError.__init__"
+    },
+    {
+      "caller": "binary_runtime_materializer::_load_object",
+      "callee": "binary_runtime_materializer::BinaryRuntimeMaterializationError.__init__"
+    },
+    {
+      "caller": "binary_runtime_materializer::_nonnegative_evidence_count",
+      "callee": "binary_runtime_materializer::BinaryRuntimeMaterializationError.__init__"
+    },
+    {
+      "caller": "binary_runtime_materializer::_outer_business_content_inventory",
+      "callee": "binary_runtime_materializer::BinaryRuntimeMaterializationError.__init__"
+    },
+    {
+      "caller": "binary_runtime_materializer::_runtime_classpath_index",
+      "callee": "binary_runtime_materializer::BinaryRuntimeMaterializationError.__init__"
+    },
+    {
+      "caller": "binary_runtime_materializer::_side_config",
+      "callee": "binary_runtime_materializer::BinaryRuntimeMaterializationError.__init__"
+    },
+    {
+      "caller": "binary_runtime_materializer::_validate_evidence_structure",
+      "callee": "binary_runtime_materializer::BinaryRuntimeMaterializationError.__init__"
+    },
+    {
+      "caller": "binary_runtime_materializer::_verify_business_content_binding",
+      "callee": "binary_runtime_materializer::BinaryRuntimeMaterializationError.__init__"
+    },
+    {
+      "caller": "binary_runtime_materializer::_zip_content_inventory",
+      "callee": "binary_runtime_materializer::BinaryRuntimeMaterializationError.__init__"
+    },
+    {
+      "caller": "binary_runtime_materializer::materialize_binary_pipeline_config",
+      "callee": "binary_runtime_materializer::BinaryRuntimeMaterializationError.__init__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler.__init__",
+      "callee": "binary_fact_store::BinaryFactStore.rows"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler.__init__",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler.__init__",
+      "callee": "binary_runtime_reconciler::_CompactRow.__getitem__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler.__init__",
+      "callee": "binary_runtime_reconciler::_CompactRow.__init__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._append_class_initialization_chain",
+      "callee": "binary_runtime_reconciler::_CompactRow.__getitem__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._append_class_initialization_chain",
+      "callee": "binary_runtime_reconciler::_CompactRow.__len__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._artifact_manifest",
+      "callee": "binary_fact_store::BinaryFactStore.rows"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._artifact_security_unsupported",
+      "callee": "binary_fact_store::BinaryFactStore.rows"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._build_definitions",
+      "callee": "binary_runtime_reconciler::_CompactRow.__getitem__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._build_definitions",
+      "callee": "binary_runtime_reconciler::_CompactRow.__init__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._build_definitions",
+      "callee": "binary_runtime_reconciler::_CompactRow.__len__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._build_definitions",
+      "callee": "binary_runtime_reconciler::_ReconciliationAccumulator.add"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._build_definitions",
+      "callee": "binary_runtime_reconciler::_StoreClassBytes.__init__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._class_fact",
+      "callee": "binary_platform_image::JdkPlatformImage.get_class"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._class_fact",
+      "callee": "binary_runtime_reconciler::_CompactRow.__len__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._class_info",
+      "callee": "binary_platform_image::JdkPlatformImage.get_class"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._class_info",
+      "callee": "binary_runtime_reconciler::_CompactRow.__getitem__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._class_info",
+      "callee": "binary_runtime_reconciler::_CompactRow.__len__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._class_initialization_resolution",
+      "callee": "binary_runtime_reconciler::_CompactRow.__getitem__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._class_initialization_resolution",
+      "callee": "binary_runtime_reconciler::_CompactRow.__len__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._compact_persisted_runtime_records",
+      "callee": "binary_runtime_reconciler::_CompactRow.__init__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._default_interface_initializers",
+      "callee": "binary_runtime_reconciler::_CompactRow.__getitem__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._default_interface_initializers",
+      "callee": "binary_runtime_reconciler::_CompactRow.__len__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._effective_class_candidates",
+      "callee": "binary_runtime_reconciler::_CompactRow.__getitem__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._loader_topology",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._member_accessible",
+      "callee": "binary_platform_image::JdkPlatformImage.module_exports"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._member_accessible",
+      "callee": "binary_runtime_reconciler::_CompactRow.__getitem__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._opcode_compatible",
+      "callee": "binary_runtime_reconciler::_CompactRow.__getitem__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._provider",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._provider",
+      "callee": "binary_platform_image::JdkPlatformImage.get_class"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._provider.<locals>.own_record",
+      "callee": "binary_runtime_reconciler::_CompactRow.__getitem__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._reconcile",
+      "callee": "binary_first_contract::StreamingCanonicalSequence.__init__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._reconcile",
+      "callee": "binary_runtime_reconciler::_ReconciliationAccumulator.__init__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._reconcile",
+      "callee": "binary_runtime_reconciler::_ReconciliationAccumulator.add"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._reconcile",
+      "callee": "binary_runtime_reconciler::_ReconciliationAccumulator.canonical_subject_identities"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._reconcile",
+      "callee": "binary_runtime_reconciler::_ReconciliationAccumulator.flush"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._resolve_edges",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._resolve_edges",
+      "callee": "binary_first_model::RuntimeProfile.complete"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._resolve_edges",
+      "callee": "binary_runtime_reconciler::_CompactRow.__getitem__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._resolve_edges",
+      "callee": "binary_runtime_reconciler::_CompactRow.__len__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._resolve_edges",
+      "callee": "binary_runtime_reconciler::_ReconciliationAccumulator.add"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._resolve_symbolic_member_uncached",
+      "callee": "binary_runtime_reconciler::_CompactRow.__getitem__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._resolve_symbolic_member_uncached",
+      "callee": "binary_runtime_reconciler::_CompactRow.__len__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._selected_resources",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._type_resolution",
+      "callee": "binary_runtime_reconciler::_CompactRow.__getitem__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._type_resolution",
+      "callee": "binary_runtime_reconciler::_CompactRow.__len__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._universe",
+      "callee": "binary_platform_image::JdkPlatformImage.ensure_classes"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._universe",
+      "callee": "binary_runtime_reconciler::_CompactRow.__getitem__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._universe",
+      "callee": "binary_runtime_reconciler::_CompactRow.__len__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._virtual_dispatch_targets",
+      "callee": "binary_runtime_reconciler::_CompactRow.__getitem__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::RuntimeReconciler._virtual_dispatch_targets",
+      "callee": "binary_runtime_reconciler::_CompactRow.__len__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::_CompactIdentitySequence.append",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::_CompactIdentitySequence.canonical_sequence",
+      "callee": "binary_first_contract::StreamingCanonicalSequence.__init__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::_CompactRow.__init__",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::_CompactRow.__or__",
+      "callee": "binary_runtime_reconciler::_CompactRow.__getitem__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::_CompactRow.__ror__",
+      "callee": "binary_runtime_reconciler::_CompactRow.__getitem__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::_ReconciliationAccumulator.__init__",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::_ReconciliationAccumulator.__init__",
+      "callee": "binary_runtime_reconciler::_CompactIdentitySequence.__init__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::_ReconciliationAccumulator._flush_kind",
+      "callee": "binary_fact_store::BinaryFactStore.add_reconciliation_payloads"
+    },
+    {
+      "caller": "binary_runtime_reconciler::_ReconciliationAccumulator.add",
+      "callee": "binary_runtime_reconciler::_CompactIdentitySequence.append"
+    },
+    {
+      "caller": "binary_runtime_reconciler::_ReconciliationAccumulator.canonical_subject_identities",
+      "callee": "binary_runtime_reconciler::_CompactIdentitySequence.canonical_sequence"
+    },
+    {
+      "caller": "binary_runtime_reconciler::_StoreClassBytes.__getitem__",
+      "callee": "binary_fact_store::BinaryFactStore.class_bytes"
+    },
+    {
+      "caller": "binary_runtime_reconciler::_loading_constraint_type_owners",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::class_load_is_ready",
+      "callee": "binary_runtime_reconciler::_CompactRow.__len__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::hydrate_runtime_reconciliation",
+      "callee": "binary_fact_store::BinaryFactStore.reconciliation_payloads"
+    },
+    {
+      "caller": "binary_runtime_reconciler::hydrate_runtime_reconciliation",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_semantic_overlay::_Builder.__init__",
+      "callee": "binary_fact_store::BinaryFactStore.rows"
+    },
+    {
+      "caller": "binary_semantic_overlay::build_binary_semantic_overlay",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_semantic_overlay::build_binary_semantic_overlay",
+      "callee": "binary_semantic_overlay::_Builder.__init__"
+    },
+    {
+      "caller": "binary_semantic_overlay::semantic_overlay_requires_runtime_selection",
+      "callee": "binary_fact_store::BinaryFactStore.runtime_trigger_summary"
+    },
+    {
+      "caller": "binary_snapshot_cache::_decode_template",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_snapshot_cache::cached_snapshot_archive",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_snapshot_cache::cached_snapshot_archive",
+      "callee": "binary_snapshot_cache::SnapshotTemplateMemo.get"
+    },
+    {
+      "caller": "binary_snapshot_cache::cached_snapshot_archive",
+      "callee": "binary_snapshot_cache::SnapshotTemplateMemo.remember"
+    },
+    {
+      "caller": "binary_source_overlay::_exact_field_reference_count",
+      "callee": "enhanced_source_analyzer::MethodDef.get_body_text"
+    },
+    {
+      "caller": "binary_source_overlay::_instruction_constants",
+      "callee": "binary_fact_store::BinaryFactStore.rows"
+    },
+    {
+      "caller": "binary_source_overlay::build_inline_consumption_overlay",
+      "callee": "binary_fact_store::BinaryFactStore.add_inline_overlay"
+    },
+    {
+      "caller": "binary_source_overlay::build_inline_consumption_overlay",
+      "callee": "binary_fact_store::BinaryFactStore.rows"
+    },
+    {
+      "caller": "binary_source_overlay::build_source_overlay",
+      "callee": "binary_fact_store::BinaryFactStore.add_source_overlay"
+    },
+    {
+      "caller": "binary_source_overlay::build_source_overlay",
+      "callee": "binary_fact_store::BinaryFactStore.rows"
+    },
+    {
+      "caller": "binary_source_overlay::build_source_overlay",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_tool_execution::execute_binary_tool",
+      "callee": "compat::run_managed_subprocess"
+    },
+    {
+      "caller": "binary_trace_engine::BinaryTraceEngine._target_nodes",
+      "callee": "binary_fact_store::BinaryFactStore.rows"
+    },
+    {
+      "caller": "binary_trace_engine::BinaryTraceEngine._trace.<locals>.enumerate_paths",
+      "callee": "binary_trace_engine::BinaryTraceEngine._trace.<locals>.materialize_path"
+    },
+    {
+      "caller": "binary_trace_engine::build_binary_traces",
+      "callee": "binary_trace_engine::BinaryTraceEngine.__init__"
+    },
+    {
+      "caller": "binary_validation_contract::_load_oracle_support_manifest",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_validation_contract::_validator_implementation_payload",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_validation_contract::_validator_source_identity_from_inputs",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_validation_oracle::_ClosedWorldGraphIndex._build_reconciliation_indexes",
+      "callee": "binary_first_contract::surrogate_safe_json_dumps"
+    },
+    {
+      "caller": "binary_validation_oracle::_ClosedWorldGraphIndex._insert_batches",
+      "callee": "binary_validation_oracle::_ClosedWorldGraphIndex._build_reconciliation_indexes.<locals>.report"
+    },
+    {
+      "caller": "binary_validation_oracle::_ClosedWorldGraphIndex._insert_batches",
+      "callee": "binary_validation_oracle::_ClosedWorldGraphIndex._build_semantic_index.<locals>.semantic_rows"
+    },
+    {
+      "caller": "binary_validation_oracle::_OracleScanSpoolCache._projection",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_validation_oracle::_ProductionStructuralSpoolCache.get",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_validation_oracle::_SpoolStructuralInstructionSource.iter_batches",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_validation_oracle::_SpoolStructuralInstructionSource.iter_batches",
+      "callee": "binary_validation_oracle::_OracleScanSpoolCache.get"
+    },
+    {
+      "caller": "binary_validation_oracle::_SpoolStructuralInstructionSource.iter_batches",
+      "callee": "binary_validation_oracle::_OracleScanSpoolCache.get_projection"
+    },
+    {
+      "caller": "binary_validation_oracle::_artifact_configs",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_validation_oracle::_artifact_truth_identity",
+      "callee": "binary_first_contract::canonical_identity_native_json"
+    },
+    {
+      "caller": "binary_validation_oracle::_artifact_truth_identity",
+      "callee": "binary_first_contract::canonical_identity_streaming"
+    },
+    {
+      "caller": "binary_validation_oracle::_attach_expected_artifact_instances",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_validation_oracle::_attach_provider_declared_members_from_scan_cache",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_validation_oracle::_attach_provider_declared_members_from_scan_cache",
+      "callee": "binary_validation_oracle::_OracleScanSpoolCache.get"
+    },
+    {
+      "caller": "binary_validation_oracle::_attach_provider_declared_members_from_scan_cache",
+      "callee": "binary_validation_oracle::_OracleScanSpoolCache.get_projection"
+    },
+    {
+      "caller": "binary_validation_oracle::_compact_observations",
+      "callee": "binary_validation_oracle::_CompactObservation.__init__"
+    },
+    {
+      "caller": "binary_validation_oracle::_compile_oracle",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_validation_oracle::_compile_oracle",
+      "callee": "binary_tool_execution::BinaryToolFailure.to_mapping"
+    },
+    {
+      "caller": "binary_validation_oracle::_compile_oracle",
+      "callee": "binary_tool_execution::BinaryToolResult.succeeded"
+    },
+    {
+      "caller": "binary_validation_oracle::_independent_archive_class_access_flags.<locals>.u1",
+      "callee": "binary_validation_oracle::_independent_archive_class_access_flags.<locals>.take"
+    },
+    {
+      "caller": "binary_validation_oracle::_independent_archive_class_access_flags.<locals>.u2",
+      "callee": "binary_validation_oracle::_independent_archive_class_access_flags.<locals>.take"
+    },
+    {
+      "caller": "binary_validation_oracle::_independent_class_access_flags.<locals>.u1",
+      "callee": "binary_validation_oracle::_independent_class_access_flags.<locals>.skip"
+    },
+    {
+      "caller": "binary_validation_oracle::_independent_class_access_flags.<locals>.u2",
+      "callee": "binary_validation_oracle::_independent_class_access_flags.<locals>.skip"
+    },
+    {
+      "caller": "binary_validation_oracle::_independent_is_valid_module_descriptor.<locals>.u1",
+      "callee": "binary_validation_oracle::_independent_is_valid_module_descriptor.<locals>.take"
+    },
+    {
+      "caller": "binary_validation_oracle::_independent_is_valid_module_descriptor.<locals>.u2",
+      "callee": "binary_validation_oracle::_independent_is_valid_module_descriptor.<locals>.take"
+    },
+    {
+      "caller": "binary_validation_oracle::_independent_is_valid_module_descriptor.<locals>.u4",
+      "callee": "binary_validation_oracle::_independent_is_valid_module_descriptor.<locals>.take"
+    },
+    {
+      "caller": "binary_validation_oracle::_independent_xml_facts.<locals>.nested_attribute",
+      "callee": "binary_validation_oracle::_independent_xml_facts.<locals>.local"
+    },
+    {
+      "caller": "binary_validation_oracle::_is_subtype",
+      "callee": "binary_validation_oracle::_CompactObservation.__len__"
+    },
+    {
+      "caller": "binary_validation_oracle::_iter_reconciliation",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_validation_oracle::_iter_sidecar_object_rows",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_validation_oracle::_iter_validated_direct_edges",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_validation_oracle::_load_json",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_validation_oracle::_normalize_oracle_scan.<locals>.compact_tuple",
+      "callee": "binary_validation_oracle::_normalize_oracle_scan.<locals>.compact_value"
+    },
+    {
+      "caller": "binary_validation_oracle::_normalize_oracle_scan.<locals>.compact_value",
+      "callee": "binary_validation_oracle::_normalize_oracle_scan.<locals>.compact_text"
+    },
+    {
+      "caller": "binary_validation_oracle::_normalize_oracle_scan.<locals>.compact_value",
+      "callee": "binary_validation_oracle::_normalize_oracle_scan.<locals>.compact_value"
+    },
+    {
+      "caller": "binary_validation_oracle::_observe_classes.<locals>.observe_batch",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_validation_oracle::_observe_classes.<locals>.observe_batch",
+      "callee": "binary_tool_execution::BinaryToolFailure.to_mapping"
+    },
+    {
+      "caller": "binary_validation_oracle::_observe_classes.<locals>.observe_batch",
+      "callee": "binary_tool_execution::BinaryToolResult.succeeded"
+    },
+    {
+      "caller": "binary_validation_oracle::_oracle_annotation_closure",
+      "callee": "binary_validation_oracle::_CompactObservation.__len__"
+    },
+    {
+      "caller": "binary_validation_oracle::_oracle_artifacts_for_entrypoint_realms",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_validation_oracle::_oracle_class_load_ready",
+      "callee": "binary_validation_oracle::_CompactObservation.__len__"
+    },
+    {
+      "caller": "binary_validation_oracle::_oracle_runtime_contexts",
+      "callee": "binary_validation_oracle::_CompactObservation.__len__"
+    },
+    {
+      "caller": "binary_validation_oracle::_oracle_runtime_semantic_rows",
+      "callee": "binary_validation_oracle::_CompactObservation.__len__"
+    },
+    {
+      "caller": "binary_validation_oracle::_oracle_tool_execution_policy",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_validation_oracle::_ordered_artifacts_for_realm.<locals>.effective",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_validation_oracle::_ordered_artifacts_for_realm.<locals>.effective",
+      "callee": "binary_validation_oracle::_ordered_artifacts_for_realm.<locals>.effective"
+    },
+    {
+      "caller": "binary_validation_oracle::_release_major",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_validation_oracle::_release_values",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_validation_oracle::_share_equal_observation_values",
+      "callee": "binary_validation_oracle::_CompactObservation.__getitem__"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_closed_world_results",
+      "callee": "binary_validation_oracle::_ClosedWorldGraphIndex.__del__"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_closed_world_results_in_workspace",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_closed_world_results_in_workspace",
+      "callee": "binary_validation_oracle::_ClosedWorldGraphIndex.__init__"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_closed_world_results_in_workspace",
+      "callee": "binary_validation_oracle::_ClosedWorldGraphIndex.close"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_closed_world_results_in_workspace",
+      "callee": "binary_validation_oracle::_ClosedWorldGraphIndex.linkage_status"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_closed_world_results_in_workspace",
+      "callee": "binary_validation_oracle::_ClosedWorldGraphIndex.relations_for_evidence"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_closed_world_results_in_workspace",
+      "callee": "binary_validation_oracle::_ClosedWorldGraphIndex.resolution_status"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_closed_world_results_in_workspace.<locals>.closure",
+      "callee": "binary_validation_oracle::_ClosedWorldGraphIndex.transitions"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_cross_version_semantics",
+      "callee": "binary_validation_oracle::_iter_validated_direct_edges"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_cross_version_semantics",
+      "callee": "binary_validation_oracle::_iter_validated_type_edges"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_direct_edges",
+      "callee": "binary_validation_oracle::_OracleScanSpoolCache.get"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_direct_edges",
+      "callee": "binary_validation_oracle::_OracleScanSpoolCache.get_direct_evidence"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_direct_edges",
+      "callee": "binary_validation_oracle::_OracleScanSpoolCache.put_evidence"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_direct_edges",
+      "callee": "binary_validation_oracle::_ProductionStructuralSpoolCache.put"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_entrypoint_discovery",
+      "callee": "binary_validation_oracle::_CompactObservation.__len__"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_entrypoint_discovery",
+      "callee": "binary_validation_oracle::_SpoolStructuralInstructionSource.iter_batches"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_entrypoint_discovery",
+      "callee": "binary_validation_oracle::_iter_validated_direct_edges"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_entrypoint_discovery.<locals>.business_owned",
+      "callee": "binary_validation_oracle::_validate_entrypoint_discovery.<locals>.artifact_path"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_runtime_outcomes",
+      "callee": "binary_validation_oracle::_CompactObservation.__len__"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_runtime_outcomes.<locals>.batches",
+      "callee": "binary_validation_oracle::_iter_reconciliation"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_runtime_outcomes.<locals>.oracle_dispatch_targets",
+      "callee": "binary_validation_oracle::_CompactObservation.__len__"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_runtime_outcomes.<locals>.oracle_dispatch_targets",
+      "callee": "binary_validation_oracle::_validate_runtime_outcomes.<locals>.concrete_subtypes"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_runtime_outcomes.<locals>.oracle_dispatch_targets",
+      "callee": "binary_validation_oracle::_validate_runtime_outcomes.<locals>.dispatch_symbol"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_runtime_outcomes.<locals>.oracle_dispatch_targets",
+      "callee": "binary_validation_oracle::_validate_runtime_outcomes.<locals>.resolve_member_cached"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_runtime_outcomes.<locals>.validate_dispatch",
+      "callee": "binary_validation_oracle::_validate_runtime_outcomes.<locals>.oracle_dispatch_targets"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_runtime_semantic_overlay",
+      "callee": "binary_validation_oracle::_CompactObservation.__len__"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_runtime_semantic_overlay",
+      "callee": "binary_validation_oracle::_SpoolStructuralInstructionSource.iter_batches"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_runtime_semantic_overlay",
+      "callee": "binary_validation_oracle::_iter_validated_direct_edges"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_runtime_semantic_overlay.<locals>.base_declared_members",
+      "callee": "binary_validation_oracle::_CompactObservation.__len__"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_runtime_semantic_overlay.<locals>.current_declared_members",
+      "callee": "binary_validation_oracle::_CompactObservation.__len__"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_runtime_semantic_overlay.<locals>.runtime_is_subtype",
+      "callee": "binary_validation_oracle::_validate_runtime_semantic_overlay.<locals>.runtime_type_closure"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_runtime_semantic_overlay.<locals>.runtime_type_closure",
+      "callee": "binary_validation_oracle::_CompactObservation.__len__"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_structural_edges",
+      "callee": "binary_validation_oracle::_OracleScanSpoolCache.get"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_structural_edges",
+      "callee": "binary_validation_oracle::_OracleScanSpoolCache.get_structural_evidence"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_structural_edges",
+      "callee": "binary_validation_oracle::_ProductionStructuralSpoolCache.__contains__"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_structural_edges",
+      "callee": "binary_validation_oracle::_ProductionStructuralSpoolCache.get"
+    },
+    {
+      "caller": "binary_validation_oracle::_validation_attachment_path_error",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_validation_oracle::_write_validation_attachment_dirfd",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_validation_oracle::_write_validation_attachment_portable",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_validation_oracle::validate_generation",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_validation_oracle::validate_generation",
+      "callee": "binary_validation_oracle::_OracleScanSpoolCache.__init__"
+    },
+    {
+      "caller": "binary_validation_oracle::validate_generation",
+      "callee": "binary_validation_oracle::_OracleScanSpoolCache.clear"
+    },
+    {
+      "caller": "binary_validation_oracle::validate_generation",
+      "callee": "binary_validation_oracle::_ProductionStructuralSpoolCache.__del__"
+    },
+    {
+      "caller": "binary_validation_oracle::validate_generation",
+      "callee": "binary_validation_oracle::_ProductionStructuralSpoolCache.__init__"
+    },
+    {
+      "caller": "binary_validation_oracle::validate_generation",
+      "callee": "binary_validation_oracle::_ProductionStructuralSpoolCache.clear"
+    },
+    {
+      "caller": "binary_validation_oracle::validate_generation",
+      "callee": "binary_validation_oracle::_SpoolStructuralInstructionSource.__init__"
+    },
+    {
+      "caller": "binary_validation_oracle::validate_generation.<locals>.inventories_for",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "compat::run_cmd.<locals>.drain",
+      "callee": "compat::run_cmd.<locals>.terminate_tree_once"
+    },
+    {
+      "caller": "enhanced_source_analyzer::MethodDef.get_body_text",
+      "callee": "enhanced_source_analyzer::MethodDef.body_text_lazy"
+    },
+    {
+      "caller": "enhanced_source_analyzer::TreeSitterAnalyzer.__init__",
+      "callee": "enhanced_source_analyzer::EnhancedRegexAnalyzer.__init__"
+    },
+    {
+      "caller": "enhanced_source_analyzer::TreeSitterAnalyzer._build_class_context",
+      "callee": "enhanced_source_analyzer::EnhancedRegexAnalyzer._extract_leading_annotations"
+    },
+    {
+      "caller": "enhanced_source_analyzer::TreeSitterAnalyzer._collect_call_sites.<locals>.collect",
+      "callee": "enhanced_source_analyzer::EnhancedRegexAnalyzer._resolve_type"
+    },
+    {
+      "caller": "enhanced_source_analyzer::TreeSitterAnalyzer._collect_call_sites.<locals>.collect",
+      "callee": "enhanced_source_analyzer::TreeSitterAnalyzer._collect_call_sites.<locals>.collect"
+    },
+    {
+      "caller": "enhanced_source_analyzer::TreeSitterAnalyzer._collect_local_variable_types",
+      "callee": "enhanced_source_analyzer::EnhancedRegexAnalyzer._resolve_type"
+    },
+    {
+      "caller": "enhanced_source_analyzer::TreeSitterAnalyzer._collect_type_metadata.<locals>.clause_types.<locals>.collect",
+      "callee": "enhanced_source_analyzer::EnhancedRegexAnalyzer._resolve_type"
+    },
+    {
+      "caller": "enhanced_source_analyzer::TreeSitterAnalyzer._collect_type_metadata.<locals>.clause_types.<locals>.collect",
+      "callee": "enhanced_source_analyzer::TreeSitterAnalyzer._collect_type_metadata.<locals>.clause_types.<locals>.collect"
+    },
+    {
+      "caller": "enhanced_source_analyzer::TreeSitterAnalyzer._collect_type_reference_sites.<locals>.walk",
+      "callee": "enhanced_source_analyzer::TreeSitterAnalyzer._collect_type_reference_sites.<locals>.walk"
+    },
+    {
+      "caller": "enhanced_source_analyzer::TreeSitterAnalyzer._infer_expression_type",
+      "callee": "enhanced_source_analyzer::EnhancedRegexAnalyzer._resolve_type"
+    },
+    {
+      "caller": "enhanced_source_analyzer::TreeSitterAnalyzer._infer_lambda_parameter_types",
+      "callee": "enhanced_source_analyzer::EnhancedRegexAnalyzer._resolve_type"
+    },
+    {
+      "caller": "enhanced_source_analyzer::TreeSitterAnalyzer._merge_ast_field_types",
+      "callee": "enhanced_source_analyzer::EnhancedRegexAnalyzer._resolve_type"
+    },
+    {
+      "caller": "enhanced_source_analyzer::TreeSitterAnalyzer._parse_method_node",
+      "callee": "enhanced_source_analyzer::EnhancedRegexAnalyzer._extract_leading_annotations"
+    },
+    {
+      "caller": "enhanced_source_analyzer::TreeSitterAnalyzer._parse_method_node",
+      "callee": "enhanced_source_analyzer::EnhancedRegexAnalyzer._extract_modifiers"
+    },
+    {
+      "caller": "enhanced_source_analyzer::TreeSitterAnalyzer._parse_method_node",
+      "callee": "enhanced_source_analyzer::EnhancedRegexAnalyzer._resolve_type"
+    },
+    {
+      "caller": "enhanced_source_analyzer::TreeSitterAnalyzer._parse_params",
+      "callee": "enhanced_source_analyzer::EnhancedRegexAnalyzer._resolve_type"
+    },
+    {
+      "caller": "enhanced_source_analyzer::TreeSitterAnalyzer.analyze",
+      "callee": "enhanced_source_analyzer::EnhancedRegexAnalyzer._detect_imports"
+    },
+    {
+      "caller": "enhanced_source_analyzer::TreeSitterAnalyzer.analyze",
+      "callee": "enhanced_source_analyzer::EnhancedRegexAnalyzer._detect_package"
+    },
+    {
+      "caller": "enhanced_source_analyzer::TreeSitterAnalyzer.analyze",
+      "callee": "enhanced_source_analyzer::EnhancedRegexAnalyzer._scan_class_structure"
+    },
+    {
+      "caller": "enhanced_source_analyzer::TreeSitterAnalyzer.analyze",
+      "callee": "enhanced_source_analyzer::EnhancedRegexAnalyzer._scan_fields"
+    },
+    {
+      "caller": "enhanced_source_analyzer::analyze_file",
+      "callee": "enhanced_source_analyzer::TreeSitterAnalyzer.__init__"
+    },
+    {
+      "caller": "enhanced_source_analyzer::analyze_file",
+      "callee": "enhanced_source_analyzer::TreeSitterAnalyzer.analyze"
+    },
+    {
+      "caller": "enhanced_source_analyzer::extract_call_edges_enhanced",
+      "callee": "enhanced_source_analyzer::MethodDef.body_text_lazy"
+    },
+    {
+      "caller": "enhanced_source_analyzer::infer_invocation_return_type.<locals>._declared_on_type",
+      "callee": "enhanced_source_analyzer::infer_invocation_return_type.<locals>._match_from_method_map"
+    },
+    {
+      "caller": "enhanced_source_analyzer::infer_invocation_return_type.<locals>._match_from_method_map",
+      "callee": "enhanced_source_analyzer::infer_invocation_return_type.<locals>._match_from_bucket"
+    },
+    {
+      "caller": "enhanced_source_analyzer::infer_invocation_return_type.<locals>._merge_parent_resolutions",
+      "callee": "enhanced_source_analyzer::infer_invocation_return_type.<locals>._resolve_type"
+    },
+    {
+      "caller": "enhanced_source_analyzer::infer_invocation_return_type.<locals>._resolve_type",
+      "callee": "enhanced_source_analyzer::infer_invocation_return_type.<locals>._declared_on_type"
+    },
+    {
+      "caller": "enhanced_source_analyzer::infer_invocation_return_type.<locals>._resolve_type",
+      "callee": "enhanced_source_analyzer::infer_invocation_return_type.<locals>._merge_parent_resolutions"
+    },
+    {
+      "caller": "enhanced_source_analyzer::infer_invocation_return_type.<locals>._resolve_type",
+      "callee": "enhanced_source_analyzer::infer_invocation_return_type.<locals>._parent_names"
+    },
+    {
+      "caller": "enhanced_source_analyzer::infer_param_type_from_expression",
+      "callee": "enhanced_source_analyzer::MethodDef.get_body_text"
+    },
+    {
+      "caller": "final_artifact_edge_oracle::_classfile_header_facts.<locals>.u1",
+      "callee": "final_artifact_edge_oracle::_classfile_header_facts.<locals>.skip"
+    },
+    {
+      "caller": "final_artifact_edge_oracle::_classfile_header_facts.<locals>.u2",
+      "callee": "final_artifact_edge_oracle::_classfile_header_facts.<locals>.skip"
+    },
+    {
+      "caller": "final_artifact_edge_oracle::_classfile_member_inventory.<locals>.read_members",
+      "callee": "final_artifact_edge_oracle::_classfile_member_inventory.<locals>.skip_attributes"
+    },
+    {
+      "caller": "final_artifact_edge_oracle::_classfile_member_inventory.<locals>.read_members",
+      "callee": "final_artifact_edge_oracle::_classfile_member_inventory.<locals>.u2"
+    },
+    {
+      "caller": "final_artifact_edge_oracle::_classfile_member_inventory.<locals>.read_members",
+      "callee": "final_artifact_edge_oracle::_classfile_member_inventory.<locals>.utf8_at"
+    },
+    {
+      "caller": "final_artifact_edge_oracle::_classfile_member_inventory.<locals>.skip_attributes",
+      "callee": "final_artifact_edge_oracle::_classfile_member_inventory.<locals>.skip"
+    },
+    {
+      "caller": "final_artifact_edge_oracle::_classfile_member_inventory.<locals>.skip_attributes",
+      "callee": "final_artifact_edge_oracle::_classfile_member_inventory.<locals>.u2"
+    },
+    {
+      "caller": "final_artifact_edge_oracle::_classfile_member_inventory.<locals>.skip_attributes",
+      "callee": "final_artifact_edge_oracle::_classfile_member_inventory.<locals>.u4"
+    },
+    {
+      "caller": "final_artifact_edge_oracle::_classfile_member_inventory.<locals>.skip_attributes",
+      "callee": "final_artifact_edge_oracle::_classfile_member_inventory.<locals>.utf8_at"
+    },
+    {
+      "caller": "final_artifact_edge_oracle::_classfile_member_inventory.<locals>.u1",
+      "callee": "final_artifact_edge_oracle::_classfile_member_inventory.<locals>.take"
+    },
+    {
+      "caller": "final_artifact_edge_oracle::_classfile_member_inventory.<locals>.u2",
+      "callee": "final_artifact_edge_oracle::_classfile_member_inventory.<locals>.take"
+    },
+    {
+      "caller": "final_artifact_edge_oracle::_classfile_member_inventory.<locals>.u4",
+      "callee": "final_artifact_edge_oracle::_classfile_member_inventory.<locals>.take"
+    },
+    {
+      "caller": "final_artifact_edge_oracle::_extract_packaged_classes.<locals>.append_class",
+      "callee": "final_artifact_edge_oracle::_extract_packaged_classes.<locals>.spill_staged_entries"
+    },
+    {
+      "caller": "final_artifact_edge_oracle::_scan_final_artifact_snapshot",
+      "callee": "edge_truth::canonical_edge_identity"
+    },
+    {
+      "caller": "final_artifact_edge_oracle::parse_structural_javap.<locals>.add_bootstrap_handle_type_edges",
+      "callee": "final_artifact_edge_oracle::parse_structural_javap.<locals>.add_method_handle_type_edges"
+    },
+    {
+      "caller": "final_artifact_edge_oracle::parse_structural_javap.<locals>.add_bootstrap_type_edges",
+      "callee": "final_artifact_edge_oracle::parse_structural_javap.<locals>.add_descriptor_type_edges"
+    },
+    {
+      "caller": "gate::gate_binary_generation",
+      "callee": "gate::_step4_decision_projection"
+    },
+    {
+      "caller": "jdk_preflight::_java_major",
+      "callee": "jdk_preflight::JdkPreflightError.__init__"
+    },
+    {
+      "caller": "jdk_preflight::_preflight_jdk_home_uncached",
+      "callee": "jdk_preflight::JdkPreflightError.__init__"
+    },
+    {
+      "caller": "jdk_preflight::_release_values",
+      "callee": "jdk_preflight::JdkPreflightError.__init__"
+    },
+    {
+      "caller": "jdk_preflight::_run_tool",
+      "callee": "binary_tool_execution::BinaryToolResult.succeeded"
+    },
+    {
+      "caller": "jdk_preflight::_run_tool",
+      "callee": "jdk_preflight::JdkPreflightError.__init__"
+    },
+    {
+      "caller": "jdk_preflight::resolve_jdk_release",
+      "callee": "jdk_preflight::JdkPreflightError.__init__"
+    },
+    {
+      "caller": "path_runtime::_longest_tracked_path",
+      "callee": "compat::run_cmd"
+    },
+    {
+      "caller": "path_runtime::_raise_worktree_recovery_errors",
+      "callee": "path_runtime::WorktreeRecoveryError.__init__"
+    },
+    {
+      "caller": "path_runtime::_resolve_worktree_commit",
+      "callee": "compat::run_cmd"
+    },
+    {
+      "caller": "path_runtime::_run_worktree_mutation",
+      "callee": "compat::run_cmd"
+    },
+    {
+      "caller": "path_runtime::create_detached_worktree",
+      "callee": "compat::run_cmd"
+    },
+    {
+      "caller": "path_runtime::recover_owned_stale_worktrees",
+      "callee": "compat::run_cmd"
+    },
+    {
+      "caller": "remote_source_refs::_group_remote_candidates",
+      "callee": "remote_source_refs::_candidate_sort_key"
+    },
+    {
+      "caller": "run_step::StepInteractionRequired.__init__",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_apply_step4_startup_recovery",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_background_child_configuration",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_background_child_lease",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_begin_step4_report_republication_state",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_binary_pipeline_config_path",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_binary_step4_pipeline_writer_lock",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_binary_step4_serialization_lock",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_commit_binary_step4_activation_receipt",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_complete_binary_step4_after_gate",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_delete_step4_validation_checkpoint_durable",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_dependency_source_cache_lock",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_execute_step_unlocked",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_expand_coord_path_by_repo",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_finalize_binary_step4_transaction",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_finalize_stale_committed_step4_checkpoint",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_main_with_workflow_lock_held",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_main_with_workflow_lock_held",
+      "callee": "run_step::step_index"
+    },
+    {
+      "caller": "run_step::_normalize_requirement_field_list",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_pinned_source_git_root",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_preflight_artifact_input",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_preflight_explicit_binary_config",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_preflight_output_storage",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_preflight_pinned_build_tool",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_prepare_binary_report_publication_candidate_in_process",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_prepare_binary_step4_deferred_handoff",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_raise_binary_step4_run_failure",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_read_step4_active_descriptor",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_read_step4_validation_checkpoint",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_reconcile_main_state_after_step4_republication",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_recover_binary_step4_transaction",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_relative_path_inside",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_remove_step_output_without_following_parent_links",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_report_publication_expectation",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_republish_current_binary_step4_reports",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_require_successful_binary_step4_recovery_rollback",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_resolved_binary_pipeline_config_path",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_revalidate_binary_step4_deferred_handoff",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_rollback_binary_step4_transaction",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "run_step::_rollback_downstream_report_publication",
+      "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "run_step::_run_downstream_report_publication",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_seal_binary_step4_activation",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_stable_path_from_project_relative",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_step4_republication_marker",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::_workflow_mutation_lock",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::apply_non_pending_structured_response",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::apply_user_response_to_main_state",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::build_canonical_user_response",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::build_non_pending_structured_response_interaction",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::build_run_context",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::build_step5_selection_summary",
+      "callee": "run_step::_parse_int_or_zero"
+    },
+    {
+      "caller": "run_step::cli_main",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::detect_integrity_repair_step",
+      "callee": "run_step::step_index"
+    },
+    {
+      "caller": "run_step::detect_source_dirs_by_modules",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::ensure_exists",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::expand_dependency_source_ref_selections",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::expand_step1_ref_selections",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::handle_step4_resume_followups",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::load_manifest",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::load_seed_json_arg",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::load_user_response",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::materialize_application_source",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::materialize_dependency_source_git_url",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::materialize_pinned_source_workspace",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::materialize_step5_all_changed_apis_input",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::merge_user_response_into_run_context",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::normalize_action_requirements",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::normalize_analysis_mode",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::normalize_coord_path_items",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::normalize_dependency_repo_mappings",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::normalize_dependency_source_dirs",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::normalize_dependency_source_mappings",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::normalize_intent_patch",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::normalize_manual_artifact_identities",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::normalize_modules_value",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::normalize_source_dirs",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::normalize_step5_scope_mode",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::normalize_step5_target_list",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::parse_bool_like",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::parse_positive_int_like",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::rebuild_current_pinned_source_context",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::refresh_step2_outputs",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::resolve_non_pending_structured_response_step",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::resolve_requested_step",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::resolve_resume_step_id",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::resolve_selected_targets",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::resolve_selected_targets.<locals>.append_selected_name",
+      "callee": "run_step::resolve_selected_targets.<locals>.unique_hits"
+    },
+    {
+      "caller": "run_step::resolve_step1_refs_for_execution",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::resolve_user_response",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::run_gate",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::run_python",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::run_python",
+      "callee": "run_step::StepInteractionRequired.__init__"
+    },
+    {
+      "caller": "run_step::run_step0_preflight",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::start_background_run",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::step6_internal_input_failure_owner_from_step_error",
+      "callee": "run_step::step_index"
+    },
+    {
+      "caller": "run_step::validate_pending_interaction_response",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::validate_run_context_for_step",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::validate_selected_targets_resolution",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::validate_step0_context",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::validate_step1_runtime_inputs",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "run_step::validate_step5_scope_response",
+      "callee": "run_step::StepError.__init__"
+    },
+    {
+      "caller": "s1_dep_diff::_build_step1_change_rows",
+      "callee": "s1_dep_diff::_entry_sort_key"
+    },
+    {
+      "caller": "s1_dep_diff::_collect_runtime_deps_for_artifact_input",
+      "callee": "s1_dep_diff::PinnedCommitMaterializationError.__init__"
+    },
+    {
+      "caller": "s1_dep_diff::_collect_runtime_deps_for_artifact_input",
+      "callee": "s1_dep_diff::SourceRevisionConfirmationRequiredError.__init__"
+    },
+    {
+      "caller": "s1_dep_diff::_collect_runtime_deps_for_artifact_input",
+      "callee": "s1_dep_diff::Step1RefResolutionRequiredError.__init__"
+    },
+    {
+      "caller": "s1_dep_diff::_collect_runtime_deps_for_artifact_input",
+      "callee": "s1_dep_diff::Step1RemoteOperationError.__init__"
+    },
+    {
+      "caller": "s1_dep_diff::_raise_gradle_command_failure",
+      "callee": "s1_dep_diff::GradleCommandFailure.__init__"
+    },
+    {
+      "caller": "s1_dep_diff::build_step1_command_blocked_error",
+      "callee": "s1_dep_diff::Step1CommandExecutionBlockedError.__init__"
+    },
+    {
+      "caller": "s1_dep_diff::build_step1_command_blocked_interaction",
+      "callee": "s1_dep_diff::Step1CommandExecutionBlockedError.__init__"
+    },
+    {
+      "caller": "s1_dep_diff::collect_gradle_deps_for_workspace",
+      "callee": "s1_dep_diff::UnresolvedPackagedCoordinatesError.__init__"
+    },
+    {
+      "caller": "s1_dep_diff::collect_maven_deps_for_workspace",
+      "callee": "s1_dep_diff::UnresolvedPackagedCoordinatesError.__init__"
+    },
+    {
+      "caller": "s1_dep_diff::collect_maven_deps_for_workspace",
+      "callee": "step1_observability::Step1Observer.increment_counter"
+    },
+    {
+      "caller": "s1_dep_diff::collect_packaged_deps_from_artifact_path",
+      "callee": "s1_dep_diff::ArtifactCoordinateInputRequiredError.__init__"
+    },
+    {
+      "caller": "s1_dep_diff::collect_packaged_deps_from_artifact_path",
+      "callee": "s1_dep_diff::main.<locals>.load_base_runtime_deps"
+    },
+    {
+      "caller": "s1_dep_diff::collect_packaged_deps_from_artifact_path",
+      "callee": "s1_dep_diff::main.<locals>.load_current_runtime_deps"
+    },
+    {
+      "caller": "s1_dep_diff::collect_packaged_deps_from_artifact_path",
+      "callee": "step1_observability::Step1Observer.increment_counter"
+    },
+    {
+      "caller": "s1_dep_diff::main",
+      "callee": "s1_dep_diff::_entry_sort_key"
+    },
+    {
+      "caller": "s1_dep_diff::main",
+      "callee": "s1_dep_diff::_step1_change_rank"
+    },
+    {
+      "caller": "s1_dep_diff::main",
+      "callee": "s1_dep_diff::_step1_risk_rank"
+    },
+    {
+      "caller": "s1_dep_diff::main",
+      "callee": "step1_observability::Step1Observer.__init__"
+    },
+    {
+      "caller": "s1_dep_diff::main",
+      "callee": "step1_observability::Step1Observer.event"
+    },
+    {
+      "caller": "s1_dep_diff::main",
+      "callee": "step1_observability::Step1Observer.finish_phase"
+    },
+    {
+      "caller": "s1_dep_diff::main",
+      "callee": "step1_observability::Step1Observer.start_phase"
+    },
+    {
+      "caller": "s2_context_from_deps::detect_jdk_from_gradle.<locals>.detect_first",
+      "callee": "s2_context_from_deps::detect_jdk_from_gradle.<locals>.expression_version"
+    },
+    {
+      "caller": "s3_scan::main",
+      "callee": "progress_logging::PhaseTimer.__init__"
+    },
+    {
+      "caller": "s3_scan::main",
+      "callee": "progress_logging::PhaseTimer.elapsed"
+    },
+    {
+      "caller": "s3_scan::main",
+      "callee": "s3_scan::scan_database_contract_changes"
+    },
+    {
+      "caller": "s3_scan::main",
+      "callee": "s3_scan::scan_dependency_classfile_versions"
+    },
+    {
+      "caller": "s3_scan::main",
+      "callee": "s3_scan::scan_dependency_compat"
+    },
+    {
+      "caller": "s5_query_call_chain::_dedupe_and_prefer_longest",
+      "callee": "s5_query_call_chain::_format_path"
+    },
+    {
+      "caller": "s5_query_call_chain::_index_target_apis",
+      "callee": "signature_utils::normalize_signature_for_identity"
+    },
+    {
+      "caller": "s5_query_call_chain::build_query_index",
+      "callee": "s5_query_call_chain::_edge_sort_key"
+    },
+    {
+      "caller": "s5_query_call_chain::query_call_chains",
+      "callee": "s5_query_call_chain::_edge_sort_key"
+    },
+    {
+      "caller": "s6_report::_completed_api_rows_by_dependency",
+      "callee": "s6_report::_completed_api_rows_by_dependency.<locals>.dependency_group_sort_key"
+    },
+    {
+      "caller": "s6_report::_completed_api_rows_by_dependency",
+      "callee": "s6_report::_completed_api_rows_by_dependency.<locals>.row_sort_key"
+    },
+    {
+      "caller": "s6_report::_main_relationship_cell",
+      "callee": "s6_report::_call_path_shape"
+    },
+    {
+      "caller": "s6_report::_minimum_compatible_variant_groups",
+      "callee": "s6_report::_signature_variant_sort_key"
+    },
+    {
+      "caller": "s6_report::_minimum_compatible_variant_groups.<locals>.search",
+      "callee": "s6_report::_minimum_compatible_variant_groups.<locals>.search"
+    },
+    {
+      "caller": "s6_report::_minimum_compatible_variant_groups.<locals>.search",
+      "callee": "s6_report::_minimum_compatible_variant_groups.<locals>.selected_vertex"
+    },
+    {
+      "caller": "s6_report::_minimum_compatible_variant_groups.<locals>.selected_vertex",
+      "callee": "s6_report::_signature_variant_sort_key"
+    },
+    {
+      "caller": "s6_report::_order_uncertain_items_by_dependency",
+      "callee": "s6_report::_uncertain_item_sort_key"
+    },
+    {
+      "caller": "s6_report::_set_report_row_reasons",
+      "callee": "s6_report::_report_reason_code_sort_key"
+    },
+    {
+      "caller": "s6_report::build_api_result_rows",
+      "callee": "s6_report::_report_result_sort_key"
+    },
+    {
+      "caller": "s6_report::build_bucket_detail_markdown",
+      "callee": "s6_report::_severity_rank"
+    },
+    {
+      "caller": "s6_report::build_human_api_analysis",
+      "callee": "s6_report::_api_result_priority"
+    },
+    {
+      "caller": "s6_report::build_human_api_analysis",
+      "callee": "s6_report::_report_result_sort_key"
+    },
+    {
+      "caller": "s6_report::build_human_dependency_analysis",
+      "callee": "s6_report::_dependency_display_sort_key"
+    },
+    {
+      "caller": "s6_report::build_impact_overview",
+      "callee": "s6_report::_impact_sort_key"
+    },
+    {
+      "caller": "s6_report::build_impact_overview",
+      "callee": "s6_report::_validated_alert_rows"
+    },
+    {
+      "caller": "s6_report::render_other_result_distribution",
+      "callee": "s6_report::_severity_rank"
+    },
+    {
+      "caller": "s6_report::write_bucket_detail_artifacts",
+      "callee": "s6_report::_severity_rank"
+    }
+  ]
+}

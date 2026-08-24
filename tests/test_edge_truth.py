@@ -250,6 +250,147 @@ class EdgeTruthTest(unittest.TestCase):
                 valid_artifact_entries=set(),
             )
 
+    def test_value_identity_and_truth_state_normalization_boundaries(self):
+        self.assertEqual(edge_truth._value(None, "missing"), "")
+        self.assertEqual(edge_truth.canonical_edge_identity(None), "|||||||")
+        record = edge_truth._make_record(None)
+        self.assertEqual(record["row"], {})
+        self.assertEqual(record["truth_state"], "present")
+
+        cases = (
+            ({}, "present"),
+            ({"edge_state": ""}, "present"),
+            ({"edge_state": " YES "}, "present"),
+            ({"edge_state": "reachable"}, "present"),
+            ({"edge_state": "0"}, "absent"),
+            ({"edge_state": "missing"}, "absent"),
+            ({"edge_state": "unknown"}, "unknown"),
+            ({"present": True}, "present"),
+            ({"present": False}, "absent"),
+            ({"present": "1"}, "present"),
+            ({"present": "no"}, "absent"),
+            ({"present": ""}, "present"),
+        )
+        for row, expected in cases:
+            with self.subTest(row=row):
+                self.assertEqual(edge_truth._truth_state(row), expected)
+
+    def test_sha_and_provenance_validation_cover_each_required_field(self):
+        self.assertFalse(edge_truth._valid_sha256("a" * 63))
+        self.assertFalse(edge_truth._valid_sha256("A" * 64))
+        self.assertTrue(edge_truth._valid_sha256("0123456789abcdef" * 4))
+
+        complete = valid_edge("run")
+        self.assertTrue(edge_truth._provenance_valid(complete))
+        invalid_rows = (
+            {**complete, "artifact_sha256": "a" * 63},
+            {**complete, "artifact_entry": " "},
+            {**complete, "authority": ""},
+            {**complete, "authority_version": None},
+            {**complete, "procedure": " "},
+        )
+        for row in invalid_rows:
+            with self.subTest(row=row):
+                self.assertFalse(edge_truth._provenance_valid(row))
+
+    def test_artifact_entry_normalization_rejects_none_and_ignores_blanks(self):
+        with self.assertRaisesRegex(TypeError, "required keyword argument"):
+            edge_truth._normalize_artifact_entries(None)
+        self.assertEqual(
+            edge_truth._normalize_artifact_entries(
+                ["", "  ", " BOOT-INF/classes/p/C.class "]
+            ),
+            VALID_ARTIFACT_ENTRIES,
+        )
+
+    def test_empty_reconciliation_is_complete_and_nonblocking(self):
+        result = edge_truth.reconcile_edges(
+            None,
+            None,
+            trusted_artifact_sha="a" * 64,
+            valid_artifact_entries=["", " BOOT-INF/classes/p/C.class "],
+        )
+
+        self.assertEqual(result["ledger"], [])
+        self.assertEqual(
+            result["verdict_counts"], {verdict: 0 for verdict in edge_truth.VERDICTS}
+        )
+        self.assertFalse(result["blocking"])
+
+    def test_invalid_trusted_hash_shapes_are_rejected(self):
+        for trusted_sha in ("", "a" * 63, "A" * 64, "g" * 64):
+            with self.subTest(trusted_sha=trusted_sha), self.assertRaisesRegex(
+                ValueError, "lowercase 64-character SHA-256"
+            ):
+                edge_truth.reconcile_edges(
+                    [],
+                    [],
+                    trusted_artifact_sha=trusted_sha,
+                    valid_artifact_entries=VALID_ARTIFACT_ENTRIES,
+                )
+
+    def test_exact_match_is_the_only_nonblocking_nonempty_result(self):
+        result = edge_truth.reconcile_edges(
+            [valid_edge("run")],
+            [valid_edge("run")],
+            trusted_artifact_sha="a" * 64,
+            valid_artifact_entries=VALID_ARTIFACT_ENTRIES,
+        )
+
+        self.assertEqual(result["verdict_counts"]["correct"], 2)
+        self.assertFalse(result["blocking"])
+        self.assertEqual(
+            {row["reason"] for row in result["ledger"]},
+            {"exact_identity_match"},
+        )
+
+    def test_same_identity_from_two_allowed_entries_is_provenance_mismatch(self):
+        other_entry = "BOOT-INF/classes/p/D.class"
+        result = edge_truth.reconcile_edges(
+            [valid_edge("run")],
+            [valid_edge("run", artifact_entry=other_entry)],
+            trusted_artifact_sha="a" * 64,
+            valid_artifact_entries={*VALID_ARTIFACT_ENTRIES, other_entry},
+        )
+
+        self.assertEqual(result["verdict_counts"]["provenance_invalid"], 2)
+        self.assertEqual(
+            {row["reason"] for row in result["ledger"]},
+            {"artifact_entry_mismatch"},
+        )
+
+    def test_non_present_unopposed_states_cannot_be_treated_as_exact_evidence(self):
+        result = edge_truth.reconcile_edges(
+            [valid_edge("analyzer-absent", edge_state="absent")],
+            [valid_edge("oracle-unknown", edge_state="indeterminate")],
+            trusted_artifact_sha="a" * 64,
+            valid_artifact_entries=VALID_ARTIFACT_ENTRIES,
+        )
+
+        self.assertEqual(result["verdict_counts"]["extra"], 1)
+        self.assertEqual(result["verdict_counts"]["missing"], 1)
+        self.assertTrue(result["blocking"])
+
+    def test_every_invalid_provenance_reason_remains_in_the_ledger(self):
+        base = valid_edge("run")
+        rows = [
+            {**base, "artifact_sha256": "b" * 64},
+            {**base, "artifact_entry": "not/allowed.class"},
+            {**base, "authority": ""},
+        ]
+        result = edge_truth.reconcile_edges(
+            rows,
+            [],
+            trusted_artifact_sha="a" * 64,
+            valid_artifact_entries=VALID_ARTIFACT_ENTRIES,
+        )
+
+        self.assertEqual(result["verdict_counts"]["provenance_invalid"], 3)
+        self.assertEqual(
+            {row["reason"] for row in result["ledger"]},
+            {"trusted_sha_mismatch", "artifact_entry_not_allowed", "invalid_provenance"},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -353,7 +353,7 @@ if hasattr(os, "register_at_fork"):
 def _validate_class_record(
     record: dict[str, Any],
     expected: dict[tuple[str, str], str],
-) -> None:
+) -> tuple[str, str]:
     key = (
         str(record.get("artifact_instance_identity") or ""),
         str(record.get("class_entry") or ""),
@@ -372,7 +372,7 @@ def _validate_class_record(
             raise BinaryAsmError(
                 "ASM_PROTOCOL_FAILURE_INCOMPLETE", f"failure record lacks failure kind for {key}"
             )
-        return
+        return key
     required = {
         "class_name", "class_major", "class_access", "fields", "methods",
         "attribute_inventory", "attribute_inventory_digest", "class_contract_digest",
@@ -389,6 +389,7 @@ def _validate_class_record(
             raise BinaryAsmError(
                 "ASM_PROTOCOL_METHOD_FACT_INCOMPLETE", f"incomplete method record for {key}"
             )
+    return key
 
 
 def extract_class_facts(
@@ -497,7 +498,6 @@ def extract_class_facts(
         output_count = 0
         returned_keys: set[tuple[str, str]] = set()
         record_digest = hashlib.sha256()
-        footer = None
         with protocol_input.open("rb") as stdin, stderr_path.open("wb") as stderr:
             process = managed_popen(
                 [
@@ -588,11 +588,7 @@ def extract_class_facts(
                             "ASM_OUTPUT_RECORD_LIMIT_EXCEEDED", f"output exceeds {max_records}"
                         )
                     _framed_digest_update(record_digest, raw)
-                    _validate_class_record(record, expected)
-                    record_key = (
-                        str(record.get("artifact_instance_identity") or ""),
-                        str(record.get("class_entry") or ""),
-                    )
+                    record_key = _validate_class_record(record, expected)
                     if record_key in returned_keys:
                         raise BinaryAsmError(
                             "ASM_PROTOCOL_CLASS_RECORD_DUPLICATE",
@@ -656,7 +652,6 @@ def extract_class_facts(
                 "ASM_HELPER_FAILED",
                 f"helper exit={returncode}: {stderr_text[-4000:]}",
             )
-        assert footer is not None
         expected_footer = {
             "input_record_count": input_count,
             "fact_record_count": fact_count,

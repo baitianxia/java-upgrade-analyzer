@@ -7,6 +7,10 @@ public final class DispatchApp {
         return service.removedReachableDefault();
     }
 
+    public static Object entryClone(DefaultService service) {
+        return service.clone();
+    }
+
     public static String deadDefault(DefaultService service) {
         return service.removedUnreachableDefault();
     }

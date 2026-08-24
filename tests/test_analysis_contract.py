@@ -701,6 +701,25 @@ class AnalysisContractTest(unittest.TestCase):
         self.assertFalse(provenance["build_executed_by_system"])
         self.assertEqual(provenance["build_execution_status"], "not_executed")
 
+    def test_build_provenance_derives_scope_when_caller_does_not_supply_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            write_pom(root / "pom.xml", "app")
+            (root / "src/main/java").mkdir(parents=True)
+
+            provenance = build_provenance(
+                root,
+                "current",
+                "HEAD",
+                ".",
+                "",
+                active_profiles={"prod"},
+            )
+
+        self.assertEqual(provenance["build_tool"], "maven")
+        self.assertEqual(provenance["active_maven_profiles"], ["prod"])
+        self.assertTrue(provenance["project_scope_hash"])
+
     @staticmethod
     def _write_bound_provenance(report, scope):
         dependencies = report / "evidence" / "dependencies"

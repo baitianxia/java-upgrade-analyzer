@@ -54,6 +54,100 @@ class BinaryArtifactDiffTest(unittest.TestCase):
         self.assertEqual(before_identity, after_identity)
         self.assertFalse(hasattr(before_identity, "changed_nanoseconds"))
 
+    def test_private_snapshot_rejects_change_while_source_handle_is_open(self):
+        artifact = self.root / "changing.jar"
+        artifact.write_bytes(b"stable input bytes")
+        before = diff._ArchiveSourceIdentity(
+            device=1,
+            inode=2,
+            mode=0o100644,
+            link_count=1,
+            byte_length=18,
+            modified_nanoseconds=10,
+        )
+        after = diff._ArchiveSourceIdentity(
+            device=1,
+            inode=2,
+            mode=0o100644,
+            link_count=1,
+            byte_length=18,
+            modified_nanoseconds=11,
+        )
+
+        with mock.patch.object(
+            diff, "_archive_source_identity", side_effect=[before, after],
+        ), self.assertRaises(diff.BinaryArtifactDiffError) as raised:
+            with diff._private_archive_snapshot(
+                artifact, diff._sha256_file(artifact),
+            ):
+                self.fail("a changing source must never be yielded")
+
+        self.assertEqual(
+            raised.exception.reason_code, "ARTIFACT_CHANGED_DURING_SNAPSHOT",
+        )
+
+    def test_runtime_effective_delta_detects_definition_sensitive_metadata(self):
+        def entry(name, digest):
+            return diff.ArchiveEntryFact(
+                physical_entry_identity=f"physical-{digest}",
+                name=name,
+                name_ordinal=0,
+                archive_ordinal=0,
+                kind="class",
+                content_sha256=digest,
+                byte_length=1,
+                crc32=1,
+                compression_method=0,
+                compressed_size=1,
+                timestamp=(2024, 1, 1, 0, 0, 0),
+                external_attributes=0,
+                extra_sha256="",
+                comment_sha256="",
+                logical_resource_entry=name,
+                logical_class_entry=name,
+                runtime_effective=True,
+            )
+
+        name = "demo/Api.class"
+        old = entry(name, "a" * 64)
+        new = entry(name, "b" * 64)
+        common = {
+            "frame_type": "class_fact",
+            "class_contract_digest": "same-contract",
+            "methods": [],
+            "fields": [],
+        }
+        old_record = {
+            **common,
+            "attribute_inventory": [{
+                "level": "method",
+                "owner": "run()V",
+                "name": "StackMapTable",
+                "sha256": "old-stack-map",
+            }],
+        }
+        new_record = {
+            **common,
+            "attribute_inventory": [{
+                "level": "method",
+                "owner": "run()V",
+                "name": "StackMapTable",
+                "sha256": "new-stack-map",
+            }],
+        }
+
+        delta, category, gaps = diff._runtime_effective_class_delta(
+            old,
+            new,
+            base_records={f"{name}#occurrence=0": old_record},
+            current_records={f"{name}#occurrence=0": new_record},
+            comparison_or_runtime_scope={"runtime_major": 17},
+        )
+
+        self.assertEqual(category, "runtime_metadata_changed")
+        self.assertEqual(delta["class_change_category"], category)
+        self.assertEqual(gaps, set())
+
     def compile_class(self, variant, body, *, debug="-g", class_name="Api"):
         source = self.root / variant / "src" / "demo" / f"{class_name}.java"
         source.parent.mkdir(parents=True)

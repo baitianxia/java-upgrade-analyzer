@@ -29,7 +29,7 @@ class TestTrustGateTest(unittest.TestCase):
 
         self.assertEqual(result["status"], "passed", result["issues"])
         self.assertGreaterEqual(result["counts"]["blackbox_cases"], 16)
-        self.assertGreaterEqual(result["counts"]["closed_truth_results"], 53)
+        self.assertGreaterEqual(result["counts"]["closed_truth_results"], 54)
         self.assertGreaterEqual(result["counts"]["forbidden_truth_results"], 16)
         self.assertGreaterEqual(result["counts"]["blackbox_assertion_sites"], 621)
         self.assertGreaterEqual(
@@ -38,15 +38,18 @@ class TestTrustGateTest(unittest.TestCase):
         self.assertEqual(
             result["capability_readiness"]["status"], "complete"
         )
-        self.assertEqual(result["counts"]["public_capabilities"], 89)
-        self.assertEqual(result["counts"]["public_capabilities_covered"], 89)
+        self.assertEqual(result["counts"]["public_capabilities"], 90)
+        self.assertEqual(result["counts"]["public_capabilities_covered"], 90)
         self.assertEqual(result["counts"]["public_capabilities_partial"], 0)
         self.assertEqual(result["counts"]["public_capabilities_missing"], 0)
         self.assertEqual(result["capability_readiness"]["blocking_capabilities"], [])
-        self.assertEqual(result["counts"]["public_scenario_contracts"], 89)
-        self.assertEqual(result["counts"]["public_scenario_dimensions"], 260)
+        self.assertEqual(result["counts"]["public_scenario_contracts"], 90)
+        self.assertGreaterEqual(
+            result["counts"]["public_scenario_dimensions"], 279
+        )
         self.assertEqual(result["counts"]["public_support_claims"], 22)
-        self.assertEqual(result["counts"]["windows_selectors"], 38)
+        self.assertEqual(result["counts"]["allowed_whitebox_skips"], 2)
+        self.assertEqual(result["counts"]["windows_selectors"], 40)
         self.assertEqual(result["counts"]["windows_excluded_selectors"], 1)
 
     def test_required_windows_selector_cannot_be_silently_removed(self):
@@ -92,6 +95,23 @@ class TestTrustGateTest(unittest.TestCase):
 
         self.assertIn(
             "WINDOWS_EXCLUSION_REPLACEMENT_SET_MISMATCH",
+            {item["code"] for item in result["issues"]},
+        )
+
+    def test_new_whitebox_skip_requires_an_explicit_locked_exception(self):
+        policy = json.loads(POLICY_PATH.read_text(encoding="utf-8"))
+        policy["allowed_whitebox_skip_selectors"].append(
+            "tests.test_binary_output.BinaryOutputTest.test_contract"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            policy_path = Path(temporary) / "policy.json"
+            policy_path.write_text(
+                json.dumps(policy, ensure_ascii=False), encoding="utf-8",
+            )
+            result = run_trust_gate(ROOT, policy_path)
+
+        self.assertIn(
+            "WHITEBOX_SKIP_ALLOWLIST_POLICY_MISMATCH",
             {item["code"] for item in result["issues"]},
         )
 
@@ -195,7 +215,8 @@ class TestTrustGateTest(unittest.TestCase):
             item for item in contracts["capabilities"]
             if item["id"] == "typed_tool_failure_boundaries"
         )
-        target["dimensions"].pop("failure_closed")
+        for dimension in ("failure_closed", "invalid_input", "partial_failure"):
+            target["dimensions"].pop(dimension)
         with tempfile.TemporaryDirectory() as temporary:
             temporary_root = Path(temporary)
             bad_contracts = temporary_root / "scenario-contracts.json"
@@ -238,6 +259,33 @@ class TestTrustGateTest(unittest.TestCase):
 
         self.assertIn(
             "PUBLIC_SCENARIO_TRUTH_POINTER_MISSING",
+            {issue["code"] for issue in result["issues"]},
+        )
+
+    def test_required_fault_dimension_cannot_be_hidden_in_a_generic_label(self):
+        policy = json.loads(POLICY_PATH.read_text(encoding="utf-8"))
+        contracts_path = ROOT / policy["public_scenario_contracts"]
+        contracts = json.loads(contracts_path.read_text(encoding="utf-8"))
+        target = next(
+            item for item in contracts["capabilities"]
+            if item["id"] == "cache_integrity_and_repeat_determinism"
+        )
+        target["dimensions"].pop("concurrency")
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_root = Path(temporary)
+            bad_contracts = temporary_root / "scenario-contracts.json"
+            bad_contracts.write_text(
+                json.dumps(contracts, ensure_ascii=False), encoding="utf-8",
+            )
+            policy["public_scenario_contracts"] = str(bad_contracts)
+            policy_path = temporary_root / "policy.json"
+            policy_path.write_text(
+                json.dumps(policy, ensure_ascii=False), encoding="utf-8",
+            )
+            result = run_trust_gate(ROOT, policy_path)
+
+        self.assertIn(
+            "PUBLIC_SCENARIO_REQUIRED_FAULT_DIMENSION_MISSING",
             {issue["code"] for issue in result["issues"]},
         )
 

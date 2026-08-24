@@ -10,7 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,6 +29,322 @@ from tests import test_binary_output as binary_output_fixtures  # noqa: E402
 
 
 class RunStepMainStateTest(unittest.TestCase):
+    @contextmanager
+    def _mocked_step4_recovery_state(
+        self,
+        *,
+        checkpoint=None,
+        pending_activation=None,
+        metadata=None,
+        committed_receipt=None,
+        checkpoint_result=None,
+        create_transaction_marker=True,
+    ):
+        """Build one isolated persisted-state combination for recovery tests."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp).resolve() / ".upgrade-report"
+            binary_root = report / run_step.BINARY_OUTPUT_RELATIVE_PATH
+            binary_root.mkdir(parents=True)
+            if create_transaction_marker:
+                evidence = report / "evidence"
+                evidence.mkdir(parents=True)
+                (evidence / ".jua-br-test.transaction.json").write_text(
+                    "{}\n", encoding="utf-8"
+                )
+            with ExitStack() as stack:
+                mocks = {
+                    "checkpoint": stack.enter_context(patch.object(
+                        run_step,
+                        "_read_step4_validation_checkpoint",
+                        return_value=checkpoint,
+                    )),
+                    "pending": stack.enter_context(patch.object(
+                        run_step,
+                        "read_pending_binary_generation",
+                        return_value=pending_activation,
+                    )),
+                    "metadata": stack.enter_context(patch.object(
+                        run_step,
+                        "report_publication_transaction_recovery_metadata",
+                        return_value=metadata or {
+                            "state": "absent",
+                            "implementation_status": "absent",
+                        },
+                    )),
+                    "committed_receipt": stack.enter_context(patch.object(
+                        run_step,
+                        "report_publication_committed_receipt",
+                        return_value=committed_receipt or {},
+                    )),
+                    "checkpoint_result": stack.enter_context(patch.object(
+                        run_step,
+                        "_checkpoint_result_for_recovery",
+                        return_value=dict(checkpoint_result or {}),
+                    )),
+                }
+                yield report, mocks
+
+    @contextmanager
+    def _mocked_step4_republication(
+        self,
+        *,
+        baseline=None,
+        rollback_metadata=None,
+        rendered=None,
+        receipt=None,
+        active=None,
+        live_active=None,
+        live_receipt=None,
+        gate_receipt=True,
+        global_release=None,
+        verified=None,
+        rollback_restored=True,
+    ):
+        """Provide a complete report-only Step4 publication transaction."""
+
+        generation = "1" * 64
+        validation = "2" * 64
+        validation_sha = "3" * 64
+        implementation = "4" * 64
+        content_identity = "5" * 64
+        binding = {
+            "result_generation_identity": generation,
+            "validation_run_identity": validation,
+            "validation_result_sha256": validation_sha,
+            "report_implementation_identity": implementation,
+        }
+        transaction = {
+            "transaction_id": "a" * 32,
+            "binding": binding,
+            "published_content_identity": content_identity,
+        }
+        default_rendered = {
+            "phase": "step4",
+            "publication_transaction": transaction,
+        }
+        default_receipt = {
+            **transaction,
+            "state": "pending_gate",
+        }
+        default_active = {
+            "result_generation_identity": generation,
+            "validation_run_identity": validation,
+            "validation_result_sha256": validation_sha,
+        }
+        default_release = {
+            "step4": {"status": "current"},
+            "step5": {"status": "stale"},
+            "step6": {"status": "stale"},
+        }
+        default_verified = {
+            "binding": binding,
+            "committed_receipt_identity": "6" * 64,
+        }
+        baseline_payload = (
+            {"state": "absent"} if baseline is None else baseline
+        )
+        rollback_payload = (
+            baseline_payload
+            if rollback_metadata is None
+            else rollback_metadata
+        )
+        rendered_payload = (
+            default_rendered if rendered is None else rendered
+        )
+        receipt_payload = (
+            default_receipt if receipt is None else receipt
+        )
+        active_payload = default_active if active is None else active
+        live_active_payload = (
+            active_payload if live_active is None else live_active
+        )
+        live_receipt_payload = (
+            receipt_payload if live_receipt is None else live_receipt
+        )
+        release_payload = (
+            default_release if global_release is None else global_release
+        )
+        verified_payload = (
+            default_verified if verified is None else verified
+        )
+
+        with tempfile.TemporaryDirectory() as tmp, ExitStack() as stack:
+            report = Path(tmp).resolve() / ".upgrade-report"
+            mocks = {
+                "metadata": stack.enter_context(patch.object(
+                    run_step,
+                    "report_publication_transaction_recovery_metadata",
+                    side_effect=[baseline_payload, rollback_payload],
+                )),
+                "render": stack.enter_context(patch.object(
+                    run_step,
+                    "_prepare_binary_report_publication_candidate_in_process",
+                    return_value=rendered_payload,
+                )),
+                "receipt": stack.enter_context(patch.object(
+                    run_step,
+                    "report_publication_transaction_receipt",
+                    side_effect=[receipt_payload, live_receipt_payload],
+                )),
+                "active": stack.enter_context(patch.object(
+                    run_step,
+                    "read_active_binary_generation",
+                    side_effect=[active_payload, live_active_payload],
+                )),
+                "implementation": stack.enter_context(patch.object(
+                    run_step,
+                    "report_implementation_identity",
+                    return_value=implementation,
+                )),
+                "gate": stack.enter_context(patch.object(
+                    run_step, "run_gate",
+                )),
+                "lock": stack.enter_context(patch.object(
+                    run_step,
+                    "exclusive_file_lock",
+                    return_value=nullcontext(),
+                )),
+                "mark": stack.enter_context(patch.object(
+                    run_step,
+                    "mark_report_publication_gate_passed",
+                    return_value=gate_receipt,
+                )),
+                "publish": stack.enter_context(patch.object(
+                    run_step, "publish_report_publication",
+                )),
+                "commit": stack.enter_context(patch.object(
+                    run_step, "commit_report_publication",
+                )),
+                "release": stack.enter_context(patch.object(
+                    run_step,
+                    "reconcile_current_release",
+                    return_value=release_payload,
+                )),
+                "verify": stack.enter_context(patch.object(
+                    run_step,
+                    "verify_current_step4_release",
+                    return_value=verified_payload,
+                )),
+                "rollback": stack.enter_context(patch.object(
+                    run_step,
+                    "rollback_report_publication",
+                    return_value=rollback_restored,
+                )),
+                "timing": stack.enter_context(patch.object(
+                    run_step, "write_csv_rows",
+                )),
+            }
+            yield report, {
+                "binding": binding,
+                "transaction": transaction,
+                "rendered": rendered_payload,
+                "receipt": receipt_payload,
+                "active": active_payload,
+                "verified": verified_payload,
+            }, mocks
+
+    @contextmanager
+    def _mocked_downstream_publication(
+        self,
+        *,
+        stage="step5",
+        baseline=None,
+        rollback_metadata=None,
+        result=None,
+        receipt=None,
+        completion=None,
+        rollback_restored=True,
+    ):
+        """Provide an isolated Step5/6 candidate publication transaction."""
+
+        binding = {
+            "result_generation_identity": "1" * 64,
+            "report_implementation_identity": "2" * 64,
+        }
+        transaction = {
+            "transaction_id": "a" * 32,
+            "binding": binding,
+            "published_content_identity": "3" * 64,
+            "destinations": ["one", "two"],
+            "candidate_destinations": ["candidate-one", "candidate-two"],
+        }
+        default_result = {
+            "phase": stage,
+            "publication_transaction": transaction,
+            "business_output": True,
+        }
+        default_receipt = {**transaction, "state": "pending_gate"}
+        release = {
+            "step4": {"status": "current"},
+            "step5": {"status": "current"},
+            "step6": {
+                "status": "stale" if stage == "step5" else "current"
+            },
+        }
+        default_completion = {
+            "publication_receipt": {
+                "committed_receipt_identity": "4" * 64,
+            },
+            "global_release": release,
+        }
+        baseline_payload = (
+            {"state": "absent"} if baseline is None else baseline
+        )
+        rollback_payload = (
+            baseline_payload
+            if rollback_metadata is None
+            else rollback_metadata
+        )
+        result_payload = default_result if result is None else result
+        receipt_payload = default_receipt if receipt is None else receipt
+        completion_payload = (
+            default_completion if completion is None else completion
+        )
+
+        with tempfile.TemporaryDirectory() as tmp, ExitStack() as stack:
+            report = Path(tmp).resolve() / ".upgrade-report"
+            mocks = {
+                "metadata": stack.enter_context(patch.object(
+                    run_step,
+                    "report_publication_transaction_recovery_metadata",
+                    side_effect=[baseline_payload, rollback_payload],
+                )),
+                "require": stack.enter_context(patch.object(
+                    run_step, "require_current_release_stage",
+                )),
+                "prepare": stack.enter_context(patch.object(
+                    run_step,
+                    "_prepare_binary_report_publication_candidate_in_process",
+                    return_value=result_payload,
+                )),
+                "receipt": stack.enter_context(patch.object(
+                    run_step,
+                    "report_publication_transaction_receipt",
+                    return_value=receipt_payload,
+                )),
+                "gate": stack.enter_context(patch.object(
+                    run_step, "run_gate",
+                )),
+                "complete": stack.enter_context(patch.object(
+                    run_step,
+                    "complete_downstream_report_publication_after_gate",
+                    return_value=completion_payload,
+                )),
+                "rollback": stack.enter_context(patch.object(
+                    run_step,
+                    "rollback_report_publication",
+                    return_value=rollback_restored,
+                )),
+            }
+            yield report, {
+                "binding": binding,
+                "transaction": transaction,
+                "result": result_payload,
+                "receipt": receipt_payload,
+                "completion": completion_payload,
+            }, mocks
+
     def _performance_authority_binding(
         self, marker="1", authority_mode="release_evidence"
     ):
@@ -10897,6 +11213,5271 @@ class RunStepMainStateTest(unittest.TestCase):
         )
         self.assertNotIn("evidence/call_chain/alerts.csv", paths)
         self.assertNotIn("deliverables/report.md", paths)
+
+    def test_deferred_handoff_revalidation_contract_and_binding_matrix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp).resolve() / ".upgrade-report"
+            binary_root = report / run_step.BINARY_OUTPUT_RELATIVE_PATH
+            result_path = run_step.runtime_state_dir(report) / "result.json"
+            self._write_fake_step4_pipeline_result([
+                "--output-root", str(binary_root),
+                "--result-json", str(result_path),
+            ])
+            result = run_step.read_json(result_path)
+
+            validated = run_step._revalidate_binary_step4_deferred_handoff(
+                report, result,
+            )
+            self.assertEqual(
+                validated["pending"]["activation_identity"],
+                result["activation_identity"],
+            )
+            self.assertEqual(validated["public_active"], {})
+
+            for invalid_result in (None, [], "invalid"):
+                with self.subTest(invalid_result=invalid_result), self.assertRaises(
+                    run_step.StepError,
+                ) as raised:
+                    run_step._revalidate_binary_step4_deferred_handoff(
+                        report, invalid_result,
+                    )
+                self.assertEqual(
+                    raised.exception.reason_codes,
+                    ["BINARY_STEP4_DEFERRED_HANDOFF_REVALIDATION_FAILED"],
+                )
+
+            contract_mutations = {
+                "schema": lambda payload: payload.update(schema="invalid"),
+                "validation-status": lambda payload: payload.update(
+                    validation_status="failed"
+                ),
+                "checkpoint-retained": lambda payload: payload.update(
+                    validation_checkpoint_retained=False
+                ),
+                "candidate-private": lambda payload: payload.update(
+                    activation_candidate_private=False
+                ),
+                "predecessor-undeclared": lambda payload: payload.pop(
+                    "activation_predecessor"
+                ),
+            }
+            for label, mutate in contract_mutations.items():
+                candidate = json.loads(json.dumps(result))
+                mutate(candidate)
+                with self.subTest(contract=label), self.assertRaises(
+                    run_step.StepError,
+                ) as raised:
+                    run_step._revalidate_binary_step4_deferred_handoff(
+                        report, candidate,
+                    )
+                self.assertIn(
+                    "BINARY_STEP4_DEFERRED_HANDOFF_REVALIDATION_FAILED",
+                    raised.exception.reason_codes,
+                )
+
+            identity_fields = (
+                "result_generation_identity",
+                "analysis_context_identity",
+                "validation_run_identity",
+                "activation_identity",
+            )
+            for field in identity_fields:
+                for invalid_value in ("short", 7):
+                    candidate = json.loads(json.dumps(result))
+                    candidate[field] = invalid_value
+                    with self.subTest(
+                        identity_field=field, invalid_value=invalid_value,
+                    ), self.assertRaises(run_step.StepError) as raised:
+                        run_step._revalidate_binary_step4_deferred_handoff(
+                            report, candidate,
+                        )
+                    self.assertIn(
+                        field,
+                        raised.exception.diagnostic["invalid_identity_fields"],
+                    )
+
+            alternate_checkpoint = report / "alternate-checkpoint.json"
+            alternate_checkpoint.write_text("{}", encoding="utf-8")
+            for declared_path in (
+                str(alternate_checkpoint),
+                str(report / "missing-checkpoint.json"),
+            ):
+                candidate = json.loads(json.dumps(result))
+                candidate["validation_checkpoint_path"] = declared_path
+                with self.subTest(declared_path=declared_path), self.assertRaises(
+                    run_step.StepError,
+                ) as raised:
+                    run_step._revalidate_binary_step4_deferred_handoff(
+                        report, candidate,
+                    )
+                self.assertIn(
+                    "BINARY_STEP4_DEFERRED_HANDOFF_REVALIDATION_FAILED",
+                    raised.exception.reason_codes,
+                )
+
+            checkpoint = run_step.read_json(
+                run_step._step4_validation_checkpoint_path(report)
+            )
+            pending = run_step.read_pending_binary_generation(binary_root)
+            public_active = {
+                "result_generation_identity": "e" * 64,
+                "validation_run_identity": "f" * 64,
+            }
+            predecessor_result = json.loads(json.dumps(result))
+            predecessor_result["activation_predecessor"] = public_active
+            predecessor_pending = json.loads(json.dumps(pending))
+            predecessor_pending["activation_predecessor"] = public_active
+            with patch.object(
+                run_step, "_read_step4_validation_checkpoint", return_value=checkpoint,
+            ), patch.object(
+                run_step, "read_pending_binary_generation", return_value=predecessor_pending,
+            ), patch.object(
+                run_step, "read_active_binary_generation", return_value=public_active,
+            ):
+                predecessor_validated = (
+                    run_step._revalidate_binary_step4_deferred_handoff(
+                        report, predecessor_result,
+                    )
+                )
+            self.assertEqual(
+                predecessor_validated["public_active"], public_active,
+            )
+
+            binding_mutations = []
+            for key in (
+                "result_generation_identity",
+                "validation_run_identity",
+                "validation_result_sha256",
+                "activation_identity",
+                "activation_state",
+                "activation_predecessor",
+            ):
+                def mutate_pending(cp, pd, payload, *, field=key):
+                    pd[field] = "changed"
+                binding_mutations.append((f"pending-{key}", mutate_pending))
+
+            def invalid_validation_sha_type(cp, _pd, _payload):
+                cp["validation_result_sha256"] = None
+
+            def invalid_validation_sha_text(cp, _pd, _payload):
+                cp["validation_result_sha256"] = "short"
+
+            def changed_analysis_context(cp, _pd, _payload):
+                cp["analysis_context_identity"] = "9" * 64
+
+            def changed_result_predecessor(_cp, _pd, payload):
+                payload["activation_predecessor"] = {"changed": True}
+
+            def missing_pending_activation_state(_cp, pd, _payload):
+                pd["activation_state"] = None
+
+            binding_mutations.extend((
+                ("validation-sha-type", invalid_validation_sha_type),
+                ("validation-sha-text", invalid_validation_sha_text),
+                ("analysis-context", changed_analysis_context),
+                ("result-predecessor", changed_result_predecessor),
+                ("pending-activation-state-empty", missing_pending_activation_state),
+            ))
+            for label, mutate in binding_mutations:
+                candidate_checkpoint = json.loads(json.dumps(checkpoint))
+                candidate_pending = json.loads(json.dumps(pending))
+                candidate_result = json.loads(json.dumps(result))
+                mutate(candidate_checkpoint, candidate_pending, candidate_result)
+                with self.subTest(binding=label), patch.object(
+                    run_step,
+                    "_read_step4_validation_checkpoint",
+                    return_value=candidate_checkpoint,
+                ), patch.object(
+                    run_step,
+                    "read_pending_binary_generation",
+                    return_value=candidate_pending,
+                ), patch.object(
+                    run_step,
+                    "read_active_binary_generation",
+                    return_value=None,
+                ), self.assertRaises(run_step.StepError) as raised:
+                    run_step._revalidate_binary_step4_deferred_handoff(
+                        report, candidate_result,
+                    )
+                self.assertEqual(
+                    raised.exception.reason_codes,
+                    ["BINARY_STEP4_DEFERRED_HANDOFF_REVALIDATION_FAILED"],
+                )
+
+            cause = run_step.StepError(
+                "checkpoint failure",
+                reason_codes=["CHECKPOINT_CAUSE"],
+                diagnostic={"detail": "preserved"},
+            )
+            with patch.object(
+                run_step, "_read_step4_validation_checkpoint", side_effect=cause,
+            ), self.assertRaises(run_step.StepError) as checkpoint_error:
+                run_step._revalidate_binary_step4_deferred_handoff(
+                    report, result,
+                )
+            self.assertEqual(
+                checkpoint_error.exception.reason_codes,
+                [
+                    "CHECKPOINT_CAUSE",
+                    "BINARY_STEP4_DEFERRED_HANDOFF_REVALIDATION_FAILED",
+                ],
+            )
+            self.assertEqual(
+                checkpoint_error.exception.diagnostic,
+                {"detail": "preserved"},
+            )
+
+            with patch.object(
+                run_step,
+                "_read_step4_validation_checkpoint",
+                side_effect=run_step.StepError("checkpoint failure"),
+            ), self.assertRaises(run_step.StepError) as empty_diagnostic_error:
+                run_step._revalidate_binary_step4_deferred_handoff(
+                    report, result,
+                )
+            self.assertEqual(empty_diagnostic_error.exception.diagnostic, {})
+
+            output_cause = run_step.BinaryOutputError(
+                "BINARY_PENDING_INVALID", "pending failure",
+            )
+            with patch.object(
+                run_step,
+                "read_pending_binary_generation",
+                side_effect=output_cause,
+            ), self.assertRaises(run_step.StepError) as output_error:
+                run_step._revalidate_binary_step4_deferred_handoff(
+                    report, result,
+                )
+            self.assertEqual(
+                output_error.exception.diagnostic,
+                {"cause_reason_code": "BINARY_PENDING_INVALID"},
+            )
+
+    def test_prepare_deferred_handoff_publication_contract_matrix(self):
+        generation = "a" * 64
+        validation = "b" * 64
+        validation_sha = "c" * 64
+        activation = "d" * 64
+        implementation = "e" * 64
+        expected_binding = {
+            "result_generation_identity": generation,
+            "validation_run_identity": validation,
+            "validation_result_sha256": validation_sha,
+            "activation_identity": activation,
+            "report_implementation_identity": implementation,
+        }
+        creator = {
+            "transaction_id": "transaction-1",
+            "binding": expected_binding,
+            "published_content_identity": "content-1",
+            "destinations": ["api", "source"],
+            "candidate_destinations": ["api.pending", "source.pending"],
+        }
+        report_result = {
+            "phase": "step4",
+            "publication_transaction": creator,
+        }
+        receipt = {
+            **creator,
+            "state": "pending_gate",
+        }
+        active = {
+            "result_generation_identity": generation,
+            "validation_run_identity": validation,
+            "validation_result_sha256": validation_sha,
+            "activation_identity": activation,
+        }
+        expectation = {
+            "transaction_id": creator["transaction_id"],
+            "binding": expected_binding,
+        }
+        base_result = {
+            "result_generation_identity": generation,
+            "validation_run_identity": validation,
+            "activation_identity": activation,
+            "phase_timings": [{
+                "phase": "independent_validation",
+                "elapsed_seconds": 1.25,
+                "attempt": 2,
+            }],
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            report = root / ".upgrade-report"
+            timing_capture = {}
+
+            def capture_timing(path, rows, fields):
+                timing_capture.update(
+                    path=Path(path), rows=list(rows), fields=tuple(fields),
+                )
+
+            with patch.object(
+                run_step, "_revalidate_binary_step4_deferred_handoff",
+            ) as revalidate, patch.object(
+                run_step,
+                "_prepare_binary_report_publication_candidate_in_process",
+                return_value=report_result,
+            ), patch.object(
+                run_step,
+                "_step4_report_publication_expectation",
+                return_value=expectation,
+            ), patch.object(
+                run_step,
+                "report_publication_transaction_receipt",
+                return_value=receipt,
+            ), patch.object(
+                run_step, "_read_step4_active_descriptor", return_value=active,
+            ), patch.object(
+                run_step, "report_implementation_identity", return_value=implementation,
+            ), patch.object(
+                run_step, "write_csv_rows", side_effect=capture_timing,
+            ):
+                result = run_step._prepare_binary_step4_deferred_handoff(
+                    result=json.loads(json.dumps(base_result)),
+                    project_dir=root,
+                    report_dir=report,
+                    s4_dir=report / "api",
+                    pipeline_subprocess_seconds=2.5,
+                )
+
+            revalidate.assert_called_once()
+            self.assertEqual(result["report_publication_transaction"], receipt)
+            self.assertEqual(len(timing_capture["rows"]), 3)
+            self.assertEqual(
+                json.loads(timing_capture["rows"][0]["details"]),
+                {"attempt": 2},
+            )
+            self.assertEqual(
+                timing_capture["fields"],
+                (
+                    "phase", "elapsed_seconds",
+                    "result_generation_identity", "details",
+                ),
+            )
+
+            for invalid_report_result in (None, [], "invalid"):
+                with self.subTest(report_result=invalid_report_result), patch.object(
+                    run_step, "_revalidate_binary_step4_deferred_handoff",
+                ), patch.object(
+                    run_step,
+                    "_prepare_binary_report_publication_candidate_in_process",
+                    return_value=invalid_report_result,
+                ), self.assertRaises(run_step.StepError) as raised:
+                    run_step._prepare_binary_step4_deferred_handoff(
+                        result=json.loads(json.dumps(base_result)),
+                        project_dir=root,
+                        report_dir=report,
+                        s4_dir=report / "api",
+                        pipeline_subprocess_seconds=2.5,
+                    )
+                self.assertEqual(
+                    raised.exception.reason_codes,
+                    ["BINARY_STEP4_REPORT_TRANSACTION_MISSING"],
+                )
+
+            for invalid_transaction in (None, [], "invalid"):
+                invalid_candidate = {
+                    "phase": "step4",
+                    "publication_transaction": invalid_transaction,
+                }
+                with self.subTest(transaction=invalid_transaction), patch.object(
+                    run_step, "_revalidate_binary_step4_deferred_handoff",
+                ), patch.object(
+                    run_step,
+                    "_prepare_binary_report_publication_candidate_in_process",
+                    return_value=invalid_candidate,
+                ), self.assertRaises(run_step.StepError) as raised:
+                    run_step._prepare_binary_step4_deferred_handoff(
+                        result=json.loads(json.dumps(base_result)),
+                        project_dir=root,
+                        report_dir=report,
+                        s4_dir=report / "api",
+                        pipeline_subprocess_seconds=2.5,
+                    )
+                self.assertEqual(
+                    raised.exception.reason_codes,
+                    ["BINARY_STEP4_REPORT_TRANSACTION_MISSING"],
+                )
+
+            for receipt_value in (None, [], "invalid"):
+                with self.subTest(receipt=receipt_value), patch.object(
+                    run_step, "_revalidate_binary_step4_deferred_handoff",
+                ), patch.object(
+                    run_step,
+                    "_prepare_binary_report_publication_candidate_in_process",
+                    return_value=report_result,
+                ), patch.object(
+                    run_step,
+                    "_step4_report_publication_expectation",
+                    return_value=expectation,
+                ), patch.object(
+                    run_step,
+                    "report_publication_transaction_receipt",
+                    return_value=receipt_value,
+                ), self.assertRaises(run_step.StepError) as raised:
+                    run_step._prepare_binary_step4_deferred_handoff(
+                        result=json.loads(json.dumps(base_result)),
+                        project_dir=root,
+                        report_dir=report,
+                        s4_dir=report / "api",
+                        pipeline_subprocess_seconds=2.5,
+                    )
+                self.assertEqual(
+                    raised.exception.reason_codes,
+                    ["BINARY_STEP4_REPORT_TRANSACTION_MISSING"],
+                )
+
+            with patch.object(
+                run_step, "_revalidate_binary_step4_deferred_handoff",
+            ), patch.object(
+                run_step,
+                "_prepare_binary_report_publication_candidate_in_process",
+                return_value=report_result,
+            ), patch.object(
+                run_step,
+                "_step4_report_publication_expectation",
+                return_value=expectation,
+            ), patch.object(
+                run_step,
+                "report_publication_transaction_receipt",
+                side_effect=RuntimeError("receipt unavailable"),
+            ), self.assertRaises(run_step.StepError) as receipt_error:
+                run_step._prepare_binary_step4_deferred_handoff(
+                    result=json.loads(json.dumps(base_result)),
+                    project_dir=root,
+                    report_dir=report,
+                    s4_dir=report / "api",
+                    pipeline_subprocess_seconds=2.5,
+                )
+            self.assertEqual(
+                receipt_error.exception.reason_codes,
+                ["BINARY_STEP4_REPORT_TRANSACTION_MISSING"],
+            )
+
+            mismatch_mutations = {
+                "phase": lambda candidate, observed_active, observed_receipt: candidate.update(
+                    phase="step5"
+                ),
+                "active-generation": lambda candidate, observed_active, observed_receipt: observed_active.update(
+                    result_generation_identity="f" * 64
+                ),
+                "active-validation": lambda candidate, observed_active, observed_receipt: observed_active.update(
+                    validation_run_identity="f" * 64
+                ),
+                "active-activation": lambda candidate, observed_active, observed_receipt: observed_active.update(
+                    activation_identity="f" * 64
+                ),
+                "receipt-state": lambda candidate, observed_active, observed_receipt: observed_receipt.update(
+                    state="prepared"
+                ),
+                "receipt-binding": lambda candidate, observed_active, observed_receipt: observed_receipt.update(
+                    binding={"changed": True}
+                ),
+                "published-content": lambda candidate, observed_active, observed_receipt: observed_receipt.update(
+                    published_content_identity="changed"
+                ),
+                "destinations": lambda candidate, observed_active, observed_receipt: observed_receipt.update(
+                    destinations=["changed"]
+                ),
+                "candidate-destinations": lambda candidate, observed_active, observed_receipt: observed_receipt.update(
+                    candidate_destinations=["changed"]
+                ),
+            }
+            for label, mutate in mismatch_mutations.items():
+                candidate = json.loads(json.dumps(report_result))
+                observed_active = json.loads(json.dumps(active))
+                observed_receipt = json.loads(json.dumps(receipt))
+                mutate(candidate, observed_active, observed_receipt)
+                with self.subTest(mismatch=label), patch.object(
+                    run_step, "_revalidate_binary_step4_deferred_handoff",
+                ), patch.object(
+                    run_step,
+                    "_prepare_binary_report_publication_candidate_in_process",
+                    return_value=candidate,
+                ), patch.object(
+                    run_step,
+                    "_step4_report_publication_expectation",
+                    return_value=expectation,
+                ), patch.object(
+                    run_step,
+                    "report_publication_transaction_receipt",
+                    return_value=observed_receipt,
+                ), patch.object(
+                    run_step,
+                    "_read_step4_active_descriptor",
+                    return_value=observed_active,
+                ), patch.object(
+                    run_step,
+                    "report_implementation_identity",
+                    return_value=implementation,
+                ), self.assertRaises(run_step.StepError) as raised:
+                    run_step._prepare_binary_step4_deferred_handoff(
+                        result=json.loads(json.dumps(base_result)),
+                        project_dir=root,
+                        report_dir=report,
+                        s4_dir=report / "api",
+                        pipeline_subprocess_seconds=2.5,
+                    )
+                self.assertEqual(
+                    raised.exception.reason_codes,
+                    ["BINARY_STEP4_REPORT_TRANSACTION_MISSING"],
+                )
+
+            with patch.object(
+                run_step, "_revalidate_binary_step4_deferred_handoff",
+            ), patch.object(
+                run_step,
+                "_prepare_binary_report_publication_candidate_in_process",
+                return_value=report_result,
+            ), patch.object(
+                run_step,
+                "_step4_report_publication_expectation",
+                return_value=expectation,
+            ), patch.object(
+                run_step,
+                "report_publication_transaction_receipt",
+                return_value=receipt,
+            ), patch.object(
+                run_step, "_read_step4_active_descriptor", return_value=active,
+            ), patch.object(
+                run_step, "report_implementation_identity", return_value=implementation,
+            ), patch.object(
+                run_step, "write_csv_rows", side_effect=OSError("diagnostic only"),
+            ):
+                degraded = run_step._prepare_binary_step4_deferred_handoff(
+                    result=json.loads(json.dumps(base_result)),
+                    project_dir=root,
+                    report_dir=report,
+                    s4_dir=report / "api",
+                    pipeline_subprocess_seconds=2.5,
+                )
+            self.assertEqual(
+                degraded["report_publication_transaction"], receipt,
+            )
+
+    def test_finalize_step4_transaction_complete_contract_matrix(self):
+        generation = "a" * 64
+        validation = "b" * 64
+        validation_sha = "c" * 64
+        activation = "d" * 64
+        gate_receipt = {"gate_receipt_identity": "gate-1"}
+        publication_binding = {
+            "result_generation_identity": generation,
+            "validation_run_identity": validation,
+            "validation_result_sha256": validation_sha,
+            "activation_identity": activation,
+        }
+        checkpoint_payload = {
+            "schema": (
+                "java-upgrade-analyzer."
+                "binary-generation-validation-checkpoint.v3"
+            ),
+            "status": "independent_validation_passed_pending_activation",
+            "result_generation_identity": generation,
+            "validation_run_identity": validation,
+            "activation_identity": activation,
+        }
+        active_payload = {
+            "result_generation_identity": generation,
+            "validation_run_identity": validation,
+            "validation_result_sha256": validation_sha,
+            "activation_identity": activation,
+        }
+        receipt_payload = {
+            "state": "gate_passed",
+            "binding": {
+                **publication_binding,
+                "report_implementation_identity": "e" * 64,
+            },
+            "gate_receipt": gate_receipt,
+        }
+        published_payload = {
+            "result_generation_identity": generation,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp).resolve() / ".upgrade-report"
+            checkpoint_path = run_step._step4_validation_checkpoint_path(report)
+            run_step.write_json(checkpoint_path, checkpoint_payload)
+            expectation = {
+                "transaction_id": "transaction-1",
+                "binding": publication_binding,
+            }
+            base_result = {
+                "validation_checkpoint_retained": True,
+                "validation_checkpoint_path": str(checkpoint_path),
+                "result_generation_identity": generation,
+                "validation_run_identity": validation,
+                "activation_identity": activation,
+                "report_publication_transaction": expectation,
+                "report_publication_gate_receipt": gate_receipt,
+            }
+
+            self.assertFalse(
+                run_step._finalize_binary_step4_transaction(report, None)
+            )
+            for not_retained in ({}, {"validation_checkpoint_retained": False}):
+                self.assertFalse(
+                    run_step._finalize_binary_step4_transaction(
+                        report, not_retained,
+                    )
+                )
+            for malformed_result in ([], "invalid", 7):
+                with self.subTest(malformed_result=malformed_result), self.assertRaises(
+                    run_step.StepError,
+                ) as raised:
+                    run_step._finalize_binary_step4_transaction(
+                        report, malformed_result,
+                    )
+                self.assertEqual(
+                    raised.exception.reason_codes,
+                    ["BINARY_STEP4_TRANSACTION_CHECKPOINT_INVALID"],
+                )
+
+    def test_complete_step4_after_gate_commit_and_failure_matrix(self):
+        expectation = {
+            "transaction_id": "transaction-1",
+            "binding": {"result_generation_identity": "a" * 64},
+        }
+        base_result = {
+            "activation_identity": "b" * 64,
+            "report_publication_transaction": expectation,
+        }
+        valid_release = {
+            "step4": {"status": "current"},
+            "step5": {"status": "stale"},
+            "step6": {"status": "stale"},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            report = root / ".upgrade-report"
+
+            for malformed_result in (None, [], "invalid", 7):
+                with self.subTest(result=malformed_result), self.assertRaises(
+                    run_step.StepError,
+                ) as raised:
+                    run_step._complete_binary_step4_after_gate(
+                        report_dir=report,
+                        project_dir=root,
+                        gate_name="jar_compare",
+                        strict_risk_gate=False,
+                        result=malformed_result,
+                    )
+                self.assertEqual(
+                    raised.exception.reason_codes,
+                    ["BINARY_STEP4_TRANSACTION_COMMIT_FAILED"],
+                )
+
+            for strict, gate_name, result_override in (
+                (False, "jar_compare", {}),
+                (True, None, {
+                    "activation_identity": "",
+                    "report_publication_transaction": None,
+                }),
+            ):
+                result = {**base_result, **result_override}
+                events = []
+
+                def record(name, value=None):
+                    def invoke(*_args, **_kwargs):
+                        events.append((name, _args, _kwargs))
+                        return value
+                    return invoke
+
+                with self.subTest(strict=strict, gate_name=gate_name), patch.object(
+                    run_step,
+                    "_step4_report_publication_expectation",
+                    return_value=expectation,
+                ), patch.object(
+                    run_step, "run_gate", side_effect=record("gate"),
+                ), patch.object(
+                    run_step,
+                    "mark_report_publication_gate_passed",
+                    side_effect=record("mark", {"gate": "receipt"}),
+                ), patch.object(
+                    run_step,
+                    "publish_report_publication",
+                    side_effect=record("publish", True),
+                ), patch.object(
+                    run_step,
+                    "_seal_binary_step4_activation",
+                    side_effect=record("seal", True),
+                ), patch.object(
+                    run_step,
+                    "_finalize_binary_step4_transaction",
+                    side_effect=record("finalize", True),
+                ), patch.object(
+                    run_step,
+                    "_commit_binary_step4_activation_receipt",
+                    side_effect=record("activation-commit", True),
+                ), patch.object(
+                    run_step,
+                    "commit_report_publication",
+                    side_effect=record("report-commit", True),
+                ), patch.object(
+                    run_step,
+                    "reconcile_current_release",
+                    side_effect=record("release", valid_release),
+                ), patch.object(
+                    run_step,
+                    "_prune_binary_step4_generations_best_effort",
+                    side_effect=record("prune", {}),
+                ):
+                    completed = run_step._complete_binary_step4_after_gate(
+                        report_dir=report,
+                        project_dir=root,
+                        gate_name=gate_name,
+                        strict_risk_gate=strict,
+                        result=result,
+                    )
+
+                self.assertTrue(completed)
+                self.assertEqual(
+                    [event[0] for event in events],
+                    [
+                        "gate", "mark", "publish", "seal", "finalize",
+                        "activation-commit", "finalize", "report-commit",
+                        "release", "prune",
+                    ],
+                )
+                gate_kwargs = events[0][2]
+                self.assertIs(
+                    gate_kwargs["strict_risk_gate"], bool(strict),
+                )
+                self.assertEqual(
+                    gate_kwargs["publication_transaction"],
+                    result.get("report_publication_transaction"),
+                )
+                self.assertEqual(
+                    gate_kwargs["candidate_activation_identity"],
+                    str(result.get("activation_identity") or ""),
+                )
+                mark_kwargs = events[1][2]
+                self.assertEqual(mark_kwargs["gate_name"], str(gate_name or ""))
+                self.assertIs(mark_kwargs["strict_risk_gate"], bool(strict))
+                self.assertEqual(
+                    result["report_publication_gate_receipt"],
+                    {"gate": "receipt"},
+                )
+                self.assertFalse(events[4][2]["delete_checkpoint"])
+                self.assertNotIn("delete_checkpoint", events[6][2])
+
+            rollback_status = {
+                "report_publication_rollback": "restored_previous_reports",
+                "active_generation_rollback": "restored_lock_observed_predecessor",
+            }
+            step_failures = (
+                run_step.StepError(
+                    "gate rejected",
+                    reason_codes=["GATE_REJECTED"],
+                    diagnostic={"cause": "gate"},
+                ),
+                run_step.StepError("gate rejected"),
+                RuntimeError("unexpected gate failure"),
+            )
+            for failure in step_failures:
+                with self.subTest(failure=type(failure).__name__), patch.object(
+                    run_step,
+                    "_step4_report_publication_expectation",
+                    return_value=expectation,
+                ), patch.object(
+                    run_step, "run_gate", side_effect=failure,
+                ), patch.object(
+                    run_step,
+                    "_rollback_binary_step4_transaction",
+                    return_value=rollback_status,
+                ) as rollback, self.assertRaises(run_step.StepError) as raised:
+                    run_step._complete_binary_step4_after_gate(
+                        report_dir=report,
+                        project_dir=root,
+                        gate_name="jar_compare",
+                        strict_risk_gate=False,
+                        result=json.loads(json.dumps(base_result)),
+                    )
+                rollback.assert_called_once()
+                self.assertEqual(
+                    raised.exception.diagnostic[
+                        "report_publication_rollback"
+                    ],
+                    "restored_previous_reports",
+                )
+                if isinstance(failure, run_step.StepError):
+                    self.assertEqual(
+                        raised.exception.reason_codes,
+                        failure.reason_codes,
+                    )
+                    self.assertEqual(
+                        raised.exception.diagnostic.get("cause"),
+                        failure.diagnostic.get("cause"),
+                    )
+                else:
+                    self.assertEqual(
+                        raised.exception.reason_codes,
+                        ["BINARY_STEP4_TRANSACTION_COMMIT_FAILED"],
+                    )
+
+            invalid_releases = (
+                None,
+                [],
+                "invalid",
+                {},
+                {"step4": [], "step5": {"status": "stale"}, "step6": {"status": "stale"}},
+                {"step4": {"status": "current"}, "step5": [], "step6": {"status": "stale"}},
+                {"step4": {"status": "current"}, "step5": {"status": "stale"}, "step6": []},
+                {"step4": {"status": "wrong"}, "step5": {"status": "stale"}, "step6": {"status": "stale"}},
+                {"step4": {"status": "current"}, "step5": {"status": "wrong"}, "step6": {"status": "stale"}},
+                {"step4": {"status": "current"}, "step5": {"status": "stale"}, "step6": {"status": "wrong"}},
+            )
+            for invalid_release in invalid_releases:
+                with self.subTest(release=invalid_release), patch.object(
+                    run_step,
+                    "_step4_report_publication_expectation",
+                    return_value=expectation,
+                ), patch.object(
+                    run_step, "run_gate",
+                ), patch.object(
+                    run_step,
+                    "mark_report_publication_gate_passed",
+                    return_value={"gate": "receipt"},
+                ), patch.object(
+                    run_step, "publish_report_publication",
+                ), patch.object(
+                    run_step, "_seal_binary_step4_activation",
+                ), patch.object(
+                    run_step, "_finalize_binary_step4_transaction",
+                ), patch.object(
+                    run_step, "_commit_binary_step4_activation_receipt",
+                ), patch.object(
+                    run_step, "commit_report_publication",
+                ), patch.object(
+                    run_step,
+                    "reconcile_current_release",
+                    return_value=invalid_release,
+                ), patch.object(
+                    run_step, "_rollback_binary_step4_transaction",
+                ) as rollback, self.assertRaises(run_step.StepError) as raised:
+                    run_step._complete_binary_step4_after_gate(
+                        report_dir=report,
+                        project_dir=root,
+                        gate_name="jar_compare",
+                        strict_risk_gate=False,
+                        result=json.loads(json.dumps(base_result)),
+                    )
+                self.assertEqual(
+                    raised.exception.reason_codes,
+                    ["BINARY_GLOBAL_RELEASE_STATE_INVALID"],
+                )
+                rollback.assert_not_called()
+
+    def test_finalize_step4_transaction_binding_and_io_matrix(self):
+        generation = "a" * 64
+        validation = "b" * 64
+        validation_sha = "c" * 64
+        activation = "d" * 64
+        gate_receipt = {"gate_receipt_identity": "gate-1"}
+        publication_binding = {
+            "result_generation_identity": generation,
+            "validation_run_identity": validation,
+            "validation_result_sha256": validation_sha,
+            "activation_identity": activation,
+        }
+        checkpoint_payload = {
+            "schema": (
+                "java-upgrade-analyzer."
+                "binary-generation-validation-checkpoint.v3"
+            ),
+            "status": "independent_validation_passed_pending_activation",
+            "result_generation_identity": generation,
+            "validation_run_identity": validation,
+            "activation_identity": activation,
+        }
+        active_payload = {
+            "result_generation_identity": generation,
+            "validation_run_identity": validation,
+            "validation_result_sha256": validation_sha,
+            "activation_identity": activation,
+        }
+        receipt_payload = {
+            "state": "gate_passed",
+            "binding": {
+                **publication_binding,
+                "report_implementation_identity": "e" * 64,
+            },
+            "gate_receipt": gate_receipt,
+        }
+        published_payload = {
+            "result_generation_identity": generation,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp).resolve() / ".upgrade-report"
+            checkpoint_path = run_step._step4_validation_checkpoint_path(report)
+            run_step.write_json(checkpoint_path, checkpoint_payload)
+            expectation = {
+                "transaction_id": "transaction-1",
+                "binding": publication_binding,
+            }
+            base_result = {
+                "validation_checkpoint_retained": True,
+                "validation_checkpoint_path": str(checkpoint_path),
+                "result_generation_identity": generation,
+                "validation_run_identity": validation,
+                "activation_identity": activation,
+                "report_publication_transaction": expectation,
+                "report_publication_gate_receipt": gate_receipt,
+            }
+            for malformed_retained in (1, "true", [], {}):
+                candidate = {
+                    "validation_checkpoint_retained": malformed_retained,
+                }
+                with self.subTest(retained=malformed_retained), self.assertRaises(
+                    run_step.StepError,
+                ):
+                    run_step._finalize_binary_step4_transaction(
+                        report, candidate,
+                    )
+
+            def invoke(
+                *,
+                result=None,
+                checkpoint=None,
+                active=None,
+                receipt=None,
+                published=None,
+                delete_checkpoint=True,
+                cleanup=None,
+            ):
+                candidate_result = json.loads(json.dumps(result or base_result))
+                candidate_checkpoint = json.loads(json.dumps(
+                    checkpoint_payload if checkpoint is None else checkpoint
+                ))
+                candidate_active = json.loads(json.dumps(
+                    active_payload if active is None else active
+                ))
+                candidate_receipt = json.loads(json.dumps(
+                    receipt_payload if receipt is None else receipt
+                ))
+                candidate_published = json.loads(json.dumps(
+                    published_payload if published is None else published
+                ))
+                with patch.object(
+                    run_step,
+                    "_step4_report_publication_expectation",
+                    return_value=expectation,
+                ), patch.object(
+                    run_step,
+                    "_read_step4_validation_checkpoint",
+                    return_value=candidate_checkpoint,
+                ), patch.object(
+                    run_step,
+                    "_read_step4_active_descriptor",
+                    return_value=candidate_active,
+                ), patch.object(
+                    run_step,
+                    "report_publication_transaction_receipt",
+                    return_value=candidate_receipt,
+                ), patch.object(
+                    run_step, "read_json", return_value=candidate_published,
+                ), patch.object(
+                    run_step,
+                    "_cleanup_committed_step4_checkpoint",
+                    side_effect=cleanup,
+                ) as cleanup_call:
+                    outcome = run_step._finalize_binary_step4_transaction(
+                        report,
+                        candidate_result,
+                        delete_checkpoint=delete_checkpoint,
+                    )
+                return outcome, cleanup_call
+
+            outcome, cleanup = invoke()
+            self.assertTrue(outcome)
+            cleanup.assert_called_once_with(checkpoint_path)
+
+            no_delete, cleanup = invoke(delete_checkpoint=False)
+            self.assertTrue(no_delete)
+            cleanup.assert_not_called()
+
+            for state in ("gate_passed", "published"):
+                receipt = json.loads(json.dumps(receipt_payload))
+                receipt["state"] = state
+                active_without_token = json.loads(json.dumps(active_payload))
+                active_without_token.pop("activation_identity")
+                with self.subTest(state=state):
+                    self.assertTrue(invoke(
+                        receipt=receipt,
+                        active=active_without_token,
+                    )[0])
+
+            alternate_path = report / "alternate-checkpoint.json"
+            alternate_path.write_text("{}", encoding="utf-8")
+
+            mismatch_mutations = {
+                "declared-path": lambda result, checkpoint, active, receipt, published: result.update(
+                    validation_checkpoint_path=str(alternate_path)
+                ),
+                "result-generation-empty": lambda result, checkpoint, active, receipt, published: result.update(
+                    result_generation_identity=""
+                ),
+                "result-validation-empty": lambda result, checkpoint, active, receipt, published: result.update(
+                    validation_run_identity=""
+                ),
+                "result-activation-empty": lambda result, checkpoint, active, receipt, published: result.update(
+                    activation_identity=""
+                ),
+                "checkpoint-schema": lambda result, checkpoint, active, receipt, published: checkpoint.update(
+                    schema="invalid"
+                ),
+                "checkpoint-status": lambda result, checkpoint, active, receipt, published: checkpoint.update(
+                    status="invalid"
+                ),
+                "checkpoint-generation": lambda result, checkpoint, active, receipt, published: checkpoint.update(
+                    result_generation_identity="f" * 64
+                ),
+                "checkpoint-validation": lambda result, checkpoint, active, receipt, published: checkpoint.update(
+                    validation_run_identity="f" * 64
+                ),
+                "checkpoint-activation": lambda result, checkpoint, active, receipt, published: checkpoint.update(
+                    activation_identity="f" * 64
+                ),
+                "active-generation": lambda result, checkpoint, active, receipt, published: active.update(
+                    result_generation_identity="f" * 64
+                ),
+                "active-activation": lambda result, checkpoint, active, receipt, published: active.update(
+                    activation_identity="f" * 64
+                ),
+                "active-activation-empty": lambda result, checkpoint, active, receipt, published: active.update(
+                    activation_identity=""
+                ),
+                "published-generation": lambda result, checkpoint, active, receipt, published: published.update(
+                    result_generation_identity="f" * 64
+                ),
+                "publication-state": lambda result, checkpoint, active, receipt, published: receipt.update(
+                    state="prepared"
+                ),
+                "publication-binding": lambda result, checkpoint, active, receipt, published: receipt.update(
+                    binding={"changed": True}
+                ),
+                "gate-receipt": lambda result, checkpoint, active, receipt, published: receipt.update(
+                    gate_receipt={"changed": True}
+                ),
+            }
+            for label, mutate in mismatch_mutations.items():
+                result = json.loads(json.dumps(base_result))
+                checkpoint = json.loads(json.dumps(checkpoint_payload))
+                active = json.loads(json.dumps(active_payload))
+                receipt = json.loads(json.dumps(receipt_payload))
+                published = json.loads(json.dumps(published_payload))
+                mutate(result, checkpoint, active, receipt, published)
+                with self.subTest(mismatch=label), self.assertRaises(
+                    run_step.StepError,
+                ) as raised:
+                    invoke(
+                        result=result,
+                        checkpoint=checkpoint,
+                        active=active,
+                        receipt=receipt,
+                        published=published,
+                    )
+                self.assertEqual(
+                    raised.exception.reason_codes,
+                    ["BINARY_STEP4_TRANSACTION_BINDING_MISMATCH"],
+                )
+
+            malformed_shapes = (
+                ("checkpoint", []),
+                ("active", []),
+                ("receipt", []),
+                ("published", []),
+            )
+            for field, value in malformed_shapes:
+                kwargs = {field: value}
+                with self.subTest(shape=field), self.assertRaises(
+                    run_step.StepError,
+                ) as raised:
+                    invoke(**kwargs)
+                self.assertEqual(
+                    raised.exception.reason_codes,
+                    ["BINARY_STEP4_TRANSACTION_CHECKPOINT_INVALID"],
+                )
+
+            for invalid_binding in (None, [], "invalid"):
+                receipt = json.loads(json.dumps(receipt_payload))
+                receipt["binding"] = invalid_binding
+                with self.subTest(binding=invalid_binding), self.assertRaises(
+                    run_step.StepError,
+                ) as raised:
+                    invoke(receipt=receipt)
+                self.assertEqual(
+                    raised.exception.reason_codes,
+                    ["BINARY_STEP4_TRANSACTION_CHECKPOINT_INVALID"],
+                )
+
+            missing_path_result = json.loads(json.dumps(base_result))
+            missing_path_result["validation_checkpoint_path"] = str(
+                report / "missing.json"
+            )
+            with self.assertRaises(run_step.StepError) as path_error:
+                invoke(result=missing_path_result)
+            self.assertEqual(
+                path_error.exception.reason_codes,
+                ["BINARY_STEP4_TRANSACTION_CHECKPOINT_INVALID"],
+            )
+
+            read_errors = (
+                OSError("read failure"),
+                UnicodeError("decode failure"),
+                json.JSONDecodeError("json failure", "{", 1),
+            )
+            for error in read_errors:
+                with self.subTest(read_error=type(error).__name__), patch.object(
+                    run_step,
+                    "_step4_report_publication_expectation",
+                    return_value=expectation,
+                ), patch.object(
+                    run_step,
+                    "_read_step4_validation_checkpoint",
+                    side_effect=error,
+                ), self.assertRaises(run_step.StepError) as raised:
+                    run_step._finalize_binary_step4_transaction(
+                        report, base_result,
+                    )
+                self.assertEqual(
+                    raised.exception.reason_codes,
+                    ["BINARY_STEP4_TRANSACTION_CHECKPOINT_INVALID"],
+                )
+
+    def test_rollback_step4_transaction_state_and_failure_matrix(self):
+        expectation = {
+            "transaction_id": "transaction-1",
+            "binding": {
+                "result_generation_identity": "a" * 64,
+                "activation_identity": "b" * 64,
+            },
+        }
+        result = {
+            "result_generation_identity": "a" * 64,
+            "activation_identity": "b" * 64,
+            "report_publication_transaction": expectation,
+        }
+        activation_binding = {
+            "result_generation_identity": "a" * 64,
+            "activation_identity": "b" * 64,
+        }
+
+        def invoke(
+            *,
+            metadata=None,
+            expected=expectation,
+            candidate_result=result,
+            report_rollback=True,
+            active_binding=activation_binding,
+            active_restore=True,
+            metadata_error=None,
+            report_error=None,
+            binding_error=None,
+            active_error=None,
+        ):
+            observed_metadata = (
+                {"state": "absent"} if metadata is None else metadata
+            )
+            with patch.object(
+                run_step,
+                "report_publication_transaction_recovery_metadata",
+                return_value=observed_metadata,
+                side_effect=metadata_error,
+            ), patch.object(
+                run_step,
+                "_step4_report_publication_expectation",
+                return_value=expected,
+            ), patch.object(
+                run_step, "report_publication_transaction_receipt",
+            ) as receipt, patch.object(
+                run_step,
+                "rollback_report_publication",
+                return_value=report_rollback,
+                side_effect=report_error,
+            ) as rollback, patch.object(
+                run_step,
+                "_step4_activation_binding",
+                return_value=active_binding,
+                side_effect=binding_error,
+            ), patch.object(
+                run_step,
+                "compare_and_restore_active_binary_generation",
+                return_value=active_restore,
+                side_effect=active_error,
+            ) as restore:
+                statuses = run_step._rollback_binary_step4_transaction(
+                    "/report", candidate_result,
+                )
+            return statuses, receipt, rollback, restore
+
+        for metadata in ({}, {"state": ""}, {"state": "absent"}):
+            statuses, receipt, rollback, restore = invoke(
+                metadata=metadata,
+                expected=None,
+                candidate_result=None,
+                active_binding={
+                    "result_generation_identity": "",
+                    "activation_identity": "",
+                },
+            )
+            with self.subTest(metadata=metadata):
+                self.assertEqual(
+                    statuses,
+                    {
+                        "report_publication_rollback": "not_present",
+                        "active_generation_rollback": (
+                            "not_attempted_without_bound_activation"
+                        ),
+                    },
+                )
+                receipt.assert_not_called()
+                rollback.assert_not_called()
+                restore.assert_not_called()
+
+        statuses, _receipt, _rollback, restore = invoke(
+            metadata={"state": "absent"},
+        )
+        self.assertTrue(
+            statuses["report_publication_rollback"].startswith(
+                "rollback_failed:BinaryReportError:"
+            )
+        )
+        self.assertEqual(
+            statuses["active_generation_rollback"],
+            "not_attempted_after_report_rollback_failure",
+        )
+        restore.assert_not_called()
+
+        statuses, receipt, rollback, restore = invoke(
+            metadata={"state": "committed"},
+        )
+        self.assertEqual(statuses["report_publication_rollback"], "already_committed")
+        self.assertEqual(
+            statuses["active_generation_rollback"],
+            "not_attempted_after_report_commit",
+        )
+        receipt.assert_called_once()
+        rollback.assert_not_called()
+        restore.assert_not_called()
+
+        for report_rollback, active_restore, expected_report, expected_active in (
+            (
+                True,
+                True,
+                "restored_previous_reports",
+                "restored_lock_observed_predecessor",
+            ),
+            (
+                False,
+                False,
+                "not_present",
+                "skipped_active_generation_or_token_changed",
+            ),
+        ):
+            statuses, receipt, rollback, restore = invoke(
+                metadata={"state": "pending_gate"},
+                report_rollback=report_rollback,
+                active_restore=active_restore,
+            )
+            with self.subTest(
+                report_rollback=report_rollback,
+                active_restore=active_restore,
+            ):
+                self.assertEqual(
+                    statuses["report_publication_rollback"], expected_report,
+                )
+                self.assertEqual(
+                    statuses["active_generation_rollback"], expected_active,
+                )
+                receipt.assert_not_called()
+                rollback.assert_called_once()
+                restore.assert_called_once()
+                self.assertEqual(
+                    restore.call_args.kwargs["expected_current_identity"],
+                    activation_binding["result_generation_identity"],
+                )
+                self.assertEqual(
+                    restore.call_args.kwargs["expected_activation_identity"],
+                    activation_binding["activation_identity"],
+                )
+
+        adopted_metadata = {
+            "state": "prepared",
+            "transaction_id": "adopted-transaction",
+            "binding": {
+                "result_generation_identity": result[
+                    "result_generation_identity"
+                ],
+                "activation_identity": result["activation_identity"],
+                "additional_binding": "retained",
+            },
+        }
+        statuses, _receipt, rollback, _restore = invoke(
+            metadata=adopted_metadata,
+            expected=None,
+        )
+        self.assertEqual(
+            statuses["report_publication_rollback"],
+            "restored_previous_reports",
+        )
+        self.assertEqual(
+            rollback.call_args.kwargs["expected_transaction_id"],
+            "adopted-transaction",
+        )
+        self.assertEqual(
+            rollback.call_args.kwargs["expected_binding"],
+            adopted_metadata["binding"],
+        )
+
+        missing_metadata_binding, _receipt, rollback, restore = invoke(
+            metadata={"state": "prepared"},
+            expected=None,
+        )
+        self.assertEqual(
+            missing_metadata_binding["report_publication_rollback"],
+            (
+                "rollback_failed:BinaryReportError:"
+                "BINARY_REPORT_PUBLICATION_TRANSACTION_BINDING_MISMATCH"
+            ),
+        )
+        rollback.assert_not_called()
+        restore.assert_not_called()
+
+        adoption_failures = (
+            None,
+            "invalid-result",
+            {"result_generation_identity": result["result_generation_identity"]},
+            {
+                "result_generation_identity": "f" * 64,
+                "activation_identity": result["activation_identity"],
+            },
+            {
+                "result_generation_identity": result["result_generation_identity"],
+                "activation_identity": "f" * 64,
+            },
+        )
+        for candidate_result in adoption_failures:
+            statuses, _receipt, rollback, restore = invoke(
+                metadata=adopted_metadata,
+                expected=None,
+                candidate_result=candidate_result,
+            )
+            with self.subTest(adoption_result=candidate_result):
+                self.assertTrue(
+                    statuses["report_publication_rollback"].startswith(
+                        "rollback_failed:BinaryReportError:"
+                    )
+                )
+                self.assertEqual(
+                    statuses["active_generation_rollback"],
+                    "not_attempted_after_report_rollback_failure",
+                )
+                rollback.assert_not_called()
+                restore.assert_not_called()
+
+        failures = (
+            (
+                "metadata-reason",
+                {"metadata_error": run_step.BinaryReportError("REPORT_BAD", "bad")},
+                "report_publication_rollback",
+                "rollback_failed:BinaryReportError:REPORT_BAD",
+            ),
+            (
+                "metadata-no-reason",
+                {"metadata_error": RuntimeError("bad")},
+                "report_publication_rollback",
+                "rollback_failed:RuntimeError",
+            ),
+            (
+                "report-reason",
+                {
+                    "metadata": {"state": "prepared"},
+                    "report_error": run_step.BinaryReportError("REPORT_BAD", "bad"),
+                },
+                "report_publication_rollback",
+                "rollback_failed:BinaryReportError:REPORT_BAD",
+            ),
+            (
+                "binding-reason",
+                {
+                    "expected": None,
+                    "candidate_result": None,
+                    "binding_error": run_step.StepError(
+                        "binding bad", reason_codes=["BINDING_BAD"]
+                    ),
+                },
+                "active_generation_rollback",
+                "rollback_failed:StepError",
+            ),
+            (
+                "active-reason",
+                {
+                    "metadata": {"state": "prepared"},
+                    "active_error": run_step.BinaryOutputError(
+                        "ACTIVE_BAD", "bad"
+                    ),
+                },
+                "active_generation_rollback",
+                "rollback_failed:BinaryOutputError:ACTIVE_BAD",
+            ),
+            (
+                "active-no-reason",
+                {
+                    "metadata": {"state": "prepared"},
+                    "active_error": RuntimeError("bad"),
+                },
+                "active_generation_rollback",
+                "rollback_failed:RuntimeError",
+            ),
+        )
+        for label, kwargs, status_field, expected_status in failures:
+            statuses, _receipt, _rollback, _restore = invoke(**kwargs)
+            with self.subTest(failure=label):
+                self.assertEqual(statuses[status_field], expected_status)
+
+        for binding in (
+            {"result_generation_identity": "", "activation_identity": "b" * 64},
+            {"result_generation_identity": "a" * 64, "activation_identity": ""},
+            {"result_generation_identity": "", "activation_identity": ""},
+        ):
+            statuses, _receipt, _rollback, restore = invoke(
+                metadata={"state": "prepared"},
+                active_binding=binding,
+            )
+            with self.subTest(binding=binding):
+                self.assertEqual(
+                    statuses["active_generation_rollback"],
+                    "not_attempted_without_bound_activation",
+                )
+                restore.assert_not_called()
+
+    def test_require_successful_step4_rollback_status_matrix(self):
+        for report_status in ("restored_previous_reports", "not_present"):
+            for active_status in (
+                "restored_lock_observed_predecessor",
+                "not_attempted_without_bound_activation",
+            ):
+                with self.subTest(
+                    report_status=report_status,
+                    active_status=active_status,
+                ):
+                    run_step._require_successful_binary_step4_recovery_rollback({
+                        "report_publication_rollback": report_status,
+                        "active_generation_rollback": active_status,
+                        "diagnostic_only": "ignored",
+                    })
+
+        for malformed in ([], "invalid", 7):
+            with self.subTest(malformed=malformed), self.assertRaises(
+                run_step.StepError,
+            ) as raised:
+                run_step._require_successful_binary_step4_recovery_rollback(
+                    malformed,
+                )
+            self.assertEqual(
+                raised.exception.reason_codes,
+                ["BINARY_STEP4_TRANSACTION_RECOVERY_FAILED"],
+            )
+            self.assertEqual(
+                raised.exception.diagnostic["rollback_status_type"],
+                type(malformed).__name__,
+            )
+
+        failures = (
+            None,
+            {},
+            {"report_publication_rollback": "not_present"},
+            {
+                "active_generation_rollback": (
+                    "restored_lock_observed_predecessor"
+                ),
+            },
+            {
+                "report_publication_rollback": "already_committed",
+                "active_generation_rollback": (
+                    "restored_lock_observed_predecessor"
+                ),
+            },
+            {
+                "report_publication_rollback": "not_present",
+                "active_generation_rollback": (
+                    "skipped_active_generation_or_token_changed"
+                ),
+            },
+        )
+        for statuses in failures:
+            with self.subTest(statuses=statuses), self.assertRaises(
+                run_step.StepError,
+            ) as raised:
+                run_step._require_successful_binary_step4_recovery_rollback(
+                    statuses,
+                )
+            self.assertEqual(
+                raised.exception.reason_codes,
+                ["BINARY_STEP4_TRANSACTION_RECOVERY_FAILED"],
+            )
+            self.assertTrue(
+                raised.exception.diagnostic["unsafe_rollback_status"]
+            )
+
+    def test_finalize_stale_committed_checkpoint_binding_matrix(self):
+        binding = {
+            "result_generation_identity": "a" * 64,
+            "validation_run_identity": "b" * 64,
+            "validation_result_sha256": "c" * 64,
+            "activation_identity": "d" * 64,
+            "report_implementation_identity": "e" * 64,
+        }
+        checkpoint = {
+            "schema": (
+                "java-upgrade-analyzer."
+                "binary-generation-validation-checkpoint.v3"
+            ),
+            "status": "independent_validation_passed_pending_activation",
+            "result_generation_identity": binding[
+                "result_generation_identity"
+            ],
+            "validation_run_identity": binding["validation_run_identity"],
+            "activation_identity": binding["activation_identity"],
+        }
+        receipt = {"state": "committed", "binding": binding}
+        active = {
+            "result_generation_identity": binding[
+                "result_generation_identity"
+            ],
+            "validation_run_identity": binding["validation_run_identity"],
+            "validation_result_sha256": binding[
+                "validation_result_sha256"
+            ],
+            "unrelated_metadata": "allowed",
+        }
+        published = {
+            "result_generation_identity": binding[
+                "result_generation_identity"
+            ],
+        }
+
+        def invoke(
+            *, candidate_checkpoint=checkpoint, candidate_receipt=receipt,
+            candidate_active=active, candidate_published=published,
+        ):
+            with patch.object(
+                run_step,
+                "_read_step4_active_descriptor",
+                return_value=candidate_active,
+            ), patch.object(
+                run_step,
+                "_read_background_json",
+                return_value=candidate_published,
+            ), patch.object(
+                run_step, "_cleanup_committed_step4_checkpoint",
+            ) as cleanup:
+                run_step._finalize_stale_committed_step4_checkpoint(
+                    "/report", candidate_checkpoint, candidate_receipt,
+                )
+            return cleanup
+
+        cleanup = invoke()
+        cleanup.assert_called_once_with(
+            run_step._step4_validation_checkpoint_path(
+                Path("/report").resolve()
+            )
+        )
+
+        malformed_shapes = (
+            ("checkpoint", [], receipt, active, published),
+            ("receipt", checkpoint, [], active, published),
+            ("active", checkpoint, receipt, [], published),
+            ("published", checkpoint, receipt, active, []),
+        )
+        for label, cp, rc, ac, pb in malformed_shapes:
+            with self.subTest(shape=label), self.assertRaises(
+                run_step.StepError,
+            ) as raised:
+                invoke(
+                    candidate_checkpoint=cp,
+                    candidate_receipt=rc,
+                    candidate_active=ac,
+                    candidate_published=pb,
+                )
+            self.assertEqual(
+                raised.exception.reason_codes,
+                ["BINARY_STEP4_TRANSACTION_BINDING_MISMATCH"],
+            )
+
+    def test_seal_step4_activation_state_matrix(self):
+        binding = {
+            "result_generation_identity": "a" * 64,
+            "activation_identity": "b" * 64,
+        }
+
+        with patch.object(
+            run_step, "_step4_activation_binding", return_value=binding,
+        ), patch.object(
+            run_step,
+            "read_pending_binary_generation",
+            side_effect=run_step.BinaryOutputError("PENDING_BAD", "bad"),
+        ), self.assertRaises(run_step.StepError) as read_error:
+            run_step._seal_binary_step4_activation("/report", {})
+        self.assertEqual(
+            read_error.exception.reason_codes,
+            ["BINARY_STEP4_ACTIVATION_SEAL_FAILED"],
+        )
+
+        for published in (True, False):
+            with self.subTest(published=published), patch.object(
+                run_step, "_step4_activation_binding", return_value=binding,
+            ), patch.object(
+                run_step,
+                "read_pending_binary_generation",
+                return_value={"activation_identity": binding["activation_identity"]},
+            ), patch.object(
+                run_step,
+                "publish_pending_binary_generation",
+                return_value=published,
+            ) as publish:
+                if published:
+                    self.assertEqual(
+                        run_step._seal_binary_step4_activation("/report", {}),
+                        "published_private_candidate",
+                    )
+                else:
+                    with self.assertRaises(run_step.StepError) as raised:
+                        run_step._seal_binary_step4_activation("/report", {})
+                    self.assertEqual(
+                        raised.exception.reason_codes,
+                        ["BINARY_STEP4_ACTIVATION_SEAL_FAILED"],
+                    )
+            publish.assert_called_once()
+
+        valid_states = (
+            (
+                {
+                    "result_generation_identity": binding[
+                        "result_generation_identity"
+                    ],
+                    "activation_identity": binding["activation_identity"],
+                    "activation_predecessor": None,
+                },
+                "legacy_public_candidate_pending",
+            ),
+            (
+                {
+                    "result_generation_identity": binding[
+                        "result_generation_identity"
+                    ],
+                },
+                "already_sealed",
+            ),
+        )
+        for active, expected in valid_states:
+            with self.subTest(expected=expected), patch.object(
+                run_step, "_step4_activation_binding", return_value=binding,
+            ), patch.object(
+                run_step, "read_pending_binary_generation", return_value=None,
+            ), patch.object(
+                run_step, "_read_step4_active_descriptor", return_value=active,
+            ):
+                self.assertEqual(
+                    run_step._seal_binary_step4_activation("/report", {}),
+                    expected,
+                )
+
+        invalid_states = (
+            {},
+            {
+                "result_generation_identity": "f" * 64,
+                "activation_identity": binding["activation_identity"],
+                "activation_predecessor": None,
+            },
+            {
+                "result_generation_identity": binding[
+                    "result_generation_identity"
+                ],
+                "activation_identity": "f" * 64,
+                "activation_predecessor": None,
+            },
+            {
+                "result_generation_identity": binding[
+                    "result_generation_identity"
+                ],
+                "activation_identity": binding["activation_identity"],
+            },
+            {
+                "result_generation_identity": binding[
+                    "result_generation_identity"
+                ],
+                "activation_predecessor": None,
+            },
+        )
+        for active in invalid_states:
+            with self.subTest(active=active), patch.object(
+                run_step, "_step4_activation_binding", return_value=binding,
+            ), patch.object(
+                run_step, "read_pending_binary_generation", return_value=None,
+            ), patch.object(
+                run_step, "_read_step4_active_descriptor", return_value=active,
+            ), self.assertRaises(run_step.StepError) as raised:
+                run_step._seal_binary_step4_activation("/report", {})
+            self.assertEqual(
+                raised.exception.reason_codes,
+                ["BINARY_STEP4_ACTIVATION_SEAL_FAILED"],
+            )
+
+    def test_finalize_stale_committed_checkpoint_mismatch_matrix(self):
+        binding = {
+            "result_generation_identity": "a" * 64,
+            "validation_run_identity": "b" * 64,
+            "validation_result_sha256": "c" * 64,
+            "activation_identity": "d" * 64,
+            "report_implementation_identity": "e" * 64,
+        }
+        checkpoint = {
+            "schema": (
+                "java-upgrade-analyzer."
+                "binary-generation-validation-checkpoint.v3"
+            ),
+            "status": "independent_validation_passed_pending_activation",
+            "result_generation_identity": binding[
+                "result_generation_identity"
+            ],
+            "validation_run_identity": binding["validation_run_identity"],
+            "activation_identity": binding["activation_identity"],
+        }
+        receipt = {"state": "committed", "binding": binding}
+        active = {
+            "result_generation_identity": binding[
+                "result_generation_identity"
+            ],
+            "validation_run_identity": binding["validation_run_identity"],
+            "validation_result_sha256": binding[
+                "validation_result_sha256"
+            ],
+        }
+        published = {
+            "result_generation_identity": binding[
+                "result_generation_identity"
+            ],
+        }
+
+        def invoke(
+            *, candidate_checkpoint=checkpoint, candidate_receipt=receipt,
+            candidate_active=active, candidate_published=published,
+        ):
+            with patch.object(
+                run_step,
+                "_read_step4_active_descriptor",
+                return_value=candidate_active,
+            ), patch.object(
+                run_step,
+                "_read_background_json",
+                return_value=candidate_published,
+            ), patch.object(
+                run_step, "_cleanup_committed_step4_checkpoint",
+            ):
+                run_step._finalize_stale_committed_step4_checkpoint(
+                    "/report", candidate_checkpoint, candidate_receipt,
+                )
+
+        for invalid_binding in (None, [], "invalid"):
+            candidate_receipt = json.loads(json.dumps(receipt))
+            candidate_receipt["binding"] = invalid_binding
+            with self.subTest(binding=invalid_binding), self.assertRaises(
+                run_step.StepError,
+            ):
+                invoke(candidate_receipt=candidate_receipt)
+
+        mutations = {
+            "receipt-state": lambda cp, rc, ac, pb: rc.update(state="published"),
+            "checkpoint-schema": lambda cp, rc, ac, pb: cp.update(schema="invalid"),
+            "checkpoint-status": lambda cp, rc, ac, pb: cp.update(status="invalid"),
+            "checkpoint-generation": lambda cp, rc, ac, pb: cp.update(
+                result_generation_identity="f" * 64
+            ),
+            "checkpoint-validation": lambda cp, rc, ac, pb: cp.update(
+                validation_run_identity="f" * 64
+            ),
+            "checkpoint-activation": lambda cp, rc, ac, pb: cp.update(
+                activation_identity="f" * 64
+            ),
+            "active-generation": lambda cp, rc, ac, pb: ac.update(
+                result_generation_identity="f" * 64
+            ),
+            "active-validation": lambda cp, rc, ac, pb: ac.update(
+                validation_run_identity="f" * 64
+            ),
+            "active-validation-sha": lambda cp, rc, ac, pb: ac.update(
+                validation_result_sha256="f" * 64
+            ),
+            "active-activation-present": lambda cp, rc, ac, pb: ac.update(
+                activation_identity=binding["activation_identity"]
+            ),
+            "active-predecessor-present": lambda cp, rc, ac, pb: ac.update(
+                activation_predecessor=None
+            ),
+            "published-generation": lambda cp, rc, ac, pb: pb.update(
+                result_generation_identity="f" * 64
+            ),
+            "binding-generation": lambda cp, rc, ac, pb: rc["binding"].update(
+                result_generation_identity="f" * 64
+            ),
+            "binding-validation": lambda cp, rc, ac, pb: rc["binding"].update(
+                validation_run_identity="f" * 64
+            ),
+            "binding-validation-sha": lambda cp, rc, ac, pb: rc["binding"].update(
+                validation_result_sha256="f" * 64
+            ),
+            "binding-activation": lambda cp, rc, ac, pb: rc["binding"].update(
+                activation_identity="f" * 64
+            ),
+        }
+        for label, mutate in mutations.items():
+            cp = json.loads(json.dumps(checkpoint))
+            rc = json.loads(json.dumps(receipt))
+            ac = json.loads(json.dumps(active))
+            pb = json.loads(json.dumps(published))
+            mutate(cp, rc, ac, pb)
+            with self.subTest(mismatch=label), self.assertRaises(
+                run_step.StepError,
+            ) as raised:
+                invoke(
+                    candidate_checkpoint=cp,
+                    candidate_receipt=rc,
+                    candidate_active=ac,
+                    candidate_published=pb,
+                )
+            self.assertEqual(
+                raised.exception.reason_codes,
+                ["BINARY_STEP4_TRANSACTION_BINDING_MISMATCH"],
+            )
+
+    def test_recover_step4_checkpoint_and_pending_intake_matrix(self):
+        checkpoint_schema = (
+            "java-upgrade-analyzer."
+            "binary-generation-validation-checkpoint.v3"
+        )
+
+        with self._mocked_step4_recovery_state(
+            create_transaction_marker=False,
+        ) as (report, _mocks):
+            self.assertEqual(
+                run_step._recover_binary_step4_transaction(report),
+                "nothing_to_recover",
+            )
+
+        checkpoint_error = run_step.StepError(
+            "invalid checkpoint",
+            reason_codes=["BINARY_STEP4_TRANSACTION_CHECKPOINT_INVALID"],
+        )
+        with self._mocked_step4_recovery_state(
+            create_transaction_marker=False,
+        ) as (report, _mocks), patch.object(
+            run_step,
+            "_read_step4_validation_checkpoint",
+            side_effect=checkpoint_error,
+        ), patch.object(
+            run_step, "_delete_step4_validation_checkpoint_durable",
+        ) as delete:
+            with self.assertRaises(run_step.StepError) as raised:
+                run_step._recover_binary_step4_transaction(report)
+            self.assertIs(raised.exception, checkpoint_error)
+            delete.assert_not_called()
+
+            self.assertEqual(
+                run_step._recover_binary_step4_transaction(
+                    report, discard_invalid_checkpoint=True,
+                ),
+                "discarded_invalid_checkpoint_for_rerun",
+            )
+            delete.assert_called_once()
+
+        invalid_checkpoints = (
+            {
+                "schema": "invalid",
+                "status": "awaiting_independent_validation",
+            },
+            {
+                "schema": checkpoint_schema,
+                "status": "invalid",
+            },
+        )
+        for checkpoint in invalid_checkpoints:
+            with self.subTest(checkpoint=checkpoint), self._mocked_step4_recovery_state(
+                checkpoint=checkpoint,
+                create_transaction_marker=False,
+            ) as (report, _mocks), patch.object(
+                run_step, "_delete_step4_validation_checkpoint_durable",
+            ) as delete:
+                self.assertEqual(
+                    run_step._recover_binary_step4_transaction(
+                        report, discard_invalid_checkpoint=True,
+                    ),
+                    "discarded_invalid_checkpoint_for_rerun",
+                )
+                delete.assert_called_once()
+
+        valid_resume = {
+            "schema": checkpoint_schema,
+            "status": "awaiting_independent_validation",
+        }
+        with self._mocked_step4_recovery_state(
+            checkpoint=valid_resume,
+            create_transaction_marker=False,
+        ) as (report, _mocks), patch.object(
+            run_step, "_delete_step4_validation_checkpoint_durable",
+        ) as delete:
+            self.assertEqual(
+                run_step._recover_binary_step4_transaction(
+                    report, discard_invalid_checkpoint=True,
+                ),
+                "validation_checkpoint_resume_required",
+            )
+            delete.assert_not_called()
+
+        with self._mocked_step4_recovery_state() as (
+            report, _mocks,
+        ), patch.object(
+            run_step,
+            "read_pending_binary_generation",
+            side_effect=run_step.BinaryOutputError(
+                "PENDING_INVALID", "invalid pending descriptor"
+            ),
+        ), self.assertRaises(run_step.StepError) as raised:
+            run_step._recover_binary_step4_transaction(report)
+        self.assertEqual(
+            raised.exception.reason_codes,
+            ["BINARY_STEP4_ACTIVE_DESCRIPTOR_INVALID"],
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp).resolve() / ".upgrade-report"
+            binary_root = report / run_step.BINARY_OUTPUT_RELATIVE_PATH
+            binary_root.parent.mkdir(parents=True)
+            try:
+                binary_root.symlink_to(report / "missing-binary-output")
+            except OSError as error:
+                self.skipTest(f"symlinks unavailable: {error}")
+            with patch.object(
+                run_step,
+                "_read_step4_validation_checkpoint",
+                return_value=None,
+            ), patch.object(
+                run_step,
+                "read_pending_binary_generation",
+                return_value=None,
+            ) as read_pending:
+                self.assertEqual(
+                    run_step._recover_binary_step4_transaction(report),
+                    "nothing_to_recover",
+                )
+            read_pending.assert_called_once()
+
+    def test_recover_step4_legacy_transaction_state_matrix(self):
+        transaction_id = "1" * 32
+        binding = {
+            "result_generation_identity": "a" * 64,
+            "validation_run_identity": "b" * 64,
+            "validation_result_sha256": "c" * 64,
+            "activation_identity": "d" * 64,
+        }
+
+        def metadata(state, candidate_binding=binding):
+            return {
+                "state": state,
+                "implementation_status": "legacy",
+                "transaction_id": transaction_id,
+                "binding": candidate_binding,
+            }
+
+        with self._mocked_step4_recovery_state(
+            checkpoint={}, metadata=metadata("committed"),
+        ) as (report, _mocks), patch.object(
+            run_step, "recover_report_publication",
+        ) as recover:
+            self.assertEqual(
+                run_step._recover_binary_step4_transaction(report),
+                "cleaned_legacy_committed_report_transaction",
+            )
+            recover.assert_called_once()
+
+        with self._mocked_step4_recovery_state(
+            checkpoint={}, metadata=metadata("published"),
+        ) as (report, _mocks), patch.object(
+            run_step,
+            "_step4_activation_recovery_state",
+            return_value="sealed_bound_generation",
+        ), patch.object(
+            run_step, "finalize_irreversible_report_publication",
+        ) as finalize:
+            self.assertEqual(
+                run_step._recover_binary_step4_transaction(report),
+                (
+                    "committed_legacy_published_transaction_"
+                    "requires_republication"
+                ),
+            )
+            finalize.assert_called_once()
+
+        for state, activation_state in (
+            ("prepared", "sealed_bound_generation"),
+            ("published", "foreign_generation"),
+        ):
+            with self.subTest(
+                state=state, activation_state=activation_state,
+            ), self._mocked_step4_recovery_state(
+                checkpoint={}, metadata=metadata(state),
+            ) as (report, _mocks), patch.object(
+                run_step,
+                "_step4_activation_recovery_state",
+                return_value=activation_state,
+            ), self.assertRaises(run_step.StepError) as raised:
+                run_step._recover_binary_step4_transaction(report)
+            self.assertEqual(
+                raised.exception.reason_codes,
+                ["BINARY_STEP4_TRANSACTION_RECOVERY_FAILED"],
+            )
+            self.assertEqual(
+                raised.exception.diagnostic["activation_recovery_state"],
+                activation_state,
+            )
+
+        for restored in (True, False):
+            with self.subTest(
+                unbound_restored=restored,
+            ), self._mocked_step4_recovery_state(
+                checkpoint={}, metadata=metadata("prepared", {}),
+            ) as (report, _mocks), patch.object(
+                run_step,
+                "_step4_activation_recovery_state",
+                return_value="unbound",
+            ), patch.object(
+                run_step,
+                "recover_report_publication",
+                return_value=restored,
+            ) as recover:
+                if restored:
+                    self.assertEqual(
+                        run_step._recover_binary_step4_transaction(report),
+                        "rolled_back_legacy_report_transaction",
+                    )
+                else:
+                    with self.assertRaises(run_step.StepError) as raised:
+                        run_step._recover_binary_step4_transaction(report)
+                    self.assertEqual(
+                        raised.exception.reason_codes,
+                        ["BINARY_STEP4_TRANSACTION_RECOVERY_FAILED"],
+                    )
+                recover.assert_called_once()
+
+        successful_rollback = {
+            "report_publication_rollback": "restored_previous_reports",
+            "active_generation_rollback": (
+                "restored_lock_observed_predecessor"
+            ),
+        }
+        for complete_binding in (True, False):
+            candidate_binding = dict(binding)
+            if not complete_binding:
+                candidate_binding["activation_identity"] = ""
+            fallback_result = {
+                "result_generation_identity": "f" * 64,
+                "activation_identity": "e" * 64,
+            }
+            with self.subTest(
+                complete_binding=complete_binding,
+            ), self._mocked_step4_recovery_state(
+                checkpoint={},
+                metadata=metadata("prepared", candidate_binding),
+                checkpoint_result=fallback_result,
+            ) as (report, _mocks), patch.object(
+                run_step,
+                "_step4_activation_recovery_state",
+                return_value="rollbackable",
+            ), patch.object(
+                run_step,
+                "_rollback_binary_step4_transaction",
+                return_value=successful_rollback,
+            ) as rollback:
+                self.assertEqual(
+                    run_step._recover_binary_step4_transaction(report),
+                    "rolled_back_legacy_report_transaction",
+                )
+            adopted = rollback.call_args.args[1]
+            if complete_binding:
+                self.assertEqual(
+                    adopted["result_generation_identity"],
+                    binding["result_generation_identity"],
+                )
+            else:
+                self.assertEqual(
+                    adopted["result_generation_identity"],
+                    candidate_binding["result_generation_identity"],
+                )
+                self.assertEqual(adopted["activation_identity"], "")
+                self.assertEqual(
+                    adopted["report_publication_transaction"]["binding"],
+                    candidate_binding,
+                )
+
+    def test_recover_step4_gate_policy_and_commit_state_matrix(self):
+        transaction_id = "1" * 32
+        binding = {
+            "result_generation_identity": "a" * 64,
+            "validation_run_identity": "b" * 64,
+            "validation_result_sha256": "c" * 64,
+            "activation_identity": "d" * 64,
+        }
+        successful_rollback = {
+            "report_publication_rollback": "restored_previous_reports",
+            "active_generation_rollback": (
+                "restored_lock_observed_predecessor"
+            ),
+        }
+
+        def metadata(
+            state="gate_passed",
+            *,
+            gate_name="jar_compare",
+            strict_risk_gate=False,
+        ):
+            return {
+                "state": state,
+                "implementation_status": "current",
+                "transaction_id": transaction_id,
+                "binding": binding,
+                "gate_receipt": {
+                    "gate_name": gate_name,
+                    "strict_risk_gate": strict_risk_gate,
+                },
+            }
+
+        policy_mismatches = (
+            (7, False, "jar_compare", False),
+            ("", False, "jar_compare", False),
+            ("jar_compare", None, "jar_compare", False),
+            ("jar_compare", False, "different_gate", False),
+            ("jar_compare", False, "jar_compare", True),
+        )
+        for (
+            expected_gate,
+            expected_strict,
+            persisted_gate,
+            persisted_strict,
+        ) in policy_mismatches:
+            with self.subTest(
+                expected_gate=expected_gate,
+                expected_strict=expected_strict,
+                persisted_gate=persisted_gate,
+                persisted_strict=persisted_strict,
+            ), self._mocked_step4_recovery_state(
+                checkpoint={},
+                metadata=metadata(
+                    gate_name=persisted_gate,
+                    strict_risk_gate=persisted_strict,
+                ),
+            ) as (report, _mocks), patch.object(
+                run_step,
+                "_step4_activation_recovery_state",
+                return_value="rollbackable",
+            ), patch.object(
+                run_step,
+                "_rollback_binary_step4_transaction",
+                return_value=successful_rollback,
+            ) as rollback:
+                self.assertEqual(
+                    run_step._recover_binary_step4_transaction(
+                        report,
+                        expected_gate_name=expected_gate,
+                        expected_strict_risk_gate=expected_strict,
+                    ),
+                    "rolled_back_gate_policy_mismatch",
+                )
+                rollback.assert_called_once()
+
+        with self._mocked_step4_recovery_state(
+            checkpoint={}, metadata=metadata(gate_name="different_gate"),
+        ) as (report, _mocks), patch.object(
+            run_step,
+            "_step4_activation_recovery_state",
+            return_value="unbound",
+        ), self.assertRaises(run_step.StepError) as raised:
+            run_step._recover_binary_step4_transaction(
+                report,
+                expected_gate_name="jar_compare",
+                expected_strict_risk_gate=False,
+            )
+        self.assertEqual(
+            raised.exception.reason_codes,
+            ["BINARY_STEP4_TRANSACTION_RECOVERY_FAILED"],
+        )
+
+        receipt = {"state": "published", "binding": binding}
+        active_with_token = {
+            "result_generation_identity": binding[
+                "result_generation_identity"
+            ],
+            "validation_run_identity": binding["validation_run_identity"],
+            "validation_result_sha256": binding[
+                "validation_result_sha256"
+            ],
+            "activation_identity": binding["activation_identity"],
+        }
+        sealed_active = {
+            key: value
+            for key, value in active_with_token.items()
+            if key != "activation_identity"
+        }
+        published = {
+            "result_generation_identity": binding[
+                "result_generation_identity"
+            ],
+        }
+
+        successful_states = (
+            (
+                "gate_passed",
+                {"checkpoint": True},
+                "completed_gate_passed_transaction",
+                "rollbackable",
+                metadata(),
+            ),
+            (
+                "published",
+                {},
+                "completed_gate_passed_transaction",
+                "rollbackable",
+                metadata(state="published"),
+            ),
+            (
+                "gate_passed",
+                {},
+                "committed_gate_policy_requires_republication",
+                "sealed_bound_generation",
+                metadata(gate_name="old_gate"),
+            ),
+        )
+        for (
+            state,
+            checkpoint,
+            expected_disposition,
+            activation_state,
+            transaction_metadata,
+        ) in successful_states:
+            with self.subTest(
+                state=state,
+                checkpoint=bool(checkpoint),
+                expected_disposition=expected_disposition,
+            ), self._mocked_step4_recovery_state(
+                checkpoint=checkpoint,
+                metadata=transaction_metadata,
+                checkpoint_result={"retained": bool(checkpoint)},
+            ) as (report, _mocks), patch.object(
+                run_step,
+                "_step4_activation_recovery_state",
+                return_value=activation_state,
+            ), patch.object(
+                run_step, "publish_report_publication",
+            ) as publish_reports, patch.object(
+                run_step, "_seal_binary_step4_activation",
+            ) as seal, patch.object(
+                run_step, "_finalize_binary_step4_transaction",
+            ) as finalize, patch.object(
+                run_step,
+                "report_publication_transaction_receipt",
+                return_value=receipt,
+            ), patch.object(
+                run_step,
+                "_read_step4_active_descriptor",
+                return_value=(
+                    active_with_token
+                    if activation_state == "rollbackable"
+                    else sealed_active
+                ),
+            ), patch.object(
+                run_step, "_read_background_json", return_value=published,
+            ), patch.object(
+                run_step, "_commit_binary_step4_activation_receipt",
+            ) as commit_activation, patch.object(
+                run_step, "commit_report_publication",
+            ) as commit_reports:
+                self.assertEqual(
+                    run_step._recover_binary_step4_transaction(
+                        report,
+                        expected_gate_name="jar_compare",
+                        expected_strict_risk_gate=False,
+                    ),
+                    expected_disposition,
+                )
+                publish_reports.assert_called_once()
+                seal.assert_called_once()
+                commit_activation.assert_called_once()
+                commit_reports.assert_called_once()
+                self.assertEqual(finalize.call_count, 2 if checkpoint else 0)
+
+        mismatches = {
+            "receipt-state": lambda rc, ac, pb: rc.update(state="prepared"),
+            "active-generation": lambda rc, ac, pb: ac.update(
+                result_generation_identity="e" * 64
+            ),
+            "active-validation": lambda rc, ac, pb: ac.update(
+                validation_run_identity="e" * 64
+            ),
+            "active-validation-sha": lambda rc, ac, pb: ac.update(
+                validation_result_sha256="e" * 64
+            ),
+            "active-token": lambda rc, ac, pb: ac.update(
+                activation_identity="e" * 64
+            ),
+            "unsealed-without-token": lambda rc, ac, pb: (
+                ac.pop("activation_identity", None),
+                ac.update(activation_predecessor=None),
+            ),
+            "published-generation": lambda rc, ac, pb: pb.update(
+                result_generation_identity="e" * 64
+            ),
+            "published-generation-missing": lambda rc, ac, pb: pb.clear(),
+        }
+        for label, mutate in mismatches.items():
+            candidate_receipt = json.loads(json.dumps(receipt))
+            candidate_active = json.loads(json.dumps(active_with_token))
+            candidate_published = json.loads(json.dumps(published))
+            mutate(candidate_receipt, candidate_active, candidate_published)
+            with self.subTest(mismatch=label), self._mocked_step4_recovery_state(
+                checkpoint={}, metadata=metadata(),
+            ) as (report, _mocks), patch.object(
+                run_step,
+                "_step4_activation_recovery_state",
+                return_value="sealed_bound_generation",
+            ), patch.object(
+                run_step, "publish_report_publication",
+            ), patch.object(
+                run_step, "_seal_binary_step4_activation",
+            ), patch.object(
+                run_step,
+                "report_publication_transaction_receipt",
+                return_value=candidate_receipt,
+            ), patch.object(
+                run_step,
+                "_read_step4_active_descriptor",
+                return_value=candidate_active,
+            ), patch.object(
+                run_step,
+                "_read_background_json",
+                return_value=candidate_published,
+            ), self.assertRaises(run_step.StepError) as raised:
+                run_step._recover_binary_step4_transaction(
+                    report,
+                    expected_gate_name="jar_compare",
+                    expected_strict_risk_gate=False,
+                )
+            self.assertEqual(
+                raised.exception.reason_codes,
+                ["BINARY_STEP4_TRANSACTION_BINDING_MISMATCH"],
+            )
+
+        with self._mocked_step4_recovery_state(
+            checkpoint={}, metadata=metadata(),
+        ) as (report, _mocks), patch.object(
+            run_step,
+            "_step4_activation_recovery_state",
+            return_value="sealed_bound_generation",
+        ), patch.object(
+            run_step, "publish_report_publication",
+        ), patch.object(
+            run_step, "_seal_binary_step4_activation",
+        ), patch.object(
+            run_step,
+            "report_publication_transaction_receipt",
+            return_value=receipt,
+        ), patch.object(
+            run_step,
+            "_read_step4_active_descriptor",
+            return_value=sealed_active,
+        ), patch.object(
+            run_step, "_read_background_json", return_value=published,
+        ), patch.object(
+            run_step, "_commit_binary_step4_activation_receipt",
+        ), patch.object(run_step, "commit_report_publication"):
+            self.assertEqual(
+                run_step._recover_binary_step4_transaction(
+                    report,
+                    expected_gate_name="jar_compare",
+                    expected_strict_risk_gate=False,
+                ),
+                "completed_gate_passed_transaction",
+            )
+
+        injected_error = RuntimeError("publish failed")
+        for activation_state, rollback_expected in (
+            ("rollbackable", True),
+            ("sealed_bound_generation", False),
+        ):
+            with self.subTest(
+                activation_state=activation_state,
+            ), self._mocked_step4_recovery_state(
+                checkpoint={}, metadata=metadata(),
+            ) as (report, _mocks), patch.object(
+                run_step,
+                "_step4_activation_recovery_state",
+                return_value=activation_state,
+            ), patch.object(
+                run_step,
+                "publish_report_publication",
+                side_effect=injected_error,
+            ), patch.object(
+                run_step,
+                "_rollback_binary_step4_transaction",
+                return_value=successful_rollback,
+            ) as rollback, self.assertRaises(RuntimeError) as raised:
+                run_step._recover_binary_step4_transaction(
+                    report,
+                    expected_gate_name="jar_compare",
+                    expected_strict_risk_gate=False,
+                )
+            self.assertIs(raised.exception, injected_error)
+            self.assertEqual(rollback.called, rollback_expected)
+
+    def test_recover_step4_committed_interrupted_and_orphan_matrix(self):
+        transaction_id = "1" * 32
+        binding = {
+            "result_generation_identity": "a" * 64,
+            "validation_run_identity": "b" * 64,
+            "validation_result_sha256": "c" * 64,
+            "activation_identity": "d" * 64,
+        }
+        receipt = {"state": "committed", "binding": binding}
+        successful_rollback = {
+            "report_publication_rollback": "restored_previous_reports",
+            "active_generation_rollback": (
+                "restored_lock_observed_predecessor"
+            ),
+        }
+
+        def metadata(state):
+            return {
+                "state": state,
+                "implementation_status": "current",
+                "transaction_id": transaction_id,
+                "binding": binding,
+            }
+
+        for checkpoint in ({"checkpoint": True}, {}):
+            with self.subTest(
+                committed_checkpoint=bool(checkpoint),
+            ), self._mocked_step4_recovery_state(
+                checkpoint=checkpoint,
+                metadata=metadata("committed"),
+            ) as (report, _mocks), patch.object(
+                run_step,
+                "report_publication_transaction_receipt",
+                return_value=receipt,
+            ), patch.object(
+                run_step, "_finalize_stale_committed_step4_checkpoint",
+            ) as finalize_checkpoint, patch.object(
+                run_step, "recover_report_publication",
+            ) as recover_reports:
+                self.assertEqual(
+                    run_step._recover_binary_step4_transaction(report),
+                    "completed_committed_transaction",
+                )
+                self.assertEqual(
+                    finalize_checkpoint.call_count,
+                    1 if checkpoint else 0,
+                )
+                recover_reports.assert_called_once()
+
+        with self._mocked_step4_recovery_state(
+            checkpoint={"checkpoint": True},
+            committed_receipt=receipt,
+        ) as (report, _mocks), patch.object(
+            run_step, "_finalize_stale_committed_step4_checkpoint",
+        ) as finalize_checkpoint:
+            self.assertEqual(
+                run_step._recover_binary_step4_transaction(report),
+                "completed_committed_receipt_checkpoint",
+            )
+            finalize_checkpoint.assert_called_once()
+
+        for state in ("staging", "prepared", "pending_gate"):
+            with self.subTest(
+                interrupted_state=state,
+            ), self._mocked_step4_recovery_state(
+                checkpoint={}, metadata=metadata(state),
+            ) as (report, _mocks), patch.object(
+                run_step,
+                "_rollback_binary_step4_transaction",
+                return_value=successful_rollback,
+            ) as rollback:
+                self.assertEqual(
+                    run_step._recover_binary_step4_transaction(report),
+                    "rolled_back_interrupted_transaction",
+                )
+                rollback.assert_called_once()
+
+        pending = {
+            "result_generation_identity": binding[
+                "result_generation_identity"
+            ],
+            "activation_identity": binding["activation_identity"],
+        }
+        with self._mocked_step4_recovery_state(
+            checkpoint=None,
+            pending_activation=pending,
+            create_transaction_marker=False,
+        ) as (report, _mocks), patch.object(
+            run_step,
+            "_rollback_binary_step4_transaction",
+            return_value=successful_rollback,
+        ) as rollback:
+            self.assertEqual(
+                run_step._recover_binary_step4_transaction(report),
+                "rolled_back_orphan_activation_candidate",
+            )
+            self.assertEqual(
+                rollback.call_args.args[1],
+                {
+                    "result_generation_identity": binding[
+                        "result_generation_identity"
+                    ],
+                    "activation_identity": binding[
+                        "activation_identity"
+                    ],
+                },
+            )
+
+        for pending_activation in (None, pending):
+            with self.subTest(
+                illegal_pending=bool(pending_activation),
+            ), self._mocked_step4_recovery_state(
+                checkpoint={},
+                pending_activation=pending_activation,
+                metadata=metadata("unknown"),
+            ) as (report, _mocks), self.assertRaises(
+                run_step.StepError,
+            ) as raised:
+                run_step._recover_binary_step4_transaction(report)
+            self.assertEqual(
+                raised.exception.reason_codes,
+                ["BINARY_STEP4_TRANSACTION_RECOVERY_FAILED"],
+            )
+            self.assertIs(
+                raised.exception.diagnostic[
+                    "pending_activation_present"
+                ],
+                pending_activation is not None,
+            )
+
+    def test_recover_step4_validation_checkpoint_state_matrix(self):
+        checkpoint_schema = (
+            "java-upgrade-analyzer."
+            "binary-generation-validation-checkpoint.v3"
+        )
+        generation = "a" * 64
+        validation = "b" * 64
+        activation = "c" * 64
+        checkpoint = {
+            "schema": checkpoint_schema,
+            "status": "independent_validation_passed_pending_activation",
+            "result_generation_identity": generation,
+            "validation_run_identity": validation,
+            "activation_identity": activation,
+        }
+
+        for status in (
+            "awaiting_independent_validation",
+            "independent_validation_failed",
+        ):
+            candidate = {**checkpoint, "status": status}
+            with self.subTest(
+                resume_status=status,
+            ), self._mocked_step4_recovery_state(
+                checkpoint=candidate,
+                create_transaction_marker=False,
+            ) as (report, _mocks):
+                self.assertEqual(
+                    run_step._recover_binary_step4_transaction(report),
+                    "validation_checkpoint_resume_required",
+                )
+
+        active = {
+            "result_generation_identity": generation,
+            "activation_identity": activation,
+        }
+        pending_cases = (
+            (
+                {**checkpoint, "activation_identity": ""},
+                active,
+                "missing-checkpoint-activation",
+            ),
+            (
+                checkpoint,
+                {**active, "result_generation_identity": "d" * 64},
+                "active-generation-mismatch",
+            ),
+            (
+                checkpoint,
+                {**active, "activation_identity": "d" * 64},
+                "active-token-mismatch",
+            ),
+        )
+        for candidate_checkpoint, candidate_active, label in pending_cases:
+            with self.subTest(
+                pending_case=label,
+            ), self._mocked_step4_recovery_state(
+                checkpoint=candidate_checkpoint,
+                create_transaction_marker=False,
+            ) as (report, _mocks), patch.object(
+                run_step,
+                "_read_step4_active_descriptor",
+                return_value=candidate_active,
+            ), patch.object(
+                run_step, "_rollback_binary_step4_transaction",
+            ) as rollback:
+                self.assertEqual(
+                    run_step._recover_binary_step4_transaction(report),
+                    "validation_checkpoint_pending_activation",
+                )
+                rollback.assert_not_called()
+
+        successful_rollback = {
+            "report_publication_rollback": "not_present",
+            "active_generation_rollback": (
+                "restored_lock_observed_predecessor"
+            ),
+        }
+        published_cases = (
+            ({}, {"result_generation_identity": "d" * 64}, True),
+            (
+                {"result_generation_identity": generation},
+                {"result_generation_identity": generation},
+                True,
+            ),
+            (
+                {"result_generation_identity": "e" * 64},
+                {"result_generation_identity": "d" * 64},
+                False,
+            ),
+        )
+        for published, restored_active, accepted in published_cases:
+            with self.subTest(
+                published=published, restored_active=restored_active,
+            ), self._mocked_step4_recovery_state(
+                checkpoint=checkpoint,
+                create_transaction_marker=False,
+            ) as (report, _mocks), patch.object(
+                run_step,
+                "_read_step4_active_descriptor",
+                side_effect=[active, restored_active],
+            ), patch.object(
+                run_step,
+                "_rollback_binary_step4_transaction",
+                return_value=successful_rollback,
+            ) as rollback, patch.object(
+                run_step,
+                "_read_background_json",
+                return_value=published,
+            ):
+                if accepted:
+                    self.assertEqual(
+                        run_step._recover_binary_step4_transaction(report),
+                        (
+                            "rolled_back_activation_before_"
+                            "report_publication"
+                        ),
+                    )
+                else:
+                    with self.assertRaises(run_step.StepError) as raised:
+                        run_step._recover_binary_step4_transaction(report)
+                    self.assertEqual(
+                        raised.exception.reason_codes,
+                        ["BINARY_STEP4_REPORT_RECOVERY_EVIDENCE_MISSING"],
+                    )
+                    self.assertEqual(
+                        raised.exception.diagnostic,
+                        successful_rollback,
+                    )
+                rollback.assert_called_once()
+
+        # Schema corruption is rejected by the real checkpoint reader before
+        # this state machine is entered (covered by the intake tests above).
+        invalid_checkpoints = ({**checkpoint, "status": "invalid"},)
+        for candidate in invalid_checkpoints:
+            with self.subTest(
+                invalid_checkpoint=candidate,
+            ), self._mocked_step4_recovery_state(
+                checkpoint=candidate,
+                create_transaction_marker=False,
+            ) as (report, _mocks), self.assertRaises(
+                run_step.StepError,
+            ) as raised:
+                run_step._recover_binary_step4_transaction(report)
+            self.assertEqual(
+                raised.exception.reason_codes,
+                ["BINARY_STEP4_TRANSACTION_RECOVERY_FAILED"],
+            )
+
+    def test_recover_step4_defaulted_metadata_and_empty_binding_matrix(self):
+        binding = {
+            "result_generation_identity": "a" * 64,
+            "validation_run_identity": "b" * 64,
+            "validation_result_sha256": "c" * 64,
+            "activation_identity": "d" * 64,
+        }
+        successful_rollback = {
+            "report_publication_rollback": "restored_previous_reports",
+            "active_generation_rollback": (
+                "restored_lock_observed_predecessor"
+            ),
+        }
+
+        with self._mocked_step4_recovery_state(
+            checkpoint=None,
+            pending_activation=None,
+            metadata={"state": "", "implementation_status": ""},
+        ) as (report, _mocks), self.assertRaises(
+            run_step.StepError,
+        ) as raised:
+            run_step._recover_binary_step4_transaction(report)
+        self.assertEqual(
+            raised.exception.reason_codes,
+            ["BINARY_STEP4_TRANSACTION_RECOVERY_FAILED"],
+        )
+        self.assertEqual(
+            raised.exception.diagnostic["report_transaction_state"],
+            "absent",
+        )
+        self.assertFalse(
+            raised.exception.diagnostic["pending_activation_present"]
+        )
+
+        conflicting_checkpoint = {
+            "schema": (
+                "java-upgrade-analyzer."
+                "binary-generation-validation-checkpoint.v3"
+            ),
+            "status": "invalid",
+        }
+        with self._mocked_step4_recovery_state(
+            checkpoint=conflicting_checkpoint,
+            pending_activation={"activation_identity": "c" * 64},
+            metadata={"state": "absent", "implementation_status": "absent"},
+        ) as (report, _mocks), self.assertRaises(
+            run_step.StepError,
+        ) as raised:
+            run_step._recover_binary_step4_transaction(report)
+        self.assertTrue(
+            raised.exception.diagnostic["pending_activation_present"]
+        )
+
+        gate_metadata = {
+            "state": "gate_passed",
+            "implementation_status": "current",
+            "transaction_id": "1" * 32,
+            "binding": binding,
+            "gate_receipt": {},
+        }
+        with self._mocked_step4_recovery_state(
+            checkpoint={}, metadata=gate_metadata,
+        ) as (report, _mocks), patch.object(
+            run_step,
+            "_step4_activation_recovery_state",
+            return_value="rollbackable",
+        ), patch.object(
+            run_step,
+            "_rollback_binary_step4_transaction",
+            return_value=successful_rollback,
+        ):
+            self.assertEqual(
+                run_step._recover_binary_step4_transaction(
+                    report,
+                    expected_gate_name="jar_compare",
+                    expected_strict_risk_gate=False,
+                ),
+                "rolled_back_gate_policy_mismatch",
+            )
+
+        exact_gate_metadata = {
+            **gate_metadata,
+            "gate_receipt": {
+                "gate_name": "jar_compare",
+                "strict_risk_gate": False,
+            },
+        }
+        with self._mocked_step4_recovery_state(
+            checkpoint={}, metadata=exact_gate_metadata,
+        ) as (report, _mocks), patch.object(
+            run_step,
+            "_step4_activation_recovery_state",
+            return_value="sealed_bound_generation",
+        ), patch.object(
+            run_step, "publish_report_publication",
+        ), patch.object(
+            run_step, "_seal_binary_step4_activation",
+        ), patch.object(
+            run_step,
+            "report_publication_transaction_receipt",
+            return_value={"state": "published", "binding": {}},
+        ), patch.object(
+            run_step,
+            "_read_step4_active_descriptor",
+            return_value={
+                "result_generation_identity": binding[
+                    "result_generation_identity"
+                ],
+                "validation_run_identity": binding[
+                    "validation_run_identity"
+                ],
+                "validation_result_sha256": binding[
+                    "validation_result_sha256"
+                ],
+            },
+        ), patch.object(
+            run_step,
+            "_read_background_json",
+            return_value={
+                "result_generation_identity": binding[
+                    "result_generation_identity"
+                ],
+            },
+        ), self.assertRaises(run_step.StepError) as raised:
+            run_step._recover_binary_step4_transaction(
+                report,
+                expected_gate_name="jar_compare",
+                expected_strict_risk_gate=False,
+            )
+        self.assertEqual(
+            raised.exception.reason_codes,
+            ["BINARY_STEP4_TRANSACTION_BINDING_MISMATCH"],
+        )
+
+        empty_binding_receipt = {"state": "committed", "binding": {}}
+        with self._mocked_step4_recovery_state(
+            checkpoint={"checkpoint": True},
+            committed_receipt=empty_binding_receipt,
+        ) as (report, _mocks), patch.object(
+            run_step, "_finalize_stale_committed_step4_checkpoint",
+        ) as finalize:
+            self.assertEqual(
+                run_step._recover_binary_step4_transaction(report),
+                "completed_committed_receipt_checkpoint",
+            )
+            finalize.assert_called_once_with(
+                report,
+                {"checkpoint": True},
+                empty_binding_receipt,
+            )
+
+    def test_republish_step4_initial_and_live_binding_matrix(self):
+        with self._mocked_step4_republication(
+            baseline={"state": ""},
+        ) as (report, payloads, mocks):
+            result = run_step._republish_current_binary_step4_reports(
+                report_dir=report,
+                project_dir=report.parent,
+                gate_name="jar_compare",
+                strict_risk_gate=False,
+            )
+            self.assertEqual(result, payloads["verified"])
+            mocks["publish"].assert_called_once()
+            mocks["commit"].assert_called_once()
+            mocks["verify"].assert_called_once()
+
+        with self._mocked_step4_republication(
+            baseline={"state": "pending_gate"},
+            rollback_metadata={"state": "absent"},
+        ) as (report, _payloads, mocks), self.assertRaises(
+            run_step.StepError,
+        ) as raised:
+            run_step._republish_current_binary_step4_reports(
+                report_dir=report,
+                project_dir=report.parent,
+                gate_name="jar_compare",
+                strict_risk_gate=False,
+            )
+        self.assertEqual(
+            raised.exception.reason_codes,
+            ["BINARY_STEP4_TRANSACTION_RECOVERY_FAILED"],
+        )
+        self.assertEqual(
+            raised.exception.diagnostic["report_publication_rollback"],
+            "not_present",
+        )
+        mocks["render"].assert_not_called()
+
+        base_rendered = {
+            "phase": "step4",
+            "publication_transaction": {
+                "transaction_id": "a" * 32,
+                "binding": {
+                    "result_generation_identity": "1" * 64,
+                    "validation_run_identity": "2" * 64,
+                    "validation_result_sha256": "3" * 64,
+                    "report_implementation_identity": "4" * 64,
+                },
+                "published_content_identity": "5" * 64,
+            },
+        }
+        base_receipt = {
+            **base_rendered["publication_transaction"],
+            "state": "pending_gate",
+        }
+        initial_mutations = {
+            "rendered-phase": lambda rendered, receipt: rendered.update(
+                phase="step5"
+            ),
+            "receipt-state": lambda rendered, receipt: receipt.update(
+                state="prepared"
+            ),
+            "receipt-empty-binding": lambda rendered, receipt: receipt.update(
+                binding={}
+            ),
+            "receipt-binding": lambda rendered, receipt: receipt["binding"].update(
+                result_generation_identity="9" * 64
+            ),
+            "receipt-content": lambda rendered, receipt: receipt.update(
+                published_content_identity="9" * 64
+            ),
+            "receipt-content-missing": lambda rendered, receipt: receipt.pop(
+                "published_content_identity", None
+            ),
+        }
+        for label, mutate in initial_mutations.items():
+            rendered = json.loads(json.dumps(base_rendered))
+            receipt = json.loads(json.dumps(base_receipt))
+            mutate(rendered, receipt)
+            with self.subTest(
+                initial_mismatch=label,
+            ), self._mocked_step4_republication(
+                rendered=rendered,
+                receipt=receipt,
+                rollback_metadata={"state": "pending_gate"},
+            ) as (report, _payloads, mocks), self.assertRaises(
+                run_step.StepError,
+            ) as raised:
+                run_step._republish_current_binary_step4_reports(
+                    report_dir=report,
+                    project_dir=report.parent,
+                    gate_name="jar_compare",
+                    strict_risk_gate=False,
+                )
+            self.assertEqual(
+                raised.exception.reason_codes,
+                ["BINARY_STEP4_REPORT_TRANSACTION_BINDING_MISMATCH"],
+            )
+            self.assertEqual(
+                raised.exception.diagnostic[
+                    "report_publication_rollback"
+                ],
+                "restored_previous_reports",
+            )
+            mocks["gate"].assert_not_called()
+            mocks["rollback"].assert_called_once()
+
+        rendered_without_transaction = {
+            "phase": "step4",
+            "publication_transaction": None,
+        }
+        with self._mocked_step4_republication(
+            rendered=rendered_without_transaction,
+            receipt=base_receipt,
+            rollback_metadata={"state": "pending_gate"},
+        ) as (report, payloads, _mocks), patch.object(
+            run_step,
+            "_step4_report_publication_expectation",
+            return_value=payloads["transaction"],
+        ), self.assertRaises(run_step.StepError) as raised:
+            run_step._republish_current_binary_step4_reports(
+                report_dir=report,
+                project_dir=report.parent,
+                gate_name="jar_compare",
+                strict_risk_gate=False,
+            )
+        self.assertEqual(
+            raised.exception.reason_codes,
+            ["BINARY_STEP4_REPORT_TRANSACTION_BINDING_MISMATCH"],
+        )
+
+        live_mismatches = {
+            "state": {**base_receipt, "state": "gate_passed"},
+            "empty-binding": {**base_receipt, "binding": {}},
+            "binding": {
+                **base_receipt,
+                "binding": {
+                    **base_receipt["binding"],
+                    "validation_run_identity": "9" * 64,
+                },
+            },
+        }
+        for label, live_receipt in live_mismatches.items():
+            with self.subTest(
+                live_mismatch=label,
+            ), self._mocked_step4_republication(
+                rendered=base_rendered,
+                receipt=base_receipt,
+                live_receipt=live_receipt,
+                rollback_metadata={"state": "pending_gate"},
+            ) as (report, _payloads, mocks), self.assertRaises(
+                run_step.StepError,
+            ) as raised:
+                run_step._republish_current_binary_step4_reports(
+                    report_dir=report,
+                    project_dir=report.parent,
+                    gate_name="jar_compare",
+                    strict_risk_gate=False,
+                )
+            self.assertEqual(
+                raised.exception.reason_codes,
+                ["BINARY_STEP4_REPORT_TRANSACTION_BINDING_MISMATCH"],
+            )
+            mocks["mark"].assert_not_called()
+            mocks["rollback"].assert_called_once()
+
+        for gate_receipt in (None, {}, False):
+            with self.subTest(
+                gate_receipt=gate_receipt,
+            ), self._mocked_step4_republication(
+                gate_receipt=gate_receipt,
+                rollback_metadata={"state": "pending_gate"},
+            ) as (report, _payloads, mocks), self.assertRaises(
+                run_step.StepError,
+            ) as raised:
+                run_step._republish_current_binary_step4_reports(
+                    report_dir=report,
+                    project_dir=report.parent,
+                    gate_name="jar_compare",
+                    strict_risk_gate=False,
+                )
+            self.assertEqual(
+                raised.exception.reason_codes,
+                ["BINARY_STEP4_REPORT_REPUBLICATION_FAILED"],
+            )
+            mocks["publish"].assert_not_called()
+            mocks["rollback"].assert_called_once()
+
+    def test_republish_step4_global_release_contract_matrix(self):
+        valid_release = {
+            "step4": {"status": "current"},
+            "step5": {"status": "stale"},
+            "step6": {"status": "stale"},
+        }
+        invalid_releases = (
+            [],
+            "invalid",
+            {**valid_release, "step4": None},
+            {**valid_release, "step4": []},
+            {**valid_release, "step5": None},
+            {**valid_release, "step5": "invalid"},
+            {**valid_release, "step6": None},
+            {**valid_release, "step6": 7},
+            {
+                **valid_release,
+                "step4": {"status": "stale"},
+            },
+            {
+                **valid_release,
+                "step5": {"status": "current"},
+            },
+            {
+                **valid_release,
+                "step6": {"status": "current"},
+            },
+        )
+        for candidate in invalid_releases:
+            with self.subTest(
+                global_release=candidate,
+            ), self._mocked_step4_republication(
+                global_release=candidate,
+                rollback_metadata={"state": "committed"},
+            ) as (report, _payloads, mocks), self.assertRaises(
+                run_step.StepError,
+            ) as raised:
+                run_step._republish_current_binary_step4_reports(
+                    report_dir=report,
+                    project_dir=report.parent,
+                    gate_name="jar_compare",
+                    strict_risk_gate=False,
+                )
+            self.assertEqual(
+                raised.exception.reason_codes,
+                ["BINARY_GLOBAL_RELEASE_STATE_INVALID"],
+            )
+            self.assertEqual(
+                raised.exception.diagnostic[
+                    "report_publication_rollback"
+                ],
+                "already_committed",
+            )
+            mocks["rollback"].assert_not_called()
+            mocks["verify"].assert_not_called()
+
+        with self._mocked_step4_republication(
+            global_release=valid_release,
+        ) as (report, payloads, mocks):
+            self.assertEqual(
+                run_step._republish_current_binary_step4_reports(
+                    report_dir=report,
+                    project_dir=report.parent,
+                    gate_name=None,
+                    strict_risk_gate=1,
+                ),
+                payloads["verified"],
+            )
+            self.assertEqual(mocks["mark"].call_args.kwargs["gate_name"], "")
+            self.assertIs(
+                mocks["mark"].call_args.kwargs["strict_risk_gate"], True,
+            )
+            self.assertEqual(
+                mocks["verify"].call_args.kwargs[
+                    "expected_gate_name"
+                ],
+                "",
+            )
+            mocks["timing"].assert_called_once()
+
+    def test_republish_step4_failure_rollback_evidence_matrix(self):
+        transaction_id = "a" * 32
+        binding = {"report_implementation_identity": "b" * 64}
+        rollback_metadata_cases = (
+            (
+                "defaulted-absent",
+                {"state": ""},
+                True,
+                "not_present",
+                False,
+            ),
+            (
+                "missing-transaction",
+                {
+                    "state": "pending_gate",
+                    "transaction_id": "",
+                    "binding": binding,
+                },
+                True,
+                "not_present",
+                False,
+            ),
+            (
+                "missing-binding",
+                {
+                    "state": "pending_gate",
+                    "transaction_id": transaction_id,
+                    "binding": {},
+                },
+                True,
+                "not_present",
+                False,
+            ),
+            (
+                "adopted-restored",
+                {
+                    "state": "pending_gate",
+                    "transaction_id": transaction_id,
+                    "binding": binding,
+                },
+                True,
+                "restored_previous_reports",
+                True,
+            ),
+            (
+                "adopted-not-present",
+                {
+                    "state": "pending_gate",
+                    "transaction_id": transaction_id,
+                    "binding": binding,
+                },
+                False,
+                "not_present",
+                True,
+            ),
+            (
+                "already-committed",
+                {
+                    "state": "committed",
+                    "transaction_id": "",
+                    "binding": {},
+                },
+                True,
+                "already_committed",
+                False,
+            ),
+        )
+        for (
+            label,
+            rollback_metadata,
+            restored,
+            expected_status,
+            rollback_called,
+        ) in rollback_metadata_cases:
+            with self.subTest(
+                rollback_metadata=label,
+            ), self._mocked_step4_republication(
+                baseline={"state": "pending_gate"},
+                rollback_metadata=rollback_metadata,
+                rollback_restored=restored,
+            ) as (report, _payloads, mocks), self.assertRaises(
+                run_step.StepError,
+            ) as raised:
+                run_step._republish_current_binary_step4_reports(
+                    report_dir=report,
+                    project_dir=report.parent,
+                    gate_name="jar_compare",
+                    strict_risk_gate=False,
+                )
+            self.assertEqual(
+                raised.exception.diagnostic[
+                    "report_publication_rollback"
+                ],
+                expected_status,
+            )
+            self.assertEqual(mocks["rollback"].called, rollback_called)
+
+        rollback_errors = (
+            (
+                run_step.BinaryReportError("ROLLBACK_BAD", "bad"),
+                (
+                    "rollback_failed:BinaryReportError:"
+                    "ROLLBACK_BAD"
+                ),
+            ),
+            (
+                RuntimeError("rollback unavailable"),
+                "rollback_failed:RuntimeError:rollback unavailable",
+            ),
+        )
+        for rollback_error, expected_status in rollback_errors:
+            with self.subTest(
+                rollback_error=type(rollback_error).__name__,
+            ), self._mocked_step4_republication(
+                baseline={"state": "pending_gate"},
+                rollback_metadata={
+                    "state": "pending_gate",
+                    "transaction_id": transaction_id,
+                    "binding": binding,
+                },
+            ) as (report, _payloads, _mocks), patch.object(
+                run_step,
+                "rollback_report_publication",
+                side_effect=rollback_error,
+            ), self.assertRaises(run_step.StepError) as raised:
+                run_step._republish_current_binary_step4_reports(
+                    report_dir=report,
+                    project_dir=report.parent,
+                    gate_name="jar_compare",
+                    strict_risk_gate=False,
+                )
+            self.assertEqual(
+                raised.exception.diagnostic[
+                    "report_publication_rollback"
+                ],
+                expected_status,
+            )
+
+        original = run_step.StepError(
+            "gate failed",
+            reason_codes=["GATE_FAILED"],
+            diagnostic={"failure_phase": "gate"},
+        )
+        with self._mocked_step4_republication(
+            rollback_metadata={"state": "pending_gate"},
+        ) as (report, _payloads, mocks), patch.object(
+            run_step, "run_gate", side_effect=original,
+        ), self.assertRaises(run_step.StepError) as raised:
+            run_step._republish_current_binary_step4_reports(
+                report_dir=report,
+                project_dir=report.parent,
+                gate_name="jar_compare",
+                strict_risk_gate=False,
+            )
+        self.assertEqual(raised.exception.reason_codes, ["GATE_FAILED"])
+        self.assertEqual(
+            raised.exception.diagnostic["failure_phase"], "gate"
+        )
+        self.assertEqual(
+            raised.exception.diagnostic["report_publication_rollback"],
+            "restored_previous_reports",
+        )
+        mocks["rollback"].assert_called_once()
+
+        runtime_error = RuntimeError("renderer crashed")
+        with self._mocked_step4_republication(
+            rollback_metadata={"state": "absent"},
+        ) as (report, _payloads, mocks), patch.object(
+            run_step,
+            "_prepare_binary_report_publication_candidate_in_process",
+            side_effect=runtime_error,
+        ), self.assertRaises(run_step.StepError) as raised:
+            run_step._republish_current_binary_step4_reports(
+                report_dir=report,
+                project_dir=report.parent,
+                gate_name="jar_compare",
+                strict_risk_gate=False,
+            )
+        self.assertEqual(
+            raised.exception.reason_codes,
+            ["BINARY_STEP4_REPORT_REPUBLICATION_FAILED"],
+        )
+        self.assertIn("renderer crashed", str(raised.exception))
+        self.assertEqual(
+            raised.exception.diagnostic["report_publication_rollback"],
+            "not_present",
+        )
+        mocks["rollback"].assert_not_called()
+
+    def test_republish_step4_timing_identity_optional_field_matrix(self):
+        verified_cases = (
+            ({"binding": {}}, ""),
+            (
+                {"binding": {"result_generation_identity": ""}},
+                "",
+            ),
+            (
+                {
+                    "binding": {
+                        "result_generation_identity": "7" * 64,
+                    },
+                    "committed_receipt_identity": None,
+                },
+                "7" * 64,
+            ),
+        )
+        for verified, expected_generation in verified_cases:
+            with self.subTest(
+                verified=verified,
+            ), self._mocked_step4_republication(
+                verified=verified,
+            ) as (report, _payloads, mocks):
+                self.assertEqual(
+                    run_step._republish_current_binary_step4_reports(
+                        report_dir=report,
+                        project_dir=report.parent,
+                        gate_name="jar_compare",
+                        strict_risk_gate=False,
+                    ),
+                    verified,
+                )
+            timing_rows = mocks["timing"].call_args.args[1]
+            self.assertEqual(
+                timing_rows[0]["result_generation_identity"],
+                expected_generation,
+            )
+
+    def test_step4_activation_recovery_state_binding_matrix(self):
+        generation = "a" * 64
+        validation = "b" * 64
+        validation_sha = "c" * 64
+        activation = "d" * 64
+        binding = {
+            "result_generation_identity": generation,
+            "validation_run_identity": validation,
+            "validation_result_sha256": validation_sha,
+            "activation_identity": activation,
+        }
+
+        for candidate in (
+            None,
+            [],
+            "invalid",
+            {},
+            {"result_generation_identity": ""},
+            {"result_generation_identity": generation},
+            {"activation_identity": activation},
+        ):
+            with self.subTest(
+                unbound=candidate,
+            ), patch.object(
+                run_step, "_read_step4_active_descriptor",
+            ) as read_active:
+                self.assertEqual(
+                    run_step._step4_activation_recovery_state(
+                        "/report", candidate,
+                    ),
+                    "unbound",
+                )
+                read_active.assert_not_called()
+
+        states = (
+            ({}, "absent"),
+            (
+                {
+                    "result_generation_identity": generation,
+                    "activation_identity": activation,
+                },
+                "rollbackable",
+            ),
+            (
+                {
+                    "result_generation_identity": generation,
+                    "validation_run_identity": validation,
+                    "validation_result_sha256": validation_sha,
+                },
+                "sealed_bound_generation",
+            ),
+            (
+                {
+                    "result_generation_identity": "e" * 64,
+                    "validation_run_identity": validation,
+                    "validation_result_sha256": validation_sha,
+                },
+                "different_generation_or_token",
+            ),
+            (
+                {
+                    "result_generation_identity": generation,
+                    "validation_run_identity": "e" * 64,
+                    "validation_result_sha256": validation_sha,
+                },
+                "different_generation_or_token",
+            ),
+            (
+                {
+                    "result_generation_identity": generation,
+                    "validation_run_identity": validation,
+                    "validation_result_sha256": "e" * 64,
+                },
+                "different_generation_or_token",
+            ),
+            (
+                {
+                    "result_generation_identity": generation,
+                    "validation_run_identity": validation,
+                    "validation_result_sha256": validation_sha,
+                    "activation_identity": "e" * 64,
+                },
+                "different_generation_or_token",
+            ),
+            (
+                {
+                    "result_generation_identity": generation,
+                    "validation_run_identity": validation,
+                    "validation_result_sha256": validation_sha,
+                    "activation_predecessor": None,
+                },
+                "different_generation_or_token",
+            ),
+        )
+        for active, expected in states:
+            with self.subTest(
+                active=active, expected=expected,
+            ), patch.object(
+                run_step,
+                "_read_step4_active_descriptor",
+                return_value=active,
+            ):
+                self.assertEqual(
+                    run_step._step4_activation_recovery_state(
+                        "/report", binding,
+                    ),
+                    expected,
+                )
+
+    def test_commit_step4_activation_receipt_state_matrix(self):
+        binding = {
+            "result_generation_identity": "a" * 64,
+            "activation_identity": "b" * 64,
+        }
+
+        for committed in (True, False):
+            with self.subTest(
+                pending_commit=committed,
+            ), patch.object(
+                run_step, "_step4_activation_binding", return_value=binding,
+            ), patch.object(
+                run_step,
+                "read_pending_binary_generation",
+                return_value={"activation_identity": binding["activation_identity"]},
+            ), patch.object(
+                run_step,
+                "commit_pending_binary_generation",
+                return_value=committed,
+            ) as commit:
+                if committed:
+                    self.assertTrue(
+                        run_step._commit_binary_step4_activation_receipt(
+                            "/report", {},
+                        )
+                    )
+                else:
+                    with self.assertRaises(run_step.StepError) as raised:
+                        run_step._commit_binary_step4_activation_receipt(
+                            "/report", {},
+                        )
+                    self.assertEqual(
+                        raised.exception.reason_codes,
+                        ["BINARY_STEP4_ACTIVATION_COMMIT_FAILED"],
+                    )
+                commit.assert_called_once()
+
+        legacy_candidate = {
+            "result_generation_identity": binding[
+                "result_generation_identity"
+            ],
+            "activation_identity": binding["activation_identity"],
+            "activation_predecessor": None,
+        }
+        for sealed in (True, False):
+            with self.subTest(
+                legacy_sealed=sealed,
+            ), patch.object(
+                run_step, "_step4_activation_binding", return_value=binding,
+            ), patch.object(
+                run_step, "read_pending_binary_generation", return_value=None,
+            ), patch.object(
+                run_step,
+                "_read_step4_active_descriptor",
+                return_value=legacy_candidate,
+            ), patch.object(
+                run_step,
+                "seal_active_binary_generation",
+                return_value=sealed,
+            ) as seal:
+                if sealed:
+                    self.assertTrue(
+                        run_step._commit_binary_step4_activation_receipt(
+                            "/report", {},
+                        )
+                    )
+                else:
+                    with self.assertRaises(run_step.StepError) as raised:
+                        run_step._commit_binary_step4_activation_receipt(
+                            "/report", {},
+                        )
+                    self.assertEqual(
+                        raised.exception.reason_codes,
+                        ["BINARY_STEP4_ACTIVATION_COMMIT_FAILED"],
+                    )
+                seal.assert_called_once()
+
+        sealed_active = {
+            "result_generation_identity": binding[
+                "result_generation_identity"
+            ],
+        }
+        invalid_active_states = (
+            {},
+            {
+                "result_generation_identity": "c" * 64,
+                "activation_identity": binding["activation_identity"],
+                "activation_predecessor": None,
+            },
+            {
+                "result_generation_identity": binding[
+                    "result_generation_identity"
+                ],
+                "activation_identity": "c" * 64,
+                "activation_predecessor": None,
+            },
+            {
+                "result_generation_identity": binding[
+                    "result_generation_identity"
+                ],
+                "activation_identity": binding["activation_identity"],
+            },
+            {
+                **sealed_active,
+                "activation_predecessor": None,
+            },
+        )
+        with patch.object(
+            run_step, "_step4_activation_binding", return_value=binding,
+        ), patch.object(
+            run_step, "read_pending_binary_generation", return_value=None,
+        ), patch.object(
+            run_step,
+            "_read_step4_active_descriptor",
+            return_value=sealed_active,
+        ):
+            self.assertTrue(
+                run_step._commit_binary_step4_activation_receipt(
+                    "/report", {},
+                )
+            )
+        for active in invalid_active_states:
+            with self.subTest(
+                invalid_active=active,
+            ), patch.object(
+                run_step, "_step4_activation_binding", return_value=binding,
+            ), patch.object(
+                run_step, "read_pending_binary_generation", return_value=None,
+            ), patch.object(
+                run_step,
+                "_read_step4_active_descriptor",
+                return_value=active,
+            ), self.assertRaises(run_step.StepError) as raised:
+                run_step._commit_binary_step4_activation_receipt(
+                    "/report", {},
+                )
+            self.assertEqual(
+                raised.exception.reason_codes,
+                ["BINARY_STEP4_ACTIVATION_COMMIT_FAILED"],
+            )
+
+    def test_classify_step4_recovery_complete_disposition_matrix(self):
+        for disposition in run_step._STEP4_RECOVERY_RESUME_DISPOSITIONS:
+            with self.subTest(
+                resume=disposition,
+            ):
+                decision = run_step._classify_step4_recovery_disposition(
+                    "/report",
+                    disposition,
+                    expected_gate_name="jar_compare",
+                    expected_strict_risk_gate=False,
+                )
+                self.assertEqual(
+                    decision["action"],
+                    run_step._STEP4_RELEASE_RESUME_PIPELINE,
+                )
+
+        for disposition in run_step._STEP4_RECOVERY_REPUBLISH_DISPOSITIONS:
+            for reusable, expected_action in (
+                (True, run_step._STEP4_RELEASE_REPUBLISH),
+                (False, run_step._STEP4_RELEASE_RESUME_PIPELINE),
+            ):
+                with self.subTest(
+                    republish=disposition, reusable=reusable,
+                ), patch.object(
+                    run_step,
+                    "_validated_active_generation_is_current",
+                    return_value=reusable,
+                ):
+                    decision = run_step._classify_step4_recovery_disposition(
+                        "/report",
+                        disposition,
+                        expected_gate_name="jar_compare",
+                        expected_strict_risk_gate=False,
+                    )
+                self.assertEqual(decision["action"], expected_action)
+
+        for disposition in (
+            None,
+            "",
+            "unknown",
+            "no_bound_transaction",
+        ):
+            with self.subTest(
+                fatal=disposition,
+            ):
+                decision = run_step._classify_step4_recovery_disposition(
+                    "/report",
+                    disposition,
+                    expected_gate_name="jar_compare",
+                    expected_strict_risk_gate=False,
+                )
+                self.assertEqual(
+                    decision["action"], run_step._STEP4_RELEASE_FATAL,
+                )
+
+        receipt_cases = (
+            ({}, "", ""),
+            ({"binding": {}}, "", ""),
+            (
+                {
+                    "committed_receipt_identity": "e" * 64,
+                    "binding": {
+                        "result_generation_identity": "f" * 64,
+                    },
+                },
+                "e" * 64,
+                "f" * 64,
+            ),
+        )
+        for receipt, committed_identity, generation_identity in receipt_cases:
+            with self.subTest(
+                receipt=receipt,
+            ), patch.object(
+                run_step,
+                "verify_current_step4_release",
+                return_value=receipt,
+            ) as verify:
+                decision = run_step._classify_step4_recovery_disposition(
+                    "/report",
+                    "nothing_to_recover",
+                    expected_gate_name=None,
+                    expected_strict_risk_gate=1,
+                )
+            self.assertEqual(
+                decision["action"], run_step._STEP4_RELEASE_CURRENT,
+            )
+            self.assertEqual(
+                decision["committed_receipt_identity"], committed_identity,
+            )
+            self.assertEqual(
+                decision["result_generation_identity"], generation_identity,
+            )
+            self.assertEqual(
+                verify.call_args.kwargs["expected_gate_name"], ""
+            )
+            self.assertIs(
+                verify.call_args.kwargs["expected_strict_risk_gate"], True,
+            )
+
+        verification_errors = (
+            run_step.BinaryReportError("RELEASE_BAD", "bad"),
+            RuntimeError("verification unavailable"),
+        )
+        for error in verification_errors:
+            for reusable in (True, False):
+                with self.subTest(
+                    error=type(error).__name__, reusable=reusable,
+                ), patch.object(
+                    run_step,
+                    "verify_current_step4_release",
+                    side_effect=error,
+                ), patch.object(
+                    run_step,
+                    "_validated_active_generation_is_current",
+                    return_value=reusable,
+                ):
+                    decision = run_step._classify_step4_recovery_disposition(
+                        "/report",
+                        "completed_committed_transaction",
+                        expected_gate_name="jar_compare",
+                        expected_strict_risk_gate=False,
+                    )
+                self.assertEqual(
+                    decision["action"],
+                    (
+                        run_step._STEP4_RELEASE_REPUBLISH
+                        if reusable
+                        else run_step._STEP4_RELEASE_RESUME_PIPELINE
+                    ),
+                )
+                self.assertIn(type(error).__name__, decision["verification_error"])
+
+    def test_step4_republication_marker_complete_contract_matrix(self):
+        generation = "a" * 64
+
+        def signed_marker(**updates):
+            marker = {
+                "schema": run_step._STEP4_REPORT_REPUBLICATION_MARKER_SCHEMA,
+                "started_at": "2026-08-22T00:00:00+00:00",
+                "result_generation_identity": generation,
+                "refresh_scope_interaction": False,
+            }
+            marker.update(updates)
+            marker["marker_identity"] = hashlib.sha256(
+                json.dumps(
+                    marker,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            return marker
+
+        for raw_state in (None, {}, {"state": {}}):
+            with self.subTest(
+                missing_state=raw_state,
+            ):
+                self.assertIsNone(
+                    run_step._step4_republication_marker(
+                        raw_state, missing_ok=True,
+                    )
+                )
+                with self.assertRaises(run_step.StepError) as raised:
+                    run_step._step4_republication_marker(raw_state)
+                self.assertEqual(
+                    raised.exception.reason_codes,
+                    ["BINARY_STEP4_REPORT_REPUBLICATION_MARKER_INVALID"],
+                )
+
+        for raw in ([], "invalid", 7, True):
+            with self.subTest(
+                malformed=raw,
+            ), self.assertRaises(run_step.StepError) as raised:
+                run_step._step4_republication_marker({
+                    "state": {
+                        "step4_report_republication_pending": raw,
+                    }
+                })
+            self.assertEqual(
+                raised.exception.reason_codes,
+                ["BINARY_STEP4_REPORT_REPUBLICATION_MARKER_INVALID"],
+            )
+
+        valid_markers = (
+            signed_marker(refresh_scope_interaction=False),
+            signed_marker(refresh_scope_interaction=True),
+        )
+        for marker in valid_markers:
+            with self.subTest(
+                valid_refresh=marker["refresh_scope_interaction"],
+            ):
+                self.assertEqual(
+                    run_step._step4_republication_marker({
+                        "state": {
+                            "step4_report_republication_pending": marker,
+                        }
+                    }),
+                    marker,
+                )
+
+        invalid_markers = []
+        wrong_identity = signed_marker()
+        wrong_identity["marker_identity"] = "b" * 64
+        invalid_markers.append(("identity", wrong_identity))
+        missing_identity = signed_marker()
+        missing_identity.pop("marker_identity")
+        invalid_markers.append(("identity-missing", missing_identity))
+        invalid_markers.extend((
+            ("schema", signed_marker(schema="invalid")),
+            (
+                "generation-missing",
+                signed_marker(result_generation_identity=""),
+            ),
+            (
+                "generation-uppercase",
+                signed_marker(result_generation_identity="A" * 64),
+            ),
+            (
+                "generation-short",
+                signed_marker(result_generation_identity="a" * 63),
+            ),
+            (
+                "refresh-missing",
+                signed_marker(refresh_scope_interaction=None),
+            ),
+            (
+                "refresh-int",
+                signed_marker(refresh_scope_interaction=1),
+            ),
+            (
+                "refresh-string",
+                signed_marker(refresh_scope_interaction="false"),
+            ),
+        ))
+        for label, marker in invalid_markers:
+            with self.subTest(
+                invalid=label,
+            ), self.assertRaises(run_step.StepError) as raised:
+                run_step._step4_republication_marker({
+                    "state": {
+                        "step4_report_republication_pending": marker,
+                    }
+                })
+            self.assertEqual(
+                raised.exception.reason_codes,
+                ["BINARY_STEP4_REPORT_REPUBLICATION_MARKER_INVALID"],
+            )
+
+    def test_step4_recovery_relevance_and_target_hint_matrix(self):
+        state_cases = (
+            (
+                {"state": {"current_step": "step4"}},
+                True,
+                "current",
+            ),
+            (
+                {"state": {"completed_step": "step5"}},
+                True,
+                "completed",
+            ),
+            (
+                {
+                    "state": {
+                        "pending_interaction": {"step_id": "step4"},
+                    }
+                },
+                True,
+                "pending",
+            ),
+            (
+                {"step4": {"input": {"present": True}}},
+                True,
+                "step4-input",
+            ),
+            (
+                {"step4": {"derived": {"present": True}}},
+                True,
+                "step4-derived",
+            ),
+            (
+                {"step4": {"output": {"present": True}}},
+                True,
+                "step4-output",
+            ),
+            ({}, False, "empty"),
+            (None, False, "none"),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp).resolve() / ".upgrade-report"
+            for state, expected, label in state_cases:
+                with self.subTest(
+                    relevance=label,
+                ):
+                    self.assertIs(
+                        run_step._workflow_has_reached_step4(state, report),
+                        expected,
+                    )
+            active = (
+                report
+                / run_step.BINARY_OUTPUT_RELATIVE_PATH
+                / "active_binary_generation.json"
+            )
+            active.parent.mkdir(parents=True)
+            active.write_text("{}\n", encoding="utf-8")
+            self.assertTrue(
+                run_step._workflow_has_reached_step4({}, report)
+            )
+
+        direct_hint_cases = (
+            (
+                SimpleNamespace(step="auto"),
+                {},
+                {"action": "restart_from_step", "restart_step_id": "step2"},
+                "step2",
+            ),
+            (SimpleNamespace(step="step3"), {}, {}, "step3"),
+            (
+                SimpleNamespace(step="auto"),
+                {
+                    "state": {
+                        "pending_interaction": {"step_id": "step5"},
+                    }
+                },
+                {"action": "rerun_current_step"},
+                "step5",
+            ),
+            (
+                SimpleNamespace(step="auto"),
+                {"state": {"current_step": "done"}},
+                {},
+                "done",
+            ),
+            (
+                SimpleNamespace(step="auto"),
+                {
+                    "state": {
+                        "current_step": "invalid",
+                        "pending_interaction": {"step_id": "step3"},
+                    }
+                },
+                {},
+                "step3",
+            ),
+            (
+                SimpleNamespace(step="auto"),
+                {"state": {"current_step": "invalid"}},
+                {},
+                "step0",
+            ),
+        )
+        for args, state, response, expected in direct_hint_cases:
+            with self.subTest(
+                hint=expected, response=response,
+            ):
+                self.assertEqual(
+                    run_step._startup_step4_recovery_target_hint(
+                        args, state, response,
+                    ),
+                    expected,
+                )
+
+        inference_cases = (
+            ({"field": "value"}, {}, "step1", "step1", True),
+            ({"field": "value"}, {}, "invalid", "step0", True),
+            (
+                {"field": "value"},
+                {"pending_interaction": {"step_id": "invalid"}},
+                "step1",
+                "step0",
+                False,
+            ),
+            (
+                {
+                    "action": "restart_from_step",
+                    "restart_step_id": "invalid",
+                },
+                {},
+                "step2",
+                "step2",
+                True,
+            ),
+            (
+                {"action": "rerun_current_step"},
+                {"pending_interaction": {"step_id": "invalid"}},
+                "step2",
+                "step0",
+                False,
+            ),
+        )
+        for response, state_fields, inferred, expected, called in inference_cases:
+            with self.subTest(
+                inference=response, pending=state_fields,
+            ), patch.object(
+                run_step,
+                "infer_non_pending_target_step_from_payload",
+                return_value=inferred,
+            ) as infer:
+                self.assertEqual(
+                    run_step._startup_step4_recovery_target_hint(
+                        SimpleNamespace(step="auto"),
+                        {"state": state_fields},
+                        response,
+                    ),
+                    expected,
+                )
+                self.assertEqual(infer.called, called)
+
+        with patch.object(
+            run_step,
+            "infer_non_pending_target_step_from_payload",
+            return_value="step2",
+        ) as infer:
+            self.assertEqual(
+                run_step._startup_step4_recovery_target_hint(
+                    SimpleNamespace(step=None),
+                    None,
+                    {"action": "rerun_current_step"},
+                ),
+                "step2",
+            )
+            infer.assert_called_once()
+
+        discard_cases = (
+            ("step0", {}, "step0", True),
+            ("step4", {}, "step4", True),
+            ("step5", {}, "step5", False),
+            ("auto", {"action": "rerun_current_step"}, "step4", True),
+            ("auto", {"action": "restart_from_step"}, "step0", True),
+            ("auto", {"action": "restart_from_step"}, "step5", False),
+            ("auto", {"action": "continue"}, "step4", False),
+            ("auto", {"action": "rerun_current_step"}, "invalid", False),
+            (None, {}, "step4", False),
+        )
+        for cli_step, response, target, expected in discard_cases:
+            with self.subTest(
+                discard=(cli_step, response, target),
+            ):
+                self.assertIs(
+                    run_step._startup_discards_invalid_step4_checkpoint(
+                        SimpleNamespace(step=cli_step), response, target,
+                    ),
+                    expected,
+                )
+
+    def test_begin_step4_republication_state_complete_matrix(self):
+        existing = {
+            "schema": run_step._STEP4_REPORT_REPUBLICATION_MARKER_SCHEMA,
+            "result_generation_identity": "a" * 64,
+            "refresh_scope_interaction": False,
+            "marker_identity": "b" * 64,
+        }
+        with patch.object(
+            run_step,
+            "_step4_republication_marker",
+            return_value=existing,
+        ), patch.object(
+            run_step, "build_restore_context",
+        ) as restore:
+            self.assertIs(
+                run_step._begin_step4_report_republication_state(
+                    main_state={}, report_dir="/report",
+                ),
+                existing,
+            )
+            restore.assert_not_called()
+
+        with patch.object(
+            run_step,
+            "_step4_republication_marker",
+            return_value=None,
+        ), patch.object(
+            run_step, "build_restore_context", return_value={},
+        ), patch.object(
+            run_step, "_read_step4_active_descriptor",
+        ) as read_active, self.assertRaises(run_step.StepError) as raised:
+            run_step._begin_step4_report_republication_state(
+                main_state={}, report_dir="/report",
+            )
+        self.assertEqual(
+            raised.exception.reason_codes,
+            ["BINARY_STEP4_RECOVERY_CONTEXT_MISSING"],
+        )
+        read_active.assert_not_called()
+
+        invalid_generations = (None, "", "a" * 63, "A" * 64, 7)
+        for generation in invalid_generations:
+            with self.subTest(
+                invalid_generation=generation,
+            ), patch.object(
+                run_step,
+                "_step4_republication_marker",
+                return_value=None,
+            ), patch.object(
+                run_step,
+                "build_restore_context",
+                return_value={"context": True},
+            ), patch.object(
+                run_step,
+                "_read_step4_active_descriptor",
+                return_value={"result_generation_identity": generation},
+            ), self.assertRaises(run_step.StepError) as raised:
+                run_step._begin_step4_report_republication_state(
+                    main_state={}, report_dir="/report",
+                )
+            self.assertEqual(
+                raised.exception.reason_codes,
+                ["BINARY_STEP4_REPORT_REPUBLICATION_MARKER_INVALID"],
+            )
+
+        success_cases = (
+            (
+                {
+                    "state": {
+                        "current_step": "done",
+                        "completed_step": "step6",
+                    },
+                    "step5": {"input": {"scope": "from-step5"}},
+                },
+                {},
+                False,
+                "step5-only-context",
+            ),
+            (
+                {
+                    "state": {
+                        "current_step": "step4",
+                        "completed_step": "step3",
+                    },
+                    "step5": {"input": {}},
+                },
+                {"scope": "from-step4"},
+                True,
+                "current-step4-before-completion",
+            ),
+            (
+                {
+                    "state": {
+                        "current_step": "done",
+                        "completed_step": "step6",
+                        "pending_interaction": {"step_id": "step4"},
+                    },
+                    "step5": {"input": {}},
+                },
+                {"scope": "from-step4"},
+                True,
+                "pending-step4",
+            ),
+            (
+                {
+                    "state": {
+                        "current_step": "step4",
+                        "completed_step": "step4",
+                        "pending_interaction": {"step_id": "step5"},
+                    },
+                    "step5": {"input": {"scope": "from-step5"}},
+                },
+                {"scope": "from-step4", "kept": True},
+                False,
+                "already-completed-step4",
+            ),
+            (
+                {
+                    "state": {
+                        "current_step": "step4",
+                        "completed_step": "step3",
+                        "pending_interaction": {"step_id": "step5"},
+                    },
+                    "step5": {"input": {"scope": "from-step5"}},
+                },
+                {"scope": "from-step4", "kept": True},
+                True,
+                "non-step4-pending-current-step4",
+            ),
+        )
+        for state, context, expected_refresh, label in success_cases:
+            state = json.loads(json.dumps(state))
+            with self.subTest(
+                success=label,
+            ), patch.object(
+                run_step,
+                "_step4_republication_marker",
+                return_value=None,
+            ), patch.object(
+                run_step, "build_restore_context", return_value=context,
+            ), patch.object(
+                run_step,
+                "_read_step4_active_descriptor",
+                return_value={"result_generation_identity": "a" * 64},
+            ), patch.object(
+                run_step, "store_step_output",
+            ) as store, patch.object(
+                run_step, "clear_steps_from",
+            ) as clear_steps, patch.object(
+                run_step, "cleanup_step_outputs_from",
+            ) as cleanup, patch.object(
+                run_step, "save_main_state",
+            ) as save, patch.object(
+                run_step, "clear_interaction_file",
+            ) as clear_interaction:
+                marker = run_step._begin_step4_report_republication_state(
+                    main_state=state, report_dir="/report",
+                )
+            self.assertIs(
+                marker["refresh_scope_interaction"], expected_refresh,
+            )
+            self.assertRegex(marker["marker_identity"], r"^[0-9a-f]{64}$")
+            store.assert_called_once()
+            expected_context = dict(context)
+            expected_context.update(
+                (state.get("step5") or {}).get("input") or {}
+            )
+            self.assertEqual(
+                clear_steps.call_args.kwargs["preserve_current_input"],
+                expected_context,
+            )
+            cleanup.assert_called_once()
+            save.assert_called_once()
+            clear_interaction.assert_called_once()
+            self.assertEqual(state["state"]["current_step"], "step5")
+            self.assertEqual(state["state"]["completed_step"], "step4")
+
+    def test_reconcile_step4_republication_complete_state_matrix(self):
+        generation = "a" * 64
+        base_marker = {
+            "result_generation_identity": generation,
+            "refresh_scope_interaction": False,
+        }
+        verified = {
+            "binding": {"result_generation_identity": generation},
+        }
+
+        with patch.object(
+            run_step,
+            "_step4_republication_marker",
+            return_value=base_marker,
+        ), patch.object(
+            run_step, "build_restore_context", return_value={},
+        ), self.assertRaises(run_step.StepError) as raised:
+            run_step._reconcile_main_state_after_step4_republication(
+                main_state={},
+                report_dir="/report",
+                project_dir="/project",
+                manifest_steps={},
+                verified_release=verified,
+            )
+        self.assertEqual(
+            raised.exception.reason_codes,
+            ["BINARY_STEP4_RECOVERY_CONTEXT_MISSING"],
+        )
+
+        invalid_verified = (
+            None,
+            {},
+            {"binding": None},
+            {"binding": {}},
+            {"binding": {"result_generation_identity": ""}},
+            {"binding": {"result_generation_identity": "b" * 64}},
+        )
+        for candidate in invalid_verified:
+            with self.subTest(
+                verified=candidate,
+            ), patch.object(
+                run_step,
+                "_step4_republication_marker",
+                return_value=base_marker,
+            ), patch.object(
+                run_step,
+                "build_restore_context",
+                return_value={"context": True},
+            ), self.assertRaises(run_step.StepError) as raised:
+                run_step._reconcile_main_state_after_step4_republication(
+                    main_state={},
+                    report_dir="/report",
+                    project_dir="/project",
+                    manifest_steps={},
+                    verified_release=candidate,
+                )
+            self.assertEqual(
+                raised.exception.reason_codes,
+                ["BINARY_STEP4_REPORT_REPUBLICATION_MARKER_INVALID"],
+            )
+
+        no_interaction_cases = (
+            (False, "builder-not-needed"),
+            (True, "builder-returned-none"),
+        )
+        for refresh, label in no_interaction_cases:
+            marker = {
+                **base_marker,
+                "refresh_scope_interaction": refresh,
+            }
+            state = {
+                "state": {
+                    "step4_report_republication_pending": marker,
+                }
+            }
+            with self.subTest(
+                no_interaction=label,
+            ), patch.object(
+                run_step,
+                "_step4_republication_marker",
+                return_value=marker,
+            ), patch.object(
+                run_step,
+                "build_restore_context",
+                return_value={"context": True},
+            ), patch.object(
+                run_step,
+                "build_interaction_payload",
+                return_value=None,
+            ) as build, patch.object(
+                run_step, "save_main_state",
+            ), patch.object(
+                run_step, "clear_interaction_file",
+            ) as clear, patch.object(
+                run_step, "write_resume_snapshot",
+            ) as snapshot:
+                interaction = (
+                    run_step._reconcile_main_state_after_step4_republication(
+                        main_state=state,
+                        report_dir="/report",
+                        project_dir="/project",
+                        manifest_steps={},
+                        verified_release=verified,
+                    )
+                )
+            self.assertIsNone(interaction)
+            self.assertEqual(build.called, refresh)
+            self.assertEqual(state["state"]["current_step"], "step5")
+            self.assertNotIn(
+                "step4_report_republication_pending", state["state"],
+            )
+            clear.assert_called_once()
+            self.assertEqual(
+                snapshot.call_args.kwargs["event"], "step_completed"
+            )
+
+        interaction_labels = (
+            ("question", "title", "question"),
+            ("", "title", "title"),
+            ("", "", "step4"),
+        )
+        for question, title, expected_reason in interaction_labels:
+            marker = {
+                **base_marker,
+                "refresh_scope_interaction": True,
+            }
+            interaction = {
+                "status": "awaiting_user_input",
+                "question": question,
+                "title": title,
+            }
+            state = {
+                "state": {
+                    "step4_report_republication_pending": marker,
+                }
+            }
+            with self.subTest(
+                interaction_reason=expected_reason,
+            ), patch.object(
+                run_step,
+                "_step4_republication_marker",
+                return_value=marker,
+            ), patch.object(
+                run_step,
+                "build_restore_context",
+                return_value={"context": True},
+            ), patch.object(
+                run_step,
+                "build_interaction_payload",
+                return_value=interaction,
+            ), patch.object(
+                run_step,
+                "apply_interaction_protocol_enhancements",
+                return_value=interaction,
+            ), patch.object(
+                run_step,
+                "_sanitize_git_persistence_payload",
+                return_value=interaction,
+            ), patch.object(
+                run_step,
+                "current_step_for_pending_interaction",
+                return_value="step4",
+            ), patch.object(
+                run_step,
+                "normalize_interaction_status",
+                return_value="awaiting_user_input",
+            ), patch.object(
+                run_step, "save_main_state",
+            ), patch.object(
+                run_step, "save_interaction_file",
+            ) as save_interaction, patch.object(
+                run_step, "write_resume_snapshot",
+            ) as snapshot:
+                result = (
+                    run_step._reconcile_main_state_after_step4_republication(
+                        main_state=state,
+                        report_dir="/report",
+                        project_dir="/project",
+                        manifest_steps={},
+                        verified_release=verified,
+                    )
+                )
+            self.assertEqual(result, interaction)
+            self.assertEqual(
+                state["state"]["blocking_reason"], expected_reason,
+            )
+            save_interaction.assert_called_once()
+            self.assertEqual(
+                snapshot.call_args.kwargs["event"],
+                "step_completed_awaiting_user",
+            )
+
+    def test_apply_step4_startup_recovery_complete_action_matrix(self):
+        marker = {
+            "result_generation_identity": "a" * 64,
+            "refresh_scope_interaction": False,
+        }
+        verified = {
+            "binding": {"result_generation_identity": "a" * 64},
+            "committed_receipt_identity": "b" * 64,
+        }
+
+        def invoke(
+            *,
+            action,
+            target="step4",
+            cli_step="auto",
+            reached=True,
+            durable_marker=None,
+            begin_marker=marker,
+            state_fields=None,
+            has_response=False,
+            interaction=None,
+            decision_extra=None,
+            gate_value="jar_compare",
+            verified_result=None,
+        ):
+            state = {
+                "state": dict(state_fields or {}),
+                "step4": {"input": {"context": True}},
+            }
+            decision = {"action": action, **dict(decision_extra or {})}
+            current_verified = (
+                verified if verified_result is None else verified_result
+            )
+            with ExitStack() as stack:
+                mocks = {
+                    "marker": stack.enter_context(patch.object(
+                        run_step,
+                        "_step4_republication_marker",
+                        return_value=durable_marker,
+                    )),
+                    "reached": stack.enter_context(patch.object(
+                        run_step,
+                        "_workflow_has_reached_step4",
+                        return_value=reached,
+                    )),
+                    "clear-marker": stack.enter_context(patch.object(
+                        run_step, "_clear_step4_republication_marker",
+                    )),
+                    "restore": stack.enter_context(patch.object(
+                        run_step,
+                        "build_restore_context",
+                        return_value={"context": True},
+                    )),
+                    "reset": stack.enter_context(patch.object(
+                        run_step, "reset_step_state_for_restart",
+                    )),
+                    "save": stack.enter_context(patch.object(
+                        run_step, "save_main_state",
+                    )),
+                    "clear-interaction": stack.enter_context(patch.object(
+                        run_step, "clear_interaction_file",
+                    )),
+                    "begin": stack.enter_context(patch.object(
+                        run_step,
+                        "_begin_step4_report_republication_state",
+                        return_value=begin_marker,
+                    )),
+                    "republish": stack.enter_context(patch.object(
+                        run_step,
+                        "_republish_current_binary_step4_reports",
+                        return_value=current_verified,
+                    )),
+                    "verify": stack.enter_context(patch.object(
+                        run_step,
+                        "verify_current_step4_release",
+                        return_value=current_verified,
+                    )),
+                    "reconcile": stack.enter_context(patch.object(
+                        run_step,
+                        "_reconcile_main_state_after_step4_republication",
+                        return_value=interaction,
+                    )),
+                }
+                result = run_step._apply_step4_startup_recovery(
+                    decision=decision,
+                    target_step_id=target,
+                    args=SimpleNamespace(step=cli_step),
+                    main_state=state,
+                    report_dir="/report",
+                    project_dir="/project",
+                    manifest_steps={"step4": {}},
+                    gate_name=gate_value,
+                    strict_risk_gate=False,
+                    has_structured_response=has_response,
+                )
+            return result, mocks, state
+
+        for reason_code, expected in (
+            ("CUSTOM_RECOVERY_FAILURE", "CUSTOM_RECOVERY_FAILURE"),
+            ("", "BINARY_STEP4_TRANSACTION_RECOVERY_FAILED"),
+            (None, "BINARY_STEP4_TRANSACTION_RECOVERY_FAILED"),
+        ):
+            with self.subTest(
+                fatal_reason=reason_code,
+            ), patch.object(
+                run_step,
+                "_step4_republication_marker",
+                return_value=None,
+            ), self.assertRaises(run_step.StepError) as raised:
+                run_step._apply_step4_startup_recovery(
+                    decision={
+                        "action": run_step._STEP4_RELEASE_FATAL,
+                        "reason_code": reason_code,
+                    },
+                    target_step_id="step4",
+                    args=SimpleNamespace(step="auto"),
+                    main_state={},
+                    report_dir="/report",
+                    project_dir="/project",
+                    manifest_steps={},
+                    gate_name="jar_compare",
+                    strict_risk_gate=False,
+                    has_structured_response=False,
+                )
+            self.assertEqual(raised.exception.reason_codes, [expected])
+
+        for decision in (None, {}, {"action": "unknown"}):
+            with self.subTest(
+                unknown=decision,
+            ), patch.object(
+                run_step,
+                "_step4_republication_marker",
+                return_value=None,
+            ), self.assertRaises(run_step.StepError) as raised:
+                run_step._apply_step4_startup_recovery(
+                    decision=decision,
+                    target_step_id="step4",
+                    args=SimpleNamespace(step="auto"),
+                    main_state=None,
+                    report_dir="/report",
+                    project_dir="/project",
+                    manifest_steps={},
+                    gate_name="jar_compare",
+                    strict_risk_gate=False,
+                    has_structured_response=False,
+                )
+            self.assertEqual(
+                raised.exception.reason_codes,
+                ["BINARY_STEP4_TRANSACTION_RECOVERY_FAILED"],
+            )
+
+        early_cases = (
+            (False, "done", marker, True, "not-reached"),
+            (True, "step3", marker, True, "earlier-target"),
+            (False, "done", None, False, "no-marker"),
+            (True, "step4", None, False, "continues"),
+        )
+        for reached, target, durable, cleared, label in early_cases:
+            result, mocks, _state = invoke(
+                action=run_step._STEP4_RELEASE_CURRENT,
+                reached=reached,
+                target=target,
+                durable_marker=durable,
+            )
+            with self.subTest(early=label):
+                if label == "continues":
+                    self.assertTrue(mocks["verify"].called is False)
+                self.assertEqual(
+                    mocks["clear-marker"].called, cleared,
+                )
+                if label != "continues":
+                    self.assertFalse(result["applied"])
+                    self.assertEqual(mocks["save"].called, cleared)
+
+        explicit_cases = (
+            (False, {}, None, False),
+            (
+                True,
+                {"pending_interaction": {"step_id": "step4"}},
+                marker,
+                True,
+            ),
+            (
+                True,
+                {"pending_interaction": {"step_id": "step3"}},
+                marker,
+                False,
+            ),
+        )
+        for has_response, state_fields, durable, discard in explicit_cases:
+            result, mocks, _state = invoke(
+                action=run_step._STEP4_RELEASE_CURRENT,
+                cli_step="step4",
+                durable_marker=durable,
+                state_fields=state_fields,
+                has_response=has_response,
+            )
+            with self.subTest(
+                explicit=(has_response, state_fields),
+            ):
+                self.assertTrue(result["applied"])
+                self.assertTrue(result["explicit_pipeline"])
+                self.assertEqual(result["forced_step_id"], "step4")
+                self.assertIs(
+                    result["discard_structured_response"], discard,
+                )
+                self.assertEqual(
+                    mocks["clear-marker"].called,
+                    durable is not None,
+                )
+                mocks["reset"].assert_called_once()
+                mocks["save"].assert_called_once()
+                mocks["clear-interaction"].assert_called_once()
+
+        current_cases = (
+            (
+                "step5", False, False, False, None, "", False,
+            ),
+            (
+                "done", True, False, True, {"interaction": True},
+                "step5", True,
+            ),
+            (
+                "step5", True, True, True, None, "", False,
+            ),
+            (
+                "done", True, False, True, None, "step5", False,
+            ),
+        )
+        for (
+            target,
+            has_response,
+            refresh,
+            expect_discard,
+            interaction,
+            forced,
+            refreshed,
+        ) in current_cases:
+            durable = {**marker, "refresh_scope_interaction": refresh}
+            result, mocks, _state = invoke(
+                action=run_step._STEP4_RELEASE_CURRENT,
+                target=target,
+                durable_marker=durable,
+                has_response=has_response,
+                interaction=interaction,
+            )
+            with self.subTest(
+                current=(target, has_response, refresh, interaction),
+            ):
+                self.assertTrue(result["applied"])
+                self.assertEqual(result["forced_step_id"], forced)
+                self.assertIs(
+                    result["discard_structured_response"],
+                    expect_discard,
+                )
+                self.assertIs(result["interaction_refreshed"], refreshed)
+                self.assertEqual(
+                    result["committed_receipt_identity"], "b" * 64,
+                )
+                mocks["verify"].assert_called_once()
+                mocks["reconcile"].assert_called_once()
+
+        no_marker, mocks, _state = invoke(
+            action=run_step._STEP4_RELEASE_CURRENT,
+            durable_marker=None,
+            cli_step=None,
+        )
+        self.assertFalse(no_marker["applied"])
+        mocks["verify"].assert_not_called()
+
+        empty_current_receipt, mocks, _state = invoke(
+            action=run_step._STEP4_RELEASE_CURRENT,
+            durable_marker=marker,
+            gate_value=None,
+            verified_result={"binding": {}},
+        )
+        self.assertEqual(
+            empty_current_receipt["committed_receipt_identity"], ""
+        )
+        self.assertEqual(
+            mocks["verify"].call_args.kwargs["expected_gate_name"], ""
+        )
+
+        republish_cases = (
+            ("step5", False, False, None, "", False, False),
+            (
+                "done", True, False, {"interaction": True},
+                "step5", True, True,
+            ),
+            ("step5", True, True, None, "", True, False),
+            ("done", True, False, None, "step5", True, False),
+        )
+        for (
+            target,
+            has_response,
+            refresh,
+            interaction,
+            forced,
+            discard,
+            refreshed,
+        ) in republish_cases:
+            begin_marker = {
+                **marker,
+                "refresh_scope_interaction": refresh,
+            }
+            result, mocks, _state = invoke(
+                action=run_step._STEP4_RELEASE_REPUBLISH,
+                target=target,
+                durable_marker=None,
+                begin_marker=begin_marker,
+                has_response=has_response,
+                interaction=interaction,
+            )
+            with self.subTest(
+                republish=(target, has_response, refresh, interaction),
+            ):
+                self.assertTrue(result["applied"])
+                self.assertEqual(result["forced_step_id"], forced)
+                self.assertIs(
+                    result["discard_structured_response"], discard,
+                )
+                self.assertIs(result["interaction_refreshed"], refreshed)
+                mocks["begin"].assert_called_once()
+                mocks["republish"].assert_called_once()
+                mocks["reconcile"].assert_called_once()
+
+        empty_republish_receipt, _mocks, _state = invoke(
+            action=run_step._STEP4_RELEASE_REPUBLISH,
+            durable_marker=None,
+            begin_marker=marker,
+            verified_result={"binding": {}},
+        )
+        self.assertEqual(
+            empty_republish_receipt["committed_receipt_identity"], ""
+        )
+
+        resume_cases = (
+            (False, {}, "step4", None, False),
+            (
+                True,
+                {"pending_interaction": {"step_id": "step4"}},
+                "step4",
+                marker,
+                True,
+            ),
+            (
+                True,
+                {"pending_interaction": {"step_id": "step3"}},
+                "step5",
+                None,
+                True,
+            ),
+            (
+                True,
+                {"pending_interaction": {"step_id": "step3"}},
+                "step4",
+                None,
+                False,
+            ),
+        )
+        for has_response, state_fields, target, durable, stale in resume_cases:
+            result, mocks, _state = invoke(
+                action=run_step._STEP4_RELEASE_RESUME_PIPELINE,
+                target=target,
+                durable_marker=durable,
+                state_fields=state_fields,
+                has_response=has_response,
+            )
+            with self.subTest(
+                resume=(has_response, state_fields, target),
+            ):
+                self.assertTrue(result["applied"])
+                self.assertEqual(result["forced_step_id"], "step4")
+                self.assertIs(
+                    result["discard_structured_response"], stale,
+                )
+                self.assertEqual(
+                    mocks["clear-marker"].called,
+                    durable is not None,
+                )
+                mocks["reset"].assert_called_once()
+
+    def test_rollback_downstream_report_publication_complete_matrix(self):
+        transaction_id = "a" * 32
+        binding = {"report_implementation_identity": "b" * 64}
+        expectation = {
+            "transaction_id": transaction_id,
+            "binding": binding,
+        }
+        cases = (
+            ({"state": ""}, None, True, "not_present", False),
+            ({"state": "absent"}, {}, True, "not_present", False),
+            ({"state": "committed"}, None, True, "already_committed", False),
+            (
+                {
+                    "state": "pending_gate",
+                    "transaction_id": transaction_id,
+                    "binding": binding,
+                },
+                None,
+                True,
+                "restored_previous_reports",
+                True,
+            ),
+            (
+                {
+                    "state": "pending_gate",
+                    "transaction_id": transaction_id,
+                    "binding": binding,
+                },
+                {},
+                False,
+                "not_present",
+                True,
+            ),
+            (
+                {"state": "prepared"},
+                expectation,
+                True,
+                "restored_previous_reports",
+                True,
+            ),
+            (
+                {"state": "prepared"},
+                expectation,
+                False,
+                "not_present",
+                True,
+            ),
+        )
+        for metadata, creator, restored, expected, called in cases:
+            with self.subTest(
+                state=metadata, creator=creator, restored=restored,
+            ), patch.object(
+                run_step,
+                "report_publication_transaction_recovery_metadata",
+                return_value=metadata,
+            ), patch.object(
+                run_step,
+                "rollback_report_publication",
+                return_value=restored,
+            ) as rollback:
+                self.assertEqual(
+                    run_step._rollback_downstream_report_publication(
+                        "/report", "step5", creator,
+                    ),
+                    expected,
+                )
+                self.assertEqual(rollback.called, called)
+
+        invalid_metadata = (
+            {
+                "state": "pending_gate",
+                "transaction_id": "",
+                "binding": binding,
+            },
+            {
+                "state": "pending_gate",
+                "transaction_id": transaction_id,
+                "binding": {},
+            },
+            {
+                "state": "pending_gate",
+                "transaction_id": "",
+                "binding": {},
+            },
+        )
+        for metadata in invalid_metadata:
+            with self.subTest(
+                invalid_metadata=metadata,
+            ), patch.object(
+                run_step,
+                "report_publication_transaction_recovery_metadata",
+                return_value=metadata,
+            ), patch.object(
+                run_step, "rollback_report_publication",
+            ) as rollback:
+                status = run_step._rollback_downstream_report_publication(
+                    "/report", "step6",
+                )
+            self.assertEqual(
+                status,
+                (
+                    "rollback_failed:BinaryReportError:"
+                    "BINARY_REPORT_PUBLICATION_RECOVERY_METADATA_INVALID"
+                ),
+            )
+            rollback.assert_not_called()
+
+        with patch.object(
+            run_step,
+            "report_publication_transaction_recovery_metadata",
+            return_value={"state": "prepared"},
+        ), patch.object(
+            run_step, "rollback_report_publication",
+        ) as rollback:
+            status = run_step._rollback_downstream_report_publication(
+                "/report",
+                "step5",
+                {"binding": binding},
+            )
+        self.assertTrue(status.startswith("rollback_failed:KeyError:"))
+        rollback.assert_not_called()
+
+        metadata_errors = (
+            (
+                run_step.BinaryReportError("METADATA_BAD", "bad"),
+                "rollback_failed:BinaryReportError:METADATA_BAD",
+            ),
+            (
+                RuntimeError("metadata unavailable"),
+                "rollback_failed:RuntimeError:metadata unavailable",
+            ),
+        )
+        for error, expected in metadata_errors:
+            with self.subTest(
+                metadata_error=type(error).__name__,
+            ), patch.object(
+                run_step,
+                "report_publication_transaction_recovery_metadata",
+                side_effect=error,
+            ):
+                self.assertEqual(
+                    run_step._rollback_downstream_report_publication(
+                        "/report", "step5",
+                    ),
+                    expected,
+                )
+
+    def test_run_downstream_publication_candidate_and_release_matrix(self):
+        rollback_metadata = {
+            "state": "pending_gate",
+            "transaction_id": "a" * 32,
+            "binding": {
+                "result_generation_identity": "1" * 64,
+                "report_implementation_identity": "2" * 64,
+            },
+        }
+        for stage, prerequisite, downstream_status in (
+            ("step5", "step4", "stale"),
+            ("step6", "step5", "current"),
+        ):
+            with self.subTest(
+                success_stage=stage,
+            ), self._mocked_downstream_publication(
+                stage=stage,
+                baseline={"state": ""},
+            ) as (report, payloads, mocks):
+                result = run_step._run_downstream_report_publication(
+                    stage=stage,
+                    report_dir=report,
+                    project_dir=report.parent,
+                    gate_name=None,
+                    strict_risk_gate=1,
+                    selected_coords=("g:a",),
+                    selected_names=("name",),
+                )
+            self.assertIsNone(result["publication_transaction"])
+            self.assertEqual(result["business_output"], True)
+            self.assertEqual(
+                result["global_release"]["step6"]["status"],
+                downstream_status,
+            )
+            mocks["require"].assert_called_once_with(
+                report,
+                prerequisite,
+                workflow_lock_held=True,
+            )
+            self.assertEqual(
+                mocks["gate"].call_args.kwargs[
+                    "publication_transaction"
+                ],
+                payloads["receipt"],
+            )
+            self.assertIs(
+                mocks["gate"].call_args.kwargs["strict_risk_gate"], True,
+            )
+            self.assertEqual(
+                mocks["complete"].call_args.kwargs["gate_name"], ""
+            )
+
+        with self._mocked_downstream_publication(
+            baseline={"state": "pending_gate"},
+            rollback_metadata={"state": "absent"},
+        ) as (report, _payloads, mocks), self.assertRaises(
+            run_step.StepError,
+        ) as raised:
+            run_step._run_downstream_report_publication(
+                stage="step5",
+                report_dir=report,
+                project_dir=report.parent,
+                gate_name="gate",
+                strict_risk_gate=False,
+            )
+        self.assertEqual(
+            raised.exception.reason_codes,
+            ["BINARY_STEP5_TRANSACTION_RECOVERY_FAILED"],
+        )
+        mocks["require"].assert_not_called()
+
+        for missing_transaction in (None, {}):
+            with self.subTest(
+                missing_transaction=missing_transaction,
+            ), self._mocked_downstream_publication(
+                stage="step5",
+                result={
+                    "phase": "step5",
+                    "publication_transaction": missing_transaction,
+                },
+                rollback_metadata={"state": "absent"},
+            ) as (report, _payloads, mocks), self.assertRaises(
+                run_step.StepError,
+            ) as raised:
+                run_step._run_downstream_report_publication(
+                    stage="step5",
+                    report_dir=report,
+                    project_dir=report.parent,
+                    gate_name="gate",
+                    strict_risk_gate=False,
+                )
+            self.assertEqual(
+                raised.exception.reason_codes,
+                ["BINARY_STEP5_REPORT_TRANSACTION_MISSING"],
+            )
+            mocks["receipt"].assert_not_called()
+
+        base_transaction = {
+            "transaction_id": "a" * 32,
+            "binding": rollback_metadata["binding"],
+            "published_content_identity": "3" * 64,
+            "destinations": ["one", "two"],
+            "candidate_destinations": ["candidate-one", "candidate-two"],
+        }
+        base_result = {
+            "phase": "step5",
+            "publication_transaction": base_transaction,
+        }
+        base_receipt = {**base_transaction, "state": "pending_gate"}
+        mutations = {
+            "phase": lambda result, receipt: result.update(phase="step6"),
+            "state": lambda result, receipt: receipt.update(state="prepared"),
+            "content": lambda result, receipt: receipt.update(
+                published_content_identity="9" * 64
+            ),
+            "content-missing": lambda result, receipt: receipt.pop(
+                "published_content_identity", None
+            ),
+            "destinations": lambda result, receipt: receipt.update(
+                destinations=["changed"]
+            ),
+            "candidate-destinations": lambda result, receipt: receipt.update(
+                candidate_destinations=["changed"]
+            ),
+        }
+        for label, mutate in mutations.items():
+            result = json.loads(json.dumps(base_result))
+            receipt = json.loads(json.dumps(base_receipt))
+            mutate(result, receipt)
+            with self.subTest(
+                candidate_mismatch=label,
+            ), self._mocked_downstream_publication(
+                stage="step5",
+                result=result,
+                receipt=receipt,
+                rollback_metadata=rollback_metadata,
+            ) as (report, _payloads, mocks), self.assertRaises(
+                run_step.StepError,
+            ) as raised:
+                run_step._run_downstream_report_publication(
+                    stage="step5",
+                    report_dir=report,
+                    project_dir=report.parent,
+                    gate_name="gate",
+                    strict_risk_gate=False,
+                )
+            self.assertEqual(
+                raised.exception.reason_codes,
+                ["BINARY_STEP5_REPORT_TRANSACTION_MISSING"],
+            )
+            self.assertEqual(
+                raised.exception.diagnostic[
+                    "report_publication_rollback"
+                ],
+                "restored_previous_reports",
+            )
+            mocks["gate"].assert_not_called()
+            mocks["rollback"].assert_called_once()
+
+        valid_step5_release = {
+            "step4": {"status": "current"},
+            "step5": {"status": "current"},
+            "step6": {"status": "stale"},
+        }
+        invalid_releases = (
+            None,
+            [],
+            "invalid",
+            {**valid_step5_release, "step4": None},
+            {**valid_step5_release, "step4": []},
+            {**valid_step5_release, "step5": None},
+            {**valid_step5_release, "step5": "invalid"},
+            {**valid_step5_release, "step6": None},
+            {**valid_step5_release, "step6": 7},
+            {
+                **valid_step5_release,
+                "step4": {"status": "stale"},
+            },
+            {
+                **valid_step5_release,
+                "step5": {"status": "stale"},
+            },
+            {
+                **valid_step5_release,
+                "step6": {"status": "current"},
+            },
+        )
+        for release in invalid_releases:
+            completion = {
+                "publication_receipt": {"committed": True},
+                "global_release": release,
+            }
+            with self.subTest(
+                invalid_release=release,
+            ), self._mocked_downstream_publication(
+                stage="step5",
+                completion=completion,
+                rollback_metadata={"state": "committed"},
+            ) as (report, _payloads, mocks), self.assertRaises(
+                run_step.StepError,
+            ) as raised:
+                run_step._run_downstream_report_publication(
+                    stage="step5",
+                    report_dir=report,
+                    project_dir=report.parent,
+                    gate_name="gate",
+                    strict_risk_gate=False,
+                )
+            self.assertEqual(
+                raised.exception.reason_codes,
+                ["BINARY_GLOBAL_RELEASE_STATE_INVALID"],
+            )
+            self.assertEqual(
+                raised.exception.diagnostic[
+                    "report_publication_rollback"
+                ],
+                "already_committed",
+            )
+            mocks["rollback"].assert_not_called()
+
+    def test_run_downstream_publication_failure_propagation_matrix(self):
+        rollback_metadata = {
+            "state": "pending_gate",
+            "transaction_id": "a" * 32,
+            "binding": {
+                "result_generation_identity": "1" * 64,
+                "report_implementation_identity": "2" * 64,
+            },
+        }
+        gate_error = run_step.StepError(
+            "gate rejected",
+            reason_codes=["CANDIDATE_GATE_REJECTED"],
+            diagnostic={"failure_phase": "gate"},
+        )
+        with self._mocked_downstream_publication(
+            stage="step6",
+            rollback_metadata=rollback_metadata,
+        ) as (report, _payloads, mocks), patch.object(
+            run_step, "run_gate", side_effect=gate_error,
+        ), self.assertRaises(run_step.StepError) as raised:
+            run_step._run_downstream_report_publication(
+                stage="step6",
+                report_dir=report,
+                project_dir=report.parent,
+                gate_name="final",
+                strict_risk_gate=False,
+            )
+        self.assertEqual(
+            raised.exception.reason_codes,
+            ["CANDIDATE_GATE_REJECTED"],
+        )
+        self.assertEqual(
+            raised.exception.diagnostic["failure_phase"], "gate"
+        )
+        self.assertEqual(
+            raised.exception.diagnostic["report_publication_rollback"],
+            "restored_previous_reports",
+        )
+        mocks["rollback"].assert_called_once()
+
+        ordinary_errors = (
+            (
+                run_step.BinaryReportError("RENDER_BAD", "bad"),
+                "BinaryReportError",
+                "RENDER_BAD",
+            ),
+            (RuntimeError("renderer unavailable"), "RuntimeError", ""),
+        )
+        for error, error_type, reason_code in ordinary_errors:
+            with self.subTest(
+                ordinary_error=error_type,
+            ), self._mocked_downstream_publication(
+                stage="step6",
+                rollback_metadata={"state": "absent"},
+            ) as (report, _payloads, mocks), patch.object(
+                run_step,
+                "_prepare_binary_report_publication_candidate_in_process",
+                side_effect=error,
+            ), self.assertRaises(run_step.StepError) as raised:
+                run_step._run_downstream_report_publication(
+                    stage="step6",
+                    report_dir=report,
+                    project_dir=report.parent,
+                    gate_name="final",
+                    strict_risk_gate=False,
+                )
+            self.assertEqual(
+                raised.exception.reason_codes,
+                ["BINARY_STEP6_REPORT_PUBLICATION_FAILED"],
+            )
+            self.assertEqual(
+                raised.exception.diagnostic["error_type"], error_type,
+            )
+            self.assertEqual(
+                raised.exception.diagnostic["reason_code"], reason_code,
+            )
+            self.assertEqual(
+                raised.exception.diagnostic[
+                    "report_publication_rollback"
+                ],
+                "not_present",
+            )
+            mocks["rollback"].assert_not_called()
+
+        for interruption in (KeyboardInterrupt(), SystemExit(7)):
+            with self.subTest(
+                interruption=type(interruption).__name__,
+            ), self._mocked_downstream_publication(
+                stage="step5",
+                rollback_metadata=rollback_metadata,
+            ) as (report, _payloads, mocks), patch.object(
+                run_step, "run_gate", side_effect=interruption,
+            ), self.assertRaises(type(interruption)) as raised:
+                run_step._run_downstream_report_publication(
+                    stage="step5",
+                    report_dir=report,
+                    project_dir=report.parent,
+                    gate_name="impact",
+                    strict_risk_gate=False,
+                )
+            self.assertIs(raised.exception, interruption)
+            mocks["rollback"].assert_called_once()
 
 
 if __name__ == "__main__":

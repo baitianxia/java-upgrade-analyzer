@@ -112,7 +112,7 @@ def _uncertain_conclusion(item):
 
 def _uncertainty_counts(items):
     counts = defaultdict(int)
-    for item in items or []:
+    for item in items:
         counts[_uncertainty_kind(item)] += 1
     return counts
 
@@ -190,14 +190,14 @@ def _step5_summary_coverage_fallback(call_summary):
 
     components = []
     critical = []
-    total_apis = integer((call_summary or {}).get('total_apis'))
+    total_apis = integer(call_summary.get('total_apis'))
     all_symbols_preserved = bool(
         total_apis
-        and integer((call_summary or {}).get('not_impacted')) == total_apis
+        and integer(call_summary.get('not_impacted')) == total_apis
     )
 
     def add_component(component_id, status, reason_codes=None, evidence=None, critical_if_incomplete=True):
-        status = str(status or 'unknown')
+        status = str(status)
         item = {
             'id': component_id,
             'status': status,
@@ -473,9 +473,12 @@ def iter_csv_rows(path, *, diagnostics=None, artifact="", required=False):
 def _record_content_diagnostic(
     diagnostics, *, artifact, stage, path, message
 ):
+    target = (str(artifact), str(stage))
     if any(
-        str(item.get("artifact") or "") == str(artifact)
-        and str(item.get("stage") or "") == str(stage)
+        (
+            str(item.get("artifact")),
+            str(item.get("stage")),
+        ) == target
         for item in (diagnostics or [])
     ):
         return
@@ -625,7 +628,7 @@ def _alert_target_matches_changed_symbol(target, row):
         return False
 
     def split_member(value):
-        text = str(value or "").strip()
+        text = str(value).strip()
         signature_start = text.find("(")
         if signature_start < 0 or not text.endswith(")"):
             return text, ""
@@ -661,7 +664,7 @@ def _alert_path_entry_matches_business_entry(path_entry, row):
         return False
 
     def split_member(value):
-        text = str(value or "").strip()
+        text = str(value).strip()
         signature_start = text.find("(")
         if signature_start < 0 or not text.endswith(")"):
             return text, ""
@@ -826,11 +829,15 @@ def _validated_alert_rows(path, *, diagnostics, required=False):
 
 def _validate_call_summary_contract(path, summary, diagnostics):
     if not Path(path).is_file() or any(
-        str(item.get("artifact") or "") == "call_chain_summary"
-        and str(item.get("stage") or "") in {
-            "json_load", "json_contract", "json_missing"
+        (
+            str(item.get("artifact")),
+            str(item.get("stage")),
+        ) in {
+            ("call_chain_summary", "json_load"),
+            ("call_chain_summary", "json_contract"),
+            ("call_chain_summary", "json_missing"),
         }
-        for item in diagnostics or []
+        for item in diagnostics
     ):
         return
     issues = []
@@ -839,7 +846,7 @@ def _validate_call_summary_contract(path, summary, diagnostics):
         "not_impacted_apis", "uncertain_apis", "not_analyzed_apis",
         "not_found_apis",
     }
-    if not summary or not contract_fields.intersection(summary):
+    if not contract_fields.intersection(summary):
         issues.append("summary has no status, target count, or result buckets")
 
     status = summary.get("status")
@@ -930,35 +937,34 @@ def _validate_call_summary_contract(path, summary, diagnostics):
             issues.append(f"{object_field} is not an object")
             summary[object_field] = {}
     user_conclusion_summary = summary.get("user_conclusion_summary") or {}
-    if isinstance(user_conclusion_summary, dict):
-        allowed_conclusion_keys = {
-            "confirmed_impact",
-            "confirmed_no_impact",
-            "probable_impact",
-            "inconclusive",
-            "input_required",
-        }
-        invalid_conclusion_keys = sorted(
-            str(key)
-            for key in user_conclusion_summary
-            if str(key) not in allowed_conclusion_keys
+    allowed_conclusion_keys = {
+        "confirmed_impact",
+        "confirmed_no_impact",
+        "probable_impact",
+        "inconclusive",
+        "input_required",
+    }
+    invalid_conclusion_keys = sorted(
+        str(key)
+        for key in user_conclusion_summary
+        if str(key) not in allowed_conclusion_keys
+    )
+    if invalid_conclusion_keys:
+        _record_content_diagnostic(
+            diagnostics,
+            artifact="call_chain_summary",
+            stage="json_contract",
+            path=path,
+            message=(
+                "user_conclusion_summary contains non-contract keys: "
+                + ", ".join(invalid_conclusion_keys)
+            ),
         )
-        if invalid_conclusion_keys:
-            _record_content_diagnostic(
-                diagnostics,
-                artifact="call_chain_summary",
-                stage="json_contract",
-                path=path,
-                message=(
-                    "user_conclusion_summary contains non-contract keys: "
-                    + ", ".join(invalid_conclusion_keys)
-                ),
-            )
-            summary["user_conclusion_summary"] = {
-                key: user_conclusion_summary[key]
-                for key in allowed_conclusion_keys
-                if key in user_conclusion_summary
-            }
+        summary["user_conclusion_summary"] = {
+            key: user_conclusion_summary[key]
+            for key in allowed_conclusion_keys
+            if key in user_conclusion_summary
+        }
     meta = summary.get("meta", {})
     if meta is not None and not isinstance(meta, dict):
         issues.append("meta is not an object")
@@ -979,7 +985,9 @@ def _validate_call_summary_contract(path, summary, diagnostics):
                 "indirect_usage",
             ):
                 value = graph_stats.get(field)
-                if value is not None and not isinstance(value, dict):
+                if value is None:
+                    continue
+                if not isinstance(value, dict):
                     issues.append(f"meta.graph_stats.{field} is not an object")
                     graph_stats[field] = {}
             truncation_reasons = graph_stats.get("truncation_reasons")
@@ -1351,7 +1359,7 @@ def _validate_coverage_contract(path, coverage, diagnostics):
     coverage["components"] = normalized_components
 
     incomplete_component_ids = {
-        str(component.get("id") or "")
+        component["id"]
         for component in normalized_components
         if component.get("status") not in {"complete", "not_applicable"}
     }
@@ -1364,7 +1372,7 @@ def _validate_coverage_contract(path, coverage, diagnostics):
         )
         coverage["overall_status"] = "partial"
     component_status_by_id = {
-        str(component.get("id") or ""): str(component.get("status") or "")
+        component["id"]: component["status"]
         for component in normalized_components
     }
     for component_id in normalized_critical:
@@ -1439,24 +1447,16 @@ def _validate_analysis_scope_contract(path, scope, diagnostics):
         issues.append(
             "full scope dependency counts are not equal"
         )
-    included_coords = {
-        str(item).strip()
-        for item in scope.get("included_dependency_coords") or []
-        if str(item).strip()
-    }
-    excluded_coords = {
-        str(item).strip()
-        for item in scope.get("excluded_dependency_coords") or []
-        if str(item).strip()
-    }
+    included_coords = set(scope["included_dependency_coords"])
+    excluded_coords = set(scope["excluded_dependency_coords"])
     if included_coords.intersection(excluded_coords):
         issues.append("included and excluded dependency coordinates overlap")
-    if "included_dependency_coords" in scope and included_coords:
+    if included_coords:
         if len(included_coords) != included:
             issues.append(
                 "included dependency coordinate count does not match"
             )
-    if "excluded_dependency_coords" in scope and excluded_coords:
+    if excluded_coords:
         if len(excluded_coords) != max(available - included, 0):
             issues.append(
                 "excluded dependency coordinate count does not match"
@@ -1865,8 +1865,6 @@ def _minimum_compatible_variant_groups(variants):
         if len(assigned) == len(variants):
             best = min(best, used_color_count)
             return
-        if used_color_count >= best:
-            return
         current = selected_vertex(assigned)
         unavailable = {
             assigned[other]
@@ -1953,14 +1951,14 @@ def _uncertain_item_sort_key(item):
 def _order_uncertain_items_by_dependency(items):
     """Keep dependency coordinates contiguous while ordering review risk."""
     grouped = defaultdict(list)
-    for item in items or []:
-        coord = str((item or {}).get("coord") or "").strip()
+    for item in items:
+        coord = str(item.get("coord") or "").strip()
         grouped[coord].append(item)
 
     dependency_groups = []
     for coord, group_items in grouped.items():
         ordered_items = sorted(group_items, key=_uncertain_item_sort_key)
-        scores = [int((item or {}).get("priority_score") or 0) for item in ordered_items]
+        scores = [int(item.get("priority_score") or 0) for item in ordered_items]
         dependency_groups.append({
             "coord": coord,
             "items": ordered_items,
@@ -1980,7 +1978,7 @@ def _order_uncertain_items_by_dependency(items):
     ordered = []
     for rank, group in enumerate(dependency_groups, 1):
         for item in group["items"]:
-            enriched = dict(item or {})
+            enriched = dict(item)
             enriched.update({
                 "dependency_priority_rank": rank,
                 "dependency_top_priority_score": group[
@@ -2067,7 +2065,7 @@ def build_bucket_detail_markdown(config, items, csv_name, *, alerts_available=Fa
     coord_summary = summarize_item_coords(items)
     severity_summary = defaultdict(int)
     change_summary = defaultdict(int)
-    for item in items or []:
+    for item in items:
         severity_summary[str(item.get("severity") or "未分级").upper()] += 1
         change_summary[
             _human_change_type(
@@ -2112,11 +2110,11 @@ def build_bucket_detail_markdown(config, items, csv_name, *, alerts_available=Fa
             "## 事实分布",
             "",
         ]
-    if len(items) > 1 and coord_summary and config.get("show_priority"):
+    if len(items) > 1 and config.get("show_priority"):
         dependency_rows = []
         seen_dependency_ranks = set()
         for item in items:
-            dependency_rank = int(item.get("dependency_priority_rank") or 0)
+            dependency_rank = item["dependency_priority_rank"]
             if dependency_rank in seen_dependency_ranks:
                 continue
             seen_dependency_ranks.add(dependency_rank)
@@ -2129,11 +2127,11 @@ def build_bucket_detail_markdown(config, items, csv_name, *, alerts_available=Fa
         ]
         for item in dependency_rows[:S6_DETAIL_MD_DEP_SUMMARY_LIMIT]:
             lines.append(
-                f"| {int(item.get('dependency_priority_rank') or 0)} | "
+                f"| {item['dependency_priority_rank']} | "
                 f"`{_md_cell(item.get('coord'))}` | "
                 f"{int(item.get('dependency_top_priority_score') or 0)} | "
                 f"{int(item.get('dependency_total_priority_score') or 0)} | "
-                f"{int(item.get('dependency_uncertain_api_count') or 0)} |"
+                f"{item['dependency_uncertain_api_count']} |"
             )
         if len(dependency_rows) > S6_DETAIL_MD_DEP_SUMMARY_LIMIT:
             lines.append(
@@ -2141,7 +2139,7 @@ def build_bucket_detail_markdown(config, items, csv_name, *, alerts_available=Fa
                 "— | — | — | — |"
             )
         lines.append("")
-    elif len(items) > 1 and coord_summary:
+    elif len(items) > 1:
         lines += [
             f"### 依赖坐标分布（前 {min(S6_DETAIL_MD_DEP_SUMMARY_LIMIT, len(coord_summary))} 个）",
             "",
@@ -2156,7 +2154,7 @@ def build_bucket_detail_markdown(config, items, csv_name, *, alerts_available=Fa
                 f"{sum(list(coord_summary.values())[S6_DETAIL_MD_DEP_SUMMARY_LIMIT:])} |"
             )
         lines.append("")
-    if len(items) > 1 and severity_summary:
+    if len(items) > 1:
         lines += [
             "### 严重级别分布",
             "",
@@ -2166,7 +2164,7 @@ def build_bucket_detail_markdown(config, items, csv_name, *, alerts_available=Fa
         for severity, count in severity_summary.items():
             lines.append(f"| {_md_cell(severity, 40)} | {count} |")
         lines.append("")
-    if len(items) > 1 and change_summary:
+    if len(items) > 1:
         lines += [
             "### 变化类型分布",
             "",
@@ -2176,7 +2174,7 @@ def build_bucket_detail_markdown(config, items, csv_name, *, alerts_available=Fa
         for change_type, count in change_summary.items():
             lines.append(f"| {_md_cell(change_type, 120)} | {count} |")
         lines.append("")
-    if len(items) > 1 and reason_summary:
+    if len(items) > 1:
         lines += [
             "### 原因分类",
             "",
@@ -2357,7 +2355,7 @@ def write_bucket_detail_artifacts(report_dir, findings, bucket_name):
     config = S6_DETAIL_BUCKETS.get(bucket_name) or {}
     if bucket_name == "confirmed":
         return _write_confirmed_detail_artifacts(report_dir, findings, config)
-    items = list((findings or {}).get(bucket_name) or [])
+    items = list(findings.get(bucket_name) or [])
     if bucket_name == "not_analyzed":
         items = [
             item for item in items
@@ -2530,7 +2528,7 @@ def _split_csv_chain_nodes(path_text):
         return []
     normalized = text.replace("→", "->")
     parts = [part.strip() for part in normalized.split("->") if part.strip()]
-    return parts if len(parts) >= 2 else ([text] if text else [])
+    return parts if len(parts) >= 2 else [text]
 
 
 def _nodes_from_csv_evidence(evidence_path):
@@ -2724,8 +2722,8 @@ def available_s6_detail_artifacts(findings):
             continue
         rows.append({
             "bucket": bucket_name,
-            "csv_path": str(artifacts.get(csv_key) or ""),
-            "md_path": str(artifacts.get(md_key) or ""),
+            "csv_path": str(artifacts[csv_key]),
+            "md_path": str(artifacts[md_key]),
             "title": config.get("title") or bucket_name,
         })
     return rows
@@ -2959,7 +2957,7 @@ def _downgrade_unverified_certain_results(call_summary, verified_identities):
             call_summary.get("reachable_apis") or []
         )
         call_summary["not_impacted"] = len(
-            call_summary.get("not_impacted_apis") or []
+            call_summary["not_impacted_apis"]
         )
         call_summary["not_analyzed"] = len(existing)
         diagnostic_guidance = list(
@@ -3113,7 +3111,6 @@ def _validate_cross_artifact_identities(
     )
     if (
         (alert_identity_mismatch or alert_bucket_mismatch)
-        and (summary_identities or alert_identities)
         and not _artifact_has_diagnostic(diagnostics, 'call_chain_alerts')
     ):
         _record_content_diagnostic(
@@ -3159,11 +3156,11 @@ def _validate_cross_artifact_identities(
     for identity, source_rows in changed_rows_by_identity.items():
         overview_item = overview_by_identity.get(identity)
         for field, overview_field in field_value_names.items():
-            source_values = {
-                str(row.get(field) or "").strip()
-                for row in source_rows
-                if str(row.get(field) or "").strip()
-            }
+            source_values = set()
+            for row in source_rows:
+                value = str(row.get(field) or "").strip()
+                if value:
+                    source_values.add(value)
             if len(source_values) > 1:
                 conflicted_changed_identities.add(identity)
                 changed_field_conflicts.append(
@@ -3182,11 +3179,11 @@ def _validate_cross_artifact_identities(
                 summary_item[field] = source_value
             if overview_item is None:
                 continue
-            repeated_values = {
-                str(value or "").strip()
-                for value in overview_item.get(overview_field) or []
-                if str(value or "").strip()
-            }
+            repeated_values = set()
+            for value in overview_item.get(overview_field) or []:
+                normalized_value = str(value or "").strip()
+                if normalized_value:
+                    repeated_values.add(normalized_value)
             if repeated_values and repeated_values != {source_value}:
                 alert_field_mismatches.append(
                     f"{field} does not match changed API inventory"
@@ -3246,7 +3243,7 @@ def _short_path(value, parts=4):
     if not text:
         return ""
     items = Path(text).parts[-parts:]
-    return "/".join(items) if items else text
+    return "/".join(items)
 
 
 def _module_from_evidence_file(value):
@@ -3626,7 +3623,7 @@ def build_impact_overview(alert_rows):
             int(item.get("path_count") or 0) for item in api_items
         ),
         "occurrence_count": sum(
-            int(item.get("occurrence_count") or 0) for item in api_items
+            item["occurrence_count"] for item in api_items
         ),
         "dependency_count": len({
             item.get("coord")
@@ -3947,9 +3944,7 @@ def collect_findings(d):
         diagnostics=diagnostics,
         selection_path=selection_path,
     )
-    scope_mode = str(
-        (findings.get('analysis_scope') or {}).get('mode') or ''
-    ).strip()
+    scope_mode = str(findings['analysis_scope'].get('mode') or '').strip()
     changed_count_mismatch = (
         target_api_count > 0
         and (
@@ -4006,11 +4001,7 @@ def collect_findings(d):
         diagnostics, "call_chain_alerts"
     ):
         findings["impact_overview"] = build_impact_overview([])
-    alert_api_count = len(
-        (findings.get('impact_overview') or {}).get("fact_apis")
-        or (findings.get('impact_overview') or {}).get('apis')
-        or []
-    )
+    alert_api_count = len(findings['impact_overview']['fact_apis'])
     if (
         target_api_count > 0
         and alert_api_count != target_api_count
@@ -4076,7 +4067,7 @@ def collect_findings(d):
                 'reason_code_aliases': definition['reason_code_aliases'],
                 'diagnostic_schema': definition['diagnostic_schema'],
                 'diagnostic_contract': definition['diagnostic_contract'],
-                'origin_step': normalized_origin_step or "unknown",
+                'origin_step': normalized_origin_step,
                 'observed_scope': raw_item.get('observed_scope') or 'unknown',
                 'affected_api_count': raw_item.get('affected_api_count') or 0,
                 'affected_api_count_semantics': (
@@ -4268,7 +4259,7 @@ def collect_findings(d):
                 item.get('reason_code') or 'UNKNOWN'
             )
             uncertainty_kind = _uncertainty_kind(item)
-            uncertain_reason_counts[reason_code or 'UNKNOWN'] += 1
+            uncertain_reason_counts[reason_code] += 1
             uncertainty_kind_counts[uncertainty_kind] += 1
             findings['uncertain'].append({
                 **_step5_result_identity_fields(item),
@@ -4312,7 +4303,7 @@ def collect_findings(d):
             reason_code = canonical_reason_code(
                 item.get('reason_code') or 'UNKNOWN'
             )
-            not_analyzed_reason_counts[reason_code or 'UNKNOWN'] += 1
+            not_analyzed_reason_counts[reason_code] += 1
             entry = {
                 **_step5_result_identity_fields(item),
                 'coord':         coord,
@@ -4351,7 +4342,7 @@ def collect_findings(d):
             reason_code = canonical_reason_code(
                 item.get('reason_code') or 'UNKNOWN'
             )
-            not_found_reason_counts[reason_code or 'UNKNOWN'] += 1
+            not_found_reason_counts[reason_code] += 1
             findings['not_found'].append({
                 **_step5_result_identity_fields(item),
                 'coord':         coord,
@@ -4412,8 +4403,14 @@ def collect_findings(d):
         for item in findings[bucket_name]:
             payload = by_api_lookup.get(build_api_identity_key(item), {})
             if payload:
-                if not item.get('reason_code'):
-                    item['reason_code'] = payload.get('reason_code', '')
+                payload_reason_code = canonical_reason_code(
+                    payload.get('reason_code') or 'UNKNOWN'
+                )
+                if (
+                    item.get('reason_code') in {None, '', 'UNKNOWN'}
+                    and payload_reason_code != 'UNKNOWN'
+                ):
+                    item['reason_code'] = payload_reason_code
                 item['evidence_paths'] = _normalize_evidence_paths(
                     payload.get('evidence_paths', [])
                 )[0]
@@ -4654,16 +4651,15 @@ def collect_findings(d):
     )
 
     component_by_reason = defaultdict(list)
-    for component in (findings.get('coverage') or {}).get('components') or []:
+    for component in findings['coverage'].get('components') or []:
         component_id = str(component.get('id') or '').strip()
         for reason_code in component.get('reason_codes') or []:
-            code = str(reason_code or '').strip()
+            code = str(reason_code).strip()
             if code and component_id not in component_by_reason[code]:
                 component_by_reason[code].append(component_id)
     existing_guidance = {
-        str(item.get('reason_code') or ''): item
-        for item in findings.get('diagnostic_guidance') or []
-        if isinstance(item, dict)
+        str(item['reason_code']): item
+        for item in findings['diagnostic_guidance']
     }
     for reason_code, component_ids in component_by_reason.items():
         for item in build_catalog_guidance(
@@ -4677,7 +4673,7 @@ def collect_findings(d):
         key=lambda item: (
             str(item.get('origin_step') or 'unknown'),
             not bool(item.get('blocking')),
-            str(item.get('reason_code') or ''),
+            str(item['reason_code']),
         ),
     )
     fatal_csv_stages = {
@@ -4687,18 +4683,22 @@ def collect_findings(d):
         "csv_contract",
     }
     fatal_alerts = any(
-        str(item.get("artifact") or "") == "call_chain_alerts"
-        and str(item.get("stage") or "") in fatal_csv_stages
+        (
+            str(item.get("artifact")),
+            str(item.get("stage")),
+        ) in {("call_chain_alerts", stage) for stage in fatal_csv_stages}
         for item in diagnostics
     )
     fatal_changed_apis = any(
-        str(item.get("artifact") or "") == "changed_apis"
-        and str(item.get("stage") or "") in fatal_csv_stages
+        (
+            str(item.get("artifact")),
+            str(item.get("stage")),
+        ) in {("changed_apis", stage) for stage in fatal_csv_stages}
         for item in diagnostics
     )
     if fatal_alerts or (
         target_api_count > 0
-        and not (findings.get("impact_overview") or {}).get("apis")
+        and not findings["impact_overview"]["apis"]
     ):
         findings['artifacts'].pop('alerts_csv', None)
     if fatal_changed_apis or (target_api_count > 0 and not changed_apis):
@@ -4711,7 +4711,11 @@ def collect_findings(d):
 
 
 def _join_inline(values, limit=3, empty="-"):
-    cleaned = [str(value or "").strip() for value in values or [] if str(value or "").strip()]
+    cleaned = []
+    for value in values or []:
+        text_value = str(value or "").strip()
+        if text_value:
+            cleaned.append(text_value)
     if not cleaned:
         return empty
     text = "<br>".join(_md_cell(value, 180) for value in cleaned[:limit])
@@ -4792,7 +4796,7 @@ def _evidence_is_available(findings, value):
         for item in (findings.get('available_evidence_paths') or [])
     }
     available.update(
-        str(item or '').strip().replace('\\', '/')
+        str(item).strip().replace('\\', '/')
         for item in ((findings.get('artifacts') or {}).values())
         if str(item or '').strip()
     )
@@ -4800,7 +4804,11 @@ def _evidence_is_available(findings, value):
 
 
 def _join_report_links(values, limit=3, empty='-'):
-    cleaned = [str(value or '').strip() for value in values or [] if str(value or '').strip()]
+    cleaned = []
+    for value in values or []:
+        text_value = str(value or '').strip()
+        if text_value:
+            cleaned.append(text_value)
     if not cleaned:
         return empty
     text = '<br>'.join(_report_link(value) for value in cleaned[:limit])
@@ -4961,11 +4969,12 @@ def _coverage_impact_text(component_id, reason_codes):
 
 
 def _coverage_component_lookup(coverage):
-    return {
-        str(item.get('id') or ''): item
-        for item in (coverage.get('components') or [])
-        if item.get('id')
-    }
+    components = {}
+    for item in coverage.get('components') or []:
+        component_id = str(item.get('id') or '')
+        if component_id:
+            components[component_id] = item
+    return components
 
 
 def _coverage_gap_rows(coverage):
@@ -5074,8 +5083,7 @@ def _item_business_entries(findings, item, limit=3, statuses=None):
             for existing in entries
         ):
             continue
-        if entry not in deduplicated:
-            deduplicated.append(entry)
+        deduplicated.append(entry)
     if limit is None:
         return deduplicated
     return deduplicated[:limit]
@@ -5113,7 +5121,7 @@ def _unresolved_count(findings):
 
 
 def render_core_conclusion(findings):
-    coverage = findings.get('coverage') or {}
+    coverage = findings['coverage']
     confirmed = [
         row for row in build_api_result_rows(findings)
         if row.get("conclusion") == "已确认影响"
@@ -5391,11 +5399,16 @@ def _occurrence_count_for_report(
 
 
 def _render_path_sample_cards(rows, findings=None):
-    evidence_rows = [
-        row for row in rows
-        if (row.get('paths') or [])
-        and str(row.get('conclusion') or '') in {'已确认影响', '已确认不受影响'}
-    ][:S6_MAIN_PATH_DETAIL_LIMIT]
+    evidence_rows = []
+    for row in rows:
+        if not row.get('paths'):
+            continue
+        if str(row.get('conclusion')) not in {
+            '已确认影响', '已确认不受影响'
+        }:
+            continue
+        evidence_rows.append(row)
+    evidence_rows = evidence_rows[:S6_MAIN_PATH_DETAIL_LIMIT]
     if not evidence_rows:
         return []
 
@@ -5417,7 +5430,7 @@ def _render_path_sample_cards(rows, findings=None):
     else:
         lines.extend(["以下链路来自本轮汇总记录中保留的证据。", ""])
     for idx, row in enumerate(evidence_rows, 1):
-        paths = list(row.get('paths') or [])
+        paths = list(row['paths'])
         path_count = int(row.get('path_count') or len(paths))
         occurrence_count = int(row.get('occurrence_count') or path_count)
         entries = list(row.get('business_entries') or [])
@@ -5590,12 +5603,13 @@ def _report_reason_code_sort_key(value):
 
 
 def _set_report_row_reasons(row, reason_codes, conclusion):
+    normalized_codes = set()
+    for value in reason_codes or []:
+        normalized = str(value or "").strip()
+        if normalized:
+            normalized_codes.add(normalized)
     ordered_codes = sorted(
-        {
-            str(value or "").strip()
-            for value in reason_codes or []
-            if str(value or "").strip()
-        },
+        normalized_codes,
         key=_report_reason_code_sort_key,
     )
     reason_texts = []
@@ -5706,7 +5720,7 @@ def build_api_result_rows(findings):
             report_item = item
             if fallback_conclusion == UNCERTAIN_CANDIDATE_CONCLUSION:
                 report_item = {
-                    **dict(item or {}),
+                    **dict(item),
                     'uncertainty_kind': _uncertainty_kind_for_report(
                         item, overview_lookup.get(identity) or {}
                     ),
@@ -5762,7 +5776,7 @@ def build_api_result_rows(findings):
                         *existing.get("reason_codes", []),
                         item.get("reason_code"),
                     ],
-                    existing.get('conclusion') or fallback_conclusion,
+                    existing['conclusion'],
                 )
                 continue
             sampled_paths = _paths_for_report(item, overview_lookup, desired_statuses)
@@ -5784,7 +5798,7 @@ def build_api_result_rows(findings):
                 status_paths = list(paths_by_status.get(status) or [])
                 if status_paths:
                     return _distinct_call_path_count(status_paths)
-                return int(counts_by_status.get(status) or 0)
+                return int(counts_by_status.get(status, 0))
 
             confirmed_path_count = status_path_count('reachable')
             occurrences_by_status = (
@@ -5808,12 +5822,12 @@ def build_api_result_rows(findings):
                 limit=None,
                 statuses=desired_statuses,
             )
-            all_business_entries = {
-                str(entry or "").strip()
-                for status in desired_statuses
-                for entry in (all_entries_by_status.get(status) or [])
-                if str(entry or "").strip()
-            }
+            all_business_entries = set()
+            for status in desired_statuses:
+                for entry in all_entries_by_status.get(status) or []:
+                    normalized_entry = str(entry or "").strip()
+                    if normalized_entry:
+                        all_business_entries.add(normalized_entry)
             all_business_entries.update(fallback_business_entries)
             business_entries = sorted(all_business_entries)
             modules = _item_modules(findings, item)
@@ -5871,7 +5885,7 @@ def build_api_result_rows(findings):
             _set_report_row_reasons(
                 row,
                 [item.get("reason_code")],
-                row.get('conclusion') or fallback_conclusion,
+                row['conclusion'],
             )
             rows.append(row)
             row_by_key[key] = row
@@ -5913,15 +5927,15 @@ def _confirmed_impact_distribution(findings, rows=None):
         change_types[change_label] += 1
 
         overview = overview_lookup.get(_identity_without_severity(row)) or {}
-        reachable_entries = {
-            str(value or "").strip()
-            for value in (
-                (overview.get("all_entries_by_status") or {}).get("reachable")
-                or row.get("business_entries")
-                or []
-            )
-            if str(value or "").strip()
-        }
+        reachable_entries = set()
+        for value in (
+            (overview.get("all_entries_by_status") or {}).get("reachable")
+            or row.get("business_entries")
+            or []
+        ):
+            normalized_entry = str(value or "").strip()
+            if normalized_entry:
+                reachable_entries.add(normalized_entry)
         dependency = dependencies.setdefault(coord, {
             "coord": coord,
             "api_count": 0,
@@ -5977,11 +5991,11 @@ def _confirmed_impact_distribution(findings, rows=None):
             "business_entry_count": len(item["entries"]),
         })
     dependency_rows.sort(key=lambda item: (
-        -int(item.get("p0") or 0),
-        -int(item.get("p1") or 0),
-        -int(item.get("api_count") or 0),
-        -int(item.get("path_count") or 0),
-        str(item.get("coord") or ""),
+        -item["p0"],
+        -item["p1"],
+        -item["api_count"],
+        -item["path_count"],
+        item["coord"],
     ))
 
     entry_rows = []
@@ -5992,11 +6006,11 @@ def _confirmed_impact_distribution(findings, rows=None):
             "dependency_count": len(item["dependencies"]),
         })
     entry_rows.sort(key=lambda item: (
-        -int(item.get("p0") or 0),
-        -int(item.get("p1") or 0),
-        -int(item.get("api_count") or 0),
-        -int(item.get("dependency_count") or 0),
-        str(item.get("entry") or ""),
+        -item["p0"],
+        -item["p1"],
+        -item["api_count"],
+        -item["dependency_count"],
+        item["entry"],
     ))
 
     return {
@@ -6062,7 +6076,7 @@ def render_impact_distribution(findings, *, heading_level=3, force=False):
     )
 
     top_dependencies = dependency_rows[:3]
-    if len(dependency_rows) > 1 and top_dependencies:
+    if len(dependency_rows) > 1:
         top_api_count = sum(
             int(item.get("api_count") or 0) for item in top_dependencies
         )
@@ -6400,7 +6414,7 @@ def render_api_result_table(findings):
 
 
 def _input_diagnostic_artifact_label(item):
-    artifact = str((item or {}).get('artifact') or '').strip()
+    artifact = str(item.get('artifact') or '').strip()
     exact_labels = {
         'coverage': '证据覆盖记录',
         'step5_selection': '分析范围快照',
@@ -6462,8 +6476,8 @@ def _input_diagnostic_fact_label(item):
 
 
 def _input_diagnostic_impact(item, findings=None):
-    artifact = str((item or {}).get('artifact') or '').strip()
-    stage = str((item or {}).get("stage") or "")
+    artifact = str(item.get('artifact') or '').strip()
+    stage = str(item.get("stage") or "")
     partial_record_failure = stage in {
         "row_contract",
         "identity_consistency",
@@ -6471,7 +6485,7 @@ def _input_diagnostic_impact(item, findings=None):
         "csv_consistency",
     }
     if artifact == 'call_chain_summary':
-        if str((item or {}).get('error_type') or '') in {
+        if str(item.get('error_type') or '') in {
             'ArtifactContentError',
             'JSONRootTypeError',
         }:
@@ -6768,9 +6782,9 @@ def render_diagnostic_detail_artifact(findings):
 def write_diagnostic_detail_artifact(report_dir, findings):
     relative_path = "deliverables/analysis-diagnostics.md"
     path = Path(report_dir) / relative_path
-    if not (
-        (findings.get('diagnostic_guidance') or [])
-        or (findings.get('diagnostics') or [])
+    if (
+        not findings.get('diagnostic_guidance')
+        and not findings.get('diagnostics')
     ):
         try:
             path.unlink()
@@ -6935,7 +6949,7 @@ def render_diagnostic_summary(findings):
 
 
 def render_limitations_section(findings):
-    coverage = findings.get('coverage') or {}
+    coverage = findings['coverage']
     gap_rows = [
         *_input_diagnostic_gap_rows(findings),
         *_coverage_gap_rows(coverage),
@@ -7182,11 +7196,11 @@ def _report_scope_included_coords(findings):
         or scope.get("validation_status") == "invalid"
     ):
         return None
-    included = {
-        _canonical_identity_coord(value)
-        for value in scope.get("included_dependency_coords") or []
-        if _canonical_identity_coord(value)
-    }
+    included = set()
+    for value in scope.get("included_dependency_coords") or []:
+        coord = _canonical_identity_coord(value)
+        if coord:
+            included.add(coord)
     declared_count = int(scope.get("included_dependency_count") or 0)
     if len(included) != declared_count:
         return None
@@ -7283,13 +7297,8 @@ def build_human_api_analysis(findings):
             variant = (
                 str(normalized_inventory_row.get("old_version") or ""),
                 str(normalized_inventory_row.get("new_version") or ""),
-                str(normalized_inventory_row.get("severity") or ""),
-                str(
-                    normalized_inventory_row.get(
-                        "change_without_severity"
-                    )
-                    or ""
-                ),
+                normalized_inventory_row["severity"],
+                normalized_inventory_row["change_without_severity"],
             )
             inventory_variant_counts[identity][variant] += 1
     conflicting_inventory_identities = {
@@ -7350,7 +7359,7 @@ def build_human_api_analysis(findings):
                 "无法确认该 API 的唯一变化内容。"
             )
             result["input_record_conflict"] = True
-        result.setdefault("aggregate_count", 1)
+        result["aggregate_count"] = 1
         rows.append(result)
 
     # When the inventory is available it is the authoritative changed-API
@@ -7360,10 +7369,10 @@ def build_human_api_analysis(findings):
     if not inventory:
         for result in selected_results.values():
             result = dict(result)
-            result.setdefault("aggregate_count", 1)
+            result["aggregate_count"] = 1
             rows.append(result)
 
-    known_count = sum(int(row.get("aggregate_count") or 1) for row in rows)
+    known_count = sum(row["aggregate_count"] for row in rows)
     scope = findings.get("analysis_scope") or {}
     if report_scope_coords is not None:
         source_counts = [
@@ -7430,15 +7439,15 @@ def build_human_api_analysis(findings):
             note_parts.append(
                 f"其中 {incomplete_inventory_identity_count} 行没有完整 API 身份"
             )
-        mismatched_sources = [
-            (label, count)
-            for label, count in positive_source_counts
-            if count != inventory_population_count
-            and not (
-                label == "变化 API 清单行数"
-                and count == len(raw_inventory)
-            )
-        ]
+        mismatched_sources = []
+        for label, count in positive_source_counts:
+            if count == inventory_population_count:
+                continue
+            if (label, count) == (
+                "变化 API 清单行数", len(raw_inventory)
+            ):
+                continue
+            mismatched_sources.append((label, count))
         if mismatched_sources:
             note_parts.append(
                 "其他产物记录的数量为"
@@ -7474,7 +7483,7 @@ def build_human_api_analysis(findings):
         missing_identity_count = max(declared_total - known_count, 0)
 
     if missing_identity_count:
-        if raw_inventory and incomplete_inventory_identity_count:
+        if incomplete_inventory_identity_count:
             incomplete_reason = (
                 f"变化 API 原始清单中有 {missing_identity_count} 条记录"
                 "没有完整的依赖坐标和 API 身份，因此无法逐项完成"
@@ -7529,20 +7538,20 @@ def build_human_api_analysis(findings):
     # Keep the model order identical to the Markdown and CSV detail artifacts:
     # dependency coordinates first, APIs within each dependency second.
     rows = [*completed, *incomplete]
-    total_count = sum(int(row.get("aggregate_count") or 1) for row in rows)
+    total_count = sum(row["aggregate_count"] for row in rows)
     completed_count = sum(
-        int(row.get("aggregate_count") or 1) for row in completed
+        row["aggregate_count"] for row in completed
     )
     incomplete_count = sum(
-        int(row.get("aggregate_count") or 1) for row in incomplete
+        row["aggregate_count"] for row in incomplete
     )
     confirmed_count = sum(
-        int(row.get("aggregate_count") or 1)
+        row["aggregate_count"]
         for row in completed
         if row.get("conclusion") == "已确认影响"
     )
     confirmed_no_impact_count = sum(
-        int(row.get("aggregate_count") or 1)
+        row["aggregate_count"]
         for row in completed
         if row.get("conclusion") == "已确认不受影响"
     )
@@ -7608,8 +7617,8 @@ def _dependency_api_change_text(api_rows):
     if not total:
         return "未记录变化 API"
     if len(counts) == 1:
-        label, count = next(iter(counts.items()))
-        return f"均为{label}" if count == total else f"{label} {count}"
+        label = next(iter(counts))
+        return f"均为{label}"
     return "；".join(
         f"{label} {count}"
         for label, count in sorted(
@@ -7629,7 +7638,7 @@ def _dependency_incomplete_reason(api_rows, findings, excluded=False):
         if not _api_result_is_incomplete(row):
             continue
         reason = _incomplete_api_reason(row, findings).rstrip("。")
-        if reason and reason not in reasons:
+        if reason not in reasons:
             reasons.append(reason)
     if not reasons:
         return "当前记录没有保存该依赖未完成调用关系分析的具体原因。"
@@ -7638,14 +7647,10 @@ def _dependency_incomplete_reason(api_rows, findings, excluded=False):
         for row in api_rows
         if _api_result_is_incomplete(row)
     )
-    prefix = (
-        f"该依赖有 {incomplete_count} 个变化 API 未完成调用关系分析："
-        if incomplete_count
-        else ""
-    )
+    prefix = f"该依赖有 {incomplete_count} 个变化 API 未完成调用关系分析："
     if len(reasons) == 1:
         return prefix + reasons[0] + "。"
-    return prefix + "；".join(reasons[:3]) + ("。" if reasons else "")
+    return prefix + "；".join(reasons[:3]) + "。"
 
 
 def _dependency_basis(api_rows):
@@ -7699,7 +7704,7 @@ def _dependency_basis(api_rows):
     ]
     if probable_with_exact_path:
         path_count = sum(
-            int(row.get("confirmed_path_count") or 0)
+            int(row["confirmed_path_count"])
             for row in probable_with_exact_path
         )
         return (
@@ -7745,10 +7750,10 @@ def _dependency_result_rank(row):
 def _dependency_display_sort_key(row):
     return (
         _dependency_result_rank(row),
-        -int((row or {}).get("top_uncertain_priority_score") or 0),
-        -int((row or {}).get("total_uncertain_priority_score") or 0),
-        -int((row or {}).get("call_relationship_count") or 0),
-        str((row or {}).get("coord") or ""),
+        -row["top_uncertain_priority_score"],
+        -row["total_uncertain_priority_score"],
+        -row["call_relationship_count"],
+        row["coord"],
     )
 
 
@@ -7757,7 +7762,9 @@ def build_human_dependency_analysis(findings, api_model=None):
     report_scope_coords = _report_scope_included_coords(findings)
     api_by_coord = defaultdict(list)
     unassigned_api_rows = []
-    for row in api_model["rows"]:
+    for source_row in api_model["rows"]:
+        row = dict(source_row)
+        row["aggregate_count"] = int(row.get("aggregate_count") or 1)
         coord = _canonical_identity_coord(row.get("coord"))
         if coord:
             api_by_coord[coord].append(row)
@@ -7827,11 +7834,11 @@ def build_human_dependency_analysis(findings, api_model=None):
             continue
         target = dependencies.setdefault(coord, {"coord": coord})
         for field in ("old_version", "new_version"):
-            values = {
-                str(row.get(field) or "").strip()
-                for row in rows
-                if str(row.get(field) or "").strip()
-            }
+            values = set()
+            for row in rows:
+                value = str(row.get(field) or "").strip()
+                if value:
+                    values.add(value)
             if not target.get(field) and len(values) == 1:
                 target[field] = next(iter(values))
     for coord, rows in resource_by_coord.items():
@@ -7839,10 +7846,11 @@ def build_human_dependency_analysis(findings, api_model=None):
             continue
         target = dependencies.setdefault(coord, {"coord": coord})
         for field in ("old_version", "new_version"):
-            values = {
-                str(row.get(field) or "").strip()
-                for row in rows if str(row.get(field) or "").strip()
-            }
+            values = set()
+            for row in rows:
+                value = str(row.get(field) or "").strip()
+                if value:
+                    values.add(value)
             if not target.get(field) and len(values) == 1:
                 target[field] = next(iter(values))
 
@@ -7856,8 +7864,7 @@ def build_human_dependency_analysis(findings, api_model=None):
         api_by_coord[only_coord].extend(unassigned_api_rows)
         unassigned_api_rows = []
     unassigned_api_count = sum(
-        int(row.get("aggregate_count") or 1)
-        for row in unassigned_api_rows
+        row["aggregate_count"] for row in unassigned_api_rows
     )
 
     excluded_coords = (
@@ -7869,9 +7876,9 @@ def build_human_dependency_analysis(findings, api_model=None):
     for coord, dependency in dependencies.items():
         api_rows = api_by_coord.get(coord, [])
         resource_rows = resource_by_coord.get(coord, [])
-        api_total = sum(int(row.get("aggregate_count") or 1) for row in api_rows)
+        api_total = sum(row["aggregate_count"] for row in api_rows)
         api_completed = sum(
-            int(row.get("aggregate_count") or 1)
+            row["aggregate_count"]
             for row in api_rows
             if not _api_result_is_incomplete(row)
         )
@@ -7896,7 +7903,7 @@ def build_human_dependency_analysis(findings, api_model=None):
             or resource_incomplete
         )
         confirmed_api_count = sum(
-            int(row.get("aggregate_count") or 1)
+            row["aggregate_count"]
             for row in api_rows
             if not _api_result_is_incomplete(row)
             and row.get("conclusion") == "已确认影响"
@@ -7950,15 +7957,16 @@ def build_human_dependency_analysis(findings, api_model=None):
             conclusion = "确认不受 API 调用影响"
         else:
             conclusion = "未确认影响"
-        incomplete_reason = (
-            _dependency_incomplete_reason(
-                api_rows,
-                findings,
-                excluded=excluded,
+        if excluded:
+            incomplete_reason = _dependency_incomplete_reason(
+                api_rows, findings, excluded=True
             )
-            if excluded or api_incomplete > 0
-            else ""
-        )
+        elif api_incomplete > 0:
+            incomplete_reason = _dependency_incomplete_reason(
+                api_rows, findings
+            )
+        else:
+            incomplete_reason = ""
         if resource_incomplete:
             resource_reason = (
                 "运行时资源变化的当前系统激活关系存在候选或未完成证据。"
@@ -8004,10 +8012,7 @@ def build_human_dependency_analysis(findings, api_model=None):
                 f"运行时资源变化 {len(resource_rows)} 个，"
                 f"已确认当前系统激活 {confirmed_resource_count} 个"
             )
-            api_change_text = (
-                f"{api_change_text}；{resource_text}"
-                if api_change_text else resource_text
-            )
+            api_change_text = f"{api_change_text}；{resource_text}"
         if unassigned_api_count:
             api_change_text += (
                 f"；另有 {unassigned_api_count} 个变化 API "
@@ -8077,12 +8082,7 @@ def build_human_dependency_analysis(findings, api_model=None):
         dependency_source_counts = [
             (
                 "本轮分析范围",
-                int(
-                    (findings.get("analysis_scope") or {}).get(
-                        "included_dependency_count"
-                    )
-                    or 0
-                ),
+                int(findings["analysis_scope"]["included_dependency_count"]),
             ),
         ]
     else:
@@ -8183,7 +8183,7 @@ def build_human_dependency_analysis(findings, api_model=None):
         missing_count = max(declared_total - known_count, 0)
 
     if missing_count:
-        if raw_dependency_inventory and incomplete_dependency_identity_count:
+        if incomplete_dependency_identity_count:
             incomplete_reason = (
                 f"依赖变化原始清单中有 {missing_count} 条记录没有完整的"
                 "依赖坐标，因此无法逐项完成依赖分析。"
@@ -8221,28 +8221,28 @@ def build_human_dependency_analysis(findings, api_model=None):
     completed.sort(key=_dependency_display_sort_key)
     incomplete.sort(
         key=lambda row: (
-            -int(row.get("call_relationship_count") or 0),
-            str(row.get("coord") or ""),
+            -row["call_relationship_count"],
+            row["coord"],
         )
     )
     completed_count = sum(
-        int(row.get("aggregate_count") or 1) for row in completed
+        row["aggregate_count"] for row in completed
     )
     incomplete_count = sum(
-        int(row.get("aggregate_count") or 1) for row in incomplete
+        row["aggregate_count"] for row in incomplete
     )
     confirmed_completed_count = sum(
-        int(row.get("aggregate_count") or 1)
+        row["aggregate_count"]
         for row in completed
         if row.get("analysis_conclusion") == "确认有影响"
     )
     confirmed_no_impact_completed_count = sum(
-        int(row.get("aggregate_count") or 1)
+        row["aggregate_count"]
         for row in completed
         if row.get("analysis_conclusion") == "确认不受 API 调用影响"
     )
     confirmed_any_count = sum(
-        int(row.get("aggregate_count") or 1)
+        row["aggregate_count"]
         for row in result_rows
         if (
             int(row.get("confirmed_api_count") or 0) > 0
@@ -8250,7 +8250,7 @@ def build_human_dependency_analysis(findings, api_model=None):
         )
     )
     confirmed_incomplete_count = sum(
-        int(row.get("aggregate_count") or 1)
+        row["aggregate_count"]
         for row in incomplete
         if int(row.get("confirmed_api_count") or 0) > 0
     )
@@ -8292,9 +8292,7 @@ def _dependency_version_change_cell(row):
     version = _version_transition(row)
     change_type = _dependency_change_type(row)
     value = _md_cell(version or "版本变化未记录", 120)
-    if change_type:
-        value += f"<br>{_md_cell(change_type, 100)}"
-    return value
+    return value + f"<br>{_md_cell(change_type, 100)}"
 
 
 def _dependency_result_explanation(row):
@@ -8304,9 +8302,9 @@ def _dependency_result_explanation(row):
 
 
 def _full_api_dependency_heading(row):
-    coord = _full_md_cell((row or {}).get("coord") or "依赖身份未记录")
+    coord = _full_md_cell(row.get("coord") or "依赖身份未记录")
     heading = f"## `{coord}`"
-    version = _version_transition(row or {})
+    version = _version_transition(row)
     if version:
         heading += f"：{_full_md_cell(version)}"
     return heading
@@ -8707,7 +8705,8 @@ def render_dependency_conclusions(findings, dependency_model=None):
     if incomplete:
         displayed = incomplete[:S6_MAIN_INCOMPLETE_LIMIT]
         displayed_count = sum(
-            int(row.get("aggregate_count") or 1) for row in displayed
+            max(int(row.get("aggregate_count", 1)), 1)
+            for row in displayed
         )
         lines.extend([
             (
@@ -8738,7 +8737,8 @@ def render_dependency_conclusions(findings, dependency_model=None):
     if completed:
         displayed = completed[:S6_MAIN_DEPENDENCY_LIMIT]
         displayed_count = sum(
-            int(row.get("aggregate_count") or 1) for row in displayed
+            max(int(row.get("aggregate_count", 1)), 1)
+            for row in displayed
         )
         lines.extend([
             (
@@ -8792,8 +8792,8 @@ def _main_relationship_cell(row):
             paths,
             key=lambda path: (
                 sum(bool(value) for value in _call_path_shape(path)[1]),
-                len(str(path or "")),
-                str(path or ""),
+                len(str(path)),
+                str(path),
             ),
         )
         relation = f"`{_md_cell(_human_chain(preferred_path), 420)}`"
@@ -8873,7 +8873,7 @@ def _api_result_explanation(row, findings=None):
             "不能据此判定该 API 未被使用。"
         )
     boundary = _result_boundary_text(row)
-    if boundary and boundary != "当前记录未提供更多结论边界。":
+    if boundary != "当前记录未提供更多结论边界。":
         return boundary
     return "当前记录没有保存更多结果说明。"
 
@@ -8894,7 +8894,7 @@ def _api_detail_table(
     ]
     for row in rows:
         count = int(row.get("aggregate_count") or 1)
-        api = _item_api_label(row) or str(row.get("api") or "API 身份未记录")
+        api = _item_api_label(row) or "API 身份未记录"
         if count > 1:
             api = f"{api}（{count} 个）"
         incomplete = _api_result_is_incomplete(row)
@@ -9245,7 +9245,7 @@ def _full_relationship_cell(row, alert_details):
         statuses = ("reachable", "uncertain", "not_analyzed")
         prefix = (
             "已确认调用关系："
-            if (paths_by_status.get("reachable") or {})
+            if paths_by_status.get("reachable")
             else "候选关系："
         )
     else:
@@ -9293,8 +9293,8 @@ def _logical_full_path_labels(path_occurrences):
             grouped[bases],
             key=lambda item: (
                 -sum(bool(value) for value in item["signatures"]),
-                -len(str(item["path"] or "")),
-                str(item["path"] or ""),
+                -len(str(item["path"])),
+                str(item["path"]),
             ),
         )
         for candidate in candidates:
@@ -9321,8 +9321,8 @@ def _logical_full_path_labels(path_occurrences):
                 cluster,
                 key=lambda item: (
                     -sum(bool(value) for value in item["signatures"]),
-                    -len(str(item["path"] or "")),
-                    str(item["path"] or ""),
+                    -len(str(item["path"])),
+                    str(item["path"]),
                 ),
             )
             occurrences = sum(
@@ -9395,9 +9395,7 @@ def _dependency_csv_row(row):
 
 def _api_csv_row(row, findings, alert_details):
     count = int(row.get("aggregate_count") or 1)
-    api = _item_api_label(row) or str(
-        row.get("api") or "API 身份未记录"
-    )
+    api = _item_api_label(row) or "API 身份未记录"
     if count > 1:
         api = f"{api}（{count} 个）"
     relationship = (
@@ -9772,9 +9770,7 @@ def cleanup_legacy_s6_detail_artifacts(report_dir):
     deliverables = _deliverables_dir(report_dir)
     for config in S6_DETAIL_BUCKETS.values():
         for key in ("csv", "md"):
-            filename = str(config.get(key) or "").strip()
-            if not filename:
-                continue
+            filename = str(config[key]).strip()
             try:
                 (deliverables / filename).unlink()
             except FileNotFoundError:
@@ -10283,7 +10279,7 @@ def main():
     )
     print("最终分析报告已生成。", file=sys.stderr)
     print(
-        f"本轮发布 API 目标 {int(result.get('api_count') or 0)} 个。",
+        f"本轮发布 API 目标 {result['api_count']} 个。",
         file=sys.stderr,
     )
     print(f"最终报告：{args.output_report}", file=sys.stderr)

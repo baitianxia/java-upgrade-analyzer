@@ -278,11 +278,10 @@ def _mr_entry_scope(name: str) -> tuple[str, int]:
 
 def _mr_class_scope(name: str) -> tuple[str, int]:
     logical, version = _mr_entry_scope(name)
-    if (
-        version < 0
-        or logical.startswith("META-INF/")
-        or (version == 0 and name.startswith("META-INF/"))
-    ):
+    # For base entries ``logical == name``.  The logical-name check therefore
+    # also covers META-INF base entries; repeating it against ``name`` creates
+    # an unreachable branch and obscures the actual JEP 238 rule.
+    if version < 0 or logical.startswith("META-INF/"):
         return name, -1
     return logical, version
 
@@ -496,10 +495,13 @@ def _java_properties_entries(content: bytes) -> tuple[tuple[str, str], ...]:
         index = 0
         escapes = {"t": "\t", "n": "\n", "r": "\r", "f": "\f"}
         while index < len(value):
-            if value[index] != "\\" or index + 1 >= len(value):
+            if value[index] != "\\":
                 output.append(value[index])
                 index += 1
                 continue
+            # Logical-line construction consumes an odd trailing backslash as
+            # a continuation marker. Key splitting likewise cannot end on an
+            # escaping backslash, so a marker is guaranteed here.
             index += 1
             marker = value[index]
             if marker == "u" and index + 4 < len(value):
@@ -607,7 +609,8 @@ def _xml_runtime_semantic_facts(content: bytes) -> tuple[tuple[str, str], ...]:
         return (("xml_parse_gap", "malformed_xml"),)
 
     def local(value: str) -> str:
-        return str(value or "").rsplit("}", 1)[-1].rsplit(":", 1)[-1]
+        # ElementTree guarantees a string tag for elements from ``fromstring``.
+        return str(value).rsplit("}", 1)[-1].rsplit(":", 1)[-1]
 
     def nested_attribute(element: Any, child_tag: str, *names: str) -> str:
         for name in names:
@@ -917,6 +920,7 @@ def _snapshot_private_archive(
                     "NONSTANDARD_MULTI_RELEASE_VERSION_8_PRESENT"
                 )
             versioned_classes: dict[str, list[tuple[int, str]]] = defaultdict(list)
+            has_versioned_class = False
             for info in archive_infos:
                 if info.is_dir():
                     continue
@@ -926,17 +930,15 @@ def _snapshot_private_archive(
                         versioned_classes[logical].append(
                             (version, info.filename)
                         )
+                        if version > 0:
+                            has_versioned_class = True
             selected_resources, resource_target_required = (
                 select_runtime_resource_entries(archive, target_jvm_major)
             )
             if (
                 multi_release
                 and target_jvm_major is None
-                and any(
-                    version > 0
-                    for rows in versioned_classes.values()
-                    for version, _ in rows
-                )
+                and has_versioned_class
                 or resource_target_required
             ):
                 raise BinaryArtifactDiffError(
@@ -947,7 +949,7 @@ def _snapshot_private_archive(
                 eligible = [
                     (version, name) for version, name in candidates
                     if version == 0 or (
-                        multi_release and target_jvm_major is not None
+                        multi_release
                         and int(target_jvm_major) >= MIN_MULTI_RELEASE_RUNTIME_MAJOR
                         and version <= int(target_jvm_major)
                     )
@@ -1185,10 +1187,11 @@ def _member_deltas(
             change_kind = "removed"
         elif old["contract_digest"] != new["contract_digest"]:
             change_kind = "contract_changed"
-        elif old["implementation_digest"] != new["implementation_digest"]:
-            change_kind = "implementation_changed"
         else:
-            continue
+            # Member records contain only the contract and implementation
+            # digests. Equality was handled above and the contract is equal
+            # here, so the implementation is necessarily the changed part.
+            change_kind = "implementation_changed"
         scope = {
             **dict(entry_scope),
             "member_kind": key[0],
@@ -1378,46 +1381,45 @@ def compare_artifact_snapshots(
                 )
                 entry_deltas.append(delta)
                 continue
-            if old is None or new is None:
-                category = "contract_changed"
+            # Both entries are necessarily present: a missing side cannot be
+            # runtime-effective and was handled by the deferred branch above.
+            old_record = base_records.get(f"{old.name}#occurrence={old.name_ordinal}")
+            new_record = current_records.get(f"{new.name}#occurrence={new.name_ordinal}")
+            if not old_record or not new_record or {
+                old_record.get("frame_type"), new_record.get("frame_type")
+            } != {"class_fact"}:
+                category = "incomplete"
+                coverage_gaps.add(f"class_parse:{key[0]}#{key[1]}")
             else:
-                old_record = base_records.get(f"{old.name}#occurrence={old.name_ordinal}")
-                new_record = current_records.get(f"{new.name}#occurrence={new.name_ordinal}")
-                if not old_record or not new_record or {
-                    old_record.get("frame_type"), new_record.get("frame_type")
-                } != {"class_fact"}:
+                old_unknown = {
+                    item.get("name") for item in old_record.get("attribute_inventory") or ()
+                    if item.get("name") not in known_attributes
+                }
+                new_unknown = {
+                    item.get("name") for item in new_record.get("attribute_inventory") or ()
+                    if item.get("name") not in known_attributes
+                }
+                if old_unknown or new_unknown:
                     category = "incomplete"
-                    coverage_gaps.add(f"class_parse:{key[0]}#{key[1]}")
-                else:
-                    old_unknown = {
-                        item.get("name") for item in old_record.get("attribute_inventory") or ()
-                        if item.get("name") not in known_attributes
-                    }
-                    new_unknown = {
-                        item.get("name") for item in new_record.get("attribute_inventory") or ()
-                        if item.get("name") not in known_attributes
-                    }
-                    if old_unknown or new_unknown:
-                        category = "incomplete"
-                        coverage_gaps.add(
-                            f"unknown_attributes:{key[0]}:{','.join(sorted(old_unknown | new_unknown))}"
-                        )
-                    elif old_record.get("class_contract_digest") != new_record.get("class_contract_digest"):
-                        category = "contract_changed"
-                    elif _method_digest_map(old_record) != _method_digest_map(new_record):
-                        category = "implementation_changed"
-                    elif _attribute_digest_map(old_record, definition_sensitive) != _attribute_digest_map(new_record, definition_sensitive):
-                        category = "runtime_metadata_changed"
-                    elif _attribute_digest_map(old_record, diagnostic) != _attribute_digest_map(new_record, diagnostic):
-                        category = "runtime_diagnostic_metadata_changed"
-                    else:
-                        category = "classfile_noise_only"
-                    delta["member_deltas"] = _member_deltas(
-                        old_record,
-                        new_record,
-                        entry_scope=scope,
-                        comparison_or_runtime_scope=comparison_or_runtime_scope,
+                    coverage_gaps.add(
+                        f"unknown_attributes:{key[0]}:{','.join(sorted(old_unknown | new_unknown))}"
                     )
+                elif old_record.get("class_contract_digest") != new_record.get("class_contract_digest"):
+                    category = "contract_changed"
+                elif _method_digest_map(old_record) != _method_digest_map(new_record):
+                    category = "implementation_changed"
+                elif _attribute_digest_map(old_record, definition_sensitive) != _attribute_digest_map(new_record, definition_sensitive):
+                    category = "runtime_metadata_changed"
+                elif _attribute_digest_map(old_record, diagnostic) != _attribute_digest_map(new_record, diagnostic):
+                    category = "runtime_diagnostic_metadata_changed"
+                else:
+                    category = "classfile_noise_only"
+                delta["member_deltas"] = _member_deltas(
+                    old_record,
+                    new_record,
+                    entry_scope=scope,
+                    comparison_or_runtime_scope=comparison_or_runtime_scope,
+                )
             class_categories.add(category)
             delta["class_change_category"] = category
         elif (old or new).kind == "resource":
@@ -1535,7 +1537,7 @@ def compare_artifact_snapshots(
     }
     result["artifact_local_result_identity"] = _identity(
         "artifact_local_diff_result",
-        {key: value for key, value in result.items() if key != "artifact_local_result_identity"},
+        dict(result),
     )
     return result
 

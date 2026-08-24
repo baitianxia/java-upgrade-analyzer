@@ -12,6 +12,18 @@
   ],
   "public_capability_matrix": "tests/fixtures/system_test_capability_matrix.json",
   "public_scenario_contracts": "tests/fixtures/system_test_scenario_contracts.json",
+  "internal_test_scope": "tests/fixtures/internal_test_scope.json",
+  "whitebox_entry_modules": [
+    "binary_pipeline",
+    "binary_report",
+    "gate",
+    "run_step",
+    "s1_dep_diff",
+    "s2_context_from_deps",
+    "s3_scan",
+    "s5_query_call_chain",
+    "s6_report"
+  ],
   "allowed_public_entrypoints": [
     "scripts/binary_pipeline.py",
     "scripts/run_step.py",
@@ -23,13 +35,13 @@
   "truth_schema": "java-upgrade-analyzer.blackbox-truth.v1",
   "minimum_oracle_mechanisms": 2,
   "minimum_blackbox_cases": 16,
-  "minimum_closed_truth_results": 53,
+  "minimum_closed_truth_results": 54,
   "minimum_forbidden_truth_results": 16,
   "minimum_supplemental_blackbox_truth_documents": 20,
   "minimum_blackbox_assertion_sites": 621,
   "minimum_supplemental_expectation_leaves": 1063,
-  "minimum_public_scenario_contracts": 89,
-  "minimum_public_scenario_dimensions": 260,
+  "minimum_public_scenario_contracts": 90,
+  "minimum_public_scenario_dimensions": 279,
   "minimum_public_support_claims": 22,
   "required_blackbox_case_ids": [
     "abstract-method-change-v1",
@@ -69,6 +81,7 @@
     "implementation_change",
     "implicit_constructor_implementation_change",
     "interface_default_dispatch",
+    "interface_object_method_resolution",
     "method_removal",
     "method_parameter_descriptor_change",
     "method_return_descriptor_change",
@@ -99,6 +112,14 @@
     "tests.test_binary_validation_performance_safety",
     "tests.test_final_artifact_edge_oracle.FinalArtifactEdgeOraclePerformanceTest"
   ],
+  "allowed_whitebox_skip_selectors": [
+    "tests.test_binary_real_project_guard.BinaryRealProjectGuardTest.test_pinned_mybatis_final_artifact_exercises_xml_proxy_dispatch",
+    "tests.test_platform_contract.PlatformContractTest.test_pythonw_parent_repeatedly_captures_real_git_stdout"
+  ],
+  "required_allowed_whitebox_skip_selectors": [
+    "tests.test_binary_real_project_guard.BinaryRealProjectGuardTest.test_pinned_mybatis_final_artifact_exercises_xml_proxy_dispatch",
+    "tests.test_platform_contract.PlatformContractTest.test_pythonw_parent_repeatedly_captures_real_git_stdout"
+  ],
   "windows_test_selectors": [
     "tests.blackbox",
     "tests.blackbox.test_public_artifact_safety.PublicArtifactSafetyBlackboxTest.test_every_archive_and_helper_budget_is_enforced_publicly",
@@ -108,6 +129,7 @@
     "tests.windows_native_contract.WindowsNativeContractTest.test_native_generation_file_fsync_accepts_owned_file",
     "tests.windows_native_contract.WindowsNativeContractTest.test_native_report_file_fsync_accepts_owned_file",
     "tests.windows_native_contract.WindowsNativeContractTest.test_native_checkpoint_write_read_roundtrip_is_exact",
+    "tests.windows_native_contract.WindowsNativeContractTest.test_run_step_native_checkpoint_dispatch_uses_windows_safe_leaf_operations",
     "tests.windows_native_contract.WindowsNativeContractTest.test_native_path_and_descriptor_checkpoint_identity_match",
     "tests.windows_native_contract.WindowsNativeContractTest.test_native_duplicate_maven_metadata_policy_is_symmetric",
     "tests.windows_native_contract.WindowsNativeContractTest.test_native_tool_failures_are_typed_without_shell",
@@ -137,6 +159,7 @@
     "tests.test_step1_packaged_deps.Step1PackagedDepsTest.test_windows_step1_git_command_enables_long_paths_without_global_config",
     "tests.test_binary_performance_gate.PerformanceProcessMetricsTest.test_windows_fallback_uses_native_cpu_and_peak_memory",
     "tests.test_binary_pipeline_input_performance.BinaryPipelineInputPerformanceTest.test_windows_native_usage_populates_pipeline_phase_metrics",
+    "tests.test_binary_pipeline_input_performance.BinaryPipelineInputPerformanceTest.test_parallel_progress_publishers_use_distinct_atomic_temporary_files",
     "tests.test_binary_performance_gate.BinaryPerformanceGateTest.test_small_fixture_enforces_class_conservation_and_zero_warm_parse"
   ],
   "required_windows_test_selectors": [
@@ -148,6 +171,7 @@
     "tests.windows_native_contract.WindowsNativeContractTest.test_native_generation_file_fsync_accepts_owned_file",
     "tests.windows_native_contract.WindowsNativeContractTest.test_native_report_file_fsync_accepts_owned_file",
     "tests.windows_native_contract.WindowsNativeContractTest.test_native_checkpoint_write_read_roundtrip_is_exact",
+    "tests.windows_native_contract.WindowsNativeContractTest.test_run_step_native_checkpoint_dispatch_uses_windows_safe_leaf_operations",
     "tests.windows_native_contract.WindowsNativeContractTest.test_native_path_and_descriptor_checkpoint_identity_match",
     "tests.windows_native_contract.WindowsNativeContractTest.test_native_duplicate_maven_metadata_policy_is_symmetric",
     "tests.windows_native_contract.WindowsNativeContractTest.test_native_tool_failures_are_typed_without_shell",
@@ -177,6 +201,7 @@
     "tests.test_step1_packaged_deps.Step1PackagedDepsTest.test_windows_step1_git_command_enables_long_paths_without_global_config",
     "tests.test_binary_performance_gate.PerformanceProcessMetricsTest.test_windows_fallback_uses_native_cpu_and_peak_memory",
     "tests.test_binary_pipeline_input_performance.BinaryPipelineInputPerformanceTest.test_windows_native_usage_populates_pipeline_phase_metrics",
+    "tests.test_binary_pipeline_input_performance.BinaryPipelineInputPerformanceTest.test_parallel_progress_publishers_use_distinct_atomic_temporary_files",
     "tests.test_binary_performance_gate.BinaryPerformanceGateTest.test_small_fixture_enforces_class_conservation_and_zero_warm_parse"
   ],
   "windows_excluded_test_selectors": [

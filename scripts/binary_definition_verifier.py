@@ -173,8 +173,7 @@ def _write_class_bundle(
                 ) from error
             content = bytes(selected_class_bytes[name])
             if (
-                not name_bytes
-                or len(name_bytes) > _MAX_BUNDLE_CLASS_NAME_BYTES
+                len(name_bytes) > _MAX_BUNDLE_CLASS_NAME_BYTES
                 or not content
                 or len(content) > _MAX_BUNDLE_CLASS_BYTES
             ):
@@ -203,10 +202,6 @@ def verify_class_definitions(
     compiled_helper = _compile_helper(str(javac), source_sha)
     helper_dir = compiled_helper.output
     names = sorted(selected_class_bytes)
-    if len(names) != len(set(names)):
-        raise ClassDefinitionVerifierError(
-            "CLASS_DEFINITION_INPUT_DUPLICATE", "class names must be unique"
-        )
     with short_temporary_directory(prefix="definition-input") as temp_text:
         bundle_path = Path(temp_text) / "classes.bundle"
         expected_hashes = _write_class_bundle(

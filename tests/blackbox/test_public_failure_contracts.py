@@ -54,8 +54,11 @@ class PublicFailureContractsBlackboxTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.temporary.cleanup()
 
-    def fake_jdk(self, mode: str) -> Path:
-        target = self.root / f"jdk-{mode}"
+    def fake_jdk(
+        self, mode: str, *, fixture_label: str = "",
+        timeout_sleep_seconds: float = 1,
+    ) -> Path:
+        target = self.root / f"jdk-{fixture_label}{mode}"
         target.mkdir()
         (target / "bin").mkdir()
         os.symlink(self.home / "release", target / "release")
@@ -73,7 +76,7 @@ class PublicFailureContractsBlackboxTest(unittest.TestCase):
             "if 'RuntimeOutcomeOracle' in args:\n"
             "    if mode == 'nonzero':\n"
             "        print('injected nonzero', file=sys.stderr); raise SystemExit(17)\n"
-            "    if mode == 'timeout': time.sleep(1); raise SystemExit(0)\n"
+            f"    if mode == 'timeout': time.sleep({timeout_sleep_seconds!r}); raise SystemExit(0)\n"
             "    if mode == 'empty': raise SystemExit(0)\n"
             "    if mode == 'malformed': print('{not-json'); raise SystemExit(0)\n"
             "os.execv(real, [real, *args])\n",
@@ -86,20 +89,27 @@ class PublicFailureContractsBlackboxTest(unittest.TestCase):
             wrapper.chmod(0o644)
         return target
 
-    def test_environment_failures_are_preflighted_and_only_transient_failures_retry(self):
+    def _assert_environment_failure_contract(
+        self, *, oracle_timeout_seconds: float,
+        timeout_sleep_seconds: float, fixture_label: str,
+    ) -> None:
         for mode, expected in TRUTH["cases"].items():
             with self.subTest(mode=mode):
-                fake_home = self.fake_jdk(mode)
+                fake_home = self.fake_jdk(
+                    mode,
+                    fixture_label=fixture_label,
+                    timeout_sleep_seconds=timeout_sleep_seconds,
+                )
                 config = pipeline_config(
                     self.case, self.artifacts, java=self.tools["java"]
                 )
                 config["base"]["jdk_home"] = str(fake_home)
                 config["current"]["jdk_home"] = str(fake_home)
                 config["tool_execution_policy"] = {
-                    "oracle_runtime_timeout_seconds": 0.05,
+                    "oracle_runtime_timeout_seconds": oracle_timeout_seconds,
                     "oracle_max_attempts": TRUTH["max_attempts"],
                 }
-                run_root = self.root / f"run-{mode}"
+                run_root = self.root / f"run-{fixture_label}{mode}"
                 run_root.mkdir()
                 config_path = run_root / "config.json"
                 result_path = run_root / "result.json"
@@ -146,6 +156,23 @@ class PublicFailureContractsBlackboxTest(unittest.TestCase):
                     (output_root / "active_binary_generation.json").exists(),
                     "a failed Oracle run activated an unvalidated generation",
                 )
+
+    def test_environment_failures_are_preflighted_and_only_transient_failures_retry(self):
+        self._assert_environment_failure_contract(
+            oracle_timeout_seconds=0.05,
+            timeout_sleep_seconds=1,
+            fixture_label="tight-",
+        )
+
+    def test_profile_safe_environment_failure_classification_preserves_retry_contract(self):
+        # Structural branch monitoring changes parent-process scheduling.  Keep
+        # the production failure classes and attempt counts identical while
+        # separating immediate exits from the timeout fixture by a wide margin.
+        self._assert_environment_failure_contract(
+            oracle_timeout_seconds=0.5,
+            timeout_sleep_seconds=2,
+            fixture_label="profile-safe-",
+        )
 
     def test_preflight_failure_never_borrows_stale_progress_phase(self):
         expected = TRUTH["attempt_progress_binding"]

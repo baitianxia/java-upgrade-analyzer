@@ -738,8 +738,7 @@ def _atomic_zip_archive(path: Path, *, field: str):
                 f"{field} temporary archive disappeared before publication: {error}"
             ) from error
         if (
-            completed_stat is None
-            or not _same_completed_private_file(completed_stat, path_stat)
+            not _same_completed_private_file(completed_stat, path_stat)
         ):
             raise PerformanceGateError(
                 f"{field} temporary archive was replaced before publication"
@@ -790,7 +789,6 @@ def build_dataset(root: Path, *, jar_count: int, classes_per_jar: int) -> list[d
     manifest_is_private_regular = bool(
         manifest_stat is not None
         and stat.S_ISREG(manifest_stat.st_mode)
-        and not stat.S_ISLNK(manifest_stat.st_mode)
         and manifest_stat.st_nlink == 1
     )
     if dataset_identity is not None and manifest_is_private_regular:
@@ -865,6 +863,8 @@ def build_dataset(root: Path, *, jar_count: int, classes_per_jar: int) -> list[d
     template = _compile_template(root)
     artifacts = []
     class_index = 0
+    if jar_count * classes_per_jar > 1_000_000:
+        raise PerformanceGateError("scale dataset class owner length overflow")
     for jar_index in range(jar_count):
         path = dataset / f"artifact-{jar_index:04d}.jar"
         with _atomic_zip_archive(
@@ -872,8 +872,6 @@ def build_dataset(root: Path, *, jar_count: int, classes_per_jar: int) -> list[d
         ) as archive:
             for _ in range(classes_per_jar):
                 owner = f"p/C{class_index:06d}".encode("ascii")
-                if len(owner) != len(b"p/C000000"):
-                    raise PerformanceGateError("scale dataset class owner length overflow")
                 content = template.replace(b"p/C000000", owner)
                 info = zipfile.ZipInfo(owner.decode("ascii") + ".class", (2026, 1, 1, 0, 0, 0))
                 info.compress_type = zipfile.ZIP_DEFLATED
@@ -919,15 +917,15 @@ def build_changed_current_artifacts(
         root, return_value=2, label="changed-template"
     )
     first_class = artifacts[0]["first_class_index"]
+    if first_class + classes_per_jar > 1_000_000:
+        raise PerformanceGateError(
+            "changed-side class owner length overflow"
+        )
     with _atomic_zip_archive(
         changed_path, field="changed performance dataset artifact"
     ) as archive:
         for class_index in range(first_class, first_class + classes_per_jar):
             owner = f"p/C{class_index:06d}".encode("ascii")
-            if len(owner) != len(b"p/C000000"):
-                raise PerformanceGateError(
-                    "changed-side class owner length overflow"
-                )
             content = template.replace(b"p/C000000", owner)
             info = zipfile.ZipInfo(
                 owner.decode("ascii") + ".class", (2026, 1, 1, 0, 0, 0)
@@ -1516,7 +1514,6 @@ def _verify_probe_worker_artifact_file(
         path_before = os.lstat(path)
         if (
             not stat.S_ISREG(path_before.st_mode)
-            or stat.S_ISLNK(path_before.st_mode)
             or path_before.st_size != expected_size
         ):
             _probe_worker_input_error(
@@ -1779,8 +1776,7 @@ def _write_exact_bytes(path: Path, content: bytes) -> None:
                 )
         path_stat = os.lstat(temporary)
         if (
-            completed_stat is None
-            or not _same_completed_private_file(completed_stat, path_stat)
+            not _same_completed_private_file(completed_stat, path_stat)
         ):
             raise PerformanceGateError(
                 "authority output temporary was replaced before publication"
@@ -2004,7 +2000,6 @@ def _snapshot_provisional_gate(
         path_before = os.lstat(snapshot_path)
         if (
             not stat.S_ISREG(path_before.st_mode)
-            or stat.S_ISLNK(path_before.st_mode)
             or path_before.st_nlink != 1
             or path_before.st_size != len(content)
         ):
@@ -2048,7 +2043,6 @@ def _snapshot_provisional_gate(
             or _probe_artifact_stat_identity(descriptor_after)
             != _probe_artifact_stat_identity(path_after)
             or bytes(observed) != content
-            or hashlib.sha256(observed).hexdigest() != expected_sha256
         ):
             raise PerformanceGateError(
                 "provisional performance authority snapshot does not match "
@@ -2216,7 +2210,9 @@ def _candidate_performance_authority(
                 binary_pipeline._cleanup_performance_recapture_state(
                     output_root
                 )
-            if output_root.exists() or output_root.is_symlink():
+            if output_root.is_symlink():
+                output_root.unlink()
+            elif output_root.exists():
                 shutil.rmtree(output_root)
             if output_root.exists() or output_root.is_symlink():
                 raise PerformanceGateError(
@@ -3701,17 +3697,15 @@ def _recorded_measurements_from_result(
     measured = result.get("measurements")
     if not isinstance(measured, Mapping):
         raise PerformanceGateError("benchmark measurements are missing")
-    warmup = dict(measured.get("warmup") or {})
-    cold = dict(measured.get("cold") or {})
-    warm = [dict(item) for item in measured.get("warm_runs") or ()]
-    legacy = dict(measured.get("legacy") or {})
-    full = deepcopy(dict(measured.get("full_pipeline_probe") or {}))
-    changed = deepcopy(dict(
-        measured.get("changed_full_pipeline_probe") or {}
-    ))
-    if not warm or not legacy or not full or not changed:
+    warmup = dict(measured["warmup"])
+    cold = dict(measured["cold"])
+    warm = [dict(item) for item in measured["warm_runs"]]
+    legacy = dict(measured["legacy"])
+    full = deepcopy(dict(measured["full_pipeline_probe"]))
+    changed = deepcopy(dict(measured["changed_full_pipeline_probe"]))
+    if not warm:
         raise PerformanceGateError(
-            "release evidence requires warm, legacy and both pipeline probes"
+            "release evidence requires at least one warm sample"
         )
     for probe in (full, changed):
         probe["captured_at"] = captured_at
@@ -3735,7 +3729,7 @@ def _recorded_measurements_from_result(
         "warmup_parser_invocations": warmup.get("parser_invocations"),
         "warmup_cache_hits": warmup.get("cache_hits"),
         "warmup_peak_rss_bytes": warmup.get("peak_rss_bytes"),
-        "warmup_class_count": (warmup.get("counts") or {}).get("classes"),
+        "warmup_class_count": warmup["counts"]["classes"],
         "cold_end_to_end_seconds": cold.get("end_to_end_seconds"),
         "cold_cpu_seconds": cold.get("cpu_seconds"),
         "cold_average_cpu_cores": cold.get("average_cpu_cores"),
@@ -4362,12 +4356,28 @@ def evaluate_gate(result: dict[str, Any], gate: dict[str, Any]) -> dict[str, Any
     upper("cold.db_write_and_index", (cold.get("stage_seconds") or {}).get("db_write_and_index"), stage_limits.get("db_write_and_index"))
     upper(
         "warm.batch_query_10000",
-        _p95([(item.get("stage_seconds") or {}).get("batch_query_10000", float("inf")) for item in warm_runs]),
+        (
+            _p95([
+                (item.get("stage_seconds") or {}).get(
+                    "batch_query_10000", float("inf")
+                )
+                for item in warm_runs
+            ])
+            if warm_runs else None
+        ),
         stage_limits.get("batch_query_10000"),
     )
     upper(
         "warm.report_10000",
-        _p95([(item.get("stage_seconds") or {}).get("report_10000", float("inf")) for item in warm_runs]),
+        (
+            _p95([
+                (item.get("stage_seconds") or {}).get(
+                    "report_10000", float("inf")
+                )
+                for item in warm_runs
+            ])
+            if warm_runs else None
+        ),
         stage_limits.get("report_10000"),
     )
     invariants = gate.get("accuracy_invariants") or {}
@@ -5110,10 +5120,9 @@ def _evaluate_recorded_gate(
             derived_dataset_identity,
             protocol.get("dataset_identity"),
         )
-    changed_artifact_identity = (
-        (protocol.get("changed_full_pipeline_probe") or {}).get(
-            "current_artifact_identity"
-        )
+    changed_probe_protocol = protocol.get("changed_full_pipeline_probe") or {}
+    changed_artifact_identity = changed_probe_protocol.get(
+        "current_artifact_identity"
     )
     if (
         not _is_sha256_identity(changed_artifact_identity)
@@ -5152,9 +5161,7 @@ def _evaluate_recorded_gate(
                 "logical_artifact_derivation_identity"
             ),
             expected_changed_derivation,
-            (protocol.get("changed_full_pipeline_probe") or {}).get(
-                "logical_artifact_derivation_identity"
-            ),
+            changed_probe_protocol.get("logical_artifact_derivation_identity"),
         )
     try:
         product = int(protocol.get("jar_count")) * int(
@@ -6584,8 +6591,10 @@ def main(argv=None) -> int:
                         ValueError,
                     ):
                         continue
-                    if isinstance(normalized_issue, dict):
-                        issues.append(normalized_issue)
+                    # Serializing ``dict(raw_issue)`` can only round-trip to a
+                    # JSON object, so the normalized value is necessarily a
+                    # dict when serialization succeeds.
+                    issues.append(normalized_issue)
             if not issues:
                 issues = [{
                     "reason_code": reason_code,

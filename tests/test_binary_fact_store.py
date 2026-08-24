@@ -1416,6 +1416,21 @@ class BinaryFactStoreTest(unittest.TestCase):
             }),
         )
 
+    def test_runtime_trigger_summary_rejects_continuously_changing_snapshot(self):
+        with BinaryFactStore() as store, patch.object(
+            store,
+            "_runtime_trigger_data_version",
+            side_effect=range(7),
+        ):
+            with self.assertRaises(BinaryFactStoreError) as raised:
+                store.runtime_trigger_summary()
+
+        self.assertEqual(
+            raised.exception.reason_code,
+            "FACT_STORE_RUNTIME_TRIGGER_SUMMARY_UNSTABLE",
+        )
+        self.assertIn("observed_data_versions", str(raised.exception))
+
     def test_exact_backup_adopts_runtime_trigger_summary_defensively(self):
         artifact = self.make_jar("summary-backup.jar")
         instance = self.instance(artifact, 0)

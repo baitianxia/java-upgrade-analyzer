@@ -16,6 +16,7 @@ from binary_artifact_diff import (
     _manifest_is_multi_release,
     select_runtime_resource_entries,
 )
+from jdk_preflight import JdkPreflightError, resolve_jdk_release
 
 
 class BinaryRuntimeMaterializationError(RuntimeError):
@@ -244,8 +245,10 @@ def _outer_business_content_inventory(outer_path: Path) -> dict[str, str]:
                     ):
                         continue
                     logical_name = name
-                if not logical_name:
-                    continue
+                # Exact application prefixes end in '/', which ZipInfo treats
+                # as directory records and which ``infos`` excludes. Plain
+                # file entry names are non-empty, so a retained logical name
+                # cannot be empty here.
                 if logical_name in selected:
                     raise BinaryRuntimeMaterializationError(
                         "BINARY_RUNTIME_BUSINESS_ENTRY_DUPLICATE",
@@ -423,9 +426,19 @@ def _validate_evidence_structure(
             retained != binary_runtime_count
             or business_count != 1
             or retained > expected
-            or (status == "complete" and retained != expected)
-            or (status == "partial" and not gaps)
         ):
+            raise BinaryRuntimeMaterializationError(
+                "BINARY_RUNTIME_EVIDENCE_STRUCTURE_INVALID",
+                f"{side}: expected={expected}; retained={retained}; "
+                f"runtime_items={binary_runtime_count}; business={business_count}",
+            )
+        if status == "complete" and retained != expected:
+            raise BinaryRuntimeMaterializationError(
+                "BINARY_RUNTIME_EVIDENCE_STRUCTURE_INVALID",
+                f"{side}: expected={expected}; retained={retained}; "
+                f"runtime_items={binary_runtime_count}; business={business_count}",
+            )
+        if status == "partial" and not gaps:
             raise BinaryRuntimeMaterializationError(
                 "BINARY_RUNTIME_EVIDENCE_STRUCTURE_INVALID",
                 f"{side}: expected={expected}; retained={retained}; "
@@ -453,10 +466,9 @@ def _properties(content: bytes) -> dict[str, str]:
                 index += 1
                 continue
             index += 1
-            if index >= len(value):
-                # An odd trailing slash is consumed as a continuation marker,
-                # including at EOF, by java.util.Properties.LineReader.
-                break
+            # Logical-line reconstruction consumes every odd trailing slash as
+            # a continuation marker. Any slash reaching this parser therefore
+            # has a following escaped character (possibly another slash).
             character = value[index]
             if character == "u":
                 digits = value[index + 1:index + 5]
@@ -519,7 +531,10 @@ def _properties(content: bytes) -> dict[str, str]:
                     value_start += 1
                 if value_start < len(line) and line[value_start] in "=:":
                     value_start += 1
-            elif escaped_separator:
+            else:
+                # The scan can stop before len(line) only on whitespace, ':'
+                # or '='. The whitespace case is handled above, so this is an
+                # explicit key/value separator.
                 value_start += 1
             while value_start < len(line) and line[value_start] in whitespace:
                 value_start += 1
@@ -633,14 +648,9 @@ def _packaged_main_class(outer_path: Path, business_path: Path) -> tuple[str, li
 
 def _jdk_feature(jdk_home: Path) -> int | None:
     try:
-        lines = (jdk_home / "release").read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError):
+        values = resolve_jdk_release(jdk_home)["values"]
+    except (JdkPreflightError, OSError, UnicodeError):
         return None
-    values = {}
-    for line in lines:
-        key, separator, value = line.partition("=")
-        if separator:
-            values[key.strip()] = value.strip().strip('"')
     match = re.match(r"(?:1\.)?(\d+)", values.get("JAVA_VERSION", ""))
     return int(match.group(1)) if match else None
 
@@ -768,10 +778,14 @@ def _side_config(
     provenance: Mapping[str, Any],
     runtime_overrides: Mapping[str, Any],
 ) -> dict[str, Any]:
+    # ``materialize_binary_pipeline_config`` validates collection types, sides,
+    # purpose lists, and the two closure records before entering this function.
+    # Use those established invariants directly so malformed evidence is
+    # rejected at one boundary instead of silently converted to empty rows.
     business_rows = [
         dict(item)
-        for item in manifest.get("business_artifacts") or ()
-        if str(item.get("side") or "") == side
+        for item in manifest["business_artifacts"]
+        if str(item["side"]) == side
     ]
     if len(business_rows) != 1:
         raise BinaryRuntimeMaterializationError(
@@ -802,8 +816,8 @@ def _side_config(
         )
     provenance_rows = [
         dict(item)
-        for item in provenance.get("sides") or ()
-        if str(item.get("side") or "") == side
+        for item in provenance["sides"]
+        if str(item["side"]) == side
     ]
     if len(provenance_rows) != 1:
         raise BinaryRuntimeMaterializationError(
@@ -858,7 +872,7 @@ def _side_config(
             ),
         )
 
-    module = str(side_provenance.get("target_module") or "application").strip()
+    module = str(side_provenance.get("target_module") or "").strip() or "application"
     artifacts = [{
         "path": str(business_path),
         "content_sha256": business_digest,
@@ -884,9 +898,9 @@ def _side_config(
     }]
     dependency_rows = [
         dict(item)
-        for item in manifest.get("items") or ()
-        if str(item.get("side") or "") == side
-        and "binary_runtime" in set(item.get("purposes") or ())
+        for item in manifest["items"]
+        if str(item["side"]) == side
+        and "binary_runtime" in set(item["purposes"])
     ]
     classpath_indexes = [_runtime_classpath_index(item) for item in dependency_rows]
     if len(classpath_indexes) != len(set(classpath_indexes)):
@@ -942,10 +956,12 @@ def _side_config(
             _dependency_runtime_configuration_gaps(
                 path,
                 target_jvm_major=target_jvm_major,
-                artifact_label=str(item.get("coord") or item.get("lib_entry") or slot),
+                artifact_label=str(item.get("coord") or item["lib_entry"]),
             )
         )
-        lib_entry = str(item.get("lib_entry") or "")
+        # A successful container digest lookup proves a non-empty declared
+        # entry name, so the fallback used before that check is unreachable.
+        lib_entry = str(item["lib_entry"])
         container_digest = container_digests[lib_entry]
         if container_digest != nested_digest:
             raise BinaryRuntimeMaterializationError(
@@ -976,8 +992,8 @@ def _side_config(
             f"{side}:outer:{outer_path}",
         )
 
-    side_coverage = dict((manifest.get("runtime_closure") or {}).get(side) or {})
-    closure_status = str(side_coverage.get("coverage_status") or "complete")
+    side_coverage = dict(manifest["runtime_closure"][side])
+    closure_status = str(side_coverage["coverage_status"])
     packaged_properties, business_configuration_gaps = (
         _packaged_runtime_configuration(
             business_path,

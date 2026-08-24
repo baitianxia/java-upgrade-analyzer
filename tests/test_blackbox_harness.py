@@ -1,9 +1,12 @@
 import copy
 import json
 from pathlib import Path
+import subprocess
+import tempfile
 import unittest
+from unittest.mock import patch
 
-from tests.blackbox.harness import evaluate_closed_truth
+from tests.blackbox.harness import evaluate_closed_truth, jdk_major_from_home
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -107,6 +110,53 @@ class BlackboxHarnessTest(unittest.TestCase):
 
         self.assertEqual(evaluation["status"], "failed")
         self.assertIn("duplicate_actual_identity", evaluation["issues"])
+
+    def test_jdk_major_prefers_release_metadata(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            (home / "release").write_text(
+                'IMPLEMENTOR="fixture"\nJAVA_VERSION="1.8.0_504"\n',
+                encoding="utf-8",
+            )
+            with patch(
+                "tests.blackbox.harness.managed_run",
+                side_effect=AssertionError("release metadata should be sufficient"),
+            ):
+                self.assertEqual(jdk_major_from_home(home), "8")
+
+    def test_jdk_major_falls_back_to_the_candidate_executable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            (home / "bin").mkdir()
+            (home / "bin" / "java").touch()
+            (home / "bin" / "java.exe").touch()
+            completed = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="",
+                stderr=(
+                    'openjdk version "1.8.0_504"\n'
+                    "OpenJDK Runtime Environment Corretto-8.504.01.1\n"
+                ),
+            )
+            with patch(
+                "tests.blackbox.harness.managed_run", return_value=completed,
+            ) as run:
+                self.assertEqual(jdk_major_from_home(home), "8")
+            self.assertEqual(run.call_args.args[0][1], "-version")
+
+    def test_jdk_major_rejects_missing_or_unidentifiable_java(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            self.assertEqual(jdk_major_from_home(home), "")
+            (home / "bin").mkdir()
+            (home / "bin" / "java").touch()
+            (home / "bin" / "java.exe").touch()
+            completed = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="vendor output", stderr="",
+            )
+            with patch(
+                "tests.blackbox.harness.managed_run", return_value=completed,
+            ):
+                self.assertEqual(jdk_major_from_home(home), "")
 
 
 if __name__ == "__main__":
