@@ -1,6 +1,6 @@
 {
   "schema": "java-upgrade-analyzer.internal-dynamic-call-edges.v1",
-  "source_identity": "c2edf3a5601e601304deeb1c5275b6af91c8769b2b5853db459d5c8c1c87b239",
+  "source_identity": "36193917441457efe658507a16313affa3ba2b219b77c243ab6e07668e4877ac",
   "inventory_rule": "Every production-to-production edge observed at runtime but unresolved by the static call graph is retained as a required implementation-dependent white-box relationship. New, removed, or source-stale edges require explicit review.",
   "edges": [
     {

@@ -321,6 +321,31 @@ def _notify_counted_progress(
     )
 
 
+def _iter_jsonl_values(payload: str) -> Iterable[Any]:
+    """Decode one JSON value per line without copying the output into lines."""
+
+    decoder = json.JSONDecoder()
+    cursor = 0
+    size = len(payload)
+    while cursor < size:
+        boundary = payload.find("\n", cursor)
+        if boundary < 0:
+            boundary = size
+        value_start = cursor
+        while (
+            value_start < boundary
+            and payload[value_start] in " \t\r"
+        ):
+            value_start += 1
+        value, value_end = decoder.raw_decode(payload, value_start)
+        if payload[value_end:boundary].strip():
+            raise json.JSONDecodeError(
+                "Extra data", payload, value_end
+            )
+        yield value
+        cursor = boundary + 1
+
+
 def _environment_progress_callback() -> ValidationProgressCallback | None:
     report_dir = str(os.environ.get("UPGRADE_REPORT_DIR") or "").strip()
     if not report_dir:
@@ -719,11 +744,88 @@ def _open_immutable_sqlite(path: Path) -> sqlite3.Connection:
         raise
 
 
-def _sha256_file(path: Path) -> str:
+def _open_sequential_binary(path: Path):
+    """Open a file for large forward-only reads with cache-friendly hints.
+
+    ``O_SEQUENTIAL`` is a Windows CRT hint that allows the cache manager to
+    aggressively read ahead and retire pages after use.  It is zero on
+    platforms that do not expose it, so the byte stream and failure semantics
+    remain those of an ordinary read-only descriptor everywhere else.
+    """
+
+    flags = os.O_RDONLY
+    flags |= int(getattr(os, "O_BINARY", 0))
+    flags |= int(getattr(os, "O_SEQUENTIAL", 0))
+    try:
+        filesystem_path = os.fspath(path)
+    except TypeError:
+        # Focused integrations may supply a read-only path facade. It cannot
+        # receive platform open flags, but retains the same exact byte stream.
+        return path.open("rb")
+    descriptor = os.open(filesystem_path, flags)
+    try:
+        return os.fdopen(descriptor, "rb", buffering=0)
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _sha256_file(
+    path: Path,
+    *,
+    progress_callback: ValidationProgressCallback | None = None,
+    progress_phase: str = "validation-file-hash",
+    progress_message: str = "校验文件 SHA-256",
+    progress_item: str | None = None,
+) -> str:
+    """Hash every byte through one reusable large sequential-read buffer."""
+
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
+    with _open_sequential_binary(path) as handle:
+        total = max(0, int(os.fstat(handle.fileno()).st_size))
+        buffer = bytearray(min(
+            8 * 1024 * 1024,
+            max(64 * 1024, total),
+        ))
+        view = memoryview(buffer)
+        completed = 0
+        report_interval = max(
+            len(buffer),
+            (total + 19) // 20 if total else len(buffer),
+        )
+        next_report = report_interval
+        _notify_progress(
+            progress_callback,
+            progress_phase,
+            progress_message,
+            0,
+            total,
+            progress_item or str(path),
+        )
+        while True:
+            count = handle.readinto(buffer)
+            if not count:
+                break
+            digest.update(view[:count])
+            completed += count
+            if completed >= next_report:
+                _notify_progress(
+                    progress_callback,
+                    progress_phase,
+                    progress_message,
+                    completed,
+                    total,
+                    progress_item or str(path),
+                )
+                next_report = completed + report_interval
+        _notify_progress(
+            progress_callback,
+            progress_phase,
+            progress_message,
+            completed,
+            total,
+            progress_item or str(path),
+        )
     return digest.hexdigest()
 
 
@@ -750,7 +852,12 @@ def _sqlite_logical_content_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _sqlite_logical_contents_equal(left: Path, right: Path) -> bool:
+def _sqlite_logical_contents_equal(
+    left: Path,
+    right: Path,
+    *,
+    progress_callback: ValidationProgressCallback | None = None,
+) -> bool:
     """Compare two SQLite files while ignoring three header-only counters.
 
     This pairwise form stops on the first semantic byte difference. It is used
@@ -761,33 +868,73 @@ def _sqlite_logical_contents_equal(left: Path, right: Path) -> bool:
     """
 
     try:
-        if left.stat().st_size != right.stat().st_size:
+        total = left.stat().st_size
+        if total != right.stat().st_size:
             return False
-        with left.open("rb") as left_handle, right.open("rb") as right_handle:
+        with _open_sequential_binary(left) as left_handle, \
+                _open_sequential_binary(right) as right_handle:
             left_header = bytearray(left_handle.read(100))
             right_header = bytearray(right_handle.read(100))
             sqlite_header = b"SQLite format 3\x00"
-            if (
-                len(left_header) != 100
-                or len(right_header) != 100
-                or not left_header.startswith(sqlite_header)
-                or not right_header.startswith(sqlite_header)
-            ):
-                return left_header == right_header and files_equal(
-                    left, right
-                )
-            for start, end in ((24, 28), (40, 44), (92, 96)):
-                left_header[start:end] = b"\x00" * (end - start)
-                right_header[start:end] = b"\x00" * (end - start)
+            sqlite_images = (
+                len(left_header) == 100
+                and len(right_header) == 100
+                and left_header.startswith(sqlite_header)
+                and right_header.startswith(sqlite_header)
+            )
+            if sqlite_images:
+                for start, end in ((24, 28), (40, 44), (92, 96)):
+                    left_header[start:end] = b"\x00" * (end - start)
+                    right_header[start:end] = b"\x00" * (end - start)
             if left_header != right_header:
                 return False
+            buffer_size = min(
+                8 * 1024 * 1024,
+                max(64 * 1024, total - len(left_header)),
+            )
+            left_buffer = bytearray(buffer_size)
+            right_buffer = bytearray(buffer_size)
+            left_view = memoryview(left_buffer)
+            right_view = memoryview(right_buffer)
+            completed = len(left_header)
+            report_interval = max(
+                len(left_buffer),
+                (total + 19) // 20 if total else len(left_buffer),
+            )
+            next_report = completed + report_interval
+            _notify_progress(
+                progress_callback,
+                "validation-side-cache",
+                "顺序比较 SQLite 逻辑内容",
+                completed,
+                total,
+            )
             while True:
-                left_block = left_handle.read(4 * 1024 * 1024)
-                right_block = right_handle.read(4 * 1024 * 1024)
-                if left_block != right_block:
+                left_count = left_handle.readinto(left_buffer)
+                right_count = right_handle.readinto(right_buffer)
+                if left_count != right_count:
                     return False
-                if not left_block:
+                if not left_count:
+                    _notify_progress(
+                        progress_callback,
+                        "validation-side-cache",
+                        "顺序比较 SQLite 逻辑内容",
+                        completed,
+                        total,
+                    )
                     return True
+                if left_view[:left_count] != right_view[:right_count]:
+                    return False
+                completed += left_count
+                if completed >= next_report:
+                    _notify_progress(
+                        progress_callback,
+                        "validation-side-cache",
+                        "顺序比较 SQLite 逻辑内容",
+                        completed,
+                        total,
+                    )
+                    next_report = completed + report_interval
     except OSError as error:
         raise BinaryValidationError(
             "BINARY_VALIDATION_SQLITE_READ_FAILED", str(error)
@@ -2153,24 +2300,31 @@ def _observe_classes(
                 observed_batch = set()
                 dependencies: set[str] = set()
                 malformed_line = ""
-                for line in completed.stdout.splitlines():
-                    try:
-                        row = json.loads(line)
-                    except json.JSONDecodeError:
-                        malformed_line = line[:200]
-                        break
-                    name = str(row.get("class_name") or "")
-                    observed_batch.add(name.replace("/", "."))
-                    candidate_rows.append((name, row))
-                    if row.get("status") == "definition_ready":
-                        for dependency in [
-                            row.get("super_name"),
-                            *(row.get("interfaces") or ()),
-                        ]:
-                            if dependency:
-                                dependencies.add(
-                                    str(dependency).replace("/", ".")
-                                )
+                # A 12k-class batch can emit a very large JSONL string.
+                # Decode directly from the immutable stdout by character
+                # offset; splitlines() otherwise duplicates the full batch.
+                try:
+                    rows = _iter_jsonl_values(completed.stdout)
+                    for row in rows:
+                        name = str(row.get("class_name") or "")
+                        observed_batch.add(name.replace("/", "."))
+                        candidate_rows.append((name, row))
+                        if row.get("status") == "definition_ready":
+                            for dependency in [
+                                row.get("super_name"),
+                                *(row.get("interfaces") or ()),
+                            ]:
+                                if dependency:
+                                    dependencies.add(
+                                        str(dependency).replace("/", ".")
+                                    )
+                except json.JSONDecodeError as error:
+                    line_start = completed.stdout.rfind(
+                        "\n", 0, error.pos
+                    ) + 1
+                    malformed_line = completed.stdout[
+                        line_start:line_start + 200
+                    ]
                 if malformed_line:
                     last_problem = {
                         "reason_code": "BINARY_ORACLE_OUTPUT_INVALID",
@@ -5190,12 +5344,190 @@ def _artifact_instance_bindings(
     return bindings, issues
 
 
+def _sequential_member_rowid_ranges(
+    connection: sqlite3.Connection,
+) -> dict[str, tuple[int, int, int]] | None:
+    """Index contiguous per-artifact member ranges with one sequential pass.
+
+    Fact-store insertion writes one complete artifact before the next one, so
+    members belonging to an artifact occupy one rowid interval.  Recording
+    only those intervals lets the edge validator load a small, covering
+    caller projection for the active artifact instead of asking SQLite to do
+    one hashed ``members`` lookup for every direct edge.  Older/focused stores
+    without the production column, or any non-contiguous layout, return
+    ``None`` and retain the exact legacy join.
+    """
+
+    try:
+        rows = connection.execute(
+            "SELECT rowid,artifact_instance_identity "
+            "FROM members ORDER BY rowid"
+        )
+    except sqlite3.Error:
+        return None
+    mutable: dict[str, list[int]] = {}
+    previous_identity: str | None = None
+    try:
+        for raw in rows:
+            rowid = int(raw[0])
+            identity = str(raw[1])
+            observed = mutable.get(identity)
+            if observed is None:
+                mutable[identity] = [rowid, rowid, 1]
+            elif previous_identity != identity:
+                # Reappearing after another artifact would make one rowid
+                # interval include unrelated members. Fall back rather than
+                # relying on an insertion-layout assumption for correctness.
+                return None
+            else:
+                observed[1] = rowid
+                observed[2] += 1
+            previous_identity = identity
+    except (IndexError, TypeError, ValueError, sqlite3.Error):
+        return None
+    return {
+        identity: (values[0], values[1], values[2])
+        for identity, values in mutable.items()
+    }
+
+
+def _artifact_member_projection(
+    connection: sqlite3.Connection,
+    artifact_instance_identity: str,
+    rowid_range: tuple[int, int, int],
+) -> dict[str, tuple[str, str, str]] | None:
+    """Load caller symbols for one artifact through its sequential row range."""
+
+    first_rowid, last_rowid, expected_count = rowid_range
+    if expected_count == 0:
+        return {}
+    try:
+        projection = {
+            str(row[0]): (str(row[1]), str(row[2]), str(row[3]))
+            for row in connection.execute(
+                """
+                SELECT member_identity,class_name,member_name,descriptor
+                FROM members
+                WHERE rowid BETWEEN ? AND ?
+                  AND artifact_instance_identity=?
+                ORDER BY rowid
+                """,
+                (first_rowid, last_rowid, artifact_instance_identity),
+            )
+        }
+    except (IndexError, TypeError, ValueError, sqlite3.Error):
+        return None
+    if len(projection) != expected_count:
+        return None
+    return projection
+
+
+def _identity_rows_with_table_locality(
+    connection: sqlite3.Connection,
+    *,
+    table: str,
+    identity_column: str,
+    selected_columns: tuple[str, ...],
+    identities: Iterable[str],
+    prefer_table_locality: bool = True,
+) -> tuple[sqlite3.Row, ...]:
+    """Resolve hashed identities before reading large table rows in rowid order.
+
+    A direct ``WHERE sha_identity IN (...)`` alternates between the compact
+    identity index and random main-table pages.  First resolving only
+    ``(identity,rowid)`` keeps that phase index-covering; the payload columns
+    are then read through a dense rowid range or sorted integer keys.  Tables
+    without rowid retain the original identity lookup exactly.
+    """
+
+    names = (table, identity_column, *selected_columns)
+    if any(re.fullmatch(r"[a-z_][a-z0-9_]*", name) is None for name in names):
+        raise ValueError("unsafe SQLite identifier")
+    normalized = tuple(dict.fromkeys(str(item) for item in identities))
+    if not normalized:
+        return ()
+    placeholders = ",".join("?" for _item in normalized)
+    selected = ",".join(selected_columns)
+    legacy_query = (
+        f"SELECT {selected} FROM {table} "
+        f"WHERE {identity_column} IN ({placeholders})"
+    )
+    if not prefer_table_locality:
+        return tuple(connection.execute(legacy_query, normalized))
+    try:
+        locations = sorted(
+            (
+                int(row[0]), str(row[1])
+            )
+            for row in connection.execute(
+                f"SELECT rowid,{identity_column} FROM {table} "
+                f"WHERE {identity_column} IN ({placeholders})",
+                normalized,
+            )
+        )
+    except (IndexError, TypeError, ValueError, sqlite3.Error):
+        return tuple(connection.execute(legacy_query, normalized))
+    if not locations:
+        return ()
+    expected = {identity for _rowid, identity in locations}
+    first_rowid = locations[0][0]
+    last_rowid = locations[-1][0]
+    span = last_rowid - first_rowid + 1
+    try:
+        if span <= max(64, len(locations) * 4):
+            rows = connection.execute(
+                f"SELECT {selected} FROM {table} "
+                "WHERE rowid BETWEEN ? AND ? ORDER BY rowid",
+                (first_rowid, last_rowid),
+            )
+        else:
+            rowid_placeholders = ",".join("?" for _item in locations)
+            rows = connection.execute(
+                f"SELECT {selected} FROM {table} "
+                f"WHERE rowid IN ({rowid_placeholders}) ORDER BY rowid",
+                tuple(rowid for rowid, _identity in locations),
+            )
+        return tuple(
+            row for row in rows
+            if str(row[identity_column]) in expected
+        )
+    except (IndexError, TypeError, ValueError, sqlite3.Error):
+        return tuple(connection.execute(legacy_query, normalized))
+
+
+def _prefer_identity_table_locality(
+    connection: sqlite3.Connection,
+) -> bool:
+    """Use two-phase row reads only when the fact store risks OS paging."""
+
+    try:
+        database_path = next(
+            str(row[2])
+            for row in connection.execute("PRAGMA database_list")
+            if str(row[1]) == "main" and str(row[2])
+        )
+        database_size = Path(database_path).stat().st_size
+    except (OSError, StopIteration, IndexError, TypeError, sqlite3.Error):
+        return False
+    gib = 1024 * 1024 * 1024
+    if database_size < gib:
+        return False
+    try:
+        available = system_available_memory_bytes()
+    except Exception:
+        available = None
+    if available is None:
+        return database_size >= 8 * gib
+    return database_size * 2 >= max(1, int(available))
+
+
 def _production_direct_truth_for_artifact(
     connection: sqlite3.Connection,
     artifact_instance_identity: str,
     issues: list[dict[str, Any]],
     *,
     include_structural: bool = False,
+    member_rowid_range: tuple[int, int, int] | None = None,
 ) -> (
     tuple[set[tuple[Any, ...]], set[tuple[Any, ...]]]
     | tuple[
@@ -5217,23 +5549,69 @@ def _production_direct_truth_for_artifact(
         "'invokedynamic_handle_method','invokedynamic_handle_field',"
         "'ldc_constant_dynamic_bootstrap','ldc_handle'"
     )
-    for edge in connection.execute(
-        f"""
-        SELECT e.edge_kind,e.symbolic_owner,e.symbolic_name,
-               e.symbolic_descriptor,e.opcode,e.bytecode_offset,e.edge_json,
-               m.class_name AS caller_class_name,
-               m.member_name AS caller_member_name,
-               m.descriptor AS caller_descriptor
-        FROM direct_edges AS e
-        JOIN members AS m ON m.member_identity=e.caller_member_identity
-        WHERE e.caller_artifact_instance_identity=? AND (
-            e.edge_kind IN ({edge_kinds})
-              OR e.edge_kind LIKE 'invokedynamic_handle_%'
-              OR e.edge_kind LIKE 'ldc_bootstrap_handle_%'
+    member_projection = (
+        _artifact_member_projection(
+            connection, artifact_instance_identity, member_rowid_range
         )
-        """,
-        (artifact_instance_identity,),
-    ):
+        if member_rowid_range is not None else None
+    )
+    if member_projection is None:
+        edge_query = f"""
+            SELECT e.edge_kind,e.symbolic_owner,e.symbolic_name,
+                   e.symbolic_descriptor,e.opcode,e.bytecode_offset,
+                   e.edge_json,
+                   m.class_name AS caller_class_name,
+                   m.member_name AS caller_member_name,
+                   m.descriptor AS caller_descriptor
+            FROM direct_edges AS e
+            JOIN members AS m
+              ON m.member_identity=e.caller_member_identity
+            WHERE e.caller_artifact_instance_identity=? AND (
+                e.edge_kind IN ({edge_kinds})
+                  OR e.edge_kind LIKE 'invokedynamic_handle_%'
+                  OR e.edge_kind LIKE 'ldc_bootstrap_handle_%'
+            )
+        """
+    else:
+        edge_query = f"""
+            SELECT e.caller_member_identity,e.edge_kind,e.symbolic_owner,
+                   e.symbolic_name,e.symbolic_descriptor,e.opcode,
+                   e.bytecode_offset,e.edge_json
+            FROM direct_edges AS e
+            WHERE e.caller_artifact_instance_identity=? AND (
+                e.edge_kind IN ({edge_kinds})
+                  OR e.edge_kind LIKE 'invokedynamic_handle_%'
+                  OR e.edge_kind LIKE 'ldc_bootstrap_handle_%'
+            )
+        """
+    for edge in connection.execute(edge_query, (artifact_instance_identity,)):
+        if member_projection is None:
+            caller_class_name = str(edge["caller_class_name"])
+            caller_member_name = str(edge["caller_member_name"])
+            caller_descriptor = str(edge["caller_descriptor"])
+        else:
+            caller_identity = str(edge["caller_member_identity"])
+            caller = member_projection.get(caller_identity)
+            if caller is None:
+                # A valid fact store keeps caller/member artifact identities
+                # aligned. Preserve the legacy INNER JOIN semantics even for
+                # an independently authored or malformed store by resolving
+                # the exceptional cross-artifact caller exactly once.
+                caller_row = connection.execute(
+                    """
+                    SELECT class_name,member_name,descriptor
+                    FROM members WHERE member_identity=?
+                    """,
+                    (caller_identity,),
+                ).fetchone()
+                if caller_row is None:
+                    continue
+                caller = (
+                    str(caller_row[0]), str(caller_row[1]),
+                    str(caller_row[2]),
+                )
+                member_projection[caller_identity] = caller
+            caller_class_name, caller_member_name, caller_descriptor = caller
         # direct_edges.edge_kind is NOT NULL and this query only admits
         # explicit edge kinds/prefixes, so an empty fallback cannot occur.
         edge_kind = str(edge["edge_kind"])
@@ -5247,8 +5625,8 @@ def _production_direct_truth_for_artifact(
                 edge_payload = None
             edge_payload_loaded = True
             caller = (
-                edge["caller_class_name"], edge["caller_member_name"],
-                edge["caller_descriptor"], int(edge["bytecode_offset"]),
+                caller_class_name, caller_member_name, caller_descriptor,
+                int(edge["bytecode_offset"]),
             )
             if edge_kind == "type":
                 structural_type.add((
@@ -5384,9 +5762,9 @@ def _production_direct_truth_for_artifact(
                     "dynamic_bootstrap",
                     "ORACLE_PRODUCTION_DYNAMIC_REFERENCE_KIND_INVALID",
                     edge_kind=edge_kind,
-                    caller_class=str(edge["caller_class_name"] or ""),
-                    caller_member=str(edge["caller_member_name"] or ""),
-                    caller_descriptor=str(edge["caller_descriptor"] or ""),
+                    caller_class=caller_class_name,
+                    caller_member=caller_member_name,
+                    caller_descriptor=caller_descriptor,
                     bytecode_offset=int(edge["bytecode_offset"]),
                 ))
                 continue
@@ -5399,8 +5777,8 @@ def _production_direct_truth_for_artifact(
                 else edge_kind
             )
             dynamic.add((
-                edge["caller_class_name"].replace("/", "."),
-                edge["caller_member_name"], edge["caller_descriptor"],
+                caller_class_name.replace("/", "."),
+                caller_member_name, caller_descriptor,
                 edge["symbolic_owner"].replace("/", "."),
                 edge["symbolic_name"], edge["symbolic_descriptor"],
                 reference_kind, reference_interface, linkage_family,
@@ -5424,9 +5802,9 @@ def _production_direct_truth_for_artifact(
                     "direct_edge",
                     "ORACLE_PRODUCTION_DIRECT_REFERENCE_KIND_INVALID",
                     edge_kind=edge_kind,
-                    caller_class=str(edge["caller_class_name"] or ""),
-                    caller_member=str(edge["caller_member_name"] or ""),
-                    caller_descriptor=str(edge["caller_descriptor"] or ""),
+                    caller_class=caller_class_name,
+                    caller_member=caller_member_name,
+                    caller_descriptor=caller_descriptor,
                     bytecode_offset=int(edge["bytecode_offset"]),
                 ))
                 continue
@@ -5436,8 +5814,8 @@ def _production_direct_truth_for_artifact(
         else:
             reference_kind = "field"
         direct.add((
-            edge["caller_class_name"].replace("/", "."),
-            edge["caller_member_name"], edge["caller_descriptor"],
+            caller_class_name.replace("/", "."),
+            caller_member_name, caller_descriptor,
             edge["symbolic_owner"].replace("/", "."),
             edge["symbolic_name"], edge["symbolic_descriptor"],
             _opcode_name(edge["opcode"]), int(edge["bytecode_offset"]),
@@ -5466,6 +5844,7 @@ def _validate_direct_edges(
     validated_projection_cache: dict[
         tuple[Any, ...], dict[str, Any]
     ] | None = None,
+    member_rowid_ranges_output: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     issues = []
     truth_rows = []
@@ -5683,6 +6062,57 @@ def _validate_direct_edges(
         scan_total,
     )
 
+    _notify_progress(
+        progress_callback,
+        "validation-direct-edge-production",
+        f"{progress_label or '当前侧'}：开始建立成员顺序区间",
+        0,
+        1,
+    )
+    member_rowid_ranges = _sequential_member_rowid_ranges(connection)
+    if member_rowid_ranges_output is not None:
+        # This map contains only three integers per artifact. Its lifetime is
+        # the current validate_generation call, so later semantic replays can
+        # avoid rescanning the complete members table without any stale-file
+        # cache across validation runs.
+        member_rowid_ranges_output["ranges"] = member_rowid_ranges
+    if member_rowid_ranges is None:
+        _notify_progress(
+            progress_callback,
+            "validation-direct-edge-production",
+            (
+                f"{progress_label or '当前侧'}：成员布局不连续，"
+                "使用兼容 JOIN 校验"
+            ),
+            1,
+            1,
+        )
+    else:
+        _notify_progress(
+            progress_callback,
+            "validation-direct-edge-production",
+            f"{progress_label or '当前侧'}：成员顺序区间已建立",
+            1,
+            1,
+            f"artifact_ranges={len(member_rowid_ranges)}",
+        )
+
+    projection_total = sum(
+        bool(instance_by_location.get((
+            str(artifact.get("loader_realm") or ""),
+            int(artifact["slot"]),
+        )))
+        for artifact in artifacts
+    )
+    projection_current = 0
+    _notify_progress(
+        progress_callback,
+        "validation-direct-edge-production",
+        f"{progress_label or '当前侧'}：开始校验生产调用边",
+        0,
+        projection_total,
+    )
+
     for artifact in artifacts:
         instance_identity = instance_by_location.get(
             (
@@ -5694,9 +6124,16 @@ def _validate_direct_edges(
             continue
         artifact_issue_start = len(issues)
         scan_key = (str(artifact["sha256"]), str(javap))
+        member_rowid_range = (
+            member_rowid_ranges.get(instance_identity, (0, -1, 0))
+            if member_rowid_ranges is not None else None
+        )
         if production_structural_cache is None:
             actual, actual_dynamic = _production_direct_truth_for_artifact(
-                connection, instance_identity, issues
+                connection,
+                instance_identity,
+                issues,
+                member_rowid_range=member_rowid_range,
             )
         else:
             (
@@ -5707,11 +6144,21 @@ def _validate_direct_edges(
                 instance_identity,
                 issues,
                 include_structural=True,
+                member_rowid_range=member_rowid_range,
             )
             production_structural_cache.put(
                 instance_identity, actual_type, actual_init
             )
             del actual_type, actual_init
+        projection_current += 1
+        _notify_counted_progress(
+            progress_callback,
+            "validation-direct-edge-production",
+            f"{progress_label or '当前侧'}：生产调用边校验中",
+            projection_current,
+            projection_total,
+            str(artifact.get("path") or instance_identity),
+        )
         projection_key = ("direct", *scan_key)
         cached_projection = (
             validated_projection_cache.get(projection_key)
@@ -5894,6 +6341,9 @@ def _validate_runtime_outcomes(
     initial_classes: Iterable[str],
     platform_realm: str,
     jdk_home: Path,
+    *,
+    progress_callback: ValidationProgressCallback | None = None,
+    progress_label: str = "",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     issues = []
     instance_by_location, binding_issues = _artifact_instance_bindings(
@@ -6128,6 +6578,9 @@ def _validate_runtime_outcomes(
     except (AttributeError, sqlite3.Error):
         variable_limit = 999
     lookup_batch_size = max(1, min(5_000, variable_limit - 8))
+    prefer_identity_table_locality = _prefer_identity_table_locality(
+        connection
+    )
 
     def batches(values: Iterable[Any]):
         batch = []
@@ -6144,7 +6597,6 @@ def _validate_runtime_outcomes(
         # Every caller passes one non-empty reconciliation batch.  The queried
         # identity/kind/symbol columns are NOT NULL in BinaryFactStore; only
         # opcode is nullable for non-bytecode semantic edges.
-        placeholders = ",".join("?" for _item in identities)
         return {
             str(row["direct_edge_identity"]): (
                 str(row["edge_kind"]),
@@ -6153,11 +6605,16 @@ def _validate_runtime_outcomes(
                 str(row["symbolic_descriptor"]),
                 int(row["opcode"]) if row["opcode"] is not None else 0,
             )
-            for row in connection.execute(
-                "SELECT direct_edge_identity,edge_kind,symbolic_owner,"
-                "symbolic_name,symbolic_descriptor,opcode "
-                f"FROM direct_edges WHERE direct_edge_identity IN ({placeholders})",
-                identities,
+            for row in _identity_rows_with_table_locality(
+                connection,
+                table="direct_edges",
+                identity_column="direct_edge_identity",
+                selected_columns=(
+                    "direct_edge_identity", "edge_kind", "symbolic_owner",
+                    "symbolic_name", "symbolic_descriptor", "opcode",
+                ),
+                identities=identities,
+                prefer_table_locality=prefer_identity_table_locality,
             )
         }
 
@@ -6167,21 +6624,54 @@ def _validate_runtime_outcomes(
         ))
         if not identities:
             return {}
-        placeholders = ",".join("?" for _item in identities)
         return {
             str(row["member_identity"]): (
                 str(row["class_name"]),
                 str(row["member_name"]),
                 str(row["descriptor"]),
             )
-            for row in connection.execute(
-                "SELECT member_identity,class_name,member_name,descriptor "
-                f"FROM members WHERE member_identity IN ({placeholders})",
-                identities,
+            for row in _identity_rows_with_table_locality(
+                connection,
+                table="members",
+                identity_column="member_identity",
+                selected_columns=(
+                    "member_identity", "class_name", "member_name",
+                    "descriptor",
+                ),
+                identities=identities,
+                prefer_table_locality=prefer_identity_table_locality,
             )
         }
 
+    def reconciliation_total(kind: str) -> int | None:
+        try:
+            return int(connection.execute(
+                "SELECT COALESCE(SUM(record_count),0) "
+                "FROM reconciliation_records WHERE record_kind=?",
+                (_ORACLE_RECONCILIATION_KIND_CODES[kind],),
+            ).fetchone()[0])
+        except (IndexError, TypeError, ValueError, sqlite3.Error):
+            # Focused/legacy integrations may expose reconciliation through a
+            # compatibility connection without the physical chunk table.
+            return None
+
+    member_resolution_total = reconciliation_total("member_resolution")
     member_resolution_count = 0
+    member_progress_interval = max(
+        lookup_batch_size,
+        (
+            (member_resolution_total + 19) // 20
+            if member_resolution_total is not None else 100_000
+        ),
+    )
+    next_member_progress = member_progress_interval
+    _notify_progress(
+        progress_callback,
+        "validation-runtime-reconciliation",
+        f"{progress_label or '当前侧'}：开始校验成员解析记录",
+        0,
+        member_resolution_total,
+    )
     for resolution_batch in batches(
         _iter_reconciliation(connection, "member_resolution")
     ):
@@ -6228,6 +6718,34 @@ def _validate_runtime_outcomes(
                     expected_owner=declaring,
                     actual_owner=selected_member[0],
                 ))
+        if (
+            member_resolution_count >= next_member_progress
+            or (
+                member_resolution_total is not None
+                and member_resolution_count == member_resolution_total
+            )
+        ):
+            _notify_progress(
+                progress_callback,
+                "validation-runtime-reconciliation",
+                f"{progress_label or '当前侧'}：成员解析记录校验中",
+                member_resolution_count,
+                member_resolution_total,
+            )
+            next_member_progress = (
+                member_resolution_count + member_progress_interval
+            )
+    _notify_progress(
+        progress_callback,
+        "validation-runtime-reconciliation",
+        f"{progress_label or '当前侧'}：成员解析记录校验完成",
+        member_resolution_count,
+        (
+            member_resolution_total
+            if member_resolution_total is not None
+            else member_resolution_count
+        ),
+    )
 
     @lru_cache(maxsize=100_000)
     def oracle_dispatch_targets(
@@ -6282,7 +6800,23 @@ def _validate_runtime_outcomes(
                 direct_edge_identity=edge_id, status=production_status,
             ))
 
+    dispatch_total = reconciliation_total("dispatch_resolution")
     dispatch_count = 0
+    dispatch_progress_interval = max(
+        lookup_batch_size,
+        (
+            (dispatch_total + 19) // 20
+            if dispatch_total is not None else 100_000
+        ),
+    )
+    next_dispatch_progress = dispatch_progress_interval
+    _notify_progress(
+        progress_callback,
+        "validation-runtime-reconciliation",
+        f"{progress_label or '当前侧'}：开始校验分派解析记录",
+        0,
+        dispatch_total,
+    )
     with short_temporary_directory(
         prefix="binary-validation-dispatch"
     ) as dispatch_temp:
@@ -6335,7 +6869,38 @@ def _validate_runtime_outcomes(
                     seen_connection.executemany(
                         "INSERT OR IGNORE INTO seen VALUES (?)", seen_rows
                     )
+                if (
+                    dispatch_count >= next_dispatch_progress
+                    or (
+                        dispatch_total is not None
+                        and dispatch_count == dispatch_total
+                    )
+                ):
+                    _notify_progress(
+                        progress_callback,
+                        "validation-runtime-reconciliation",
+                        f"{progress_label or '当前侧'}：分派解析记录校验中",
+                        dispatch_count,
+                        dispatch_total,
+                    )
+                    next_dispatch_progress = (
+                        dispatch_count + dispatch_progress_interval
+                    )
+            _notify_progress(
+                progress_callback,
+                "validation-runtime-reconciliation",
+                f"{progress_label or '当前侧'}：分派解析记录校验完成",
+                dispatch_count,
+                dispatch_total if dispatch_total is not None else dispatch_count,
+            )
             seen_connection.commit()
+            _notify_progress(
+                progress_callback,
+                "validation-runtime-reconciliation",
+                f"{progress_label or '当前侧'}：开始复核缺失分派记录",
+                0,
+                None,
+            )
             database_path_text = str(
                 connection.execute("PRAGMA database_list").fetchone()[2]
                 or ""
@@ -6345,7 +6910,6 @@ def _validate_runtime_outcomes(
                        e.symbolic_name,e.symbolic_descriptor,e.opcode
                        {caller_columns}
                 FROM {schema}.direct_edges AS e
-                {caller_join}
                 {seen_join}
                 WHERE e.edge_kind='method' AND e.opcode IN (182,185)
                 {missing_predicate}
@@ -6360,12 +6924,7 @@ def _validate_runtime_outcomes(
                     schema="facts",
                     caller_columns=(
                         ",e.caller_artifact_instance_identity,"
-                        "caller.class_name AS caller_class_name"
-                        if can_filter_selected_callers else ""
-                    ),
-                    caller_join=(
-                        "JOIN facts.members AS caller "
-                        "ON caller.member_identity=e.caller_member_identity"
+                        "e.caller_member_identity"
                         if can_filter_selected_callers else ""
                     ),
                     seen_join=(
@@ -6386,24 +6945,37 @@ def _validate_runtime_outcomes(
                         schema="main",
                         caller_columns=(
                             ",e.caller_artifact_instance_identity,"
-                            "caller.class_name AS caller_class_name"
-                            if can_filter_selected_callers else ""
-                        ),
-                        caller_join=(
-                            "JOIN main.members AS caller "
-                            "ON caller.member_identity=e.caller_member_identity"
+                            "e.caller_member_identity"
                             if can_filter_selected_callers else ""
                         ),
                         seen_join="", missing_predicate="",
                     ))
                     if str(row["direct_edge_identity"]) not in seen_ids
                 )
+
+            @lru_cache(maxsize=20_000)
+            def missing_caller_class(member_identity: str) -> str | None:
+                source = seen_connection if database_path_text else connection
+                schema = "facts" if database_path_text else "main"
+                row = source.execute(
+                    f"SELECT class_name FROM {schema}.members "
+                    "WHERE member_identity=?",
+                    (member_identity,),
+                ).fetchone()
+                return str(row[0]) if row is not None else None
+
             for row in missing_rows:
-                if can_filter_selected_callers and (
-                    str(row["caller_artifact_instance_identity"]),
-                    str(row["caller_class_name"]),
-                ) not in selected_caller_artifact_classes:
-                    continue
+                if can_filter_selected_callers:
+                    caller_class = missing_caller_class(str(
+                        row["caller_member_identity"]
+                    ))
+                    # Preserve the former INNER JOIN behavior for a dangling
+                    # member in an independently authored fact store.
+                    if caller_class is None or (
+                        str(row["caller_artifact_instance_identity"]),
+                        caller_class,
+                    ) not in selected_caller_artifact_classes:
+                        continue
                 edge_id = str(row["direct_edge_identity"])
                 edge = (
                     str(row["edge_kind"]),
@@ -6414,6 +6986,13 @@ def _validate_runtime_outcomes(
                     int(row["opcode"]),
                 )
                 validate_dispatch(edge_id, edge, "", set())
+            _notify_progress(
+                progress_callback,
+                "validation-runtime-reconciliation",
+                f"{progress_label or '当前侧'}：缺失分派记录复核完成",
+                1,
+                1,
+            )
         finally:
             seen_connection.close()
 
@@ -6562,7 +7141,160 @@ def _validate_pairings(
     return issues, {"pairings": expected}
 
 
-def _iter_validated_direct_edges(database: Path) -> Iterable[tuple[Any, ...]]:
+def _edge_scan_artifact_identities(
+    connection: sqlite3.Connection,
+) -> tuple[str, ...]:
+    """Return the small authoritative artifact order for local edge scans."""
+
+    try:
+        return tuple(
+            str(row[0])
+            for row in connection.execute(
+                "SELECT artifact_instance_identity FROM artifact_instances "
+                "ORDER BY runtime_classpath_index,rowid"
+            )
+        )
+    except sqlite3.Error:
+        # Focused/legacy stores may omit artifact_instances. Preserve their
+        # complete edge universe through the covering caller-artifact index.
+        return tuple(
+            str(row[0])
+            for row in connection.execute(
+                "SELECT DISTINCT caller_artifact_instance_identity "
+                "FROM direct_edges "
+                "ORDER BY caller_artifact_instance_identity"
+            )
+        )
+
+
+def _iter_edge_rows_with_local_callers(
+    connection: sqlite3.Connection,
+    *,
+    selected_columns: str,
+    edge_predicate: str,
+    member_rowid_ranges: Mapping[
+        str, tuple[int, int, int]
+    ] | None = None,
+    progress_callback: ValidationProgressCallback | None = None,
+    progress_label: str = "",
+):
+    """Stream edge rows with bounded, sequential caller-symbol projections.
+
+    The production schema keeps members for each artifact contiguous.  One
+    per-artifact projection replaces a hashed members-table lookup for every
+    edge while preserving INNER JOIN behavior for dangling/cross-artifact
+    callers.  A legacy or non-contiguous member layout retains the original
+    global JOIN exactly.
+    """
+
+    if member_rowid_ranges is None:
+        member_rowid_ranges = _sequential_member_rowid_ranges(connection)
+    if member_rowid_ranges is None:
+        for edge in connection.execute(
+            f"""
+            SELECT {selected_columns},
+                   m.class_name AS caller_class_name,
+                   m.member_name AS caller_member_name,
+                   m.descriptor AS caller_descriptor
+            FROM direct_edges AS e
+            JOIN members AS m
+              ON m.member_identity=e.caller_member_identity
+            WHERE {edge_predicate}
+            """
+        ):
+            yield edge, (
+                str(edge["caller_class_name"]),
+                str(edge["caller_member_name"]),
+                str(edge["caller_descriptor"]),
+            )
+        return
+
+    artifact_identities = _edge_scan_artifact_identities(connection)
+    _notify_progress(
+        progress_callback,
+        "validation-edge-replay",
+        progress_label or "开始顺序重放已校验调用边",
+        0,
+        len(artifact_identities),
+    )
+    for artifact_index, artifact_identity in enumerate(
+        artifact_identities, start=1,
+    ):
+        member_projection = _artifact_member_projection(
+            connection,
+            artifact_identity,
+            member_rowid_ranges.get(artifact_identity, (0, -1, 0)),
+        )
+        if member_projection is None:
+            # This artifact has not yielded any rows yet, so a local fallback
+            # can reproduce the old INNER JOIN without duplication.
+            for edge in connection.execute(
+                f"""
+                SELECT {selected_columns},
+                       m.class_name AS caller_class_name,
+                       m.member_name AS caller_member_name,
+                       m.descriptor AS caller_descriptor
+                FROM direct_edges AS e
+                JOIN members AS m
+                  ON m.member_identity=e.caller_member_identity
+                WHERE e.caller_artifact_instance_identity=?
+                  AND ({edge_predicate})
+                ORDER BY e.rowid
+                """,
+                (artifact_identity,),
+            ):
+                yield edge, (
+                    str(edge["caller_class_name"]),
+                    str(edge["caller_member_name"]),
+                    str(edge["caller_descriptor"]),
+                )
+        else:
+            for edge in connection.execute(
+                f"""
+                SELECT e.caller_member_identity,{selected_columns}
+                FROM direct_edges AS e
+                WHERE e.caller_artifact_instance_identity=?
+                  AND ({edge_predicate})
+                ORDER BY e.rowid
+                """,
+                (artifact_identity,),
+            ):
+                caller_identity = str(edge["caller_member_identity"])
+                caller = member_projection.get(caller_identity)
+                if caller is None:
+                    caller_row = connection.execute(
+                        "SELECT class_name,member_name,descriptor "
+                        "FROM members WHERE member_identity=?",
+                        (caller_identity,),
+                    ).fetchone()
+                    if caller_row is None:
+                        # Match the legacy INNER JOIN for a dangling caller.
+                        continue
+                    caller = (
+                        str(caller_row[0]), str(caller_row[1]),
+                        str(caller_row[2]),
+                    )
+                    member_projection[caller_identity] = caller
+                yield edge, caller
+        _notify_counted_progress(
+            progress_callback,
+            "validation-edge-replay",
+            progress_label or "顺序重放已校验调用边",
+            artifact_index,
+            len(artifact_identities),
+            artifact_identity,
+        )
+
+
+def _iter_validated_direct_edges(
+    database: Path,
+    *,
+    member_rowid_ranges: Mapping[
+        str, tuple[int, int, int]
+    ] | None = None,
+    progress_callback: ValidationProgressCallback | None = None,
+    progress_label: str = "",
+) -> Iterable[tuple[Any, ...]]:
     """Replay already validated method/field truth from the immutable store.
 
     The independent javap pass has just proved exact set equality per artifact.
@@ -6574,18 +7306,16 @@ def _iter_validated_direct_edges(database: Path) -> Iterable[tuple[Any, ...]]:
     connection = _open_immutable_sqlite(database)
     connection.row_factory = sqlite3.Row
     try:
-        for edge in connection.execute(
-            """
-            SELECT e.edge_kind,e.symbolic_owner,e.symbolic_name,
-                   e.symbolic_descriptor,e.opcode,e.bytecode_offset,
-                   e.edge_json,m.class_name AS caller_class_name,
-                   m.member_name AS caller_member_name,
-                   m.descriptor AS caller_descriptor
-            FROM direct_edges AS e
-            JOIN members AS m
-              ON m.member_identity=e.caller_member_identity
-            WHERE e.edge_kind IN ('method','field')
-            """
+        for edge, caller in _iter_edge_rows_with_local_callers(
+            connection,
+            selected_columns=(
+                "e.edge_kind,e.symbolic_owner,e.symbolic_name,"
+                "e.symbolic_descriptor,e.opcode,e.bytecode_offset,e.edge_json"
+            ),
+            edge_predicate="e.edge_kind IN ('method','field')",
+            member_rowid_ranges=member_rowid_ranges,
+            progress_callback=progress_callback,
+            progress_label=progress_label,
         ):
             # All selected text columns are NOT NULL in the validated fact
             # store. Empty strings remain observable; SQL NULL is impossible.
@@ -6613,9 +7343,9 @@ def _iter_validated_direct_edges(database: Path) -> Iterable[tuple[Any, ...]]:
             else:
                 reference_kind = "field"
             yield (
-                str(edge["caller_class_name"]).replace("/", "."),
-                str(edge["caller_member_name"]),
-                str(edge["caller_descriptor"]),
+                caller[0].replace("/", "."),
+                caller[1],
+                caller[2],
                 str(edge["symbolic_owner"]).replace("/", "."),
                 str(edge["symbolic_name"]),
                 str(edge["symbolic_descriptor"]),
@@ -6627,27 +7357,31 @@ def _iter_validated_direct_edges(database: Path) -> Iterable[tuple[Any, ...]]:
         connection.close()
 
 
-def _iter_validated_type_edges(database: Path) -> Iterable[tuple[Any, ...]]:
+def _iter_validated_type_edges(
+    database: Path,
+    *,
+    member_rowid_ranges: Mapping[
+        str, tuple[int, int, int]
+    ] | None = None,
+    progress_callback: ValidationProgressCallback | None = None,
+    progress_label: str = "",
+) -> Iterable[tuple[Any, ...]]:
     connection = _open_immutable_sqlite(database)
     connection.row_factory = sqlite3.Row
     try:
-        for edge in connection.execute(
-            """
-            SELECT e.bytecode_offset,e.symbolic_owner,e.edge_json,
-                   m.class_name AS caller_class_name,
-                   m.member_name AS caller_member_name,
-                   m.descriptor AS caller_descriptor
-            FROM direct_edges AS e
-            JOIN members AS m
-              ON m.member_identity=e.caller_member_identity
-            WHERE e.edge_kind='type'
-            """
+        for edge, caller in _iter_edge_rows_with_local_callers(
+            connection,
+            selected_columns=(
+                "e.bytecode_offset,e.symbolic_owner,e.edge_json"
+            ),
+            edge_predicate="e.edge_kind='type'",
+            member_rowid_ranges=member_rowid_ranges,
+            progress_callback=progress_callback,
+            progress_label=progress_label,
         ):
             payload = json.loads(str(edge["edge_json"]))
             yield (
-                str(edge["caller_class_name"]),
-                str(edge["caller_member_name"]),
-                str(edge["caller_descriptor"]),
+                caller[0], caller[1], caller[2],
                 int(edge["bytecode_offset"]),
                 str(edge["symbolic_owner"]),
                 str(payload.get("type_use_kind") or "type_instruction"),
@@ -6685,6 +7419,7 @@ def _iter_common_validated_direct_edges(
     try:
         connection.execute("PRAGMA temp_store = FILE")
         owner_join = ""
+        edge_source = "{schema}.direct_edges AS e"
         if normalized_target_owners is not None:
             connection.execute(
                 "CREATE TABLE affected_owner(owner TEXT PRIMARY KEY) WITHOUT ROWID"
@@ -6705,6 +7440,28 @@ def _iter_common_validated_direct_edges(
             "ATTACH DATABASE ? AS current_side",
             (f"{current_database.resolve().as_uri()}?mode=ro&immutable=1",),
         )
+        if normalized_target_owners is not None:
+            has_symbolic_target_indexes = all(
+                connection.execute(
+                    f"SELECT 1 FROM {schema}.sqlite_master "
+                    "WHERE type='index' "
+                    "AND name='direct_edges_symbolic_target'"
+                ).fetchone() is not None
+                for schema in ("base_side", "current_side")
+            )
+            if has_symbolic_target_indexes:
+                # Without a fixed join order SQLite chooses a full direct-edge
+                # scan and probes the tiny affected_owner table for every row.
+                # CROSS JOIN deliberately drives the existing symbolic-target
+                # index once per affected owner instead. The relational input
+                # to the exact INTERSECT is unchanged.
+                edge_source = (
+                    "affected_owner AS affected CROSS JOIN "
+                    "{schema}.direct_edges AS e "
+                    "INDEXED BY direct_edges_symbolic_target "
+                    "ON e.symbolic_owner=affected.owner"
+                )
+                owner_join = ""
         projection = """
             SELECT replace(m.class_name,'/','.'),m.member_name,m.descriptor,
                    replace(e.symbolic_owner,'/','.'),e.symbolic_name,
@@ -6725,7 +7482,7 @@ def _iter_common_validated_direct_edges(
                        THEN 'interface_method'
                      ELSE 'method'
                    END
-            FROM {schema}.direct_edges AS e
+            FROM {edge_source}
             JOIN {schema}.members AS m
               ON m.member_identity=e.caller_member_identity
             {owner_join}
@@ -6733,11 +7490,15 @@ def _iter_common_validated_direct_edges(
         """
         query = (
             projection.format(
-                schema="base_side", owner_join=owner_join
+                schema="base_side",
+                edge_source=edge_source.format(schema="base_side"),
+                owner_join=owner_join,
             )
             + " INTERSECT "
             + projection.format(
-                schema="current_side", owner_join=owner_join
+                schema="current_side",
+                edge_source=edge_source.format(schema="current_side"),
+                owner_join=owner_join,
             )
         )
         for row in connection.execute(query):
@@ -10529,7 +11290,13 @@ def validate_generation(
             continue
         sidecar = generation / str(name)
         actual = (
-            _sha256_file(sidecar)
+            _sha256_file(
+                sidecar,
+                progress_callback=progress_callback,
+                progress_phase="validation-generation-integrity",
+                progress_message="逐字节校验生成侧车完整性",
+                progress_item=str(name),
+            )
             if not sidecar.is_symlink() and sidecar.is_file()
             else "MISSING_OR_SYMLINK"
         )
@@ -10794,6 +11561,7 @@ def validate_generation(
             databases_equal = _sqlite_logical_contents_equal(
                 generation / base_db_name,
                 generation / current_db_name,
+                progress_callback=progress_callback,
             )
             _notify_progress(
                 progress_callback,
@@ -10826,6 +11594,12 @@ def validate_generation(
     foundational_validation_cache: dict[
         tuple[Any, ...], dict[str, Any]
     ] = {}
+    foundational_member_ranges_cache: dict[
+        tuple[Any, ...], Mapping[str, tuple[int, int, int]] | None
+    ] = {}
+    member_rowid_ranges_by_side: dict[
+        str, Mapping[str, tuple[int, int, int]] | None
+    ] = {}
 
     # Pass 1 proves every immutable/artifact/bytecode fact for both sides.
     # Do not start target-JVM reflection or graph semantics until this cheaper
@@ -10841,6 +11615,9 @@ def validate_generation(
                 cached_foundational_truth
             )
             truth_parts[side_name] = cached_foundational_truth
+            member_rowid_ranges_by_side[side_name] = (
+                foundational_member_ranges_cache.get(side_validation_key)
+            )
             _notify_progress(
                 progress_callback,
                 "validation-side-cache",
@@ -10854,6 +11631,7 @@ def validate_generation(
         connection = _open_immutable_sqlite(db_path)
         connection.row_factory = sqlite3.Row
         production_structural_cache = _ProductionStructuralSpoolCache()
+        member_range_output: dict[str, Any] = {}
         try:
             javap = str(jdk_tool_path(jdk_home, "javap"))
             edge_issues, edge_truth = _validate_direct_edges(
@@ -10871,6 +11649,10 @@ def validate_generation(
                 retain_truth_rows=False,
                 production_structural_cache=production_structural_cache,
                 validated_projection_cache=validated_projection_cache,
+                member_rowid_ranges_output=member_range_output,
+            )
+            member_rowid_ranges_by_side[side_name] = (
+                member_range_output.get("ranges")
             )
             structural_issues, structural_truth = _validate_structural_edges(
                 connection,
@@ -10895,12 +11677,16 @@ def validate_generation(
                 foundational_validation_cache[
                     side_validation_key
                 ] = foundational_truth
+                foundational_member_ranges_cache[
+                    side_validation_key
+                ] = member_range_output.get("ranges")
         finally:
             production_structural_cache.clear()
             connection.close()
 
     validated_projection_cache.clear()
     foundational_validation_cache.clear()
+    foundational_member_ranges_cache.clear()
     clear_immutable_oracle_cache()
 
     if issues:
@@ -11028,6 +11814,8 @@ def validate_generation(
                 independent_classes,
                 platform_realm,
                 jdk_home,
+                progress_callback=progress_callback,
+                progress_label=side_name,
             )
             resource_issues, resource_truth = _validate_resource_selections(
                 connection,
@@ -11118,7 +11906,10 @@ def validate_generation(
         observations_by_side.get("current") or {},
         (truth_parts.get("current") or {}).get("resource_selections") or (),
         _iter_validated_direct_edges(
-            generation / "current_binary_facts.sqlite"
+            generation / "current_binary_facts.sqlite",
+            member_rowid_ranges=member_rowid_ranges_by_side.get("current"),
+            progress_callback=progress_callback,
+            progress_label="current：重放入口发现调用边",
         ),
         current_instruction_source,
     )
@@ -11139,7 +11930,10 @@ def validate_generation(
         observations_by_side.get("current") or {},
         current_instruction_source,
         _iter_validated_direct_edges(
-            generation / "current_binary_facts.sqlite"
+            generation / "current_binary_facts.sqlite",
+            member_rowid_ranges=member_rowid_ranges_by_side.get("current"),
+            progress_callback=progress_callback,
+            progress_label="current：重放语义覆盖调用边",
         ),
         (truth_parts.get("current") or {}).get("resource_selections") or (),
     )

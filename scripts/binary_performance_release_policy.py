@@ -179,8 +179,8 @@ def _policy_payload() -> dict[str, Any]:
                 "89abc64c805"
             ),
             "validator_implementation_identity": (
-                "1676fc8e4a481ef8946f1c5326042f57238d1988b5b49e88627b4"
-                "7486b8f4be5"
+                "28f65df630dc92ad3bbb0d897a70d60dce4cc035253d279f3432a"
+                "a3ae1385935"
             ),
         },
         "thresholds": {
