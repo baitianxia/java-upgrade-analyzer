@@ -803,6 +803,52 @@ class CompatBoundaryTest(unittest.TestCase):
             )
         release_kernel.TerminateJobObject.assert_not_called()
 
+    def test_windows_job_assignment_retries_only_access_denied(self):
+        def attach(kernel, error_codes):
+            process = SimpleNamespace(_handle=88)
+            with patch.object(compat, "IS_WINDOWS", True), patch.object(
+                compat.os, "name", "nt",
+            ), patch.object(
+                ctypes, "WinDLL", return_value=kernel, create=True,
+            ), patch.object(
+                ctypes, "get_last_error", side_effect=error_codes, create=True,
+            ), patch.object(
+                ctypes,
+                "WinError",
+                side_effect=lambda code: OSError(code),
+                create=True,
+            ), patch.object(compat.time, "sleep") as sleep:
+                compat._attach_windows_managed_job(process)
+            return process, sleep
+
+        transient = self._windows_kernel()
+        transient.AssignProcessToJobObject.side_effect = [False, False, True]
+        process, sleep = attach(transient, [5, 5])
+        self.assertEqual(transient.AssignProcessToJobObject.call_count, 3)
+        self.assertEqual(
+            [item.args[0] for item in sleep.call_args_list],
+            [
+                compat._WINDOWS_JOB_ASSIGNMENT_RETRY_DELAY_SECONDS,
+                compat._WINDOWS_JOB_ASSIGNMENT_RETRY_DELAY_SECONDS * 2,
+            ],
+        )
+        self.assertEqual(
+            getattr(process, compat._WINDOWS_JOB_HANDLE_ATTRIBUTE), 101,
+        )
+        transient.CloseHandle.assert_not_called()
+
+        persistent = self._windows_kernel(assign=False)
+        with self.assertRaises(OSError):
+            attach(persistent, [5, 5, 5])
+        self.assertEqual(persistent.AssignProcessToJobObject.call_count, 3)
+        persistent.CloseHandle.assert_called_once_with(101)
+
+        deterministic = self._windows_kernel(assign=False)
+        with self.assertRaises(OSError):
+            attach(deterministic, [87])
+        deterministic.AssignProcessToJobObject.assert_called_once()
+        deterministic.CloseHandle.assert_called_once_with(101)
+
     def test_managed_popen_option_conflicts_spawn_and_assignment_failures(self):
         process = SimpleNamespace(pid=1)
         with patch.object(compat, "IS_WINDOWS", True), patch.object(

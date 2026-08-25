@@ -23,6 +23,21 @@ public final class ClassDefinitionVerifier {
         byte[] payload=Json.stringify(value).getBytes(StandardCharsets.UTF_8);
         out.writeInt(payload.length); out.write(payload); out.flush();
     }
+    private static boolean validInternalClassName(String name) {
+        if(name.isEmpty()||name.charAt(0)=='/'||name.charAt(name.length()-1)=='/')return false;
+        boolean componentHasCharacter=false;
+        for(int index=0;index<name.length();index++){
+            char value=name.charAt(index);
+            if(value=='/'){
+                if(!componentHasCharacter)return false;
+                componentHasCharacter=false;
+            }else{
+                if(value=='.'||value==';'||value=='[')return false;
+                componentHasCharacter=true;
+            }
+        }
+        return componentHasCharacter;
+    }
     public static void main(String[] args) {
         if(args.length!=1){System.err.println("usage: ClassDefinitionVerifier <class-bundle>");System.exit(64);}
         try{run(Paths.get(args[0]));}catch(Throwable error){error.printStackTrace(System.err);System.exit(2);}
@@ -83,7 +98,7 @@ public final class ClassDefinitionVerifier {
                     byte[] nameBytes=new byte[(int)unsignedNameLength]; file.readFully(nameBytes);
                     String name=new String(nameBytes,StandardCharsets.UTF_8);
                     if(!Arrays.equals(nameBytes,name.getBytes(StandardCharsets.UTF_8)))throw new IOException("invalid UTF-8 class name");
-                    if(!name.matches("(?:[A-Za-z_$][A-Za-z0-9_$]*|package-info|module-info)(?:/(?:[A-Za-z_$][A-Za-z0-9_$]*|package-info|module-info))*"))throw new IOException("unsafe class name");
+                    if(!validInternalClassName(name))throw new IOException("invalid internal class name");
                     if(previous!=null&&previous.compareTo(name)>=0)throw new IOException("class bundle names are not strictly sorted");
                     long offset=file.getFilePointer(); long end=offset+unsignedClassLength;
                     if(end<offset||end>file.length())throw new IOException("class bundle record exceeds file");

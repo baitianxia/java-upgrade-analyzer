@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 import mmap
 import os
@@ -24,6 +25,7 @@ _DIRECTORY_FSYNC_UNSUPPORTED_ERRNOS = frozenset(
     )
     if value is not None
 )
+_JSON_STREAM_BUFFER_BYTES = 64 * 1024
 
 
 class StreamingJsonReadError(ValueError):
@@ -435,6 +437,76 @@ def fsync_directory(path: str | Path) -> bool:
     return supported
 
 
+def _surrogate_safe_json_text(value: str) -> str:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return "".join(
+            f"\\u{ord(character):04x}"
+            if 0xD800 <= ord(character) <= 0xDFFF
+            else character
+            for character in value
+        )
+    return value
+
+
+def _iter_json_text(
+    value: Any,
+    *,
+    ensure_ascii: bool = False,
+    sort_keys: bool = True,
+    separators=(",", ":"),
+    indent=None,
+    newline: bool = True,
+) -> Iterator[str]:
+    encoder = json.JSONEncoder(
+        ensure_ascii=ensure_ascii,
+        sort_keys=sort_keys,
+        separators=separators if indent is None else None,
+        indent=indent,
+        allow_nan=False,
+    )
+    for chunk in encoder.iterencode(value):
+        yield _surrogate_safe_json_text(chunk)
+    if newline:
+        yield "\n"
+
+
+def iter_json_bytes(
+    value: Any,
+    *,
+    ensure_ascii: bool = False,
+    sort_keys: bool = True,
+    separators=(",", ":"),
+    indent=None,
+    newline: bool = True,
+) -> Iterator[bytes]:
+    """Yield canonical UTF-8 JSON without materializing the full document."""
+
+    buffered = bytearray()
+    for chunk in _iter_json_text(
+        value,
+        ensure_ascii=ensure_ascii,
+        sort_keys=sort_keys,
+        separators=separators,
+        indent=indent,
+        newline=newline,
+    ):
+        encoded = chunk.encode("utf-8")
+        if (
+            buffered
+            and len(buffered) + len(encoded) > _JSON_STREAM_BUFFER_BYTES
+        ):
+            yield bytes(buffered)
+            buffered.clear()
+        if len(encoded) >= _JSON_STREAM_BUFFER_BYTES and not buffered:
+            yield encoded
+        else:
+            buffered.extend(encoded)
+    if buffered:
+        yield bytes(buffered)
+
+
 def stream_json(
     value: Any,
     handle: TextIO,
@@ -445,17 +517,51 @@ def stream_json(
     indent=None,
     newline: bool = True,
 ) -> None:
-    encoder = json.JSONEncoder(
+    for chunk in _iter_json_text(
+        value,
         ensure_ascii=ensure_ascii,
         sort_keys=sort_keys,
-        separators=separators if indent is None else None,
+        separators=separators,
         indent=indent,
-        allow_nan=False,
-    )
-    for chunk in encoder.iterencode(value):
+        newline=newline,
+    ):
         handle.write(chunk)
-    if newline:
-        handle.write("\n")
+
+
+def json_file_digest_if_matches(
+    path: str | Path,
+    value: Any,
+    *,
+    ensure_ascii: bool = False,
+    sort_keys: bool = True,
+    separators=(",", ":"),
+    indent=None,
+    newline: bool = True,
+) -> str | None:
+    """Return the file SHA-256 only when it equals streamed JSON bytes.
+
+    Comparison and hashing share one sequential pass and retain at most one
+    encoder chunk, avoiding a full ``read_bytes`` buffer and a second complete
+    JSON serialization at checkpoint boundaries.
+    """
+
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for expected in iter_json_bytes(
+            value,
+            ensure_ascii=ensure_ascii,
+            sort_keys=sort_keys,
+            separators=separators,
+            indent=indent,
+            newline=newline,
+        ):
+            observed = handle.read(len(expected))
+            if observed != expected:
+                return None
+            digest.update(observed)
+        if handle.read(1):
+            return None
+    return digest.hexdigest()
 
 
 def write_json_streaming(

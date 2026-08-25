@@ -11,7 +11,7 @@ import tempfile
 import threading
 import unittest
 import warnings
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from types import MappingProxyType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 import zipfile
@@ -456,6 +456,49 @@ class BinaryValidationOracleBoundaryTest(unittest.TestCase):
             oracle._provider_resource_path("file:/tmp/provider.jar"),
             Path("/tmp/provider.jar").resolve(),
         )
+        for value in (
+            "file:/C:/workspace/provider.jar",
+            "file:///C:/workspace/provider.jar",
+            "file://C:/workspace/provider.jar",
+            "jar:file:/C:/workspace/provider.jar!/demo/Api.class",
+        ):
+            resource = value[4:].split("!/", 1)[0] if value.startswith("jar:") else value
+            decoded = oracle._decoded_file_url_path(
+                oracle.urlparse(resource), windows=True
+            )
+            self.assertEqual(
+                PureWindowsPath(decoded),
+                PureWindowsPath("C:/workspace/provider.jar"),
+            )
+            self.assertNotIn("C:\\C:", decoded)
+        self.assertEqual(
+            PureWindowsPath(oracle._decoded_file_url_path(
+                oracle.urlparse("file://server/share/provider.jar"),
+                windows=True,
+            )),
+            PureWindowsPath("//server/share/provider.jar"),
+        )
+
+        class CapturingPath:
+            def __init__(self, value):
+                self.value = str(value)
+
+            def resolve(self):
+                return self.value
+
+        oracle._file_url_path.cache_clear()
+        try:
+            with patch.object(oracle.os, "name", "nt"), patch.object(
+                oracle, "Path", CapturingPath,
+            ):
+                self.assertEqual(
+                    oracle._provider_resource_path(
+                        "jar:file:/C:/workspace/provider.jar!/demo/Api.class"
+                    ),
+                    r"C:\workspace\provider.jar",
+                )
+        finally:
+            oracle._file_url_path.cache_clear()
 
         self.assertEqual(
             oracle._descriptor_return_class("()Ldemo/Type;"), "demo/Type",
@@ -699,6 +742,31 @@ class BinaryValidationOracleBoundaryTest(unittest.TestCase):
             self.assertEqual(
                 json.loads(destination.read().decode("utf-8")), {"value": 1},
             )
+        large_result = {
+            "issues": [
+                {"domain": "provider", "index": index, "text": "问题" * 8}
+                for index in range(20_000)
+            ]
+        }
+        real_write = os.write
+        write_sizes = []
+
+        def observed_write(descriptor, payload):
+            write_sizes.append(len(payload))
+            return real_write(descriptor, payload)
+
+        with tempfile.TemporaryFile() as destination, patch.object(
+            oracle.os, "write", side_effect=observed_write,
+        ), patch.object(
+            oracle,
+            "surrogate_safe_json_dumps",
+            side_effect=AssertionError("full JSON serialization is forbidden"),
+        ):
+            oracle._write_json_descriptor(destination.fileno(), large_result)
+            size = destination.seek(0, os.SEEK_END)
+        self.assertGreater(size, 1_000_000)
+        self.assertGreater(len(write_sizes), 10)
+        self.assertLess(max(write_sizes), 128 * 1024)
         with patch.object(oracle.os, "write", return_value=0):
             with self.assertRaises(OSError):
                 oracle._write_json_descriptor(9, {"value": 1})

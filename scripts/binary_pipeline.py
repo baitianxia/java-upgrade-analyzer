@@ -106,7 +106,7 @@ from path_runtime import short_temporary_directory
 from jdk_preflight import JdkPreflightError, preflight_jdk_home
 from process_lock import exclusive_file_lock
 from process_metrics import windows_current_process_usage
-from streaming_json import fsync_directory
+from streaming_json import fsync_directory, json_file_digest_if_matches
 
 
 SUPPORT_MANIFEST_PATH = Path(__file__).with_name("binary_first_support_manifest.json")
@@ -3081,18 +3081,20 @@ def _persist_validation_checkpoint(
         if key != "validation_result_path"
     }
     try:
-        content = expected_path.read_bytes()
+        validation_result_sha256 = json_file_digest_if_matches(
+            expected_path,
+            expected_payload,
+        )
     except OSError as error:
         raise BinaryPipelineError(
             "BINARY_VALIDATION_CHECKPOINT_ATTACHMENT_INVALID",
             f"{expected_path}: {error}",
         ) from error
-    if content != _canonical_json_bytes(expected_payload):
+    if validation_result_sha256 is None:
         raise BinaryPipelineError(
             "BINARY_VALIDATION_CHECKPOINT_ATTACHMENT_INVALID",
             str(expected_path),
         )
-    validation_result_sha256 = hashlib.sha256(content).hexdigest()
     if (
         status == "passed"
         and not is_complete_v3_validation_result(expected_payload, manifest)
@@ -3206,7 +3208,9 @@ def _record_resume_decision(
 
 def _validation_failure_detail(validation: Mapping[str, Any]) -> dict[str, Any]:
     """Keep failure output bounded while pointing at the complete persisted truth."""
-    issues = list(validation.get("issues") or ())
+    issues = validation.get("issues")
+    if not isinstance(issues, list):
+        issues = []
     try:
         issue_count = int(validation.get("issue_count", len(issues)))
     except (TypeError, ValueError):

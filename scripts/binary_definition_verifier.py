@@ -8,7 +8,7 @@ import hashlib
 import io
 import json
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import shutil
 import struct
 import weakref
@@ -31,6 +31,23 @@ _MAX_BUNDLE_CLASS_BYTES = 0x7FFF_FFFF
 
 class ClassDefinitionVerifierError(BinaryFirstContractError):
     pass
+
+
+def _is_valid_internal_class_name(value: Any) -> bool:
+    """Match the JVMS 4.2.1/4.2.2 internal-name grammar.
+
+    An internal name is a slash-separated sequence of non-empty unqualified
+    names.  The JVM excludes only ``.``, ``;``, ``[`` and the separator ``/``
+    from each component; source-language identifier rules do not apply.
+    """
+
+    if type(value) is not str or not value:
+        return False
+    return all(
+        component
+        and not any(character in component for character in ".;[")
+        for component in value.split("/")
+    )
 
 
 def _remove_owned_helper_directory(
@@ -155,13 +172,7 @@ def _write_class_bundle(
         handle.write(_BUNDLE_MAGIC)
         handle.write(struct.pack(">I", len(names)))
         for name in names:
-            logical_path = PurePosixPath(name)
-            if (
-                logical_path.is_absolute()
-                or ".." in logical_path.parts
-                or not name
-                or "." in name
-            ):
+            if not _is_valid_internal_class_name(name):
                 raise ClassDefinitionVerifierError(
                     "CLASS_DEFINITION_NAME_INVALID", name
                 )

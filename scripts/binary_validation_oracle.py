@@ -21,6 +21,7 @@ import hashlib
 import heapq
 from itertools import chain
 import json
+import ntpath
 import os
 from pathlib import Path
 import pickle
@@ -65,6 +66,7 @@ from streaming_json import (
     files_equal,
     fsync_directory,
     iter_canonical_json_object_array,
+    iter_json_bytes,
     load_canonical_json_top_level_value,
     prime_canonical_json_fields,
     stream_json,
@@ -2458,7 +2460,34 @@ def _file_url_path(value: str) -> Path | None:
     parsed = urlparse(value)
     if parsed.scheme != "file":
         return None
-    return Path(unquote(parsed.path)).resolve()
+    decoded = _decoded_file_url_path(parsed, windows=os.name == "nt")
+    return Path(decoded).resolve() if decoded else None
+
+
+def _decoded_file_url_path(parsed: Any, *, windows: bool) -> str:
+    """Decode a JVM file URL without turning ``/C:/`` into ``C:\\C:``.
+
+    JVM resource/code-source URLs use URI paths even on Windows.  A leading
+    slash before a drive designator is URI syntax, not a Windows root-relative
+    path.  UNC authorities remain part of the resulting path.
+    """
+
+    path = unquote(str(parsed.path or ""))
+    authority = unquote(str(parsed.netloc or ""))
+    remote_authority = authority if authority.lower() != "localhost" else ""
+    if windows:
+        if re.fullmatch(r"[A-Za-z]:", remote_authority):
+            path = f"{remote_authority}{path}"
+        elif remote_authority:
+            path = f"//{remote_authority}{path}"
+        elif re.match(r"^/[A-Za-z]:(?:/|$)", path):
+            path = path[1:]
+        if not path:
+            return ""
+        return ntpath.normpath(path.replace("/", "\\"))
+    if remote_authority:
+        path = f"//{remote_authority}{path}"
+    return path
 
 
 def _provider_resource_path(value: str) -> Path | None:
@@ -10685,25 +10714,22 @@ def _fsync_bound_directory(descriptor: int) -> bool:
 
 
 def _write_json_descriptor(descriptor: int, value: Any) -> None:
-    payload = surrogate_safe_json_dumps(
+    for payload in iter_json_bytes(
         value,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
-    remaining = memoryview(payload)
-    while remaining:
-        written = os.write(descriptor, remaining)
-        if written <= 0:
-            raise OSError(errno.EIO, "validation attachment write made no progress")
-        remaining = remaining[written:]
-    remaining = memoryview(b"\n")
-    while remaining:
-        written = os.write(descriptor, remaining)
-        if written <= 0:
-            raise OSError(errno.EIO, "validation attachment write made no progress")
-        remaining = remaining[written:]
+        newline=True,
+    ):
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise OSError(
+                    errno.EIO,
+                    "validation attachment write made no progress",
+                )
+            remaining = remaining[written:]
     os.fsync(descriptor)
 
 

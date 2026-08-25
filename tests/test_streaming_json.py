@@ -1,4 +1,5 @@
 import errno
+import hashlib
 import io
 import json
 import mmap
@@ -14,11 +15,13 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import streaming_json  # noqa: E402
+from binary_first_contract import surrogate_safe_json_dumps  # noqa: E402
 from streaming_json import (  # noqa: E402
     StreamingJsonReadError,
     files_equal,
     fsync_directory,
     iter_canonical_json_object_array,
+    json_file_digest_if_matches,
     load_canonical_json_top_level_value,
     prime_canonical_json_fields,
     write_json_streaming,
@@ -27,6 +30,26 @@ from streaming_json import (  # noqa: E402
 
 
 class StreamingJsonTest(unittest.TestCase):
+    def test_streamed_bytes_match_frozen_surrogate_safe_json_encoding(self):
+        payload = {
+            "literal": r"\ud800",
+            "raw": json.loads('"\\ud800"'),
+            "unicode": "问题😀",
+        }
+        expected = (
+            surrogate_safe_json_dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+        self.assertEqual(
+            b"".join(streaming_json.iter_json_bytes(payload)), expected
+        )
+
     def test_structure_cursor_covers_reconnected_plain_string_and_negative_depth(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "structure.bin"
@@ -382,6 +405,38 @@ class StreamingJsonTest(unittest.TestCase):
             + "\n"
         ).encode("utf-8")
         self.assertEqual(encoded, expected)
+
+    def test_streamed_json_file_match_hashes_without_whole_document_bytes(self):
+        raw_surrogate = json.loads('"\\ud800"')
+        payload = {
+            "issues": [
+                {
+                    "domain": "provider",
+                    "index": index,
+                    "text": raw_surrogate if index == 0 else "问题" * 8,
+                }
+                for index in range(20_000)
+            ],
+            "status": "failed",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "validation.json"
+            write_json_streaming(destination, payload)
+            expected_digest = hashlib.sha256(destination.read_bytes()).hexdigest()
+            with patch.object(
+                Path,
+                "read_bytes",
+                side_effect=AssertionError("whole-file read is forbidden"),
+            ):
+                self.assertEqual(
+                    json_file_digest_if_matches(destination, payload),
+                    expected_digest,
+                )
+            with destination.open("ab") as handle:
+                handle.write(b"x")
+            self.assertIsNone(
+                json_file_digest_if_matches(destination, payload)
+            )
 
     def test_stream_encoder_covers_indented_output_without_terminal_newline(self):
         handle = io.StringIO()

@@ -462,6 +462,9 @@ def managed_foreground_process_kwargs():
 
 
 _WINDOWS_JOB_HANDLE_ATTRIBUTE = "_jua_managed_job_handle"
+_WINDOWS_JOB_ASSIGNMENT_RETRY_COUNT = 2
+_WINDOWS_JOB_ASSIGNMENT_RETRY_DELAY_SECONDS = 0.05
+_WINDOWS_ERROR_ACCESS_DENIED = 5
 _MANAGED_PROCESS_TREE_TOKEN_ATTRIBUTE = "_jua_managed_process_tree_token"
 _MANAGED_PROCESS_TREE_LOCK = threading.RLock()
 _MANAGED_PROCESS_TREES = {}
@@ -638,8 +641,22 @@ def _attach_windows_managed_job(proc):
         raise ctypes.WinError(ctypes.get_last_error())
     try:
         process_handle = wintypes.HANDLE(int(proc._handle))
-        if not kernel32.AssignProcessToJobObject(job_handle, process_handle):
-            raise ctypes.WinError(ctypes.get_last_error())
+        for attempt in range(_WINDOWS_JOB_ASSIGNMENT_RETRY_COUNT + 1):
+            if kernel32.AssignProcessToJobObject(job_handle, process_handle):
+                break
+            error_code = ctypes.get_last_error()
+            if (
+                error_code != _WINDOWS_ERROR_ACCESS_DENIED
+                or attempt >= _WINDOWS_JOB_ASSIGNMENT_RETRY_COUNT
+            ):
+                raise ctypes.WinError(error_code)
+            # A bounded retry accommodates a genuinely transient denial
+            # without treating every Job Object failure as transient.  Keep
+            # the Job handle/process unchanged; other errors still fail closed
+            # without delaying deterministic faults.
+            time.sleep(
+                _WINDOWS_JOB_ASSIGNMENT_RETRY_DELAY_SECONDS * (attempt + 1)
+            )
         setattr(proc, _WINDOWS_JOB_HANDLE_ATTRIBUTE, int(job_handle))
     except BaseException:
         kernel32.CloseHandle(job_handle)

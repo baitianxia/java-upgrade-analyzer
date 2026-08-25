@@ -175,6 +175,86 @@ class BinaryDefinitionVerifierTest(unittest.TestCase):
                 },
             )
 
+    def test_internal_class_name_validation_matches_jvms_unqualified_names(self):
+        okio_hyphen_names = (
+            "okio/-Base64",
+            "okio/-DeflaterSinkExtensions",
+            "okio/-DeprecatedOkio",
+            "okio/-DeprecatedUpgrade",
+            "okio/-DeprecatedUtf8",
+            "okio/-GzipSinkExtensions",
+            "okio/-GzipSourceExtensions",
+            "okio/-InflaterSourceExtensions",
+            "okio/-SegmentedByteString",
+            "okio/internal/-Buffer",
+            "okio/internal/-ByteString",
+            "okio/internal/-FileSystem",
+            "okio/internal/-FileSystem$collectRecursively$1",
+            "okio/internal/-FileSystem$commonDeleteRecursively$sequence$1",
+            "okio/internal/-FileSystem$commonListRecursively$1",
+            "okio/internal/-Path",
+            "okio/internal/-RealBufferedSink",
+            "okio/internal/-RealBufferedSource",
+            "okio/internal/-SegmentedByteString",
+        )
+        self.assertEqual(len(okio_hyphen_names), 19)
+        for name in okio_hyphen_names:
+            with self.subTest(name=name):
+                self.assertTrue(verifier._is_valid_internal_class_name(name))
+        for name in (
+            "", "/demo/A", "demo/A/", "demo//A", "demo.A", "demo/A;B",
+            "demo/[A",
+        ):
+            with self.subTest(name=name):
+                self.assertFalse(verifier._is_valid_internal_class_name(name))
+
+    def test_hyphen_and_case_distinct_names_define_from_one_bundle(self):
+        home = jdk_home()
+        if not home or not shutil.which("javac"):
+            self.skipTest("full JDK required")
+        renames = {
+            "XBase64": "-Base64",
+            "AAAAAAAAAAAAAAA": "SLF4JLogFactory",
+            "BBBBBBBBBBBBBBB": "Slf4jLogFactory",
+        }
+        self.assertTrue(all(
+            len(source) == len(target) for source, target in renames.items()
+        ))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "src" / "demo" / "Fixture.java"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                "package demo; class XBase64 {} "
+                "class AAAAAAAAAAAAAAA {} class BBBBBBBBBBBBBBB {}\n",
+                encoding="utf-8",
+            )
+            classes = root / "classes"
+            classes.mkdir()
+            completed = subprocess.run(
+                ["javac", "-d", str(classes), str(source)],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            selected = {}
+            for original, renamed in renames.items():
+                content = (classes / "demo" / f"{original}.class").read_bytes()
+                original_name = f"demo/{original}".encode("utf-8")
+                renamed_name = f"demo/{renamed}".encode("utf-8")
+                self.assertIn(original_name, content)
+                selected[f"demo/{renamed}"] = content.replace(
+                    original_name, renamed_name
+                )
+            outcomes = verify_class_definitions(
+                JdkPlatformImage(home, asm_jar=resolve_asm_jar()), selected
+            )
+
+        self.assertEqual(set(outcomes), set(selected))
+        self.assertTrue(all(
+            outcome["status"] == "definition_ready"
+            for outcome in outcomes.values()
+        ), outcomes)
+
     @unittest.skipUnless(hasattr(os, "fork"), "fork is unavailable")
     def test_forked_child_cache_clear_does_not_remove_parent_helper(self):
         verifier._compile_helper.cache_clear()

@@ -138,6 +138,63 @@ class BinaryPipelineTest(unittest.TestCase):
             "BINARY_VALIDATION_CHECKPOINT_STATE_INVALID",
         )
 
+    def test_validation_checkpoint_compares_large_attachment_without_full_read(self):
+        output = self.root / "streamed-validation-checkpoint"
+        generation, manifest = self._resume_generation(output)
+        generation = generation.resolve()
+        config = {
+            "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+            "base": {"artifacts": []},
+            "current": {"artifacts": []},
+        }
+        issues = [
+            {
+                "domain": "provider",
+                "reason_code": "ORACLE_ARTIFACT_PROVIDER_MISMATCH",
+                "evidence": {"index": index, "path": "C:/workspace/app.jar"},
+            }
+            for index in range(20_000)
+        ]
+        validation = self._resume_validation_result(
+            generation,
+            manifest,
+            "failed",
+            issues=issues,
+            issue_count=len(issues),
+            domain_summary={"provider": {"issues": len(issues)}},
+        )
+        validation_path = Path(validation["validation_result_path"])
+        expected_sha256 = hashlib.sha256(validation_path.read_bytes()).hexdigest()
+        checkpoint = binary_pipeline._normalized_resume_checkpoint(
+            self._resume_checkpoint(config, manifest)
+        )
+        real_read_bytes = Path.read_bytes
+
+        def guarded_read_bytes(path):
+            if Path(path) == validation_path:
+                raise AssertionError("whole validation attachment read is forbidden")
+            return real_read_bytes(Path(path))
+
+        with patch.object(
+            Path, "read_bytes", autospec=True, side_effect=guarded_read_bytes,
+        ), patch.object(
+            binary_pipeline,
+            "_canonical_json_bytes",
+            side_effect=AssertionError("full JSON serialization is forbidden"),
+        ), patch.object(
+            binary_pipeline,
+            "_write_resume_checkpoint_roundtrip",
+            side_effect=lambda _root, payload, **_kwargs: dict(payload),
+        ):
+            updated = binary_pipeline._persist_validation_checkpoint(
+                output, generation, manifest, checkpoint, validation
+            )
+
+        self.assertEqual(updated["validation_result_sha256"], expected_sha256)
+        self.assertEqual(
+            updated["status"], binary_pipeline._RESUME_VALIDATION_FAILED
+        )
+
     @unittest.skipUnless(
         binary_pipeline._secure_resume_checkpoint_dirfd_supported(),
         "checkpoint mutation requires POSIX dir_fd support",
