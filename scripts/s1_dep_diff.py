@@ -37,6 +37,7 @@ from artifact_safety import (
     _archive_entry_expansion_ratio,
     _unsafe_entry_name,
     is_allowed_duplicate_archive_entry,
+    jar_signature_metadata,
     require_safe_archive,
 )
 from artifact_coordinates import normalize_artifact_coord
@@ -140,6 +141,9 @@ def _business_content_entries(archive):
     has_application_layout = any(
         name.startswith(application_prefixes) for name in names
     )
+    rewrite_sensitive_signature_entries = set(
+        jar_signature_metadata(names).rewrite_sensitive_entries
+    )
     entries = []
     seen_targets = set()
     for name in names:
@@ -161,9 +165,7 @@ def _business_content_entries(archive):
             upper_name = name.upper()
             packaging_only = (
                 upper_name.startswith('META-INF/MAVEN/')
-                or bool(re.fullmatch(
-                    r'META-INF/[^/]+\.(?:SF|RSA|DSA|EC)', upper_name
-                ))
+                or name in rewrite_sensitive_signature_entries
             )
             if packaging_only or name.startswith(('BOOT-INF/', 'WEB-INF/', 'lib/')):
                 continue

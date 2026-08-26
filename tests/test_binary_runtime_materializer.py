@@ -376,7 +376,7 @@ class BinaryRuntimeMaterializerTest(unittest.TestCase):
             ):
                 materialize_binary_pipeline_config(report)
 
-    def test_signed_or_sealed_runtime_is_not_labeled_unsigned_unsealed(self):
+    def test_signed_or_sealed_outer_degrades_without_aborting_materialization(self):
         for label, extra_entries in (
             (
                 "main-sealed",
@@ -445,11 +445,58 @@ class BinaryRuntimeMaterializerTest(unittest.TestCase):
                     json.dumps(provenance), encoding="utf-8"
                 )
 
-                with self.assertRaisesRegex(
-                    BinaryRuntimeMaterializationError,
-                    "BINARY_RUNTIME_SIGNED_OR_SEALED_UNSUPPORTED",
-                ):
-                    materialize_binary_pipeline_config(report)
+                config = materialize_binary_pipeline_config(report)
+                profile = config["base"]["runtime_profile"]
+                self.assertEqual(
+                    profile[
+                        "runtime_security_and_package_sealing_policy_identity"
+                    ],
+                    "unsupported-outer-signed-or-sealed-v1",
+                )
+                self.assertEqual(
+                    profile["runtime_configuration_coverage_status"], "partial"
+                )
+                self.assertTrue(any(
+                    gap.startswith("outer_runtime_security_unsupported:")
+                    for gap in profile["runtime_configuration_coverage_gaps"]
+                ))
+
+    def test_orphan_outer_signature_file_is_treated_as_unsigned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self.fixture(Path(tmp))
+            dependencies = report / "evidence" / "dependencies"
+            manifest_path = dependencies / "dependency_jars.json"
+            provenance_path = dependencies / "build_provenance.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+            business = next(
+                item for item in manifest["business_artifacts"]
+                if item["side"] == "base"
+            )
+            outer = Path(business["outer_artifact_path"])
+            with zipfile.ZipFile(outer, "a") as archive:
+                archive.writestr(
+                    "META-INF/BOOT.SF", "Signature-Version: 1.0\r\n\r\n"
+                )
+            outer_sha = hashlib.sha256(outer.read_bytes()).hexdigest()
+            business["outer_artifact_sha256"] = outer_sha
+            next(
+                item for item in manifest["items"] if item["side"] == "base"
+            )["outer_artifact_sha256"] = outer_sha
+            next(
+                item for item in provenance["sides"] if item["side"] == "base"
+            )["artifact_sha256"] = outer_sha
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+
+            config = materialize_binary_pipeline_config(report)
+
+            self.assertEqual(
+                config["base"]["runtime_profile"][
+                    "runtime_security_and_package_sealing_policy_identity"
+                ],
+                "standard-unsealed-unsigned-v1",
+            )
 
     def test_retained_signed_or_sealed_dependency_does_not_abort_step4(self):
         variants = (
@@ -514,7 +561,7 @@ class BinaryRuntimeMaterializerTest(unittest.TestCase):
                     config["base"]["artifacts"][1]["content_sha256"], nested_sha
                 )
 
-    def test_plain_signed_outer_is_rejected_before_unsigned_profile_claim(self):
+    def test_plain_signed_outer_is_degraded_before_unsigned_profile_claim(self):
         with tempfile.TemporaryDirectory() as tmp:
             report = self.fixture(Path(tmp))
             dependencies = report / "evidence" / "dependencies"
@@ -556,11 +603,14 @@ class BinaryRuntimeMaterializerTest(unittest.TestCase):
                 json.dumps(provenance), encoding="utf-8"
             )
 
-            with self.assertRaisesRegex(
-                BinaryRuntimeMaterializationError,
-                "BINARY_RUNTIME_SIGNED_OR_SEALED_UNSUPPORTED",
-            ):
-                materialize_binary_pipeline_config(report)
+            config = materialize_binary_pipeline_config(report)
+
+            self.assertEqual(
+                config["base"]["runtime_profile"][
+                    "runtime_security_and_package_sealing_policy_identity"
+                ],
+                "unsupported-outer-signed-or-sealed-v1",
+            )
 
     def test_materialized_config_carries_step0_jdk_preflight_identity(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -5657,6 +5657,53 @@ public class demo.ArrayCasts {
             },
         }
 
+    def test_unsupported_outer_security_completes_as_non_authoritative(self):
+        base = self._jar("unsupported-security-base", 1)
+        current = self._jar("unsupported-security-current", 2)
+        config = {
+            "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+            "source_usage": {
+                "decision": "skip_source",
+                "decision_source": "explicit_config",
+            },
+            "asm_jar": str(self.asm_jar),
+            "base": self._side(base, "1"),
+            "current": self._side(current, "2"),
+        }
+        for side in (config["base"], config["current"]):
+            profile = side["runtime_profile"]
+            profile[
+                "runtime_security_and_package_sealing_policy_identity"
+            ] = "unsupported-outer-signed-or-sealed-v1"
+            profile["runtime_configuration_coverage_status"] = "partial"
+            profile["runtime_configuration_coverage_gaps"] = [
+                "outer_runtime_security_unsupported:signature_entry:META-INF/APP.RSA"
+            ]
+            profile["resource_selection_coverage_status"] = "partial"
+
+        result = run_pipeline(
+            config,
+            output_root=self.root / "unsupported-security-output",
+        )
+        verification = json.loads(
+            (
+                Path(result["generation_directory"])
+                / "binary_definition_verification.json"
+            ).read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(result["validation_status"], "passed")
+        for side in ("base", "current"):
+            summary = verification[side]
+            self.assertGreater(
+                summary["definition_status_counts"].get("security_failed", 0),
+                0,
+            )
+            self.assertTrue(any(
+                item["reason"] == "runtime_security_policy_unsupported"
+                for item in summary["failure_samples"]
+            ))
+
     def test_identical_sides_share_indexes_and_reuse_semantic_preflight(self):
         artifact = self._jar("identical-shared-runtime", 1)
         side = self._side(artifact, "1")
@@ -7851,6 +7898,9 @@ public class demo.ArrayCasts {
                 deployed_archive.writestr(
                     f"BOOT-INF/lib/{core.name}", core.read_bytes()
                 )
+                deployed_archive.writestr(
+                    "META-INF/BOOT.SF", "Signature-Version: 1.0\r\n\r\n"
+                )
             outer_digest = digest(outer)
             manifest["business_artifacts"].append({
                 "side": side,
@@ -7897,6 +7947,13 @@ public class demo.ArrayCasts {
         )
 
         config = materialize_binary_pipeline_config(report)
+        for side in ("base", "current"):
+            self.assertEqual(
+                config[side]["runtime_profile"][
+                    "runtime_security_and_package_sealing_policy_identity"
+                ],
+                "standard-unsealed-unsigned-v1",
+            )
         config["asm_jar"] = str(self.asm_jar)
         result = run_pipeline(
             config,

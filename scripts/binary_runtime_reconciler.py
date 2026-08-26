@@ -9,6 +9,7 @@ from functools import lru_cache
 import json
 from typing import Any, Iterable, Mapping
 
+from artifact_safety import is_jar_signature_block_entry
 from binary_definition_verifier import (
     ClassDefinitionVerifierError,
     verifier_identity,
@@ -1248,6 +1249,7 @@ class RuntimeReconciler:
                     definition_status = "unsupported_class_version"
                 elif not security_supported:
                     definition_status = "security_failed"
+                    evidence["reason"] = "runtime_security_policy_unsupported"
                 elif self._artifact_security_unsupported(row["artifact_instance_identity"]):
                     definition_status = "security_failed"
                     evidence["reason"] = "signed_or_sealed_artifact_unsupported"
@@ -1338,7 +1340,14 @@ class RuntimeReconciler:
             where="artifact_instance_identity=? AND resource_category='operational_security'",
             parameters=(artifact_identity,),
         )
-        if resources and not self.capability.signed_artifacts_supported:
+        has_signature_block_candidate = any(
+            is_jar_signature_block_entry(row.get("resource_name"))
+            for row in resources
+        )
+        if (
+            has_signature_block_candidate
+            and not self.capability.signed_artifacts_supported
+        ):
             unsupported = True
         else:
             manifest = self._artifact_manifest(artifact_identity)

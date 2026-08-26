@@ -2274,7 +2274,20 @@ class Step1DependencyDiffCompletionBoundaryTest(unittest.TestCase):
             Info("lib/b.jar"),
             Info("app/Main.class"),
         ]))
-        self.assertEqual(plain_entries, [("app/Main.class", "app/Main.class")])
+        self.assertEqual(plain_entries, [
+            ("META-INF/SIGNATURE.SF", "META-INF/SIGNATURE.SF"),
+            ("app/Main.class", "app/Main.class"),
+        ])
+        signed_entries = s1_dep_diff._business_content_entries(Archive([
+            Info("META-INF/SIGNATURE.SF"),
+            Info("META-INF/SIGNATURE.RSA"),
+            Info("META-INF/ORPHAN.SF"),
+            Info("app/Main.class"),
+        ]))
+        self.assertEqual(signed_entries, [
+            ("META-INF/ORPHAN.SF", "META-INF/ORPHAN.SF"),
+            ("app/Main.class", "app/Main.class"),
+        ])
         application_entries = s1_dep_diff._business_content_entries(Archive([
             Info("BOOT-INF/classes/"),
             Info("BOOT-INF/classes/app/Main.class"),

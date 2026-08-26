@@ -11,6 +11,7 @@ import shlex
 from typing import Any, Mapping
 import zipfile
 
+from artifact_safety import jar_signature_metadata
 from binary_artifact_diff import (
     BinaryArtifactDiffError,
     _manifest_is_multi_release,
@@ -214,6 +215,11 @@ def _outer_business_content_inventory(outer_path: Path) -> dict[str, str]:
     try:
         with zipfile.ZipFile(outer_path) as archive:
             infos = [info for info in archive.infolist() if not info.is_dir()]
+            rewrite_sensitive_signature_entries = set(
+                jar_signature_metadata(
+                    info.filename for info in infos
+                ).rewrite_sensitive_entries
+            )
             prefixes = ("BOOT-INF/classes/", "WEB-INF/classes/")
             has_application_layout = any(
                 info.filename.startswith(prefixes) for info in infos
@@ -236,9 +242,7 @@ def _outer_business_content_inventory(outer_path: Path) -> dict[str, str]:
                     upper_name = name.upper()
                     packaging_only = (
                         upper_name.startswith("META-INF/MAVEN/")
-                        or re.fullmatch(
-                            r"META-INF/[^/]+\.(?:SF|RSA|DSA|EC)", upper_name
-                        ) is not None
+                        or name in rewrite_sensitive_signature_entries
                     )
                     if packaging_only or name.startswith(
                         ("BOOT-INF/", "WEB-INF/", "lib/")
@@ -568,22 +572,21 @@ def _manifest_attributes(content: bytes) -> dict[str, str]:
 def _archive_security_markers(path: Path) -> tuple[str, ...]:
     """Detect JAR signer and package-sealing semantics.
 
-    A rewritten outer business container is still rejected because repacking
-    cannot preserve its signature contract. Retained dependency JARs keep
-    their exact bytes; their markers are handled artifact-by-artifact by the
-    runtime reconciler instead of aborting materialization for the whole side.
+    Repacking cannot preserve an outer container's signature contract, so its
+    markers select an unsupported runtime-security profile and an explicit
+    coverage gap. Retained dependency JARs keep their exact bytes; their
+    markers are handled artifact-by-artifact by the runtime reconciler.
     """
 
     markers = set()
     try:
         with zipfile.ZipFile(path) as archive:
             infos = [info for info in archive.infolist() if not info.is_dir()]
-            for info in infos:
-                if re.fullmatch(
-                    r"META-INF/[^/]+\.(?:SF|RSA|DSA|EC)",
-                    info.filename.upper(),
-                ):
-                    markers.add(f"signature_entry:{info.filename}")
+            signature_metadata = jar_signature_metadata(
+                info.filename for info in infos
+            )
+            for name in signature_metadata.rewrite_sensitive_entries:
+                markers.add(f"signature_entry:{name}")
             manifests = [
                 info for info in infos
                 if info.filename.upper() == "META-INF/MANIFEST.MF"
@@ -610,7 +613,10 @@ def _archive_security_markers(path: Path) -> tuple[str, ...]:
                     normalized_value = value.strip().lower()
                     if normalized_key == "sealed" and normalized_value == "true":
                         markers.add("sealed_manifest_section")
-                    if normalized_key.endswith("-digest"):
+                    if (
+                        signature_metadata.has_signature_block_candidate
+                        and normalized_key.endswith("-digest")
+                    ):
                         markers.add("signed_manifest_digest")
     except (OSError, RuntimeError, zipfile.BadZipFile) as error:
         raise BinaryRuntimeMaterializationError(
@@ -809,11 +815,15 @@ def _side_config(
             "BINARY_RUNTIME_MANIFEST_AMBIGUOUS",
             f"{side}:outer:case-insensitive manifest candidates",
         )
-    if outer_security_markers:
-        raise BinaryRuntimeMaterializationError(
-            "BINARY_RUNTIME_SIGNED_OR_SEALED_UNSUPPORTED",
-            f"{side}:outer:{','.join(outer_security_markers)}",
-        )
+    # Repacking cannot preserve signer or sealing semantics, but rejecting the
+    # whole analysis discards artifact-local facts that remain useful.  Carry
+    # the unsupported policy into runtime reconciliation instead: definitions
+    # are then prevented from becoming authoritative while Step4 can complete
+    # with an explicit coverage gap.
+    outer_runtime_security_markers = tuple(
+        marker for marker in outer_security_markers
+        if marker != "manifest_ambiguous"
+    )
     provenance_rows = [
         dict(item)
         for item in provenance["sides"]
@@ -1002,6 +1012,10 @@ def _side_config(
     )
     configuration_gaps = sorted(set(
         dependency_configuration_gaps + business_configuration_gaps
+        + ([
+            "outer_runtime_security_unsupported:"
+            + ",".join(outer_runtime_security_markers)
+        ] if outer_runtime_security_markers else [])
     ))
     packaged_main_class, main_class_gaps = _packaged_main_class(
         outer_path, business_path
@@ -1060,7 +1074,9 @@ def _side_config(
             }],
         },
         "runtime_security_and_package_sealing_policy_identity": (
-            "standard-unsealed-unsigned-v1"
+            "unsupported-outer-signed-or-sealed-v1"
+            if outer_runtime_security_markers
+            else "standard-unsealed-unsigned-v1"
         ),
         "active_profile_identities": active_profiles,
         "resolved_configuration_properties": resolved_properties,

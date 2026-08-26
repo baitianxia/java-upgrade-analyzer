@@ -1610,6 +1610,42 @@ def _independent_resource_facts(name: str, content: bytes) -> list[list[str]]:
     ]
 
 
+def _independent_artifact_security_unsupported(
+    inventory: Mapping[str, Any],
+) -> bool:
+    """Reconstruct the release's unsupported signer/sealing boundary.
+
+    This intentionally uses only independently inventoried archive names and
+    manifest facts.  An ``.SF`` is signing metadata, but OpenJDK does not attach
+    code signers unless a supported PKCS7 block is also present.
+    """
+
+    resources = inventory.get("resources") or {}
+    if any(
+        re.fullmatch(
+            r"META-INF/[^/]+\.(?:RSA|DSA|EC)",
+            str(name).upper(),
+        )
+        for name in resources
+    ):
+        return True
+    manifest_rows = [
+        row
+        for name, selected in resources.items()
+        if str(name).upper() == "META-INF/MANIFEST.MF"
+        for row in selected
+        if isinstance(row, Mapping)
+    ]
+    return any(
+        len(fact) == 2
+        and str(fact[0]).strip().lower() == "sealed"
+        and str(fact[1]).strip().lower() == "true"
+        for row in manifest_rows
+        for fact in (row.get("semantic_facts") or ())
+        if isinstance(fact, (list, tuple))
+    )
+
+
 def _independent_xml_facts(content: bytes) -> list[list[str]]:
     """Oracle-side XML registration inventory built directly from archive bytes."""
     if len(content) > 4 * 1024 * 1024:
@@ -4444,6 +4480,8 @@ def _validate_entrypoint_discovery(
     resource_truth: Iterable[Mapping[str, Any]],
     direct_edge_truth: Iterable[Iterable[Any]],
     semantic_instructions: Iterable[Iterable[Any]],
+    *,
+    inventories: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Independently reconstruct automatic callback roots using target-JVM reflection."""
 
@@ -4500,6 +4538,33 @@ def _validate_entrypoint_discovery(
 
     def artifact_path(observation: Mapping[str, Any]) -> Path | None:
         return _file_url_path(str(observation.get("provider_url") or ""))
+
+    security_policy_supported = str(
+        runtime_profile.get(
+            "runtime_security_and_package_sealing_policy_identity"
+        )
+        or "standard-unsealed-unsigned-v1"
+    ) == "standard-unsealed-unsigned-v1"
+    security_unsupported_artifact_paths = {
+        Path(str(artifact["path"])).resolve()
+        for artifact, inventory in zip(
+            current_artifacts, inventories or (), strict=False
+        )
+        if _independent_artifact_security_unsupported(inventory)
+    }
+
+    def security_prevents_definition(
+        observation: Mapping[str, Any],
+    ) -> bool:
+        path = artifact_path(observation)
+        return bool(
+            path is not None
+            and path in path_kinds_by_path
+            and (
+                not security_policy_supported
+                or path in security_unsupported_artifact_paths
+            )
+        )
 
     def business_owned(observation: Mapping[str, Any]) -> bool:
         path = artifact_path(observation)
@@ -4735,6 +4800,8 @@ def _validate_entrypoint_discovery(
         for class_name, observation in observations.items():
             if not _oracle_class_load_ready(observation):
                 continue
+            if security_prevents_definition(observation):
+                continue
             if int(observation.get("modifiers") or 0) & (0x0200 | 0x0400):
                 continue
             owned = business_owned(observation)
@@ -4894,7 +4961,10 @@ def _validate_entrypoint_discovery(
         for factory_key, instructions in instructions_by_member.items():
             factory_class, _factory_member, factory_descriptor = factory_key
             factory_observation = observations.get(factory_class) or {}
-            if not _oracle_class_load_ready(factory_observation):
+            if (
+                not _oracle_class_load_ready(factory_observation)
+                or security_prevents_definition(factory_observation)
+            ):
                 continue
             instructions.sort()
             callback_names = set()
@@ -4936,11 +5006,14 @@ def _validate_entrypoint_discovery(
             )
             for realm in realms:
                 for receiver_owner in receiver_owners:
+                    receiver_observation = observations.get(receiver_owner) or {}
+                    if security_prevents_definition(receiver_observation):
+                        continue
                     callback_candidates = [
                         (name, descriptor)
                         for kind, name, descriptor, _flags in (
                             _declared_members(
-                                observations.get(receiver_owner) or {}
+                                receiver_observation
                             )
                         )
                         if kind == "method" and name in callback_names
@@ -5011,10 +5084,13 @@ def _validate_entrypoint_discovery(
                     class_name = str(raw_value or "").rsplit("|", 1)[-1].replace(
                         ".", "/"
                     )
+                    class_observation = observations.get(class_name) or {}
+                    if security_prevents_definition(class_observation):
+                        continue
                     candidates = [
                         (name, descriptor)
                         for kind, name, descriptor, _flags in _declared_members(
-                            observations.get(class_name) or {}
+                            class_observation
                         )
                         if kind == "method" and name in callback_names
                     ]
@@ -5042,10 +5118,13 @@ def _validate_entrypoint_discovery(
                     continue
                 class_name = parts[1].replace(".", "/")
                 method_name = parts[2]
+                class_observation = observations.get(class_name) or {}
+                if security_prevents_definition(class_observation):
+                    continue
                 candidates = [
                     (name, descriptor)
                     for kind, name, descriptor, _flags in _declared_members(
-                        observations.get(class_name) or {}
+                        class_observation
                     )
                     if kind == "method" and name == method_name
                 ]
@@ -6371,6 +6450,7 @@ def _validate_runtime_outcomes(
     platform_realm: str,
     jdk_home: Path,
     *,
+    runtime_security_policy_identity: str = "standard-unsealed-unsigned-v1",
     progress_callback: ValidationProgressCallback | None = None,
     progress_label: str = "",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -6476,6 +6556,15 @@ def _validate_runtime_outcomes(
             expected_instance_by_path.setdefault(
                 Path(str(artifact["path"])).resolve(), instance_identity
             )
+    security_policy_supported = (
+        str(runtime_security_policy_identity)
+        == "standard-unsealed-unsigned-v1"
+    )
+    security_unsupported_artifact_paths = {
+        Path(str(artifact["path"])).resolve()
+        for artifact, inventory in zip(artifacts, inventories)
+        if _independent_artifact_security_unsupported(inventory)
+    }
     # These indexes are consulted only for four scalar values. Retaining the
     # full decoded reconciliation payloads (especially definition evidence)
     # made the Oracle keep a second copy of a large part of the graph alive.
@@ -6547,7 +6636,17 @@ def _validate_runtime_outcomes(
         production_definition_status = definition[0] if definition else None
         production_class_load_status = definition[1] if definition else None
         production_class_load_ready = production_class_load_status == "ready"
-        oracle_definition_ready = oracle.get("status") == "definition_ready"
+        security_prevents_definition = bool(
+            expected_kind == "artifact"
+            and (
+                not security_policy_supported
+                or provider_path in security_unsupported_artifact_paths
+            )
+        )
+        oracle_definition_ready = bool(
+            oracle.get("status") == "definition_ready"
+            and not security_prevents_definition
+        )
         if (
             not definition
             or oracle_definition_ready
@@ -6559,7 +6658,11 @@ def _validate_runtime_outcomes(
                 oracle_status=oracle.get("status"),
                 production_status=production_definition_status,
             ))
-        if definition and production_class_load_ready != _oracle_class_load_ready(oracle):
+        oracle_class_load_ready = bool(
+            _oracle_class_load_ready(oracle)
+            and not security_prevents_definition
+        )
+        if definition and production_class_load_ready != oracle_class_load_ready:
             issues.append(_validation_issue(
                 "class_definition", "ORACLE_CLASS_LOAD_READY_MISMATCH",
                 realm=realm, class_name=name,
@@ -7035,6 +7138,10 @@ def _validate_runtime_outcomes(
         "provider_count": provider_count,
         "member_resolution_count": member_resolution_count,
         "dispatch_count": dispatch_count,
+        "runtime_security_policy_supported": security_policy_supported,
+        "security_unsupported_artifact_count": len(
+            security_unsupported_artifact_paths
+        ),
     }
 
 
@@ -11840,6 +11947,12 @@ def validate_generation(
                 independent_classes,
                 platform_realm,
                 jdk_home,
+                runtime_security_policy_identity=str(
+                    (side.get("runtime_profile") or {}).get(
+                        "runtime_security_and_package_sealing_policy_identity"
+                    )
+                    or ""
+                ),
                 progress_callback=progress_callback,
                 progress_label=side_name,
             )
@@ -11938,6 +12051,7 @@ def validate_generation(
             progress_label="current：重放入口发现调用边",
         ),
         current_instruction_source,
+        inventories=current_inventories,
     )
     issues.extend(entrypoint_issues)
     truth_parts["entrypoint_discovery"] = entrypoint_truth

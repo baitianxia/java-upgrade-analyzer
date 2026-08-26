@@ -677,8 +677,17 @@ class RuntimeReconcilerBoundaryTest(unittest.TestCase):
         self.assertFalse(reconciler._artifact_security_unsupported("artifact"))
         self.assertFalse(reconciler._artifact_security_unsupported("artifact"))
 
+        orphan = blank_reconciler()
+        orphan.store = SimpleNamespace(rows=lambda *_args, **_kwargs: [{
+            "resource_name": "META-INF/BOOT.SF",
+        }])
+        orphan._artifact_manifest = lambda _identity: {}
+        self.assertFalse(orphan._artifact_security_unsupported("orphan-sf"))
+
         signed = blank_reconciler()
-        signed.store = SimpleNamespace(rows=lambda *_args, **_kwargs: [{"signed": True}])
+        signed.store = SimpleNamespace(rows=lambda *_args, **_kwargs: [{
+            "resource_name": "META-INF/APP.RSA",
+        }])
         signed._artifact_manifest = lambda _identity: {}
         self.assertTrue(signed._artifact_security_unsupported("signed"))
         signed.capability = rr.RuntimeCapabilityPolicy(signed_artifacts_supported=True)
@@ -1576,6 +1585,10 @@ class RuntimeReconcilerBoundaryTest(unittest.TestCase):
             "runtime_security_and_package_sealing_policy_identity": "unsupported",
         })
         self.assertEqual(record["class_definition_status"], "security_failed")
+        self.assertEqual(
+            record["evidence"]["reason"],
+            "runtime_security_policy_unsupported",
+        )
         _case, record = one_case(artifact_security=True)
         self.assertEqual(record["evidence"]["reason"], "signed_or_sealed_artifact_unsupported")
         _case, record = one_case(profile_payload={

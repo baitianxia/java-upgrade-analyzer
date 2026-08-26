@@ -1,4 +1,6 @@
 import io
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -25,6 +27,169 @@ def archive_bytes(entries, *, compression=zipfile.ZIP_DEFLATED):
 
 
 class BinaryArtifactSafetyTest(unittest.TestCase):
+    def test_jar_signature_metadata_separates_orphan_sf_from_block_candidates(self):
+        orphan = artifact_safety.jar_signature_metadata((
+            "META-INF/BOOT.SF",
+            # OpenJDK reserves this as signing-related metadata but does not
+            # feed it to JarVerifier's block/SF signer installation path.
+            "META-INF/SIG-CUSTOM.A1",
+            "pkg/App.class",
+        ))
+        self.assertFalse(orphan.has_signature_block_candidate)
+        self.assertEqual(orphan.signature_files, ("META-INF/BOOT.SF",))
+        self.assertEqual(orphan.orphan_signature_files, ("META-INF/BOOT.SF",))
+        self.assertEqual(orphan.rewrite_sensitive_entries, ())
+
+        candidate = artifact_safety.jar_signature_metadata((
+            "META-INF/APP.SF",
+            "META-INF/APP.RSA",
+            "META-INF/ORPHAN.SF",
+            "META-INF/SECOND.EC",
+            "META-INF/nested/IGNORED.RSA",
+        ))
+        self.assertTrue(candidate.has_signature_block_candidate)
+        self.assertEqual(
+            candidate.signature_blocks,
+            ("META-INF/APP.RSA", "META-INF/SECOND.EC"),
+        )
+        self.assertEqual(candidate.paired_signature_files, ("META-INF/APP.SF",))
+        self.assertEqual(candidate.orphan_signature_files, ("META-INF/ORPHAN.SF",))
+        self.assertEqual(
+            candidate.rewrite_sensitive_entries,
+            (
+                "META-INF/APP.RSA",
+                "META-INF/APP.SF",
+                "META-INF/SECOND.EC",
+            ),
+        )
+
+    @unittest.skipUnless(
+        all(shutil.which(tool) for tool in ("java", "javac", "keytool", "jarsigner")),
+        "JDK signing tools are required",
+    )
+    def test_openjdk_oracle_treats_real_sf_without_its_block_as_unsigned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "JarSignerStateProbe.java"
+            source.write_text(
+                """
+import java.io.InputStream;
+import java.util.Enumeration;
+import java.util.jar.JarEntry;
+import java.util.jar.JarFile;
+
+public final class JarSignerStateProbe {
+    public static void main(String[] args) throws Exception {
+        boolean signed = false;
+        byte[] buffer = new byte[8192];
+        try (JarFile jar = new JarFile(args[0], true)) {
+            Enumeration<JarEntry> entries = jar.entries();
+            while (entries.hasMoreElements()) {
+                JarEntry entry = entries.nextElement();
+                if (entry.isDirectory()) {
+                    continue;
+                }
+                try (InputStream input = jar.getInputStream(entry)) {
+                    while (input.read(buffer) != -1) {
+                        // Reading every byte triggers JarVerifier.
+                    }
+                }
+                if (entry.getCodeSigners() != null) {
+                    signed = true;
+                }
+            }
+        }
+        System.out.print(signed ? "signed" : "unsigned");
+    }
+}
+""".strip(),
+                encoding="utf-8",
+            )
+            subprocess.run(
+                [shutil.which("javac"), "-d", str(root), str(source)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            signed_jar = root / "signed.jar"
+            with zipfile.ZipFile(signed_jar, "w") as archive:
+                archive.writestr(
+                    "META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\r\n\r\n"
+                )
+                archive.writestr("payload.txt", b"payload")
+            keystore = root / "signer.p12"
+            subprocess.run(
+                [
+                    shutil.which("keytool"),
+                    "-genkeypair",
+                    "-alias", "signer",
+                    "-keyalg", "RSA",
+                    "-keysize", "2048",
+                    "-validity", "1",
+                    "-dname", "CN=Jar Security Test",
+                    "-keystore", str(keystore),
+                    "-storetype", "PKCS12",
+                    "-storepass", "changeit",
+                    "-keypass", "changeit",
+                    "-noprompt",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                [
+                    shutil.which("jarsigner"),
+                    "-keystore", str(keystore),
+                    "-storepass", "changeit",
+                    "-keypass", "changeit",
+                    "-sigalg", "SHA256withRSA",
+                    "-digestalg", "SHA-256",
+                    str(signed_jar),
+                    "signer",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            def signer_state(path):
+                completed = subprocess.run(
+                    [
+                        shutil.which("java"),
+                        "-cp", str(root),
+                        "JarSignerStateProbe",
+                        str(path),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                return completed.stdout.strip()
+
+            self.assertEqual(signer_state(signed_jar), "signed")
+
+            orphan_jar = root / "orphan-sf.jar"
+            with zipfile.ZipFile(signed_jar) as source_archive:
+                with zipfile.ZipFile(orphan_jar, "w") as target_archive:
+                    for info in source_archive.infolist():
+                        if artifact_safety.is_jar_signature_block_entry(
+                            info.filename
+                        ):
+                            continue
+                        target_archive.writestr(
+                            info,
+                            b"" if info.is_dir() else source_archive.read(info),
+                        )
+            with zipfile.ZipFile(orphan_jar) as archive:
+                metadata = artifact_safety.jar_signature_metadata(
+                    info.filename for info in archive.infolist()
+                )
+            self.assertTrue(metadata.orphan_signature_files)
+            self.assertFalse(metadata.has_signature_block_candidate)
+            self.assertEqual(signer_state(orphan_jar), "unsigned")
+
     def test_spring_xml_uses_xml_semantics_before_line_registration_semantics(self):
         malformed = b"<beans><bean id='broken'"
 

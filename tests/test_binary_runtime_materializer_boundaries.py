@@ -377,7 +377,11 @@ class BinaryRuntimeMaterializerBoundaryTest(unittest.TestCase):
             plain_business = _outer_business_content_inventory(plain)
             self.assertEqual(
                 set(plain_business),
-                {"pkg/App.class", "META-INF/MANIFEST.MF"},
+                {
+                    "pkg/App.class",
+                    "META-INF/MANIFEST.MF",
+                    "META-INF/APP.SF",
+                },
             )
 
             boot = root / "boot.jar"
@@ -723,10 +727,27 @@ class BinaryRuntimeMaterializerBoundaryTest(unittest.TestCase):
             _write_zip(clean, [("dir/", b""), ("pkg/App.class", b"app")])
             self.assertEqual(_archive_security_markers(clean), ())
 
+            orphan_signature_file = root / "orphan-signature-file.jar"
+            _write_zip(
+                orphan_signature_file,
+                [
+                    ("META-INF/BOOT.SF", b"Signature-Version: 1.0\n"),
+                    (
+                        "META-INF/MANIFEST.MF",
+                        b"Manifest-Version: 1.0\nSHA-256-Digest: stale\n",
+                    ),
+                    ("pkg/App.class", b"app"),
+                ],
+            )
+            self.assertEqual(
+                _archive_security_markers(orphan_signature_file), ()
+            )
+
             marked = root / "marked.jar"
             _write_zip(
                 marked,
                 [
+                    ("META-INF/APP.SF", b"Signature-Version: 1.0\n"),
                     ("META-INF/APP.RSA", b"signature"),
                     (
                         "META-INF/MANIFEST.MF",
@@ -742,6 +763,7 @@ class BinaryRuntimeMaterializerBoundaryTest(unittest.TestCase):
             self.assertEqual(
                 set(_archive_security_markers(marked)),
                 {
+                    "signature_entry:META-INF/APP.SF",
                     "signature_entry:META-INF/APP.RSA",
                     "sealed_manifest_section",
                     "signed_manifest_digest",

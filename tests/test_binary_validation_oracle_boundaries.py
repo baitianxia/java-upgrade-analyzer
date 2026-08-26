@@ -10648,6 +10648,40 @@ class BinaryValidationOracleBoundaryTest(unittest.TestCase):
         )
         self.assertIn(("mybatis_statement", "plain"), boundary_pairs)
 
+    def test_independent_artifact_security_boundary_ignores_orphan_sf(self):
+        orphan_sf = {
+            "resources": {
+                "META-INF/BOOT.SF": [{"semantic_facts": []}],
+                "META-INF/MANIFEST.MF": [{
+                    "semantic_facts": [["SHA-256-Digest", "digest"]],
+                }],
+            },
+        }
+        self.assertFalse(
+            oracle._independent_artifact_security_unsupported(orphan_sf)
+        )
+
+        signature_block = {
+            "resources": {
+                "META-INF/APP.SF": [{"semantic_facts": []}],
+                "META-INF/APP.RSA": [{"semantic_facts": []}],
+            },
+        }
+        self.assertTrue(
+            oracle._independent_artifact_security_unsupported(signature_block)
+        )
+
+        sealed = {
+            "resources": {
+                "META-INF/MANIFEST.MF": [{
+                    "semantic_facts": [["sealed", "true"]],
+                }],
+            },
+        }
+        self.assertTrue(
+            oracle._independent_artifact_security_unsupported(sealed)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
