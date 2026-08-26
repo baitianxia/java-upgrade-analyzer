@@ -1665,12 +1665,14 @@ class BinaryValidationOracleBoundaryTest(unittest.TestCase):
 
             defaults = oracle._oracle_tool_execution_policy({})
             self.assertEqual(defaults["max_attempts"], 2)
+            self.assertEqual(defaults["compile_timeout_seconds"], 300.0)
+            self.assertEqual(defaults["javap_time_budget_seconds"], 3600.0)
             limits = oracle._oracle_tool_execution_policy({
                 "tool_execution_policy": {
                     "oracle_compile_timeout_seconds": 0.01,
                     "oracle_runtime_timeout_seconds": 300,
                     "oracle_runtime_phase_time_budget_seconds": 7200,
-                    "oracle_javap_time_budget_seconds": 1800,
+                    "oracle_javap_time_budget_seconds": 7200,
                     "oracle_max_attempts": 3,
                 },
             })
@@ -1687,7 +1689,7 @@ class BinaryValidationOracleBoundaryTest(unittest.TestCase):
                 {"oracle_runtime_phase_time_budget_seconds": 0},
                 {"oracle_runtime_phase_time_budget_seconds": 7201},
                 {"oracle_javap_time_budget_seconds": 0},
-                {"oracle_javap_time_budget_seconds": 1801},
+                {"oracle_javap_time_budget_seconds": 7201},
                 {"oracle_max_attempts": 0},
                 {"oracle_max_attempts": 4},
             ]

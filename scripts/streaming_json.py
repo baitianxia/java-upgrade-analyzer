@@ -32,6 +32,44 @@ class StreamingJsonReadError(ValueError):
     """Raised when a canonical generated sidecar cannot be streamed safely."""
 
 
+class StreamingJsonArray(list):
+    """Repeatable lazy JSON array accepted by :class:`json.JSONEncoder`.
+
+    ``JSONEncoder`` deliberately recognizes list subclasses and iterates them
+    through the Python streaming encoder.  Keeping the backing list empty
+    avoids retaining the represented rows; ``__iter__`` opens a fresh bounded
+    reader for every canonical comparison or identity pass.  The explicit
+    length makes truthiness and schema conservation checks exact without a
+    probe that would consume the first row.
+
+    Callers must use :func:`stream_json`, :func:`iter_json_bytes`, or
+    :func:`json_file_digest_if_matches` when serializing this value.  The
+    one-shot C accelerator used by ``json.dumps`` is not part of this class's
+    contract.
+    """
+
+    __slots__ = ("_iterator_factory", "_length")
+
+    def __init__(self, iterator_factory: Callable[[], Iterable[Any]], length: int):
+        super().__init__()
+        if not callable(iterator_factory):
+            raise StreamingJsonReadError(
+                "streaming JSON array requires a callable iterator factory"
+            )
+        if type(length) is not int or length < 0:
+            raise StreamingJsonReadError(
+                "streaming JSON array length must be a non-negative integer"
+            )
+        self._iterator_factory = iterator_factory
+        self._length = length
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter(self._iterator_factory())
+
+    def __len__(self) -> int:
+        return self._length
+
+
 _CANONICAL_VALUE_START_CACHE: dict[
     tuple[str, int, int, str], tuple[int, ...]
 ] = {}
@@ -210,6 +248,7 @@ def iter_canonical_json_object_array(
     *,
     progress_callback: Callable[[int, int], None] | None = None,
     progress_interval_bytes: int = 64 * 1024 * 1024,
+    maximum_item_bytes: int | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Iterate one top-level array of objects without materializing the file.
 
@@ -269,6 +308,15 @@ def iter_canonical_json_object_array(
                         else:
                             boundary = separator + 1
                             final_item = False
+                        if (
+                            maximum_item_bytes is not None
+                            and boundary - cursor > max(1, int(maximum_item_bytes))
+                        ):
+                            raise StreamingJsonReadError(
+                                f"object in {key!r} exceeds "
+                                f"{int(maximum_item_bytes)} bytes at byte {cursor}: "
+                                f"{source}"
+                            )
                         try:
                             value = json.loads(mapped[cursor:boundary])
                         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -638,10 +686,13 @@ def write_json_streaming_atomic(
 
 
 __all__ = [
+    "StreamingJsonArray",
     "StreamingJsonReadError",
     "files_equal",
     "fsync_directory",
     "iter_canonical_json_object_array",
+    "iter_json_bytes",
+    "json_file_digest_if_matches",
     "load_canonical_json_top_level_value",
     "prime_canonical_json_fields",
     "stream_json",

@@ -151,6 +151,25 @@ class BinaryFactStoreTest(unittest.TestCase):
         self.assertIn("field", {item["edge_kind"] for item in edges})
         self.assertIn("method", {item["edge_kind"] for item in edges})
 
+    def test_content_identity_never_expands_compressed_fact_tables(self):
+        artifact = self.make_jar("streamed-content-identity.jar")
+        instance = self.instance(artifact, 0)
+        snapshot = self.snapshot(artifact, instance)
+
+        with BinaryFactStore() as store:
+            store.add_artifact_snapshot(instance, snapshot)
+            with patch.object(
+                store,
+                "rows",
+                side_effect=AssertionError("whole-table rows are forbidden"),
+            ), patch(
+                "binary_fact_store.zlib.decompress",
+                side_effect=AssertionError("blob decompression is forbidden"),
+            ):
+                identity = store.content_identity()
+
+        self.assertEqual(len(identity), 64)
+
     def test_fact_store_preserves_unpaired_surrogate_jvm_text(self):
         from tests.test_final_artifact_edge_oracle import (
             _minimal_static_edge_class,

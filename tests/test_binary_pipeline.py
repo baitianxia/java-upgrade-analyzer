@@ -195,6 +195,58 @@ class BinaryPipelineTest(unittest.TestCase):
             updated["status"], binary_pipeline._RESUME_VALIDATION_FAILED
         )
 
+    def test_resume_reads_large_failed_validation_as_bounded_lazy_rows(self):
+        output = self.root / "streamed-validation-resume"
+        generation, manifest = self._resume_generation(output)
+        generation = generation.resolve()
+        issues = [
+            {
+                "domain": "provider",
+                "reason_code": "ORACLE_ARTIFACT_PROVIDER_MISMATCH",
+                "evidence": {"index": index},
+            }
+            for index in range(2_000)
+        ]
+        validation = self._resume_validation_result(
+            generation,
+            manifest,
+            "failed",
+            issues=issues,
+            issue_count=len(issues),
+            domain_summary={"provider": {"issues": len(issues)}},
+        )
+        validation_path = Path(validation["validation_result_path"])
+        expected_sha256 = hashlib.sha256(
+            validation_path.read_bytes()
+        ).hexdigest()
+        real_read_bytes = Path.read_bytes
+
+        def guarded_read_bytes(path):
+            if Path(path) == validation_path:
+                raise AssertionError("whole validation attachment read is forbidden")
+            return real_read_bytes(Path(path))
+
+        with patch.object(
+            Path, "read_bytes", autospec=True, side_effect=guarded_read_bytes,
+        ), patch.object(
+            binary_pipeline,
+            "_canonical_json_bytes",
+            side_effect=AssertionError("full JSON serialization is forbidden"),
+        ):
+            loaded = binary_pipeline._checkpoint_validation_attachment(
+                generation,
+                manifest,
+                validation_run_identity=validation["validation_run_identity"],
+                validation_result_sha256=expected_sha256,
+                expected_status="failed",
+            )
+
+        self.assertIsInstance(
+            loaded["issues"], binary_pipeline.StreamingJsonArray
+        )
+        self.assertEqual(len(loaded["issues"]), len(issues))
+        self.assertEqual(next(iter(loaded["issues"])), issues[0])
+
     @unittest.skipUnless(
         binary_pipeline._secure_resume_checkpoint_dirfd_supported(),
         "checkpoint mutation requires POSIX dir_fd support",

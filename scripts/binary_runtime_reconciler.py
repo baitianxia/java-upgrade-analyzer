@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 import json
@@ -333,14 +333,14 @@ class RuntimeReconciliationResult:
     analysis_context_identity: str
     runtime_profile_identity: str
     universe_identity: str
-    provider_bindings: tuple[dict[str, Any], ...]
-    class_definitions: tuple[dict[str, Any], ...]
-    member_resolutions: tuple[dict[str, Any], ...]
-    dispatch_resolutions: tuple[dict[str, Any], ...]
-    type_resolutions: tuple[dict[str, Any], ...]
-    class_initialization_resolutions: tuple[dict[str, Any], ...]
-    linkage_resolutions: tuple[dict[str, Any], ...]
-    resource_selections: tuple[dict[str, Any], ...]
+    provider_bindings: Collection[dict[str, Any]]
+    class_definitions: Collection[dict[str, Any]]
+    member_resolutions: Collection[dict[str, Any]]
+    dispatch_resolutions: Collection[dict[str, Any]]
+    type_resolutions: Collection[dict[str, Any]]
+    class_initialization_resolutions: Collection[dict[str, Any]]
+    linkage_resolutions: Collection[dict[str, Any]]
+    resource_selections: Collection[dict[str, Any]]
     coverage_status: str
     coverage_gaps: tuple[str, ...]
     identity: str
@@ -386,6 +386,47 @@ _RECONCILIATION_RESULT_FIELDS_BY_KIND = {
 }
 
 
+class _PersistedReconciliationPayloads(Collection[dict[str, Any]]):
+    """Repeatable, store-backed view over one reconciliation record family."""
+
+    __slots__ = ("store", "record_kind", "_count")
+
+    def __init__(self, store: BinaryFactStore, record_kind: str):
+        self.store = store
+        self.record_kind = str(record_kind)
+        counter = getattr(store, "reconciliation_payload_count", None)
+        self._count = (
+            int(counter(self.record_kind))
+            if callable(counter)
+            else sum(1 for _item in store.reconciliation_payloads(
+                self.record_kind
+            ))
+        )
+
+    def __iter__(self) -> Iterator[dict[str, Any]]:
+        return iter(self.store.reconciliation_payloads(self.record_kind))
+
+    def __len__(self) -> int:
+        return self._count
+
+    def __contains__(self, candidate: object) -> bool:
+        return any(item == candidate for item in self)
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Iterable):
+            return False
+        sentinel = object()
+        left = iter(self)
+        right = iter(other)
+        while True:
+            left_item = next(left, sentinel)
+            right_item = next(right, sentinel)
+            if left_item is sentinel or right_item is sentinel:
+                return left_item is sentinel and right_item is sentinel
+            if left_item != right_item:
+                return False
+
+
 def hydrate_runtime_reconciliation(
     store: BinaryFactStore,
     reconciliation: RuntimeReconciliationResult,
@@ -414,7 +455,9 @@ def hydrate_runtime_reconciliation(
         field_name = _RECONCILIATION_RESULT_FIELDS_BY_KIND[kind]
         if getattr(reconciliation, field_name):
             continue
-        replacements[field_name] = tuple(store.reconciliation_payloads(kind))
+        persisted = _PersistedReconciliationPayloads(store, kind)
+        if persisted:
+            replacements[field_name] = persisted
     return replace(reconciliation, **replacements) if replacements else reconciliation
 
 
@@ -1262,10 +1305,17 @@ class RuntimeReconciler:
                         definition_status = "unsupported"
                         evidence["reason"] = "target_jvm_verification_unavailable"
                     else:
-                        definition_status = (
-                            "definition_ready" if outcome["status"] == "definition_ready"
-                            else self._definition_status_from_failure(outcome.get("failure_kind", ""))
-                        )
+                        if outcome["status"] == "definition_ready":
+                            definition_status = "definition_ready"
+                        elif outcome["status"] == "verification_unavailable":
+                            definition_status = "unsupported"
+                            self.coverage_gaps.add(
+                                f"definition_verifier_budget_exhausted:{realm}"
+                            )
+                        else:
+                            definition_status = self._definition_status_from_failure(
+                                outcome.get("failure_kind", "")
+                            )
                         evidence["target_jvm_verification"] = outcome
             resolution_identity = _class_definition_resolution_identity_native(
                 provider["provider_binding_identity"],
@@ -2371,7 +2421,7 @@ class RuntimeReconciler:
     def reconcile(
         self,
         *,
-        retain_record_kinds: Iterable[str] | None = None,
+        retain_record_kinds: Iterable[str] | None = (),
     ) -> RuntimeReconciliationResult:
         """Build and atomically persist the complete runtime truth set.
 
@@ -2403,13 +2453,15 @@ class RuntimeReconciler:
     def _reconcile(
         self,
         *,
-        retain_record_kinds: Iterable[str] | None = None,
+        retain_record_kinds: Iterable[str] | None = (),
     ) -> RuntimeReconciliationResult:
-        retained_kinds = (
-            set(_RECONCILIATION_RECORD_FIELDS)
-            if retain_record_kinds is None
-            else {str(kind) for kind in retain_record_kinds}
-        )
+        # Persisted SQLite chunks are the complete authority.  Retaining every
+        # family by default made a routine multi-million-edge reconciliation
+        # keep a second Python object graph alive.  Callers that deliberately
+        # need a bounded family must opt in by name.
+        retained_kinds = {
+            str(kind) for kind in (retain_record_kinds or ())
+        }
         universe = self._universe()
         accumulator = _ReconciliationAccumulator(
             self.store,

@@ -696,6 +696,163 @@ class DefinitionVerifierBoundaryTest(unittest.TestCase):
                 self._verify_with_output({}, b"", completed=completed)
             self.assertEqual(raised.exception.reason_code, expected_reason)
 
+    def test_failed_batch_is_bisected_and_only_toxic_class_is_failed(self):
+        selected = {
+            "demo/A": b"class-a",
+            "demo/B": b"class-b",
+            "demo.Bad": b"invalid-name",
+        }
+        valid_names = ["demo/A", "demo/B"]
+        calls = []
+        process_failure = SimpleNamespace(
+            failure_kind="nonzero_exit",
+            to_mapping=lambda: {
+                "failure_kind": "nonzero_exit",
+                "returncode": 2,
+            },
+        )
+
+        def successful_range(start, end):
+            names = valid_names[start:end]
+            records = [
+                {
+                    "frame_type": "class_definition",
+                    "class_name": name,
+                    "class_bytes_sha256": hashlib.sha256(
+                        selected[name]
+                    ).hexdigest(),
+                    "status": "definition_ready",
+                }
+                for name in names
+            ]
+            return SimpleNamespace(
+                succeeded=True,
+                stdout=framed_json(
+                    {
+                        "frame_type": "definition_output_header",
+                        "schema": verifier.SCHEMA,
+                        "class_count": len(names),
+                    },
+                    *records,
+                    {
+                        "frame_type": "definition_output_footer",
+                        "class_count": len(names),
+                        "definition_ready_count": len(names),
+                        "failure_count": 0,
+                    },
+                ),
+            )
+
+        def execute(command, **_kwargs):
+            start, end = map(int, command[-2:])
+            calls.append((start, end))
+            if (start, end) in {(0, 2), (1, 2)}:
+                return SimpleNamespace(
+                    succeeded=False, failure=process_failure
+                )
+            return successful_range(start, end)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            platform, helper = self._platform(Path(tmp))
+            with patch.object(
+                verifier,
+                "_compile_helper",
+                return_value=SimpleNamespace(output=helper),
+            ), patch.object(
+                verifier, "execute_binary_tool", side_effect=execute,
+            ), patch.object(
+                verifier, "verifier_identity", return_value="verifier-id",
+            ):
+                result = verifier.verify_class_definitions(platform, selected)
+
+        self.assertEqual(calls, [(0, 2), (0, 1), (1, 2)])
+        self.assertEqual(result["demo/A"]["status"], "definition_ready")
+        self.assertEqual(result["demo/B"]["status"], "verification_failed")
+        self.assertEqual(
+            result["demo/B"]["isolation_status"], "single_class_failure"
+        )
+        self.assertEqual(result["demo.Bad"]["status"], "verification_failed")
+        self.assertEqual(
+            result["demo.Bad"]["isolation_status"],
+            "invalid_name_isolated",
+        )
+        self.assertEqual(
+            result["demo.Bad"]["failure_kind"],
+            "CLASS_DEFINITION_NAME_INVALID",
+        )
+
+    def test_transient_verifier_start_failure_is_retried_before_isolation(self):
+        name = "demo/A"
+        content = b"class-a"
+        header = {
+            "frame_type": "definition_output_header",
+            "schema": verifier.SCHEMA,
+            "class_count": 1,
+        }
+        record = {
+            "frame_type": "class_definition",
+            "class_name": name,
+            "class_bytes_sha256": hashlib.sha256(content).hexdigest(),
+            "status": "definition_ready",
+        }
+        footer = {
+            "frame_type": "definition_output_footer",
+            "class_count": 1,
+            "definition_ready_count": 1,
+            "failure_count": 0,
+        }
+        transient = SimpleNamespace(
+            succeeded=False,
+            failure=SimpleNamespace(
+                failure_kind="start_failed",
+                to_mapping=lambda: {"failure_kind": "start_failed"},
+            ),
+        )
+        success = SimpleNamespace(
+            succeeded=True, stdout=framed_json(header, record, footer)
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            platform, helper = self._platform(Path(tmp))
+            with patch.object(
+                verifier,
+                "_compile_helper",
+                return_value=SimpleNamespace(output=helper),
+            ), patch.object(
+                verifier,
+                "execute_binary_tool",
+                side_effect=(transient, success),
+            ) as execute, patch.object(
+                verifier, "verifier_identity", return_value="verifier-id",
+            ):
+                result = verifier.verify_class_definitions(
+                    platform, {name: content}
+                )
+
+        self.assertEqual(execute.call_count, 2)
+        self.assertEqual(result[name]["status"], "definition_ready")
+
+    def test_isolated_process_failure_excludes_nondeterministic_tool_detail(self):
+        first = verifier._verification_process_failure(
+            "demo/A",
+            "a" * 64,
+            verifier.ClassDefinitionVerifierError(
+                "CLASS_DEFINITION_VERIFIER_FAILED",
+                "/tmp/run-one/classes.bundle: access denied",
+            ),
+        )
+        second = verifier._verification_process_failure(
+            "demo/A",
+            "a" * 64,
+            verifier.ClassDefinitionVerifierError(
+                "CLASS_DEFINITION_VERIFIER_FAILED",
+                "C:/Temp/run-two/classes.bundle: WinError 5",
+            ),
+        )
+
+        self.assertEqual(first, second)
+        self.assertNotIn("bundle", first["failure_message"])
+
     def test_protocol_header_and_frame_failures_are_classified(self):
         name = "demo/A"
         content = b"class"

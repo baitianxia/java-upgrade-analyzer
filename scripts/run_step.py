@@ -8964,13 +8964,13 @@ def _preflight_explicit_binary_config(run_context, project_dir):
         "oracle_max_attempts",
     }
     try:
-        compile_timeout = float(policy.get("oracle_compile_timeout_seconds", 60))
+        compile_timeout = float(policy.get("oracle_compile_timeout_seconds", 300))
         runtime_timeout = float(policy.get("oracle_runtime_timeout_seconds", 300))
         runtime_phase_budget = float(
             policy.get("oracle_runtime_phase_time_budget_seconds", 1800)
         )
         javap_budget = float(
-            policy.get("oracle_javap_time_budget_seconds", 300)
+            policy.get("oracle_javap_time_budget_seconds", 3600)
         )
         attempts = int(policy.get("oracle_max_attempts", 2))
     except (TypeError, ValueError) as error:
@@ -8994,7 +8994,7 @@ def _preflight_explicit_binary_config(run_context, project_dir):
         or not 0.01 <= compile_timeout <= 300
         or not 0.01 <= runtime_timeout <= 300
         or not 1 <= runtime_phase_budget <= 7200
-        or not 0.01 <= javap_budget <= 1800
+        or not 0.01 <= javap_budget <= 7200
         or not 1 <= attempts <= 3
     ):
         raise StepError(

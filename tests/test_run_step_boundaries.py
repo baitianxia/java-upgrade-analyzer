@@ -3892,11 +3892,28 @@ class RunStepBoundaryTest(unittest.TestCase):
             base, selected = self._binary_config_payload(root)
             selected["binary_pipeline_config"] = str(path)
 
+            path.write_text(json.dumps(base), encoding="utf-8")
+            default_result, _ = run_step._preflight_explicit_binary_config(
+                selected, root
+            )
+            self.assertEqual(
+                default_result["tool_execution_policy"][
+                    "oracle_compile_timeout_seconds"
+                ],
+                300.0,
+            )
+            self.assertEqual(
+                default_result["tool_execution_policy"][
+                    "oracle_javap_time_budget_seconds"
+                ],
+                3600.0,
+            )
+
             valid_policy = {
                 "oracle_compile_timeout_seconds": "0.01",
                 "oracle_runtime_timeout_seconds": 300,
                 "oracle_runtime_phase_time_budget_seconds": 1,
-                "oracle_javap_time_budget_seconds": 1800,
+                "oracle_javap_time_budget_seconds": 7200,
                 "oracle_max_attempts": "3",
             }
             payload = json.loads(json.dumps(base))
@@ -3909,7 +3926,7 @@ class RunStepBoundaryTest(unittest.TestCase):
                     "oracle_compile_timeout_seconds": 0.01,
                     "oracle_runtime_timeout_seconds": 300.0,
                     "oracle_runtime_phase_time_budget_seconds": 1.0,
-                    "oracle_javap_time_budget_seconds": 1800.0,
+                    "oracle_javap_time_budget_seconds": 7200.0,
                     "oracle_max_attempts": 3,
                 },
             )
@@ -3930,7 +3947,7 @@ class RunStepBoundaryTest(unittest.TestCase):
                 "phase-low": {"oracle_runtime_phase_time_budget_seconds": 0},
                 "phase-high": {"oracle_runtime_phase_time_budget_seconds": 7201},
                 "javap-low": {"oracle_javap_time_budget_seconds": 0},
-                "javap-high": {"oracle_javap_time_budget_seconds": 1801},
+                "javap-high": {"oracle_javap_time_budget_seconds": 7201},
                 "attempts-low": {"oracle_max_attempts": 0},
                 "attempts-high": {"oracle_max_attempts": 4},
                 "nan": {"oracle_runtime_timeout_seconds": "nan"},

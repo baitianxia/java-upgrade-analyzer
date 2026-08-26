@@ -1825,6 +1825,40 @@ class FinalArtifactJavapExecutionBoundaryTest(unittest.TestCase):
         process.communicate.return_value = (stdout, stderr)
         return process
 
+    def test_windows_path_binding_and_transient_spawn_retry(self):
+        with patch.object(oracle.os, "name", "nt"):
+            self.assertEqual(
+                oracle._javap_path_key(r"C:\work\classes\A.class"),
+                oracle._javap_path_key("/C:/work/classes/A.class"),
+            )
+            self.assertNotEqual(
+                oracle._javap_path_key(
+                    "jar:file:///C:/work/app.jar!/classes/A.class"
+                ),
+                oracle._javap_path_key(
+                    "jar:file:///C:/work/app.jar!/classes/a.class"
+                ),
+            )
+
+        transient = OSError(errno.EACCES, "temporarily denied")
+        transient.winerror = 5
+        process = self.process()
+        cancellation = Mock()
+        cancellation.is_set.return_value = False
+        cancellation.wait.return_value = False
+        with patch.object(
+            oracle, "managed_popen", side_effect=(transient, process),
+        ) as popen, patch.object(
+            oracle.time, "perf_counter", return_value=0,
+        ):
+            started = oracle._spawn_javap(
+                ["javap", "A.class"], cancellation, 10,
+            )
+
+        self.assertIs(started, process)
+        self.assertEqual(popen.call_count, 2)
+        cancellation.wait.assert_called_once()
+
     def test_single_entry_javap_preflight_execution_and_result_matrix(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1948,14 +1982,14 @@ class FinalArtifactJavapExecutionBoundaryTest(unittest.TestCase):
 
             process = self.process()
             event = Event()
-            perf_values = iter((0, 0, 31))
+            perf_values = iter((0, 0, 301))
             with patch.object(oracle, "managed_popen", return_value=process), patch.object(
                 oracle, "_cancel_process",
             ) as cancel, patch.object(
                 oracle.time, "perf_counter", side_effect=lambda: next(perf_values),
             ):
                 result = oracle._parse_entry_with_javap(
-                    entry, "sha", "javap", "21", event, 100,
+                    entry, "sha", "javap", "21", event, 1000,
                 )
             self.assertFalse(result["completed"])
             cancel.assert_called_once_with(process)
@@ -2020,7 +2054,7 @@ class FinalArtifactJavapExecutionBoundaryTest(unittest.TestCase):
             )
             self.assertTrue(all(not result["completed"] for result in results))
 
-            perf_values = iter((0, 31))
+            perf_values = iter((0, 301))
             with patch.object(
                 oracle.time, "perf_counter", side_effect=lambda: next(perf_values),
             ):
@@ -2062,7 +2096,7 @@ class FinalArtifactJavapExecutionBoundaryTest(unittest.TestCase):
             fallback = {"rows": [], "failures": [], "completed": True, "parsed": True}
 
             process = self.process()
-            perf_values = iter((0, 0, 31, 31))
+            perf_values = iter((0, 0, 301, 301))
             with patch.object(oracle, "managed_popen", return_value=process), patch.object(
                 oracle, "_cancel_process",
             ), patch.object(
@@ -2071,14 +2105,14 @@ class FinalArtifactJavapExecutionBoundaryTest(unittest.TestCase):
                 oracle.time, "perf_counter", side_effect=lambda: next(perf_values),
             ):
                 results = oracle._parse_entry_group_with_javap(
-                    entries, "sha", "javap", "21", Event(), 100,
+                    entries, "sha", "javap", "21", Event(), 1000,
                     force_verbose=False,
                 )
             self.assertEqual(len(results), 2)
             self.assertEqual(separate.call_count, 2)
 
             process = self.process()
-            perf_values = iter((0, 0, 31))
+            perf_values = iter((0, 0, 301))
             with patch.object(oracle, "managed_popen", return_value=process), patch.object(
                 oracle, "_cancel_process",
             ), patch.object(

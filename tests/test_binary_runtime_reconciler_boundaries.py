@@ -1606,6 +1606,21 @@ class RuntimeReconcilerBoundaryTest(unittest.TestCase):
         })
         self.assertEqual(record["class_definition_status"], "definition_ready")
 
+        budget_case, record = one_case(verifier={
+            "Ready": {
+                "status": "verification_unavailable",
+                "failure_kind": "CLASS_DEFINITION_VERIFIER_TIMEOUT",
+                "isolation_status": (
+                    "range_unverified_phase_budget_exhausted"
+                ),
+            },
+        })
+        self.assertEqual(record["class_definition_status"], "unsupported")
+        self.assertIn(
+            "definition_verifier_budget_exhausted:app",
+            budget_case.coverage_gaps,
+        )
+
         empty_realm, record = one_case(realm="")
         self.assertEqual(record["class_definition_status"], "unsupported")
         self.assertIn("definition_topology_unsupported:", empty_realm.coverage_gaps)

@@ -26,6 +26,11 @@ from binary_runtime_reconciler import (  # noqa: E402
 )
 
 
+FULL_RECORD_KINDS = frozenset(
+    runtime_reconciler._RECONCILIATION_RECORD_FIELDS
+)
+
+
 def current_jdk_home():
     completed = subprocess.run(
         ["java", "-XshowSettings:properties", "-version"],
@@ -278,7 +283,9 @@ class BinaryRuntimeReconcilerTest(unittest.TestCase):
                 self.platform,
                 analysis_context_identity="analysis-context-1",
             )
-            result = reconciler.reconcile()
+            result = reconciler.reconcile(
+                retain_record_kinds=FULL_RECORD_KINDS
+            )
             store.connection.set_trace_callback(None)
             cache_before = (
                 reconciler._symbolic_member_cache_hits,
@@ -509,7 +516,7 @@ class BinaryRuntimeReconcilerTest(unittest.TestCase):
             ), self.assertRaisesRegex(
                 RuntimeError, "synthetic reconciliation failure"
             ):
-                reconciler.reconcile()
+                reconciler.reconcile(retain_record_kinds=FULL_RECORD_KINDS)
 
             self.assertGreaterEqual(calls, 2)
             self.assertEqual(store.counts()["reconciliation_records"], 0)
@@ -533,7 +540,7 @@ class BinaryRuntimeReconcilerTest(unittest.TestCase):
                 self.profile,
                 self.platform,
                 analysis_context_identity="analysis-context-shadow",
-            ).reconcile()
+            ).reconcile(retain_record_kinds=FULL_RECORD_KINDS)
 
         provider = next(
             item for item in result.provider_bindings
@@ -552,7 +559,7 @@ class BinaryRuntimeReconcilerTest(unittest.TestCase):
                 self.profile,
                 self.platform,
                 analysis_context_identity="analysis-context-retention",
-            ).reconcile()
+            ).reconcile(retain_record_kinds=FULL_RECORD_KINDS)
             compact = RuntimeReconciler(
                 compact_store,
                 self.profile,
@@ -578,26 +585,59 @@ class BinaryRuntimeReconcilerTest(unittest.TestCase):
                 compact_store.rows("reconciliation_records"),
                 key=lambda item: item["record_identity"],
             )
+            self.assertEqual(compact.identity, full.identity)
+            self.assertEqual(compact.provider_bindings, full.provider_bindings)
+            self.assertEqual(compact.class_definitions, full.class_definitions)
+            self.assertEqual(compact.resource_selections, full.resource_selections)
+            self.assertEqual(compact.member_resolutions, ())
+            self.assertEqual(compact.dispatch_resolutions, ())
+            self.assertEqual(compact.type_resolutions, ())
+            self.assertEqual(compact.class_initialization_resolutions, ())
+            self.assertEqual(compact.linkage_resolutions, ())
+            self.assertEqual(hydrated.member_resolutions, full.member_resolutions)
+            self.assertEqual(hydrated.dispatch_resolutions, full.dispatch_resolutions)
+            self.assertEqual(hydrated.type_resolutions, full.type_resolutions)
+            self.assertEqual(
+                hydrated.class_initialization_resolutions,
+                full.class_initialization_resolutions,
+            )
+            self.assertEqual(hydrated.linkage_resolutions, full.linkage_resolutions)
+            self.assertEqual(hydrated.identity, compact.identity)
+            self.assertEqual(compact_evidence, full_evidence)
 
-        self.assertEqual(compact.identity, full.identity)
-        self.assertEqual(compact.provider_bindings, full.provider_bindings)
-        self.assertEqual(compact.class_definitions, full.class_definitions)
-        self.assertEqual(compact.resource_selections, full.resource_selections)
-        self.assertEqual(compact.member_resolutions, ())
-        self.assertEqual(compact.dispatch_resolutions, ())
-        self.assertEqual(compact.type_resolutions, ())
-        self.assertEqual(compact.class_initialization_resolutions, ())
-        self.assertEqual(compact.linkage_resolutions, ())
-        self.assertEqual(hydrated.member_resolutions, full.member_resolutions)
-        self.assertEqual(hydrated.dispatch_resolutions, full.dispatch_resolutions)
-        self.assertEqual(hydrated.type_resolutions, full.type_resolutions)
-        self.assertEqual(
-            hydrated.class_initialization_resolutions,
-            full.class_initialization_resolutions,
-        )
-        self.assertEqual(hydrated.linkage_resolutions, full.linkage_resolutions)
-        self.assertEqual(hydrated.identity, compact.identity)
-        self.assertEqual(compact_evidence, full_evidence)
+    def test_default_retention_is_empty_and_hydration_stays_store_backed(self):
+        with self.build_store() as store:
+            compact = RuntimeReconciler(
+                store,
+                self.profile,
+                self.platform,
+                analysis_context_identity="analysis-context-default-retention",
+            ).reconcile()
+
+            for field_name in (
+                runtime_reconciler._RECONCILIATION_RESULT_FIELDS_BY_KIND.values()
+            ):
+                self.assertEqual(getattr(compact, field_name), ())
+            self.assertGreater(
+                store.reconciliation_payload_count("member_resolution"), 0
+            )
+
+            hydrated = hydrate_runtime_reconciliation(
+                store, compact, ("member_resolution",)
+            )
+            records = hydrated.member_resolutions
+            self.assertNotIsInstance(records, tuple)
+            self.assertEqual(
+                len(records),
+                store.reconciliation_payload_count("member_resolution"),
+            )
+            first_pass = [
+                item["member_resolution_identity"] for item in records
+            ]
+            second_pass = [
+                item["member_resolution_identity"] for item in records
+            ]
+            self.assertEqual(first_pass, second_pass)
 
     def test_sequential_edge_scan_preserves_every_reconciliation_record(self):
         with (
@@ -609,7 +649,7 @@ class BinaryRuntimeReconcilerTest(unittest.TestCase):
                 self.profile,
                 self.platform,
                 analysis_context_identity="analysis-context-edge-order",
-            ).reconcile()
+            ).reconcile(retain_record_kinds=FULL_RECORD_KINDS)
             with patch.object(
                 RuntimeReconciler,
                 "DIRECT_EDGE_SCAN_ORDER",
@@ -620,7 +660,7 @@ class BinaryRuntimeReconcilerTest(unittest.TestCase):
                     self.profile,
                     self.platform,
                     analysis_context_identity="analysis-context-edge-order",
-                ).reconcile()
+                ).reconcile(retain_record_kinds=FULL_RECORD_KINDS)
             sequential_records = sorted(
                 sequential_store.rows("reconciliation_records"),
                 key=lambda item: item["record_identity"],
@@ -698,7 +738,7 @@ class BinaryRuntimeReconcilerTest(unittest.TestCase):
                 current_profile,
                 self.platform,
                 analysis_context_identity="analysis-context-access-reduced",
-            ).reconcile()
+            ).reconcile(retain_record_kinds=FULL_RECORD_KINDS)
 
         member = next(
             item for item in result.member_resolutions
@@ -731,7 +771,7 @@ class BinaryRuntimeReconcilerTest(unittest.TestCase):
                 self.profile,
                 self.platform,
                 analysis_context_identity="analysis-context-nestmate-access",
-            ).reconcile()
+            ).reconcile(retain_record_kinds=FULL_RECORD_KINDS)
 
         member = next(
             item for item in result.member_resolutions
@@ -753,7 +793,7 @@ class BinaryRuntimeReconcilerTest(unittest.TestCase):
                 self.platform,
                 analysis_context_identity="analysis-context-invalid-nestmates",
             )
-            reconciler.reconcile()
+            reconciler.reconcile(retain_record_kinds=FULL_RECORD_KINDS)
             host_provider = reconciler._provider(
                 "application-loader", "demo/NestHost"
             )

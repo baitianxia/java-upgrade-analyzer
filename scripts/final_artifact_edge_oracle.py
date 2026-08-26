@@ -9,6 +9,7 @@ import errno
 import hashlib
 import io
 import json
+import ntpath
 import os
 from pathlib import Path
 import re
@@ -165,6 +166,8 @@ MAX_JAVAP_COMMAND_CHARS = 24_000 if os.name == "nt" else 0
 MAX_STAGED_JAVAP_CLASS_BYTES = 16 * 1024 * 1024
 USE_STAGED_JAVAP_ARCHIVE = os.name == "nt"
 JAVAP_VERSION_TIMEOUT_SECONDS = 5.0
+JAVAP_INVOCATION_TIMEOUT_SECONDS = 300.0
+JAVAP_SPAWN_MAX_ATTEMPTS = 3
 _IMMUTABLE_ORACLE_CACHE: dict[tuple[str, str, str, str, str], str] = {}
 _JAVAP_VERSION_CACHE: dict[tuple[str, int, int, int], str] = {}
 _IMMUTABLE_ORACLE_CACHE_LOCK = Lock()
@@ -2986,7 +2989,72 @@ def _entry_requires_verbose_javap(entry: PackagedClass) -> bool:
 
 def _javap_path_key(path: str | Path) -> str:
     """Normalize a javap path lexically without restatting every class file."""
-    return os.path.normcase(os.path.abspath(os.fspath(path)))
+    value = os.fspath(path)
+    if os.name != "nt":
+        return os.path.normcase(os.path.abspath(value))
+    if value.lower().startswith("jar:file:"):
+        archive, separator, entry = value.partition("!/")
+        # Windows file URI paths are case-insensitive, but JAR entry names are
+        # not. Normalize only the archive portion and preserve the entry bytes.
+        archive = archive.replace("\\", "/").casefold()
+        return archive + (separator + entry if separator else "")
+    # javap renders an absolute drive path as ``/C:/...`` in Classfile
+    # markers. ntpath treats that leading slash as a different rooted path;
+    # remove exactly this URI-style prefix before ordinary Windows folding.
+    if re.match(r"^[\\/][A-Za-z]:[\\/]", value):
+        value = value[1:]
+    return ntpath.normcase(ntpath.abspath(value))
+
+
+def _javap_spawn_error_retryable(error: OSError) -> bool:
+    return bool(
+        getattr(error, "winerror", None) in {5, 8, 1450, 1455}
+        or error.errno in {
+            errno.EACCES,
+            errno.EAGAIN,
+            errno.EINTR,
+            errno.EMFILE,
+            errno.ENFILE,
+            errno.ENOMEM,
+        }
+    )
+
+
+def _spawn_javap(
+    command: list[str],
+    cancellation_event: Event,
+    deadline: float,
+) -> subprocess.Popen:
+    last_error = None
+    for attempt in range(1, JAVAP_SPAWN_MAX_ATTEMPTS + 1):
+        if attempt > 1 and (
+            cancellation_event.is_set() or time.perf_counter() >= deadline
+        ):
+            break
+        try:
+            return managed_popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except OSError as error:
+            last_error = error
+            if (
+                _command_line_too_long(error)
+                or not _javap_spawn_error_retryable(error)
+                or attempt >= JAVAP_SPAWN_MAX_ATTEMPTS
+            ):
+                raise
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                break
+            cancellation_event.wait(min(0.1 * attempt, remaining))
+    if last_error is not None:
+        raise last_error
+    raise TimeoutError("javap spawn deadline exceeded")
 
 
 def _entry_javap_argument(entry: PackagedClass) -> str:
@@ -3017,7 +3085,9 @@ def _parse_entry_with_javap(
             "completed": True,
             "parsed": False,
         }
-    per_class_deadline = time.perf_counter() + 30.0
+    per_class_deadline = (
+        time.perf_counter() + JAVAP_INVOCATION_TIMEOUT_SECONDS
+    )
     deadline = min(deadline, per_class_deadline) if deadline is not None else per_class_deadline
     if cancellation_event.is_set() or time.perf_counter() >= deadline:
         return {"rows": [], "failures": [], "completed": False, "parsed": False}
@@ -3026,15 +3096,8 @@ def _parse_entry_with_javap(
         if _entry_requires_verbose_javap(entry) if verbose is None else verbose:
             command.append("-v")
         command.extend(("-c", "-p", "-s", _entry_javap_argument(entry)))
-        process = managed_popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-    except OSError as error:
+        process = _spawn_javap(command, cancellation_event, deadline)
+    except (OSError, TimeoutError) as error:
         return {
             "rows": [],
             "failures": [f"{entry.artifact_entry}: {javap} execution failed: {error}"],
@@ -3203,7 +3266,9 @@ def _parse_entry_group_with_javap(
     }
     if materialize_errors:
         return parse_separately(entries)
-    group_deadline = time.perf_counter() + 30.0
+    group_deadline = (
+        time.perf_counter() + JAVAP_INVOCATION_TIMEOUT_SECONDS
+    )
     deadline = min(deadline, group_deadline) if deadline is not None else group_deadline
     if cancellation_event.is_set() or time.perf_counter() >= deadline:
         return [
@@ -3225,17 +3290,14 @@ def _parse_entry_group_with_javap(
             command.append("-sysinfo")
         command.extend(("-c", "-p", "-s"))
         command.extend(_entry_javap_argument(entry) for entry in entries)
-        process = managed_popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-    except OSError as error:
+        process = _spawn_javap(command, cancellation_event, deadline)
+    except (OSError, TimeoutError) as error:
         # The single-entry path returned above, so every group here can bisect.
-        if _command_line_too_long(error):
+        if (
+            isinstance(error, TimeoutError)
+            or _command_line_too_long(error)
+            or _javap_spawn_error_retryable(error)
+        ):
             midpoint = len(entries) // 2
             return [
                 *_parse_entry_group_with_javap(
@@ -3244,7 +3306,7 @@ def _parse_entry_group_with_javap(
                     javap,
                     version,
                     cancellation_event,
-                    deadline,
+                    overall_deadline,
                     force_verbose=force_verbose,
                 ),
                 *_parse_entry_group_with_javap(
@@ -3253,7 +3315,7 @@ def _parse_entry_group_with_javap(
                     javap,
                     version,
                     cancellation_event,
-                    deadline,
+                    overall_deadline,
                     force_verbose=force_verbose,
                 ),
             ]

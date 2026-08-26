@@ -5364,6 +5364,37 @@ binary_report._stage_directory_group((
             )
             self.assertFalse((Path(tmp) / "active_binary_generation.json").exists())
 
+    def test_activation_hashes_validation_attachment_without_whole_file_read(self):
+        profile = self.profile()
+        decisions, traces = self.bundles()
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = write_binary_generation(
+                tmp, decisions, traces, profile,
+                policy_identities={"registry": "v1"},
+            )
+            validation = self.validation_result(manifest)
+            validation_path = Path(validation["validation_result_path"])
+            real_read_bytes = Path.read_bytes
+
+            def guarded_read_bytes(path):
+                if Path(path) == validation_path:
+                    raise AssertionError(
+                        "whole validation attachment read is forbidden"
+                    )
+                return real_read_bytes(Path(path))
+
+            with patch.object(
+                Path,
+                "read_bytes",
+                autospec=True,
+                side_effect=guarded_read_bytes,
+            ):
+                active = Path(activate_binary_generation(
+                    tmp, manifest, validation_result=validation,
+                ))
+
+            self.assertTrue(active.is_file())
+
     def test_activation_rejects_symlinked_validation_attachment(self):
         profile = self.profile()
         decisions, traces = self.bundles()

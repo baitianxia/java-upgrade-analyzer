@@ -22,7 +22,6 @@ from binary_first_model import (
     Decision,
     ProjectionAssessment,
     build_projection_obligations,
-    validate_decision_conservation,
     validate_projection_conservation,
 )
 from binary_runtime_reconciler import RuntimeReconciliationResult
@@ -210,7 +209,6 @@ class BinaryDecisionEngine:
         self.assessments = []
         self.projections = []
         self.candidate_plans = []
-        self.obligations = []
         self._obligation_origins = {}
         self.coverage_gaps = set()
         self._base_artifact_lineages = self._artifact_lineages(
@@ -1182,7 +1180,6 @@ class BinaryDecisionEngine:
                 f"first={previous_origin}; duplicate={origin}",
             )
         self._obligation_origins[decision.obligation_identity] = origin
-        self.obligations.append(decision.obligation_identity)
         if channel == "authoritative":
             self.authoritative.append(record)
             self._assess(record)
@@ -2003,22 +2000,40 @@ class BinaryDecisionEngine:
         if self.base_runtime.identity != self.current_runtime.identity:
             self._process_member_resolution_deltas()
             self._process_runtime_outcome_deltas()
-        decision_objects = []
-        for record in (*self.authoritative, *self.diagnostic, *self.excluded):
-            payload = {
-                key: value for key, value in record.items()
-                if key not in {
-                    "observed_delta_identity", "disposition_obligation_identity", "decision_identity",
-                    "decision_channel", "change_fact_identity",
-                }
-            }
-            decision_objects.append(Decision(
-                record["observed_delta_identity"], self.context, record["decision_channel"], payload
-            ))
-        validate_decision_conservation(
-            disposition_obligation_identities=self.obligations,
-            decisions=decision_objects,
-        )
+        # ``_decision`` already indexed every unique obligation together with
+        # its diagnostic origin. Consume that existing index to prove a
+        # one-to-one owner mapping and release it as we go. Building a second
+        # owner dictionary here would add hundreds of MiB at production scale;
+        # rebuilding every payload-bearing Decision was substantially worse.
+        pending_obligations = self._obligation_origins
+        missing = object()
+        for channel in (
+            self.authoritative,
+            self.diagnostic,
+            self.excluded,
+        ):
+            for record in channel:
+                obligation_identity = record.get(
+                    "disposition_obligation_identity"
+                )
+                if pending_obligations.pop(
+                    obligation_identity, missing
+                ) is missing:
+                    raise BinaryFirstContractError(
+                        "DISPOSITION_OBLIGATION_CONSERVATION_FAILED",
+                        f"{obligation_identity!r} has duplicate or unknown owner",
+                    )
+                if not str(record.get("decision_identity") or ""):
+                    raise BinaryFirstContractError(
+                        "DECISION_IDENTITY_INVALID",
+                        f"decision owner for {obligation_identity!r} has no identity",
+                    )
+        if pending_obligations:
+            obligation_identity = next(iter(pending_obligations))
+            raise BinaryFirstContractError(
+                "DISPOSITION_OBLIGATION_CONSERVATION_FAILED",
+                f"{obligation_identity} has 0 active owners",
+            )
         snapshots = {
             "decision": ActiveSnapshot(
                 "decision", self.context,

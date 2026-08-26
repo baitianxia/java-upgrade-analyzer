@@ -39,15 +39,22 @@ public final class ClassDefinitionVerifier {
         return componentHasCharacter;
     }
     public static void main(String[] args) {
-        if(args.length!=1){System.err.println("usage: ClassDefinitionVerifier <class-bundle>");System.exit(64);}
-        try{run(Paths.get(args[0]));}catch(Throwable error){error.printStackTrace(System.err);System.exit(2);}
+        if(args.length!=1&&args.length!=3){System.err.println("usage: ClassDefinitionVerifier <class-bundle> [start-index end-index]");System.exit(64);}
+        try{
+            int start=args.length==3?Integer.parseInt(args[1]):0;
+            int end=args.length==3?Integer.parseInt(args[2]):-1;
+            run(Paths.get(args[0]),start,end);
+        }catch(Throwable error){error.printStackTrace(System.err);System.exit(2);}
     }
-    private static void run(Path bundlePath) throws Exception {
+    private static void run(Path bundlePath,int start,int end) throws Exception {
         bundlePath=bundlePath.toRealPath();
         if(!Files.isRegularFile(bundlePath))throw new IOException("class bundle is not a regular file");
         DataOutputStream out=new DataOutputStream(new BufferedOutputStream(System.out));
         try(ClassBundle bundle=new ClassBundle(bundlePath)){
-            List<String> names=bundle.names();
+            List<String> allNames=bundle.names();
+            if(end<0)end=allNames.size();
+            if(start<0||end<start||end>allNames.size())throw new IOException("invalid verification range");
+            List<String> names=allNames.subList(start,end);
             write(out,map("frame_type","definition_output_header","schema","target-jvm-definition-v2","class_count",names.size()));
             int ready=0,failed=0;
             ClassLoader parent=ClassLoader.getSystemClassLoader().getParent();

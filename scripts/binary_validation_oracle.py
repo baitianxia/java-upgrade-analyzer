@@ -2174,7 +2174,7 @@ def _compile_oracle(
     jdk_home: Path,
     destination: Path,
     *,
-    timeout_seconds: float = 60,
+    timeout_seconds: float = 300,
     max_attempts: int = 1,
     phase_deadline: float | None = None,
 ) -> str:
@@ -2245,7 +2245,7 @@ def _observe_classes(
     artifacts: list[dict[str, Any]],
     initial_classes: Iterable[str],
     *,
-    compile_timeout_seconds: float = 60,
+    compile_timeout_seconds: float = 300,
     runtime_timeout_seconds: float = 300,
     phase_time_budget_seconds: float | None = None,
     max_attempts: int = 1,
@@ -10676,13 +10676,13 @@ def _oracle_tool_execution_policy(config: Mapping[str, Any]) -> dict[str, Any]:
             f"unknown fields: {unknown}",
         )
     try:
-        compile_timeout = float(raw.get("oracle_compile_timeout_seconds", 60))
+        compile_timeout = float(raw.get("oracle_compile_timeout_seconds", 300))
         runtime_timeout = float(raw.get("oracle_runtime_timeout_seconds", 300))
         runtime_phase_time_budget = float(
             raw.get("oracle_runtime_phase_time_budget_seconds", 1800)
         )
         javap_time_budget = float(
-            raw.get("oracle_javap_time_budget_seconds", 300)
+            raw.get("oracle_javap_time_budget_seconds", 3600)
         )
         max_attempts = int(raw.get("oracle_max_attempts", 2))
     except (TypeError, ValueError) as error:
@@ -10704,14 +10704,14 @@ def _oracle_tool_execution_policy(config: Mapping[str, Any]) -> dict[str, Any]:
         or not 0.01 <= compile_timeout <= 300
         or not 0.01 <= runtime_timeout <= 300
         or not 1 <= runtime_phase_time_budget <= 7200
-        or not 0.01 <= javap_time_budget <= 1800
+        or not 0.01 <= javap_time_budget <= 7200
         or not 1 <= max_attempts <= 3
     ):
         raise BinaryValidationError(
             "BINARY_ORACLE_TOOL_POLICY_INVALID",
             "compile/runtime timeouts must be within 0.01..300 seconds, "
             "runtime phase budget within 1..7200 seconds, javap budget "
-            "within 0.01..1800 seconds, and attempts within 1..3",
+            "within 0.01..7200 seconds, and attempts within 1..3",
         )
     return {
         "compile_timeout_seconds": compile_timeout,

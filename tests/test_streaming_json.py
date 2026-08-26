@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import streaming_json  # noqa: E402
 from binary_first_contract import surrogate_safe_json_dumps  # noqa: E402
 from streaming_json import (  # noqa: E402
+    StreamingJsonArray,
     StreamingJsonReadError,
     files_equal,
     fsync_directory,
@@ -30,6 +31,31 @@ from streaming_json import (  # noqa: E402
 
 
 class StreamingJsonTest(unittest.TestCase):
+    def test_lazy_array_is_repeatable_and_enforces_per_item_limit(self):
+        calls = []
+        rows = [{"index": 1}, {"index": 2}]
+        lazy = StreamingJsonArray(
+            lambda: (calls.append("iter") or iter(rows)),
+            len(rows),
+        )
+        payload = {"issues": lazy, "status": "failed"}
+
+        expected = b'{"issues":[{"index":1},{"index":2}],"status":"failed"}\n'
+        self.assertEqual(b"".join(streaming_json.iter_json_bytes(payload)), expected)
+        self.assertEqual(b"".join(streaming_json.iter_json_bytes(payload)), expected)
+        self.assertEqual(calls, ["iter", "iter"])
+        self.assertEqual(len(lazy), 2)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "oversized-item.json"
+            write_json_streaming(path, {"rows": [{"text": "x" * 100}]})
+            with self.assertRaisesRegex(
+                StreamingJsonReadError, "exceeds 32 bytes"
+            ):
+                list(iter_canonical_json_object_array(
+                    path, "rows", maximum_item_bytes=32,
+                ))
+
     def test_streamed_bytes_match_frozen_surrogate_safe_json_encoding(self):
         payload = {
             "literal": r"\ud800",

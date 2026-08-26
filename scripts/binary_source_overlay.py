@@ -326,7 +326,10 @@ def build_inline_consumption_overlay(
                 new = delta.get("current_contract") or {}
                 if (
                     scope.get("member_kind") == "field"
-                    and int(new.get("access") or old.get("access") or 0) & 0x0018 == 0x0018
+                    and (
+                        int(new.get("access") or old.get("access") or 0)
+                        & 0x0018
+                    ) == 0x0018
                     and old.get("constant") != new.get("constant")
                     and old.get("constant") is not None
                     and new.get("constant") is not None

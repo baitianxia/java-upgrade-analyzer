@@ -442,7 +442,9 @@ class BinaryLoadingConstraintTest(unittest.TestCase):
             ),
             capability_policy=capability,
         )
-        return store, reconciler.reconcile()
+        return store, reconciler.reconcile(retain_record_kinds=(
+            binary_runtime_reconciler._RECONCILIATION_RECORD_FIELDS
+        ))
 
     @staticmethod
     def caller_edges(store):

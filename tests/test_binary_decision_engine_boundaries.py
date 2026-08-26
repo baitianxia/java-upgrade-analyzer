@@ -2043,6 +2043,30 @@ class DecisionEngineBoundaryTest(unittest.TestCase):
         self.assertEqual(diagnostic_bundle.coverage_status, "partial")
         self.assertEqual(diagnostic_bundle.coverage_gaps, ())
 
+    def test_build_conservation_does_not_reconstruct_decision_payloads(self):
+        decision_engine = self.engine()
+        record = decision_engine._decision(
+            observed_identity="already-constructed",
+            channel="excluded",
+            reason_code="NO_RUNTIME_EFFECT",
+            fact_kind="unknown",
+            fact_scope={},
+        )
+
+        with patch.object(
+            engine_module,
+            "Decision",
+            side_effect=AssertionError(
+                "build conservation must use existing decision identities"
+            ),
+        ):
+            bundle = decision_engine.build()
+
+        self.assertEqual(
+            bundle.excluded_decisions[0]["decision_identity"],
+            record["decision_identity"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

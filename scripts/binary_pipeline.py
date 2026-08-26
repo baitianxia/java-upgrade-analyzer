@@ -106,7 +106,15 @@ from path_runtime import short_temporary_directory
 from jdk_preflight import JdkPreflightError, preflight_jdk_home
 from process_lock import exclusive_file_lock
 from process_metrics import windows_current_process_usage
-from streaming_json import fsync_directory, json_file_digest_if_matches
+from streaming_json import (
+    StreamingJsonArray,
+    StreamingJsonReadError,
+    fsync_directory,
+    iter_canonical_json_object_array,
+    json_file_digest_if_matches,
+    load_canonical_json_top_level_value,
+    prime_canonical_json_fields,
+)
 
 
 SUPPORT_MANIFEST_PATH = Path(__file__).with_name("binary_first_support_manifest.json")
@@ -179,6 +187,8 @@ _VALIDATION_ATTACHMENT_FIELDS = frozenset({
     "skipped_domains",
     "production_identity_influence",
 })
+_VALIDATION_ATTACHMENT_METADATA_MAX_BYTES = 16 * 1024 * 1024
+_VALIDATION_ATTACHMENT_ISSUE_MAX_BYTES = 4 * 1024 * 1024
 _PERFORMANCE_AUTHORITY_BINDING_FIELDS = frozenset({
     "schema",
     "authority_mode",
@@ -2730,13 +2740,20 @@ def _failed_validation_attachment_is_bound(
     ):
         return False
     domain_counts: dict[str, dict[str, int]] = {}
-    for issue in issues:
-        if not isinstance(issue, Mapping):
-            return False
-        domain = issue.get("domain")
-        if not isinstance(domain, str) or not domain:
-            return False
-        domain_counts.setdefault(domain, {"issues": 0})["issues"] += 1
+    actual_issue_count = 0
+    try:
+        for issue in issues:
+            actual_issue_count += 1
+            if not isinstance(issue, Mapping):
+                return False
+            domain = issue.get("domain")
+            if not isinstance(domain, str) or not domain:
+                return False
+            domain_counts.setdefault(domain, {"issues": 0})["issues"] += 1
+    except (OSError, StreamingJsonReadError, TypeError, ValueError):
+        return False
+    if actual_issue_count != validation.get("issue_count"):
+        return False
     if dict(validation["domain_summary"]) != domain_counts:
         return False
     normalized_skipped_domains = []
@@ -2832,6 +2849,61 @@ def _failed_validation_attachment_is_bound(
     )
 
 
+def _streamed_validation_attachment(
+    path: Path,
+) -> tuple[dict[str, Any], str]:
+    """Load compact validation metadata and stream its potentially huge issues.
+
+    The final streamed byte comparison proves both the exact field set and the
+    canonical representation while hashing the attachment.  ``issues`` is a
+    repeatable list-compatible view whose iterator decodes one bounded object
+    at a time, so cached multi-GiB failure evidence never becomes a second
+    Python heap copy during resume.
+    """
+
+    metadata_fields = tuple(sorted(_VALIDATION_ATTACHMENT_FIELDS - {"issues"}))
+    prime_canonical_json_fields(path, (*metadata_fields, "issues"))
+    validation = {
+        field: load_canonical_json_top_level_value(
+            path,
+            field,
+            maximum_bytes=_VALIDATION_ATTACHMENT_METADATA_MAX_BYTES,
+        )
+        for field in metadata_fields
+    }
+    issue_count = validation.get("issue_count")
+    if type(issue_count) is not int or issue_count < 0:
+        raise StreamingJsonReadError(
+            f"validation issue_count is invalid in {path}: {issue_count!r}"
+        )
+    if issue_count == 0:
+        issues = load_canonical_json_top_level_value(
+            path,
+            "issues",
+            maximum_bytes=_VALIDATION_ATTACHMENT_METADATA_MAX_BYTES,
+        )
+        if issues != []:
+            raise StreamingJsonReadError(
+                f"zero-count validation issues are not empty in {path}"
+            )
+    else:
+        issues = StreamingJsonArray(
+            lambda: iter_canonical_json_object_array(
+                path,
+                "issues",
+                maximum_item_bytes=_VALIDATION_ATTACHMENT_ISSUE_MAX_BYTES,
+            ),
+            issue_count,
+        )
+    validation["issues"] = issues
+    digest = json_file_digest_if_matches(path, validation)
+    if digest is None:
+        raise StreamingJsonReadError(
+            f"validation attachment is not exact canonical JSON: {path}"
+        )
+    return validation, digest
+
+
 def _checkpoint_validation_attachment(
     generation: Path,
     manifest: Mapping[str, Any],
@@ -2851,18 +2923,22 @@ def _checkpoint_validation_attachment(
             or not path.is_file()
         ):
             raise OSError("validation attachment is not a bound regular file")
-        content = path.read_bytes()
-        if hashlib.sha256(content).hexdigest() != validation_result_sha256:
+        validation, observed_sha256 = _streamed_validation_attachment(path)
+        if observed_sha256 != validation_result_sha256:
             raise OSError("validation attachment digest mismatch")
-        validation = json.loads(content.decode("utf-8"))
-    except (OSError, RuntimeError, UnicodeError, json.JSONDecodeError) as error:
+    except (
+        OSError,
+        RuntimeError,
+        StreamingJsonReadError,
+        TypeError,
+        ValueError,
+    ) as error:
         raise BinaryPipelineError(
             "BINARY_RESUME_VALIDATION_ATTACHMENT_INVALID", f"{path}: {error}"
         ) from error
     if (
         not isinstance(validation, Mapping)
         or set(validation) != _VALIDATION_ATTACHMENT_FIELDS
-        or content != _canonical_json_bytes(validation)
         or validation.get("validation_run_identity")
         != validation_run_identity
         or validation.get("status") != expected_status
@@ -2917,14 +2993,12 @@ def _checkpoint_validator_attachment_is_stale(
             or not path.is_file()
         ):
             return False
-        content = path.read_bytes()
-        if hashlib.sha256(content).hexdigest() != validation_sha256:
+        validation, observed_sha256 = _streamed_validation_attachment(path)
+        if observed_sha256 != validation_sha256:
             return False
-        validation = json.loads(content.decode("utf-8"))
         if (
             not isinstance(validation, Mapping)
             or set(validation) != _VALIDATION_ATTACHMENT_FIELDS
-            or content != _canonical_json_bytes(validation)
             or validation.get("validation_run_identity")
             != validation_identity
             or validation.get("result_generation_identity")
@@ -2937,8 +3011,7 @@ def _checkpoint_validator_attachment_is_stale(
     except (
         OSError,
         RuntimeError,
-        UnicodeError,
-        json.JSONDecodeError,
+        StreamingJsonReadError,
         BinaryFirstContractError,
         TypeError,
         ValueError,
@@ -2991,14 +3064,20 @@ def _discover_current_validation_attachment(
                 or not path.is_file()
             ):
                 continue
-            content = path.read_bytes()
-            validation = json.loads(content.decode("utf-8"))
-        except (OSError, RuntimeError, UnicodeError, json.JSONDecodeError):
+            validation, _validation_sha256 = (
+                _streamed_validation_attachment(path)
+            )
+        except (
+            OSError,
+            RuntimeError,
+            StreamingJsonReadError,
+            TypeError,
+            ValueError,
+        ):
             continue
         if (
             not isinstance(validation, Mapping)
             or set(validation) != _VALIDATION_ATTACHMENT_FIELDS
-            or content != _canonical_json_bytes(validation)
             or validation.get("validation_run_identity") != match.group(1)
             or validation.get("result_generation_identity")
             != manifest.get("result_generation_identity")

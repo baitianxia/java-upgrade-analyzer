@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT_DIR / "scripts"))
 
 import binary_asm_helper  # noqa: E402
 import binary_artifact_diff  # noqa: E402
+import binary_runtime_reconciler  # noqa: E402
 import binary_trace_engine  # noqa: E402
 from binary_decision_engine import BinaryDecisionEngine  # noqa: E402
 from binary_fact_store import BinaryFactStore  # noqa: E402
@@ -1854,11 +1855,15 @@ class BinaryTraceEngineTest(unittest.TestCase):
             base_runtime = RuntimeReconciler(
                 base_store, base_profile, self.platform,
                 analysis_context_identity=context.identity,
-            ).reconcile()
+            ).reconcile(retain_record_kinds=(
+                binary_runtime_reconciler._RECONCILIATION_RECORD_FIELDS
+            ))
             current_runtime = RuntimeReconciler(
                 current_store, current_profile, self.platform,
                 analysis_context_identity=context.identity,
-            ).reconcile()
+            ).reconcile(retain_record_kinds=(
+                binary_runtime_reconciler._RECONCILIATION_RECORD_FIELDS
+            ))
             decisions = BinaryDecisionEngine(
                 analysis_context_identity=context.identity,
                 runtime_comparison_identity=comparison.identity,

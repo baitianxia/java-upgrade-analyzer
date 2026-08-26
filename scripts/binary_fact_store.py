@@ -16,7 +16,9 @@ from binary_artifact_diff import ArtifactSnapshot
 from binary_first_contract import (
     BinaryFirstContractError,
     JVM_TEXT_TRANSPORT_PREFIX,
+    StreamingCanonicalSequence,
     canonical_identity_native_json,
+    canonical_identity_streaming,
     canonical_json_string,
     surrogate_safe_json_dumps,
     transport_jvm_value,
@@ -1912,6 +1914,24 @@ class BinaryFactStore:
             for envelope in records:
                 yield dict(envelope["payload"])
 
+    def reconciliation_payload_count(self, record_kind: str) -> int:
+        """Return a persisted family count without expanding its chunks."""
+
+        kind = str(record_kind or "")
+        code = RECONCILIATION_KIND_CODES.get(kind)
+        if code is None:
+            raise BinaryFactStoreError(
+                "FACT_STORE_RECONCILIATION_KIND_INVALID", kind
+            )
+        return int(self.connection.execute(
+            """
+            SELECT COALESCE(SUM(record_count),0)
+            FROM reconciliation_records
+            WHERE record_kind=?
+            """,
+            (code,),
+        ).fetchone()[0])
+
     def class_bytes(self, class_variant_identity: str) -> bytes:
         """Load one classfile payload by identity without expanding its fact row."""
         row = self.connection.execute(
@@ -2153,30 +2173,70 @@ class BinaryFactStore:
         return result
 
     def content_identity(self) -> str:
-        payload = {"schema_version": SCHEMA_VERSION, "tables": {}}
-        for table in (
+        """Hash persisted table content with memory bounded to one SQLite row.
+
+        This diagnostic identity is intentionally based on exact persisted
+        values in primary-key order.  Binary blobs are represented by digest
+        and byte length, so class bytes, facts, and reconciliation chunks are
+        never decompressed or accumulated merely to compare test stores.
+        """
+
+        tables = (
             "artifact_instances", "archive_entries", "classes", "members", "direct_edges",
             "resources", "reconciliation_records", "source_overlays",
             "inline_overlays",
-        ):
-            rows = [
-                {
-                    key: (
-                        {
-                            "blob_sha256": hashlib.sha256(value).hexdigest(),
-                            "byte_length": len(value),
-                        }
-                        if isinstance(value, bytes) else value
-                    )
-                    for key, value in row.items()
-                }
-                for row in self.rows(table)
+        )
+
+        def rows(table: str) -> Iterator[dict[str, Any]]:
+            columns = [
+                (str(item[1]), int(item[5]))
+                for item in self.connection.execute(
+                    f"PRAGMA table_info({table})"
+                )
             ]
-            payload["tables"][table] = sorted(
-                rows,
-                key=lambda item: _json(item),
+            primary_key = [
+                name for name, position in sorted(
+                    columns, key=lambda item: item[1] or 1_000_000
+                )
+                if position
+            ]
+            if not primary_key:
+                raise BinaryFactStoreError(
+                    "FACT_STORE_CONTENT_IDENTITY_ORDER_MISSING", table
+                )
+            order = ",".join(f'"{name}"' for name in primary_key)
+            cursor = self.connection.execute(
+                f"SELECT * FROM {table} ORDER BY {order}"
             )
-        return _identity("binary_fact_store_content_identity", payload)
+            try:
+                for raw in cursor:
+                    yield {
+                        key: (
+                            {
+                                "blob_sha256": hashlib.sha256(value).hexdigest(),
+                                "byte_length": len(value),
+                            }
+                            if isinstance(value, bytes) else value
+                        )
+                        for key, value in dict(raw).items()
+                    }
+            finally:
+                cursor.close()
+
+        payload = {
+            "schema_version": SCHEMA_VERSION,
+            "tables": {
+                table: StreamingCanonicalSequence(
+                    lambda table=table: rows(table)
+                )
+                for table in tables
+            },
+        }
+        return canonical_identity_streaming(
+            "binary_fact_store_content_identity",
+            payload,
+            schema_version="1",
+        )
 
 
 __all__ = [

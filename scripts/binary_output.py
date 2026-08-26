@@ -37,6 +37,7 @@ from process_lock import exclusive_file_lock
 from signature_utils import jvm_method_parameter_signature
 from streaming_json import (
     fsync_directory as _fsync_directory_durable,
+    json_file_digest_if_matches,
     write_json_streaming,
 )
 
@@ -4131,23 +4132,18 @@ def activate_binary_generation(
                 str(validation_path),
             )
     try:
-        validation_bytes = validation_path.read_bytes()
-        persisted_validation = json.loads(validation_bytes.decode("utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
+        validation_result_sha256 = json_file_digest_if_matches(
+            validation_path,
+            expected_validation,
+        )
+    except (OSError, TypeError, ValueError):
         raise BinaryOutputError(
             "BINARY_GENERATION_VALIDATION_ATTACHMENT_INVALID", str(validation_path)
         ) from None
-    if (
-        not isinstance(persisted_validation, Mapping)
-        or not is_complete_v3_validation_result(
-            persisted_validation, manifest
-        )
-        or validation_bytes != _json_bytes(expected_validation)
-    ):
+    if validation_result_sha256 is None:
         raise BinaryOutputError(
             "BINARY_GENERATION_VALIDATION_ATTACHMENT_INVALID", str(validation_path)
         )
-    validation_result_sha256 = hashlib.sha256(validation_bytes).hexdigest()
     # The active descriptor is the final durable commit point. Re-establish
     # durability for every byte it names, including the validation attachment
     # and its newly-created directory entry, before taking the activation lock.
