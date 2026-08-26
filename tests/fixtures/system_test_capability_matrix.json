@@ -5,8 +5,8 @@
     "public_contract_sources": [
       "README.md",
       "RUNBOOK.md",
-      "docs/developer/architecture.md",
-      "docs/developer/testing-strategy.md",
+      "docs/system/architecture/overview.md",
+      "docs/system/quality/testing-strategy.md",
       "scripts/step_manifest.json",
       "scripts/binary_first_support_manifest.json"
     ],

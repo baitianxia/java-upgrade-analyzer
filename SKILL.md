@@ -5,7 +5,7 @@ description: "Java 升级兼容性分析。用户提到 JDK、Spring Boot、Spri
 
 # Java 系统升级兼容性分析
 
-这是一个给 Claude Code 使用的 Java 升级兼容性分析 Skill。本文件只定义模型执行任务时必须遵守的运行合同；使用说明见 `README.md`，维护和测试说明见 `docs/developer/`。
+这是一个给 Claude Code 使用的 Java 升级兼容性分析 Skill。本文件只定义模型执行任务时必须遵守的运行合同；使用说明见 `README.md`，维护和测试说明见 `docs/system/`。
 
 极简交互规则见 `CHECKPOINT_RULES.md`。统一入口是 `${CLAUDE_SKILL_DIR}/scripts/run_step.py`，不要直接调用内部引擎脚本。
 
@@ -290,9 +290,9 @@ Step4 人工复核顺序：
 
 ## 按需查阅
 
-- 用户输出：`docs/user/outputs.md`
-- 最终引擎设计：`docs/developer/binary-first-source-overlay-design.md`
-- 架构：`docs/developer/architecture.md`
+- 用户输出：`docs/system/operations/outputs.md`
+- 最终引擎设计：`docs/system/architecture/binary-first-engine.md`
+- 架构：`docs/system/architecture/overview.md`
 - 运行命令：`RUNBOOK.md`
 - 最小交互规则：`CHECKPOINT_RULES.md`
-- 质量与测试：`docs/developer/quality.md`
+- 质量与测试：`docs/system/quality/quality-gates.md`

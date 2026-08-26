@@ -44,7 +44,7 @@ class BinaryOnlyArchitectureTest(unittest.TestCase):
 
     def test_design_does_not_require_normal_users_to_handwrite_binary_config(self):
         design = (
-            ROOT / "docs/developer/binary-first-source-overlay-design.md"
+            ROOT / "docs/system/architecture/binary-first-engine.md"
         ).read_text(encoding="utf-8")
         self.assertIn("正常用户流程不要求用户手写", design)
         self.assertIn("Step1", design)

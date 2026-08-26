@@ -8,6 +8,13 @@
 
 使用者只需要在 Claude Code 中描述升级场景，让 Claude Code 调用本 Skill，按交互提示补充信息，并查看最终报告。
 
+## 文档入口
+
+- 当前系统架构、契约和质量边界：[docs/system/README.md](docs/system/README.md)
+- 当前维护上下文与后续候选：[docs/project/current.md](docs/project/current.md)
+- 完整文档导航：[docs/README.md](docs/README.md)
+- Claude Code 执行合同：[SKILL.md](SKILL.md)
+
 ---
 
 ## 它能做什么
@@ -129,7 +136,7 @@ Step4–6 只使用 binary-first 引擎，没有 legacy、shadow、灰度或 fal
 
 输入模板见 `binary_pipeline_config.example.json`，完整运行配置见 `runtime_config.example.json`。身份、支持边界、独立 Oracle 或 sidecar 完整性任一失败时，当前 generation 失败关闭并保留上一份已验证结果；系统不会调用旧引擎补算，也不会逐 API、逐事实或逐边降级。
 
-binary 输出使用 `reachability_status`、`static_linkage_status`、`impact_conclusion`、`runtime_verification_status` 四个独立维度。静态分析最多给出 `probable_impact`，不会伪造 `confirmed_impact`、`confirmed_no_impact` 或已经执行的运行验证。人工复核先看 `evidence/api_changes/changed_dependencies.md`，再进入 `s4_per_dependency/` 的依赖明细；批量筛选使用 `all_changed_apis.csv`。详细文件和复核顺序见 `docs/user/outputs.md`。
+binary 输出使用 `reachability_status`、`static_linkage_status`、`impact_conclusion`、`runtime_verification_status` 四个独立维度。静态分析最多给出 `probable_impact`，不会伪造 `confirmed_impact`、`confirmed_no_impact` 或已经执行的运行验证。人工复核先看 `evidence/api_changes/changed_dependencies.md`，再进入 `s4_per_dependency/` 的依赖明细；批量筛选使用 `all_changed_apis.csv`。详细文件和复核顺序见 `docs/system/operations/outputs.md`。
 
 ---
 

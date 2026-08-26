@@ -106,7 +106,7 @@ class CsvEncodingContractTest(unittest.TestCase):
             self.assert_single_bom(observer.timing_path)
 
     def test_user_docs_declare_excel_compatible_encoding(self):
-        for relative in ("SKILL.md", "RUNBOOK.md", "docs/user/outputs.md"):
+        for relative in ("SKILL.md", "RUNBOOK.md", "docs/system/operations/outputs.md"):
             self.assertIn("UTF-8 BOM", (ROOT / relative).read_text(encoding="utf-8"))
 
 

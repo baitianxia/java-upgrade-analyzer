@@ -13,7 +13,7 @@
       "root_cause_family": "access-linkage-state-model",
       "escape_reason": "早期场景没有把成员解析成功与访问链接失败拆成两个独立状态。",
       "resolution_scope": "root-cause-model-and-public-regression",
-      "source_evidence": ["docs/developer/testing-strategy.md"],
+      "source_evidence": ["docs/system/quality/testing-strategy.md"],
       "truth_evidence": [{
         "path": "tests/fixtures/blackbox/access-restriction-v1/truth.json",
         "control_pointers": ["/forbidden_results/0"]
@@ -40,7 +40,7 @@
       "root_cause_family": "protected-access-path-semantics",
       "escape_reason": "原有访问案例没有同时包含合法子类路径和相近非法路径。",
       "resolution_scope": "root-cause-model-and-public-regression",
-      "source_evidence": ["docs/developer/testing-strategy.md"],
+      "source_evidence": ["docs/system/quality/testing-strategy.md"],
       "truth_evidence": [{
         "path": "tests/fixtures/blackbox/access-level-matrix-v1/truth.json",
         "control_pointers": ["/expected_results/0", "/forbidden_results/0"]
@@ -67,7 +67,7 @@
       "root_cause_family": "protected-access-path-semantics",
       "escape_reason": "只覆盖了声明可见性，没有覆盖接收者类型这一 JVM 约束。",
       "resolution_scope": "root-cause-model-and-public-regression",
-      "source_evidence": ["docs/developer/testing-strategy.md"],
+      "source_evidence": ["docs/system/quality/testing-strategy.md"],
       "truth_evidence": [{
         "path": "tests/fixtures/blackbox/access-level-matrix-v1/truth.json",
         "control_pointers": ["/expected_results/0", "/forbidden_results/0"]
@@ -94,7 +94,7 @@
       "root_cause_family": "missing-linkage-certainty",
       "escape_reason": "原测试没有区分带跨版本制品证据与无配对证据的缺类。",
       "resolution_scope": "root-cause-model-and-public-regression",
-      "source_evidence": ["docs/developer/testing-strategy.md"],
+      "source_evidence": ["docs/system/quality/testing-strategy.md"],
       "truth_evidence": [{
         "path": "tests/fixtures/blackbox/removed-class-v1/truth.json",
         "control_pointers": ["/expected_results/0", "/forbidden_results/0"]
@@ -121,7 +121,7 @@
       "root_cause_family": "inherited-member-resolution",
       "escape_reason": "早期闭集只覆盖直接声明，没有覆盖子类符号引用到父类声明的重绑定。",
       "resolution_scope": "root-cause-model-and-public-regression",
-      "source_evidence": ["docs/developer/testing-strategy.md"],
+      "source_evidence": ["docs/system/quality/testing-strategy.md"],
       "truth_evidence": [{
         "path": "tests/fixtures/blackbox/virtual-inherited-dispatch-v1/truth.json",
         "control_pointers": ["/expected_results/0", "/forbidden_results/0"]
@@ -148,7 +148,7 @@
       "root_cause_family": "jvm-access-flag-transition",
       "escape_reason": "原案例只比较成员存在性，没有覆盖 access flags 的方向性变化。",
       "resolution_scope": "root-cause-model-and-public-regression",
-      "source_evidence": ["docs/developer/testing-strategy.md"],
+      "source_evidence": ["docs/system/quality/testing-strategy.md"],
       "truth_evidence": [{
         "path": "tests/fixtures/blackbox/abstract-method-change-v1/truth.json",
         "control_pointers": ["/expected_results/0", "/forbidden_results/0"]
@@ -175,7 +175,7 @@
       "root_cause_family": "jvm-access-flag-transition",
       "escape_reason": "原案例没有用旧子类在当前制品上的真实类定义行为交叉验证。",
       "resolution_scope": "root-cause-model-and-public-regression",
-      "source_evidence": ["docs/developer/testing-strategy.md"],
+      "source_evidence": ["docs/system/quality/testing-strategy.md"],
       "truth_evidence": [
         {
           "path": "tests/fixtures/blackbox/final-class-change-v1/truth.json",
@@ -208,7 +208,7 @@
       "root_cause_family": "target-jvm-nestmate-semantics",
       "escape_reason": "早期访问矩阵基于 Java 8 语义，没有覆盖 Java 11 nestmate 元数据。",
       "resolution_scope": "root-cause-model-and-public-regression",
-      "source_evidence": ["docs/developer/testing-strategy.md"],
+      "source_evidence": ["docs/system/quality/testing-strategy.md"],
       "truth_evidence": [{
         "path": "tests/fixtures/blackbox/nestmate-private-path-v1/truth.json",
         "control_pointers": ["/expected_results/0", "/forbidden_results/0"]
@@ -240,7 +240,7 @@
       "root_cause_family": "workflow-input-scope",
       "escape_reason": "早期工作流测试只检查代码目录和成功状态，没有闭集比较资源输出。",
       "resolution_scope": "workflow-scope-and-public-regression",
-      "source_evidence": ["docs/developer/testing-strategy.md"],
+      "source_evidence": ["docs/system/quality/testing-strategy.md"],
       "truth_evidence": [{
         "path": "tests/fixtures/workflow_blackbox/step3_public_scans_v1.json",
         "control_pointers": ["/spring_config/0", "/runtime_flags/0"]
@@ -267,7 +267,7 @@
       "root_cause_family": "workflow-scope-state-machine",
       "escape_reason": "原测试只覆盖非空选择，没有把零变化作为独立边界输入。",
       "resolution_scope": "state-machine-and-public-regression",
-      "source_evidence": ["docs/developer/testing-strategy.md"],
+      "source_evidence": ["docs/system/quality/testing-strategy.md"],
       "truth_evidence": [{
         "path": "tests/fixtures/workflow_blackbox/step4_scope_v1.json",
         "control_pointers": ["/zero/scope", "/invalid_partial_without_target"]
@@ -294,7 +294,7 @@
       "root_cause_family": "report-fact-identity-and-aggregation",
       "escape_reason": "早期报告测试偏重总数和成功状态，没有比较同类多事实的精确身份集合。",
       "resolution_scope": "aggregation-model-and-public-regression",
-      "source_evidence": ["docs/developer/testing-strategy.md"],
+      "source_evidence": ["docs/system/quality/testing-strategy.md"],
       "truth_evidence": [{
         "path": "tests/fixtures/workflow_blackbox/full_public_workflow_v1.json",
         "control_pointers": ["/expected_api_rows/0", "/expected_report_contract"]
@@ -321,7 +321,7 @@
       "root_cause_family": "runtime-provider-identity",
       "escape_reason": "原测试把路径来源当作 provider 身份，没有加入同内容异路径的变形控制。",
       "resolution_scope": "identity-model-and-public-regression",
-      "source_evidence": ["docs/developer/testing-strategy.md"],
+      "source_evidence": ["docs/system/quality/testing-strategy.md"],
       "truth_evidence": [{
         "path": "tests/fixtures/blackbox_runtime/runtime_topology_v1.json",
         "control_pointers": ["/cases/parent_first"]
@@ -353,7 +353,7 @@
       "root_cause_family": "public-failure-boundary",
       "escape_reason": "原测试只断言非零退出，没有把 stderr 禁止项作为外部合同。",
       "resolution_scope": "public-boundary-and-contract-regression",
-      "source_evidence": ["docs/developer/testing-strategy.md"],
+      "source_evidence": ["docs/system/quality/testing-strategy.md"],
       "truth_evidence": [{
         "path": "tests/fixtures/workflow_blackbox/public_cli_surface_v1.json",
         "control_pointers": ["/invalid_option_contract/forbidden_stderr_markers/0"]
@@ -380,7 +380,7 @@
       "root_cause_family": "concurrent-atomic-publication",
       "escape_reason": "单进程成功测试没有制造两个真实写者的并发时序。",
       "resolution_scope": "shared-publication-primitive-and-concurrency-regression",
-      "source_evidence": ["docs/developer/testing-strategy.md"],
+      "source_evidence": ["docs/system/quality/testing-strategy.md"],
       "truth_evidence": [{
         "path": "tests/fixtures/blackbox_runtime/cache_public_contract_v1.json",
         "control_pointers": ["/expected_concurrent_failure_reason_code"]
@@ -407,7 +407,7 @@
       "root_cause_family": "concurrent-atomic-publication",
       "escape_reason": "原子替换只在串行路径验证，没有覆盖同内容写者的竞争窗口。",
       "resolution_scope": "shared-publication-primitive-and-concurrency-regression",
-      "source_evidence": ["docs/developer/testing-strategy.md"],
+      "source_evidence": ["docs/system/quality/testing-strategy.md"],
       "truth_evidence": [{
         "path": "tests/fixtures/blackbox_runtime/cache_public_contract_v1.json",
         "control_pointers": ["/expected_concurrent_result_identity_count"]
@@ -434,7 +434,7 @@
       "root_cause_family": "archive-entry-ambiguity",
       "escape_reason": "原制品测试只验证 ZIP 可读，没有构造重复名称和允许重复元数据的对照。",
       "resolution_scope": "archive-policy-and-public-regression",
-      "source_evidence": ["docs/developer/testing-strategy.md"],
+      "source_evidence": ["docs/system/quality/testing-strategy.md"],
       "truth_evidence": [{
         "path": "tests/fixtures/blackbox_runtime/artifact_safety_public_contract_v1.json",
         "control_pointers": ["/duplicate_entry_reason", "/blocking_reason"]
@@ -461,7 +461,7 @@
       "root_cause_family": "resource-parser-dispatch",
       "escape_reason": "原资源案例按路径覆盖但没有加入畸形 XML 与合法 XML 的近邻对照。",
       "resolution_scope": "parser-dispatch-and-public-regression",
-      "source_evidence": ["docs/developer/testing-strategy.md"],
+      "source_evidence": ["docs/system/quality/testing-strategy.md"],
       "truth_evidence": [{
         "path": "tests/fixtures/blackbox_runtime/artifact_safety_public_contract_v1.json",
         "control_pointers": ["/malformed_xml_gap_suffix"]
@@ -493,7 +493,7 @@
       "root_cause_family": "public-failure-boundary",
       "escape_reason": "早期失败测试没有预置陈旧进度，也没有同时注入主失败和结果落盘失败。",
       "resolution_scope": "failure-precedence-and-public-regression",
-      "source_evidence": ["docs/developer/testing-strategy.md"],
+      "source_evidence": ["docs/system/quality/testing-strategy.md"],
       "truth_evidence": [{
         "path": "tests/fixtures/blackbox_runtime/tool_failure_public_contract_v1.json",
         "control_pointers": ["/attempt_progress_binding", "/result_sink_failure"]

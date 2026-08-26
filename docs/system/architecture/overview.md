@@ -10,7 +10,7 @@
 2. Step4–Step6：单一 binary-first 引擎生成变化事实、静态触达结果和最终报告；
 3. 调度与交互：保存主状态、门控、原子发布、恢复、进度和用户确认。
 
-Step4–Step6 不存在旧引擎选择、shadow、灰度、兼容模式或 fallback。详细引擎合同见 [Binary-first / Source-overlay 最终设计](binary-first-source-overlay-design.md)。
+Step4–Step6 不存在旧引擎选择、shadow、灰度、兼容模式或 fallback。详细引擎合同见 [Binary-first / Source-overlay 最终设计](binary-first-engine.md)。
 
 ## 2. 架构目标
 

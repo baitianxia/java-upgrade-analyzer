@@ -1,0 +1,27 @@
+# 历史实施计划
+
+以下计划按文件日期排序，保留当时的任务拆分和路径语境。计划存在不等于已经执行或验收。
+
+- [MyBatis Proxy Real-Project Audit Implementation Plan](2026-07-14-mybatis-proxy-real-project-audit.md)
+- [Step5 Evidence Model Phase 1 Implementation Plan](2026-07-14-step5-evidence-model-phase1.md)
+- [Step5 Full Evidence Migration Implementation Plan](2026-07-15-step5-full-evidence-migration.md)
+- [Test Round Retrospective Implementation Plan](2026-07-15-test-round-retrospective.md)
+- [Capability Family Closure Implementation Plan](2026-07-16-capability-family-closure.md)
+- [Close Known Gaps And Rotate Real Project Implementation Plan](2026-07-16-close-known-gaps-and-rotate-real-project.md)
+- [Dubbo RPC Proxy Real Project Implementation Plan](2026-07-16-dubbo-rpc-proxy-real-project.md)
+- [Real Project Fault Injection Implementation Plan](2026-07-16-real-project-fault-injection.md)
+- [Step1 Branch Ref Resolution Implementation Plan](2026-07-16-step1-branch-ref-resolution.md)
+- [Cache Evidence Correctness Remediation Plan](2026-07-17-cache-evidence-correctness-remediation.md)
+- [CSV Excel Encoding Implementation Plan](2026-07-17-csv-excel-encoding.md)
+- [Pipeline Performance Optimization Implementation Plan](2026-07-17-pipeline-performance-optimization.md)
+- [Remote-first source resolution implementation plan](2026-07-17-remote-source-resolution.md)
+- [Active Defect Discovery Implementation Plan](2026-07-18-active-defect-discovery.md)
+- [Operational and Performance Assurance Implementation Plan](2026-07-18-operational-performance-assurance.md)
+- [Production Evidence Closure Implementation Plan](2026-07-18-production-evidence-closure.md)
+- [Test Quality Hardening Implementation Plan](2026-07-18-test-quality-hardening.md)
+- [Framework Owner Artifact Routing Implementation Plan](2026-07-19-framework-owner-artifact-routing.md)
+- [Pig Real Project Audit Implementation Plan](2026-07-19-pig-real-project-audit.md)
+- [Step5 Cold-Run Performance Implementation Plan](2026-07-19-step5-cold-run-performance.md)
+- [Step5 Equivalent Memory Reduction Implementation Plan](2026-07-19-step5-memory-equivalence.md)
+- [Quality Convergence Implementation Plan](2026-07-20-quality-convergence.md)
+- [Step1 Shallow Dependency Inventory Implementation Plan](2026-07-20-step1-shallow-inventory.md)

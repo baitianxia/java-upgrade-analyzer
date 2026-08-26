@@ -10,7 +10,7 @@ class UserVisibleOutputContractTest(unittest.TestCase):
         return (ROOT_DIR / relative).read_text(encoding="utf-8")
 
     def test_outputs_doc_explains_three_report_layers(self):
-        text = self.read("docs/user/outputs.md")
+        text = self.read("docs/system/operations/outputs.md")
         self.assertIn("deliverables/", text)
         self.assertIn("evidence/", text)
         self.assertIn(".runtime/", text)
@@ -19,7 +19,7 @@ class UserVisibleOutputContractTest(unittest.TestCase):
         self.assertIn("程序", text)
 
     def test_outputs_doc_uses_reader_facing_conclusion_terms(self):
-        text = self.read("docs/user/outputs.md")
+        text = self.read("docs/system/operations/outputs.md")
         reading_section = text[text.index("主报告的内容顺序：") : text.index("每个用户可见文件")]
 
         self.assertIn("依赖层面结论", reading_section)
@@ -40,7 +40,7 @@ class UserVisibleOutputContractTest(unittest.TestCase):
         self.assertIn("对应位置必须直接给出", text)
 
     def test_outputs_doc_explains_dependency_level_step4_selection(self):
-        text = self.read("docs/user/outputs.md")
+        text = self.read("docs/system/operations/outputs.md")
         self.assertIn("changed_dependencies.md", text)
         self.assertIn("changed_dependencies.csv", text)
         self.assertIn("依赖包维度", text)
@@ -48,7 +48,7 @@ class UserVisibleOutputContractTest(unittest.TestCase):
         self.assertIn("完整 API", text)
 
     def test_outputs_doc_separates_human_first_files_from_program_files(self):
-        text = self.read("docs/user/outputs.md")
+        text = self.read("docs/system/operations/outputs.md")
         self.assertIn("人工优先看的文件", text)
         self.assertIn("深度排查或程序使用的文件", text)
         step5_text = text[text.index("## 系统触达证据") : text.index("## 系统触达证据结论")]
@@ -72,7 +72,7 @@ class UserVisibleOutputContractTest(unittest.TestCase):
     def test_claude_code_runtime_docs_exclude_developer_test_governance(self):
         skill = self.read("SKILL.md")
         runbook = self.read("RUNBOOK.md")
-        quality = self.read("docs/developer/quality.md")
+        quality = self.read("docs/system/quality/quality-gates.md")
 
         self.assertIn("给 Claude Code 使用", skill)
         self.assertIn("${CLAUDE_SKILL_DIR}", skill)
@@ -100,7 +100,7 @@ class UserVisibleOutputContractTest(unittest.TestCase):
         readme = self.read("README.md")
         runbook = self.read("RUNBOOK.md")
         manifest = self.read("scripts/step_manifest.json")
-        outputs = self.read("docs/user/outputs.md")
+        outputs = self.read("docs/system/operations/outputs.md")
 
         self.assertIn(".upgrade-report/README.md", readme)
         self.assertIn(".upgrade-report/evidence/context/review.md", readme)

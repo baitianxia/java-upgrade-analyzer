@@ -174,6 +174,6 @@ python3 scripts/binary_performance_gate.py --verify-recorded-gate tests/fixtures
 python3 scripts/binary_real_project_guard.py --manifest tests/fixtures/binary_first/real_projects/mybatis_sample_xml_noop.json --verify-manifest
 ```
 
-`blackbox` 保护公开输入输出，`whitebox` 保护当前内部实现，`performance` 保护小规模性能与正确性守恒；具体原则见 `docs/developer/testing-strategy.md`。release profile 先执行测试可信度门，再使用 unittest discovery 唯一分类并运行全部测试，新增测试不会因未登记而漏跑。对重要引擎改动还必须执行同一真值输入的 `main`/当前分支对比，逐项核对依赖身份、变化对象、路径、漏报、误报、覆盖边界、耗时和内存；只比较总数不构成有效证据。
+`blackbox` 保护公开输入输出，`whitebox` 保护当前内部实现，`performance` 保护小规模性能与正确性守恒；具体原则见 `docs/system/quality/testing-strategy.md`。release profile 先执行测试可信度门，再使用 unittest discovery 唯一分类并运行全部测试，新增测试不会因未登记而漏跑。对重要引擎改动还必须执行同一真值输入的 `main`/当前分支对比，逐项核对依赖身份、变化对象、路径、漏报、误报、覆盖边界、耗时和内存；只比较总数不构成有效证据。
 
 公开能力盘点位于 `tests/fixtures/system_test_capability_matrix.json`。`python3 scripts/test_trust_gate.py` 会输出 covered/partial/missing 数和具体阻断项；局部测试即使全部通过，只要矩阵未完成，`test_suite_runner.py --suite all` 与 Release 准出仍会以 `PUBLIC_CAPABILITY_MATRIX_INCOMPLETE` 失败，避免把“已测部分通过”误报成“系统全面可靠”。

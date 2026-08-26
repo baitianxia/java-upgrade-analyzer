@@ -1,47 +1,61 @@
-# 文档地图
+# 文档中心
 
-本文档用于说明工程文档的阅读入口和目录职责。
+本文档是仓库文档的总入口。文档按“当前系统事实、项目过程、历史资料”分域，避免当前契约、待办计划和历史设计互相覆盖。
 
-## 快速入口
+## 日常入口
 
-| 读者 | 建议先看 | 用途 |
-|---|---|---|
-| 使用者 | [../README.md](../README.md) | 快速运行、常见输入、主要产物 |
-| Claude Code | [../SKILL.md](../SKILL.md) | 执行协议、交互硬规则、状态机约束 |
-| 人工复核人 | [user/outputs.md](user/outputs.md) | `.upgrade-report/` 产物、复核顺序、状态语义 |
-| 所有维护者 | [developer/constitution.md](developer/constitution.md) | 工程宪法、不可违背的原则性约束 |
-| 新接手维护者 | [../TODO.md](../TODO.md)、[developer/architecture.md](developer/architecture.md) | 当前待办和架构阅读入口 |
-| 维护者 | [developer/architecture.md](developer/architecture.md) | 当前架构、Step0~Step6 职责、状态模型 |
-| Step5 修改者 | [developer/step5-design.md](developer/step5-design.md) | binary trace 四态、范围、alerts 台账语义 |
-| 测试/发布负责人 | [developer/quality.md](developer/quality.md) | 质量门禁、测试矩阵、真实项目验证口径 |
-| 测试体系维护者 | [developer/testing-strategy.md](developer/testing-strategy.md) | 黑盒/白盒/性能分层、第三方 Oracle 与真值治理 |
+1. [当前工作上下文](project/current.md)：维护者和 Agent 开始工作时的首要入口。
+2. [当前系统文档](system/README.md)：产品边界、架构、跨步骤契约、运维说明和质量下限。
+3. [项目文档](project/README.md)：路线图、开发记录、审计和文档治理。
+4. [使用说明](../README.md)：用户快速开始、输入方式、交互和结果阅读。
+5. [历史文档](archive/README.md)：仅用于解释旧设计或目录迁移，不指导当前实现。
 
-## 目录职责
+## 权威域
+
+| 位置 | 权威性 | 回答的问题 | 不能用于 |
+|---|---|---|---|
+| `system/` | 当前系统规范 | 系统现在是什么、必须保持哪些契约和质量边界 | 宣称某个计划已实施或某次验证已通过 |
+| `project/current.md` | 当前开发导航 | 当前应读取哪些文档、是否存在活动开发记录 | 改写系统契约 |
+| `project/roadmap/` | 规划候选 | 后续可能做什么、进入条件是什么 | 直接授权实现或宣称能力存在 |
+| `project/iterations/`、`project/audits/` | 项目记录与证据 | 当时计划、设计或审计发现了什么 | 自动覆盖当前 `system/` 语义 |
+| `archive/` | 历史 | 解释旧状态和迁移原因 | 作为当前开发默认输入 |
+| 根目录运行文档 | Skill 分发合同 | Claude Code 如何执行、恢复和交互 | 承载维护治理或历史设计 |
+
+## 目录结构
 
 ```text
 docs/
-├── README.md                 # 文档地图
-├── user/                     # 面向使用者和人工复核
-│   └── outputs.md
-├── developer/                # 面向维护、设计和质量保障
-│   ├── constitution.md
-│   ├── architecture.md
-│   ├── step5-design.md
-│   ├── quality.md
-│   ├── testing-strategy.md
-│   └── technical-sharing.md
-└── archive/                  # 历史设计资料和已归档决策
+├── README.md
+├── system/
+│   ├── product/
+│   ├── architecture/
+│   ├── contracts/
+│   ├── operations/
+│   └── quality/
+├── project/
+│   ├── current.md
+│   ├── roadmap/
+│   ├── iterations/
+│   ├── audits/
+│   └── governance/
+└── archive/
+    ├── migration-records/
+    └── legacy/
 ```
 
-## 根目录保留什么
+## 根目录保留项
 
-根目录只保留高频入口和 Skill 必需文件：
+当前工程是可分发的 Claude Code Skill，因此以下文件有运行时或高频入口职责，不迁入 `docs/`：
 
-- `README.md`：使用者快速入口；
-- `SKILL.md`：Claude Code 执行分析任务时的运行时规则；
-- `RUNBOOK.md`：详细命令手册；
-- `CHECKPOINT_RULES.md`：最小交互硬规则；
-- `TODO.md`：待优化项；
-- `scripts/`、`tests/`、`references/`、`agents/`：正式代码与规则资源。
+- `README.md`：使用者入口；
+- `SKILL.md`：Claude Code 执行合同；
+- `RUNBOOK.md`：可随 Skill 分发的命令手册；
+- `CHECKPOINT_RULES.md`：运行时读取的最小交互规则；
+- `AGENTS.md`：仓库级工程约束。
 
-打包产物放在 `dist/`，运行报告放在 `.upgrade-report/`，这两类都不应作为源码结构的一部分阅读。
+## 修改规则
+
+- 当前系统语义只修改 `system/` 中的唯一所有者文档；项目记录通过链接引用，不复制一份新真相。
+- 新计划先进入 `project/roadmap/`；设计和验证记录不得仅凭“已计划”改写为“已实现”。
+- 历史文档保留当时语境。需要恢复旧正文时优先使用 Git 历史，不把旧规则重新提升为当前规范。
+- 修改路径后必须同步更新当前文档、运行文档、测试夹具中的引用，并执行链接检查和受影响的文档契约测试。

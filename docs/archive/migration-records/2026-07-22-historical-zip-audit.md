@@ -15,7 +15,7 @@
 
 1. `git log --all -- '*.zip' '*.ZIP'` 没有结果；两个 ZIP 从未受 Git 跟踪。
 2. 当前仓库没有 ZIP。对精确文件名执行本机 Spotlight 查询也没有结果，但该结果不能覆盖未索引位置或本机无读取权限的 Desktop、Documents、Downloads 等目录。
-3. `docs/superpowers/plans/2026-07-17-csv-excel-encoding.md` 的最终工作区验收曾明确要求只保留
+3. 当前迁移到 `docs/project/iterations/historical-2026-07/plans/2026-07-17-csv-excel-encoding.md` 的历史计划，其最终工作区验收曾明确要求只保留
    `java-upgrade-analyzer-performance-optimization-fdb3895-20260717.zip` 这一未跟踪文件。这证明它在 2026-07-17 的语境中是有意保留的交付候选，不是偶然缓存。
 4. `75dd55b5f113ecbe34dbd90eb6d86724ac500070` 首次把两个文件同时写入正式 TODO；后续 `d064f61412703e2d4b112ef8883215eb80d298c3` 将它们明确描述为早于当前源码的旧版完整打包快照，并要求所有者决定通过 GitHub Release/制品库交付还是清理。
 5. 本轮无法访问 GitHub SSH/API，因此不能核验远端 Release 附件或其他制品库；当前仓库也没有记录任何交付 URL、版本号或历史 ZIP 的 SHA-256。
