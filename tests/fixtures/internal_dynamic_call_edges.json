@@ -1,6 +1,6 @@
 {
   "schema": "java-upgrade-analyzer.internal-dynamic-call-edges.v1",
-  "source_identity": "2c94ef59b96a77c1ac3cf38e2a5240e552c6befa511d92b004f034b7ff8b551c",
+  "source_identity": "2af296c0ba825ed0b5888d5557df5cff1d340ce66cf007e5ffa618cffc93f490",
   "inventory_rule": "Every production-to-production edge observed at runtime but unresolved by the static call graph is retained as a required implementation-dependent white-box relationship. New, removed, or source-stale edges require explicit review.",
   "edges": [
     {
@@ -1860,6 +1860,14 @@
       "callee": "binary_fact_store::BinaryFactStore.rows"
     },
     {
+      "caller": "binary_semantic_overlay::_Builder.__init__",
+      "callee": "binary_semantic_overlay::_DirectMethodEdgeSource.__init__"
+    },
+    {
+      "caller": "binary_semantic_overlay::_Builder._method_edges",
+      "callee": "binary_semantic_overlay::_DirectMethodEdgeSource.iter_method_edges"
+    },
+    {
       "caller": "binary_semantic_overlay::build_binary_semantic_overlay",
       "callee": "binary_first_contract::BinaryFirstContractError.__init__"
     },
@@ -1920,12 +1928,68 @@
       "callee": "compat::run_managed_subprocess"
     },
     {
+      "caller": "binary_trace_engine::BinaryTraceEngine.__init__",
+      "callee": "binary_trace_engine::_SQLiteTraceRowLookup.__init__"
+    },
+    {
+      "caller": "binary_trace_engine::BinaryTraceEngine._build_reverse_graph",
+      "callee": "binary_fact_store::BinaryFactStore.reconciliation_payloads"
+    },
+    {
+      "caller": "binary_trace_engine::BinaryTraceEngine._build_reverse_graph",
+      "callee": "binary_trace_engine::_ExecutableResolutionRow.__getitem__"
+    },
+    {
+      "caller": "binary_trace_engine::BinaryTraceEngine._build_reverse_graph",
+      "callee": "binary_trace_engine::_ExecutableResolutionRow.__len__"
+    },
+    {
+      "caller": "binary_trace_engine::BinaryTraceEngine._build_reverse_graph",
+      "callee": "binary_trace_engine::_IncomingTraceEdge.__init__"
+    },
+    {
+      "caller": "binary_trace_engine::BinaryTraceEngine._iter_graph_edge_items",
+      "callee": "binary_trace_engine::_SQLiteTraceRowLookup.iter_graph_items"
+    },
+    {
+      "caller": "binary_trace_engine::BinaryTraceEngine._load_compact_resolution_indexes",
+      "callee": "binary_fact_store::BinaryFactStore.reconciliation_payloads"
+    },
+    {
+      "caller": "binary_trace_engine::BinaryTraceEngine._load_compact_resolution_indexes",
+      "callee": "binary_trace_engine::_ExecutableResolutionRow.__init__"
+    },
+    {
+      "caller": "binary_trace_engine::BinaryTraceEngine._matching_resolution_edges",
+      "callee": "binary_trace_engine::_SQLiteTraceRowLookup.iter_matching_items"
+    },
+    {
+      "caller": "binary_trace_engine::BinaryTraceEngine._service_activation_results",
+      "callee": "binary_trace_engine::_SQLiteTraceRowLookup.iter_service_activation_rows"
+    },
+    {
       "caller": "binary_trace_engine::BinaryTraceEngine._target_nodes",
       "callee": "binary_fact_store::BinaryFactStore.rows"
     },
     {
       "caller": "binary_trace_engine::BinaryTraceEngine._trace.<locals>.enumerate_paths",
       "callee": "binary_trace_engine::BinaryTraceEngine._trace.<locals>.materialize_path"
+    },
+    {
+      "caller": "binary_trace_engine::BinaryTraceEngine._trace.<locals>.materialize_path",
+      "callee": "binary_trace_engine::_IncomingTraceEdge.__getitem__"
+    },
+    {
+      "caller": "binary_trace_engine::_SQLiteTraceRowLookup.__getitem__",
+      "callee": "binary_trace_engine::_SQLiteTraceRowLookup._projection"
+    },
+    {
+      "caller": "binary_trace_engine::_SQLiteTraceRowLookup.iter_graph_items",
+      "callee": "binary_trace_engine::_SQLiteTraceRowLookup._projection"
+    },
+    {
+      "caller": "binary_trace_engine::_SQLiteTraceRowLookup.iter_service_activation_rows",
+      "callee": "binary_trace_engine::_SQLiteTraceRowLookup._projection"
     },
     {
       "caller": "binary_trace_engine::build_binary_traces",

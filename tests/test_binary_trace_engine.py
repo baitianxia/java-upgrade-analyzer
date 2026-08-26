@@ -256,6 +256,33 @@ class BinaryTraceFastPathTest(unittest.TestCase):
             self.assertIs(actual, expected)
             engine.assert_called_once()
 
+    def test_full_graph_hydrates_only_runtime_selection_families(self):
+        runtime = SimpleNamespace(coverage_gaps=())
+        selected = SimpleNamespace(coverage_gaps=())
+        decisions = self.decisions(formal_projections=({"identity": "p"},))
+        store = object()
+        with patch.object(
+            binary_trace_engine,
+            "discover_binary_entrypoints",
+            return_value=self.discovery(),
+        ), patch.object(
+            binary_trace_engine,
+            "hydrate_runtime_reconciliation",
+            return_value=selected,
+        ) as hydrate, patch.object(
+            binary_trace_engine, "BinaryTraceEngine"
+        ) as engine:
+            engine.return_value.build.return_value = "built"
+            result = build_binary_traces(store, object(), runtime, decisions)
+
+        self.assertEqual(result, "built")
+        hydrate.assert_called_once_with(
+            store,
+            runtime,
+            ("provider_binding", "class_definition"),
+        )
+        self.assertIs(engine.call_args.args[2], selected)
+
     def test_constant_dynamic_handles_participate_in_reverse_linkage(self):
         engine = object.__new__(BinaryTraceEngine)
         engine.member_resolutions = {
@@ -718,6 +745,91 @@ class BinaryTraceBoundaryTest(unittest.TestCase):
         self.assertIn("semantic-edge", engine.semantic_edges)
         self.assertIn("target", engine.reverse)
         self.assertEqual(engine.graph_stats["runtime_semantic_overlay_identity"], "semantic")
+
+    def test_constructor_streams_store_edges_and_releases_full_resolution_payloads(self):
+        class Connection:
+            def __init__(self):
+                self.statements = []
+
+            def execute(self, statement, parameters=()):
+                normalized = " ".join(statement.split())
+                self.statements.append((normalized, tuple(parameters)))
+                if "FROM direct_edges" in normalized and "WHERE" not in normalized:
+                    return ({
+                        "direct_edge_identity": "edge",
+                        "caller_member_identity": "root",
+                        "caller_artifact_instance_identity": "artifact",
+                        "instruction_index": 0,
+                        "bytecode_offset": 0,
+                        "edge_kind": "method",
+                        "opcode": 184,
+                        "symbolic_owner": "demo/Target",
+                        "symbolic_name": "run",
+                        "symbolic_descriptor": "()V",
+                        "edge_json": "{}",
+                    },)
+                if "FROM members" in normalized and "WHERE" in normalized:
+                    return ({
+                        "member_identity": "root",
+                        "class_name": "demo/Root",
+                        "member_name": "main",
+                        "descriptor": "()V",
+                    },)
+                raise AssertionError((normalized, parameters))
+
+        connection = Connection()
+        store = SimpleNamespace(connection=connection)
+        runtime = self.runtime(
+            member_resolutions=({
+                "direct_edge_identity": "edge",
+                "member_resolution_status": "resolved",
+                "resolved_member_identity": "target",
+                "member_resolution_identity": "resolution",
+                "initiating_loader_realm_identity": "loader",
+                "loading_constraints": [{"unused": "x" * 100_000}],
+            },),
+            dispatch_resolutions=({
+                "direct_edge_identity": "edge",
+                "dispatch_status": "exact",
+                "implementation_target_identities": ("target",),
+                "dispatch_resolution_identity": "dispatch",
+            },),
+            linkage_resolutions=({
+                "direct_edge_identity": "edge",
+                "linkage_status": "resolved",
+                "loading_constraints": [{"unused": "x" * 100_000}],
+            },),
+        )
+        engine = BinaryTraceEngine(
+            store,
+            SimpleNamespace(identity="profile"),
+            runtime,
+            self.decisions(),
+            entrypoint_discovery=self.discovery(exact=("root",)),
+        )
+
+        self.assertNotIsInstance(engine.edges, dict)
+        self.assertEqual(engine.member_resolutions, {})
+        self.assertEqual(engine.dispatch, {})
+        self.assertEqual(engine.linkage_resolutions, {})
+        incoming = engine.reverse["target"][0]
+        self.assertEqual(dict(incoming), {
+            "caller_member_identity": "root",
+            "direct_edge_identity": "edge",
+            "certainty": "exact",
+            "member_resolution_identity": "resolution",
+            "dispatch_resolution_identity": "dispatch",
+        })
+        self.assertLess(sys.getsizeof(incoming), sys.getsizeof(dict(incoming)))
+        self.assertEqual(
+            sum("FROM direct_edges" in statement and "WHERE" not in statement
+                for statement, _parameters in connection.statements),
+            1,
+        )
+        self.assertFalse(any(
+            "FROM members" in statement and "WHERE" not in statement
+            for statement, _parameters in connection.statements
+        ))
 
     def test_reverse_graph_admits_only_reconciled_executable_edges_and_overlays(self):
         engine = self.graph_engine()
@@ -1387,6 +1499,20 @@ class BinaryTraceBoundaryTest(unittest.TestCase):
             "reachable",
         )
 
+    def test_service_activation_without_service_decisions_does_not_scan_edges(self):
+        class Edges:
+            def values(self):
+                raise AssertionError("unrelated direct edges must not be scanned")
+
+        engine = object.__new__(BinaryTraceEngine)
+        engine.edges = Edges()
+        engine.decisions = self.decisions(authoritative_decisions=({
+            "fact_kind": "method",
+            "decision_identity": "method",
+        },))
+
+        self.assertEqual(engine._service_activation_results(), [])
+
     def test_build_skips_non_targetable_candidate_and_binds_partial_coverage(self):
         engine = object.__new__(BinaryTraceEngine)
         engine.decisions = self.decisions(
@@ -1531,10 +1657,6 @@ class BinaryTraceBoundaryTest(unittest.TestCase):
             ) as engine, patch.object(
                 binary_trace_engine,
                 "hydrate_runtime_reconciliation",
-                return_value=runtime,
-            ), patch.object(
-                binary_trace_engine,
-                "_hydrate_trace_reconciliation",
                 return_value=runtime,
             ):
                 engine.return_value.build.return_value = "built"

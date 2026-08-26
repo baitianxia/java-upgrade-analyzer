@@ -235,6 +235,43 @@ class BinarySemanticOverlay:
         }
 
 
+class _DirectMethodEdgeSource:
+    """Replay filtered method edges without retaining the complete edge table."""
+
+    _PROJECTION = (
+        "direct_edge_identity,caller_member_identity,edge_kind,"
+        "symbolic_owner,symbolic_name,symbolic_descriptor"
+    )
+
+    def __init__(self, connection: Any):
+        self.connection = connection
+
+    def iter_method_edges(
+        self, owners: Iterable[str] | None = None
+    ):
+        if owners is None:
+            for row in self.connection.execute(
+                f"SELECT {self._PROJECTION} FROM direct_edges "
+                "WHERE edge_kind='method' ORDER BY rowid"
+            ):
+                yield dict(row)
+            return
+        normalized = tuple(sorted({str(owner) for owner in owners if owner}))
+        if not normalized:
+            return
+        # JSON1 is already part of the fact-store SQL contract. A single JSON
+        # parameter avoids SQLite's variable limit while preserving the old
+        # full-table rowid order across arbitrarily many selected owners.
+        owner_json = json.dumps(normalized, separators=(",", ":"))
+        for row in self.connection.execute(
+            f"SELECT {self._PROJECTION} FROM direct_edges "
+            "WHERE edge_kind='method' AND symbolic_owner IN "
+            "(SELECT value FROM json_each(?)) ORDER BY rowid",
+            (owner_json,),
+        ):
+            yield dict(row)
+
+
 class _Builder:
     def __init__(self, store: Any, profile: Any, reconciliation: Any, decisions: Any = None):
         self.store = store
@@ -263,18 +300,7 @@ class _Builder:
         self.members_by_variant: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for row in self.members.values():
             self.members_by_variant[row["class_variant_identity"]].append(row)
-        self.direct_edges = [
-            dict(row)
-            for row in store.connection.execute(
-                """
-                SELECT direct_edge_identity,caller_member_identity,
-                       caller_artifact_instance_identity,instruction_index,
-                       bytecode_offset,edge_kind,opcode,symbolic_owner,
-                       symbolic_name,symbolic_descriptor,edge_json
-                FROM direct_edges
-                """
-            )
-        ]
+        self.direct_edges = _DirectMethodEdgeSource(store.connection)
         class_load_ready = {
             (
                 str(item.get("initiating_loader_realm_identity") or ""),
@@ -346,6 +372,20 @@ class _Builder:
             if row.get("member_kind") == "method"
             and (not name or row.get("member_name") == name)
         ]
+
+    def _method_edges(self, owners: Iterable[str] | None = None):
+        source = self.direct_edges
+        filtered = getattr(source, "iter_method_edges", None)
+        if callable(filtered):
+            yield from filtered(owners)
+            return
+        owner_set = None if owners is None else set(owners)
+        for edge in source:
+            if edge.get("edge_kind") != "method":
+                continue
+            if owner_set is not None and edge.get("symbolic_owner") not in owner_set:
+                continue
+            yield edge
 
     def _member_fact_rows(self):
         for (realm, class_name), (class_row, fact) in self.selected.items():
@@ -667,16 +707,23 @@ class _Builder:
                 runtime_targets.append(matches[0][1])
             elif namespaces:
                 self.gaps.add(f"mybatis_runtime_target_unresolved:{owner}:{name}")
-        invoked_owners = {
-            str(edge.get("symbolic_owner") or "") for edge in self.direct_edges
-            if edge.get("edge_kind") == "method"
-        }
+        registered_interfaces = []
         for realm, class_name in sorted(self.selected):
             selected = self.selected[(realm, class_name)]
             annotations = self._class_annotations(selected)
             registered = bool(annotations & MAPPER_ANNOTATIONS) or class_name in namespaces
             interface = int(selected[1].get("class_access") or 0) & ACC_INTERFACE
-            if not registered or not interface or class_name not in invoked_owners:
+            if registered and interface:
+                registered_interfaces.append((realm, class_name, annotations))
+        invoked_owners = {
+            str(edge.get("symbolic_owner") or "")
+            for edge in self._method_edges(
+                class_name
+                for _realm, class_name, _annotations in registered_interfaces
+            )
+        }
+        for realm, class_name, annotations in registered_interfaces:
+            if class_name not in invoked_owners:
                 continue
             certainty = "exact" if annotations & MAPPER_ANNOTATIONS else "possible"
             if certainty == "possible":
@@ -825,16 +872,18 @@ class _Builder:
                     if PRIMARY in annotations:
                         primary_bean_types.add((realm, registered_type))
 
-        for edge in self.direct_edges:
-            if edge.get("edge_kind") != "method":
-                continue
-            realm_candidates = self.realms
+        interface_owners = {
+            class_name
+            for _realm, class_name in self.selected
+            if any(
+                int((self.selected.get((realm, class_name)) or ({}, {}))[1].get(
+                    "class_access"
+                ) or 0) & ACC_INTERFACE
+                for realm in self.realms
+            )
+        }
+        for edge in self._method_edges(interface_owners):
             interface = str(edge.get("symbolic_owner") or "")
-            if not any(
-                int((self.selected.get((realm, interface)) or ({}, {}))[1].get("class_access") or 0) & ACC_INTERFACE
-                for realm in realm_candidates
-            ):
-                continue
             implementations = []
             for (realm, class_name), _selected in self.selected.items():
                 if (realm, class_name) not in bean_types or interface not in self._hierarchy(realm, class_name):
@@ -881,11 +930,10 @@ class _Builder:
         }
         if custom_repository_configuration:
             self.gaps.add("spring_data_custom_repository_factory")
-        for edge in self.direct_edges:
+        for edge in self._method_edges(repo_interfaces):
             owner = str(edge.get("symbolic_owner") or "")
             if (
                 owner not in repo_interfaces
-                or edge.get("edge_kind") != "method"
                 or custom_repository_configuration
             ):
                 continue
@@ -1061,10 +1109,11 @@ class _Builder:
                 implementation = str(value).split("=", 1)[-1].strip().replace(".", "/")
                 if implementation:
                     providers[(resource["realm"], service)].add(implementation)
-        for edge in self.direct_edges:
+        for edge in self._method_edges({
+            "org/apache/dubbo/common/extension/ExtensionLoader"
+        }):
             if not (
-                edge.get("edge_kind") == "method"
-                and edge.get("symbolic_owner") == "org/apache/dubbo/common/extension/ExtensionLoader"
+                edge.get("symbolic_owner") == "org/apache/dubbo/common/extension/ExtensionLoader"
                 and edge.get("symbolic_name") in {"getExtension", "getAdaptiveExtension", "getActivateExtension"}
             ):
                 continue

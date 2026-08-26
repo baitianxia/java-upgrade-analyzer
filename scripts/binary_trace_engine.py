@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
+from collections.abc import Iterator
 from dataclasses import dataclass
 import json
 from typing import Any, Mapping
@@ -125,6 +126,228 @@ def _unresolved_edge_certainty(
     )
 
 
+class _ExecutableResolutionRow(Mapping[str, Any]):
+    """One state object shared by member, dispatch, and linkage indexes."""
+
+    __slots__ = (
+        "direct_edge_identity", "member_resolution_status",
+        "resolved_member_identity", "member_resolution_identity",
+        "initiating_loader_realm_identity", "dispatch_status",
+        "implementation_target_identities", "dispatch_resolution_identity",
+        "linkage_status",
+    )
+    FIELDS = __slots__
+    FIELD_SET = frozenset(FIELDS)
+
+    def __init__(self, direct_edge_identity: str) -> None:
+        self.direct_edge_identity = direct_edge_identity
+        self.member_resolution_status = ""
+        self.resolved_member_identity = ""
+        self.member_resolution_identity = ""
+        self.initiating_loader_realm_identity = ""
+        self.dispatch_status = ""
+        self.implementation_target_identities = ()
+        self.dispatch_resolution_identity = ""
+        self.linkage_status = ""
+
+    def __getitem__(self, key: str) -> Any:
+        if key not in self.FIELD_SET:
+            raise KeyError(key)
+        return getattr(self, key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.FIELDS)
+
+    def __len__(self) -> int:
+        return len(self.FIELDS)
+
+
+class _IncomingTraceEdge(Mapping[str, Any]):
+    """Compact reverse edge with private linkage facts for selected paths."""
+
+    __slots__ = (
+        "caller_member_identity", "direct_edge_identity", "certainty",
+        "member_resolution_identity", "dispatch_resolution_identity",
+        "class_initialization_resolution_identity", "inline_overlay_identity",
+        "semantic_edge_identity", "resolution_status", "linkage_status",
+        "initiating_loader_realm_identity",
+    )
+    REQUIRED_FIELDS = (
+        "caller_member_identity", "direct_edge_identity", "certainty",
+        "member_resolution_identity", "dispatch_resolution_identity",
+    )
+    OPTIONAL_FIELDS = (
+        "class_initialization_resolution_identity", "inline_overlay_identity",
+        "semantic_edge_identity",
+    )
+
+    def __init__(
+        self,
+        *,
+        caller_member_identity: str,
+        direct_edge_identity: str,
+        certainty: str,
+        member_resolution_identity: str = "",
+        dispatch_resolution_identity: str = "",
+        class_initialization_resolution_identity: str = "",
+        inline_overlay_identity: str = "",
+        semantic_edge_identity: str = "",
+        resolution_status: str = "",
+        linkage_status: str = "",
+        initiating_loader_realm_identity: str = "",
+    ) -> None:
+        self.caller_member_identity = caller_member_identity
+        self.direct_edge_identity = direct_edge_identity
+        self.certainty = certainty
+        self.member_resolution_identity = member_resolution_identity
+        self.dispatch_resolution_identity = dispatch_resolution_identity
+        self.class_initialization_resolution_identity = (
+            class_initialization_resolution_identity
+        )
+        self.inline_overlay_identity = inline_overlay_identity
+        self.semantic_edge_identity = semantic_edge_identity
+        self.resolution_status = resolution_status
+        self.linkage_status = linkage_status
+        self.initiating_loader_realm_identity = initiating_loader_realm_identity
+
+    def __getitem__(self, key: str) -> Any:
+        if key not in self.REQUIRED_FIELDS and key not in self.OPTIONAL_FIELDS:
+            raise KeyError(key)
+        value = getattr(self, key)
+        if key in self.OPTIONAL_FIELDS and not value:
+            raise KeyError(key)
+        return value
+
+    def __iter__(self) -> Iterator[str]:
+        yield from self.REQUIRED_FIELDS
+        for key in self.OPTIONAL_FIELDS:
+            if getattr(self, key):
+                yield key
+
+    def __len__(self) -> int:
+        return len(self.REQUIRED_FIELDS) + sum(
+            bool(getattr(self, key)) for key in self.OPTIONAL_FIELDS
+        )
+
+
+_EDGE_COLUMNS = (
+    "direct_edge_identity", "caller_member_identity",
+    "caller_artifact_instance_identity", "instruction_index",
+    "bytecode_offset", "edge_kind", "opcode", "symbolic_owner",
+    "symbolic_name", "symbolic_descriptor", "edge_json",
+)
+_MEMBER_COLUMNS = (
+    "member_identity", "class_name", "member_name", "descriptor",
+)
+
+
+class _SQLiteTraceRowLookup(Mapping[str, Mapping[str, Any]]):
+    """Lazy fact lookup; complete table scans are explicit streaming iterators."""
+
+    __slots__ = ("connection", "table", "identity_column", "columns", "_cache")
+    CACHE_LIMIT = 16_384
+
+    def __init__(self, connection, table, identity_column, columns) -> None:
+        self.connection = connection
+        self.table = table
+        self.identity_column = identity_column
+        self.columns = tuple(columns)
+        self._cache: dict[str, dict[str, Any]] = {}
+
+    @property
+    def _projection(self) -> str:
+        return ",".join(self.columns)
+
+    def __getitem__(self, identity: str) -> Mapping[str, Any]:
+        key = str(identity)
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+        row = self.connection.execute(
+            f"SELECT {self._projection} FROM {self.table} "
+            f"WHERE {self.identity_column}=?",
+            (key,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(key)
+        value = dict(row)
+        if len(self._cache) >= self.CACHE_LIMIT:
+            self._cache.clear()
+        self._cache[key] = value
+        return value
+
+    def __iter__(self) -> Iterator[str]:
+        for row in self.connection.execute(
+            f"SELECT {self.identity_column} FROM {self.table}"
+        ):
+            yield str(row[0])
+
+    def __len__(self) -> int:
+        return int(self.connection.execute(
+            f"SELECT COUNT(*) FROM {self.table}"
+        ).fetchone()[0])
+
+    def iter_graph_items(self) -> Iterator[tuple[str, Mapping[str, Any]]]:
+        for row in self.connection.execute(
+            f"SELECT {self._projection} FROM {self.table}"
+        ):
+            yield str(row[self.identity_column]), dict(row)
+
+    def iter_matching_items(
+        self, identities: tuple[str, ...]
+    ) -> Iterator[tuple[str, Mapping[str, Any]]]:
+        # Auxiliary resolution payloads already contain their symbolic facts;
+        # only the caller is absent. Avoid fetching edge_json and the other
+        # nine columns through millions of random primary-key probes.
+        projection = f"{self.identity_column},caller_member_identity"
+        for offset in range(0, len(identities), 400):
+            chunk = identities[offset:offset + 400]
+            placeholders = ",".join("?" for _value in chunk)
+            for row in self.connection.execute(
+                f"SELECT {projection} FROM {self.table} "
+                f"WHERE {self.identity_column} IN ({placeholders})",
+                chunk,
+            ):
+                yield str(row[self.identity_column]), dict(row)
+
+    def iter_service_activation_rows(
+        self, service_owners: tuple[str, ...]
+    ) -> Iterator[Mapping[str, Any]]:
+        if self.table != "direct_edges":
+            return
+        # The ServiceLoader call shape is shared by every service type.
+        for row in self.connection.execute(
+            f"""
+            SELECT {self._projection} FROM direct_edges
+            WHERE edge_kind='method'
+              AND symbolic_owner='java/util/ServiceLoader'
+              AND symbolic_name='load'
+              AND symbolic_descriptor GLOB '(Ljava/lang/Class;*'
+            """
+        ):
+            yield dict(row)
+        # SQLite builds use different variable limits. Keep each indexed IN
+        # probe comfortably below the historical 999-parameter floor.
+        for offset in range(0, len(service_owners), 400):
+            chunk = service_owners[offset:offset + 400]
+            placeholders = ",".join("?" for _value in chunk)
+            for row in self.connection.execute(
+                f"""
+                SELECT {self._projection} FROM direct_edges
+                WHERE edge_kind='type'
+                  AND symbolic_owner IN ({placeholders})
+                """,
+                chunk,
+            ):
+                yield dict(row)
+
+
+@dataclass(frozen=True)
+class _TraceRuntimeView:
+    coverage_gaps: tuple[str, ...]
+    identity: str = ""
+
+
 @dataclass(frozen=True)
 class BinaryTraceBundle:
     analysis_context_identity: str
@@ -159,7 +382,10 @@ class BinaryTraceEngine:
     ):
         self.store = store
         self.profile = runtime_profile
-        self.runtime = reconciliation
+        self.runtime = _TraceRuntimeView(
+            tuple(getattr(reconciliation, "coverage_gaps", ())),
+            str(getattr(reconciliation, "identity", "") or ""),
+        )
         self.decisions = decisions
         self.max_visited_nodes = max_visited_nodes
         self.max_paths_per_target = max_paths_per_target
@@ -222,56 +448,27 @@ class BinaryTraceEngine:
                 or ()
             ):
                 self.unresolved_edge_alias_targets[str(edge_id)].add(target)
-        self.reverse: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        self.reverse: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
         self._trace_cache: dict[
             tuple[str, ...], tuple[list[dict[str, Any]], list[str]]
         ] = {}
+        self._path_outcomes: dict[str, tuple[str, str, str]] = {}
         if materialize_graph:
-            self.members = {
-                row["member_identity"]: dict(row)
-                for row in store.connection.execute(
-                    """
-                    SELECT member_identity,class_name,member_name,descriptor
-                    FROM members
-                    """
-                )
-            }
-            self.edges = {
-                row["direct_edge_identity"]: dict(row)
-                for row in store.connection.execute(
-                    """
-                    SELECT direct_edge_identity,caller_member_identity,
-                           caller_artifact_instance_identity,instruction_index,
-                           bytecode_offset,edge_kind,opcode,symbolic_owner,
-                           symbolic_name,symbolic_descriptor,edge_json
-                    FROM direct_edges
-                    """
-                )
-            }
+            self.members = _SQLiteTraceRowLookup(
+                store.connection, "members", "member_identity", _MEMBER_COLUMNS
+            )
+            self.edges = _SQLiteTraceRowLookup(
+                store.connection,
+                "direct_edges",
+                "direct_edge_identity",
+                _EDGE_COLUMNS,
+            )
             self.semantic_edges = {
                 row["semantic_edge_identity"]: row
                 for row in getattr(semantic_overlay, "rows", ())
             }
-            self.member_resolutions = {
-                item["direct_edge_identity"]: item
-                for item in reconciliation.member_resolutions
-            }
-            self.dispatch = {
-                item["direct_edge_identity"]: item
-                for item in reconciliation.dispatch_resolutions
-            }
-            self.type_resolutions = {
-                item["direct_edge_identity"]: item
-                for item in reconciliation.type_resolutions
-            }
-            self.class_initializations = {
-                item["direct_edge_identity"]: item
-                for item in reconciliation.class_initialization_resolutions
-            }
-            self.linkage_resolutions = {
-                item["direct_edge_identity"]: item
-                for item in reconciliation.linkage_resolutions
-            }
+            self._node_identity_pool: dict[str, str] = {}
+            self._load_compact_resolution_indexes(reconciliation)
             self.class_definition_statuses = {
                 (
                     str(item.get("initiating_loader_realm_identity") or ""),
@@ -279,6 +476,8 @@ class BinaryTraceEngine:
                 ): str(item.get("class_definition_status") or "")
                 for item in reconciliation.class_definitions
             }
+            self._stream_auxiliary_resolutions = True
+            self._release_resolution_indexes_after_build = True
             self._build_reverse_graph()
             self._prepare_batch_graph()
         else:
@@ -295,6 +494,8 @@ class BinaryTraceEngine:
             self.class_initializations = {}
             self.linkage_resolutions = {}
             self.class_definition_statuses = {}
+            self._stream_auxiliary_resolutions = False
+            self._release_resolution_indexes_after_build = False
             self.exact_reachable_nodes = set()
             self.possible_reachable_nodes = set()
             self.possible_path_nodes = set()
@@ -338,11 +539,155 @@ class BinaryTraceEngine:
             for item in decisions.projection_assessments
         }
 
-    def _build_reverse_graph(self) -> None:
-        for edge_id, resolution in self.member_resolutions.items():
+    @staticmethod
+    def _shared_value(pool: dict[str, str], value: Any) -> str:
+        normalized = str(value or "")
+        return pool.setdefault(normalized, normalized)
+
+    def _resolution_records(
+        self,
+        reconciliation: RuntimeReconciliationResult,
+        attribute: str,
+        record_kind: str,
+    ):
+        retained = getattr(reconciliation, attribute, ())
+        if retained:
+            return iter(retained)
+        reader = getattr(self.store, "reconciliation_payloads", None)
+        return reader(record_kind) if callable(reader) else iter(())
+
+    def _node_identity(self, value: Any) -> str:
+        pool = getattr(self, "_node_identity_pool", None)
+        if pool is None:
+            return str(value or "")
+        return self._shared_value(pool, value)
+
+    def _load_compact_resolution_indexes(
+        self, reconciliation: RuntimeReconciliationResult
+    ) -> None:
+        status_pool: dict[str, str] = {}
+        realm_pool: dict[str, str] = {}
+
+        executable: dict[str, _ExecutableResolutionRow] = {}
+        for item in self._resolution_records(
+            reconciliation, "member_resolutions", "member_resolution"
+        ):
+            edge_id = str(item.get("direct_edge_identity") or "")
+            state = executable.get(edge_id)
+            if state is None:
+                state = executable[edge_id] = _ExecutableResolutionRow(edge_id)
+            state.member_resolution_status = self._shared_value(
+                status_pool, item.get("member_resolution_status")
+            )
+            state.resolved_member_identity = self._node_identity(
+                item.get("resolved_member_identity")
+            )
+            state.member_resolution_identity = str(
+                item.get("member_resolution_identity") or ""
+            )
+            state.initiating_loader_realm_identity = self._shared_value(
+                realm_pool, item.get("initiating_loader_realm_identity")
+            )
+
+        for item in self._resolution_records(
+            reconciliation, "dispatch_resolutions", "dispatch_resolution"
+        ):
+            edge_id = str(item.get("direct_edge_identity") or "")
+            state = executable.get(edge_id)
+            if state is None:
+                state = executable[edge_id] = _ExecutableResolutionRow(edge_id)
+            state.dispatch_status = self._shared_value(
+                status_pool, item.get("dispatch_status")
+            )
+            state.implementation_target_identities = tuple(
+                self._node_identity(value)
+                for value in item.get("implementation_target_identities") or ()
+                if value
+            )
+            state.dispatch_resolution_identity = str(
+                item.get("dispatch_resolution_identity") or ""
+            )
+
+        # The three public names intentionally share one dictionary.  A direct
+        # edge has one executable resolution state; three dictionaries would
+        # repeat millions of keys and hash-table slots without adding facts.
+        self.member_resolutions = executable
+        self.dispatch = executable
+        self.linkage_resolutions = executable
+        for item in self._resolution_records(
+            reconciliation, "linkage_resolutions", "linkage_resolution"
+        ):
+            edge_id = str(item.get("direct_edge_identity") or "")
+            state = executable.get(edge_id)
+            if state is not None:
+                state.linkage_status = self._shared_value(
+                    status_pool, item.get("linkage_status")
+                )
+
+        # Type and class-initialization records apply to disjoint edge kinds.
+        # They are joined back to direct edges in bounded batches while the
+        # reverse graph is built, instead of becoming two more global maps.
+        self.type_resolutions = {}
+        self.class_initializations = {}
+        self._trace_reconciliation = reconciliation
+
+    def _iter_graph_edge_items(
+        self,
+    ) -> Iterator[tuple[str, Mapping[str, Any]]]:
+        iterator = getattr(self.edges, "iter_graph_items", None)
+        if callable(iterator):
+            yield from iterator()
+            return
+        for edge_id, edge in self.edges.items():
+            yield str(edge_id), edge
+
+    def _matching_resolution_edges(
+        self, resolutions: Mapping[str, Mapping[str, Any]]
+    ) -> Iterator[tuple[Mapping[str, Any], Mapping[str, Any]]]:
+        identities = tuple(resolutions)
+        matcher = getattr(self.edges, "iter_matching_items", None)
+        if callable(matcher):
+            for edge_id, edge in matcher(identities):
+                resolution = resolutions.get(edge_id)
+                if resolution is not None:
+                    yield resolution, edge
+            return
+        for edge_id, resolution in resolutions.items():
             edge = self.edges.get(edge_id)
-            if not edge:
+            if edge is not None:
+                if not resolution.get("direct_edge_identity"):
+                    resolution = {
+                        **resolution,
+                        "direct_edge_identity": edge_id,
+                    }
+                yield resolution, edge
+
+    def _iter_resolution_edge_batches(
+        self, records
+    ) -> Iterator[tuple[Mapping[str, Any], Mapping[str, Any]]]:
+        pending: dict[str, Mapping[str, Any]] = {}
+        for resolution in records:
+            edge_id = str(resolution.get("direct_edge_identity") or "")
+            if edge_id:
+                pending[edge_id] = resolution
+            if len(pending) >= 2_000:
+                yield from self._matching_resolution_edges(pending)
+                pending.clear()
+        if pending:
+            yield from self._matching_resolution_edges(pending)
+
+    def _build_reverse_graph(self) -> None:
+        shared_executable_index = (
+            self.dispatch is self.member_resolutions
+            and self.linkage_resolutions is self.member_resolutions
+        )
+        for scanned_edge_id, edge in self._iter_graph_edge_items():
+            resolution = self.member_resolutions.get(scanned_edge_id)
+            if not resolution or not resolution.get("member_resolution_status"):
                 continue
+            edge_id = str(
+                resolution.get("direct_edge_identity") or scanned_edge_id
+            )
             edge_kind = str(edge.get("edge_kind") or "")
             dynamic_handle = (
                 edge_kind.startswith("invokedynamic_handle_")
@@ -355,21 +700,33 @@ class BinaryTraceEngine:
             } or dynamic_handle
             if edge_kind not in {"method", "field"} and not executable_linkage:
                 continue
-            caller = edge["caller_member_identity"]
+            caller = self._node_identity(edge["caller_member_identity"])
             status = resolution["member_resolution_status"]
-            dispatch = self.dispatch.get(edge_id) or {}
+            dispatch = (
+                resolution
+                if shared_executable_index
+                else self.dispatch.get(edge_id) or {}
+            )
             linkage_status = (
-                self.linkage_resolutions.get(edge_id) or {}
-            ).get("linkage_status")
+                resolution.get("linkage_status")
+                if shared_executable_index
+                else (
+                    self.linkage_resolutions.get(edge_id) or {}
+                ).get("linkage_status")
+            )
             loading_constraint_blocked = linkage_status in {
                 "loader_constraint_violation",
                 "loading_constraint_deferred_conflict",
                 "loading_constraint_unresolved",
             }
-            targets = list(dispatch.get("implementation_target_identities") or ())
+            targets = dispatch.get("implementation_target_identities") or ()
             dispatch_status = dispatch.get("dispatch_status")
-            if not targets and status == "resolved" and resolution.get("resolved_member_identity"):
-                targets = [resolution["resolved_member_identity"]]
+            if (
+                not targets
+                and status == "resolved"
+                and resolution.get("resolved_member_identity")
+            ):
+                targets = (resolution["resolved_member_identity"],)
             certainty = (
                 "possible"
                 if dispatch_status in {"possible", "partial_possible_set"}
@@ -378,73 +735,153 @@ class BinaryTraceEngine:
                 else "exact"
             )
             for target in targets:
-                self.reverse[target].append({
-                    "caller_member_identity": caller,
-                    "direct_edge_identity": edge_id,
-                    "certainty": certainty,
-                    "member_resolution_identity": resolution["member_resolution_identity"],
-                    "dispatch_resolution_identity": dispatch.get("dispatch_resolution_identity", ""),
-                })
+                target = self._node_identity(target)
+                self.reverse[target].append(_IncomingTraceEdge(
+                    caller_member_identity=caller,
+                    direct_edge_identity=edge_id,
+                    certainty=certainty,
+                    member_resolution_identity=str(
+                        resolution.get("member_resolution_identity") or ""
+                    ),
+                    dispatch_resolution_identity=str(
+                        dispatch.get("dispatch_resolution_identity", "")
+                    ),
+                    resolution_status=str(status or ""),
+                    linkage_status=str(linkage_status or ""),
+                    initiating_loader_realm_identity=str(
+                        resolution.get("initiating_loader_realm_identity") or ""
+                    ),
+                ))
             if status != "resolved":
-                symbolic = self._symbolic_target(
+                symbolic = self._node_identity(self._symbolic_target(
                     edge["symbolic_owner"], edge["symbolic_name"], edge["symbolic_descriptor"],
                     "field" if edge["edge_kind"] == "field" else "method",
-                )
+                ))
                 symbolic_targets = {
                     symbolic,
                     *self.unresolved_edge_alias_targets.get(edge_id, ()),
                 }
                 for symbolic_target in sorted(symbolic_targets):
-                    self.reverse[symbolic_target].append({
-                        "caller_member_identity": caller,
-                        "direct_edge_identity": edge_id,
-                        "certainty": _unresolved_edge_certainty(
+                    symbolic_target = self._node_identity(symbolic_target)
+                    self.reverse[symbolic_target].append(_IncomingTraceEdge(
+                        caller_member_identity=caller,
+                        direct_edge_identity=edge_id,
+                        certainty=_unresolved_edge_certainty(
                             status,
                             paired_artifact_change=(
                                 symbolic_target in self.paired_artifact_missing_targets
                             ),
                         ),
-                        "member_resolution_identity": resolution["member_resolution_identity"],
-                        "dispatch_resolution_identity": dispatch.get("dispatch_resolution_identity", ""),
-                    })
+                        member_resolution_identity=str(
+                            resolution.get("member_resolution_identity") or ""
+                        ),
+                        dispatch_resolution_identity=str(
+                            dispatch.get("dispatch_resolution_identity", "")
+                        ),
+                        resolution_status=str(status or ""),
+                        linkage_status=str(linkage_status or ""),
+                        initiating_loader_realm_identity=str(
+                            resolution.get(
+                                "initiating_loader_realm_identity"
+                            ) or ""
+                        ),
+                    ))
+
+        if getattr(self, "_release_resolution_indexes_after_build", False):
+            # All outcome facts needed by a selected path now live on its
+            # compact incoming transition. Drop the multi-million-entry join
+            # index before adding the much smaller auxiliary edge families.
+            self.member_resolutions.clear()
+
         # Type observations are admitted only after provider/definition
         # resolution; raw shadowed or definition-failed observations never enter
         # the effective graph.
-        for edge in self.edges.values():
-            if edge["edge_kind"] != "type":
-                continue
-            type_resolution = self.type_resolutions.get(edge["direct_edge_identity"])
-            if not type_resolution or type_resolution.get("type_resolution_status") not in {
+        if getattr(self, "_stream_auxiliary_resolutions", False):
+            type_pairs = self._iter_resolution_edge_batches(
+                resolution
+                for resolution in self._resolution_records(
+                    self._trace_reconciliation, "type_resolutions", "type_resolution"
+                )
+                if resolution.get("type_resolution_status") in {
+                    "resolved", "primitive_or_array_type"
+                }
+            )
+        else:
+            type_pairs = (
+                (
+                    type_resolution
+                    if type_resolution.get("direct_edge_identity")
+                    else {
+                        **type_resolution,
+                        "direct_edge_identity": edge_id,
+                    },
+                    edge,
+                )
+                for edge_id, edge in self._iter_graph_edge_items()
+                for type_resolution in [self.type_resolutions.get(edge_id)]
+                if type_resolution is not None
+            )
+        for type_resolution, edge in type_pairs:
+            if type_resolution.get("type_resolution_status") not in {
                 "resolved", "primitive_or_array_type"
             }:
                 continue
-            symbolic = self._symbolic_target(
-                edge["symbolic_owner"], "<class>", edge["symbolic_descriptor"], "class"
+            edge_id = str(type_resolution["direct_edge_identity"])
+            symbolic = self._node_identity(self._symbolic_target(
+                str(
+                    type_resolution.get("symbolic_owner")
+                    or edge.get("symbolic_owner")
+                    or ""
+                ),
+                "<class>",
+                str(
+                    type_resolution.get("symbolic_descriptor")
+                    or edge.get("symbolic_descriptor")
+                    or ""
+                ),
+                "class",
+            ))
+            self.reverse[symbolic].append(_IncomingTraceEdge(
+                caller_member_identity=self._node_identity(
+                    edge["caller_member_identity"]
+                ),
+                direct_edge_identity=edge_id,
+                certainty="exact",
+            ))
+
+        if getattr(self, "_stream_auxiliary_resolutions", False):
+            initialization_pairs = self._iter_resolution_edge_batches(
+                resolution
+                for resolution in self._resolution_records(
+                    self._trace_reconciliation,
+                    "class_initialization_resolutions",
+                    "class_initialization_resolution",
+                )
+                if resolution.get("class_initialization_status") == "resolved"
+                and resolution.get("initializer_target_identities")
             )
-            self.reverse[symbolic].append({
-                "caller_member_identity": edge["caller_member_identity"],
-                "direct_edge_identity": edge["direct_edge_identity"],
-                "certainty": "exact",
-                "member_resolution_identity": "",
-                "dispatch_resolution_identity": "",
-            })
-        for edge_id, resolution in self.class_initializations.items():
+        else:
+            initialization_pairs = self._matching_resolution_edges(
+                self.class_initializations
+            )
+        for resolution, edge in initialization_pairs:
             if resolution.get("class_initialization_status") != "resolved":
                 continue
-            edge = self.edges.get(edge_id)
-            if not edge:
-                continue
+            edge_id = str(resolution["direct_edge_identity"])
             for target in resolution.get("initializer_target_identities") or ():
-                self.reverse[target].append({
-                    "caller_member_identity": edge["caller_member_identity"],
-                    "direct_edge_identity": edge_id,
-                    "certainty": "exact",
-                    "member_resolution_identity": "",
-                    "dispatch_resolution_identity": "",
-                    "class_initialization_resolution_identity": resolution[
-                        "class_initialization_resolution_identity"
-                    ],
-                })
+                target = self._node_identity(target)
+                self.reverse[target].append(_IncomingTraceEdge(
+                    caller_member_identity=self._node_identity(
+                        edge["caller_member_identity"]
+                    ),
+                    direct_edge_identity=edge_id,
+                    certainty="exact",
+                    class_initialization_resolution_identity=str(
+                        resolution.get(
+                            "class_initialization_resolution_identity"
+                        ) or ""
+                    ),
+                ))
         for record in getattr(self.inline_overlay, "rows", ()):
             if record.get("consumption_state") != "changed_with_source":
                 continue
@@ -455,37 +892,44 @@ class BinaryTraceEngine:
             target = str(record.get("changed_field_member_identity") or "")
             if not consumer or not target:
                 continue
-            self.reverse[target].append({
-                "caller_member_identity": consumer,
-                "direct_edge_identity": record["inline_overlay_identity"],
-                "certainty": "exact" if certainty == "proven" else "possible",
-                "member_resolution_identity": "",
-                "dispatch_resolution_identity": "",
-                "inline_overlay_identity": record["inline_overlay_identity"],
-            })
+            self.reverse[self._node_identity(target)].append(_IncomingTraceEdge(
+                caller_member_identity=self._node_identity(consumer),
+                direct_edge_identity=str(record["inline_overlay_identity"]),
+                certainty="exact" if certainty == "proven" else "possible",
+                inline_overlay_identity=str(record["inline_overlay_identity"]),
+            ))
         for record in self.semantic_edges.values():
             caller = str(record.get("caller_member_identity") or "")
             target = str(record.get("target_member_identity") or "")
             if not caller or not target:
                 continue
-            self.reverse[target].append({
-                "caller_member_identity": caller,
-                "direct_edge_identity": record["semantic_edge_identity"],
-                "certainty": (
+            self.reverse[self._node_identity(target)].append(_IncomingTraceEdge(
+                caller_member_identity=self._node_identity(caller),
+                direct_edge_identity=str(record["semantic_edge_identity"]),
+                certainty=(
                     "exact" if record.get("path_certainty") == "exact" else "possible"
                 ),
-                "member_resolution_identity": "",
-                "dispatch_resolution_identity": "",
-                "semantic_edge_identity": record["semantic_edge_identity"],
-            })
+                semantic_edge_identity=str(record["semantic_edge_identity"]),
+            ))
         for target in self.reverse:
             self.reverse[target].sort(
                 key=lambda item: (
+                    item.caller_member_identity,
+                    item.certainty,
+                    item.direct_edge_identity,
+                ) if isinstance(item, _IncomingTraceEdge) else (
                     item["caller_member_identity"],
                     item["certainty"],
                     item["direct_edge_identity"],
                 )
             )
+        if getattr(self, "_release_resolution_indexes_after_build", False):
+            self.dispatch = {}
+            self.linkage_resolutions = {}
+            self.type_resolutions = {}
+            self.class_initializations = {}
+            self._node_identity_pool.clear()
+            self._trace_reconciliation = None
 
     @staticmethod
     def _reachable(entrypoints, adjacency):
@@ -493,7 +937,7 @@ class BinaryTraceEngine:
         queue = deque(sorted(entrypoints))
         while queue:
             node = queue.popleft()
-            for target in sorted(adjacency.get(node, ())):
+            for target in adjacency.get(node, ()):
                 if target not in reached:
                     reached.add(target)
                     queue.append(target)
@@ -502,13 +946,21 @@ class BinaryTraceEngine:
     @staticmethod
     def _scc_count(nodes, adjacency):
         """Deterministic iterative Kosaraju, including isolated nodes."""
+        def ordered_targets(node):
+            targets = adjacency.get(node, ())
+            return (
+                targets
+                if isinstance(targets, (list, tuple))
+                else tuple(sorted(targets))
+            )
+
         seen = set()
         finish = []
         for root in sorted(nodes):
             if root in seen:
                 continue
             seen.add(root)
-            stack = [(root, 0, tuple(sorted(adjacency.get(root, ()))))]
+            stack = [(root, 0, ordered_targets(root))]
             while stack:
                 node, index, targets = stack[-1]
                 if index < len(targets):
@@ -517,15 +969,15 @@ class BinaryTraceEngine:
                     if target not in seen:
                         seen.add(target)
                         stack.append((
-                            target, 0, tuple(sorted(adjacency.get(target, ())))
+                            target, 0, ordered_targets(target)
                         ))
                 else:
                     finish.append(node)
                     stack.pop()
-        transpose = defaultdict(set)
+        transpose = defaultdict(list)
         for caller, targets in adjacency.items():
             for target in targets:
-                transpose[target].add(caller)
+                transpose[target].append(caller)
         assigned = set()
         count = 0
         largest = 0
@@ -539,7 +991,7 @@ class BinaryTraceEngine:
             while stack:
                 node = stack.pop()
                 size += 1
-                for target in sorted(transpose.get(node, ()), reverse=True):
+                for target in transpose.get(node, ()):
                     if target not in assigned:
                         assigned.add(target)
                         stack.append(target)
@@ -547,24 +999,44 @@ class BinaryTraceEngine:
         return count, largest
 
     def _prepare_batch_graph(self):
-        exact = defaultdict(set)
-        possible = defaultdict(set)
-        all_edges = defaultdict(set)
+        exact = defaultdict(list)
+        possible = defaultdict(list)
+        all_edges = defaultdict(list)
         nodes = set(self.entrypoints)
         effective_edge_count = 0
         possible_edge_count = 0
         for target, incoming_rows in self.reverse.items():
             nodes.add(target)
             for incoming in incoming_rows:
-                caller = incoming["caller_member_identity"]
-                nodes.add(caller)
-                all_edges[caller].add(target)
-                effective_edge_count += 1
-                if incoming["certainty"] == "exact":
-                    exact[caller].add(target)
+                if isinstance(incoming, _IncomingTraceEdge):
+                    caller = incoming.caller_member_identity
+                    certainty = incoming.certainty
                 else:
-                    possible[caller].add(target)
+                    caller = incoming["caller_member_identity"]
+                    certainty = incoming["certainty"]
+                nodes.add(caller)
+                all_edges[caller].append(target)
+                effective_edge_count += 1
+                if certainty == "exact":
+                    exact[caller].append(target)
+                else:
+                    possible[caller].append(target)
                     possible_edge_count += 1
+        # Reachability and SCCs care about transitions, not how many bytecode
+        # call sites induce the same caller -> target pair. Sort and compact
+        # each list in place, avoiding the per-entry overhead of Python sets.
+        for adjacency in (exact, possible, all_edges):
+            for targets in adjacency.values():
+                targets.sort()
+                write = 0
+                previous = None
+                for target in targets:
+                    if write and target == previous:
+                        continue
+                    targets[write] = target
+                    write += 1
+                    previous = target
+                del targets[write:]
         self.exact_reachable_nodes = self._reachable(self.exact_entrypoints, exact)
         self.possible_reachable_nodes = self._reachable(self.entrypoints, all_edges)
         certainty_states = {
@@ -590,7 +1062,9 @@ class BinaryTraceEngine:
             node for node, contains_possible in certainty_states
             if contains_possible
         }
+        del certainty_states, certainty_queue, possible
         exact_scc_count, exact_largest = self._scc_count(nodes, exact)
+        del exact
         possible_scc_count, possible_largest = self._scc_count(nodes, all_edges)
         self.graph_stats = {
             "batch_transition_build": "shared_target_independent_v1",
@@ -686,6 +1160,12 @@ class BinaryTraceEngine:
             ]
             path_edges = []
             for item in reversed(suffix):
+                if isinstance(item, _IncomingTraceEdge):
+                    self._path_outcomes[item.direct_edge_identity] = (
+                        item.resolution_status,
+                        item.linkage_status,
+                        item.initiating_loader_realm_identity,
+                    )
                 edge = (
                     self.edges.get(item["direct_edge_identity"])
                     or self.semantic_edges.get(item["direct_edge_identity"])
@@ -771,12 +1251,18 @@ class BinaryTraceEngine:
                             node, suffix, recorded_certainty
                         ))
                 for incoming in self.reverse.get(node, ()):
-                    if exact_only and incoming["certainty"] != "exact":
+                    if isinstance(incoming, _IncomingTraceEdge):
+                        incoming_certainty = incoming.certainty
+                        caller = incoming.caller_member_identity
+                    else:
+                        incoming_certainty = incoming["certainty"]
+                        caller = incoming["caller_member_identity"]
+                    if exact_only and incoming_certainty != "exact":
                         continue
-                    caller = incoming["caller_member_identity"]
                     next_certainty = (
                         "possible"
-                        if "possible" in {certainty, incoming["certainty"]}
+                        if certainty == "possible"
+                        or incoming_certainty == "possible"
                         else "exact"
                     )
                     state = caller if exact_only else (caller, next_certainty)
@@ -815,6 +1301,26 @@ class BinaryTraceEngine:
         self._trace_cache[target_nodes] = result
         return result
 
+    def _path_edge_outcome(
+        self, edge: Mapping[str, Any]
+    ) -> tuple[str | None, str | None, str]:
+        edge_id = str(edge.get("direct_edge_identity") or "")
+        compact = getattr(self, "_path_outcomes", {}).get(edge_id)
+        if compact is not None:
+            resolution_status, linkage_status, realm = compact
+            return (
+                resolution_status or None,
+                linkage_status or None,
+                realm,
+            )
+        resolution = (self.member_resolutions.get(edge_id) or {})
+        linkage = (self.linkage_resolutions.get(edge_id) or {})
+        return (
+            resolution.get("member_resolution_status"),
+            linkage.get("linkage_status"),
+            str(resolution.get("initiating_loader_realm_identity") or ""),
+        )
+
     def _result_for(
         self,
         *,
@@ -846,34 +1352,31 @@ class BinaryTraceEngine:
             reachability,
             possible_path_exists=possible if reachability in {"reachable", "uncertain"} else False,
         )
-        resolution_statuses = {
-            (self.member_resolutions.get(edge["direct_edge_identity"]) or {}).get(
-                "member_resolution_status"
-            )
+        edge_outcomes = [
+            (edge, self._path_edge_outcome(edge))
             for path in paths
             for edge in path["edges"]
+        ]
+        resolution_statuses = {
+            outcome[0] for _edge, outcome in edge_outcomes
         }
         linkage_statuses = {
-            (self.linkage_resolutions.get(edge["direct_edge_identity"]) or {}).get(
-                "linkage_status"
-            )
-            for path in paths
-            for edge in path["edges"]
+            outcome[1] for _edge, outcome in edge_outcomes
         }
         resolution_statuses.discard(None)
         linkage_statuses.discard(None)
-        caller_definition_statuses = {
-            self.class_definition_statuses.get((
-                str((self.member_resolutions.get(
-                    edge["direct_edge_identity"]
-                ) or {}).get("initiating_loader_realm_identity") or ""),
-                str((self.members.get(
+        caller_definition_statuses = set()
+        for edge, outcome in edge_outcomes:
+            caller_class_name = str(edge.get("caller_class_name") or "")
+            if not caller_class_name:
+                caller_class_name = str((self.members.get(
                     edge["caller_member_identity"]
-                ) or {}).get("class_name") or ""),
-            )) or "missing"
-            for path in paths
-            for edge in path["edges"]
-        }
+                ) or {}).get("class_name") or "")
+            caller_definition_statuses.add(
+                self.class_definition_statuses.get((
+                    outcome[2], caller_class_name,
+                )) or "missing"
+            )
         change_kind = str(
             (decision.get("fact_scope") or {}).get("member_change_kind") or ""
         )
@@ -963,9 +1466,33 @@ class BinaryTraceEngine:
         return payload
 
     def _service_activation_results(self) -> list[dict[str, Any]]:
+        prefix = "META-INF/services/"
+        service_decisions = []
+        for decision in self.decisions.authoritative_decisions:
+            if decision.get("fact_kind") != "resource":
+                continue
+            scope = decision.get("fact_scope") or {}
+            resource_name = str(scope.get("resource_name") or "")
+            if resource_name.startswith(prefix):
+                service_decisions.append((decision, scope, resource_name))
+        if not service_decisions:
+            return []
+
         results = []
         edges_by_caller: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for edge in self.edges.values():
+        service_owners = tuple(sorted({
+            resource_name[len(prefix):].replace(".", "/")
+            for _decision, _scope, resource_name in service_decisions
+        }))
+        filtered_rows = getattr(
+            self.edges, "iter_service_activation_rows", None
+        )
+        edge_rows = (
+            filtered_rows(service_owners)
+            if callable(filtered_rows)
+            else self.edges.values()
+        )
+        for edge in edge_rows:
             edges_by_caller[edge["caller_member_identity"]].append(edge)
         for rows in edges_by_caller.values():
             rows.sort(key=lambda item: (
@@ -973,14 +1500,7 @@ class BinaryTraceEngine:
                 str(item.get("edge_kind") or ""),
             ))
 
-        for decision in self.decisions.authoritative_decisions:
-            if decision.get("fact_kind") != "resource":
-                continue
-            scope = decision.get("fact_scope") or {}
-            resource_name = str(scope.get("resource_name") or "")
-            prefix = "META-INF/services/"
-            if not resource_name.startswith(prefix):
-                continue
+        for decision, scope, resource_name in service_decisions:
             service_owner = resource_name[len(prefix):].replace(".", "/")
             candidates = []
             for caller_identity, rows in edges_by_caller.items():
@@ -1146,26 +1666,6 @@ class BinaryTraceEngine:
             ),
         )
 
-
-def _hydrate_trace_reconciliation(
-    store: BinaryFactStore,
-    reconciliation: RuntimeReconciliationResult,
-) -> RuntimeReconciliationResult:
-    """Restore graph-only record families after selective reconciliation."""
-
-    return hydrate_runtime_reconciliation(
-        store,
-        reconciliation,
-        (
-            "member_resolution",
-            "dispatch_resolution",
-            "type_resolution",
-            "class_initialization_resolution",
-            "linkage_resolution",
-        ),
-    )
-
-
 def build_binary_traces(
     store: BinaryFactStore,
     runtime_profile: RuntimeProfile,
@@ -1234,11 +1734,10 @@ def build_binary_traces(
             reconciliation,
             ("provider_binding", "class_definition"),
         )
-        hydrated = _hydrate_trace_reconciliation(store, selected)
         return BinaryTraceEngine(
             store,
             runtime_profile,
-            hydrated,
+            selected,
             decisions,
             entrypoint_discovery=entrypoint_discovery,
             inline_overlay=inline_overlay,

@@ -420,9 +420,8 @@ class BinarySemanticOverlayBoundaryTest(unittest.TestCase):
             },
         ]
         member_rows = [member("m", variant="v-good")]
-        direct_rows = [{"direct_edge_identity": "edge", "edge_kind": "method"}]
         connection = MagicMock()
-        connection.execute.side_effect = [member_rows, direct_rows]
+        connection.execute.return_value = member_rows
         store = MagicMock(connection=connection)
         store.rows.side_effect = lambda table, **_kwargs: (
             artifact_rows if table == "artifact_instances" else class_rows
@@ -518,9 +517,14 @@ class BinarySemanticOverlayBoundaryTest(unittest.TestCase):
         self.assertNotIn("fact_json", class_rows[0])
         self.assertEqual(builder.realms, ["app"])
         self.assertEqual(len(builder.resource_facts), 2)
+        self.assertNotIsInstance(builder.direct_edges, list)
+        self.assertEqual(connection.execute.call_count, 1)
+        self.assertNotIn(
+            "FROM direct_edges", connection.execute.call_args.args[0]
+        )
 
         empty_connection = MagicMock()
-        empty_connection.execute.side_effect = [[], []]
+        empty_connection.execute.return_value = []
         empty_store = MagicMock(connection=empty_connection)
         empty_store.rows.return_value = []
         empty_builder = semantic._Builder(
