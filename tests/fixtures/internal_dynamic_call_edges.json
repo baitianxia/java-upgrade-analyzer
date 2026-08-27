@@ -1,6 +1,6 @@
 {
   "schema": "java-upgrade-analyzer.internal-dynamic-call-edges.v1",
-  "source_identity": "a3ad052d5cc5b8a67e64ff4fe658d1e3951194c5aafa47680c68ad1129cc557c",
+  "source_identity": "59c8560a51f73511a9bad50cb31594d2ccf3c2307cf6bbace5681d112f4e2671",
   "inventory_rule": "Every production-to-production edge observed at runtime but unresolved by the static call graph is retained as a required implementation-dependent white-box relationship. New, removed, or source-stale edges require explicit review.",
   "edges": [
     {
@@ -66,10 +66,6 @@
     {
       "caller": "binary_asm_helper::_compile_helper",
       "callee": "binary_asm_helper::_OwnedHelperDirectory.__init__"
-    },
-    {
-      "caller": "binary_asm_helper::_compile_helper",
-      "callee": "binary_asm_helper::_OwnedHelperDirectory.cleanup"
     },
     {
       "caller": "binary_asm_helper::_compile_helper",
@@ -202,10 +198,6 @@
     {
       "caller": "binary_definition_verifier::_compile_helper",
       "callee": "binary_definition_verifier::_OwnedHelperDirectory.__init__"
-    },
-    {
-      "caller": "binary_definition_verifier::_compile_helper",
-      "callee": "binary_definition_verifier::_OwnedHelperDirectory.cleanup"
     },
     {
       "caller": "binary_definition_verifier::_compile_helper",
@@ -689,14 +681,6 @@
     },
     {
       "caller": "binary_performance_gate::_analyze_once",
-      "callee": "binary_fact_store::BinaryFactStore.add_artifact_snapshot"
-    },
-    {
-      "caller": "binary_performance_gate::_analyze_once",
-      "callee": "binary_fact_store::BinaryFactStore.close"
-    },
-    {
-      "caller": "binary_performance_gate::_analyze_once",
       "callee": "binary_performance_gate::PerformanceGateError.__init__"
     },
     {
@@ -1037,14 +1021,6 @@
     },
     {
       "caller": "binary_pipeline::_run_pipeline_under_lock",
-      "callee": "binary_fact_store::BinaryFactStore.adopt_runtime_trigger_summary_from_exact_backup"
-    },
-    {
-      "caller": "binary_pipeline::_run_pipeline_under_lock",
-      "callee": "binary_fact_store::BinaryFactStore.ensure_secondary_indexes"
-    },
-    {
-      "caller": "binary_pipeline::_run_pipeline_under_lock",
       "callee": "binary_first_contract::BinaryFirstContractError.__init__"
     },
     {
@@ -1053,27 +1029,7 @@
     },
     {
       "caller": "binary_pipeline::_run_pipeline_under_lock",
-      "callee": "binary_pipeline::_ArtifactDigestSession.metrics"
-    },
-    {
-      "caller": "binary_pipeline::_run_pipeline_under_lock",
-      "callee": "binary_pipeline::_ArtifactDigestSession.prime"
-    },
-    {
-      "caller": "binary_pipeline::_run_pipeline_under_lock",
-      "callee": "binary_pipeline::_ArtifactDigestSession.revalidate_marked"
-    },
-    {
-      "caller": "binary_pipeline::_run_pipeline_under_lock",
       "callee": "binary_pipeline::_PhaseTimingRecorder.__init__"
-    },
-    {
-      "caller": "binary_pipeline::_run_pipeline_under_lock",
-      "callee": "binary_pipeline::_PhaseTimingRecorder.append"
-    },
-    {
-      "caller": "binary_pipeline::_run_pipeline_under_lock",
-      "callee": "binary_pipeline::_PhaseTimingRecorder.start"
     },
     {
       "caller": "binary_pipeline::_run_pipeline_under_lock",
@@ -1090,10 +1046,6 @@
     {
       "caller": "binary_pipeline::_run_pipeline_under_lock.<locals>.build_lineage_snapshot",
       "callee": "binary_snapshot_cache::SnapshotTemplateMemo.__init__"
-    },
-    {
-      "caller": "binary_pipeline::_run_pipeline_under_lock.<locals>.build_lineage_snapshot",
-      "callee": "binary_snapshot_cache::SnapshotTemplateMemo.clear"
     },
     {
       "caller": "binary_pipeline::_run_pipeline_under_lock.<locals>.record_lineage_snapshot",
@@ -1722,18 +1674,6 @@
     {
       "caller": "binary_runtime_reconciler::RuntimeReconciler._reconcile",
       "callee": "binary_runtime_reconciler::_ReconciliationAccumulator.__init__"
-    },
-    {
-      "caller": "binary_runtime_reconciler::RuntimeReconciler._reconcile",
-      "callee": "binary_runtime_reconciler::_ReconciliationAccumulator.add"
-    },
-    {
-      "caller": "binary_runtime_reconciler::RuntimeReconciler._reconcile",
-      "callee": "binary_runtime_reconciler::_ReconciliationAccumulator.canonical_subject_identities"
-    },
-    {
-      "caller": "binary_runtime_reconciler::RuntimeReconciler._reconcile",
-      "callee": "binary_runtime_reconciler::_ReconciliationAccumulator.flush"
     },
     {
       "caller": "binary_runtime_reconciler::RuntimeReconciler._resolve_edges",
@@ -2369,19 +2309,11 @@
     },
     {
       "caller": "binary_validation_oracle::validate_generation",
-      "callee": "binary_validation_oracle::_OracleScanSpoolCache.clear"
-    },
-    {
-      "caller": "binary_validation_oracle::validate_generation",
       "callee": "binary_validation_oracle::_ProductionStructuralSpoolCache.__del__"
     },
     {
       "caller": "binary_validation_oracle::validate_generation",
       "callee": "binary_validation_oracle::_ProductionStructuralSpoolCache.__init__"
-    },
-    {
-      "caller": "binary_validation_oracle::validate_generation",
-      "callee": "binary_validation_oracle::_ProductionStructuralSpoolCache.clear"
     },
     {
       "caller": "binary_validation_oracle::validate_generation",
@@ -3134,10 +3066,6 @@
     {
       "caller": "s3_scan::main",
       "callee": "progress_logging::PhaseTimer.__init__"
-    },
-    {
-      "caller": "s3_scan::main",
-      "callee": "progress_logging::PhaseTimer.elapsed"
     },
     {
       "caller": "s3_scan::main",

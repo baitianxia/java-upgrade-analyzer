@@ -98,8 +98,17 @@ class WindowsProcessContractTest(unittest.TestCase):
         kernel.CloseHandle.assert_called_once_with(123)
 
         kernel = self._kernel(handle=0)
-        with patch.object(ctypes, "WinDLL", return_value=kernel, create=True):
+        with patch.object(ctypes, "WinDLL", return_value=kernel, create=True), patch.object(
+            ctypes, "get_last_error", return_value=87, create=True,
+        ):
             self.assertFalse(path_runtime._windows_process_is_alive(99))
+        kernel.CloseHandle.assert_not_called()
+
+        kernel = self._kernel(handle=0)
+        with patch.object(ctypes, "WinDLL", return_value=kernel, create=True), patch.object(
+            ctypes, "get_last_error", return_value=5, create=True,
+        ):
+            self.assertTrue(path_runtime._windows_process_is_alive(99))
         kernel.CloseHandle.assert_not_called()
 
     def test_generic_process_probe_dispatches_to_native_windows_probe(self):

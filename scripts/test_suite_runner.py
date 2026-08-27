@@ -13,7 +13,11 @@ import time
 import unittest
 from typing import Any, Iterable, Mapping
 
+from compat import setup_utf8_io
 from test_trust_gate import run_trust_gate
+
+
+setup_utf8_io()
 
 
 ROOT = Path(__file__).resolve().parents[1]

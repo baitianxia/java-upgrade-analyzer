@@ -243,14 +243,16 @@ MUTATIONS = (
 )
 
 
-def _function_branch_lines(path: Path) -> set[int]:
+def _function_branch_inventory(path: Path) -> tuple[set[int], set[str]]:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     alternatives = set()
+    discovered = set()
     for node in tree.body:
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         if node.name not in BRANCH_FUNCTIONS:
             continue
+        discovered.add(node.name)
         for branch in ast.walk(node):
             if isinstance(branch, ast.If):
                 if branch.body:
@@ -271,12 +273,17 @@ def _function_branch_lines(path: Path) -> set[int]:
                 alternatives.update(
                     case.body[0].lineno for case in branch.cases if case.body
                 )
-    return alternatives
+    return alternatives, discovered
+
+
+def _function_branch_lines(path: Path) -> set[int]:
+    return _function_branch_inventory(path)[0]
 
 
 def branch_probe() -> dict:
     target = (SCRIPTS / "binary_first_contract.py").resolve()
-    alternatives = _function_branch_lines(target)
+    alternatives, discovered = _function_branch_inventory(target)
+    missing_functions = sorted(BRANCH_FUNCTIONS - discovered)
     executed = set()
     previous = sys.gettrace()
 
@@ -295,10 +302,18 @@ def branch_probe() -> dict:
     finally:
         sys.settrace(previous)
     covered = alternatives & executed
-    ratio = len(covered) / len(alternatives) if alternatives else 1.0
+    ratio = len(covered) / len(alternatives) if alternatives else 0.0
     return {
-        "status": "passed" if result.wasSuccessful() and ratio == 1.0 else "failed",
+        "status": "passed" if (
+            result.wasSuccessful()
+            and not missing_functions
+            and bool(alternatives)
+            and ratio == 1.0
+        ) else "failed",
         "test_count": result.testsRun,
+        "expected_branch_functions": sorted(BRANCH_FUNCTIONS),
+        "discovered_branch_functions": sorted(discovered),
+        "missing_branch_functions": missing_functions,
         "branch_alternative_count": len(alternatives),
         "covered_branch_alternative_count": len(covered),
         "coverage_ratio": round(ratio, 6),
@@ -364,9 +379,17 @@ def mutation_probe(mutations=MUTATIONS) -> dict:
                 "status": (
                     "timeout"
                     if timed_out
-                    else ("killed" if completed.returncode != 0 else "survived")
+                    else {
+                        0: "survived",
+                        1: "killed",
+                        4: "worker_load_failed",
+                    }.get(completed.returncode, "worker_failed")
                 ),
                 "test": mutation["test"],
+                "returncode": completed.returncode,
+                "worker_detail": (
+                    f"{completed.stdout or ''}\n{completed.stderr or ''}"
+                )[-2000:],
             })
     return {
         "status": "passed" if rows and all(

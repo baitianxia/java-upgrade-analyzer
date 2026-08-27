@@ -5038,12 +5038,15 @@ def _item_api_label(item):
     return api
 
 
-def _item_business_entries(findings, item, limit=3, statuses=None):
+def _item_business_entries(
+    findings, item, limit=3, statuses=None, *, overview=None,
+):
     entries = []
     direct_entry = str(item.get('business_entry') or '').strip()
     if direct_entry:
         entries.append(direct_entry)
-    overview = _overview_for_item(findings, item)
+    if overview is None:
+        overview = _overview_for_item(findings, item)
     overview_entries = []
     if statuses:
         for status in statuses:
@@ -5089,9 +5092,10 @@ def _item_business_entries(findings, item, limit=3, statuses=None):
     return deduplicated[:limit]
 
 
-def _item_modules(findings, item, limit=3):
+def _item_modules(findings, item, limit=3, *, overview=None):
     modules = []
-    overview = _overview_for_item(findings, item)
+    if overview is None:
+        overview = _overview_for_item(findings, item)
     for module in overview.get('sample_modules') or []:
         module = str(module or '').strip()
         if module and module not in modules:
@@ -5681,6 +5685,17 @@ def build_api_result_rows(findings):
         _identity_without_severity(item): item
         for item in ((findings.get('impact_overview') or {}).get('apis') or [])
     }
+    # Step6 can contain hundreds of thousands of API rows. Resolve dependency
+    # metadata once instead of scanning both dependency collections per API.
+    dependency_lookup = {}
+    for dependency in findings.get('impacted_dependencies') or []:
+        coord = _canonical_identity_coord(dependency.get('coord'))
+        if coord:
+            dependency_lookup.setdefault(coord, dependency)
+    for dependency in findings.get('per_dependency_results') or []:
+        coord = _canonical_identity_coord(dependency.get('coord'))
+        if coord:
+            dependency_lookup.setdefault(coord, dependency)
     source_buckets = [
         ('已确认影响', 'P0', findings.get('p0') or []),
         ('已确认影响', 'P1', findings.get('p1') or []),
@@ -5717,6 +5732,7 @@ def build_api_result_rows(findings):
         }.get(fallback_conclusion, ())
         for item in items:
             identity = _identity_without_severity(item)
+            overview = overview_lookup.get(identity) or {}
             report_item = item
             if fallback_conclusion == UNCERTAIN_CANDIDATE_CONCLUSION:
                 report_item = {
@@ -5729,7 +5745,10 @@ def build_api_result_rows(findings):
                 report_item, fallback_conclusion
             )
             key = (identity, item_conclusion)
-            dependency = _dependency_for_item(findings, item)
+            dependency = dependency_lookup.get(
+                _canonical_identity_coord(item.get('coord')),
+                {},
+            )
             old_version = str(
                 item.get("old_version")
                 or dependency.get("old_version")
@@ -5762,6 +5781,7 @@ def build_api_result_rows(findings):
                     item,
                     limit=None,
                     statuses=desired_statuses,
+                    overview=overview,
                 )
                 existing["business_entries"] = sorted({
                     *existing.get("business_entries", []),
@@ -5780,7 +5800,6 @@ def build_api_result_rows(findings):
                 )
                 continue
             sampled_paths = _paths_for_report(item, overview_lookup, desired_statuses)
-            overview = overview_lookup.get(identity) or {}
             counts_by_status = overview.get('path_counts_by_status') or {}
             logical_counts_by_status = (
                 overview.get("logical_path_counts_by_status") or {}
@@ -5821,6 +5840,7 @@ def build_api_result_rows(findings):
                 item,
                 limit=None,
                 statuses=desired_statuses,
+                overview=overview,
             )
             all_business_entries = set()
             for status in desired_statuses:
@@ -5830,7 +5850,7 @@ def build_api_result_rows(findings):
                         all_business_entries.add(normalized_entry)
             all_business_entries.update(fallback_business_entries)
             business_entries = sorted(all_business_entries)
-            modules = _item_modules(findings, item)
+            modules = _item_modules(findings, item, overview=overview)
             path_count = _path_count_for_report(
                 item, overview_lookup, sampled_paths, desired_statuses
             )

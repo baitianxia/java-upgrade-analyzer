@@ -17,7 +17,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
-import xml.etree.ElementTree as ET
+import safe_xml as ET
 import zipfile
 
 from binary_asm_helper import BinaryAsmError, BinaryClassInput, extract_class_facts
@@ -680,7 +680,10 @@ def scan_artifact(
                     if b'<entity-mappings' in content[:4096] or b'<hibernate-mapping' in content[:4096]:
                         for fact in facts_from_orm_xml(content, info.filename):
                             result.facts[fact.key] = fact
-                except ET.ParseError:
+                except ET.ParseError as error:
+                    if "DTD and entity declarations are not allowed" in str(error):
+                        result.gaps.append(f"xml_dtd_rejected:{info.filename}")
+                        continue
                     # Most packaged XML files are not MyBatis mappers. Only flag
                     # files that look like one, avoiding unrelated XML noise.
                     if b"<mapper" in content[:4096]:

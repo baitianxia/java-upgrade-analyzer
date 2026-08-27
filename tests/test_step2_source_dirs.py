@@ -397,6 +397,24 @@ class Step2SourceDirsTest(unittest.TestCase):
 
         self.assertEqual(step2.detect_jdk_from_pom(pom), "17")
 
+    def test_detect_jdk_from_pom_prefers_active_plugin_over_plugin_management(self):
+        pom = """
+        <project>
+          <build>
+            <pluginManagement><plugins><plugin>
+              <artifactId>maven-compiler-plugin</artifactId>
+              <configuration><release>8</release></configuration>
+            </plugin></plugins></pluginManagement>
+            <plugins><plugin>
+              <artifactId>maven-compiler-plugin</artifactId>
+              <configuration><release>21</release></configuration>
+            </plugin></plugins>
+          </build>
+        </project>
+        """
+
+        self.assertEqual(step2.detect_jdk_from_pom(pom), "21")
+
     def test_detect_jdk_from_malformed_pom_uses_narrow_diagnostic_fragment(self):
         malformed = (
             "<diagnostic><java.version>1.8</java.version>"

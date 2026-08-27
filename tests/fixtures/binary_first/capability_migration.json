@@ -126,7 +126,6 @@
       "tests/test_pinned_source_discovery.py",
       "tests/test_production_constant_pipeline.py",
       "tests/test_production_mutation.py",
-      "tests/test_progress_logging.py",
       "tests/test_quality_signal_audit.py",
       "tests/test_real_project_regression.py",
       "tests/test_ref_confirmation_flow.py",

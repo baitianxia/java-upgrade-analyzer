@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 
@@ -21,6 +22,21 @@ from binary_capability_migration_audit import (
     audit_capability_migration,
 )
 from compat import run_managed_subprocess
+
+
+TEST_TIMEOUT_SECONDS_BY_PROFILE = {
+    "quick": 3600,
+    "step5": 7200,
+    "blackbox": 7200,
+    "whitebox": 14400,
+    "performance": 14400,
+    "release": 21600,
+}
+TEST_HEALTH_TIMEOUT_SECONDS = 3600
+REAL_PROJECT_TIMEOUT_SECONDS = 3600
+RECORDED_PERFORMANCE_TIMEOUT_SECONDS = 1800
+LIVE_PERFORMANCE_TIMEOUT_SECONDS = 21600
+JDK_DISCOVERY_TIMEOUT_SECONDS = 30
 
 
 QUICK_STEP4_ORACLE_REGRESSION_TESTS = (
@@ -404,14 +420,20 @@ def real_project_command(
 
 def performance_command(
     audit_root: str | Path, *, evidence_mode: str = "live",
+    output_path: str | Path | None = None,
 ) -> list[str]:
     root = Path(audit_root).expanduser().resolve()
+    output = (
+        Path(output_path).expanduser().resolve()
+        if output_path is not None
+        else root / "performance_result.json"
+    )
     if evidence_mode == "recorded":
         return [
             sys.executable,
             str(Path(__file__).with_name("binary_performance_gate.py")),
             "--verify-recorded-gate", str(PERFORMANCE_GATE_PATH),
-            "--output", str(root / "performance_result.json"),
+            "--output", str(output),
         ]
     if evidence_mode != "live":
         raise ValueError(f"unsupported performance evidence mode: {evidence_mode}")
@@ -419,7 +441,7 @@ def performance_command(
         sys.executable,
         str(Path(__file__).with_name("binary_performance_gate.py")),
         "--work-root", str(root / "performance_work"),
-        "--output", str(root / "performance_result.json"),
+        "--output", str(output),
         "--gate", str(PERFORMANCE_GATE_PATH),
     ]
 
@@ -429,6 +451,7 @@ def _jdk_home() -> Path:
         ["java", "-XshowSettings:properties", "-version"],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         check=False,
+        timeout=JDK_DISCOVERY_TIMEOUT_SECONDS,
     )
     for line in completed.stderr.splitlines():
         if "java.home" in line and "=" in line:
@@ -470,6 +493,29 @@ def capability_migration_status(repository_root: str | Path) -> dict:
     return audit_capability_migration(repository_root, registry)
 
 
+def _run_bounded_subprocess(command, *, timeout_seconds, **kwargs):
+    """Run a release-gate child with a finite tree-killing deadline."""
+
+    try:
+        return run_managed_subprocess(
+            command,
+            timeout=float(timeout_seconds),
+            **kwargs,
+        ), False
+    except subprocess.TimeoutExpired as error:
+        def decoded(value):
+            if isinstance(value, bytes):
+                return value.decode("utf-8", errors="replace")
+            return value
+
+        return subprocess.CompletedProcess(
+            command,
+            124,
+            decoded(getattr(error, "stdout", None)),
+            decoded(getattr(error, "stderr", None)),
+        ), True
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Binary-first quality gate")
     parser.add_argument(
@@ -502,6 +548,9 @@ def main(argv=None) -> int:
     test_execution_path = (
         audit_root / f"{args.profile}-test-execution-{os.getpid()}.json"
     )
+    performance_path = (
+        audit_root / f"performance-result-{os.getpid()}.json"
+    )
     command = command_for(args.profile, json_out=str(test_execution_path))
     cache_root = Path(
         args.real_project_cache or (audit_root / "real_project_cache")
@@ -522,7 +571,9 @@ def main(argv=None) -> int:
         release_commands = [test_health_command(), *real_project_commands(
             audit_root, cache_root=cache_root, jdk_home=release_jdk_home,
         ), performance_command(
-            audit_root, evidence_mode=args.release_performance_mode,
+            audit_root,
+            evidence_mode=args.release_performance_mode,
+            output_path=performance_path,
         )]
     if args.dry_run:
         print(" ".join(command))
@@ -532,6 +583,7 @@ def main(argv=None) -> int:
     try:
         audit_root.mkdir(parents=True, exist_ok=True)
         test_execution_path.unlink(missing_ok=True)
+        performance_path.unlink(missing_ok=True)
     except OSError as error:
         payload = {
             "schema": "java-upgrade-analyzer.binary-quality-gate.v2",
@@ -550,8 +602,15 @@ def main(argv=None) -> int:
         print(json.dumps(payload, ensure_ascii=False))
         return 2
     started = datetime.now(timezone.utc)
+    subprocess_timeouts = []
     print(f"[binary-quality-gate] tests: {' '.join(command)}", flush=True)
-    completed = run_managed_subprocess(command, check=False)
+    completed, tests_timed_out = _run_bounded_subprocess(
+        command,
+        timeout_seconds=TEST_TIMEOUT_SECONDS_BY_PROFILE[args.profile],
+        check=False,
+    )
+    if tests_timed_out:
+        subprocess_timeouts.append("tests")
     test_execution, test_execution_error = load_test_execution_evidence(
         test_execution_path,
         profile=args.profile,
@@ -566,10 +625,14 @@ def main(argv=None) -> int:
     if args.profile == "release":
         audit_root.mkdir(parents=True, exist_ok=True)
         print("[binary-quality-gate] test health: branch/mutation/repeat", flush=True)
-        health_completed = run_managed_subprocess(
-            release_commands[0], check=False, capture_output=True, text=True,
+        health_completed, health_timed_out = _run_bounded_subprocess(
+            release_commands[0],
+            timeout_seconds=TEST_HEALTH_TIMEOUT_SECONDS,
+            check=False, capture_output=True, text=True,
             encoding="utf-8", errors="replace",
         )
+        if health_timed_out:
+            subprocess_timeouts.append("test_health")
         health_returncode = health_completed.returncode
         try:
             health = json.loads(
@@ -588,10 +651,14 @@ def main(argv=None) -> int:
                 f"[binary-quality-gate] real project: {manifest.stem}",
                 flush=True,
             )
-            real_completed = run_managed_subprocess(
-                real_command, check=False, capture_output=True, text=True,
+            real_completed, real_timed_out = _run_bounded_subprocess(
+                real_command,
+                timeout_seconds=REAL_PROJECT_TIMEOUT_SECONDS,
+                check=False, capture_output=True, text=True,
                 encoding="utf-8", errors="replace",
             )
+            if real_timed_out:
+                subprocess_timeouts.append(f"real_project:{manifest.stem}")
             real_project_returncode = (
                 real_project_returncode or real_completed.returncode
             )
@@ -620,12 +687,19 @@ def main(argv=None) -> int:
             f"[binary-quality-gate] performance: {performance_label}",
             flush=True,
         )
-        performance_completed = run_managed_subprocess(
-            release_commands[-1], check=False, capture_output=True, text=True,
+        performance_completed, performance_timed_out = _run_bounded_subprocess(
+            release_commands[-1],
+            timeout_seconds=(
+                LIVE_PERFORMANCE_TIMEOUT_SECONDS
+                if args.release_performance_mode == "live"
+                else RECORDED_PERFORMANCE_TIMEOUT_SECONDS
+            ),
+            check=False, capture_output=True, text=True,
             encoding="utf-8", errors="replace",
         )
+        if performance_timed_out:
+            subprocess_timeouts.append("performance")
         performance_returncode = performance_completed.returncode
-        performance_path = audit_root / "performance_result.json"
         try:
             performance = json.loads(performance_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as error:
@@ -663,6 +737,7 @@ def main(argv=None) -> int:
         "test_health": health,
         "real_project": real_project,
         "performance": performance,
+        "subprocess_timeouts": subprocess_timeouts,
     }
     if args.json_out:
         target = Path(args.json_out).resolve()

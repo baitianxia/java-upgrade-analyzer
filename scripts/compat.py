@@ -920,6 +920,18 @@ def run_managed_subprocess(
     if input is not None:
         popen_kwargs["stdin"] = subprocess.PIPE
 
+    # These managed calls are the common boundary used by the quality and
+    # evidence runners.  A Python child must not inherit a GBK/CP936 stdout
+    # codec and turn a successfully completed Unicode test run into return
+    # code 1 while printing its final JSON payload.
+    provided_env = popen_kwargs.get("env")
+    proc_env = dict(os.environ if provided_env is None else provided_env)
+    for key in tuple(proc_env):
+        if str(key).upper() == "PYTHONIOENCODING":
+            proc_env.pop(key, None)
+    proc_env["PYTHONIOENCODING"] = "utf-8"
+    popen_kwargs["env"] = proc_env
+
     proc = managed_popen(command, **popen_kwargs)
     try:
         stdout, stderr = proc.communicate(input=input, timeout=timeout)

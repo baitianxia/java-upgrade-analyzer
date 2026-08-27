@@ -108,10 +108,5 @@
     {"module": "whitebox_call_coverage", "category": "test_infrastructure", "test_selectors": ["tests.test_whitebox_call_coverage"]},
     {"module": "whitebox_coverage_gate", "category": "test_infrastructure", "test_selectors": ["tests.test_whitebox_call_coverage"]}
   ],
-  "shell_entrypoints": [
-    {"path": "scripts/s3_jdk_internal.sh", "test_selectors": ["tests.test_step3_rule_packs"]},
-    {"path": "scripts/s3_jdk_removed.sh", "test_selectors": ["tests.test_step3_jdk_removed"]},
-    {"path": "scripts/s3_springboot_autoconfig.sh", "test_selectors": ["tests.test_step3_rule_packs"]},
-    {"path": "scripts/s3_springboot_config.sh", "test_selectors": ["tests.test_step3_spring_config"]}
-  ]
+  "shell_entrypoints": []
 }

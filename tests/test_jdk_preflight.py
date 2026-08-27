@@ -496,9 +496,12 @@ class JdkPreflightBoundaryTest(unittest.TestCase):
                 )
                 third = preflight.preflight_jdk_home(home)
 
-        self.assertIs(first, observed)
-        self.assertIs(second, observed)
-        self.assertIs(third, observed)
+        self.assertEqual(first, observed)
+        self.assertEqual(second, observed)
+        self.assertEqual(third, observed)
+        self.assertIsNot(first, second)
+        first["status"] = "mutated-by-caller"
+        self.assertEqual(second["status"], "passed")
         self.assertEqual(uncached.call_count, 2)
 
 

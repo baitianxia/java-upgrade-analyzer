@@ -1,10 +1,12 @@
 import math
 import os
+import subprocess
 import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,6 +18,7 @@ from binary_test_health_gate import (  # noqa: E402
     mutation_probe,
     repeat_health_probe,
 )
+import binary_test_health_gate  # noqa: E402
 
 
 class BinaryTestHealthGateTest(unittest.TestCase):
@@ -29,6 +32,63 @@ class BinaryTestHealthGateTest(unittest.TestCase):
         result = mutation_probe()
         self.assertEqual(result["status"], "passed", result)
         self.assertEqual(result["mutation_count"], result["killed_count"])
+
+    def test_mutation_worker_load_failure_is_not_counted_as_killed(self):
+        mutation = {
+            "id": "load-failure",
+            "module": "binary_first_contract",
+            "path": ROOT / "scripts" / "binary_first_contract.py",
+            "old": "from __future__ import annotations",
+            "new": "from __future__ import annotations\n",
+            "test": "tests.test_binary_first_contract",
+        }
+        failed_load = subprocess.CompletedProcess(
+            ["worker"], 4, "", "mutant import failed"
+        )
+        with patch.object(
+            binary_test_health_gate,
+            "_run_gate_command",
+            return_value=(failed_load, False),
+        ):
+            result = mutation_probe((mutation,))
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["killed_count"], 0)
+        self.assertEqual(result["rows"][0]["status"], "worker_load_failed")
+
+    def test_branch_inventory_fails_when_registered_functions_are_renamed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "contract.py"
+            target.write_text(
+                "def unrelated(value):\n    if value:\n        return 1\n    return 0\n",
+                encoding="utf-8",
+            )
+            alternatives, discovered = (
+                binary_test_health_gate._function_branch_inventory(target)
+            )
+
+        self.assertEqual(alternatives, set())
+        self.assertEqual(discovered, set())
+        successful_suite = unittest.TestSuite([
+            unittest.FunctionTestCase(lambda: None)
+        ])
+        with patch.object(
+            binary_test_health_gate,
+            "_function_branch_inventory",
+            return_value=(set(), set()),
+        ), patch.object(
+            binary_test_health_gate.unittest.defaultTestLoader,
+            "loadTestsFromName",
+            return_value=successful_suite,
+        ):
+            result = branch_probe()
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["coverage_ratio"], 0.0)
+        self.assertEqual(
+            result["missing_branch_functions"],
+            sorted(binary_test_health_gate.BRANCH_FUNCTIONS),
+        )
 
     def test_repeat_health_requires_same_test_count_and_time_budget(self):
         result = repeat_health_probe(

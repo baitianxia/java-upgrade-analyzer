@@ -375,14 +375,22 @@ def _preflight_input_signature(home: Path) -> tuple[tuple[str, int, int], ...]:
 def _cached_preflight(
     home_text: str,
     _input_signature: tuple[tuple[str, int, int], ...],
-) -> dict[str, Any]:
-    return _preflight_jdk_home_uncached(home_text)
+) -> bytes:
+    """Cache immutable canonical bytes, never a caller-mutable mapping."""
+    return json.dumps(
+        _preflight_jdk_home_uncached(home_text),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
 
 
 def preflight_jdk_home(jdk_home: str | Path) -> dict[str, Any]:
     """Exercise and content-bind all JDK inputs used by later phases."""
     home = Path(jdk_home).expanduser().resolve()
-    return _cached_preflight(str(home), _preflight_input_signature(home))
+    return json.loads(
+        _cached_preflight(str(home), _preflight_input_signature(home)).decode("utf-8")
+    )
 
 
 __all__ = [

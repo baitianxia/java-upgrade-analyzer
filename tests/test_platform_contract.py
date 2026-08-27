@@ -328,6 +328,11 @@ class PlatformContractTest(unittest.TestCase):
 
     def test_every_managed_popen_caller_has_success_and_failure_cleanup(self):
         missing = []
+        ownership_transfers = {
+            ("final_artifact_edge_oracle.py", "_spawn_javap"),
+        }
+        observed_transfers = set()
+        observed_transfer_callers = set()
         cleanup_names = {
             "_cancel_process",
             "_terminate_subprocess",
@@ -351,7 +356,19 @@ class PlatformContractTest(unittest.TestCase):
                     for call in calls
                 )
                 if not uses_managed_popen:
-                    continue
+                    transfer_calls = {
+                        call.func.id
+                        for call in calls
+                        if (
+                            isinstance(call.func, ast.Name)
+                            and call.func.id == "_spawn_javap"
+                        )
+                    }
+                    if not transfer_calls:
+                        continue
+                    observed_transfer_callers.add(
+                        (source_path.name, definition.name)
+                    )
                 called_names = {
                     call.func.id
                     for call in calls
@@ -361,12 +378,24 @@ class PlatformContractTest(unittest.TestCase):
                     for call in calls
                     if isinstance(call.func, ast.Attribute)
                 }
+                owner = (source_path.name, definition.name)
+                if uses_managed_popen and owner in ownership_transfers:
+                    observed_transfers.add(owner)
+                    continue
                 if "release_process_tree" not in called_names:
                     missing.append(f"{source_path.name}:{definition.name}:success")
                 if not (cleanup_names & called_names):
                     missing.append(f"{source_path.name}:{definition.name}:failure")
 
         self.assertEqual(missing, [])
+        self.assertEqual(observed_transfers, ownership_transfers)
+        self.assertEqual(observed_transfer_callers, {
+            (
+                "final_artifact_edge_oracle.py",
+                "_parse_entry_group_with_javap",
+            ),
+            ("final_artifact_edge_oracle.py", "_parse_entry_with_javap"),
+        })
 
     def test_synchronous_product_commands_cannot_bypass_tree_management(self):
         """Only the deliberate background launcher may own a raw Popen."""

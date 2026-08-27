@@ -4219,6 +4219,55 @@ class Step6ReportObjectivityTest(unittest.TestCase):
                 for item in findings["diagnostics"]
             ))
 
+    def test_large_api_projection_uses_prebuilt_overview_and_dependency_indexes(self):
+        count = 2000
+        items = [
+            {
+                "coord": f"g:a{index % 10}",
+                "api": f"p.C{index}.run",
+                "api_signature": "()",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+                "reason_code": "NOT_FOUND_IN_STATIC_ANALYSIS",
+            }
+            for index in range(count)
+        ]
+        findings = {
+            "p0": [],
+            "p1": [],
+            "p2": [],
+            "probable_impact": [],
+            "uncertain": [],
+            "not_impacted": [],
+            "needs_input": [],
+            "not_analyzed": [],
+            "not_found": items,
+            "impact_overview": {"apis": [dict(item) for item in items]},
+            "impacted_dependencies": [
+                {
+                    "coord": f"g:a{index}",
+                    "old_version": "1",
+                    "new_version": "2",
+                }
+                for index in range(10)
+            ],
+            "per_dependency_results": [],
+        }
+
+        with patch.object(
+            s6_report,
+            "_overview_for_item",
+            side_effect=AssertionError("linear overview scan used"),
+        ), patch.object(
+            s6_report,
+            "_dependency_for_item",
+            side_effect=AssertionError("linear dependency scan used"),
+        ):
+            rows = s6_report.build_api_result_rows(findings)
+
+        self.assertEqual(len(rows), count)
+        self.assertEqual({row["old_version"] for row in rows}, {"1"})
+
 
 if __name__ == "__main__":
     unittest.main()

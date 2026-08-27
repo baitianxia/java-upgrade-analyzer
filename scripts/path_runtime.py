@@ -34,7 +34,6 @@ _WORKTREE_LOCK_RETRY_DELAYS = (0.1, 0.25, 0.5, 1.0)
 _WORKTREE_LEASE_PREFIX = ".jua-worktree-lease-"
 _WORKTREE_LEASE_VERSION = 2
 _SUPPORTED_WORKTREE_LEASE_VERSIONS = {1, _WORKTREE_LEASE_VERSION}
-_MAX_WORKTREE_LEASES_PER_ROOT = 256
 _LEGACY_RESERVED_WORKTREE_NAMES = frozenset({
     "jua-base-build",
     "jua-current-build",
@@ -429,6 +428,13 @@ def _remove_worktree_lease(worktree):
 
 
 def _windows_process_is_alive(pid):
+    """Conservatively determine Windows process liveness.
+
+    A failed ``OpenProcess`` is not proof that the PID is dead.  In
+    particular, ERROR_ACCESS_DENIED is expected for protected processes.  Only
+    ERROR_INVALID_PARAMETER is the documented absent-PID result that may
+    authorize stale-worktree cleanup.
+    """
     try:
         import ctypes
 
@@ -444,13 +450,20 @@ def _windows_process_is_alive(pid):
         close_handle.restype = ctypes.c_int
         handle = open_process(0x00100000, False, int(pid))  # SYNCHRONIZE
         if not handle:
-            return False
+            get_last_error = getattr(ctypes, "get_last_error", None)
+            error_code = int(get_last_error() if get_last_error else 0)
+            return error_code != 87  # ERROR_INVALID_PARAMETER => PID absent
         try:
-            return wait_for_single_object(handle, 0) == 0x00000102
+            wait_result = wait_for_single_object(handle, 0)
+            if wait_result == 0x00000000:  # WAIT_OBJECT_0: process exited
+                return False
+            # WAIT_TIMEOUT proves liveness.  WAIT_FAILED/unknown values are
+            # deliberately preserved as live because they cannot prove death.
+            return True
         finally:
             close_handle(handle)
     except (AttributeError, OSError, TypeError, ValueError):
-        return False
+        return True
 
 
 def _process_is_alive(pid):
@@ -792,12 +805,11 @@ def _recover_stale_worktree_leases(
                 f"root={root}:lease_scan_failed:{type(exc).__name__}:{exc}"
             )
             continue
-        if len(leases) > _MAX_WORKTREE_LEASES_PER_ROOT:
-            result["errors"].append(
-                f"root={root}:lease_scan_limit_exceeded:"
-                f"{len(leases)}>{_MAX_WORKTREE_LEASES_PER_ROOT}"
-            )
-            leases = leases[:_MAX_WORKTREE_LEASES_PER_ROOT]
+        # Do not truncate the scan.  A fixed prefix limit permanently hid
+        # later leases once a root accumulated more than 256 files, while the
+        # resulting error blocked every future analysis before it could
+        # self-heal.  The shared operation deadline remains the resource bound;
+        # every successfully cleaned stale lease reduces the next scan.
         for lease in leases:
             if _remaining_timeout(deadline) <= 0:
                 result["errors"].append("lease_recovery_deadline_exceeded")

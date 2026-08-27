@@ -97,7 +97,7 @@ run("python .../run_step.py --step auto")
 
 硬规则：
 
-1. `run_step.py` 返回退出码 `4`、输出 `AWAITING USER INPUT` 或主状态进入 `awaiting_*` 时，立即停止执行。
+1. `run_step.py` 返回退出码 `4` 或主状态进入 `awaiting_*` 时，立即停止执行；机器事件 `JUA_CONFIRMATION_JSON` 只用于提取同一决策卡，不是额外状态。
 2. 待交互时只读取 `.upgrade-report/.runtime/state/interaction.json` 和它引用的人工文件；没有用户答复不得继续。
 3. 恢复只使用 `--response-json` 或 `--response-file`，不得使用裸动作参数绕过结构化答复。
 4. `state.status=ready` 只表示上一阶段完成；只有 `current_step=done`、`completed_step=step6` 且状态为 `completed` 或 `completed_with_limits` 时才是整个分析完成。
@@ -191,11 +191,11 @@ Step4 或其他可能超过 Agent 单次执行时限的任务，使用统一入�
 ### Phase 5 [AUTO] Binary Evidence Build
 
 - 对应步骤：`step4`
-- `binary_pipeline_config` 是必需输入。
+- Binary pipeline 必须消费持久化的 `binary_pipeline_config`；正常流程由 Step1 从最终制品、完整运行闭包和目标 JDK 自动物化，普通用户无需手写。只有高级重放或特殊 loader 部署才显式覆盖。
 - 单向执行 Step4A artifact-local diff → Step5A runtime-effective reconciliation → Step4B decision/projection freeze → Step5B batch trace，并为 Step6 冻结同一 immutable generation。
 - class/provider/member/resource/dispatch 选择均按显式 RuntimeProfile；源码只做解释覆盖。
 - authoritative、candidate、excluded 必须互斥守恒；confirmed-unprojectable 事实保留依赖坐标进入 `review.md`。
-- identity、support、Oracle、sidecar、数据库或性能门失败时不激活 generation，不生成旧引擎结果。
+- identity、support、Oracle、sidecar 或数据库完整性失败时不激活 generation，不生成旧引擎结果。性能证据只约束开发/发布审计；陈旧或失败的记录不得阻断普通 Step4，也不得伪装成已通过发布门。
 - Phase 6 是自动执行阶段，不存在“Step4 执行方式”确认。预计可能超过 Agent 单次命令时限时必须从统一入口以 `--background` 启动并由 Agent 持续监视，不得让用户另开终端或调整操作系统安全配置。
 
 Step4 人工复核顺序：

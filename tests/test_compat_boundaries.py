@@ -990,6 +990,9 @@ class CompatBoundaryTest(unittest.TestCase):
             )
         self.assertEqual((completed.stdout, completed.stderr), (b"out", b"err"))
         self.assertEqual(popen.call_args.kwargs["stdin"], subprocess.PIPE)
+        self.assertEqual(
+            popen.call_args.kwargs["env"]["PYTHONIOENCODING"], "utf-8"
+        )
         release.assert_called_once_with(process)
 
         timeout = subprocess.TimeoutExpired(

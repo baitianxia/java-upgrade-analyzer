@@ -69,6 +69,24 @@ class DatabaseContractScanTest(unittest.TestCase):
             archive.writestr("mapper/OrderMapper.xml", mapper_xml)
         return hashlib.sha256(path.read_bytes()).hexdigest()
 
+    def test_artifact_scan_rejects_utf16_dtd_without_entity_expansion(self):
+        payload = (
+            '<!DOCTYPE mapper [<!ENTITY boom "expanded">]>'
+            '<mapper namespace="demo.Mapper"><select id="x">&boom;</select></mapper>'
+        ).encode("utf-16")
+        with tempfile.TemporaryDirectory() as tmp:
+            jar_path = Path(tmp) / "mapper.jar"
+            with zipfile.ZipFile(jar_path, "w") as archive:
+                archive.writestr("mapper/DangerousMapper.xml", payload)
+
+            result = scan_artifact("g:a", "1", "current", jar_path)
+
+        self.assertEqual(result.facts, {})
+        self.assertIn(
+            "xml_dtd_rejected:mapper/DangerousMapper.xml",
+            result.gaps,
+        )
+
     def test_compares_two_sided_mapper_contract_and_keeps_dependency_owner(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

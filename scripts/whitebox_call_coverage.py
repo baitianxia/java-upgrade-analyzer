@@ -174,7 +174,7 @@ def reachable_production_modules(
     if missing:
         raise ValueError("missing production entry modules: " + ",".join(missing))
     trees = {
-        module: ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        module: ast.parse(path.read_text(encoding="utf-8-sig"), filename=str(path))
         for module, path in paths.items()
     }
     available = set(paths)
@@ -296,7 +296,7 @@ def audit_internal_test_scope(
             }, ensure_ascii=False, sort_keys=True),
         )
 
-    shell_rows = contract.get("shell_entrypoints") or ()
+    shell_rows = contract.get("shell_entrypoints", [])
     declared_shell_paths: list[str] = []
     if not isinstance(shell_rows, list):
         issue("SHELL_ENTRYPOINT_CLASSIFICATION_INVALID")
@@ -473,6 +473,22 @@ class _BindingCollector(ast.NodeVisitor):
         self.module_candidates: dict[str, set[str]] = {}
         self.symbol_candidates: dict[str, set[tuple[str, str]]] = {}
         self.names: set[str] = set()
+        self.non_import_names: set[str] = set()
+
+    def visit_Name(self, node: ast.Name) -> None:  # noqa: N802
+        if isinstance(node.ctx, ast.Store):
+            self.names.add(node.id)
+            self.non_import_names.add(node.id)
+
+    def visit_arg(self, node: ast.arg) -> None:  # noqa: N802
+        self.names.add(node.arg)
+        self.non_import_names.add(node.arg)
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:  # noqa: N802
+        if node.name:
+            self.names.add(node.name)
+            self.non_import_names.add(node.name)
+        self.generic_visit(node)
 
     def visit_Import(self, node: ast.Import) -> None:  # noqa: N802
         for alias in node.names:
@@ -497,18 +513,45 @@ class _BindingCollector(ast.NodeVisitor):
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
         if node is self.root:
+            for argument in (
+                list(node.args.posonlyargs)
+                + list(node.args.args)
+                + list(node.args.kwonlyargs)
+            ):
+                self.visit(argument)
+            if node.args.vararg:
+                self.visit(node.args.vararg)
+            if node.args.kwarg:
+                self.visit(node.args.kwarg)
             for statement in node.body:
                 self.visit(statement)
+        else:
+            self.names.add(node.name)
+            self.non_import_names.add(node.name)
 
     def visit_AsyncFunctionDef(  # noqa: N802
         self, node: ast.AsyncFunctionDef,
     ) -> None:
         if node is self.root:
+            for argument in (
+                list(node.args.posonlyargs)
+                + list(node.args.args)
+                + list(node.args.kwonlyargs)
+            ):
+                self.visit(argument)
+            if node.args.vararg:
+                self.visit(node.args.vararg)
+            if node.args.kwarg:
+                self.visit(node.args.kwarg)
             for statement in node.body:
                 self.visit(statement)
+        else:
+            self.names.add(node.name)
+            self.non_import_names.add(node.name)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802
-        return
+        self.names.add(node.name)
+        self.non_import_names.add(node.name)
 
 
 def _bindings_in_scope(
@@ -520,20 +563,18 @@ def _bindings_in_scope(
     collector = _BindingCollector(root, available_modules)
     if isinstance(root, ast.Module):
         for node in root.body:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                continue
             collector.visit(node)
     else:
         collector.visit(root)
     module_aliases = {
         name: next(iter(values))
         for name, values in collector.module_candidates.items()
-        if len(values) == 1
+        if len(values) == 1 and name not in collector.non_import_names
     }
     symbol_aliases = {
         name: next(iter(values))
         for name, values in collector.symbol_candidates.items()
-        if len(values) == 1
+        if len(values) == 1 and name not in collector.non_import_names
     }
     return module_aliases, symbol_aliases, collector.names
 
@@ -542,7 +583,7 @@ def _merged_bindings(
     tree: ast.Module,
     function: ast.FunctionDef | ast.AsyncFunctionDef,
     available_modules: set[str],
-) -> tuple[dict[str, str], dict[str, tuple[str, str]]]:
+) -> tuple[dict[str, str], dict[str, tuple[str, str]], set[str]]:
     module_aliases, symbol_aliases, _module_names = _bindings_in_scope(
         tree, available_modules,
     )
@@ -554,7 +595,7 @@ def _merged_bindings(
         symbol_aliases.pop(name, None)
     module_aliases.update(local_modules)
     symbol_aliases.update(local_symbols)
-    return module_aliases, symbol_aliases
+    return module_aliases, symbol_aliases, local_names
 
 
 class _CallCollector(ast.NodeVisitor):
@@ -587,6 +628,171 @@ class _CallCollector(ast.NodeVisitor):
         return
 
 
+class _LocalInstanceCollector(ast.NodeVisitor):
+    """Collect unambiguous local ``name = Class(...)`` bindings."""
+
+    def __init__(self, root, constructor_identity) -> None:
+        self.root = root
+        self.constructor_identity = constructor_identity
+        self.candidates: dict[str, set[tuple[str, str]]] = {}
+        self.invalid: set[str] = set()
+        self.first_assignment: dict[str, tuple[int, int]] = {}
+
+    @staticmethod
+    def _target_names(target: ast.AST) -> set[str]:
+        if isinstance(target, ast.Name):
+            return {target.id}
+        if isinstance(target, (ast.Tuple, ast.List)):
+            names: set[str] = set()
+            for element in target.elts:
+                names.update(_LocalInstanceCollector._target_names(element))
+            return names
+        return set()
+
+    def _record(self, target: ast.AST, value: ast.AST | None) -> None:
+        names = self._target_names(target)
+        identity = self.constructor_identity(value) if len(names) == 1 else None
+        for name in names:
+            position = (
+                int(getattr(target, "lineno", 0) or 0),
+                int(getattr(target, "col_offset", 0) or 0),
+            )
+            self.first_assignment.setdefault(name, position)
+            if identity:
+                self.candidates.setdefault(name, set()).add(identity)
+            else:
+                self.invalid.add(name)
+
+    def _record_arguments(self, node) -> None:
+        arguments = (
+            list(node.args.posonlyargs)
+            + list(node.args.args)
+            + list(node.args.kwonlyargs)
+        )
+        if node.args.vararg:
+            arguments.append(node.args.vararg)
+        if node.args.kwarg:
+            arguments.append(node.args.kwarg)
+        self.invalid.update(argument.arg for argument in arguments)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
+        if node is self.root:
+            self._record_arguments(node)
+            for statement in node.body:
+                self.visit(statement)
+        else:
+            self.invalid.add(node.name)
+
+    def visit_AsyncFunctionDef(  # noqa: N802
+        self, node: ast.AsyncFunctionDef,
+    ) -> None:
+        self.visit_FunctionDef(node)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802
+        self.invalid.add(node.name)
+
+    def visit_Assign(self, node: ast.Assign) -> None:  # noqa: N802
+        for target in node.targets:
+            self._record(target, node.value)
+        self.visit(node.value)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:  # noqa: N802
+        self._record(node.target, node.value)
+        if node.value is not None:
+            self.visit(node.value)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:  # noqa: N802
+        self._record(node.target, None)
+        self.visit(node.value)
+
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:  # noqa: N802
+        self._record(node.target, node.value)
+        self.visit(node.value)
+
+    def visit_For(self, node: ast.For) -> None:  # noqa: N802
+        self._record(node.target, None)
+        self.visit(node.iter)
+        for statement in (*node.body, *node.orelse):
+            self.visit(statement)
+
+    def visit_AsyncFor(self, node: ast.AsyncFor) -> None:  # noqa: N802
+        self.visit_For(node)
+
+    def visit_With(self, node: ast.With) -> None:  # noqa: N802
+        for item in node.items:
+            self.visit(item.context_expr)
+            if item.optional_vars is not None:
+                self._record(item.optional_vars, None)
+        for statement in node.body:
+            self.visit(statement)
+
+    def visit_AsyncWith(self, node: ast.AsyncWith) -> None:  # noqa: N802
+        self.visit_With(node)
+
+    def visit_Import(self, node: ast.Import) -> None:  # noqa: N802
+        for alias in node.names:
+            self.invalid.add(alias.asname or alias.name.split(".")[0])
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:  # noqa: N802
+        for alias in node.names:
+            if alias.name != "*":
+                self.invalid.add(alias.asname or alias.name)
+
+    def visit_Delete(self, node: ast.Delete) -> None:  # noqa: N802
+        for target in node.targets:
+            self.invalid.update(self._target_names(target))
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:  # noqa: N802
+        if node.type is not None:
+            self.visit(node.type)
+        if node.name:
+            self.invalid.add(node.name)
+        for statement in node.body:
+            self.visit(statement)
+
+
+def _local_instance_bindings(
+    caller: CallableRecord,
+    *,
+    class_methods: Mapping[tuple[str, str, str], str],
+    module_aliases: Mapping[str, str],
+    symbol_aliases: Mapping[str, tuple[str, str]],
+) -> dict[str, tuple[str, str, int, int]]:
+    known_classes = {
+        (module, class_name)
+        for module, class_name, _method_name in class_methods
+    }
+
+    def constructor_identity(value):
+        if not isinstance(value, ast.Call):
+            return None
+        function = value.func
+        if isinstance(function, ast.Name):
+            identity = symbol_aliases.get(function.id)
+            if identity is None:
+                identity = (caller.module, function.id)
+        elif (
+            isinstance(function, ast.Attribute)
+            and isinstance(function.value, ast.Name)
+            and function.value.id in module_aliases
+        ):
+            identity = (module_aliases[function.value.id], function.attr)
+        else:
+            return None
+        return identity if identity in known_classes else None
+
+    collector = _LocalInstanceCollector(caller.node, constructor_identity)
+    collector.visit(caller.node)
+    bindings = {}
+    for name, candidates in collector.candidates.items():
+        if name in collector.invalid or len(candidates) != 1:
+            continue
+        module, class_name = next(iter(candidates))
+        line, column = collector.first_assignment.get(name, (0, 0))
+        bindings[name] = (module, class_name, line, column)
+    return bindings
+
+
 def _resolve_name_call(
     name: str,
     *,
@@ -615,6 +821,8 @@ def _resolve_attribute_call(
     class_methods: Mapping[tuple[str, str, str], str],
     module_aliases: Mapping[str, str],
     symbol_aliases: Mapping[str, tuple[str, str]],
+    local_instances: Mapping[str, tuple[str, str, int, int]],
+    locally_bound_names: set[str],
 ) -> str:
     owner = function.value
     attribute = function.attr
@@ -623,6 +831,18 @@ def _resolve_attribute_call(
             return class_methods.get(
                 (caller.module, caller.owner_class, attribute), ""
             )
+        local_instance = local_instances.get(owner.id)
+        if local_instance:
+            module, class_name, line, column = local_instance
+            call_position = (
+                int(getattr(function, "lineno", 0) or 0),
+                int(getattr(function, "col_offset", 0) or 0),
+            )
+            if call_position >= (line, column):
+                return class_methods.get(
+                    (module, class_name, attribute), ""
+                )
+            return ""
         imported_module = module_aliases.get(owner.id)
         if imported_module:
             return top_level.get((imported_module, attribute), "")
@@ -632,9 +852,11 @@ def _resolve_attribute_call(
             return class_methods.get(
                 (imported_module, imported_name, attribute), ""
             )
-        candidate = class_methods.get(
-            (caller.module, owner.id, attribute), ""
-        )
+        candidate = ""
+        if owner.id not in locally_bound_names:
+            candidate = class_methods.get(
+                (caller.module, owner.id, attribute), ""
+            )
         return candidate if candidate in callable_ids else ""
     if isinstance(owner, ast.Call) and isinstance(owner.func, ast.Name):
         constructor_name = owner.func.id
@@ -737,7 +959,7 @@ def _static_branch_alternatives(
         if record.path in compiled_paths:
             continue
         compiled_paths.add(record.path)
-        source = record.path.read_text(encoding="utf-8")
+        source = record.path.read_text(encoding="utf-8-sig")
         module_code = compile(
             source, str(record.path), "exec", dont_inherit=True,
         )
@@ -873,7 +1095,7 @@ def _static_call_sites(
             continue
         compiled_paths.add(record.path)
         module_code = compile(
-            record.path.read_text(encoding="utf-8"),
+            record.path.read_text(encoding="utf-8-sig"),
             str(record.path),
             "exec",
             dont_inherit=True,
@@ -951,8 +1173,14 @@ def build_static_call_graph(
     for caller in records:
         calls = _CallCollector(caller.node)
         calls.visit(caller.node)
-        module_aliases, symbol_aliases = _merged_bindings(
+        module_aliases, symbol_aliases, locally_bound_names = _merged_bindings(
             trees[caller.module], caller.node, set(reachable),
+        )
+        local_instances = _local_instance_bindings(
+            caller,
+            class_methods=class_methods,
+            module_aliases=module_aliases,
+            symbol_aliases=symbol_aliases,
         )
         for call in calls.calls:
             callee = ""
@@ -974,6 +1202,8 @@ def build_static_call_graph(
                     class_methods=class_methods,
                     module_aliases=module_aliases,
                     symbol_aliases=symbol_aliases,
+                    local_instances=local_instances,
+                    locally_bound_names=locally_bound_names,
                 )
             if callee and callee in callable_ids:
                 edges.add((caller.callable_id, callee))
@@ -1608,7 +1838,7 @@ def install_process_profiler_from_environment() -> bool:
     output_directory = os.environ.get(ENV_OUTPUT_DIRECTORY, "")
     if not index_path or not output_directory or _INSTALLED_PROFILER is not None:
         return False
-    payload = json.loads(Path(index_path).read_text(encoding="utf-8"))
+    payload = json.loads(Path(index_path).read_text(encoding="utf-8-sig"))
     if not process_target_is_governed(payload):
         return False
     profiler = create_runtime_profiler(

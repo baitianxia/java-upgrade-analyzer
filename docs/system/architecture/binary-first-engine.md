@@ -293,8 +293,9 @@ Markdown 与 CSV 必须从同一排序后的数据集合生成；二者行数、
 - sidecar SHA；
 - SQLite schema/integrity；
 - 独立 Oracle；
-- performance gate；
 - 人工输出与权威数据的确定性对账。
+
+固定性能证据属于开发/发布审计，不属于普通 Step4 激活条件。专用 benchmark 与 release profile 必须因身份过期、准确性回退或性能越界而失败；正常分析不得读取陈旧性能 fixture 并把它转换成用户任务失败。
 
 任何检查失败：
 

@@ -2069,6 +2069,35 @@ def parse_version_info(version):
     if not normalized:
         return None
 
+    # Maven resolves ``*-SNAPSHOT`` artifacts to timestamped physical
+    # versions such as ``1.0-20240101.090000-123``.  The timestamp and build
+    # number qualify ``1.0``; they are not extra numeric base components.
+    timestamped_snapshot = re.fullmatch(
+        r'(?P<base>\d+(?:[._-]\d+)*)-'
+        r'(?P<date>\d{8})\.(?P<time>\d{4,6})-(?P<build>\d+)',
+        normalized,
+    )
+    if timestamped_snapshot:
+        return {
+            'base': [
+                int(token)
+                for token in re.split(
+                    r'[._-]', timestamped_snapshot.group('base')
+                )
+            ],
+            'stage_rank': -5,
+            'stage_num': int(timestamped_snapshot.group('build')),
+            'stage_sequence': (
+                1,
+                int(timestamped_snapshot.group('date')),
+                int(timestamped_snapshot.group('time')),
+                int(timestamped_snapshot.group('build')),
+            ),
+            'text': normalized,
+            'qualifier': 'snapshot',
+            'timestamped_snapshot': True,
+        }
+
     stage_rank_map = {
         'snapshot': -5,
         'alpha': -4,
@@ -2110,8 +2139,10 @@ def parse_version_info(version):
         'base': base,
         'stage_rank': stage_rank,
         'stage_num': stage_num,
+        'stage_sequence': (0,) if qualifier == 'snapshot' else (stage_num,),
         'text': normalized,
         'qualifier': qualifier,
+        'timestamped_snapshot': False,
     }
 
 
@@ -2137,8 +2168,14 @@ def compare_versions(old_ver, new_ver):
     if left_nums < right_nums:
         return -1
 
-    left_stage = (left['stage_rank'], left['stage_num'])
-    right_stage = (right['stage_rank'], right['stage_num'])
+    left_stage = (
+        left['stage_rank'],
+        tuple(left.get('stage_sequence') or (left['stage_num'],)),
+    )
+    right_stage = (
+        right['stage_rank'],
+        tuple(right.get('stage_sequence') or (right['stage_num'],)),
+    )
     if left_stage > right_stage:
         return 1
     if left_stage < right_stage:

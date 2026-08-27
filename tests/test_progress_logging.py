@@ -99,6 +99,27 @@ class ProgressLoggingTest(unittest.TestCase):
                 progress_logging._write_progress_event(payload, report_dir="/tmp")
             )
 
+    def test_progress_event_log_rotates_into_two_bounded_segments(self):
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            progress_logging, "PROGRESS_LOG_MAX_BYTES", 240,
+        ), patch.object(
+            progress_logging, "PROGRESS_EVENT_MAX_BYTES", 180,
+        ):
+            for index in range(12):
+                progress_logging._write_progress_event(
+                    {"event": index, "detail": "x" * 70},
+                    report_dir=temporary,
+                )
+            directory = Path(temporary) / ".runtime" / "observability"
+            current = directory / "progress.jsonl"
+            previous = directory / "progress.previous.jsonl"
+            self.assertTrue(previous.is_file())
+            self.assertLessEqual(current.stat().st_size, 240)
+            self.assertLessEqual(previous.stat().st_size, 240)
+            for path in (current, previous):
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    json.loads(line)
+
     def test_emit_progress_renders_full_empty_current_only_and_unknown_forms(self):
         captured_payloads = []
 

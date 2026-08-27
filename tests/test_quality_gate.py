@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -237,6 +238,39 @@ class QualityGateTest(unittest.TestCase):
         )
         self.assertGreaterEqual(len(matrix), 3)
         self.assertTrue(all("--manifest" in item for item in matrix))
+
+        first = quality_gate.performance_command(
+            "/tmp/audit",
+            output_path="/tmp/audit/performance-result-1.json",
+        )
+        second = quality_gate.performance_command(
+            "/tmp/audit",
+            output_path="/tmp/audit/performance-result-2.json",
+        )
+        self.assertNotEqual(
+            first[first.index("--output") + 1],
+            second[second.index("--output") + 1],
+        )
+
+    def test_quality_children_have_finite_timeout_and_timeout_result(self):
+        timeout = subprocess.TimeoutExpired(["child"], 1, output="partial")
+        with patch.object(
+            quality_gate,
+            "run_managed_subprocess",
+            side_effect=timeout,
+        ) as managed:
+            completed, timed_out = quality_gate._run_bounded_subprocess(
+                ["child"], timeout_seconds=1, check=False,
+            )
+
+        self.assertTrue(timed_out)
+        self.assertEqual(completed.returncode, 124)
+        self.assertEqual(completed.stdout, "partial")
+        self.assertEqual(managed.call_args.kwargs["timeout"], 1.0)
+        self.assertTrue(all(
+            seconds > 0
+            for seconds in quality_gate.TEST_TIMEOUT_SECONDS_BY_PROFILE.values()
+        ))
 
     def test_named_test_suites_have_stable_quality_gate_profiles(self):
         for profile in ("blackbox", "whitebox", "performance"):

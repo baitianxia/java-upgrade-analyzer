@@ -446,7 +446,7 @@ class BinaryReportPureBoundaryTest(unittest.TestCase):
             ("reachable", "已确认影响", "RUNTIME_VERIFICATION_REQUIRED", "probable_impact"),
             ("uncertain", "结论未确定（静态分析能力边界）", "BINARY_REACHABILITY_UNCERTAIN", "uncertain"),
             ("not_found_in_static_analysis", "未发现调用路径", "NOT_FOUND_IN_STATIC_ANALYSIS", "not_found_in_static_analysis"),
-            ("other", "本次未完成分析", "BINARY_TRACE_NOT_ANALYZED", "other"),
+            ("other", "本次未完成分析", "BINARY_TRACE_NOT_ANALYZED", "not_analyzed"),
         ]
         for state, conclusion, reason, bucket in states:
             with self.subTest(state=state):
@@ -454,6 +454,10 @@ class BinaryReportPureBoundaryTest(unittest.TestCase):
                 self.assertEqual(result["user_conclusion"], conclusion)
                 self.assertEqual(result["reason_code"], reason)
                 self.assertEqual(result["decision_bucket"], bucket)
+                self.assertEqual(
+                    result["source_reachability_status"],
+                    "other" if state == "other" else "",
+                )
                 self.assertEqual(result["call_paths"], [])
                 self.assertEqual(result["verification"], ["执行相关单元测试、集成测试或运行时回归验证。"] if state == "reachable" else [])
 

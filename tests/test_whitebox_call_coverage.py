@@ -125,6 +125,7 @@ class WhiteboxCallCoverageTest(unittest.TestCase):
             (scripts / "entry.py").write_text(textwrap.dedent("""
                 import worker
                 from helper import normalize
+                from worker import Engine as WorkerEngine
 
                 def main(value):
                     if value:
@@ -147,7 +148,36 @@ class WhiteboxCallCoverageTest(unittest.TestCase):
                     else:
                         import helper as selected
                     return selected.run(value)
-            """), encoding="utf-8")
+
+                def local_instance(value):
+                    engine = worker.Engine()
+                    return engine.execute(value)
+
+                def imported_local_instance(value):
+                    engine = WorkerEngine()
+                    return engine.execute(value)
+
+                def shadowed_module_name(value):
+                    worker = object()
+                    return worker.run(value)
+
+                def imported_over_instance(value):
+                    engine = worker.Engine()
+                    import helper as engine
+                    return engine.execute(value)
+
+                def deleted_instance(value):
+                    engine = worker.Engine()
+                    del engine
+                    return engine.execute(value)
+
+                def exception_over_instance(value):
+                    engine = worker.Engine()
+                    try:
+                        return value
+                    except Exception as engine:
+                        return engine.execute(value)
+            """), encoding="utf-8-sig")
             (scripts / "worker.py").write_text(textwrap.dedent("""
                 class Engine:
                     def execute(self, value):
@@ -197,6 +227,14 @@ class WhiteboxCallCoverageTest(unittest.TestCase):
         self.assertIn(
             ("entry::local_import", "worker::run"), graph.resolved_edges,
         )
+        self.assertIn(
+            ("entry::local_instance", "worker::Engine.execute"),
+            graph.resolved_edges,
+        )
+        self.assertIn(
+            ("entry::imported_local_instance", "worker::Engine.execute"),
+            graph.resolved_edges,
+        )
         call_site_edges = {
             (row.caller, row.callee) for row in graph.call_sites
         }
@@ -212,6 +250,19 @@ class WhiteboxCallCoverageTest(unittest.TestCase):
             and callee in {"worker::run", "helper::run"}
             for caller, callee in graph.resolved_edges
         ))
+        self.assertFalse(any(
+            caller == "entry::shadowed_module_name"
+            and callee == "worker::run"
+            for caller, callee in graph.resolved_edges
+        ))
+        for caller in (
+            "entry::imported_over_instance",
+            "entry::deleted_instance",
+            "entry::exception_over_instance",
+        ):
+            self.assertNotIn(
+                (caller, "worker::Engine.execute"), graph.resolved_edges,
+            )
         entry_branches = [
             row for row in graph.branch_alternatives
             if row.callable_id == "entry::main"

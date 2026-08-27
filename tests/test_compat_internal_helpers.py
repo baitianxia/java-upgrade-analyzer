@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 from pathlib import Path
 import signal
 import sys
@@ -264,7 +265,9 @@ class CompatInteractionAndLifecycleTest(unittest.TestCase):
     def test_windows_encoding_probe_uses_platform_subprocess_options(self):
         completed = MagicMock()
         completed.stdout.decode.return_value = "Active code page: 65001"
-        with patch.object(compat, "IS_WINDOWS", True), patch.object(
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            compat, "IS_WINDOWS", True,
+        ), patch.object(
             compat.subprocess, "run", return_value=completed,
         ), patch.object(
             compat, "subprocess_platform_kwargs", return_value={"creationflags": 7},

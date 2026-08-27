@@ -416,6 +416,12 @@ class InvocationParsingContractTest(unittest.TestCase):
             'before(); "hidden.call()" after();': "before();  after();",
             'before(); "escaped \\\" hidden.call()" after();': "before();  after();",
             'before(); "unterminated hidden.call()': "before(); ",
+            'before(); String text = """\nhidden.call();\n"""; after();': (
+                "before(); String text = ; after();"
+            ),
+            'before(); String text = """\nescaped \\\""" hidden.call();\n"""; after();': (
+                "before(); String text = ; after();"
+            ),
             "before(); 'x' after();": "before();  after();",
             "before(); '\\'' after();": "before();  after();",
             "before(); 'unterminated hidden.call()": "before(); ",
@@ -2408,6 +2414,11 @@ class TypeResolutionContractTest(unittest.TestCase):
             "null": "Object",
             "Order.class": "Class",
             "(Order) input": "Order",
+            "(java.util.List<String>) input": "List",
+            "(Map<String, List<Order>>) input": "Map",
+            "client.<String>convert(input)": None,
+            "<String>convert(input)": None,
+            "LEFT < RIGHT": "boolean",
             "new Order[2][]": "Order[][]",
             "new Order()": "Order",
             "condition ? input : null": "Input",

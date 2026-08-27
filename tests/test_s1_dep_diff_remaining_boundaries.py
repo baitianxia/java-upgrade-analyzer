@@ -531,12 +531,22 @@ class Step1DependencyDiffRemainingBoundaryTest(unittest.TestCase):
         self.assertIsNone(s1_dep_diff.parse_version_info("💥"))
         self.assertEqual(s1_dep_diff.parse_version_info("1-RC")["stage_num"], 0)
         self.assertEqual(s1_dep_diff.parse_version_info("1-RC-beta")["stage_num"], 0)
+        timestamped = s1_dep_diff.parse_version_info(
+            "1.0-20240101.0900-123"
+        )
+        self.assertEqual(timestamped["base"], [1, 0])
+        self.assertEqual(timestamped["qualifier"], "snapshot")
+        self.assertTrue(timestamped["timestamped_snapshot"])
 
         for old, new, expected in (
             (None, "1", 0), ("1", None, 0), ("2", "1", 1), ("1", "2", -1),
             ("1.0", "1", 0), ("1-RC1", "1", -1),
             ("1", "1-RC1", 1), ("1-RC2", "1-RC1", 1),
             ("1-RC1", "1-RC2", -1), ("1.0", "1.0", 0),
+            ("1.0-20240101.0900-123", "1.0-20240102.0900-1", -1),
+            ("1.0-20240102.0900-1", "1.0-20240101.0900-123", 1),
+            ("1.0-SNAPSHOT", "1.0-20240101.0900-123", -1),
+            ("1.0-20240101.0900-123", "1.0", -1),
         ):
             with self.subTest(old=old, new=new):
                 self.assertEqual(s1_dep_diff.compare_versions(old, new), expected)

@@ -5,6 +5,7 @@ import json
 from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
+import zlib
 
 import binary_semantic_overlay as semantic
 
@@ -420,12 +421,22 @@ class BinarySemanticOverlayBoundaryTest(unittest.TestCase):
             },
         ]
         member_rows = [member("m", variant="v-good")]
+        database_class_rows = [
+            {
+                "class_variant_identity": row["class_variant_identity"],
+                "artifact_instance_identity": row["artifact_instance_identity"],
+                "fact_zlib": zlib.compress(
+                    str(row.get("fact_json") or "").encode("utf-8")
+                ),
+            }
+            for row in class_rows
+        ]
         connection = MagicMock()
-        connection.execute.return_value = member_rows
-        store = MagicMock(connection=connection)
-        store.rows.side_effect = lambda table, **_kwargs: (
-            artifact_rows if table == "artifact_instances" else class_rows
+        connection.execute.side_effect = lambda query, *_args: (
+            database_class_rows if "FROM classes" in query else member_rows
         )
+        store = MagicMock(connection=connection)
+        store.rows.return_value = artifact_rows
         reconciliation = SimpleNamespace(
             class_definitions=(
                 {"initiating_loader_realm_identity": None, "class_name": None, "ready": False},
@@ -514,7 +525,9 @@ class BinarySemanticOverlayBoundaryTest(unittest.TestCase):
             ("app", "demo/Good"), ("app", "demo/GoodAlias"),
             ("app", "demo/Invalid"), ("app", "demo/Empty"),
         })
-        self.assertNotIn("fact_json", class_rows[0])
+        self.assertNotIn("fact_json", builder.selected[("app", "demo/Good")][0])
+        self.assertIsInstance(builder.members, semantic._MemberSource)
+        self.assertIsNone(builder.members_by_variant)
         self.assertEqual(builder.realms, ["app"])
         self.assertEqual(len(builder.resource_facts), 2)
         self.assertNotIsInstance(builder.direct_edges, list)
@@ -599,6 +612,56 @@ class BinarySemanticOverlayBoundaryTest(unittest.TestCase):
         builder.profile.payload["business_entrypoint_profile"] = None
         builder.profile.payload["container_and_launcher_kind"] = "SPRING-BOOT"
         self.assertTrue(builder._spring_active())
+
+    def test_spring_bean_wiring_indexes_implementations_once_per_class(self):
+        builder = bare_builder(spring=True)
+        interface_method = member(
+            "interface-run", "demo/Service", "run", variant="service"
+        )
+        install_class(
+            builder, "app", "demo/Service", variant="service",
+            access=semantic.ACC_INTERFACE, members=(interface_method,),
+        )
+        implementation_method = member(
+            "implementation-run", "demo/ServiceImpl", "run", variant="impl"
+        )
+        install_class(
+            builder, "app", "demo/ServiceImpl", variant="impl",
+            interfaces=("demo/Service",),
+            annotations=(annotation(
+                "Lorg/springframework/stereotype/Component;"
+            ),),
+            members=(implementation_method,),
+        )
+        caller = member(
+            "caller", "demo/Caller", "call", variant="caller"
+        )
+        install_class(
+            builder, "app", "demo/Caller", variant="caller",
+            members=(caller,),
+        )
+        builder.direct_edges = [
+            {
+                "caller_member_identity": "caller",
+                "edge_kind": "method",
+                "symbolic_owner": "demo/Service",
+                "symbolic_name": "run",
+                "symbolic_descriptor": "()V",
+            }
+            for _index in range(250)
+        ]
+
+        with patch.object(
+            builder, "_hierarchy", wraps=builder._hierarchy,
+        ) as hierarchy:
+            builder.spring_data_and_bean_wiring()
+
+        self.assertLessEqual(hierarchy.call_count, len(builder.selected) * 3)
+        self.assertTrue(any(
+            row.get("semantic_edge_kind") == "spring_bean_wiring_dispatch"
+            and row["target_member_identity"] == "implementation-run"
+            for row in builder.rows
+        ))
 
     def test_condition_certainty_complete_activation_matrix(self):
         builder = bare_builder()

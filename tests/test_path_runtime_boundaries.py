@@ -563,7 +563,7 @@ class PathRuntimeBoundaryTest(unittest.TestCase):
                 [],
             )
 
-    def test_stale_lease_scan_limit_deadline_and_scan_error(self):
+    def test_stale_lease_scan_is_not_truncated_and_reports_deadline_and_scan_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
             repository = root / "repository"
@@ -575,13 +575,19 @@ class PathRuntimeBoundaryTest(unittest.TestCase):
             second = root / f"{runtime._WORKTREE_LEASE_PREFIX}zz.json"
             second.write_text("{}", encoding="utf-8")
 
-            with patch.object(runtime, "_MAX_WORKTREE_LEASES_PER_ROOT", 1), \
-                    patch.object(runtime, "_remaining_timeout", return_value=0):
+            with patch.object(runtime, "_remaining_timeout", return_value=0):
                 result = runtime._recover_stale_worktree_leases(
                     ["git"], repository, [root], None, deadline=1
                 )
-            self.assertTrue(any("lease_scan_limit_exceeded" in e for e in result["errors"]))
             self.assertIn("lease_recovery_deadline_exceeded", result["errors"])
+
+            with patch.object(runtime, "_remaining_timeout", return_value=1), patch.object(
+                runtime, "_lease_owner_is_alive", return_value=True,
+            ):
+                result = runtime._recover_stale_worktree_leases(
+                    ["git"], repository, [root], None, deadline=1
+                )
+            self.assertEqual(result["checked_leases"], 2)
 
             original_glob = Path.glob
 

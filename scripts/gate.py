@@ -46,7 +46,7 @@ def python_cmds():
     )
 
 def fail(msg, instructions=None):
-    print(f"\n{'='*60}\n❌ 门控未通过：{msg}", file=sys.stderr)
+    print(f"\n{'='*60}\n[FAILED] 门控未通过：{msg}", file=sys.stderr)
     if instructions:
         print("\n需要执行：", file=sys.stderr)
         for i in instructions: print(f"  {i}", file=sys.stderr)
@@ -63,7 +63,7 @@ def fail_binary_report_contract(message, error):
         )
     fail(message)
 
-def ok(msg): print(f"✅ {msg}", file=sys.stderr)
+def ok(msg): print(f"[OK] {msg}", file=sys.stderr)
 
 
 def _formal_step5_target(item):

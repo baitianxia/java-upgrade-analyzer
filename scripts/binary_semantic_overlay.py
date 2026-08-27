@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import json
 import re
 from typing import Any, Iterable, Mapping
+import zlib
 
 from binary_first_contract import BinaryFirstContractError, canonical_identity
 from binary_runtime_reconciler import (
@@ -272,6 +273,84 @@ class _DirectMethodEdgeSource:
             yield dict(row)
 
 
+class _MemberSource:
+    """Stream/query member rows without retaining the complete member table."""
+
+    _PROJECTION = (
+        "member_identity,class_variant_identity,artifact_instance_identity,"
+        "class_name,member_kind,member_name,descriptor,access_flags,contract_json"
+    )
+    CACHE_LIMIT = 4096
+
+    def __init__(self, connection: Any):
+        self.connection = connection
+        self._identity_cache: dict[str, dict[str, Any]] = {}
+        self._variant_cache: dict[tuple[str, str, str], tuple[dict[str, Any], ...]] = {}
+
+    @staticmethod
+    def _bounded_put(cache, key, value):
+        if len(cache) >= _MemberSource.CACHE_LIMIT:
+            cache.clear()
+        cache[key] = value
+
+    def get(self, identity: str, default=None):
+        key = str(identity or "")
+        if not key:
+            return default
+        cached = self._identity_cache.get(key)
+        if cached is not None:
+            return cached
+        row = self.connection.execute(
+            f"SELECT {self._PROJECTION} FROM members WHERE member_identity=?",
+            (key,),
+        ).fetchone()
+        if row is None:
+            return default
+        value = dict(row)
+        self._bounded_put(self._identity_cache, key, value)
+        return value
+
+    def for_variant(
+        self, variant: str, *, kind: str = "", name: str = ""
+    ) -> tuple[dict[str, Any], ...]:
+        key = (str(variant or ""), str(kind or ""), str(name or ""))
+        cached = self._variant_cache.get(key)
+        if cached is not None:
+            return cached
+        clauses = ["class_variant_identity=?"]
+        parameters = [key[0]]
+        if key[1]:
+            clauses.append("member_kind=?")
+            parameters.append(key[1])
+        if key[2]:
+            clauses.append("member_name=?")
+            parameters.append(key[2])
+        rows = tuple(
+            dict(row) for row in self.connection.execute(
+                f"SELECT {self._PROJECTION} FROM members WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY member_kind,member_name,descriptor",
+                tuple(parameters),
+            )
+        )
+        self._bounded_put(self._variant_cache, key, rows)
+        return rows
+
+    def iter_methods(self):
+        cursor = self.connection.execute(
+            f"SELECT {self._PROJECTION} FROM members "
+            "WHERE member_kind='method' "
+            "ORDER BY class_variant_identity,member_name,descriptor"
+        )
+        try:
+            for row in cursor:
+                yield dict(row)
+        finally:
+            close = getattr(cursor, "close", None)
+            if callable(close):
+                close()
+
+
 class _Builder:
     def __init__(self, store: Any, profile: Any, reconciliation: Any, decisions: Any = None):
         self.store = store
@@ -282,24 +361,10 @@ class _Builder:
             row["artifact_instance_identity"]: row
             for row in store.rows("artifact_instances")
         }
-        self.classes = {
-            row["class_variant_identity"]: row
-            for row in store.rows("classes", include_class_bytes=False)
-        }
-        self.members = {
-            row["member_identity"]: dict(row)
-            for row in store.connection.execute(
-                """
-                SELECT member_identity,class_variant_identity,
-                       artifact_instance_identity,class_name,member_kind,
-                       member_name,descriptor,access_flags,contract_json
-                FROM members
-                """
-            )
-        }
-        self.members_by_variant: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for row in self.members.values():
-            self.members_by_variant[row["class_variant_identity"]].append(row)
+        self.members = _MemberSource(store.connection)
+        # Boundary tests can still install a small in-memory fixture by
+        # replacing this with a mapping. Production never populates it.
+        self.members_by_variant = None
         self.direct_edges = _DirectMethodEdgeSource(store.connection)
         class_load_ready = {
             (
@@ -309,8 +374,7 @@ class _Builder:
             for item in getattr(reconciliation, "class_definitions", ())
             if class_load_is_ready(item)
         }
-        self.selected: dict[tuple[str, str], tuple[dict[str, Any], dict[str, Any]]] = {}
-        selected_facts: dict[str, dict[str, Any]] = {}
+        selections_by_variant: dict[str, list[tuple[str, str]]] = defaultdict(list)
         for binding in getattr(reconciliation, "provider_bindings", ()):
             if binding.get("class_provider_status") != "resolved":
                 continue
@@ -321,21 +385,48 @@ class _Builder:
             if selection_key not in class_load_ready:
                 continue
             variant = str(binding.get("selected_class_variant_identity") or "")
-            row = self.classes.get(variant)
-            if row is not None:
-                fact = selected_facts.get(variant)
-                if fact is None:
-                    fact = _loads(row.get("fact_json") or "{}")
-                    selected_facts[variant] = fact
-                self.selected[selection_key] = (
-                    row, fact
-                )
-        # ``selected`` owns the rows needed below. Drop shadowed/MR variants
-        # and the duplicate serialized fact strings before semantic indexes are
-        # built from the parsed documents.
-        for row, _fact in self.selected.values():
-            row.pop("fact_json", None)
-        self.classes.clear()
+            if variant:
+                selections_by_variant[variant].append(selection_key)
+        self.selected: dict[
+            tuple[str, str], tuple[dict[str, Any], dict[str, Any]]
+        ] = {}
+        cursor = store.connection.execute(
+            "SELECT class_variant_identity,artifact_instance_identity,fact_zlib "
+            "FROM classes ORDER BY class_variant_identity"
+        )
+        try:
+            for raw in cursor:
+                raw = dict(raw)
+                variant = str(raw.get("class_variant_identity") or "")
+                selection_keys = selections_by_variant.get(variant)
+                if not selection_keys:
+                    continue
+                try:
+                    fact = _loads(
+                        zlib.decompress(raw.get("fact_zlib") or b"").decode("utf-8")
+                    )
+                except (TypeError, ValueError, zlib.error, UnicodeError):
+                    fact = {}
+                class_row = {
+                    "class_variant_identity": variant,
+                    "artifact_instance_identity": str(
+                        raw.get("artifact_instance_identity") or ""
+                    ),
+                }
+                for selection_key in selection_keys:
+                    self.selected[selection_key] = (class_row, fact)
+        finally:
+            close = getattr(cursor, "close", None)
+            if callable(close):
+                close()
+        self._selection_keys_by_variant: dict[
+            str, tuple[tuple[str, str], ...]
+        ] = {
+            variant: tuple(keys)
+            for variant, keys in selections_by_variant.items()
+            if any(key in self.selected for key in keys)
+        }
+        self._hierarchy_cache: dict[tuple[str, str], frozenset[str]] = {}
         self.realms = sorted({realm for realm, _name in self.selected})
         self.rows: list[dict[str, Any]] = []
         self.seen = set()
@@ -367,11 +458,21 @@ class _Builder:
         selected = self.selected.get((realm, class_name))
         if not selected:
             return []
-        return [
-            row for row in self.members_by_variant[selected[0]["class_variant_identity"]]
-            if row.get("member_kind") == "method"
-            and (not name or row.get("member_name") == name)
-        ]
+        return list(self._members_for_variant(
+            selected[0]["class_variant_identity"], kind="method", name=name,
+        ))
+
+    def _members_for_variant(
+        self, variant: str, *, kind: str = "", name: str = ""
+    ):
+        fixture_rows = getattr(self, "members_by_variant", None)
+        if fixture_rows is not None:
+            return tuple(
+                row for row in fixture_rows.get(variant, ())
+                if (not kind or row.get("member_kind") == kind)
+                and (not name or row.get("member_name") == name)
+            )
+        return self.members.for_variant(variant, kind=kind, name=name)
 
     def _method_edges(self, owners: Iterable[str] | None = None):
         source = self.direct_edges
@@ -388,10 +489,38 @@ class _Builder:
             yield edge
 
     def _member_fact_rows(self):
+        fixture_rows = getattr(self, "members_by_variant", None)
+        if fixture_rows is None:
+            current_variant = None
+            method_facts = {}
+            for member in self.members.iter_methods():
+                variant = str(member.get("class_variant_identity") or "")
+                selection_keys = self._selection_keys_by_variant.get(variant, ())
+                if not selection_keys:
+                    continue
+                if variant != current_variant:
+                    current_variant = variant
+                    fact = self.selected[selection_keys[0]][1]
+                    method_facts = {
+                        (
+                            (item.get("contract") or {}).get("name"),
+                            (item.get("contract") or {}).get("descriptor"),
+                        ): item
+                        for item in fact.get("methods") or ()
+                    }
+                method = method_facts.get((
+                    member.get("member_name"), member.get("descriptor")
+                ))
+                if method is None:
+                    continue
+                for realm, class_name in selection_keys:
+                    class_row, fact = self.selected[(realm, class_name)]
+                    yield realm, class_name, class_row, fact, member, method
+            return
         for (realm, class_name), (class_row, fact) in self.selected.items():
             by_key = {
                 (row.get("member_name"), row.get("descriptor")): row
-                for row in self.members_by_variant[class_row["class_variant_identity"]]
+                for row in fixture_rows[class_row["class_variant_identity"]]
                 if row.get("member_kind") == "method"
             }
             for method in fact.get("methods") or ():
@@ -401,6 +530,13 @@ class _Builder:
                     yield realm, class_name, class_row, fact, member, method
 
     def _hierarchy(self, realm: str, class_name: str) -> set[str]:
+        key = (realm, class_name)
+        cache = getattr(self, "_hierarchy_cache", None)
+        if cache is None:
+            cache = self._hierarchy_cache = {}
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
         result = set()
         pending = [class_name]
         while pending:
@@ -414,7 +550,11 @@ class _Builder:
                 if parent not in result:
                     result.add(parent)
                     pending.append(parent)
-        return result
+        frozen = frozenset(result)
+        if len(cache) >= 8192:
+            cache.clear()
+        cache[key] = frozen
+        return frozen
 
     def _spring_active(self) -> bool:
         runtime = self.profile.payload
@@ -627,11 +767,11 @@ class _Builder:
                     if not selected:
                         continue
                     candidates.extend(
-                        member for member in self.members_by_variant[
-                            selected[0]["class_variant_identity"]
-                        ]
-                        if member.get("member_kind") == target_kind
-                        and member.get("member_name") == member_name
+                        self._members_for_variant(
+                            selected[0]["class_variant_identity"],
+                            kind=target_kind,
+                            name=member_name,
+                        )
                     )
                 certainty = "exact" if len(candidates) == 1 else "possible"
                 if len(candidates) > 1:
@@ -882,12 +1022,24 @@ class _Builder:
                 for realm in self.realms
             )
         }
+        implementations_by_interface: dict[
+            str, list[tuple[str, str]]
+        ] = defaultdict(list)
+        for (realm, class_name), _selected in self.selected.items():
+            if (realm, class_name) not in bean_types:
+                continue
+            for interface in interface_owners.intersection(
+                self._hierarchy(realm, class_name)
+            ):
+                implementations_by_interface[interface].append(
+                    (realm, class_name)
+                )
         for edge in self._method_edges(interface_owners):
             interface = str(edge.get("symbolic_owner") or "")
             implementations = []
-            for (realm, class_name), _selected in self.selected.items():
-                if (realm, class_name) not in bean_types or interface not in self._hierarchy(realm, class_name):
-                    continue
+            for realm, class_name in implementations_by_interface.get(
+                interface, ()
+            ):
                 implementations.extend(
                     (
                         row,
@@ -1159,9 +1311,11 @@ class _Builder:
                 selected = self.selected.get((realm, owner))
                 if selected:
                     target_nodes.extend(
-                        row for row in self.members_by_variant[selected[0]["class_variant_identity"]]
-                        if row.get("member_kind") == "field"
-                        and row.get("member_name") == scope.get("member_name")
+                        self._members_for_variant(
+                            selected[0]["class_variant_identity"],
+                            kind="field",
+                            name=str(scope.get("member_name") or ""),
+                        )
                     )
             if not target_nodes:
                 descriptor = str(scope.get("descriptor") or "")

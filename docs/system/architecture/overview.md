@@ -157,7 +157,7 @@ Step3 扫描：
 - `scripts/binary_report.py --phase step4`：发布人工 Step4 视图；
 - `scripts/gate.py step4`：验证 generation 与人工视图守恒。
 
-必需输入 `binary_pipeline_config` 固定：
+Binary pipeline 必须消费持久化的 `binary_pipeline_config`；正常流程由 Step1 自动物化，普通用户无需手写。该配置固定：
 
 - base/current artifacts；
 - coord、lineage、container entry 和 runtime path；
@@ -180,7 +180,7 @@ Step4A artifact-local diff
 
 - `binary_first_model.py`：schema 和 immutable identity；
 - `binary_artifact_diff.py`：archive/classfile/IR/resource facts；
-- `binary_runtime_resolver.py`：provider、definition、member/resource resolution；
+- `binary_runtime_reconciler.py`：provider、definition、member/resource reconciliation；
 - `binary_decision_engine.py`：authoritative/candidate/excluded；
 - `binary_trace_engine.py`：entrypoint 到目标的 batch trace；
 - `binary_output.py`：SQLite、sidecar、formal/candidate/coverage/summary；
@@ -269,8 +269,9 @@ Step6 只读取同 generation 的 Step5 范围，发布：
 - trace/dependency binding；
 - sidecar SHA；
 - SQLite integrity；
-- 独立 Oracle；
-- performance gate。
+- 独立 Oracle。
+
+性能记录不参与正常 generation 激活。它只在专用基准与 release audit 中验证实现身份、耗时、内存和准确性守恒；记录陈旧或门禁失败必须让发布门响亮失败，但不能把开发观测前置为用户 Step4 的运行时阻断条件。
 
 失败记录在 `.runtime/binary_authority/binary_failures/`。active pointer 不切换，已有用户输出不覆盖，不创建旧引擎 generation。
 
@@ -288,7 +289,7 @@ Source overlay 是可选解释层：
 
 ## 15. 观测与性能
 
-统一进度位于 `.runtime/observability/progress.jsonl`。各阶段 timing 保存 phase、对象、状态、耗时、规模和可用时的进度分母。
+统一进度位于 `.runtime/observability/progress.jsonl`，当前段和 `progress.previous.jsonl` 各自最多 8 MiB，单事件最多 256 KiB；轮转和截断只影响观测字段，不能改变正式结果。各阶段 timing 保存 phase、对象、状态、耗时、规模和可用时的进度分母。
 
 Binary 性能策略：
 

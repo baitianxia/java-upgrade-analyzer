@@ -145,6 +145,17 @@ class Step3ScanBoundaryTest(unittest.TestCase):
             )
             self.assertGreaterEqual(len(unfiltered), 5)
 
+            with patch.object(scan, "walk_files", wraps=scan.walk_files) as walk:
+                grouped = scan.scan_patterns(
+                    root,
+                    [("hit", "HIT"), ("class", r"\bclass\b")],
+                    skip_comment=False,
+                    skip_test=True,
+                )
+            self.assertEqual(walk.call_count, 1)
+            self.assertTrue(grouped["hit"])
+            self.assertTrue(grouped["class"])
+
             scan.reset_scan_diagnostics()
             with patch.object(scan, "walk_files", return_value=[str(main / "App.java")]), patch.object(
                 scan, "open_text", side_effect=OSError("unreadable"),
@@ -541,6 +552,9 @@ class Step3ScanBoundaryTest(unittest.TestCase):
 
     def test_residual_helper_short_circuit_matrix(self):
         self.assertTrue(scan.is_jdk_javax("javax.sql.rowset"))
+        self.assertTrue(scan.is_jdk_javax("javax.annotation.processing.Processor"))
+        self.assertTrue(scan.is_jdk_javax("javax.tools.JavaCompiler"))
+        self.assertFalse(scan.is_jdk_javax("javax.sqlx.NotAPlatformPackage"))
         self.assertFalse(scan.is_jdk_javax("javax.servlet"))
         self.assertIsNone(scan.resolve_dep_version({"new_version": "", "old_version": ""}))
         self.assertIsNone(scan.resolve_dep_version({"new_version": "-", "old_version": "-"}))
@@ -660,8 +674,11 @@ class Step3ScanBoundaryTest(unittest.TestCase):
             ]
             with patch.object(scan, "active_jdk_removed_rules", return_value=rules), patch.object(
                 scan,
-                "scan_pattern",
-                side_effect=[[("A.java", 1, "REMOVED_HIT")], [("B.java", 2, "DEPRECATED_HIT")]],
+                "scan_patterns",
+                return_value={
+                    0: [("A.java", 1, "REMOVED_HIT")],
+                    1: [("B.java", 2, "DEPRECATED_HIT")],
+                },
             ), patch.object(scan, "scan_thread_lifecycle_calls", return_value=[]):
                 self.assertEqual(scan.scan_jdk_removed(root, output), 2)
             loaded = scan.load_csv_rows(output)
@@ -816,6 +833,7 @@ class Step3ScanBoundaryTest(unittest.TestCase):
                 ("app.properties", "type=javax.persistence.Entity"),
                 ("app.yml", "type: javax.validation.Validator"),
                 ("app.yaml", "type: javax.ws.rs.Path"),
+                ("processor.xml", "type=javax.annotation.processing.Processor"),
                 ("spring.factories", "key=javax.servlet.Filter\nno.match=true"),
             ):
                 (root / name).write_text(content, encoding="utf-8")
@@ -857,6 +875,12 @@ class Step3ScanBoundaryTest(unittest.TestCase):
             self.assertGreaterEqual(count, 9)
             rows = scan.load_csv_rows(output)
             self.assertTrue(any(row["需迁移"] == "N" for row in rows))
+            self.assertTrue(any(
+                "javax.annotation.processing.Processor" in row["内容"]
+                and row["需迁移"] == "N"
+                and row["规则ID"] == "jdk-javax-no-migration"
+                for row in rows
+            ))
             self.assertTrue(any(row["规则ID"] == "servlet" for row in rows))
             self.assertTrue(any(row["需迁移"] == "UNKNOWN" for row in rows))
 

@@ -18,6 +18,16 @@ import gate  # noqa: E402
 
 
 class GateProjectionBoundaryTest(unittest.TestCase):
+    def test_terminal_markers_are_ascii_safe_on_gbk_streams(self):
+        raw = io.BytesIO()
+        stream = io.TextIOWrapper(raw, encoding="gbk", write_through=True)
+
+        with patch.object(sys, "stderr", stream):
+            with self.assertRaises(SystemExit):
+                gate.fail("测试失败原因")
+
+        self.assertIn(b"[FAILED]", raw.getvalue())
+
     def test_formal_api_target_projection_source_and_path_matrix(self):
         rich = {
             "reported_api_identity": "reported",

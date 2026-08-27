@@ -1,7 +1,7 @@
 # Checkpoint Rules
 
 0. 所有回答都必须清晰、准确、诚实：区分已核实事实、基于证据的推断和无法确认；不得编造、夸大或遗漏会改变用户判断的关键事实；答错后必须立即明确更正。
-1. 看到 `AWAITING USER INPUT`、`main_state.json.status=awaiting_*`，或 `run_step.py` 返回退出码 `4` 时，必须立即停止。
+1. 看到 `main_state.json.status=awaiting_*` 或 `run_step.py` 返回退出码 `4` 时，必须立即停止；标准输出中的 `JUA_CONFIRMATION_JSON` 是同一交互的机器事件，不另定义暂停状态。
 2. 停止后只能做四件事：读 `main_state.json`、读 `interaction.json`、把交互内容整理成用户可读的决策卡片、等待用户回复。
 3. 禁止跳过用户确认，禁止替用户选择 `continue`，禁止伪造用户答复。
 4. 恢复时优先使用 `--response-json` 或 `--response-file`，把用户真实答复整理成 `intent_patch` 后传回 `run_step.py`。

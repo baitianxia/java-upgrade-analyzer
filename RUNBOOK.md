@@ -174,6 +174,36 @@ python3 scripts/binary_performance_gate.py --verify-recorded-gate tests/fixtures
 python3 scripts/binary_real_project_guard.py --manifest tests/fixtures/binary_first/real_projects/mybatis_sample_xml_noop.json --verify-manifest
 ```
 
+### 固定性能证据重录
+
+只有 `scripts/binary_performance_release_policy.py` 声明的参考机、Python、JDK 和 ASM 身份全部匹配时才允许重录。实现身份过期时先复核引起变化的源码；候选命令会以 `BINARY_PERFORMANCE_REFERENCE_IMPLEMENTATION_MISMATCH` 给出参考机实际观测的 `pipeline_generation_implementation_identity` 与 `validator_implementation_identity`，维护者审核后把这两个值更新到 source-owned release policy。不得直接改性能 fixture 或 support manifest 的哈希来伪造通过。
+
+在两个不同的私有工作目录依次执行：
+
+```bash
+python3 scripts/binary_performance_gate.py \
+  --work-root <candidate-private-work-root> \
+  --output <candidate-result.json>
+
+python3 scripts/binary_performance_gate.py \
+  --build-provisional-from-result <candidate-result.json> \
+  --captured-at <UTC-YYYY-MM-DDTHH:MM:SSZ> \
+  --output <provisional-gate.json>
+
+python3 scripts/binary_performance_gate.py \
+  --work-root <recapture-private-work-root> \
+  --output <recapture-result.json> \
+  --provisional-gate <provisional-gate.json>
+
+python3 scripts/binary_performance_gate.py \
+  --build-final-from-result <recapture-result.json> \
+  --provisional-gate <provisional-gate.json> \
+  --captured-at <UTC-YYYY-MM-DDTHH:MM:SSZ> \
+  --output <final-gate.json>
+```
+
+只有 final build 和随后 `--verify-recorded-gate` 都通过，才能用 final 文件替换 `tests/fixtures/binary_first/performance_gate.json`，并同步更新 `scripts/binary_first_support_manifest.json` 中的证据 SHA-256 与 `source_implementation_identity`。候选和复采工作目录不得复用；完整 pipeline 测量产生的 active generation 必须在私有根内 seal/discard，不能进入用户分析目录。性能记录只约束开发/发布审计，不阻断普通 Step4。
+
 `blackbox` 保护公开输入输出，`whitebox` 保护当前内部实现，`performance` 保护小规模性能与正确性守恒；具体原则见 `docs/system/quality/testing-strategy.md`。release profile 先执行测试可信度门，再使用 unittest discovery 唯一分类并运行全部测试，新增测试不会因未登记而漏跑。对重要引擎改动还必须执行同一真值输入的 `main`/当前分支对比，逐项核对依赖身份、变化对象、路径、漏报、误报、覆盖边界、耗时和内存；只比较总数不构成有效证据。
 
 公开能力盘点位于 `tests/fixtures/system_test_capability_matrix.json`。`python3 scripts/test_trust_gate.py` 会输出 covered/partial/missing 数和具体阻断项；局部测试即使全部通过，只要矩阵未完成，`test_suite_runner.py --suite all` 与 Release 准出仍会以 `PUBLIC_CAPABILITY_MATRIX_INCOMPLETE` 失败，避免把“已测部分通过”误报成“系统全面可靠”。

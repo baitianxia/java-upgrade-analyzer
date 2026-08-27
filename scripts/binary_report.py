@@ -4984,7 +4984,17 @@ def _legacy_result_item(
     ]
     if not paths and str(item.get("path_text") or "").strip():
         paths = [str(item.get("path_text")).strip()]
-    state = str(item.get("reachability_status") or "not_analyzed")
+    source_state = str(item.get("reachability_status") or "not_analyzed")
+    state = (
+        source_state
+        if source_state in {
+            "reachable",
+            "uncertain",
+            "not_found_in_static_analysis",
+            "not_analyzed",
+        }
+        else "not_analyzed"
+    )
     if state == "reachable":
         user_conclusion = "已确认影响"
         reason_code = "RUNTIME_VERIFICATION_REQUIRED"
@@ -5001,6 +5011,13 @@ def _legacy_result_item(
         user_conclusion = "未发现调用路径"
         reason_code = "NOT_FOUND_IN_STATIC_ANALYSIS"
         user_reason = "当前完整静态范围内未发现调用路径；该结论不能解释为安全。"
+    elif source_state != state:
+        user_conclusion = "本次未完成分析"
+        reason_code = "BINARY_TRACE_NOT_ANALYZED"
+        user_reason = (
+            "上游触达状态不在正式四态词汇表中，发布时已按未完成分析处理；"
+            "不能把该项解释为未受影响。"
+        )
     else:
         user_conclusion = "本次未完成分析"
         reason_code = "BINARY_TRACE_NOT_ANALYZED"
@@ -5046,6 +5063,9 @@ def _legacy_result_item(
         "confirmed": str(change.get("confirmed") or "true"),
         "source": str(change.get("source") or "binary_first"),
         "analysis_status": state,
+        "source_reachability_status": (
+            source_state if source_state != state else ""
+        ),
         "uncertainty_kind": (
             "candidate_evidence" if state == "uncertain" and paths
             else "analysis_limitation" if state == "uncertain" else ""

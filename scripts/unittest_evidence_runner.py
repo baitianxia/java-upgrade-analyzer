@@ -12,6 +12,10 @@ import time
 import unittest
 from typing import Any, Iterable
 
+from compat import setup_utf8_io
+
+
+setup_utf8_io()
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
