@@ -73,6 +73,7 @@ class BinaryRealProjectGuardTest(unittest.TestCase):
                 if asset.get("kind") == "source_build":
                     self.assertTrue(asset["repository_url"].startswith("https://"))
                     self.assertEqual(asset["git_revision"], manifest["git_revision"])
+                    self.assertEqual(asset["build_jdk_major"], 21)
                     self.assertTrue(asset["build_command"])
                 else:
                     self.assertTrue(asset["url"].startswith("https://repo1.maven.org/"))
@@ -340,21 +341,30 @@ class BinaryRealProjectGuardTest(unittest.TestCase):
                 "repository_url": "https://example.invalid/project.git",
                 "git_revision": revision,
                 "working_directory": "complete",
+                "build_jdk_major": 21,
                 "build_command": ["mvnw", "-q", "package"],
                 "artifact_path": "target/application.jar",
                 "canonicalize_zip": True,
                 "sha256": expected,
             }
             observed = []
+            build_jdk = root / "jdk"
+            (build_jdk / "bin").mkdir(parents=True)
+            (build_jdk / "bin" / "java").write_bytes(b"")
+            previous_java_home = os.environ.get("JAVA_HOME")
 
             def fake_execute(command, **kwargs):
-                observed.append((tuple(command), dict(kwargs)))
                 stage = kwargs["stage"]
+                observed.append((
+                    tuple(command), dict(kwargs), os.environ.get("JAVA_HOME")
+                ))
                 if stage.endswith(".clone"):
                     checkout = Path(command[-1])
                     (checkout / "complete").mkdir(parents=True)
                 elif stage.endswith(".revision"):
                     return BinaryToolResult(revision + "\n", "", 0)
+                elif stage.endswith(".build_jdk"):
+                    return BinaryToolResult("", 'openjdk version "21.0.8"\n', 0)
                 elif stage.endswith(".build"):
                     produced = Path(kwargs["cwd"]) / "target" / "application.jar"
                     produced.parent.mkdir(parents=True)
@@ -367,15 +377,56 @@ class BinaryRealProjectGuardTest(unittest.TestCase):
                 "binary_real_project_guard.execute_binary_tool",
                 side_effect=fake_execute,
             ):
-                result = resolve_asset(asset, root / "cache", allow_download=True)
+                result = resolve_asset(
+                    asset, root / "cache", allow_download=True,
+                    build_jdk_home=build_jdk,
+                )
             result_bytes = result.read_bytes()
 
         self.assertEqual(hashlib.sha256(result_bytes).hexdigest(), expected)
-        self.assertEqual(observed[0][0][:4], ("git", "clone", "--quiet", "--no-checkout"))
-        self.assertEqual(observed[2][0][-2:], ("rev-parse", "HEAD"))
-        build_call = observed[3]
+        self.assertEqual(observed[0][0][-1], "-version")
+        self.assertEqual(observed[1][0][:4], ("git", "clone", "--quiet", "--no-checkout"))
+        self.assertEqual(observed[3][0][-2:], ("rev-parse", "HEAD"))
+        build_call = observed[4]
         self.assertEqual(build_call[0], ("mvnw", "-q", "package"))
         self.assertEqual(Path(build_call[1]["cwd"]).name, "complete")
+        self.assertEqual(build_call[2], str(build_jdk.resolve()))
+        self.assertEqual(os.environ.get("JAVA_HOME"), previous_java_home)
+
+    def test_source_build_rejects_wrong_jdk_before_clone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_jdk = root / "jdk"
+            (build_jdk / "bin").mkdir(parents=True)
+            (build_jdk / "bin" / "java").write_bytes(b"")
+            asset = {
+                "kind": "source_build",
+                "filename": "built.jar",
+                "repository_url": "https://example.invalid/project.git",
+                "git_revision": "1" * 40,
+                "working_directory": "complete",
+                "build_jdk_major": 21,
+                "build_command": ["mvnw", "-q", "package"],
+                "artifact_path": "target/application.jar",
+                "canonicalize_zip": True,
+                "sha256": "2" * 64,
+            }
+            with patch(
+                "binary_real_project_guard.execute_binary_tool",
+                return_value=BinaryToolResult(
+                    "", 'openjdk version "17.0.20"\n', 0
+                ),
+            ) as execute:
+                with self.assertRaises(BinaryRealProjectGuardError) as raised:
+                    resolve_asset(
+                        asset, root / "cache", allow_download=True,
+                        build_jdk_home=build_jdk,
+                    )
+        self.assertEqual(
+            raised.exception.reason_code,
+            "REAL_PROJECT_SOURCE_BUILD_JDK_MISMATCH",
+        )
+        execute.assert_called_once()
 
     def test_missing_asset_fails_closed_without_unrequested_download(self):
         manifest = load_guard_manifest(DEFAULT_MANIFEST)

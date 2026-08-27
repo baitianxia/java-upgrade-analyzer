@@ -54,6 +54,14 @@ def _same_json_value(left: Any, right: Any) -> bool:
 _MISSING_DECISION_VALUE = object()
 _COMPACT_DECISION_INDEXES: dict[tuple[str, ...], dict[str, int]] = {}
 _TEMP_TABLE_IDS = count()
+_SHARED_COMPACT_DECISION_STRING_FIELDS = frozenset({
+    "initiating_loader_realm_identity",
+    "class_provider_status",
+    "runtime_profile_identity",
+    "selected_defining_loader_realm_identity",
+    "class_definition_status",
+    "class_load_status",
+})
 
 
 class _CompactDecisionRecord(Mapping[str, Any]):
@@ -67,6 +75,7 @@ class _CompactDecisionRecord(Mapping[str, Any]):
         fields: tuple[str, ...],
         *,
         excluded_fields: frozenset[str] = frozenset(),
+        string_pool: dict[str, str] | None = None,
     ):
         self._fields = fields
         index = _COMPACT_DECISION_INDEXES.get(fields)
@@ -74,10 +83,24 @@ class _CompactDecisionRecord(Mapping[str, Any]):
             index = {field: offset for offset, field in enumerate(fields)}
             _COMPACT_DECISION_INDEXES[fields] = index
         self._index = index
-        self._values = tuple(
-            row[field] if field in row else _MISSING_DECISION_VALUE
-            for field in fields
-        )
+        values = []
+        for field in fields:
+            value = row[field] if field in row else _MISSING_DECISION_VALUE
+            if (
+                string_pool is not None
+                and field in _SHARED_COMPACT_DECISION_STRING_FIELDS
+                and type(value) is str
+            ):
+                # These fields are realm/profile identities or closed status
+                # enums repeated for every selected class. Sharing their
+                # immutable string objects changes neither value nor record
+                # shape, while avoiding several full copies across base and
+                # current decision indexes. High-cardinality class/evidence
+                # identities are deliberately excluded, so the pool itself
+                # remains bounded by the runtime/status vocabulary.
+                value = string_pool.setdefault(value, value)
+            values.append(value)
+        self._values = tuple(values)
         self._extras = tuple(
             (key, value) for key, value in row.items()
             if key not in self._index and key not in excluded_fields
@@ -211,6 +234,7 @@ class BinaryDecisionEngine:
         self.candidate_plans = []
         self._obligation_origins = {}
         self.coverage_gaps = set()
+        self._compact_string_pool: dict[str, str] = {}
         self._base_artifact_lineages = self._artifact_lineages(
             "base_artifact_instance_identity"
         )
@@ -226,6 +250,7 @@ class BinaryDecisionEngine:
             _PROVIDER_DECISION_FIELDS,
             duplicate_code="PROVIDER_BINDING_SCOPE_DUPLICATE",
             identity_field="provider_binding_identity",
+            string_pool=self._compact_string_pool,
         )
         if shared_runtime_evidence:
             self._current_providers = self._base_providers
@@ -239,6 +264,7 @@ class BinaryDecisionEngine:
                 _PROVIDER_DECISION_FIELDS,
                 duplicate_code="PROVIDER_BINDING_SCOPE_DUPLICATE",
                 identity_field="provider_binding_identity",
+                string_pool=self._compact_string_pool,
             )
         base_definition_records = self._reconciliation_records(
             base_store, base_reconciliation, "class_definitions",
@@ -249,6 +275,7 @@ class BinaryDecisionEngine:
             _DEFINITION_DECISION_FIELDS,
             duplicate_code="CLASS_DEFINITION_SCOPE_DUPLICATE",
             identity_field="class_definition_resolution_identity",
+            string_pool=self._compact_string_pool,
             excluded_fields=(
                 frozenset()
                 if base_reconciliation.class_definitions
@@ -267,6 +294,7 @@ class BinaryDecisionEngine:
                 _DEFINITION_DECISION_FIELDS,
                 duplicate_code="CLASS_DEFINITION_SCOPE_DUPLICATE",
                 identity_field="class_definition_resolution_identity",
+                string_pool=self._compact_string_pool,
                 excluded_fields=(
                     frozenset()
                     if current_reconciliation.class_definitions
@@ -384,10 +412,14 @@ class BinaryDecisionEngine:
         duplicate_code: str,
         identity_field: str,
         excluded_fields: frozenset[str] = frozenset(),
+        string_pool: dict[str, str] | None = None,
     ) -> dict[tuple[Any, ...], Mapping[str, Any]]:
         compact_records = (
             _CompactDecisionRecord(
-                record, fields, excluded_fields=excluded_fields
+                record,
+                fields,
+                excluded_fields=excluded_fields,
+                string_pool=string_pool,
             )
             for record in records
         )

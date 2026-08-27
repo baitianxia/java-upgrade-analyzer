@@ -59,6 +59,8 @@ python3 scripts/quality_gate.py --profile release
 - `step5`：在 quick 上增加 ASM/fact store/cache/source overlay、端到端 pipeline、查询、调度和用户输出契约；
 - `release`：先由 `test_suite_runner.py --suite all` 做可信度审计、全量 discovery 和唯一分类，再运行全部当前测试；随后运行能力/拓扑迁移审计、分支/变异/重复健康门、目录内全部 pinned 真实项目 manifest，以及 400 JAR/10 万 class 性能与范围守恒门。任一阶段失败即阻断。
 
+Release CI 先保存独立 JDK 8/17 路径供升级工作流黑盒使用，再激活 JDK 21 构建三个 `source_build` 真实项目；这些 manifest 的完整 canonical JAR SHA 包含 javac constant-pool 排序和 `Build-Jdk-Spec`，因此构建 JDK major 是制品身份合同的一部分。guard 必须用 manifest 声明的 JDK 绑定构建环境；不得用另一 major 构建后重写 SHA 来掩盖差异。
+
 `quality_gate.py` 的通过条件不再只有子进程返回码。每个 profile 必须产生结构化 `test_execution`，至少包含 selected/unique-selected/run/failure/error/skip/expected-failure/loader-failure、失败测试身份、skip 原因和耗时；证据缺失、明细与计数不一致、selector 重叠、schema 不匹配、运行数为零或证据状态与进程返回码矛盾都使质量门失败。重叠 selector 只执行一次并直接报配置失败，不能靠重复运行同一案例抬高数量。任何 `expectedFailure` 都是未修复缺陷而不是成功；黑盒、性能和 Windows 禁止任何 skip。`quick`、`step5` 与完整白盒只允许策略中精确登记、分别由 Release 和 Windows 原生门替代执行的 skip，其他新增、改名或未登记 skip 都失败。
 
 ## 逃逸缺陷闭环
@@ -89,7 +91,7 @@ Windows 原生套件由版本化 selector 清单和 `minimum_windows_test_count=
 
 系统级准出还受 `tests/fixtures/system_test_capability_matrix.json` 和 `tests/fixtures/system_test_scenario_contracts.json` 约束。矩阵从所有登记的公开 CLI、Step0~Step6 和 binary support manifest 反向盘点能力，并区分 `covered`、`partial`、`missing`。2026-08-23 的审计快照为 90/90 covered、279 个风险场景维度和 22/22 个细粒度框架机制声明；它只描述该次仓库状态，后续权威数量必须重新由门禁计算。除正常、反例、边界、失败关闭、恢复和变形外，系统级场景集合还必须显式覆盖无效输入、部分失败、状态迁移、并发和资源上限。critical 能力至少需要 nominal 加两个不同逆向维度，high 至少需要 nominal 加一个逆向维度，且每一维必须指向非空第三方真值并由该能力登记的具体黑盒证据实际读取。白盒测试存在不等于公开语义已验证，任何新增能力若没有独立黑盒证据和足够场景都会阻断 `--suite all` 的“全面质量通过”声明。局部 profile 通过只说明对应已执行范围没有回归。
 
-2026-08-23 当前工作树的本地最终 `release` 证据为：3382 项唯一测试全部被选择和裁决（黑盒 61、白盒 3158、性能 163），其中 3380 项实际通过、2 项精确替代执行 skip；0 failure、0 error、0 expected failure、0 unexpected success、0 loader failure、0 非预期 skip。6/6 个固定真实项目通过且各项目 issue 列表为空；测试健康门为 98/98 个登记分支替代、15/15 个登记变异被杀死、84 项健康集连续两轮稳定；400 JAR/100000 class 的 source-bound 记录证据重放通过且 issue_count 为 0。两项精确 skip 分别由该 Release 的真实 MyBatis 探针和 Windows 原生矩阵替代执行；前者已在本次 Release 实际通过，后者尚无本机替代证据。由于当前主机不是 Windows，Windows Server 2022/2025 × JDK 11/17/21 六个原生结果仍必须由对应 CI 产生；远端 GitHub required-check 设置也必须另行核实。
+2026-08-28 当前工作树的本地最终 `release` 证据为：3435 项唯一测试全部被选择和裁决（黑盒 61、白盒 3210、性能 164），其中 3433 项实际通过、2 项精确替代执行 skip；0 failure、0 error、0 expected failure、0 unexpected success、0 loader failure、0 非预期 skip。6/6 个固定真实项目通过且各项目 issue 列表为空；测试健康门为 98/98 个登记分支替代、15/15 个登记变异被杀死、84 项健康集连续两轮稳定；400 JAR/100000 class 的 source-bound 记录证据重放通过且 issue_count 为 0，完整门无子进程超时。两项精确 skip 分别由该 Release 的真实 MyBatis 探针和 Windows 原生矩阵替代执行；前者已在本次 Release 实际通过，后者尚无本机替代证据。由于当前主机不是 Windows，Windows Server 2022/2025 × JDK 11/17/21 六个原生结果仍必须由对应 CI 产生，目标 Windows 10/Xeon/32GB 的 27GB Step4 ≤5h 也仍需实机复跑；远端 GitHub required-check 设置必须另行核实。
 
 准确性定向门：
 
@@ -165,7 +167,7 @@ Oracle 失败或证据不足时 generation 不得激活。
 
 ## 性能门
 
-性能门必须同时记录输入规模、冷/热 cache、总耗时、阶段耗时、P50/P95、CPU 秒、平均核数和可取得的峰值内存；门禁从原始样本复算分位数与平均核数。固定性能 fixture 位于 `tests/fixtures/binary_first/performance_gate.json`，其内容身份在 support manifest 中固定。当前记录于 2026-08-27 在固定 macOS arm64 参考环境完成候选采集、provisional 绑定、独立完整复采和正式回放，并含 CPU 原始证据。大规模 fact-store 门与两条冷启动完整流水线门都覆盖 400 JAR/100000 class：一条比较完全相同的两侧，另一条确定性替换 current 侧的一个 JAR 并校验 250 条实现变化。正式复采 cold 为 122.768 秒，三次 warm 的 P50/P95 为 44.597/44.719 秒；相同两侧完整流水线为 182.194 秒且正式结果/validation issue 均为 0，单 JAR 变化流水线为 268.543 秒且变化事实/正式结果均精确为 250，最大记录 RSS 为 752238592 字节。完整门继续覆盖 runtime reconciliation、trace、generation 和独立 Oracle，从两侧 SQLite 与已落盘 Oracle 结果读取实际类数、变化数量与种类、正式结果状态和问题数，并逐阶段记录累计峰值 RSS、单独限制完整流水线 RSS，避免配置中的理论规模掩盖事实丢失，也避免缩小样本掩盖超线性协调、全表物化、双侧对象重叠或逐 class 子进程退化。任何新结果缺少 CPU 证据或派生关系不一致时失败；历史记录若确实没有 CPU 原始数据只能显式声明，不能补造。
+性能门必须同时记录输入规模、冷/热 cache、总耗时、阶段耗时、P50/P95、CPU 秒、平均核数和可取得的峰值内存；门禁从原始样本复算分位数与平均核数。固定性能 fixture 位于 `tests/fixtures/binary_first/performance_gate.json`，其内容身份在 support manifest 中固定。当前记录于 2026-08-27 在固定 macOS arm64 参考环境完成候选采集、provisional 绑定、独立完整复采和正式回放，并含 CPU 原始证据。大规模 fact-store 门与两条冷启动完整流水线门都覆盖 400 JAR/100000 class：一条比较完全相同的两侧，另一条确定性替换 current 侧的一个 JAR 并校验 250 条实现变化。正式复采 cold 为 122.233 秒，三次 warm 的 P50/P95 为 43.889/44.032 秒；相同两侧完整流水线为 181.807 秒且正式结果/validation issue 均为 0，单 JAR 变化流水线为 266.617 秒且变化事实/正式结果均精确为 250，最大记录 RSS 为 758317056 字节。完整门继续覆盖 runtime reconciliation、trace、generation 和独立 Oracle，从两侧 SQLite 与已落盘 Oracle 结果读取实际类数、变化数量与种类、正式结果状态和问题数，并逐阶段记录累计峰值 RSS、单独限制完整流水线 RSS，避免配置中的理论规模掩盖事实丢失，也避免缩小样本掩盖超线性协调、全表物化、双侧对象重叠或逐 class 子进程退化。任何新结果缺少 CPU 证据或派生关系不一致时失败；历史记录若确实没有 CPU 原始数据只能显式声明，不能补造。
 
 性能证据中的精确字节快照、SHA-256、规范化绑定身份、实现身份和 provisional→recapture 链只建立**内部一致性与失败关闭**：它们用于发现陈旧证据、输入替换、类型别名、读取期间变化和不同执行阶段使用了不同字节。它们不是发布者身份认证，也不提供不可伪造性；拥有证据、源码或执行环境写权限的主体可以重新计算全部摘要，受损的 builder 与被测实现也可能共同产生一致但不可信的结果。叶节点 `lstat`、私有临时文件和原子替换能阻止预置 symlink/hardlink 写穿，但不把同权限恶意并发者纳入安全边界；这类主体仍可能在检查后替换祖先目录或持续改写工作区，因此性能捕获必须独占工作目录，并依赖 CI 文件权限/沙箱隔离并发写者。正式发布若需要抵抗这类主体，必须在本机制之外使用受保护的 CI 身份、隔离执行环境、签名制品和可验证 provenance/attestation，并由独立信任根校验。在外部证明落地前，只能声明“本地内容与实现绑定一致”，不能声明“已由可信发布者进行密码学认证”。
 

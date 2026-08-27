@@ -29,6 +29,45 @@ from binary_tool_execution import BinaryToolFailure, BinaryToolResult  # noqa: E
 
 
 class BinaryValidationPerformanceSafetyTest(unittest.TestCase):
+    def test_transient_string_pool_and_projection_cache_are_hard_bounded(self):
+        with patch.object(
+            oracle, "MAX_VALIDATION_STRING_POOL_ENTRIES", 3,
+        ), patch.object(
+            oracle, "MAX_VALIDATION_POOLED_STRING_CHARS", 8,
+        ):
+            pool = {}
+            first = oracle._pooled_string("same", pool)
+            self.assertIs(oracle._pooled_string("same", pool), first)
+            for value in ("two", "three", "four", "five"):
+                self.assertEqual(oracle._pooled_string(value, pool), value)
+            self.assertEqual(len(pool), 3)
+            long_value = "x" * 9
+            self.assertEqual(
+                oracle._pooled_string(long_value, pool), long_value
+            )
+            self.assertNotIn(long_value, pool)
+
+        loads = []
+        cache = oracle._BoundedProjectionCache(2)
+
+        def load(identities):
+            loads.append(identities)
+            return {
+                identity: identity.upper()
+                for identity in identities
+                if identity != "missing"
+            }
+
+        self.assertEqual(
+            cache.resolve(("a", "missing", "a"), load), {"a": "A"}
+        )
+        self.assertEqual(
+            cache.resolve(("a", "missing", "b"), load),
+            {"a": "A", "b": "B"},
+        )
+        self.assertEqual(loads, [("a", "missing"), ("b",)])
+        self.assertLessEqual(len(cache.values), 2)
+
     def test_artifact_truth_identity_uses_bounded_native_fast_path(self):
         rows = [
             ("demo.Caller", "run", "()V", index)
@@ -126,11 +165,24 @@ class BinaryValidationPerformanceSafetyTest(unittest.TestCase):
                     ),
                 )
 
-            add_chunk("member_resolution", [{
-                "direct_edge_identity": "edge-method",
-                "member_resolution_status": "resolved",
-                "resolved_member_identity": "target-method",
-            }])
+            add_chunk("member_resolution", [
+                {
+                    # Deliberately starts after edge-method in rowid order.
+                    "direct_edge_identity": "edge-type",
+                    "member_resolution_status": "type-placeholder",
+                },
+                {
+                    "direct_edge_identity": "edge-orphan",
+                    "member_resolution_status": "orphan-status",
+                },
+                {
+                    # This row is now behind the forward cursor and must take
+                    # the exact primary-key fallback without being omitted.
+                    "direct_edge_identity": "edge-method",
+                    "member_resolution_status": "resolved",
+                    "resolved_member_identity": "target-method",
+                },
+            ])
             add_chunk("dispatch_resolution", [])
             add_chunk("type_resolution", [{
                 "direct_edge_identity": "edge-type",
@@ -168,7 +220,20 @@ class BinaryValidationPerformanceSafetyTest(unittest.TestCase):
             try:
                 transitions = set(index.transitions("caller"))
                 resolution_status = index.resolution_status("edge-method")
+                out_of_order_status = index.resolution_status("edge-type")
+                orphan_status = index.resolution_status("edge-orphan")
                 linkage_status = index.linkage_status("edge-method")
+                member_columns = {
+                    str(row[1]) for row in index.connection.execute(
+                        "PRAGMA table_info(member_resolution)"
+                    )
+                }
+                temp_tables = {
+                    str(row[0]) for row in index.connection.execute(
+                        "SELECT name FROM sqlite_temp_master "
+                        "WHERE type='table'"
+                    )
+                }
             finally:
                 index.close()
 
@@ -179,7 +244,13 @@ class BinaryValidationPerformanceSafetyTest(unittest.TestCase):
         )
         self.assertTrue(any(row[2] == "edge-type" for row in transitions))
         self.assertEqual(resolution_status, "resolved")
+        self.assertEqual(out_of_order_status, "type-placeholder")
+        self.assertEqual(orphan_status, "orphan-status")
         self.assertEqual(linkage_status, "linked")
+        self.assertEqual(
+            member_columns, {"edge_rowid", "status", "resolved_member"}
+        )
+        self.assertNotIn("edge_order", temp_tables)
 
     def test_maven_metadata_duplicate_policy_matches_production_and_oracle(self):
         with tempfile.TemporaryDirectory() as temp_text:

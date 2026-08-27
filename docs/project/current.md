@@ -11,7 +11,8 @@
 
 ## 当前项目状态
 
-- 最新完成记录是 [2026-08-27 跨阶段正确性、可靠性与性能修复](iterations/2026-08-27-cross-stage-remediation.md)；当前没有仍在执行的开发轮次。
+- 当前开发记录是 [2026-08-27 binary-first 27GB 性能收敛](iterations/2026-08-27-binary-27gb-performance.md)：实现、本地正确性/目标 edge 密度验证、固定性能证据重录和完整 Release 均已通过；目标 Windows 27GB 完整复跑仍待关闭。
+- 上一份完成记录是 [2026-08-27 跨阶段正确性、可靠性与性能修复](iterations/2026-08-27-cross-stage-remediation.md)。
 - `historical-2026-07/` 是迁移前形成的历史设计和计划记录，不是当前开发授权。
 - 尚未完成的两个候选事项位于 [Roadmap](roadmap/README.md)，两者均需先满足各自的证据或观测条件。
 

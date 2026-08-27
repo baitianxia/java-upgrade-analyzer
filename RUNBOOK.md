@@ -158,6 +158,16 @@ Step4 重跑会生成或复用内容绑定的 generation；若失败发生在不
 generation 身份全部一致时复用该 generation 并重做验证。任一身份变化都会拒绝断点并
 完整重建，不能用旧 generation 掩盖输入变化。Step5/6 只消费 active generation。范围改变时从 Step4 的范围确认恢复，让调度器清理 Step5 及之后的用户输出；不要手工混合两次 generation 的文件。
 
+### 27GB / 高调用边密度复核
+
+对 400+ 依赖、约 27GB generation 的性能结论必须来自目标 Windows 机器上的完整 Step4，不能把小规模门或局部合成基准外推为“5 小时内已达成”。执行前保留输入、JDK、CPU/内存和磁盘余量，关闭会显著占用内存的非必要进程；执行中读取：
+
+- `binary_observability/latest_in_progress.json`：当前 phase、子步骤进度、CPU 和峰值 RSS；
+- `binary_observability/latest_phase_timings.json`：完整墙钟、各 phase、峰值 RSS 和 checkpoint 恢复范围；
+- `binary_observability/latest_cache_metrics.json`：本次 cache/checkpoint 复用证据。
+
+验收必须同时满足：完整分析墙钟不超过 5 小时；validation issue 为 0；base/current 的 artifact、class、member、edge 和 reconciliation 数与输入及 generation 对账；正式 fact/API/path 身份集合与同输入正确性基线完全一致；无采样、跳过、缩小 JVM 观察或因预算提前结束。若超过目标，先按 `latest_phase_timings.json` 定位 phase，再结合 `latest_in_progress.json` 的 `average_cpu_cores`、`peak_rss_bytes` 和系统磁盘吞吐区分 CPU、换页和 I/O，不能只看总墙钟。
+
 ## 开发验证
 
 ```bash

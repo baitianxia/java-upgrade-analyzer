@@ -1,6 +1,6 @@
 {
   "schema": "java-upgrade-analyzer.internal-dynamic-call-edges.v1",
-  "source_identity": "59c8560a51f73511a9bad50cb31594d2ccf3c2307cf6bbace5681d112f4e2671",
+  "source_identity": "fdbb3e2acf963d78ea993299ff574508221f3b25037afde6d876e1a9dca442e1",
   "inventory_rule": "Every production-to-production edge observed at runtime but unresolved by the static call graph is retained as a required implementation-dependent white-box relationship. New, removed, or source-stale edges require explicit review.",
   "edges": [
     {
@@ -208,6 +208,10 @@
       "callee": "binary_tool_execution::BinaryToolResult.succeeded"
     },
     {
+      "caller": "binary_definition_verifier::_execute_verifier_range",
+      "callee": "binary_tool_execution::BinaryToolResult.succeeded"
+    },
+    {
       "caller": "binary_definition_verifier::_write_class_bundle",
       "callee": "binary_first_contract::BinaryFirstContractError.__init__"
     },
@@ -237,11 +241,19 @@
     },
     {
       "caller": "binary_entrypoint_discovery::discover_binary_entrypoints",
+      "callee": "binary_fact_store::BinaryFactStore.reconciliation_payloads"
+    },
+    {
+      "caller": "binary_entrypoint_discovery::discover_binary_entrypoints",
       "callee": "binary_fact_store::BinaryFactStore.rows"
     },
     {
       "caller": "binary_entrypoint_discovery::discover_binary_entrypoints",
       "callee": "binary_fact_store::BinaryFactStore.runtime_trigger_summary"
+    },
+    {
+      "caller": "binary_entrypoint_discovery::discover_binary_entrypoints",
+      "callee": "binary_runtime_reconciler::_PersistedReconciliationPayloads.__iter__"
     },
     {
       "caller": "binary_fact_store::BinaryFactStore._add_normalized_reconciliation_records",
@@ -308,6 +320,10 @@
       "callee": "binary_first_contract::BinaryFirstContractError.__init__"
     },
     {
+      "caller": "binary_fact_store::BinaryFactStore.add_reconciliation_payloads.<locals>.flush",
+      "callee": "binary_fact_store::BinaryFactStore.add_reconciliation_payloads.<locals>.next_chunk_ordinal"
+    },
+    {
       "caller": "binary_fact_store::BinaryFactStore.add_source_overlay",
       "callee": "binary_first_contract::BinaryFirstContractError.__init__"
     },
@@ -326,6 +342,10 @@
     {
       "caller": "binary_fact_store::BinaryFactStore.content_identity",
       "callee": "binary_fact_store::_json"
+    },
+    {
+      "caller": "binary_fact_store::BinaryFactStore.content_identity",
+      "callee": "binary_first_contract::StreamingCanonicalSequence.__init__"
     },
     {
       "caller": "binary_fact_store::BinaryFactStore.reconciliation_payloads",
@@ -361,6 +381,10 @@
     },
     {
       "caller": "binary_first_contract::_update_canonical_digest.<locals>.write",
+      "callee": "binary_fact_store::BinaryFactStore.content_identity.<locals>.rows"
+    },
+    {
+      "caller": "binary_first_contract::_update_canonical_digest.<locals>.write",
       "callee": "binary_first_contract::BinaryFirstContractError.__init__"
     },
     {
@@ -390,6 +414,14 @@
     {
       "caller": "binary_first_contract::_update_canonical_digest.<locals>.write",
       "callee": "binary_validation_oracle::_CompactObservation.__len__"
+    },
+    {
+      "caller": "binary_first_contract::_update_canonical_digest.<locals>.write",
+      "callee": "streaming_json::StreamingJsonArray.__iter__"
+    },
+    {
+      "caller": "binary_first_contract::_update_canonical_digest.<locals>.write",
+      "callee": "streaming_json::iter_canonical_json_object_array"
     },
     {
       "caller": "binary_first_contract::analysis_context_identity",
@@ -940,6 +972,30 @@
       "callee": "binary_first_contract::BinaryFirstContractError.__init__"
     },
     {
+      "caller": "binary_pipeline::_failed_validation_attachment_is_bound",
+      "callee": "streaming_json::StreamingJsonArray.__iter__"
+    },
+    {
+      "caller": "binary_pipeline::_failed_validation_attachment_is_bound",
+      "callee": "streaming_json::StreamingJsonArray.__len__"
+    },
+    {
+      "caller": "binary_pipeline::_failed_validation_attachment_is_bound",
+      "callee": "streaming_json::iter_canonical_json_object_array"
+    },
+    {
+      "caller": "binary_pipeline::_failed_validation_attachment_is_reusable",
+      "callee": "streaming_json::StreamingJsonArray.__iter__"
+    },
+    {
+      "caller": "binary_pipeline::_failed_validation_attachment_is_reusable",
+      "callee": "streaming_json::StreamingJsonArray.__len__"
+    },
+    {
+      "caller": "binary_pipeline::_failed_validation_attachment_is_reusable",
+      "callee": "streaming_json::iter_canonical_json_object_array"
+    },
+    {
       "caller": "binary_pipeline::_generation_runtime_identity",
       "callee": "binary_first_contract::BinaryFirstContractError.__init__"
     },
@@ -1096,6 +1152,10 @@
       "callee": "binary_first_contract::BinaryFirstContractError.__init__"
     },
     {
+      "caller": "binary_pipeline::_streamed_validation_attachment",
+      "callee": "streaming_json::StreamingJsonArray.__init__"
+    },
+    {
       "caller": "binary_pipeline::_validate_generation_source_import_closure",
       "callee": "binary_first_contract::BinaryFirstContractError.__init__"
     },
@@ -1142,6 +1202,18 @@
     {
       "caller": "binary_pipeline::_validation_checkpoint_result_receipt",
       "callee": "binary_first_contract::BinaryFirstContractError.__init__"
+    },
+    {
+      "caller": "binary_pipeline::_validation_failure_detail",
+      "callee": "streaming_json::StreamingJsonArray.__iter__"
+    },
+    {
+      "caller": "binary_pipeline::_validation_failure_detail",
+      "callee": "streaming_json::StreamingJsonArray.__len__"
+    },
+    {
+      "caller": "binary_pipeline::_validation_failure_detail",
+      "callee": "streaming_json::iter_canonical_json_object_array"
     },
     {
       "caller": "binary_pipeline::_verify_captured_generation_sources",
@@ -1489,6 +1561,10 @@
     },
     {
       "caller": "binary_runtime_materializer::_archive_security_markers",
+      "callee": "artifact_safety::JarSignatureMetadata.has_signature_block_candidate"
+    },
+    {
+      "caller": "binary_runtime_materializer::_archive_security_markers",
       "callee": "binary_runtime_materializer::BinaryRuntimeMaterializationError.__init__"
     },
     {
@@ -1756,6 +1832,18 @@
       "callee": "binary_runtime_reconciler::_CompactRow.__getitem__"
     },
     {
+      "caller": "binary_runtime_reconciler::_PersistedReconciliationPayloads.__eq__",
+      "callee": "binary_fact_store::BinaryFactStore.reconciliation_payloads"
+    },
+    {
+      "caller": "binary_runtime_reconciler::_PersistedReconciliationPayloads.__eq__",
+      "callee": "binary_runtime_reconciler::_PersistedReconciliationPayloads.__iter__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::_PersistedReconciliationPayloads.__init__",
+      "callee": "binary_fact_store::BinaryFactStore.reconciliation_payload_count"
+    },
+    {
       "caller": "binary_runtime_reconciler::_ReconciliationAccumulator.__init__",
       "callee": "binary_first_contract::BinaryFirstContractError.__init__"
     },
@@ -1796,16 +1884,52 @@
       "callee": "binary_first_contract::BinaryFirstContractError.__init__"
     },
     {
+      "caller": "binary_runtime_reconciler::hydrate_runtime_reconciliation",
+      "callee": "binary_runtime_reconciler::_PersistedReconciliationPayloads.__init__"
+    },
+    {
+      "caller": "binary_runtime_reconciler::hydrate_runtime_reconciliation",
+      "callee": "binary_runtime_reconciler::_PersistedReconciliationPayloads.__len__"
+    },
+    {
+      "caller": "binary_semantic_overlay::_Builder.__init__",
+      "callee": "binary_fact_store::BinaryFactStore.reconciliation_payloads"
+    },
+    {
       "caller": "binary_semantic_overlay::_Builder.__init__",
       "callee": "binary_fact_store::BinaryFactStore.rows"
+    },
+    {
+      "caller": "binary_semantic_overlay::_Builder.__init__",
+      "callee": "binary_runtime_reconciler::_PersistedReconciliationPayloads.__iter__"
     },
     {
       "caller": "binary_semantic_overlay::_Builder.__init__",
       "callee": "binary_semantic_overlay::_DirectMethodEdgeSource.__init__"
     },
     {
+      "caller": "binary_semantic_overlay::_Builder.__init__",
+      "callee": "binary_semantic_overlay::_MemberSource.__init__"
+    },
+    {
+      "caller": "binary_semantic_overlay::_Builder._member_fact_rows",
+      "callee": "binary_semantic_overlay::_MemberSource.iter_methods"
+    },
+    {
+      "caller": "binary_semantic_overlay::_Builder._members_for_variant",
+      "callee": "binary_semantic_overlay::_MemberSource.for_variant"
+    },
+    {
       "caller": "binary_semantic_overlay::_Builder._method_edges",
       "callee": "binary_semantic_overlay::_DirectMethodEdgeSource.iter_method_edges"
+    },
+    {
+      "caller": "binary_semantic_overlay::_Builder.dubbo_spi",
+      "callee": "binary_semantic_overlay::_MemberSource.get"
+    },
+    {
+      "caller": "binary_semantic_overlay::_Builder.spring_data_and_bean_wiring",
+      "callee": "binary_semantic_overlay::_MemberSource.get"
     },
     {
       "caller": "binary_semantic_overlay::build_binary_semantic_overlay",
@@ -1849,7 +1973,15 @@
     },
     {
       "caller": "binary_source_overlay::build_inline_consumption_overlay",
+      "callee": "binary_fact_store::BinaryFactStore.reconciliation_payloads"
+    },
+    {
+      "caller": "binary_source_overlay::build_inline_consumption_overlay",
       "callee": "binary_fact_store::BinaryFactStore.rows"
+    },
+    {
+      "caller": "binary_source_overlay::build_inline_consumption_overlay",
+      "callee": "binary_runtime_reconciler::_PersistedReconciliationPayloads.__iter__"
     },
     {
       "caller": "binary_source_overlay::build_source_overlay",
@@ -1866,6 +1998,14 @@
     {
       "caller": "binary_tool_execution::execute_binary_tool",
       "callee": "compat::run_managed_subprocess"
+    },
+    {
+      "caller": "binary_trace_engine::BinaryTraceEngine.__init__",
+      "callee": "binary_fact_store::BinaryFactStore.reconciliation_payloads"
+    },
+    {
+      "caller": "binary_trace_engine::BinaryTraceEngine.__init__",
+      "callee": "binary_runtime_reconciler::_PersistedReconciliationPayloads.__iter__"
     },
     {
       "caller": "binary_trace_engine::BinaryTraceEngine.__init__",
@@ -1948,12 +2088,12 @@
       "callee": "binary_first_contract::BinaryFirstContractError.__init__"
     },
     {
-      "caller": "binary_validation_oracle::_ClosedWorldGraphIndex._build_reconciliation_indexes",
-      "callee": "binary_first_contract::surrogate_safe_json_dumps"
+      "caller": "binary_validation_oracle::_BoundedProjectionCache.resolve",
+      "callee": "binary_validation_oracle::_validate_runtime_outcomes.<locals>.load_member_symbols"
     },
     {
-      "caller": "binary_validation_oracle::_ClosedWorldGraphIndex._insert_batches",
-      "callee": "binary_validation_oracle::_ClosedWorldGraphIndex._build_reconciliation_indexes.<locals>.report"
+      "caller": "binary_validation_oracle::_ClosedWorldGraphIndex._build_reconciliation_indexes",
+      "callee": "binary_first_contract::surrogate_safe_json_dumps"
     },
     {
       "caller": "binary_validation_oracle::_ClosedWorldGraphIndex._insert_batches",
@@ -2216,12 +2356,24 @@
       "callee": "binary_validation_oracle::_validate_entrypoint_discovery.<locals>.artifact_path"
     },
     {
+      "caller": "binary_validation_oracle::_validate_entrypoint_discovery.<locals>.security_prevents_definition",
+      "callee": "binary_validation_oracle::_validate_entrypoint_discovery.<locals>.artifact_path"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_runtime_outcomes",
+      "callee": "binary_validation_oracle::_BoundedProjectionCache.__init__"
+    },
+    {
       "caller": "binary_validation_oracle::_validate_runtime_outcomes",
       "callee": "binary_validation_oracle::_CompactObservation.__len__"
     },
     {
       "caller": "binary_validation_oracle::_validate_runtime_outcomes.<locals>.batches",
       "callee": "binary_validation_oracle::_iter_reconciliation"
+    },
+    {
+      "caller": "binary_validation_oracle::_validate_runtime_outcomes.<locals>.member_symbol_batch",
+      "callee": "binary_validation_oracle::_BoundedProjectionCache.resolve"
     },
     {
       "caller": "binary_validation_oracle::_validate_runtime_outcomes.<locals>.oracle_dispatch_targets",

@@ -6,6 +6,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from functools import lru_cache
 import hashlib
+from itertools import chain
 import json
 from pathlib import Path
 import sqlite3
@@ -26,7 +27,7 @@ from binary_first_contract import (
 from binary_first_model import ArtifactInstance
 
 
-SCHEMA_VERSION = "binary-fact-sqlite-v8"
+SCHEMA_VERSION = "binary-fact-sqlite-v9"
 RECONCILIATION_KIND_CODES = {
     "provider_binding": 1,
     "class_definition": 2,
@@ -348,6 +349,13 @@ class BinaryFactStore:
                 record_kind INTEGER NOT NULL,
                 record_count INTEGER NOT NULL,
                 payload_zlib BLOB NOT NULL
+            ) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS reconciliation_chunk_order (
+                record_kind INTEGER NOT NULL,
+                chunk_ordinal INTEGER NOT NULL,
+                chunk_identity BLOB NOT NULL UNIQUE
+                    REFERENCES reconciliation_records(chunk_identity),
+                PRIMARY KEY(record_kind, chunk_ordinal)
             ) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS source_overlays (
                 overlay_identity TEXT PRIMARY KEY,
@@ -1548,6 +1556,13 @@ class BinaryFactStore:
         ).encode("utf-8")
         identity_suffix = b',"schema_version":"1"}'
 
+        def next_chunk_ordinal() -> int:
+            return int(self.connection.execute(
+                "SELECT COALESCE(MAX(chunk_ordinal),-1)+1 "
+                "FROM reconciliation_chunk_order WHERE record_kind=?",
+                (RECONCILIATION_KIND_CODES[kind],),
+            ).fetchone()[0])
+
         def flush() -> None:
             nonlocal serialized
             if not pending_identities:
@@ -1561,13 +1576,22 @@ class BinaryFactStore:
                     "record_identities": pending_identities,
                 },
             )
+            chunk_identity_bytes = bytes.fromhex(chunk_identity)
             self.connection.execute(
                 "INSERT INTO reconciliation_records VALUES(?,?,?,?)",
                 (
-                    sqlite3.Binary(bytes.fromhex(chunk_identity)),
+                    sqlite3.Binary(chunk_identity_bytes),
                     RECONCILIATION_KIND_CODES[kind],
                     len(pending_identities),
                     sqlite3.Binary(zlib.compress(serialized, level=1)),
+                ),
+            )
+            self.connection.execute(
+                "INSERT INTO reconciliation_chunk_order VALUES(?,?,?)",
+                (
+                    RECONCILIATION_KIND_CODES[kind],
+                    next_chunk_ordinal(),
+                    sqlite3.Binary(chunk_identity_bytes),
                 ),
             )
             pending_identities.clear()
@@ -1669,15 +1693,30 @@ class BinaryFactStore:
                             ],
                         },
                     )
+                    chunk_identity_bytes = bytes.fromhex(chunk_identity)
                     self.connection.execute(
                         "INSERT INTO reconciliation_records VALUES(?,?,?,?)",
                         (
-                            sqlite3.Binary(bytes.fromhex(chunk_identity)),
+                            sqlite3.Binary(chunk_identity_bytes),
                             RECONCILIATION_KIND_CODES[pending_kind],
                             len(pending),
                             sqlite3.Binary(zlib.compress(
                                 _json(pending).encode("utf-8"), level=1
                             )),
+                        ),
+                    )
+                    record_kind_code = RECONCILIATION_KIND_CODES[pending_kind]
+                    chunk_ordinal = int(self.connection.execute(
+                        "SELECT COALESCE(MAX(chunk_ordinal),-1)+1 "
+                        "FROM reconciliation_chunk_order WHERE record_kind=?",
+                        (record_kind_code,),
+                    ).fetchone()[0])
+                    self.connection.execute(
+                        "INSERT INTO reconciliation_chunk_order VALUES(?,?,?)",
+                        (
+                            record_kind_code,
+                            chunk_ordinal,
+                            sqlite3.Binary(chunk_identity_bytes),
                         ),
                     )
                     pending_kind = ""
@@ -1810,8 +1849,8 @@ class BinaryFactStore:
         """
         allowed = {
             "metadata", "artifact_instances", "archive_entries", "classes", "members",
-            "direct_edges", "resources", "reconciliation_records", "source_overlays",
-            "inline_overlays",
+            "direct_edges", "resources", "reconciliation_records",
+            "reconciliation_chunk_order", "source_overlays", "inline_overlays",
         }
         if table not in allowed:
             raise BinaryFactStoreError("FACT_STORE_TABLE_INVALID", table)
@@ -1894,15 +1933,36 @@ class BinaryFactStore:
             raise BinaryFactStoreError(
                 "FACT_STORE_RECONCILIATION_KIND_INVALID", kind
             )
-        for row in self.connection.execute(
+        ordered_chunks = self.connection.execute(
             """
-            SELECT chunk_identity,record_count,payload_zlib
-            FROM reconciliation_records
-            WHERE record_kind=?
-            ORDER BY chunk_identity
+            SELECT records.chunk_identity,records.record_count,
+                   records.payload_zlib
+            FROM reconciliation_chunk_order AS ordering
+            JOIN reconciliation_records AS records
+              ON records.chunk_identity=ordering.chunk_identity
+             AND records.record_kind=ordering.record_kind
+            WHERE ordering.record_kind=?
+            ORDER BY ordering.chunk_ordinal
             """,
             (code,),
-        ):
+        )
+        unordered_chunks = self.connection.execute(
+            """
+            SELECT records.chunk_identity,records.record_count,
+                   records.payload_zlib
+            FROM reconciliation_records AS records
+            LEFT JOIN reconciliation_chunk_order AS ordering
+              ON ordering.chunk_identity=records.chunk_identity
+             AND ordering.record_kind=records.record_kind
+            WHERE records.record_kind=?
+              AND ordering.chunk_identity IS NULL
+            ORDER BY records.chunk_identity
+            """,
+            (code,),
+        )
+        # The ordinal is a locality hint only. Corrupting or deleting one hint
+        # changes traversal order but can never make persisted evidence vanish.
+        for row in chain(ordered_chunks, unordered_chunks):
             records = json.loads(
                 zlib.decompress(row["payload_zlib"]).decode("utf-8")
             )
@@ -2158,8 +2218,8 @@ class BinaryFactStore:
     def counts(self) -> dict[str, int]:
         tables = (
             "artifact_instances", "archive_entries", "classes", "members", "direct_edges",
-            "resources", "reconciliation_records", "source_overlays",
-            "inline_overlays",
+            "resources", "reconciliation_records", "reconciliation_chunk_order",
+            "source_overlays", "inline_overlays",
         )
         result = {
             table: int(self.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
@@ -2183,8 +2243,8 @@ class BinaryFactStore:
 
         tables = (
             "artifact_instances", "archive_entries", "classes", "members", "direct_edges",
-            "resources", "reconciliation_records", "source_overlays",
-            "inline_overlays",
+            "resources", "reconciliation_records", "reconciliation_chunk_order",
+            "source_overlays", "inline_overlays",
         )
 
         def rows(table: str) -> Iterator[dict[str, Any]]:

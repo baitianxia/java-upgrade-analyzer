@@ -335,7 +335,7 @@ class BinaryFactStoreTest(unittest.TestCase):
             )[0]["value"]
 
         by_name = {row["resource_name"]: row for row in resources}
-        self.assertEqual(schema, "binary-fact-sqlite-v8")
+        self.assertEqual(schema, "binary-fact-sqlite-v9")
         self.assertEqual(counts["resources"], 3)
         self.assertEqual(
             by_name["config/runtime.xml"]["content_sha256"],
@@ -428,7 +428,7 @@ class BinaryFactStoreTest(unittest.TestCase):
                 "metadata", where="key='schema_version'"
             )[0]["value"]
 
-        self.assertEqual(version, "binary-fact-sqlite-v8")
+        self.assertEqual(version, "binary-fact-sqlite-v9")
         self.assertEqual(after, before)
 
     def test_custom_invokedynamic_bootstrap_tag_validates_from_nested_payload(self):

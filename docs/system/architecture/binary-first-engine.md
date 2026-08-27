@@ -151,6 +151,8 @@ ZIP 时间戳、条目顺序、签名重打包等只有在版本化安全规则�
 
 Artifact-local 变化只有在当前 realm/profile 下生效，或它本身属于当前分析范围可观察事实时，才能进入正式裁决。被其他 provider 遮蔽的变化保留审计证据，但不能生成正式 API 目标。
 
+Runtime reconciliation 以调用边 `rowid` 的确定性顺序生成并分块持久化。fact-store 的 reconciliation chunk ordinal 只用于恢复该顺序和提高 SQLite 局部性，不是事实、完整性或排序真值：ordinal 缺失、损坏或旧库不具备该表时，所有消费者仍必须读取全部 chunk，并对无法顺序合并的记录执行精确主键回退。schema 变化必须使旧 checkpoint 失效并重建，不能把旧库静默解释为新库。
+
 ### 6.3 Step4B：Decision 与 projection freeze
 
 所有变化事实进入三套互斥裁决：
@@ -337,6 +339,10 @@ Oracle 与生产实现只能共享最终制品、RuntimeProfile 和身份协议�
 
 缺失、额外、重复、冲突或无法绑定本次制品的 Oracle 结果都使 generation 无法激活。
 
+Oracle 可以改变证据遍历和临时索引的物理策略，但不能改变独立性或范围。大规模调用边验证采用一次顺序扫描同时合并 member、dispatch、type、class-init 和 linkage 五域；临时索引以 SQLite `rowid` 整数关联原始边，旧顺序、缺失 ordinal 和孤立 evidence 逐条回退到 SHA 主键查询。字符串池和 resolved-member projection cache 都有硬上限，达到上限后仅停止缓存，绝不采样、截断、跳过或改写记录。制品 SHA、ZIP/resource/XML inventory 可按可用内存并发执行，但每个物理路径仍单独校验完整 SHA，每个唯一 content/target 组合仍完整清点。
+
+DecisionEngine 解压 provider/definition chunk 后可以在 base/current compact view 间共享 realm、runtime-profile 和封闭状态枚举的不可变字符串对象；class 名、事实身份、证据和任意高基数字段不得进入该池。共享只允许改变对象复用，不得改变字段类型、值、记录数、遍历范围或最终身份。
+
 ### 12.2 必备 fixture
 
 测试至少覆盖：
@@ -371,6 +377,9 @@ Oracle 与生产实现只能共享最终制品、RuntimeProfile 和身份协议�
 - graph 和 SCC 批量构建，多目标共享遍历；
 - 缓存键包含 artifact SHA、RuntimeProfile、policy 和 parser version；
 - 缓存完整性失败直接重建，不能读取近似结果；
+- reconciliation ordinal、顺序游标和整数 rowid 只能作为局部性提示；任何提示缺失都必须精确回退并保持完整事实集合；
+- 内存压力只允许降低 worker/cache 数量，不能降低 class、member、edge、archive entry 或 JVM observation 数量；
+- 独立验证的五个调用边解析域共享一次顺序表扫描，禁止为每域复制 SHA 索引或重复全表随机读取；
 - 记录端到端耗时、各 phase 耗时、峰值 RSS、archive/class/edge 数和缓存命中率；
 - 性能回归门和准确性 Oracle 同时通过后才能发布。
 

@@ -92,6 +92,17 @@ class PublicRealProjectContractBlackboxTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("schedule:", workflow)
         self.assertIn("quality_gate.py --profile release", workflow)
+        release_job = workflow.split("  release-regression:", 1)[1]
+        java17_record = release_job.index("Record Reference Java 17 Home")
+        java21_setup = release_job.index("Setup Source Build Java 21")
+        gradle_setup = release_job.index("Setup Gradle")
+        release_gate = release_job.index("Run Release Quality Gate")
+        self.assertLess(java17_record, java21_setup)
+        self.assertLess(java21_setup, gradle_setup)
+        self.assertLess(gradle_setup, release_gate)
+        self.assertIn(
+            'java-version: "21"', release_job[java21_setup:gradle_setup]
+        )
         dry_run = managed_run(
             [
                 sys.executable, str(ROOT / "scripts" / "quality_gate.py"),

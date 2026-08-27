@@ -5953,7 +5953,8 @@ class BinaryValidationOracleBoundaryTest(unittest.TestCase):
                     "path": str(artifact_path), "sha256": "0" * 64,
                 }
                 oracle._artifact_configs.side_effect = (
-                    [bad_artifact], [bad_artifact],
+                    [bad_artifact, bad_artifact],
+                    [bad_artifact, bad_artifact],
                 )
                 with self.assertRaises(
                     oracle.BinaryValidationError
@@ -5970,13 +5971,17 @@ class BinaryValidationOracleBoundaryTest(unittest.TestCase):
                     "sha256": hashlib.sha256(b"artifact").hexdigest(),
                 }
                 oracle._artifact_configs.side_effect = (
-                    [good_artifact], [good_artifact],
+                    [good_artifact, good_artifact],
+                    [good_artifact, good_artifact],
                 )
                 oracle._archive_inventory.return_value = {
                     "classes": {}, "failures": ["invalid archive entry"],
                 }
                 inventory_failure = oracle.validate_generation(
                     {}, generation, progress_callback=lambda *_args: None,
+                )
+                parallel_inventory_call_count = (
+                    oracle._archive_inventory.call_count
                 )
                 oracle._artifact_configs.side_effect = None
                 oracle._artifact_configs.return_value = []
@@ -6063,6 +6068,7 @@ class BinaryValidationOracleBoundaryTest(unittest.TestCase):
             "BINARY_ORACLE_ARTIFACT_CHANGED_DURING_INVENTORY",
         )
         self.assertEqual(inventory_failure["status"], "failed")
+        self.assertEqual(parallel_inventory_call_count, 1)
         self.assertEqual(unequal_databases["status"], "passed")
         self.assertEqual(foundational_failure["status"], "failed")
         self.assertEqual(empty_current_truth["status"], "passed")

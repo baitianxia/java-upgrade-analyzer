@@ -19,6 +19,7 @@
       "repository_url": "https://github.com/spring-guides/gs-scheduling-tasks.git",
       "git_revision": "ae04f0228a689bda86a9900d880277effc99b205",
       "working_directory": "complete",
+      "build_jdk_major": 21,
       "build_command": ["mvn", "-q", "-DskipTests", "package"],
       "artifact_path": "target/scheduling-tasks-complete-0.0.1-SNAPSHOT.jar",
       "canonicalize_zip": true,

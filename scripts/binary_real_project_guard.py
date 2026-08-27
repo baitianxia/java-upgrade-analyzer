@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -48,6 +49,7 @@ _JAVAP_FIELD_HEADING = re.compile(
 )
 _JAVAP_DESCRIPTOR = re.compile(r"^\s*descriptor:\s*(\S+)\s*$")
 _JAVAP_FLAGS = re.compile(r"^\s*flags:\s*\(0x[0-9a-fA-F]+\)\s*(.*)$")
+_JAVA_VERSION = re.compile(r'version\s+"(?:1\.)?(\d+)(?:[._"]|$)')
 
 
 def _sha256(path: Path) -> str:
@@ -67,6 +69,51 @@ def _jdk_tool(jdk_home: str | Path, name: str) -> str:
     raise BinaryRealProjectGuardError(
         "REAL_PROJECT_ORACLE_JDK_TOOL_MISSING", f"{name}; jdk_home={root}"
     )
+
+
+def _jdk_major(jdk_home: str | Path) -> int:
+    java = _jdk_tool(jdk_home, "java")
+    observed = execute_binary_tool(
+        [java, "-version"],
+        stage="binary_real_project.build_jdk",
+        reason_prefix="REAL_PROJECT_SOURCE_BUILD_JDK",
+        timeout_seconds=30,
+    )
+    if not observed.succeeded:
+        raise BinaryRealProjectGuardError(
+            observed.failure.reason_code,
+            json.dumps(observed.failure.to_mapping(), ensure_ascii=False),
+        )
+    version_text = f"{observed.stdout}\n{observed.stderr}"
+    match = _JAVA_VERSION.search(version_text)
+    if match is None:
+        raise BinaryRealProjectGuardError(
+            "REAL_PROJECT_SOURCE_BUILD_JDK_VERSION_INVALID",
+            version_text[-1000:],
+        )
+    return int(match.group(1))
+
+
+@contextmanager
+def _bound_build_jdk(jdk_home: str | Path):
+    """Bind a source build to the exact JDK whose bytes were pinned."""
+    root = Path(jdk_home).expanduser().resolve()
+    previous = {
+        "JAVA_HOME": os.environ.get("JAVA_HOME"),
+        "PATH": os.environ.get("PATH"),
+    }
+    os.environ["JAVA_HOME"] = str(root)
+    os.environ["PATH"] = os.pathsep.join(
+        part for part in (str(root / "bin"), previous["PATH"] or "") if part
+    )
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def _javap_contracts(
@@ -451,6 +498,14 @@ def verify_manifest_contract(
                 "reason_code": "REAL_PROJECT_ASSET_DIGEST_INVALID",
                 "asset": name,
             })
+        if asset.get("kind") == "source_build" and (
+            type(asset.get("build_jdk_major")) is not int
+            or asset["build_jdk_major"] < 8
+        ):
+            issues.append({
+                "reason_code": "REAL_PROJECT_SOURCE_BUILD_JDK_INVALID",
+                "asset": name,
+            })
     expected = dict(manifest.get("expected") or {})
     truth = dict(expected.get("formal_result_truth") or {})
     provenance = dict(expected.get("oracle_provenance") or {})
@@ -569,6 +624,7 @@ def evaluate_real_project_formal_truth(
 
 def resolve_asset(
     asset: Mapping[str, Any], cache_root: str | Path, *, allow_download: bool,
+    build_jdk_home: str | Path | None = None,
 ) -> Path:
     cache = Path(cache_root).expanduser().resolve()
     cache.mkdir(parents=True, exist_ok=True)
@@ -595,14 +651,24 @@ def resolve_asset(
         working_directory = str(asset.get("working_directory") or "")
         build_command = [str(value) for value in asset.get("build_command") or ()]
         artifact_path = str(asset.get("artifact_path") or "")
+        build_jdk_major = asset.get("build_jdk_major")
         if (
             not repository.startswith("https://")
             or len(revision) != 40
             or not build_command
             or not artifact_path
+            or type(build_jdk_major) is not int
+            or build_jdk_major < 8
+            or build_jdk_home is None
         ):
             raise BinaryRealProjectGuardError(
                 "REAL_PROJECT_SOURCE_BUILD_CONTRACT_INVALID", filename
+            )
+        observed_jdk_major = _jdk_major(build_jdk_home)
+        if observed_jdk_major != build_jdk_major:
+            raise BinaryRealProjectGuardError(
+                "REAL_PROJECT_SOURCE_BUILD_JDK_MISMATCH",
+                f"expected={build_jdk_major}; observed={observed_jdk_major}",
             )
         with short_temporary_directory(
             prefix="real-project-source-build"
@@ -649,11 +715,12 @@ def resolve_asset(
                 raise BinaryRealProjectGuardError(
                     "REAL_PROJECT_SOURCE_BUILD_PATH_UNSAFE", working_directory
                 ) from error
-            built = execute_binary_tool(
-                build_command, stage="binary_real_project.build",
-                reason_prefix="REAL_PROJECT_SOURCE_BUILD",
-                timeout_seconds=900, cwd=build_root,
-            )
+            with _bound_build_jdk(build_jdk_home):
+                built = execute_binary_tool(
+                    build_command, stage="binary_real_project.build",
+                    reason_prefix="REAL_PROJECT_SOURCE_BUILD",
+                    timeout_seconds=900, cwd=build_root,
+                )
             if not built.succeeded:
                 raise BinaryRealProjectGuardError(
                     built.failure.reason_code,
@@ -1206,6 +1273,7 @@ def main(argv=None) -> int:
         application = resolve_asset(
             manifest["assets"]["application"], args.cache_root,
             allow_download=args.download,
+            build_jdk_home=args.jdk_home,
         )
         base_dependency = resolve_asset(
             manifest["assets"]["base_dependency"], args.cache_root,

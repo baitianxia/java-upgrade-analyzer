@@ -284,6 +284,50 @@ class DecisionEngineBoundaryTest(unittest.TestCase):
         self.assertEqual(tuple(second), ("a", "b"))
         self.assertEqual(len(second), 2)
 
+        pool = {}
+        realm_left = bytes("application-loader", "utf-8").decode("utf-8")
+        realm_right = bytes("application-loader", "utf-8").decode("utf-8")
+        class_left = bytes("demo/Api", "utf-8").decode("utf-8")
+        class_right = bytes("demo/Api", "utf-8").decode("utf-8")
+        self.assertIsNot(realm_left, realm_right)
+        self.assertIsNot(class_left, class_right)
+        compact_fields = (
+            "initiating_loader_realm_identity",
+            "class_name",
+            "class_provider_status",
+        )
+        left = engine_module._CompactDecisionRecord(
+            {
+                "initiating_loader_realm_identity": realm_left,
+                "class_name": class_left,
+                "class_provider_status": "resolved",
+            },
+            compact_fields,
+            string_pool=pool,
+        )
+        right = engine_module._CompactDecisionRecord(
+            {
+                "initiating_loader_realm_identity": realm_right,
+                "class_name": class_right,
+                "class_provider_status": "resolved",
+            },
+            compact_fields,
+            string_pool=pool,
+        )
+        self.assertEqual(dict(left), dict(right))
+        self.assertIs(
+            left["initiating_loader_realm_identity"],
+            right["initiating_loader_realm_identity"],
+        )
+        self.assertIs(
+            left["class_provider_status"],
+            right["class_provider_status"],
+        )
+        self.assertIsNot(left["class_name"], right["class_name"])
+        self.assertEqual(
+            set(pool), {"application-loader", "resolved"}
+        )
+
     def test_projection_rule_explicit_and_derived_identity(self):
         derived = engine_module.ProjectionRule("resource", "resource")
         explicit = engine_module.ProjectionRule(

@@ -95,6 +95,8 @@ LOADING_CONSTRAINT_TYPE_OWNERS_KEY = "loading_constraint_type_owners"
 # metaspace, reflection metadata and captured JSON for each child process.
 MAX_CLASSES_PER_RUNTIME_ORACLE_PROCESS = 12_000
 LOW_AVAILABLE_MEMORY_WARNING_BYTES = 4 * 1024 * 1024 * 1024
+MAX_VALIDATION_STRING_POOL_ENTRIES = 250_000
+MAX_VALIDATION_POOLED_STRING_CHARS = 4_096
 _NATIVE_ARTIFACT_IDENTITY_MAX_ROWS = 50_000
 _NATIVE_ARTIFACT_IDENTITY_MAX_ESTIMATED_BYTES = 16 * 1024 * 1024
 # Avoid process-startup concurrency for tiny projects/tests. Above this point
@@ -210,6 +212,25 @@ def _artifact_scan_worker_count(request_count: int) -> tuple[int, int | None]:
         ),
         available,
     )
+
+
+def _runtime_member_projection_cache_limit() -> int:
+    """Keep hot resolved-member projections without pushing Windows to page."""
+
+    try:
+        available = system_available_memory_bytes()
+    except Exception:
+        available = None
+    gib = 1024 * 1024 * 1024
+    if available is None:
+        return 100_000
+    if available < 2 * gib:
+        return 20_000
+    if available < 4 * gib:
+        return 50_000
+    if available < 8 * gib:
+        return 100_000
+    return 250_000
 
 
 def _notify_progress(
@@ -3913,7 +3934,59 @@ def _same_json_value(left: Any, right: Any) -> bool:
 
 
 def _pooled_string(value: str, pool: dict[str, str]) -> str:
-    return pool.setdefault(value, value)
+    pooled = pool.get(value)
+    if pooled is not None:
+        return pooled
+    # Object sharing is only a memory optimization; it is not validation
+    # evidence. A high-cardinality edge/member corpus can otherwise make this
+    # dictionary retain every unique transient string after its artifact has
+    # already been compressed to the disk spool. Stop admitting new values at
+    # a fixed bound and never retain unusually large diagnostic text.
+    if (
+        len(pool) >= MAX_VALIDATION_STRING_POOL_ENTRIES
+        or len(value) > MAX_VALIDATION_POOLED_STRING_CHARS
+    ):
+        return value
+    pool[value] = value
+    return value
+
+
+class _BoundedProjectionCache:
+    """Cache repeated immutable identity projections without unbounded RSS."""
+
+    _MISSING = object()
+
+    def __init__(self, limit: int):
+        self.limit = max(0, int(limit))
+        self.values: dict[str, Any] = {}
+
+    def resolve(
+        self,
+        identities: Iterable[str],
+        loader: Callable[[tuple[str, ...]], Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        normalized = tuple(dict.fromkeys(
+            str(item) for item in identities if item
+        ))
+        result: dict[str, Any] = {}
+        misses = []
+        for identity in normalized:
+            value = self.values.get(identity, self._MISSING)
+            if value is self._MISSING:
+                misses.append(identity)
+            elif value is not None:
+                result[identity] = value
+        if misses:
+            loaded = dict(loader(tuple(misses)))
+            for identity in misses:
+                value = loaded.get(identity)
+                if len(self.values) < self.limit:
+                    # Negative entries are safe: the validated immutable
+                    # SQLite attachment cannot gain a member during the run.
+                    self.values[identity] = value
+                if value is not None:
+                    result[identity] = value
+        return result
 
 
 def _compact_json_values(value: Any, string_pool: dict[str, str]) -> Any:
@@ -4107,14 +4180,85 @@ def _share_equal_observation_values(
     return shared_rows, shared_values
 
 
+def _has_complete_reconciliation_chunk_order(
+    connection: sqlite3.Connection,
+    kind: str,
+) -> bool:
+    """Return true only when every chunk has one v9 locality record."""
+
+    kind_code = _ORACLE_RECONCILIATION_KIND_CODES[kind]
+    try:
+        total, ordered = connection.execute(
+            """
+            SELECT
+              (SELECT COUNT(*) FROM reconciliation_records
+               WHERE record_kind=?),
+              (SELECT COUNT(*)
+               FROM reconciliation_records AS records
+               JOIN reconciliation_chunk_order AS ordering
+                 ON ordering.chunk_identity=records.chunk_identity
+                AND ordering.record_kind=records.record_kind
+               WHERE records.record_kind=?)
+            """,
+            (kind_code, kind_code),
+        ).fetchone()
+        return int(total) == int(ordered)
+    except (IndexError, TypeError, ValueError, sqlite3.Error):
+        return False
+
+
 def _iter_reconciliation(
     connection: sqlite3.Connection,
     kind: str,
 ) -> Iterable[dict[str, Any]]:
-    for row in connection.execute(
-        "SELECT record_count,payload_zlib FROM reconciliation_records WHERE record_kind=?",
-        (_ORACLE_RECONCILIATION_KIND_CODES[kind],),
-    ):
+    kind_code = _ORACLE_RECONCILIATION_KIND_CODES[kind]
+    if not isinstance(connection, sqlite3.Connection):
+        # Boundary adapters predating v9 expose only the original one-query
+        # protocol. They have no physical locality table to consult.
+        chunks = connection.execute(
+            "SELECT record_count,payload_zlib FROM reconciliation_records "
+            "WHERE record_kind=? ORDER BY chunk_identity",
+            (kind_code,),
+        )
+    else:
+        try:
+            ordered_chunks = connection.execute(
+                """
+                SELECT records.record_count,records.payload_zlib
+                FROM reconciliation_chunk_order AS ordering
+                JOIN reconciliation_records AS records
+                  ON records.chunk_identity=ordering.chunk_identity
+                 AND records.record_kind=ordering.record_kind
+                WHERE ordering.record_kind=?
+                ORDER BY ordering.chunk_ordinal
+                """,
+                (kind_code,),
+            )
+            unordered_chunks = connection.execute(
+                """
+                SELECT records.record_count,records.payload_zlib
+                FROM reconciliation_records AS records
+                LEFT JOIN reconciliation_chunk_order AS ordering
+                  ON ordering.chunk_identity=records.chunk_identity
+                 AND ordering.record_kind=records.record_kind
+                WHERE records.record_kind=?
+                  AND ordering.chunk_identity IS NULL
+                ORDER BY records.chunk_identity
+                """,
+                (kind_code,),
+            )
+            chunks = chain(ordered_chunks, unordered_chunks)
+        except sqlite3.Error:
+            # Immutable v8 fixtures do not carry the performance-only
+            # insertion-order index. Every chunk is still read and validated;
+            # only their traversal locality is unavailable.
+            chunks = connection.execute(
+                "SELECT record_count,payload_zlib "
+                "FROM reconciliation_records WHERE record_kind=? "
+                "ORDER BY chunk_identity",
+                (kind_code,),
+            )
+    for row in chunks:
         records = json.loads(zlib.decompress(row["payload_zlib"]).decode("utf-8"))
         if len(records) != int(row["record_count"]):
             raise BinaryValidationError(
@@ -5603,6 +5747,78 @@ def _identity_rows_with_table_locality(
         return tuple(connection.execute(legacy_query, normalized))
 
 
+class _SequentialIdentityProjection:
+    """Merge ordered identities with one forward SQLite table scan.
+
+    Reconciliation v9 records preserve the reconciler's direct-edge rowid
+    order. Resolving each SHA identity through the primary-key B-tree still
+    performs millions of random index probes even when the requested payload
+    rows are adjacent. This cursor consumes the table once in rowid order.
+    Any missing or out-of-order identity falls back to the exact indexed
+    lookup, so the locality hint can never omit or relabel evidence.
+    """
+
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        table: str,
+        identity_column: str,
+        selected_columns: tuple[str, ...],
+        prefer_table_locality: bool,
+    ):
+        names = (table, identity_column, *selected_columns)
+        if any(
+            re.fullmatch(r"[a-z_][a-z0-9_]*", name) is None
+            for name in names
+        ):
+            raise ValueError("unsafe SQLite identifier")
+        self.connection = connection
+        self.table = table
+        self.identity_column = identity_column
+        self.selected_columns = selected_columns
+        self.prefer_table_locality = prefer_table_locality
+        selected = ",".join(selected_columns)
+        self.cursor = connection.execute(
+            f"SELECT {selected} FROM {table} ORDER BY rowid"
+        )
+        self.current = self.cursor.fetchone()
+        self.closed = False
+
+    def resolve(self, identities: Iterable[str]) -> tuple[sqlite3.Row, ...]:
+        normalized = tuple(dict.fromkeys(str(item) for item in identities))
+        if not normalized:
+            return ()
+        resolved = []
+        fallback = []
+        for identity in normalized:
+            while (
+                self.current is not None
+                and str(self.current[self.identity_column]) != identity
+            ):
+                self.current = self.cursor.fetchone()
+            if self.current is None:
+                fallback.append(identity)
+                continue
+            resolved.append(self.current)
+            self.current = self.cursor.fetchone()
+        if fallback:
+            resolved.extend(_identity_rows_with_table_locality(
+                self.connection,
+                table=self.table,
+                identity_column=self.identity_column,
+                selected_columns=self.selected_columns,
+                identities=fallback,
+                prefer_table_locality=self.prefer_table_locality,
+            ))
+        return tuple(resolved)
+
+    def close(self) -> None:
+        if not self.closed:
+            self.cursor.close()
+            self.closed = True
+
+
 def _prefer_identity_table_locality(
     connection: sqlite3.Connection,
 ) -> bool:
@@ -6724,7 +6940,33 @@ def _validate_runtime_outcomes(
         if batch:
             yield batch
 
-    def direct_edge_batch(edge_ids: Iterable[str]):
+    direct_edge_selected_columns = (
+        "direct_edge_identity", "edge_kind", "symbolic_owner",
+        "symbolic_name", "symbolic_descriptor", "opcode",
+    )
+
+    def open_direct_projection(
+        reconciliation_kind: str,
+    ) -> _SequentialIdentityProjection | None:
+        if not (
+            prefer_identity_table_locality
+            and _has_complete_reconciliation_chunk_order(
+                connection, reconciliation_kind
+            )
+        ):
+            return None
+        return _SequentialIdentityProjection(
+            connection,
+            table="direct_edges",
+            identity_column="direct_edge_identity",
+            selected_columns=direct_edge_selected_columns,
+            prefer_table_locality=prefer_identity_table_locality,
+        )
+
+    def direct_edge_batch(
+        edge_ids: Iterable[str],
+        projection: _SequentialIdentityProjection | None = None,
+    ):
         identities = tuple(dict.fromkeys(str(item) for item in edge_ids))
         # Every caller passes one non-empty reconciliation batch.  The queried
         # identity/kind/symbol columns are NOT NULL in BinaryFactStore; only
@@ -6737,25 +6979,25 @@ def _validate_runtime_outcomes(
                 str(row["symbolic_descriptor"]),
                 int(row["opcode"]) if row["opcode"] is not None else 0,
             )
-            for row in _identity_rows_with_table_locality(
-                connection,
-                table="direct_edges",
-                identity_column="direct_edge_identity",
-                selected_columns=(
-                    "direct_edge_identity", "edge_kind", "symbolic_owner",
-                    "symbolic_name", "symbolic_descriptor", "opcode",
-                ),
-                identities=identities,
-                prefer_table_locality=prefer_identity_table_locality,
+            for row in (
+                projection.resolve(identities)
+                if projection is not None
+                else _identity_rows_with_table_locality(
+                    connection,
+                    table="direct_edges",
+                    identity_column="direct_edge_identity",
+                    selected_columns=direct_edge_selected_columns,
+                    identities=identities,
+                    prefer_table_locality=prefer_identity_table_locality,
+                )
             )
         }
 
-    def member_symbol_batch(member_ids: Iterable[str]):
-        identities = tuple(dict.fromkeys(
-            str(item) for item in member_ids if item
-        ))
-        if not identities:
-            return {}
+    member_symbol_cache = _BoundedProjectionCache(
+        _runtime_member_projection_cache_limit()
+    )
+
+    def load_member_symbols(identities: tuple[str, ...]):
         return {
             str(row["member_identity"]): (
                 str(row["class_name"]),
@@ -6774,6 +7016,9 @@ def _validate_runtime_outcomes(
                 prefer_table_locality=prefer_identity_table_locality,
             )
         }
+
+    def member_symbol_batch(member_ids: Iterable[str]):
+        return member_symbol_cache.resolve(member_ids, load_member_symbols)
 
     def reconciliation_total(kind: str) -> int | None:
         try:
@@ -6804,69 +7049,80 @@ def _validate_runtime_outcomes(
         0,
         member_resolution_total,
     )
-    for resolution_batch in batches(
-        _iter_reconciliation(connection, "member_resolution")
-    ):
-        member_resolution_count += len(resolution_batch)
-        edge_by_id = direct_edge_batch(
-            row["direct_edge_identity"] for row in resolution_batch
-        )
-        selected_members = member_symbol_batch(
-            row.get("resolved_member_identity")
-            for row in resolution_batch
-        )
-        for resolution in resolution_batch:
-            edge_identity = str(resolution["direct_edge_identity"])
-            edge = edge_by_id.get(edge_identity)
-            if not edge or edge[0] not in {"method", "field"}:
-                continue
-            kind = "field" if edge[0] == "field" else "method"
-            oracle_member = resolve_member_cached(
-                edge[1], kind, edge[2], edge[3],
-            )
-            status = resolution["member_resolution_status"]
-            if oracle_member is None:
-                if status == "resolved":
-                    issues.append(_validation_issue(
-                        "member_resolution", "ORACLE_MEMBER_FALSE_RESOLUTION",
-                        direct_edge_identity=edge_identity,
-                    ))
-                continue
-            declaring, _member = oracle_member
-            if status != "resolved":
-                issues.append(_validation_issue(
-                    "member_resolution", "ORACLE_MEMBER_MISSED",
-                    direct_edge_identity=edge_identity,
-                    declaring_owner=declaring,
-                ))
-                continue
-            selected_member = selected_members.get(str(
-                resolution.get("resolved_member_identity") or ""
-            ))
-            if selected_member and selected_member[0] != declaring:
-                issues.append(_validation_issue(
-                    "member_resolution", "ORACLE_MEMBER_OWNER_MISMATCH",
-                    direct_edge_identity=edge_identity,
-                    expected_owner=declaring,
-                    actual_owner=selected_member[0],
-                ))
-        if (
-            member_resolution_count >= next_member_progress
-            or (
-                member_resolution_total is not None
-                and member_resolution_count == member_resolution_total
-            )
+    member_direct_projection = open_direct_projection("member_resolution")
+    try:
+        for resolution_batch in batches(
+            _iter_reconciliation(connection, "member_resolution")
         ):
-            _notify_progress(
-                progress_callback,
-                "validation-runtime-reconciliation",
-                f"{progress_label or '当前侧'}：成员解析记录校验中",
-                member_resolution_count,
-                member_resolution_total,
+            member_resolution_count += len(resolution_batch)
+            edge_by_id = direct_edge_batch(
+                (
+                    row["direct_edge_identity"]
+                    for row in resolution_batch
+                ),
+                member_direct_projection,
             )
-            next_member_progress = (
-                member_resolution_count + member_progress_interval
+            selected_members = member_symbol_batch(
+                row.get("resolved_member_identity")
+                for row in resolution_batch
             )
+            for resolution in resolution_batch:
+                edge_identity = str(resolution["direct_edge_identity"])
+                edge = edge_by_id.get(edge_identity)
+                if not edge or edge[0] not in {"method", "field"}:
+                    continue
+                kind = "field" if edge[0] == "field" else "method"
+                oracle_member = resolve_member_cached(
+                    edge[1], kind, edge[2], edge[3],
+                )
+                status = resolution["member_resolution_status"]
+                if oracle_member is None:
+                    if status == "resolved":
+                        issues.append(_validation_issue(
+                            "member_resolution",
+                            "ORACLE_MEMBER_FALSE_RESOLUTION",
+                            direct_edge_identity=edge_identity,
+                        ))
+                    continue
+                declaring, _member = oracle_member
+                if status != "resolved":
+                    issues.append(_validation_issue(
+                        "member_resolution", "ORACLE_MEMBER_MISSED",
+                        direct_edge_identity=edge_identity,
+                        declaring_owner=declaring,
+                    ))
+                    continue
+                selected_member = selected_members.get(str(
+                    resolution.get("resolved_member_identity") or ""
+                ))
+                if selected_member and selected_member[0] != declaring:
+                    issues.append(_validation_issue(
+                        "member_resolution",
+                        "ORACLE_MEMBER_OWNER_MISMATCH",
+                        direct_edge_identity=edge_identity,
+                        expected_owner=declaring,
+                        actual_owner=selected_member[0],
+                    ))
+            if (
+                member_resolution_count >= next_member_progress
+                or (
+                    member_resolution_total is not None
+                    and member_resolution_count == member_resolution_total
+                )
+            ):
+                _notify_progress(
+                    progress_callback,
+                    "validation-runtime-reconciliation",
+                    f"{progress_label or '当前侧'}：成员解析记录校验中",
+                    member_resolution_count,
+                    member_resolution_total,
+                )
+                next_member_progress = (
+                    member_resolution_count + member_progress_interval
+                )
+    finally:
+        if member_direct_projection is not None:
+            member_direct_projection.close()
     _notify_progress(
         progress_callback,
         "validation-runtime-reconciliation",
@@ -6959,13 +7215,21 @@ def _validate_runtime_outcomes(
         seen_connection.execute(
             "CREATE TABLE seen (evidence TEXT PRIMARY KEY) WITHOUT ROWID"
         )
+        dispatch_direct_projection = None
         try:
+            dispatch_direct_projection = open_direct_projection(
+                "dispatch_resolution"
+            )
             for dispatch_batch in batches(
                 _iter_reconciliation(connection, "dispatch_resolution")
             ):
                 dispatch_count += len(dispatch_batch)
                 edge_by_id = direct_edge_batch(
-                    row["direct_edge_identity"] for row in dispatch_batch
+                    (
+                        row["direct_edge_identity"]
+                        for row in dispatch_batch
+                    ),
+                    dispatch_direct_projection,
                 )
                 target_ids = [
                     target
@@ -7126,6 +7390,8 @@ def _validate_runtime_outcomes(
                 1,
             )
         finally:
+            if dispatch_direct_projection is not None:
+                dispatch_direct_projection.close()
             seen_connection.close()
 
     return issues, {
@@ -9086,6 +9352,7 @@ class _ClosedWorldGraphIndex:
         self._aliases = unresolved_edge_alias_targets
         self._progress_callback = progress_callback
         self._closed = False
+        self._compact_resolution_index = True
         self.connection = sqlite3.connect(index_path, uri=True)
         self.connection.row_factory = sqlite3.Row
         self.connection.executescript(
@@ -9095,25 +9362,48 @@ class _ClosedWorldGraphIndex:
             PRAGMA locking_mode=EXCLUSIVE;
             PRAGMA temp_store=FILE;
             CREATE TABLE member_resolution (
+                edge_rowid INTEGER PRIMARY KEY,
+                status TEXT NOT NULL,
+                resolved_member TEXT NOT NULL
+            );
+            CREATE TABLE dispatch_resolution (
+                edge_rowid INTEGER PRIMARY KEY,
+                status TEXT NOT NULL,
+                targets_json TEXT NOT NULL
+            );
+            CREATE TABLE type_resolution (
+                edge_rowid INTEGER PRIMARY KEY,
+                status TEXT NOT NULL
+            );
+            CREATE TABLE initialization_resolution (
+                edge_rowid INTEGER PRIMARY KEY,
+                status TEXT NOT NULL,
+                targets_json TEXT NOT NULL
+            );
+            CREATE TABLE linkage_resolution (
+                edge_rowid INTEGER PRIMARY KEY,
+                status TEXT NOT NULL
+            );
+            CREATE TABLE orphan_member_resolution (
                 evidence TEXT PRIMARY KEY,
                 status TEXT NOT NULL,
                 resolved_member TEXT NOT NULL
             ) WITHOUT ROWID;
-            CREATE TABLE dispatch_resolution (
+            CREATE TABLE orphan_dispatch_resolution (
                 evidence TEXT PRIMARY KEY,
                 status TEXT NOT NULL,
                 targets_json TEXT NOT NULL
             ) WITHOUT ROWID;
-            CREATE TABLE type_resolution (
+            CREATE TABLE orphan_type_resolution (
                 evidence TEXT PRIMARY KEY,
                 status TEXT NOT NULL
             ) WITHOUT ROWID;
-            CREATE TABLE initialization_resolution (
+            CREATE TABLE orphan_initialization_resolution (
                 evidence TEXT PRIMARY KEY,
                 status TEXT NOT NULL,
                 targets_json TEXT NOT NULL
             ) WITHOUT ROWID;
-            CREATE TABLE linkage_resolution (
+            CREATE TABLE orphan_linkage_resolution (
                 evidence TEXT PRIMARY KEY,
                 status TEXT NOT NULL
             ) WITHOUT ROWID;
@@ -9123,10 +9413,6 @@ class _ClosedWorldGraphIndex:
                 certainty TEXT NOT NULL,
                 evidence TEXT NOT NULL
             );
-            CREATE INDEX semantic_transition_caller
-                ON semantic_transition(caller);
-            CREATE INDEX semantic_transition_evidence
-                ON semantic_transition(evidence);
             """
         )
         facts_uri = (
@@ -9176,8 +9462,8 @@ class _ClosedWorldGraphIndex:
             (
                 "member_resolution",
                 "INSERT INTO member_resolution VALUES (?,?,?)",
+                "INSERT INTO orphan_member_resolution VALUES (?,?,?)",
                 lambda row: (
-                    str(row.get("direct_edge_identity") or ""),
                     str(row.get("member_resolution_status") or ""),
                     str(row.get("resolved_member_identity") or ""),
                 ),
@@ -9185,8 +9471,8 @@ class _ClosedWorldGraphIndex:
             (
                 "dispatch_resolution",
                 "INSERT INTO dispatch_resolution VALUES (?,?,?)",
+                "INSERT INTO orphan_dispatch_resolution VALUES (?,?,?)",
                 lambda row: (
-                    str(row.get("direct_edge_identity") or ""),
                     str(row.get("dispatch_status") or ""),
                     surrogate_safe_json_dumps(
                         list(row.get("implementation_target_identities") or ()),
@@ -9198,16 +9484,16 @@ class _ClosedWorldGraphIndex:
             (
                 "type_resolution",
                 "INSERT INTO type_resolution VALUES (?,?)",
+                "INSERT INTO orphan_type_resolution VALUES (?,?)",
                 lambda row: (
-                    str(row.get("direct_edge_identity") or ""),
                     str(row.get("type_resolution_status") or ""),
                 ),
             ),
             (
                 "class_initialization_resolution",
                 "INSERT INTO initialization_resolution VALUES (?,?,?)",
+                "INSERT INTO orphan_initialization_resolution VALUES (?,?,?)",
                 lambda row: (
-                    str(row.get("direct_edge_identity") or ""),
                     str(row.get("class_initialization_status") or ""),
                     surrogate_safe_json_dumps(
                         list(row.get("initializer_target_identities") or ()),
@@ -9219,45 +9505,191 @@ class _ClosedWorldGraphIndex:
             (
                 "linkage_resolution",
                 "INSERT INTO linkage_resolution VALUES (?,?)",
+                "INSERT INTO orphan_linkage_resolution VALUES (?,?)",
                 lambda row: (
-                    str(row.get("direct_edge_identity") or ""),
                     str(row.get("linkage_status") or ""),
                 ),
             ),
         )
         try:
-            for domain_index, (kind, statement, project) in enumerate(
-                specs, start=1
-            ):
+            states: list[dict[str, Any]] = []
+            for domain_index, (
+                kind, statement, orphan_statement, project,
+            ) in enumerate(specs, start=1):
                 total = int(source.execute(
                     "SELECT COALESCE(SUM(record_count),0) "
                     "FROM reconciliation_records WHERE record_kind=?",
                     (_ORACLE_RECONCILIATION_KIND_CODES[kind],),
                 ).fetchone()[0])
-
-                def report(current: int, *, current_kind=kind) -> None:
-                    _notify_progress(
-                        self._progress_callback,
-                        "validation-closed-world-index",
-                        f"闭世界索引：{current_kind}",
-                        current,
-                        total,
-                    )
-
-                self._insert_batches(
-                    self.connection,
-                    statement,
-                    (project(row) for row in _iter_reconciliation(source, kind)),
-                    progress=report,
-                )
-                self.connection.commit()
+                iterator = iter(_iter_reconciliation(source, kind))
+                states.append({
+                    "domain_index": domain_index,
+                    "kind": kind,
+                    "statement": statement,
+                    "orphan_statement": orphan_statement,
+                    "project": project,
+                    "iterator": iterator,
+                    "current": next(iterator, None),
+                    "main_batch": [],
+                    "orphan_batch": [],
+                    "processed": 0,
+                    "total": total,
+                    "progress_interval": max(
+                        10_000,
+                        (total + 19) // 20 if total else 10_000,
+                    ),
+                    "next_progress": max(
+                        10_000,
+                        (total + 19) // 20 if total else 10_000,
+                    ),
+                })
                 _notify_progress(
                     self._progress_callback,
                     "validation-closed-world-index",
-                    f"闭世界索引完成：{kind}",
-                    domain_index,
+                    f"闭世界索引：{kind}",
+                    0,
+                    total,
+                )
+
+            def flush_state(state: dict[str, Any]) -> None:
+                main_batch = state["main_batch"]
+                if main_batch:
+                    self.connection.executemany(
+                        state["statement"], main_batch
+                    )
+                    main_batch.clear()
+                orphan_batch = state["orphan_batch"]
+                if orphan_batch:
+                    self.connection.executemany(
+                        state["orphan_statement"], orphan_batch
+                    )
+                    orphan_batch.clear()
+
+            def stage_record(
+                state: dict[str, Any],
+                reconciliation: Mapping[str, Any],
+                edge_rowid: int | None,
+            ) -> None:
+                projected = state["project"](reconciliation)
+                if edge_rowid is None:
+                    state["orphan_batch"].append((
+                        str(reconciliation.get("direct_edge_identity") or ""),
+                        *projected,
+                    ))
+                else:
+                    state["main_batch"].append((edge_rowid, *projected))
+                state["processed"] += 1
+                if (
+                    len(state["main_batch"])
+                    + len(state["orphan_batch"])
+                    >= 10_000
+                ):
+                    flush_state(state)
+                if (
+                    state["processed"] >= state["next_progress"]
+                    or state["processed"] == state["total"]
+                ):
+                    _notify_progress(
+                        self._progress_callback,
+                        "validation-closed-world-index",
+                        f"闭世界索引：{state['kind']}",
+                        state["processed"],
+                        state["total"],
+                    )
+                    state["next_progress"] = (
+                        state["processed"] + state["progress_interval"]
+                    )
+
+            direct_edge_total = int(self.connection.execute(
+                "SELECT COUNT(*) FROM facts.direct_edges"
+            ).fetchone()[0])
+            direct_edge_progress_interval = max(
+                10_000,
+                (direct_edge_total + 19) // 20
+                if direct_edge_total else 10_000,
+            )
+            _notify_progress(
+                self._progress_callback,
+                "validation-closed-world-index",
+                "闭世界索引：单次顺序合并全部解析域",
+                0,
+                direct_edge_total,
+            )
+            # Every reconciliation family is a monotonic subset of the
+            # reconciler's direct-edge rowid scan. Advance all five iterators
+            # together while reading the wide facts table exactly once. This
+            # avoids both a second SHA-keyed database and five repeated scans
+            # of the multi-GiB direct-edge table.
+            edge_cursor = self.connection.execute(
+                """
+                SELECT edge.rowid AS edge_rowid,
+                       edge.direct_edge_identity AS evidence
+                FROM facts.direct_edges AS edge NOT INDEXED
+                ORDER BY edge.rowid
+                """
+            )
+            try:
+                for current_edge, edge_row in enumerate(edge_cursor, start=1):
+                    evidence = str(edge_row["evidence"])
+                    edge_rowid = int(edge_row["edge_rowid"])
+                    for state in states:
+                        reconciliation = state["current"]
+                        while (
+                            reconciliation is not None
+                            and str(reconciliation.get(
+                                "direct_edge_identity"
+                            ) or "") == evidence
+                        ):
+                            stage_record(state, reconciliation, edge_rowid)
+                            reconciliation = next(
+                                state["iterator"], None
+                            )
+                            state["current"] = reconciliation
+                    if (
+                        current_edge == direct_edge_total
+                        or current_edge % direct_edge_progress_interval == 0
+                    ):
+                        _notify_progress(
+                            self._progress_callback,
+                            "validation-closed-world-index",
+                            "闭世界索引：单次顺序合并全部解析域",
+                            current_edge,
+                            direct_edge_total,
+                        )
+            finally:
+                edge_cursor.close()
+
+            # A missing order hint, legacy hash-ordered chunk, or malformed
+            # evidence can leave records behind the forward scan. Resolve all
+            # such records through the exact primary-key lookup. Locality is
+            # optional; validation completeness never is.
+            for state in states:
+                reconciliation = state["current"]
+                while reconciliation is not None:
+                    evidence = str(
+                        reconciliation.get("direct_edge_identity") or ""
+                    )
+                    matched = self.connection.execute(
+                        "SELECT rowid FROM facts.direct_edges "
+                        "WHERE direct_edge_identity=?",
+                        (evidence,),
+                    ).fetchone()
+                    stage_record(
+                        state,
+                        reconciliation,
+                        int(matched[0]) if matched is not None else None,
+                    )
+                    reconciliation = next(state["iterator"], None)
+                    state["current"] = reconciliation
+                flush_state(state)
+                _notify_progress(
+                    self._progress_callback,
+                    "validation-closed-world-index",
+                    f"闭世界索引完成：{state['kind']}",
+                    state["domain_index"],
                     len(specs),
                 )
+            self.connection.commit()
         finally:
             source.close()
 
@@ -9315,6 +9747,17 @@ class _ClosedWorldGraphIndex:
             "INSERT INTO semantic_transition VALUES (?,?,?,?)",
             semantic_rows(),
         )
+        # Building both lookup indexes after the append-only load lets SQLite
+        # sort once. Maintaining two B-trees for every streamed semantic edge
+        # caused avoidable random writes on virtualized Windows disks.
+        self.connection.executescript(
+            """
+            CREATE INDEX semantic_transition_caller
+                ON semantic_transition(caller);
+            CREATE INDEX semantic_transition_evidence
+                ON semantic_transition(evidence);
+            """
+        )
         self.connection.commit()
 
     def close(self) -> None:
@@ -9353,6 +9796,25 @@ class _ClosedWorldGraphIndex:
             else "e.direct_edge_identity=?"
         )
         parameter = caller if caller is not None else evidence
+        compact_index = bool(getattr(
+            self, "_compact_resolution_index", False
+        ))
+        member_join = (
+            "mr.edge_rowid=e.rowid"
+            if compact_index else "mr.evidence=e.direct_edge_identity"
+        )
+        dispatch_join = (
+            "dr.edge_rowid=e.rowid"
+            if compact_index else "dr.evidence=e.direct_edge_identity"
+        )
+        type_join = (
+            "tr.edge_rowid=e.rowid"
+            if compact_index else "tr.evidence=e.direct_edge_identity"
+        )
+        initialization_join = (
+            "ir.edge_rowid=e.rowid"
+            if compact_index else "ir.evidence=e.direct_edge_identity"
+        )
         rows = self.connection.execute(
             f"""
             SELECT e.direct_edge_identity,e.caller_member_identity,e.edge_kind,
@@ -9366,13 +9828,13 @@ class _ClosedWorldGraphIndex:
                    ir.targets_json AS initialization_targets
             FROM facts.direct_edges AS e
             LEFT JOIN member_resolution AS mr
-              ON mr.evidence=e.direct_edge_identity
+              ON {member_join}
             LEFT JOIN dispatch_resolution AS dr
-              ON dr.evidence=e.direct_edge_identity
+              ON {dispatch_join}
             LEFT JOIN type_resolution AS tr
-              ON tr.evidence=e.direct_edge_identity
+              ON {type_join}
             LEFT JOIN initialization_resolution AS ir
-              ON ir.evidence=e.direct_edge_identity
+              ON {initialization_join}
             WHERE {predicate}
             """,
             (parameter,),
@@ -9494,17 +9956,47 @@ class _ClosedWorldGraphIndex:
         return result
 
     def resolution_status(self, evidence: str) -> str:
-        row = self.connection.execute(
-            "SELECT status FROM member_resolution WHERE evidence=?",
-            (evidence,),
-        ).fetchone()
+        if bool(getattr(self, "_compact_resolution_index", False)):
+            edge = self.connection.execute(
+                "SELECT rowid FROM facts.direct_edges "
+                "WHERE direct_edge_identity=?",
+                (evidence,),
+            ).fetchone()
+            row = self.connection.execute(
+                "SELECT status FROM member_resolution WHERE edge_rowid=?",
+                (int(edge[0]),),
+            ).fetchone() if edge is not None else self.connection.execute(
+                "SELECT status FROM orphan_member_resolution "
+                "WHERE evidence=?",
+                (evidence,),
+            ).fetchone()
+        else:
+            row = self.connection.execute(
+                "SELECT status FROM member_resolution WHERE evidence=?",
+                (evidence,),
+            ).fetchone()
         return str(row[0] or "") if row else ""
 
     def linkage_status(self, evidence: str) -> str:
-        row = self.connection.execute(
-            "SELECT status FROM linkage_resolution WHERE evidence=?",
-            (evidence,),
-        ).fetchone()
+        if bool(getattr(self, "_compact_resolution_index", False)):
+            edge = self.connection.execute(
+                "SELECT rowid FROM facts.direct_edges "
+                "WHERE direct_edge_identity=?",
+                (evidence,),
+            ).fetchone()
+            row = self.connection.execute(
+                "SELECT status FROM linkage_resolution WHERE edge_rowid=?",
+                (int(edge[0]),),
+            ).fetchone() if edge is not None else self.connection.execute(
+                "SELECT status FROM orphan_linkage_resolution "
+                "WHERE evidence=?",
+                (evidence,),
+            ).fetchone()
+        else:
+            row = self.connection.execute(
+                "SELECT status FROM linkage_resolution WHERE evidence=?",
+                (evidence,),
+            ).fetchone()
         return str(row[0] or "") if row else ""
 
 
@@ -11550,7 +12042,6 @@ def validate_generation(
     ) -> list[dict[str, Any]]:
         artifact_rows = list(artifacts)
         target_major = _release_major(jdk_home)
-        result = []
         _notify_progress(
             progress_callback,
             "validation-inventory",
@@ -11558,27 +12049,133 @@ def validate_generation(
             0,
             len(artifact_rows),
         )
-        for index, item in enumerate(artifact_rows, start=1):
+        worker_count, available_memory = _artifact_scan_worker_count(
+            len(artifact_rows)
+        )
+        if worker_count > 1:
+            _notify_progress(
+                progress_callback,
+                "validation-inventory",
+                f"{side_name}：制品校验并发度 {worker_count}",
+                0,
+                len(artifact_rows),
+                (
+                    "available_memory=unknown"
+                    if available_memory is None
+                    else f"available_memory={available_memory}"
+                ),
+            )
+
+        if worker_count <= 1:
+            result = []
+            for index, item in enumerate(artifact_rows, start=1):
+                key = (str(item["sha256"]), target_major)
+                path = Path(item["path"])
+                actual_sha256 = _sha256_file(path)
+                if actual_sha256 != key[0]:
+                    raise BinaryValidationError(
+                        "BINARY_ORACLE_ARTIFACT_CHANGED_DURING_INVENTORY",
+                        f"{path}: expected={key[0]};actual={actual_sha256}",
+                    )
+                inventory = inventory_cache.get(key)
+                if inventory is None:
+                    inventory = _archive_inventory(path, target_major)
+                    inventory_cache[key] = inventory
+                result.append(inventory)
+                _notify_counted_progress(
+                    progress_callback,
+                    "validation-inventory",
+                    f"{side_name}：制品清单校验中",
+                    index,
+                    len(artifact_rows),
+                    str(path),
+                )
+            return result
+
+        # One representative per content/target pair performs ZIP, resource
+        # and XML inventory. Every physical path still receives its own full
+        # SHA check. The representative hashes and then immediately opens the
+        # archive in the same worker, preserving the original mutation window
+        # instead of separating verification and inventory into two phases.
+        representative_indexes: dict[tuple[str, int], int] = {}
+        for request_index, item in enumerate(artifact_rows):
+            key = (str(item["sha256"]), target_major)
+            if (
+                key not in inventory_cache
+                and key not in representative_indexes
+            ):
+                representative_indexes[key] = request_index
+
+        def scan_request(request: tuple[int, Mapping[str, Any]]):
+            request_index, item = request
             key = (str(item["sha256"]), target_major)
             path = Path(item["path"])
             actual_sha256 = _sha256_file(path)
             if actual_sha256 != key[0]:
                 raise BinaryValidationError(
                     "BINARY_ORACLE_ARTIFACT_CHANGED_DURING_INVENTORY",
-                    f"{path}: expected={key[0]}; actual={actual_sha256}",
+                    f"{path}: expected={key[0]};actual={actual_sha256}",
                 )
-            inventory = inventory_cache.get(key)
-            if inventory is None:
-                inventory = _archive_inventory(path, target_major)
-                inventory_cache[key] = inventory
-            result.append(inventory)
+            inventory = (
+                _archive_inventory(path, target_major)
+                if representative_indexes.get(key) == request_index
+                else None
+            )
+            return key, path, inventory
+
+        # A rolling window prevents I/O concurrency from becoming paging when
+        # the validator shares a 32 GiB Windows host with other processes.
+        completed_count = 0
+        requests = iter(enumerate(artifact_rows))
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="binary-oracle-inventory",
+        ) as executor:
+            active = {}
+            for _ in range(worker_count):
+                try:
+                    request = next(requests)
+                except StopIteration:
+                    break
+                active[executor.submit(scan_request, request)] = None
+            while active:
+                completed, _pending = wait(
+                    active, return_when=FIRST_COMPLETED
+                )
+                for future in completed:
+                    active.pop(future)
+                    key, path, inventory = future.result()
+                    if inventory is not None:
+                        inventory_cache[key] = inventory
+                    completed_count += 1
+                    _notify_counted_progress(
+                        progress_callback,
+                        "validation-inventory",
+                        f"{side_name}：制品清单校验中",
+                        completed_count,
+                        len(artifact_rows),
+                        str(path),
+                    )
+                    try:
+                        next_request = next(requests)
+                    except StopIteration:
+                        continue
+                    active[executor.submit(
+                        scan_request, next_request
+                    )] = None
+
+        result = [
+            inventory_cache[(str(item["sha256"]), target_major)]
+            for item in artifact_rows
+        ]
+        if artifact_rows:
             _notify_counted_progress(
                 progress_callback,
                 "validation-inventory",
-                f"{side_name}：制品清单校验中",
-                index,
+                f"{side_name}：制品清单校验完成",
                 len(artifact_rows),
-                str(path),
+                len(artifact_rows),
+                side_name,
             )
         return result
 

@@ -17,6 +17,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import binary_validation_oracle as oracle
+from binary_fact_store import BinaryFactStore
 
 
 def _fact_connection(database: str | Path = ":memory:") -> sqlite3.Connection:
@@ -82,6 +83,40 @@ def _insert_edge(
 
 
 class DirectEdgeLocalityTest(unittest.TestCase):
+    def test_sequential_identity_projection_preserves_out_of_order_fallback(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.execute(
+            "CREATE TABLE facts(identity TEXT PRIMARY KEY,value TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO facts VALUES (?, ?)",
+            [("a", "one"), ("b", "two"), ("c", "three"), ("d", "four")],
+        )
+        projection = oracle._SequentialIdentityProjection(
+            connection,
+            table="facts",
+            identity_column="identity",
+            selected_columns=("identity", "value"),
+            prefer_table_locality=False,
+        )
+        try:
+            forward = projection.resolve(("b", "d"))
+            # ``a`` is now behind the forward cursor and ``missing`` never
+            # existed; both take the exact indexed compatibility path.
+            fallback = projection.resolve(("a", "missing"))
+        finally:
+            projection.close()
+            connection.close()
+        self.assertEqual(
+            [(row["identity"], row["value"]) for row in forward],
+            [("b", "two"), ("d", "four")],
+        )
+        self.assertEqual(
+            [(row["identity"], row["value"]) for row in fallback],
+            [("a", "one")],
+        )
+
     def test_hashed_identity_lookup_reads_dense_payload_rows_by_rowid(self):
         connection = _fact_connection()
         try:
@@ -507,6 +542,117 @@ class SequentialHashTest(unittest.TestCase):
                 "large.bin",
             ))
             self.assertLessEqual(len(observed), 22)
+
+
+class ReconciliationLocalityTest(unittest.TestCase):
+    def test_fact_store_chunk_order_streams_every_record_in_write_order(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "facts.sqlite"
+            with BinaryFactStore(database) as store:
+                expected = [f"edge-{index:05d}" for index in range(4_501)]
+                store.add_reconciliation_payloads(
+                    analysis_context_identity="context",
+                    record_kind="member_resolution",
+                    records=(
+                        (
+                            "resolved",
+                            hashlib.sha256(edge.encode("utf-8")).hexdigest(),
+                            {
+                                "direct_edge_identity": edge,
+                                "member_resolution_status": "resolved",
+                            },
+                        )
+                        for edge in expected
+                    ),
+                    collect_identities=False,
+                )
+                order_rows = list(store.connection.execute(
+                    "SELECT record_kind,chunk_ordinal "
+                    "FROM reconciliation_chunk_order "
+                    "ORDER BY record_kind,chunk_ordinal"
+                ))
+                actual = [
+                    row["direct_edge_identity"]
+                    for row in oracle._iter_reconciliation(
+                        store.connection, "member_resolution"
+                    )
+                ]
+                hydrated = [
+                    row["direct_edge_identity"]
+                    for row in store.reconciliation_payloads(
+                        "member_resolution"
+                    )
+                ]
+                ordered_content_identity = store.content_identity()
+
+                self.assertEqual(actual, expected)
+                self.assertEqual(hydrated, expected)
+                self.assertTrue(
+                    oracle._has_complete_reconciliation_chunk_order(
+                        store.connection, "member_resolution"
+                    )
+                )
+                self.assertEqual(
+                    [int(row[1]) for row in order_rows], [0, 1, 2]
+                )
+
+                # The order table is a locality hint, never a completeness
+                # authority. Removing one hint must move, not omit, its chunk.
+                store.connection.execute(
+                    "DELETE FROM reconciliation_chunk_order "
+                    "WHERE chunk_ordinal=1"
+                )
+                self.assertFalse(
+                    oracle._has_complete_reconciliation_chunk_order(
+                        store.connection, "member_resolution"
+                    )
+                )
+                self.assertNotEqual(
+                    store.content_identity(), ordered_content_identity
+                )
+                complete = [
+                    row["direct_edge_identity"]
+                    for row in oracle._iter_reconciliation(
+                        store.connection, "member_resolution"
+                    )
+                ]
+                hydrated_complete = [
+                    row["direct_edge_identity"]
+                    for row in store.reconciliation_payloads(
+                        "member_resolution"
+                    )
+                ]
+                self.assertEqual(len(complete), len(expected))
+                self.assertEqual(set(complete), set(expected))
+                self.assertEqual(set(hydrated_complete), set(expected))
+
+    def test_chunk_ordinal_is_reused_after_transaction_rollback(self):
+        with BinaryFactStore() as store:
+            store.connection.execute("BEGIN")
+            store.add_reconciliation_payloads(
+                analysis_context_identity="context",
+                record_kind="member_resolution",
+                records=(("resolved", "a" * 64, {
+                    "direct_edge_identity": "edge-rolled-back",
+                    "member_resolution_status": "resolved",
+                }),),
+                collect_identities=False,
+                manage_transaction=False,
+            )
+            store.connection.rollback()
+            store.add_reconciliation_payloads(
+                analysis_context_identity="context",
+                record_kind="member_resolution",
+                records=(("resolved", "b" * 64, {
+                    "direct_edge_identity": "edge-committed",
+                    "member_resolution_status": "resolved",
+                }),),
+                collect_identities=False,
+            )
+            ordinal = store.connection.execute(
+                "SELECT chunk_ordinal FROM reconciliation_chunk_order"
+            ).fetchone()[0]
+            self.assertEqual(int(ordinal), 0)
 
 
 if __name__ == "__main__":

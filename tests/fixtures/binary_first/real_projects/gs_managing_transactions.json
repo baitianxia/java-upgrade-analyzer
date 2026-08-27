@@ -20,6 +20,7 @@
       "repository_url": "https://github.com/spring-guides/gs-managing-transactions.git",
       "git_revision": "efa693451b6a6ca123476c9c6e65eedab9048e2c",
       "working_directory": "complete",
+      "build_jdk_major": 21,
       "build_command": ["mvn", "-q", "-DskipTests", "package"],
       "artifact_path": "target/managing-transactions-complete-0.0.1-SNAPSHOT.jar",
       "canonicalize_zip": true,
