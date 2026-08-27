@@ -54,6 +54,7 @@ S6_MAIN_INCOMPLETE_LIMIT = 10
 S6_MAIN_RESOURCE_LIMIT = 12
 S6_MAIN_PATH_DETAIL_LIMIT = 3
 S6_MAIN_DIAGNOSTIC_LIMIT = 5
+S6_DATABASE_CONTRACT_EVIDENCE_PREVIEW_LIMIT = 3
 S6_CONCENTRATION_LIMIT = 5
 S6_NOT_FOUND_INLINE_LIMIT = S6_INLINE_LIMIT
 S6_DETAIL_MD_FULL_LIMIT = 200
@@ -3890,13 +3891,13 @@ def collect_findings(d):
         if database_contract_review_path.is_file():
             read_order.insert(
                 insert_at,
-                'evidence/static_scan/s3_database_contract_changes.md（数据库契约完整复核明细）',
+                'evidence/static_scan/s3_database_contract_changes.md（数据库契约 Step3 完整扫描证据）',
             )
             insert_at += 1
         if database_contract_csv_path.is_file():
             read_order.insert(
                 insert_at,
-                'evidence/static_scan/s3_database_contract_changes.csv（数据库契约结构化明细）',
+                'evidence/static_scan/s3_database_contract_changes.csv（数据库契约 Step3 结构化证据）',
             )
 
     # Step 5 汇总先决定逐链路台账是否应当存在。零变化 API 的正式
@@ -8586,9 +8587,311 @@ def render_report_scope_notice(findings):
     ]
 
 
+def _database_contract_identifiers(value):
+    """Return stable, non-empty identifiers from a Step3 display field."""
+    values = []
+    for item in re.split(r"\s*[,，]\s*", str(value or "").strip()):
+        normalized = item.strip()
+        if normalized and normalized not in {"-", "未知"} and normalized not in values:
+            values.append(normalized)
+    return tuple(values)
+
+
+def _database_contract_text_identifiers(value, label):
+    """Read ``表=...`` / ``列=...`` values from a Step3 old/new summary."""
+    prefix = f"{label}="
+    for item in re.split(r"[；;]", str(value or "")):
+        item = item.strip()
+        if item.startswith(prefix):
+            return _database_contract_identifiers(item[len(prefix):])
+    return ()
+
+
+def _database_contract_change_mode(value):
+    text = str(value or "").strip().lower()
+    if "新增" in text or text in {"added", "new", "current_added"}:
+        return "added"
+    if "移除" in text or "删除" in text or text in {"removed", "deleted"}:
+        return "removed"
+    return "modified"
+
+
+def _database_contract_evidence_location(row):
+    explicit = str(row.get("证据") or "").strip()
+    if explicit:
+        return explicit
+    location = str(row.get("契约位置") or "-").strip() or "-"
+    member = str(row.get("语句或字段") or "-").strip() or "-"
+    return f"{location}#{member}"
+
+
+def _database_contract_evidence_identity(row):
+    return tuple(
+        str(row.get(field) or "").strip()
+        for field in (
+            "依赖包", "旧版本", "新版本", "变化类型", "契约类型",
+            "可信度", "表", "列", "契约位置", "语句或字段", "旧契约",
+            "新契约", "证据", "人工复核建议",
+        )
+    )
+
+
+def _database_contract_change_text(mode, column):
+    if mode == "added":
+        return (
+            "当前版本新增的数据访问契约使用该列"
+            if column
+            else "当前版本新增访问该表"
+        )
+    if mode == "removed":
+        return (
+            "当前版本的数据访问契约不再使用该列"
+            if column
+            else "当前版本不再访问该表"
+        )
+    return "该表或列相关的数据访问契约发生变化"
+
+
+def _database_contract_action(mode, column):
+    target = "列" if column else "表"
+    if mode == "added":
+        return f"确认目标数据库存在该{target}，并执行相关数据访问场景测试。"
+    if mode == "removed":
+        return f"存在回滚或新旧版本并行时，不要仅依据本结果删除该{target}。"
+    return "核对目标数据库结构、运行时 SQL 与当前映射，并执行相关场景测试。"
+
+
+def build_database_contract_report_model(rows):
+    """Aggregate contract-location rows into user-facing table/column facts.
+
+    Step3 records one row per Mapper/ORM contract location. The final report
+    groups equal semantic table/column changes inside the same dependency scope
+    and keeps every contributing location as evidence. Different dependency
+    scopes are not merged because identical table names do not prove a shared
+    physical datasource.
+    """
+    groups = {}
+
+    def add_group(
+        row,
+        *,
+        mode,
+        table="",
+        column="",
+        force_review_reason="",
+        uncertain_content="",
+    ):
+        scope = str(row.get("依赖包") or "未知来源").strip() or "未知来源"
+        kind = "column" if column else ("table" if table else "unresolved")
+        key = (
+            scope,
+            kind,
+            table,
+            column,
+            mode,
+            uncertain_content,
+        )
+        group = groups.setdefault(key, {
+            "first_seen": len(groups),
+            "scope": scope,
+            "table": table,
+            "column": column,
+            "mode": mode,
+            "change": _database_contract_change_text(mode, column),
+            "action": _database_contract_action(mode, column),
+            "force_review_reasons": set(),
+            "evidence_review_reasons": set(),
+            "evidence": {},
+            "contract_types": set(),
+            "uncertain_content": uncertain_content,
+        })
+        if force_review_reason:
+            group["force_review_reasons"].add(force_review_reason)
+        confidence = str(row.get("可信度") or "").strip()
+        if confidence != "确认":
+            group["evidence_review_reasons"].add(
+                "证据包含动态 SQL、约定式映射或无法唯一解析的结构"
+            )
+        evidence = dict(row)
+        evidence["证据位置"] = _database_contract_evidence_location(row)
+        evidence["确认证据"] = confidence == "确认" and not force_review_reason
+        group["evidence"][_database_contract_evidence_identity(row)] = evidence
+        contract_type = str(row.get("契约类型") or "").strip()
+        if contract_type:
+            group["contract_types"].add(contract_type)
+
+    def emit_side(row, *, mode, tables, columns):
+        if len(tables) == 1:
+            table = tables[0]
+            if columns:
+                for column in columns:
+                    add_group(row, mode=mode, table=table, column=column)
+            else:
+                add_group(row, mode=mode, table=table)
+            return
+        if len(tables) > 1:
+            add_group(
+                row,
+                mode=mode,
+                table=", ".join(tables),
+                column=", ".join(columns),
+                force_review_reason="一条契约涉及多个表，现有证据不能可靠绑定每个列的所属表",
+                uncertain_content="多表语句中的表列归属",
+            )
+            return
+        add_group(
+            row,
+            mode=mode,
+            column=", ".join(columns),
+            force_review_reason="未解析到唯一表名，不能形成确定的表列变化",
+            uncertain_content=(
+                "具体表及列的归属" if columns else "具体表或列"
+            ),
+        )
+
+    raw_rows = [dict(row) for row in rows or ()]
+    for row in raw_rows:
+        mode = _database_contract_change_mode(row.get("变化类型"))
+        tables = _database_contract_identifiers(row.get("表"))
+        columns = _database_contract_identifiers(row.get("列"))
+        if mode != "modified":
+            emit_side(row, mode=mode, tables=tables, columns=columns)
+            continue
+
+        old_tables = _database_contract_text_identifiers(row.get("旧契约"), "表")
+        new_tables = _database_contract_text_identifiers(row.get("新契约"), "表")
+        old_columns = _database_contract_text_identifiers(row.get("旧契约"), "列")
+        new_columns = _database_contract_text_identifiers(row.get("新契约"), "列")
+        emitted = False
+        if old_tables == new_tables and len(old_tables) == 1:
+            new_column_set = set(new_columns)
+            old_column_set = set(old_columns)
+            removed_columns = tuple(
+                column for column in old_columns if column not in new_column_set
+            )
+            added_columns = tuple(
+                column for column in new_columns if column not in old_column_set
+            )
+            if removed_columns:
+                emit_side(
+                    row,
+                    mode="removed",
+                    tables=old_tables,
+                    columns=removed_columns,
+                )
+                emitted = True
+            if added_columns:
+                emit_side(
+                    row,
+                    mode="added",
+                    tables=new_tables,
+                    columns=added_columns,
+                )
+                emitted = True
+        elif old_tables or new_tables:
+            new_table_set = set(new_tables)
+            old_table_set = set(old_tables)
+            removed_tables = tuple(
+                table for table in old_tables if table not in new_table_set
+            )
+            added_tables = tuple(
+                table for table in new_tables if table not in old_table_set
+            )
+            if removed_tables:
+                emit_side(
+                    row,
+                    mode="removed",
+                    tables=removed_tables,
+                    columns=old_columns,
+                )
+                emitted = True
+            if added_tables:
+                emit_side(
+                    row,
+                    mode="added",
+                    tables=added_tables,
+                    columns=new_columns,
+                )
+                emitted = True
+        if emitted:
+            continue
+        add_group(
+            row,
+            mode="modified",
+            table=", ".join(tables),
+            column=", ".join(columns),
+            force_review_reason=(
+                "表列集合未形成可确认的增删差异，变化可能来自映射、类型或动态 SQL"
+            ),
+            uncertain_content="映射、类型或动态 SQL 的具体变化",
+        )
+
+    semantic_rows = []
+    for group in groups.values():
+        evidence = sorted(
+            group["evidence"].values(),
+            key=lambda item: (
+                str(item.get("证据位置") or ""),
+                str(item.get("契约类型") or ""),
+            ),
+        )
+        confirmed_evidence_count = sum(
+            bool(item.get("确认证据")) for item in evidence
+        )
+        force_review = bool(group["force_review_reasons"])
+        status = "已确认" if confirmed_evidence_count and not force_review else "需复核"
+        review_reasons = sorted(
+            group["force_review_reasons"] or group["evidence_review_reasons"]
+        )
+        semantic_rows.append({
+            **{key: value for key, value in group.items() if key not in {
+                "force_review_reasons", "evidence_review_reasons", "evidence",
+                "contract_types", "first_seen",
+            }},
+            "_first_seen": group["first_seen"],
+            "status": status,
+            "review_reason": "；".join(review_reasons),
+            "contract_types": sorted(group["contract_types"]),
+            "evidence": evidence,
+            "evidence_count": len(evidence),
+            "confirmed_evidence_count": confirmed_evidence_count,
+        })
+    semantic_rows.sort(key=lambda item: (
+        0 if item["status"] == "已确认" else 1,
+        item["_first_seen"],
+    ))
+    for item in semantic_rows:
+        item.pop("_first_seen", None)
+    confirmed_rows = [row for row in semantic_rows if row["status"] == "已确认"]
+    review_rows = [row for row in semantic_rows if row["status"] != "已确认"]
+    return {
+        "rows": semantic_rows,
+        "confirmed_rows": confirmed_rows,
+        "review_rows": review_rows,
+        "unique_change_count": len(semantic_rows),
+        "confirmed_count": len(confirmed_rows),
+        "review_count": len(review_rows),
+        "table_count": len({
+            (row["scope"], table)
+            for row in semantic_rows
+            for table in _database_contract_identifiers(row["table"])
+        }),
+        "raw_evidence_count": len(raw_rows),
+    }
+
+
+def _database_contract_evidence_label(row):
+    target = row.get("table") or "未确定表"
+    if row.get("column"):
+        target += "." + row["column"]
+    return f"{row.get('scope') or '未知来源'} / {target}"
+
+
 def render_database_contract_changes(findings, limit=10):
     contract = findings.get('database_contract') or {}
-    rows = list(contract.get('rows') or ())
+    evidence_rows = list(contract.get('rows') or ())
+    model = build_database_contract_report_model(evidence_rows)
+    rows = model["rows"]
     artifacts = findings.get('artifacts') or {}
     review_path = str(artifacts.get('database_contract_review_md') or '').strip()
     csv_path = str(artifacts.get('database_contract_csv') or '').strip()
@@ -8596,6 +8899,8 @@ def render_database_contract_changes(findings, limit=10):
         return []
 
     displayed = rows[:limit]
+    displayed_confirmed = [row for row in displayed if row["status"] == "已确认"]
+    displayed_review = [row for row in displayed if row["status"] != "已确认"]
     status = str(contract.get('coverage_status') or 'unknown')
     status_label = {
         'complete': '完整',
@@ -8603,24 +8908,33 @@ def render_database_contract_changes(findings, limit=10):
         'insufficient': '证据不足',
     }.get(status, '未记录')
     lines = [
-        f"### 数据库契约变化提醒（展示 {len(displayed)}/{len(rows)}）",
+        f"### 数据库访问契约变化（展示 {len(displayed)}/{len(rows)}）",
         "",
         (
-            "这里比较升级前后制品中的 MyBatis/ORM 数据访问契约。"
-            "它不属于 API 调用可达性结论，也不表示对应 DDL/迁移已经存在或已执行；"
-            "发现变化时，需要人工核对目标环境表结构并执行对应数据访问场景测试。"
+            "这里按来源范围、表、列和变化方向合并 Step3 扫描结果；"
+            "多个 Mapper、ResultMap 和 ORM 契约位置保留为同一变化的证据。"
+            "不同依赖不跨范围合并，因为现有证据不能证明同名表属于同一数据源。"
+        ),
+        "",
+        (
+            "> **结论边界**：本节表示升级前后 MyBatis/ORM 数据访问契约发生变化，"
+            "不属于 API 调用可达性结论，也不表示对应 DDL/迁移已经存在或已执行。"
         ),
         "",
         f"- 扫描覆盖状态：**{status_label}**",
-        f"- 识别到的契约变化：**{len(rows)}** 条",
+        f"- 涉及表：**{model['table_count']}** 个",
+        f"- 唯一表/列变化及待复核线索：**{model['unique_change_count']}** 条",
+        f"- 已确认：**{model['confirmed_count']}** 条",
+        f"- 需复核：**{model['review_count']}** 条",
+        f"- Step3 原始证据：**{model['raw_evidence_count']}** 条",
     ]
     detail_links = []
     if review_path:
-        detail_links.append(_report_link(review_path, '完整人工复核明细'))
+        detail_links.append(_report_link(review_path, 'Step3 完整扫描证据'))
     if csv_path:
-        detail_links.append(_report_link(csv_path, '结构化明细 CSV'))
+        detail_links.append(_report_link(csv_path, 'Step3 结构化证据 CSV'))
     if detail_links:
-        lines.append("- 全部明细位置：" + "；".join(detail_links))
+        lines.append("- 全部证据位置：" + "；".join(detail_links))
     lines.append("")
 
     gaps = list(contract.get('coverage_gaps') or ())
@@ -8632,7 +8946,7 @@ def render_database_contract_changes(findings, limit=10):
             ),
             "",
         ])
-    if not rows:
+    if not evidence_rows:
         lines.extend([
             (
                 "本次未识别到升级前后数据访问契约变化。"
@@ -8646,31 +8960,69 @@ def render_database_contract_changes(findings, limit=10):
     if len(rows) > len(displayed):
         lines.extend([
             f"正文仅展示前 {len(displayed)} 条，未展开 {len(rows) - len(displayed)} 条；"
-            "请在上面的完整人工复核明细中逐项查看。",
+            "请在上面的 Step3 完整扫描证据中逐项查看。",
             "",
         ])
-    lines.extend([
-        "| 依赖包 | 变化 | 契约类型 | 可信度 | 表/列 | 契约位置 | 人工复核建议 |",
-        "|---|---|---|---|---|---|---|",
-    ])
-    for row in displayed:
-        table_column = []
-        if row.get('表'):
-            table_column.append(f"表：{row['表']}")
-        if row.get('列'):
-            table_column.append(f"列：{row['列']}")
-        location = f"{row.get('契约位置') or '-'}#{row.get('语句或字段') or '-'}"
+    if displayed_confirmed:
+        lines.extend([
+            "#### 已识别的具体表/列变化",
+            "",
+            "| 来源范围 | 表 | 变化对象 | 具体变化 | 判断 | 证据 | 建议 |",
+            "|---|---|---|---|---|---:|---|",
+        ])
+    for row in displayed_confirmed:
+        object_label = f"列 `{row['column']}`" if row.get("column") else "整表访问"
         cells = (
-            row.get('依赖包') or '-',
-            row.get('变化类型') or '-',
-            row.get('契约类型') or '-',
-            row.get('可信度') or '-',
-            '；'.join(table_column) or '-',
-            location,
-            row.get('人工复核建议') or '-',
+            row.get("scope") or "-",
+            f"`{row['table']}`" if row.get("table") else "-",
+            object_label,
+            row.get("change") or "-",
+            row.get("status") or "-",
+            f"{row.get('evidence_count') or 0} 条",
+            row.get("action") or "-",
         )
         lines.append("| " + " | ".join(_md_cell(value, 220) for value in cells) + " |")
-    lines.append("")
+    if displayed_confirmed:
+        lines.append("")
+
+    if displayed_review:
+        lines.extend([
+            "#### 待复核线索",
+            "",
+            "| 来源范围 | 已识别表/列 | 未确定内容 | 原因 | 证据 |",
+            "|---|---|---|---|---:|",
+        ])
+        for row in displayed_review:
+            target = row.get("table") or "-"
+            if row.get("column"):
+                target += " / " + row["column"]
+            cells = (
+                row.get("scope") or "-",
+                target,
+                row.get("uncertain_content") or row.get("change") or "具体变化",
+                row.get("review_reason") or "现有证据不能形成唯一表列结论",
+                f"{row.get('evidence_count') or 0} 条",
+            )
+            lines.append("| " + " | ".join(_md_cell(value, 220) for value in cells) + " |")
+        lines.append("")
+
+    if displayed:
+        lines.extend(["#### Step3 证据摘要", ""])
+        for row in displayed:
+            evidence = list(row.get("evidence") or ())
+            preview = [
+                str(item.get("证据位置") or "-")
+                for item in evidence[:S6_DATABASE_CONTRACT_EVIDENCE_PREVIEW_LIMIT]
+            ]
+            hidden_count = max(len(evidence) - len(preview), 0)
+            suffix = f"；另有 {hidden_count} 条" if hidden_count else ""
+            lines.append(
+                f"- `{_md_cell(_database_contract_evidence_label(row), 160)}`："
+                f"{len(evidence)} 条；" + "；".join(
+                    f"`{_md_cell(location, 180)}`" for location in preview
+                ) + suffix
+            )
+        lines.append("")
     return lines
 
 
@@ -9982,21 +10334,27 @@ def render_user_visible_files(
         file_links = []
         if database_contract_review_path:
             file_links.append(
-                _report_link(database_contract_review_path, '数据库契约完整复核明细')
+                _report_link(database_contract_review_path, '数据库契约 Step3 完整扫描证据')
             )
         if database_contract_csv_path:
             file_links.append(
-                _report_link(database_contract_csv_path, '数据库契约明细 CSV')
+                _report_link(database_contract_csv_path, '数据库契约 Step3 证据 CSV')
             )
         contract = findings.get('database_contract') or {}
+        contract_model = build_database_contract_report_model(
+            contract.get('rows') or ()
+        )
         rows.append((
             '<br>'.join(file_links),
             (
-                '升级前后制品中的 MyBatis/ORM 数据访问契约变化，保留依赖包、'
-                '表/列、证据位置、可信度和人工复核建议；不扫描 DDL/迁移文件'
+                '每个 Mapper/ORM 契约位置一条 Step3 原始证据；主报告按来源范围、'
+                '表、列和变化方向去重展示，不扫描 DDL/迁移文件'
             ),
-            f"已识别契约变化全量 {len(contract.get('rows') or [])} 条",
-            '“一、依赖层面结论 / 数据库契约变化提醒”',
+            (
+                f"唯一变化及待复核线索 {contract_model['unique_change_count']} 条；"
+                f"Step3 原始证据全量 {contract_model['raw_evidence_count']} 条"
+            ),
+            '“一、依赖层面结论 / 数据库访问契约变化”',
         ))
     changed_path = str(artifacts.get("changed_apis_csv") or "").strip()
     if changed_path:
@@ -10132,8 +10490,8 @@ _MAIN_REPORT_TOC_ENTRIES = (
         1,
     ),
     (
-        "### 数据库契约变化提醒",
-        "数据库契约变化提醒",
+        "### 数据库访问契约变化",
+        "数据库访问契约变化",
         1,
     ),
     (

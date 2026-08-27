@@ -4147,21 +4147,130 @@ class Step6ReportObjectivityTest(unittest.TestCase):
 
         report = s6_report.generate_report(findings)
         section = report[
-            report.index("### 数据库契约变化提醒"):
+            report.index("### 数据库访问契约变化"):
             report.index("## 二、API 及调用关系")
         ]
         toc = report[
             report.index("## 报告目录"):report.index("## 一、依赖层面结论")
         ]
 
-        self.assertIn("[数据库契约变化提醒]", toc)
+        self.assertIn("[数据库访问契约变化]", toc)
         self.assertIn("展示 10/12", section)
-        self.assertIn("完整人工复核明细", section)
-        self.assertIn("结构化明细 CSV", section)
+        self.assertIn("Step3 完整扫描证据", section)
+        self.assertIn("Step3 结构化证据 CSV", section)
         self.assertIn("不表示对应 DDL/迁移已经存在或已执行", section)
         self.assertIn("column_9", section)
         self.assertNotIn("column_10", section)
-        self.assertIn("数据库契约完整复核明细", report)
+        self.assertIn("数据库契约 Step3 完整扫描证据", report)
+
+    def test_database_contract_report_groups_table_column_and_keeps_all_evidence(self):
+        rows = [
+            {
+                "依赖包": "com.acme:data-access",
+                "变化类型": "新增当前契约",
+                "契约类型": "MyBatis XML SELECT",
+                "可信度": "确认",
+                "表": "orders",
+                "列": "status",
+                "契约位置": "com.acme.OrderMapper",
+                "语句或字段": "findById",
+                "证据": "mapper/OrderMapper.xml#findById",
+            },
+            {
+                "依赖包": "com.acme:data-access",
+                "变化类型": "新增当前契约",
+                "契约类型": "ORM 持久化字段",
+                "可信度": "确认",
+                "表": "orders",
+                "列": "status",
+                "契约位置": "com.acme.Order",
+                "语句或字段": "status",
+                "证据": "com/acme/Order.class#status",
+            },
+        ]
+
+        model = s6_report.build_database_contract_report_model(rows)
+        report = "\n".join(s6_report.render_database_contract_changes({
+            "database_contract": {"coverage_status": "complete", "rows": rows},
+        }))
+
+        self.assertEqual(model["unique_change_count"], 1)
+        self.assertEqual(model["raw_evidence_count"], 2)
+        self.assertEqual(model["rows"][0]["evidence_count"], 2)
+        self.assertIn("唯一表/列变化及待复核线索：**1** 条", report)
+        self.assertIn("Step3 原始证据：**2** 条", report)
+        self.assertEqual(report.count("| `orders` | 列 `status` |"), 1)
+        self.assertIn("mapper/OrderMapper.xml#findById", report)
+        self.assertIn("com/acme/Order.class#status", report)
+
+    def test_database_contract_report_does_not_merge_unknown_datasource_scopes(self):
+        rows = [
+            {
+                "依赖包": coord,
+                "变化类型": "新增当前契约",
+                "契约类型": "MyBatis XML SELECT",
+                "可信度": "确认",
+                "表": "orders",
+                "列": "status",
+                "契约位置": f"{coord}.OrderMapper",
+                "语句或字段": "find",
+            }
+            for coord in ("com.acme:orders-a", "com.acme:orders-b")
+        ]
+
+        model = s6_report.build_database_contract_report_model(rows)
+
+        self.assertEqual(model["unique_change_count"], 2)
+        self.assertEqual(
+            {row["scope"] for row in model["rows"]},
+            {"com.acme:orders-a", "com.acme:orders-b"},
+        )
+
+    def test_database_contract_report_splits_modified_column_set_into_semantic_changes(self):
+        row = {
+            "依赖包": "com.acme:data-access",
+            "变化类型": "修改契约",
+            "契约类型": "MyBatis XML SELECT",
+            "可信度": "确认",
+            "表": "orders",
+            "列": "id, status",
+            "契约位置": "com.acme.OrderMapper",
+            "语句或字段": "find",
+            "旧契约": "表=orders；列=id, legacy_code",
+            "新契约": "表=orders；列=id, status",
+        }
+
+        model = s6_report.build_database_contract_report_model([row])
+
+        self.assertEqual(model["unique_change_count"], 2)
+        self.assertEqual(
+            {(item["mode"], item["column"]) for item in model["rows"]},
+            {("added", "status"), ("removed", "legacy_code")},
+        )
+
+    def test_database_contract_report_keeps_ambiguous_table_binding_for_review(self):
+        row = {
+            "依赖包": "com.acme:data-access",
+            "变化类型": "新增当前契约",
+            "契约类型": "MyBatis XML SELECT",
+            "可信度": "需复核",
+            "表": "orders, users",
+            "列": "id, status",
+            "契约位置": "com.acme.SearchMapper",
+            "语句或字段": "search",
+            "证据": "mapper/SearchMapper.xml#search",
+        }
+
+        model = s6_report.build_database_contract_report_model([row])
+        report = "\n".join(s6_report.render_database_contract_changes({
+            "database_contract": {"coverage_status": "complete", "rows": [row]},
+        }))
+
+        self.assertEqual(model["confirmed_count"], 0)
+        self.assertEqual(model["review_count"], 1)
+        self.assertEqual(model["table_count"], 2)
+        self.assertIn("待复核线索", report)
+        self.assertIn("不能可靠绑定每个列的所属表", report)
 
     def test_database_contract_gap_does_not_render_false_clean_conclusion(self):
         lines = s6_report.render_database_contract_changes({

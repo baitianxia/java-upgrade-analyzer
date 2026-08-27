@@ -299,6 +299,7 @@ Step6 已经生成了，但我想补充依赖源码后，从 Step0 重新确认�
 | `.upgrade-report/evidence/context/review.md` | 给人看的升级上下文确认页 |
 | `.upgrade-report/evidence/api_changes/changed_dependencies.md` | 依赖包维度的 API 变化和范围选择入口 |
 | `.upgrade-report/evidence/call_chain/alerts.csv` | 完整系统触达证据台账 |
+| `.upgrade-report/evidence/static_scan/s3_database_contract_changes.md` | Mapper/XML/ORM 数据库访问契约的 Step3 完整扫描证据 |
 
 人工阅读优先按这个顺序：
 
@@ -314,6 +315,9 @@ Step6 已经生成了，但我想补充依赖源码后，从 Step0 重新确认�
 ```text
 .upgrade-report/evidence/call_chain/alerts.csv
 ```
+
+若识别到数据库访问契约变化，主报告会按具体表、列和变化方向聚合，原 Mapper/XML/ORM 命中
+保留为 Step3 证据；详细边界见[输出文件与人工复核指南](docs/system/operations/outputs.md#step3背景兼容线索)。
 
 ## Step5 结果状态怎么理解
 

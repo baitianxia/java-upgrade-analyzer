@@ -106,10 +106,13 @@ Step3 线索不能直接证明当前系统受影响，也不能创建 Step4 正�
 | `evidence/static_scan/s3_springboot_config.csv` | Spring Boot 配置线索与扫描完成度 |
 | `evidence/static_scan/s3_dependency_compat.csv` | current 最终制品内依赖兼容规则命中 |
 | `evidence/static_scan/s3_dependency_classfile.csv` | 实际打包依赖的 classfile 版本台账 |
-| `evidence/static_scan/s3_database_contract_changes.md/.csv` | MyBatis/ORM 数据访问契约变化 |
+| `evidence/static_scan/s3_database_contract_changes.md/.csv` | MyBatis/ORM 数据访问契约的 Step3 原始证据；每个契约位置一行，同一表列可出现多行 |
 | `evidence/static_scan/s3_database_contract_summary.json` | 数据库契约覆盖和缺口摘要 |
 
 数据库契约扫描不证明 DDL 已存在或执行；无法绑定跨制品实体时记录覆盖缺口，不猜测关系。
+最终报告在同一依赖来源范围内按“表 + 列/整表 + 变化方向”去重展示，并把上述每个契约位置
+保留为证据。由于扫描结果没有物理数据源身份，相同表列不会跨依赖合并；多表语句、动态 SQL、
+只有 ResultMap 列而无法确定表名，或表列集合未发生明确增删的映射变化，单独进入“待复核线索”。
 
 ## Step4：依赖与变化事实
 
@@ -192,3 +195,6 @@ binary_failures/
 `.runtime/findings/s6_findings.json` 是程序使用的结构化结果，不属于主报告阅读路径。部分范围只统计用户选择的对象；未选择对象记录在 `analysis-scope.md`，不能归入“本次未完成分析”，也不能据部分范围给出全局结论。
 
 主报告先展示可能影响和仍不确定的结果，再展示静态未命中与未完成统计；完整 Markdown 和 CSV 保留所有对象及同一排序。任何行动建议都必须受证据边界约束，不能把静态分析结果写成已经完成的发布判断、代码修改或业务运行验证。
+数据库访问契约章节额外展示涉及表数、唯一表/列变化数、需复核线索数和 Step3 原始证据数；
+正文只展示有界的聚合结果，并就近链接 Step3 完整 Markdown/CSV 证据。表格中的“已确认”只表示
+base/current 制品中的契约变化有明确证据，不表示数据库 DDL 已经部署。

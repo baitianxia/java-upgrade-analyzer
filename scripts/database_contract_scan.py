@@ -919,15 +919,17 @@ def _write_outputs(output_dir: Path, rows: list[dict[str, str]], summary: dict[s
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     lines = [
-        "# 数据库契约变化明细",
+        "# 数据库契约变化明细（Step3 扫描证据）",
         "",
         "> 本文件比较升级前后制品中的数据访问契约，不扫描 DDL/迁移文件，",
         "> 因而不表示对应表结构变更已经存在或已在目标环境执行。",
+        "> 本文件按 Mapper/ORM 契约位置保留原始变化证据；同一表列可能出现多行。",
+        "> 最终报告按来源范围、表、列和变化方向聚合展示，并回链到这些证据。",
         "> MyBatis-Plus 约定式无注解实体通过同一制品内的 `BaseMapper<Entity>` 绑定识别；",
         "> 实体无法在该制品内绑定时会记录覆盖缺口，不推断跨制品关系。",
         "",
         f"- 覆盖状态：{summary['coverage_status']}",
-        f"- 变化条目：{len(rows)}",
+        f"- Step3 原始证据条目：{len(rows)}",
         f"- 涉及依赖包：{summary['changed_dependency_count']}",
         "",
     ]
@@ -937,7 +939,7 @@ def _write_outputs(output_dir: Path, rows: list[dict[str, str]], summary: dict[s
         lines.append("")
     if rows:
         lines.extend([
-            "## 全部变化", "",
+            "## 全部扫描证据", "",
             "| 依赖包 | 变化 | 契约类型 | 可信度 | 表 | 列 | 契约位置 | 人工复核建议 |",
             "|---|---|---|---|---|---|---|---|",
         ])

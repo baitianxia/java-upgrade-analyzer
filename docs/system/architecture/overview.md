@@ -145,9 +145,13 @@ Step3 扫描：
 - `javax`/`jakarta` 迁移；
 - Spring Boot 配置与自动装配；
 - runtime flag、serialization、reflection；
-- current 最终制品依赖兼容和 classfile 版本。
+- current 最终制品依赖兼容和 classfile 版本；
+- base/current 最终制品中的 MyBatis Mapper、ResultMap、JPA/Hibernate 与
+  MyBatis-Plus 数据访问契约。
 
-输出位于 `evidence/static_scan/`。Step3 是背景风险层，不得制造 Step4 正式 API projection，不覆盖 binary decision。
+数据库契约扫描按 Mapper/ORM 契约位置保留完整原始证据，不扫描 DDL 或迁移文件，
+也不证明目标数据库已经执行对应结构变更。输出位于 `evidence/static_scan/`。
+Step3 是背景风险层，不得制造 Step4 正式 API projection，不覆盖 binary decision。
 
 ## 9. Step4：Binary generation 与 API 变化视图
 
@@ -256,6 +260,7 @@ Step6 只读取同 generation 的 Step5 范围，发布：
 - `.runtime/findings/s6_findings.json`。
 
 报告顺序固定为依赖层 → API/调用关系 → 文件说明。Markdown/CSV 从同一排序数据生成，并保留 coord、base/current 版本、四维状态和关键路径。
+数据库访问契约的证据与报告投影遵循[输出文件与人工复核指南](../operations/outputs.md#step3背景兼容线索)。
 
 完成摘要使用“可能影响/仍不确定”，不保留旧 severity bucket、`not_impacted` 或 confirmed impact/no-impact 空字段。
 

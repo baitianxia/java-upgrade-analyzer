@@ -5148,8 +5148,8 @@ class Step6ReportCompletionBoundaryTest(unittest.TestCase):
             base_api_model,
             {**zero_visible_dependency_model, "incomplete": [], "completed": []},
         ))
-        self.assertIn("数据库契约完整复核明细", review_only_text)
-        self.assertNotIn("数据库契约明细 CSV", review_only_text)
+        self.assertIn("数据库契约 Step3 完整扫描证据", review_only_text)
+        self.assertNotIn("数据库契约 Step3 证据 CSV", review_only_text)
 
         csv_only = copy.deepcopy(visible_common)
         csv_only["artifacts"] = {
@@ -5160,8 +5160,8 @@ class Step6ReportCompletionBoundaryTest(unittest.TestCase):
             base_api_model,
             {**zero_visible_dependency_model, "incomplete": [], "completed": []},
         ))
-        self.assertIn("数据库契约明细 CSV", csv_only_text)
-        self.assertNotIn("数据库契约完整复核明细", csv_only_text)
+        self.assertIn("数据库契约 Step3 证据 CSV", csv_only_text)
+        self.assertNotIn("数据库契约 Step3 完整扫描证据", csv_only_text)
 
     def test_contract_validators_empty_present_and_existing_diagnostic_matrix(self):
         with tempfile.TemporaryDirectory() as tmp:
