@@ -13863,7 +13863,11 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
         self.assertEqual(dependency_model["total_count"], 1)
         self.assertEqual(dependency_model["completed_count"], 1)
         self.assertEqual(dependency_model["incomplete_count"], 0)
-        self.assertNotIn("## 报告目录", report_text)
+        self.assertIn("## 报告目录", report_text)
+        self.assertLess(
+            report_text.index("## 报告目录"),
+            report_text.index("## 一、依赖层面结论"),
+        )
         self.assertIn("## 一、依赖层面结论", report_text)
         self.assertIn("## 二、API 及调用关系", report_text)
         self.assertIn("## 三、用户可见文件说明", report_text)
@@ -14515,7 +14519,7 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
             )
             self.assertIn("未展开 391 个", report_text)
             self.assertIn(
-                "### 已确认触达与结论未确定的 API（完整展示 0/0）",
+                "### 已确认触达与结论未确定的 API（展示 0/0）",
                 report_text,
             )
             self.assertIn(
@@ -14528,7 +14532,7 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
             )
             self.assertIn(
                 "[完整 API 分析与调用关系明细]"
-                "(all-impact-details.md#unanalyzed-apis)",
+                "(all-impact-details.md)",
                 report_text,
             )
             self.assertNotIn(
@@ -14566,7 +14570,7 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
             self.assertIn("## 未完成分析的 API（401）", full_api_text)
             self.assertIn(
                 "[未完成 API 及原因]"
-                "(all-impact-details.md#unanalyzed-apis)",
+                "(all-impact-details.md#未完成分析的-api401)",
                 full_dependency_text,
             )
             self.assertEqual(
@@ -14675,17 +14679,18 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
                 report_text,
             )
             self.assertIn(
-                "### 已确认触达与结论未确定的 API（完整展示 60/60）",
+                "### 已确认触达与结论未确定的 API（展示 12/60）",
                 report_text,
             )
             self.assertIn("未展开 50 个", report_text)
+            self.assertIn("未展开 48 个", report_text)
             self.assertIn("com.example.Probable0.changed", report_text)
             self.assertIn("com.example.Probable11.changed", report_text)
             self.assertIn("com.example.Probable19.changed", report_text)
-            self.assertIn("com.example.Probable2.changed", report_text)
-            self.assertIn("com.example.Probable29.changed", report_text)
-            self.assertIn("com.example.Uncertain0.changed", report_text)
-            self.assertIn("com.example.Uncertain29.changed", report_text)
+            self.assertNotIn("com.example.Probable2.changed", report_text)
+            self.assertNotIn("com.example.Probable29.changed", report_text)
+            self.assertNotIn("com.example.Uncertain0.changed", report_text)
+            self.assertNotIn("com.example.Uncertain29.changed", report_text)
             self.assertEqual(report_text.count("### `com.example.Uncertain"), 0)
             self.assertNotIn("主报告按结论类型各展示前 20 条", report_text)
             self.assertNotIn("Probable action", report_text)
@@ -14704,7 +14709,7 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
             )
             self.assertIn(
                 "[完整 API 分析与调用关系明细]"
-                "(all-impact-details.md#unanalyzed-apis)",
+                "(all-impact-details.md)",
                 report_text,
             )
             full_api_text = full_api_md.read_text(encoding="utf-8")
@@ -14959,7 +14964,7 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
         self.assertIn("## 二、API 及调用关系", report_text)
         self.assertIn("### 未完成分析的 API（展示 2/2）", report_text)
         self.assertIn(
-            "### 已确认触达与结论未确定的 API（完整展示 1/1）",
+            "### 已确认触达与结论未确定的 API（展示 1/1）",
             report_text,
         )
         self.assertIn("com.example.Demo.behavior", report_text)
@@ -14981,7 +14986,7 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
         )
         self.assertIn(
             "[完整 API 分析与调用关系明细]"
-            "(all-impact-details.md#unanalyzed-apis)",
+            "(all-impact-details.md)",
             report_text,
         )
         self.assertIn("com.example.Demo.behavior", full_api_md)
@@ -14989,7 +14994,7 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
         self.assertIn("com.example.Demo.unknown", full_api_md)
         self.assertIn(
             "[未完成 API 及原因]"
-            "(all-impact-details.md#unanalyzed-apis)",
+            "(all-impact-details.md#未完成分析的-api2)",
             full_dependency_md,
         )
         self.assertNotIn("缺少依赖源码/构建产物", report_text)
@@ -19300,6 +19305,45 @@ org.example.Outer$Inner(org.example.Outer, java.lang.String);
         )
 
         self.assertEqual(inferred, "String")
+
+    def test_source_analyzer_strips_java_text_blocks_atomically(self):
+        stripped = source_analyzer._strip_strings_and_comments(
+            'before(); String text = """\nhidden.call();\n"""; after();'
+        )
+
+        self.assertEqual(stripped, "before(); String text = ; after();")
+
+    def test_param_type_inference_handles_generic_casts_and_invocation_type_args(self):
+        method_def = SimpleNamespace(
+            class_fqcn="com.example.Service",
+            class_name="Service",
+            package_name="com.example",
+            param_types={},
+            field_types={},
+            local_var_types={},
+            local_method_return_types={},
+            known_method_return_types={},
+            known_method_return_types_by_signature={},
+            imports={"Map": "java.util.Map", "List": "java.util.List"},
+        )
+        infer = lambda expression: source_analyzer.infer_param_type_from_expression(
+            expression, method_def, local_var_types={}
+        )
+
+        self.assertEqual(infer("(java.util.List<String>) input"), "List")
+        self.assertEqual(infer("(Map<String, List<Order>>) input"), "Map")
+        self.assertIsNone(infer("client.<String>convert(input)"))
+        self.assertIsNone(infer("<String>convert(input)"))
+        self.assertEqual(infer("LEFT < RIGHT"), "boolean")
+        for java_lang_type in (
+            "CharSequence", "Byte", "Character", "Short", "Iterable",
+            "Record", "Enum",
+        ):
+            with self.subTest(java_lang_type=java_lang_type):
+                self.assertEqual(
+                    source_analyzer.resolve_type_fqn(java_lang_type, method_def),
+                    f"java.lang.{java_lang_type}",
+                )
 
     def test_trace_api_reaches_overload_target_with_object_param_from_chained_tostring_and_subtype(self):
         with tempfile.TemporaryDirectory() as tmp:

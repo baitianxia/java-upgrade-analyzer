@@ -73,6 +73,11 @@ python3 scripts/real_project_regression.py --case guard-exploratory
 import；需要 Java/Maven 的测试 profile 只检查命令可执行，不把 CI 工具版本强加给用户工程。
 运行分析时不得隐式联网修复环境。
 
+质量门中的每个子任务都有有限超时：普通任务默认 1 小时，heavy 与真实项目任务默认 6 小时。
+超时结果必须记录 `timed_out=true`、实际预算和返回码 124，并清理完整子进程树；不得把挂起任务
+当作测试通过，也不得留下后台 Java/Python 进程。每个质量门进程使用独立审计目录，避免并发
+执行相互覆盖结果。
+
 快速检查：
 
 ```bash
@@ -135,7 +140,9 @@ python3 scripts/quality_signal_audit.py <real-project-result.json> --json-out <q
 - 多模块项目必须明确目标部署模块；
 - 不得用不完整 dependency tree 替代正式产物事实；
 - Maven/Gradle 内部模块补全只能覆盖目标模块运行时闭包，必须排除目标模块自身和无关 sibling；Maven 有效属性、Gradle project path、自定义 `finalName` 以及构建输出优先级都要有正反例；
+- base/current 必须分别在对应 revision 中选择构建工具；Maven timestamped SNAPSHOT 的数值基、时间戳和 build sequence 必须有顺序回归；
 - 静态项目模型只能为最终制品中实际存在的内部 JAR 补身份，不能覆盖构建工具报告的不同版本，也不能扩展制品依赖范围；
+- 业务 fat JAR / boot JAR / WAR 的运行时内容留存必须覆盖 manifest、业务 `META-INF`、Maven 元数据与签名对的取舍；损坏或无法打开的候选归档不得按普通 thin JAR 继续；
 - 无法安全解析的坐标必须显式进入交互或 unresolved。
 
 ### Step4
@@ -164,15 +171,16 @@ python3 scripts/quality_signal_audit.py <real-project-result.json> --json-out <q
 
 ### Step6
 
-- `report.md` 必须按“依赖层面结论 → API 及调用关系 → 用户可见文件说明”排列；
+- `report.md` 必须在生成信息与范围说明后提供只含已生成章节的原生 Markdown 目录，再按“依赖层面结论 → API 及调用关系 → 用户可见文件说明”排列；目录不得插入 HTML 锚点，也不得混入完整明细文件链接；
 - 依赖层和 API 层必须统一使用“变化总数、已完成分析、未完成分析、确认有影响、确认不受影响、尚未确认影响”六列；总数必须等于已完成与未完成之和；依赖已有确认有影响结果但仍有其他 API 未完成时，必须同时保留确认有影响事实和未完成状态；
 - 部分分析时，六列统计、主报告逐项结果和两份完整明细只能包含 `included_dependency_coords` 及其变化 API；未选择对象属于范围外对象，不得计入“未完成分析”。选择前全集继续保留在原始依赖/API 清单，未纳入对象及原因进入 `analysis-scope.md`；
 - 同一层级的已完成与未完成明细必须使用相同表头和列顺序；依赖与 API 明细共同使用“当前系统调用关系、分析结果、结果说明”，不得分别改用“分析状态、未完成原因、分析结论、结论依据”等不同标题；
 - 已执行分析但未发现当前系统调用关系属于已完成分析；缺少关键输入或分析过程未完成才进入未完成分析，并逐项显示原因；
 - 正文只展示部分明细时必须同时给出展示数、总数、未展示数量和对应全量文件；
 - 本轮范围内全部依赖结果进入 `all-affected-dependencies.md`，本轮范围内全部 API 结果及完整调用关系进入 `all-impact-details.md`，两者不得合并为同一个链接；
-- 主报告必须按依赖坐标分组完整展示本轮全部 `reachable` 和 `uncertain` API，依赖之间及依赖内部都按影响/复核优先证据排序；`not_found_in_static_analysis` 在主报告只展示统计且必须明确不等于安全。完整依赖/API 明细仍按“确认有影响 → 未确认影响 → 确认不受影响”组织，并覆盖本轮范围内全部状态；
+- 主报告必须按依赖坐标分组、在固定上限内展示排序靠前的 `reachable` 和 `uncertain` API，依赖之间及依赖内部都按影响/复核优先证据排序；依赖和 API 章节必须标明展示数、总数、未展示数，并在正文对应位置直接链接完整 Markdown 与 CSV。`not_found_in_static_analysis` 在主报告只展示统计且必须明确不等于安全。完整依赖/API 明细仍按“确认有影响 → 未确认影响 → 确认不受影响”组织，并覆盖本轮范围内全部状态；
 - `all-affected-dependencies.md` 和 `all-impact-details.md` 必须分别生成同数据、同顺序的 `all-affected-dependencies.csv` 和 `all-impact-details.csv`，CSV 使用与 Markdown 相同的用户可读字段；
+- 两份 Markdown 之间的跳转必须指向目标文件的原生标题 fragment，禁止用人工 HTML `<a>` 标签制造第二套锚点；
 - `alerts.csv` 是一行一条的原始分析记录，必须保留全量记录；`report.md` 的文件说明必须解释它与用户可读 API 明细的区别；
 - `s6_findings.json` 保持结构化消费能力。
 
@@ -203,9 +211,9 @@ release profile 额外执行三类阻塞门：
 - `branch_coverage_core` 使用 Python 运行时 line-arc 跟踪计算 `if` 的 true/false decision
   branch，而不是把行覆盖冒充分支覆盖。`signature_utils.py` 与
   `step5_evidence_model.py` 的最低门槛为 75%，纯追踪策略 `step5_trace_policy.py` 为 90%；
-  缺失函数、无可测分支或低于门槛都会失败。
+  缺失函数、无可测分支、测试 loader 错误、零测试执行或低于门槛都会失败；空目标不能形成通过结果。
 - `production_mutations` 对生产 AST 应用 owner、签名、坐标、change identity、证据完整性、
-  深度预算、最终制品绑定与归档安全等变异。任一 survived 或 infrastructure failure 都会失败。
+  深度预算、最终制品绑定与归档安全等变异。变异测试在隔离 worker 中执行，必须区分被测试杀死的 mutant 与 loader 错误、零测试等基础设施失败；任一 survived 或 infrastructure failure 都会失败。
 - `test_health` 对声明式 health 闭集重复运行，输出每个测试的结果序列和耗时降序排行；结果波动
   视为 flaky，单测平均耗时超过 profile 预算视为 slow，二者都阻塞 release。
 
@@ -232,6 +240,11 @@ Step5 的事实提取、身份解析、图存储、纯追踪策略、结论收�
 `blocking`。超时、命令缺失、权限不足、启动异常、非零退出和要求输出却为空分别使用稳定
 reason code。上层必须把失败投影到 coverage/EvidenceFailure；禁止捕获后返回空字符串，
 也禁止后续 collector ingestion 覆盖已经记录的工具失败。
+
+共享输入边界同样必须失败关闭：归档检查按流分块读取，并受 entry 数、解压总量、嵌套深度、
+单个嵌套归档大小和取消信号约束；取消回调自身异常也视为取消，不能绕过检查。JAR 签名元数据
+只按 signer basename 区分 `.SF`、签名块、有效配对和孤立 `.SF`；结构信息不得冒充证书或
+加密有效性结论。XML 的 DTD/ENTITY 拒绝必须覆盖 UTF-8、UTF-16、UTF-32 及 BOM/NUL 形态。
 
 ## 正例和负例
 

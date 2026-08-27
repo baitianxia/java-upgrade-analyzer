@@ -11,11 +11,10 @@ import json
 from pathlib import Path
 import re
 import shutil
-import subprocess
 import sys
 import zipfile
 
-from compat import git_cmd, run_cmd
+from compat import git_cmd, run_cmd, run_managed_subprocess
 
 
 PUBLIC_SCRIPT_RE = re.compile(r"\$\{CLAUDE_SKILL_DIR\}/(scripts/[A-Za-z0-9_./-]+\.py)")
@@ -126,7 +125,7 @@ def _semantic_state_sha(path: Path) -> str:
 
 
 def _run(command, cwd):
-    return subprocess.run(
+    return run_managed_subprocess(
         command,
         cwd=str(cwd),
         capture_output=True,
@@ -134,6 +133,7 @@ def _run(command, cwd):
         encoding="utf-8",
         errors="replace",
         timeout=60,
+        check=False,
     )
 
 

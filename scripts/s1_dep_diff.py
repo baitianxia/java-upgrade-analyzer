@@ -37,6 +37,7 @@ from artifact_safety import (
     _archive_entry_expansion_ratio,
     _unsafe_entry_name,
     is_allowed_duplicate_archive_entry,
+    jar_signature_metadata,
     require_safe_archive,
 )
 from artifact_coordinates import normalize_artifact_coord
@@ -140,6 +141,9 @@ def _business_content_entries(archive):
     has_application_layout = any(
         name.startswith(application_prefixes) for name in names
     )
+    rewrite_sensitive_signature_entries = set(
+        jar_signature_metadata(names).rewrite_sensitive_entries
+    )
     entries = []
     seen_targets = set()
     for name in names:
@@ -148,11 +152,21 @@ def _business_content_entries(archive):
                 (value for value in application_prefixes if name.startswith(value)),
                 '',
             )
-            if not prefix:
+            if prefix:
+                target_name = name[len(prefix):]
+            elif name.upper() == 'META-INF/MANIFEST.MF':
+                # The outer manifest controls multi-release class/resource
+                # selection and remains part of the application runtime view.
+                target_name = name
+            else:
                 continue
-            target_name = name[len(prefix):]
         else:
-            if name.startswith(('META-INF/', 'BOOT-INF/', 'WEB-INF/', 'lib/')):
+            upper_name = name.upper()
+            packaging_only = (
+                upper_name.startswith('META-INF/MAVEN/')
+                or name in rewrite_sensitive_signature_entries
+            )
+            if packaging_only or name.startswith(('BOOT-INF/', 'WEB-INF/', 'lib/')):
                 continue
             target_name = name
         if not target_name:
@@ -1869,6 +1883,35 @@ def parse_version_info(version):
     if not normalized:
         return None
 
+    # Maven resolves ``*-SNAPSHOT`` artifacts to timestamped physical
+    # versions such as ``1.0-20240101.090000-123``.  The timestamp and build
+    # number qualify ``1.0``; they are not extra numeric base components.
+    timestamped_snapshot = re.fullmatch(
+        r'(?P<base>\d+(?:[._-]\d+)*)-'
+        r'(?P<date>\d{8})\.(?P<time>\d{4,6})-(?P<build>\d+)',
+        normalized,
+    )
+    if timestamped_snapshot:
+        return {
+            'base': [
+                int(token)
+                for token in re.split(
+                    r'[._-]', timestamped_snapshot.group('base')
+                )
+            ],
+            'stage_rank': -5,
+            'stage_num': int(timestamped_snapshot.group('build')),
+            'stage_sequence': (
+                1,
+                int(timestamped_snapshot.group('date')),
+                int(timestamped_snapshot.group('time')),
+                int(timestamped_snapshot.group('build')),
+            ),
+            'text': normalized,
+            'qualifier': 'snapshot',
+            'timestamped_snapshot': True,
+        }
+
     stage_rank_map = {
         'snapshot': -5,
         'alpha': -4,
@@ -1910,8 +1953,10 @@ def parse_version_info(version):
         'base': base,
         'stage_rank': stage_rank,
         'stage_num': stage_num,
+        'stage_sequence': (0,) if qualifier == 'snapshot' else (stage_num,),
         'text': normalized,
         'qualifier': qualifier,
+        'timestamped_snapshot': False,
     }
 
 
@@ -1937,8 +1982,14 @@ def compare_versions(old_ver, new_ver):
     if left_nums < right_nums:
         return -1
 
-    left_stage = (left['stage_rank'], left['stage_num'])
-    right_stage = (right['stage_rank'], right['stage_num'])
+    left_stage = (
+        left['stage_rank'],
+        tuple(left.get('stage_sequence') or (left['stage_num'],)),
+    )
+    right_stage = (
+        right['stage_rank'],
+        tuple(right.get('stage_sequence') or (right['stage_num'],)),
+    )
     if left_stage > right_stage:
         return 1
     if left_stage < right_stage:
@@ -3075,8 +3126,11 @@ def _detect_archive_packaging_type(artifact_path):
     try:
         with zipfile.ZipFile(str(artifact_path)) as outer_zip:
             names = [name.lower() for name in outer_zip.namelist()]
-    except Exception:
-        return 'unknown'
+    except Exception as exc:
+        raise RuntimeError(
+            f"最终制品扫描不完整：{Path(artifact_path).resolve()}。"
+            f"archive_open:{type(exc).__name__}:{exc}"
+        ) from exc
     if any(name.startswith('boot-inf/lib/') and name.endswith('.jar') for name in names):
         return 'boot_jar'
     if any(name.startswith('web-inf/lib/') and name.endswith('.jar') for name in names):
@@ -4971,6 +5025,21 @@ def create_branch_worktree(branch, work_dir, side=""):
     )
 
 
+def detect_workspace_build_tool(workspace, requested=""):
+    requested = str(requested or "").strip().lower()
+    if requested in {"maven", "gradle"}:
+        return requested
+    root = Path(workspace)
+    if (root / "pom.xml").is_file():
+        return "maven"
+    if any((root / name).is_file() for name in (
+        "build.gradle", "build.gradle.kts", "settings.gradle",
+        "settings.gradle.kts", "gradlew", "gradlew.bat",
+    )):
+        return "gradle"
+    return "maven"
+
+
 def remove_branch_worktree(temp_dir, work_dir):
     remove_detached_worktree(
         temp_dir,
@@ -4998,6 +5067,7 @@ def get_packaged_deps_by_switching_branch(
     build_tool='maven',
 ):
     blocked_error = None
+    effective_build_tool = str(build_tool or 'maven').strip().lower()
     env = None
     temp_dir = None
     result = None
@@ -5039,9 +5109,12 @@ def get_packaged_deps_by_switching_branch(
             )
     if blocked_error is None:
         try:
+            effective_build_tool = detect_workspace_build_tool(
+                temp_dir, build_tool
+            )
             collector = (
                 collect_gradle_deps_for_workspace
-                if str(build_tool or 'maven').lower() == 'gradle'
+                if effective_build_tool == 'gradle'
                 else collect_maven_deps_for_workspace
             )
             collector_kwargs = {
@@ -5055,13 +5128,14 @@ def get_packaged_deps_by_switching_branch(
                 'observer': observer,
                 'side': side,
             }
-            if str(build_tool or 'maven').lower() == 'maven':
+            if effective_build_tool == 'maven':
                 collector_kwargs['active_maven_profiles'] = active_maven_profiles
             deps, meta = collector(
                 str(temp_dir),
                 **collector_kwargs,
             )
             meta['branch'] = branch
+            meta['build_tool'] = effective_build_tool
             meta['jdk_home'] = resolve_effective_jdk_home(jdk_home)
             meta['worktree_dir'] = str(temp_dir)
             artifact_path = str(meta.get('artifact_path') or '').strip()
@@ -5092,12 +5166,12 @@ def get_packaged_deps_by_switching_branch(
                     exc,
                     default_stage=(
                         "gradle_build"
-                        if str(build_tool).lower() == 'gradle'
+                        if effective_build_tool == 'gradle'
                         else "mvn_package"
                     ),
                     default_command=(
                         "gradlew --no-daemon --console=plain build -x test"
-                        if str(build_tool).lower() == 'gradle'
+                        if effective_build_tool == 'gradle'
                         else f"mvn --batch-mode {MAVEN_SKIP_TEST_COMPILATION_ARG} package"
                     ),
                     side=side,
@@ -5144,6 +5218,7 @@ def get_runtime_deps_by_switching_branch(
     build_tool='maven',
 ):
     blocked_error = None
+    effective_build_tool = str(build_tool or 'maven').strip().lower()
     env = None
     temp_dir = None
     result = None
@@ -5187,6 +5262,9 @@ def get_runtime_deps_by_switching_branch(
             )
     if blocked_error is None:
         try:
+            effective_build_tool = detect_workspace_build_tool(
+                temp_dir, build_tool
+            )
             runtime_deps, list_command = collect_runtime_deps_for_workspace(
                 str(temp_dir),
                 primary_module=primary_module,
@@ -5195,7 +5273,7 @@ def get_runtime_deps_by_switching_branch(
                 observer=observer,
                 side=side,
                 active_maven_profiles=active_maven_profiles,
-                build_tool=build_tool,
+                build_tool=effective_build_tool,
             )
             result = (
                 runtime_deps,
@@ -5204,6 +5282,7 @@ def get_runtime_deps_by_switching_branch(
                     'list_command': list_command,
                     'jdk_home': resolve_effective_jdk_home(jdk_home),
                     'worktree_dir': str(temp_dir),
+                    'build_tool': effective_build_tool,
                 },
             )
         except Exception as exc:
@@ -5214,13 +5293,13 @@ def get_runtime_deps_by_switching_branch(
                     exc,
                     default_stage=(
                         "gradle_dependencies"
-                        if str(build_tool).lower() == 'gradle'
+                        if effective_build_tool == 'gradle'
                         else "mvn_dependency_list"
                     ),
                     default_command=(
                         "gradlew --no-daemon --console=plain dependencies "
                         "--configuration runtimeClasspath"
-                        if str(build_tool).lower() == 'gradle'
+                        if effective_build_tool == 'gradle'
                         else (
                             f"mvn --batch-mode {MAVEN_SKIP_TEST_COMPILATION_ARG} dependency:list "
                             "-DincludeScope=runtime "
@@ -5517,7 +5596,10 @@ def main():
     )
     ap.add_argument('--base',           dest='base_branch',    help='基准分支名（自动模式）')
     ap.add_argument('--current',        dest='current_branch', help='当前分支名（自动模式）')
-    ap.add_argument('--tool',           choices=['maven', 'gradle'], default=None)
+    ap.add_argument('--tool', choices=['maven', 'gradle'], default=None,
+                    help='兼容参数；同时指定 base/current 构建工具。')
+    ap.add_argument('--base-tool', choices=['maven', 'gradle'], default=None)
+    ap.add_argument('--current-tool', choices=['maven', 'gradle'], default=None)
     ap.add_argument('--work-dir',       default='.')
     ap.add_argument('--base-artifact-path',
                     help='基准侧已编译产物路径（直接产物模式）')
@@ -5566,7 +5648,20 @@ def main():
             or orchestrated_input.get("current_resolved_ref", "")
             or orchestrated_input.get("current_branch", "")
         )
-        args.tool = args.tool or orchestrated_input.get("tool", "maven")
+        legacy_tool = args.tool or orchestrated_input.get("tool", "")
+        legacy_is_explicit = bool(
+            args.tool or orchestrated_input.get("tool_explicit")
+        )
+        args.base_tool = (
+            args.base_tool
+            or orchestrated_input.get("base_tool", "")
+            or (legacy_tool if legacy_is_explicit else "")
+        )
+        args.current_tool = (
+            args.current_tool
+            or orchestrated_input.get("current_tool", "")
+            or legacy_tool
+        )
         args.base_artifact_path = args.base_artifact_path or orchestrated_input.get("base_artifact_path", "")
         args.current_artifact_path = args.current_artifact_path or orchestrated_input.get("current_artifact_path", "")
         args.base_source_project_dir = args.base_source_project_dir or orchestrated_input.get("base_source_project_dir", "")
@@ -5596,7 +5691,8 @@ def main():
             ]
         if not args.allow_unresolved and orchestrated_input.get("allow_unresolved"):
             args.allow_unresolved = True
-    args.tool = args.tool or 'maven'
+    args.base_tool = args.base_tool or args.tool or ''
+    args.current_tool = args.current_tool or args.tool or ''
 
     manual_coord_overrides, invalid_manual_overrides = parse_manual_coord_overrides(args.manual_coord_override)
     if invalid_manual_overrides:
@@ -5721,7 +5817,7 @@ def main():
                         artifact_path=args.base_artifact_path,
                         observer=observer,
                         active_maven_profiles=args.active_maven_profile,
-                        build_tool=args.tool,
+                        build_tool=args.base_tool,
                         source_resolution=confirmed_source_resolution("base"),
                         expected_commit=str(orchestrated_input.get("base_expected_commit") or ""),
                         expected_remote=str(ref_binding.get("remote") or ""),
@@ -5748,7 +5844,7 @@ def main():
                         artifact_path=args.current_artifact_path,
                         observer=observer,
                         active_maven_profiles=args.active_maven_profile,
-                        build_tool=args.tool,
+                        build_tool=args.current_tool,
                         source_resolution=confirmed_source_resolution("current"),
                         expected_commit=str(orchestrated_input.get("current_expected_commit") or ""),
                         expected_remote=str(ref_binding.get("remote") or ""),
@@ -5899,7 +5995,7 @@ def main():
                 sys.exit(EXIT_AWAITING_USER)
         except Step1CommandExecutionBlockedError as e:
             interaction = build_step1_command_blocked_interaction(e)
-            print(f"当前输入已进入执行阶段，但 {args.tool} 命令被环境问题阻塞。", file=sys.stderr)
+            print("当前输入已进入执行阶段，但构建工具命令被环境问题阻塞。", file=sys.stderr)
             print(f"  - 阻塞阶段: {e.stage}", file=sys.stderr)
             if e.branch:
                 print(f"  - 失败分支: {e.branch}", file=sys.stderr)
@@ -5921,9 +6017,11 @@ def main():
             attach_unresolved_side(base_meta.get('unresolved_items') or [], 'base')
             + attach_unresolved_side(curr_meta.get('unresolved_items') or [], 'current')
         )
-    elif args.base_branch and args.current_branch and args.tool in {'maven', 'gradle'}:
+    elif args.base_branch and args.current_branch:
         print(
-            f"模式：自动切换分支并使用 {args.tool} 对目标模块执行真实构建",
+            "模式：在固定 revision 的隔离工作区中分别识别并执行 "
+            f"base/current 构建工具（{args.base_tool or 'auto'}/"
+            f"{args.current_tool or 'auto'}）",
             file=sys.stderr,
         )
         try:
@@ -5938,7 +6036,7 @@ def main():
                     artifact_cache_dir=Path(args.output).parent / STEP1_ARTIFACTS_DIRNAME if args.output else None,
                 observer=observer,
                 active_maven_profiles=args.active_maven_profile,
-                build_tool=args.tool,
+                build_tool=args.base_tool,
             )
             curr_deps, curr_meta = get_packaged_deps_by_switching_branch(
                     args.current_branch, args.work_dir, args.primary_module, args.modules,
@@ -5950,11 +6048,11 @@ def main():
                     artifact_cache_dir=Path(args.output).parent / STEP1_ARTIFACTS_DIRNAME if args.output else None,
                 observer=observer,
                 active_maven_profiles=args.active_maven_profile,
-                build_tool=args.tool,
+                build_tool=args.current_tool,
             )
         except Step1CommandExecutionBlockedError as e:
             interaction = build_step1_command_blocked_interaction(e)
-            print(f"当前输入已进入执行阶段，但 {args.tool} 命令被环境问题阻塞。", file=sys.stderr)
+            print("当前输入已进入执行阶段，但构建工具命令被环境问题阻塞。", file=sys.stderr)
             print(f"  - 阻塞阶段: {e.stage}", file=sys.stderr)
             if e.branch:
                 print(f"  - 失败分支: {e.branch}", file=sys.stderr)
@@ -5971,7 +6069,7 @@ def main():
             print("建议人工执行：", file=sys.stderr)
             target_selector = _resolve_single_module_selector(args.primary_module, args.modules, args.work_dir)
             print(f"  git checkout {args.base_branch}", file=sys.stderr)
-            if args.tool == 'gradle':
+            if args.base_tool == 'gradle':
                 target_model = _gradle_target_model(args.work_dir, target_selector)
                 command = ' '.join(gradle_cmd(args.work_dir) + [_gradle_task(target_model, 'build'), '-x', 'test'])
             else:
@@ -5982,7 +6080,21 @@ def main():
                 )
             print(f"  {command}", file=sys.stderr)
             print(f"  git checkout {args.current_branch}", file=sys.stderr)
-            print(f"  {command}", file=sys.stderr)
+            if args.current_tool == 'gradle':
+                current_model = _gradle_target_model(args.work_dir, target_selector)
+                current_command = ' '.join(
+                    gradle_cmd(args.work_dir)
+                    + [_gradle_task(current_model, 'build'), '-x', 'test']
+                )
+            else:
+                current_pl = _normalize_maven_pl_with_workdir(
+                    target_selector, args.work_dir
+                )
+                current_command = (
+                    f"mvn {'-pl ' + current_pl + ' -am ' if current_pl else ''}"
+                    f"{MAVEN_SKIP_TEST_COMPILATION_ARG} package"
+                )
+            print(f"  {current_command}", file=sys.stderr)
             sys.exit(1)
 
         base_fmt = base_meta.get('mode', 'final_artifact')
@@ -6251,7 +6363,11 @@ def main():
             'target_module': str(args.primary_module or ''),
             'jdk_home': str((meta or {}).get('jdk_home') or resolve_effective_jdk_home(configured_jdk) or ''),
             'build_command': str((meta or {}).get('build_command') or ''),
-            'build_tool': str((meta or {}).get('build_tool') or args.tool or 'maven'),
+            'build_tool': str(
+                (meta or {}).get('build_tool')
+                or (args.base_tool if side == 'base' else args.current_tool)
+                or 'unknown'
+            ),
             'artifact_path': artifact_path,
             'original_artifact_path': str((meta or {}).get('original_artifact_path') or artifact_path),
             'artifact_relative_path': str((meta or {}).get('artifact_relative_path') or ''),

@@ -8,6 +8,7 @@
 import json
 import os
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,18 +33,104 @@ PHASE_LABELS = {
     "gitdiff": "源码辅助对比",
     "japicmp": "制品 API 对比",
     "behavior-bytecode": "行为字节码核验",
+    "artifact-facts": "解析运行时制品事实",
+    "reconcile": "重建目标运行时",
+    "decision": "冻结变化裁决",
     "graph": "构建调用图",
     "bridge-check": "跨依赖检查",
     "trace": "追踪系统触达",
     "edge-ledger": "构建运行时边台账",
     "bytecode-scan": "扫描依赖字节码",
     "bytecode-expand": "扩展依赖调用者",
+    "validation": "独立验证 generation",
+    "validation-preflight": "验证工具链复核",
+    "validation-inventory": "校验制品清单",
+    "validation-direct-edges": "校验直接调用边",
+    "validation-structural": "校验结构与指令",
+    "validation-runtime": "校验目标 JVM 运行时结果",
+    "validation-semantics": "校验跨版本语义",
+    "validation-closed-world": "校验闭世界结果",
+    "validation-write": "写入验证结果",
     "diagnostic": "实时诊断",
     "perf": "性能状态",
     "report": "生成结果",
     "heartbeat": "运行中",
     "done": "完成",
 }
+
+PROGRESS_LOG_MAX_BYTES = 8 * 1024 * 1024
+PROGRESS_EVENT_MAX_BYTES = 256 * 1024
+_PROGRESS_WRITE_LOCK = threading.Lock()
+
+
+def _progress_event_line(payload):
+    encoded = (
+        json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    if len(encoded) <= PROGRESS_EVENT_MAX_BYTES:
+        return encoded
+    reduced = dict(payload)
+    reduced["event_truncated"] = True
+    reduced["original_event_bytes"] = len(encoded)
+    for field in ("message", "item"):
+        value = str(reduced.get(field) or "")
+        if len(value) > 8192:
+            reduced[field] = value[:8189] + "..."
+    encoded = (
+        json.dumps(reduced, ensure_ascii=False, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    if len(encoded) <= PROGRESS_EVENT_MAX_BYTES:
+        return encoded
+    minimal = {
+        key: reduced.get(key)
+        for key in (
+            "schema", "timestamp", "step_id", "phase", "current", "total",
+        )
+    }
+    minimal.update({
+        "message": "progress event exceeded bounded observability record",
+        "event_truncated": True,
+        "original_event_bytes": len(encoded),
+    })
+    return (
+        json.dumps(minimal, ensure_ascii=False, sort_keys=True) + "\n"
+    ).encode("utf-8")
+
+
+def _rotate_progress_log(progress_path):
+    """Retain one bounded previous segment without reading the whole log."""
+    archive_path = progress_path.with_name("progress.previous.jsonl")
+    size = progress_path.stat().st_size
+    if size <= PROGRESS_LOG_MAX_BYTES:
+        os.replace(progress_path, archive_path)
+        return
+
+    temporary = archive_path.with_name(
+        f"{archive_path.name}.{os.getpid()}.tmp"
+    )
+    try:
+        with progress_path.open("rb") as source:
+            start = max(0, size - PROGRESS_LOG_MAX_BYTES)
+            source.seek(start)
+            tail = source.read(PROGRESS_LOG_MAX_BYTES)
+        if start:
+            newline = tail.find(b"\n")
+            tail = tail[newline + 1:] if newline >= 0 else b""
+        with temporary.open("wb") as destination:
+            destination.write(tail)
+            destination.flush()
+            os.fsync(destination.fileno())
+        os.replace(temporary, archive_path)
+        # The oversized source is an old unbounded observability artifact.
+        # Truncating it after its bounded tail is retained must never affect an
+        # analysis result.
+        with progress_path.open("wb"):
+            pass
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def format_elapsed(seconds):
@@ -93,8 +180,15 @@ def _write_progress_event(payload, report_dir=None):
             / "progress.jsonl"
         )
         progress_path.parent.mkdir(parents=True, exist_ok=True)
-        with progress_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+        event = _progress_event_line(payload)
+        with _PROGRESS_WRITE_LOCK:
+            current_size = (
+                progress_path.stat().st_size if progress_path.exists() else 0
+            )
+            if current_size + len(event) > PROGRESS_LOG_MAX_BYTES:
+                _rotate_progress_log(progress_path)
+            with progress_path.open("ab") as handle:
+                handle.write(event)
     except (OSError, UnicodeError, TypeError, ValueError):
         # 可观测性不能成为正式分析的故障源。
         return

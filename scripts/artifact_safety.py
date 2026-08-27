@@ -14,6 +14,9 @@ import zipfile
 _DUPLICATE_MAVEN_METADATA_PATTERN = re.compile(
     r"^META-INF/maven/[^/]+/[^/]+/(?:pom\.properties|pom\.xml)$"
 )
+_JAR_SIGNATURE_ENTRY_PATTERN = re.compile(
+    r"META-INF/([^/]+)\.(SF|RSA|DSA|EC)"
+)
 
 
 @dataclass(frozen=True)
@@ -25,6 +28,84 @@ class ArchiveSafetyResult:
     nested_archives: int
     max_observed_depth: int
     details: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class JarSignatureMetadata:
+    """Structural signing metadata without claiming cryptographic validity.
+
+    OpenJDK can obtain the signature-file bytes from a sibling ``.SF`` entry
+    or from inside a PKCS7 block.  A standalone ``.SF`` is only cached while
+    ``META-INF`` is scanned and never installs code signers by itself.
+    """
+
+    signature_files: tuple[str, ...]
+    signature_blocks: tuple[str, ...]
+    paired_signature_files: tuple[str, ...]
+    orphan_signature_files: tuple[str, ...]
+    rewrite_sensitive_entries: tuple[str, ...]
+
+    @property
+    def has_signature_block_candidate(self):
+        return bool(self.signature_blocks)
+
+
+def _jar_signature_entry_parts(name):
+    match = _JAR_SIGNATURE_ENTRY_PATTERN.fullmatch(
+        str(name or "").upper()
+    )
+    return match.groups() if match is not None else None
+
+
+def is_jar_signature_file_entry(name):
+    parts = _jar_signature_entry_parts(name)
+    return bool(parts and parts[1] == "SF")
+
+
+def is_jar_signature_block_entry(name):
+    parts = _jar_signature_entry_parts(name)
+    return bool(parts and parts[1] != "SF")
+
+
+def jar_signature_metadata(entry_names):
+    """Associate signature files with block candidates by signer basename.
+
+    The result deliberately calls block files *candidates*: validating PKCS7,
+    certificates and every signed entry is target-JDK work.  Structural
+    consumers may conservatively degrade on a block candidate, but must never
+    treat an orphan ``.SF`` as proof that an archive is signed.
+    """
+
+    entries = []
+    for raw_name in entry_names:
+        name = str(raw_name or "")
+        parts = _jar_signature_entry_parts(name)
+        if parts is not None:
+            entries.append((name, *parts))
+    block_stems = {
+        stem for _name, stem, extension in entries if extension != "SF"
+    }
+    signature_files = {
+        name for name, _stem, extension in entries if extension == "SF"
+    }
+    signature_blocks = {
+        name for name, _stem, extension in entries if extension != "SF"
+    }
+    paired_signature_files = {
+        name
+        for name, stem, extension in entries
+        if extension == "SF" and stem in block_stems
+    }
+    orphan_signature_files = signature_files - paired_signature_files
+    return JarSignatureMetadata(
+        signature_files=tuple(sorted(signature_files)),
+        signature_blocks=tuple(sorted(signature_blocks)),
+        paired_signature_files=tuple(sorted(paired_signature_files)),
+        orphan_signature_files=tuple(sorted(orphan_signature_files)),
+        rewrite_sensitive_entries=tuple(sorted(
+            signature_blocks | paired_signature_files
+        )),
+    )
 
 
 def _unsafe_entry_name(name):
@@ -75,6 +156,7 @@ def _inspect_archive_source(
     max_nested_archive_bytes=64 * 1024 * 1024,
     inspect_nested_archives=True,
     allow_duplicate_maven_metadata=False,
+    cancellation_check=None,
 ):
     reasons = set()
     details = set()
@@ -83,13 +165,32 @@ def _inspect_archive_source(
     nested_archives = 0
     max_depth = 0
 
+    def cancelled():
+        if cancellation_check is None:
+            return False
+        try:
+            value = bool(cancellation_check())
+        except Exception:
+            # A safety boundary must not convert a broken cancellation hook
+            # into authorization. Treat it as cancellation and fail closed.
+            value = True
+        if value:
+            reasons.add("ARCHIVE_INSPECTION_CANCELLED")
+        return value
+
     def inspect(payload, depth, location="<root>"):
         nonlocal entry_count, total_size, nested_archives, max_depth
+        if cancelled():
+            return
         max_depth = max(max_depth, depth)
         try:
-            archive_source = (
-                payload if isinstance(payload, (str, Path)) else io.BytesIO(payload)
-            )
+            if isinstance(payload, (str, Path)):
+                archive_source = payload
+            elif hasattr(payload, "read") and hasattr(payload, "seek"):
+                payload.seek(0)
+                archive_source = payload
+            else:
+                archive_source = io.BytesIO(payload)
             with zipfile.ZipFile(archive_source) as archive:
                 infos = archive.infolist()
                 names = [item.filename for item in infos]
@@ -113,6 +214,8 @@ def _inspect_archive_source(
                     for name in blocking_duplicate_names:
                         details.add(f"ARCHIVE_DUPLICATE_ENTRY:{location}!/{name}")
                 for info in infos:
+                    if cancelled():
+                        return
                     entry_rejected = False
                     if _unsafe_entry_name(info.filename):
                         reasons.add("ARCHIVE_ENTRY_PATH_UNSAFE")
@@ -152,12 +255,16 @@ def _inspect_archive_source(
                             reasons.add("ARCHIVE_NESTED_SIZE_EXCEEDED")
                             continue
                     try:
-                        if is_nested and inspect_nested_archives:
-                            nested_payload = archive.read(info)
-                        else:
-                            with archive.open(info) as entry_stream:
-                                while entry_stream.read(1024 * 1024):
-                                    pass
+                        nested_chunks = []
+                        with archive.open(info) as entry_stream:
+                            while True:
+                                if cancelled():
+                                    return
+                                block = entry_stream.read(1024 * 1024)
+                                if not block:
+                                    break
+                                if is_nested and inspect_nested_archives:
+                                    nested_chunks.append(block)
                     except (OSError, RuntimeError, zipfile.BadZipFile, KeyError):
                         reason = (
                             "ARCHIVE_NESTED_READ_FAILED"
@@ -168,7 +275,9 @@ def _inspect_archive_source(
                         details.add(f"{reason}:{info.filename}")
                         continue
                     if is_nested and inspect_nested_archives:
-                        inspect(nested_payload, depth + 1, info.filename)
+                        if cancelled():
+                            return
+                        inspect(b"".join(nested_chunks), depth + 1, info.filename)
         except OSError:
             reason = (
                 "ARCHIVE_READ_FAILED"
@@ -194,11 +303,20 @@ def _inspect_archive_source(
     )
 
 
-def inspect_archive_bytes(content, **limits):
+def inspect_archive_bytes(content, *, cancellation_check=None, **limits):
+    if cancellation_check is not None:
+        limits["cancellation_check"] = cancellation_check
     return _inspect_archive_source(bytes(content), **limits)
 
 
-def inspect_archive(path, **limits):
+def inspect_archive_stream(stream, *, cancellation_check=None, **limits):
+    """Inspect one caller-owned seekable snapshot without reopening its path."""
+    if cancellation_check is not None:
+        limits["cancellation_check"] = cancellation_check
+    return _inspect_archive_source(stream, **limits)
+
+
+def inspect_archive(path, *, cancellation_check=None, **limits):
     archive_path = Path(path)
     if not archive_path.is_file():
         return ArchiveSafetyResult(
@@ -209,6 +327,8 @@ def inspect_archive(path, **limits):
             nested_archives=0,
             max_observed_depth=0,
         )
+    if cancellation_check is not None:
+        limits["cancellation_check"] = cancellation_check
     return _inspect_archive_source(archive_path, **limits)
 
 
@@ -282,18 +402,25 @@ _ARCHIVE_CACHE_IN_FLIGHT = set()
 _ARCHIVE_CACHE_CONDITION = threading.Condition()
 
 
-def require_safe_archive(path, **limits):
+def require_safe_archive(path, *, cancellation_check=None, **limits):
     archive_path = Path(path)
-    try:
-        artifact_sha256 = _sha256_file(archive_path)
-    except OSError:
-        result = inspect_archive(archive_path, **limits)
-    else:
-        result = _cached_archive_inspection(
-            str(archive_path.resolve()),
-            artifact_sha256,
-            tuple(sorted(limits.items())),
+    if cancellation_check is not None:
+        result = inspect_archive(
+            archive_path,
+            cancellation_check=cancellation_check,
+            **limits,
         )
+    else:
+        try:
+            artifact_sha256 = _sha256_file(archive_path)
+        except OSError:
+            result = inspect_archive(archive_path, **limits)
+        else:
+            result = _cached_archive_inspection(
+                str(archive_path.resolve()),
+                artifact_sha256,
+                tuple(sorted(limits.items())),
+            )
     if not result.safe:
         evidence = result.details or result.reason_codes
         raise ValueError("artifact_safety_violation:" + ",".join(evidence))

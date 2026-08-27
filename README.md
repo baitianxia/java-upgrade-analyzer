@@ -155,7 +155,7 @@ Claude Code 会把你的答复整理成 Skill 需要的结构化输入，并恢�
 运行后 `.upgrade-report/README.md` 是产物目录的落地阅读入口；它会把 `deliverables/`、`evidence/`、`.runtime/` 的用途分开说明。
 
 1. 先打开 `.upgrade-report/README.md`；这里只链接本轮已经生成的文件，并在等待确认时保留问题、选项和可直接使用的回复示例。
-2. 看 `.upgrade-report/deliverables/report.md`：先读依赖层面的结论，再读 API 和调用关系。
+2. 看 `.upgrade-report/deliverables/report.md`：先用顶部目录定位章节，再读依赖层面的结论、API 和调用关系。
 3. 主报告没有展开的依赖，全部位于 `.upgrade-report/deliverables/all-affected-dependencies.md`。
 4. 主报告没有展开的 API 和完整调用关系，全部位于 `.upgrade-report/deliverables/all-impact-details.md`。
 5. `.upgrade-report/evidence/call_chain/alerts.csv` 是一行一条的原始分析记录，用于核对明细中的调用关系和证据文件。
@@ -306,7 +306,7 @@ Step6 已经生成了，但我想补充依赖源码后，从 Step5 重新分析�
 - `not_found_in_static_analysis` 不是“确定不影响”。
 - 反射、动态代理、运行时配置、依赖源码缺失都可能让结果进入 `uncertain` 或 `not_analyzed`。
 - 删除依赖 JAR 的场景下，即使业务源码没有直接引用，运行时依赖 JAR 使用了被删 API 也会进入 Step5 证据链。
-- 主报告会按依赖坐标完整展开全部 `reachable` 和 `uncertain` API；`not_found_in_static_analysis` 只在正文中给统计，逐项记录位于 `all-impact-details.md`。
+- 主报告会按依赖坐标和影响优先级限量展开 `reachable` 与 `uncertain` API，并明确展示数、总数和未展开数量；完整逐项结果与调用关系位于 `all-impact-details.md` / `.csv`。`not_found_in_static_analysis` 只在正文中给统计，不等于确认安全。
 
 ---
 

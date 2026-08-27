@@ -4,9 +4,9 @@
 import argparse
 from pathlib import Path
 import platform
-import subprocess
 import sys
 
+from compat import run_managed_subprocess
 from runtime_contract import (
     is_python_runtime_compatible,
     python_runtime_expectation,
@@ -55,7 +55,7 @@ def main(argv=None):
     if args.dry_run:
         print(" ".join(command))
         return 0
-    completed = subprocess.run(command, cwd=str(ROOT), check=False)
+    completed = run_managed_subprocess(command, cwd=str(ROOT), check=False)
     if completed.returncode:
         return completed.returncode
     from runtime_contract import contract_payload

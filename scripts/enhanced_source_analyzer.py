@@ -537,9 +537,11 @@ class EnhancedRegexAnalyzer:
     """
 
     def __init__(self, file_path, source_root):
-        self.file_path = file_path
+        self.file_path = os.path.abspath(os.fspath(file_path))
         self.source_root = source_root
-        self.language = "kotlin" if file_path.endswith((".kt", ".kts")) else "java"
+        self.language = (
+            "kotlin" if self.file_path.endswith((".kt", ".kts")) else "java"
+        )
         self.package_name = ""
         self.imports = {}
         self.static_imports = {}
@@ -1127,8 +1129,10 @@ class EnhancedRegexAnalyzer:
 
         # java.lang包（只包含真正的java.lang类）
         java_lang_types = {
-            'String', 'Object', 'Class', 'Integer', 'Long', 'Double',
-            'Exception', 'RuntimeException', 'Throwable', 'Void', 'Boolean'
+            'String', 'CharSequence', 'Object', 'Class', 'Throwable',
+            'Exception', 'RuntimeException', 'Boolean', 'Byte', 'Character',
+            'Short', 'Integer', 'Long', 'Float', 'Double', 'Void', 'Iterable',
+            'Record', 'Enum'
         }
         if simple_name in java_lang_types:
             return f"java.lang.{simple_name}"
@@ -1216,16 +1220,16 @@ class TreeSitterAnalyzer:
     """
 
     def __init__(self, file_path, source_root):
-        self.file_path = file_path
+        self.file_path = os.path.abspath(os.fspath(file_path))
         self.source_root = source_root
-        self.language = "java" if file_path.endswith('.java') else "kotlin"
-        self.helper = EnhancedRegexAnalyzer(file_path, source_root)
+        self.language = "java" if self.file_path.endswith('.java') else "kotlin"
+        self.helper = EnhancedRegexAnalyzer(self.file_path, source_root)
         self.error_nodes = 0
         self.non_empty_source = False
         self.has_type_declarations = False
 
         # tree-sitter only supports Java, skip Kotlin files
-        if file_path.endswith('.kt') or file_path.endswith('.kts'):
+        if self.file_path.endswith('.kt') or self.file_path.endswith('.kts'):
             raise ImportError("tree-sitter does not support Kotlin, use regex analyzer instead")
 
         # 初始化parser
@@ -2116,8 +2120,20 @@ def _strip_strings_and_comments(text):
     n = len(text)
     while i < n:
         ch = text[i]
+        # Java text blocks must be removed atomically. Treating the first two
+        # quotes as an empty string would leak most of the block as source.
+        if text.startswith('"""', i):
+            i += 3
+            while i < n:
+                if text.startswith('"""', i):
+                    i += 3
+                    break
+                if text[i] == '\\':
+                    i += 2
+                else:
+                    i += 1
         # 字符串字面量（双引号）——完全移除，包括引号
-        if ch == '"':
+        elif ch == '"':
             i += 1
             while i < n:
                 c = text[i]
@@ -2751,7 +2767,11 @@ def resolve_type_fqn(type_expr, method_def):
         return f"{method_def.class_fqcn}.{inner_suffix}"
 
     # Common Java classes (reduce false positives)
-    java_lang_classes = ["String", "Integer", "Long", "Double", "Float", "Boolean", "Object", "Class", "Exception", "RuntimeException"]
+    java_lang_classes = [
+        "String", "CharSequence", "Object", "Class", "Throwable", "Exception",
+        "RuntimeException", "Boolean", "Byte", "Character", "Short", "Integer",
+        "Long", "Float", "Double", "Void", "Iterable", "Record", "Enum",
+    ]
     java_util_classes = ["List", "ArrayList", "Map", "HashMap", "Set", "HashSet", "Optional", "Stream", "Collector"]
 
     if type_expr in java_lang_classes:
@@ -3093,6 +3113,44 @@ def infer_known_library_method_return_type(receiver_type, method_name):
     return None
 
 
+def _mask_java_generic_arguments(expr):
+    """Mask explicit invocation type arguments before comparison inference."""
+    text = str(expr or '')
+    masked = list(text)
+    index = 0
+    while index < len(text):
+        if text[index] != '<':
+            index += 1
+            continue
+        prefix = text[:index].rstrip()
+        if prefix and not prefix.endswith('.'):
+            index += 1
+            continue
+        depth = 1
+        cursor = index + 1
+        while cursor < len(text) and depth:
+            if text[cursor] == '<':
+                depth += 1
+            elif text[cursor] == '>':
+                depth -= 1
+            cursor += 1
+        if depth:
+            index += 1
+            continue
+        contents = text[index + 1:cursor - 1]
+        if not contents.strip() or re.search(r'[=!:;+*/%|]', contents):
+            index += 1
+            continue
+        suffix = text[cursor:].lstrip()
+        if not re.match(r'[A-Za-z_$][\w$]*\s*\(', suffix):
+            index += 1
+            continue
+        for position in range(index, cursor):
+            masked[position] = ' '
+        index = cursor
+    return ''.join(masked)
+
+
 def infer_param_type_from_expression(expr, method_def, local_var_types=None):
     """
     Infer parameter type from expression for signature matching
@@ -3153,8 +3211,24 @@ def infer_param_type_from_expression(expr, method_def, local_var_types=None):
         if false_type in {'Object', 'null', None} and true_type:
             return true_type
 
-    cast_match = re.match(r'^\(\s*([A-Za-z_][\w.]*)\s*\)\s*(.+)$', expr)
+    cast_match = re.match(
+        r'^\(\s*([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)'
+        r'(?:\s*<(?P<generic>[^()]+)>)?\s*\)\s*(.+)$',
+        expr,
+    )
     if cast_match:
+        generic_text = cast_match.group('generic')
+        if generic_text is not None:
+            depth = 0
+            for char in generic_text:
+                if char == '<':
+                    depth += 1
+                elif char == '>':
+                    depth -= 1
+                    if depth < 0:
+                        return None
+            if depth or not re.fullmatch(r'[\w$.,?\s<>\[\]&]+', generic_text):
+                return None
         cast_type = cast_match.group(1).strip()
         resolved = resolve_type_fqn(cast_type, method_def)
         return resolved.rsplit('.', 1)[-1] if resolved else cast_type.rsplit('.', 1)[-1]
@@ -3198,7 +3272,10 @@ def infer_param_type_from_expression(expr, method_def, local_var_types=None):
     # or `item instanceof String` are common guard arguments for validation
     # helpers. Treating them as boolean lets Step5 keep precise signatures for
     # varargs APIs such as Validate.isTrue(boolean, String, Object...).
-    if re.search(r'(?<![=!<>])(?:==|!=|<=|>=|<|>)(?![=])', expr):
+    comparison_expr = _mask_java_generic_arguments(expr)
+    if re.search(
+        r'(?<![=!<>])(?:==|!=|<=|>=|<|>)(?![=])', comparison_expr
+    ):
         return 'boolean'
     if re.search(r'\binstanceof\b', expr):
         return 'boolean'

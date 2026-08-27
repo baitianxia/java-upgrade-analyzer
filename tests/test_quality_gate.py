@@ -1,4 +1,5 @@
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -299,10 +300,32 @@ class QualityGateTest(unittest.TestCase):
                 "producer", [], "", output_paths=(str(stale),)
             )
             completed = __import__("subprocess").CompletedProcess([], 0)
-            with patch.object(quality_gate.subprocess, "run", return_value=completed):
+            with patch.object(
+                quality_gate, "run_managed_subprocess", return_value=completed
+            ):
                 quality_gate._run_task(task)
 
             self.assertFalse(stale.exists())
+
+    def test_quality_children_have_finite_timeout_and_timeout_result(self):
+        timeout = subprocess.TimeoutExpired(["child"], 1, output="partial")
+        with patch.object(
+            quality_gate,
+            "run_managed_subprocess",
+            side_effect=timeout,
+        ) as managed:
+            completed, timed_out = quality_gate._run_bounded_subprocess(
+                ["child"], timeout_seconds=1, check=False,
+            )
+
+        self.assertTrue(timed_out)
+        self.assertEqual(completed.returncode, 124)
+        self.assertEqual(completed.stdout, "partial")
+        self.assertEqual(managed.call_args.kwargs["timeout"], 1.0)
+        self.assertTrue(all(
+            seconds > 0
+            for seconds in quality_gate.TEST_TIMEOUT_SECONDS_BY_PROFILE.values()
+        ))
 
     def test_unexecuted_audit_cannot_reuse_stale_summary(self):
         with tempfile.TemporaryDirectory() as tmp:

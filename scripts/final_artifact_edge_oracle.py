@@ -17,7 +17,14 @@ import time
 import zipfile
 
 from artifact_safety import inspect_archive
+from compat import (
+    managed_popen,
+    release_process_tree,
+    run_managed_subprocess,
+    terminate_process_tree,
+)
 from edge_truth import EdgeIdentity, canonical_edge_identity
+from javap_contract import javap_command
 from path_runtime import short_temporary_directory
 
 
@@ -566,9 +573,14 @@ def _parse_javap_output(
     return rows, failures
 
 
+def _javap_command(javap: str, *arguments: str) -> list[str]:
+    return javap_command(javap, *arguments)
+
+
 def _javap_version(javap: str, *, timeout: float) -> str:
-    completed = subprocess.run(
-        [javap, "-version"], capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=timeout
+    completed = run_managed_subprocess(
+        _javap_command(javap, "-version"), capture_output=True, text=True,
+        encoding="utf-8", errors="replace", check=False, timeout=timeout,
     )
     return (completed.stdout or completed.stderr).strip()
 
@@ -578,10 +590,40 @@ def _javap_major(version: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def _cancel_process(process: subprocess.Popen) -> None:
-    if process.poll() is None:
-        process.kill()
-    process.communicate()
+def _cancel_process(process: subprocess.Popen) -> list[str]:
+    cleanup_failures = []
+    try:
+        terminate_process_tree(process)
+    except BaseException as error:
+        cleanup_failures.append(
+            f"process tree termination failed: {type(error).__name__}: {error}"
+        )
+    try:
+        process.communicate(timeout=5)
+    except (OSError, ValueError) as error:
+        cleanup_failures.append(
+            f"process reap failed: {type(error).__name__}: {error}"
+        )
+    except subprocess.TimeoutExpired:
+        for pipe in (process.stdin, process.stdout, process.stderr):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError as error:
+                    cleanup_failures.append(
+                        f"process pipe close failed: {type(error).__name__}: {error}"
+                    )
+    except BaseException as error:
+        cleanup_failures.append(
+            f"process reap interrupted: {type(error).__name__}: {error}"
+        )
+    try:
+        release_process_tree(process)
+    except BaseException as error:
+        cleanup_failures.append(
+            f"process tree release failed: {type(error).__name__}: {error}"
+        )
+    return cleanup_failures
 
 
 def _materialize_packaged_class(entry: PackagedClass) -> str:
@@ -629,11 +671,11 @@ def _parse_entry_with_javap(
     if cancellation_event.is_set() or (deadline is not None and time.perf_counter() >= deadline):
         return {"rows": [], "failures": [], "completed": False, "parsed": False}
     try:
-        command = [javap]
+        command = _javap_command(javap)
         if _entry_requires_verbose_javap(entry) if verbose is None else verbose:
             command.append("-v")
         command.extend(("-c", "-p", "-s", str(entry.extracted_path)))
-        process = subprocess.Popen(
+        process = managed_popen(
             command,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -649,17 +691,30 @@ def _parse_entry_with_javap(
             "parsed": False,
         }
 
-    while True:
-        remaining = deadline - time.perf_counter() if deadline is not None else None
-        if cancellation_event.is_set() or (remaining is not None and remaining <= 0):
-            _cancel_process(process)
-            return {"rows": [], "failures": [], "completed": False, "parsed": False}
-        wait_seconds = min(0.1, remaining) if remaining is not None else 0.1
-        try:
-            stdout, stderr = process.communicate(timeout=wait_seconds)
-            break
-        except subprocess.TimeoutExpired:
-            continue
+    try:
+        while True:
+            remaining = deadline - time.perf_counter() if deadline is not None else None
+            if cancellation_event.is_set() or (remaining is not None and remaining <= 0):
+                cleanup_failures = _cancel_process(process)
+                return {
+                    "rows": [],
+                    "failures": cleanup_failures,
+                    "completed": False,
+                    "parsed": False,
+                }
+            wait_seconds = min(0.1, remaining) if remaining is not None else 0.1
+            try:
+                stdout, stderr = process.communicate(timeout=wait_seconds)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+    except BaseException as error:
+        for failure in _cancel_process(process):
+            add_note = getattr(error, "add_note", None)
+            if callable(add_note):
+                add_note(failure)
+        raise
+    release_process_tree(process)
 
     if process.returncode != 0:
         detail = (stderr or stdout).strip().replace("\n", " ")
@@ -744,12 +799,12 @@ def _parse_entry_group_with_javap(
             for _entry in entries
         ]
     try:
-        command = [javap]
+        command = _javap_command(javap)
         if force_verbose:
             command.append("-v")
         command.extend(("-c", "-p", "-s"))
         command.extend(str(entry.extracted_path) for entry in entries)
-        process = subprocess.Popen(
+        process = managed_popen(
             command,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -768,19 +823,32 @@ def _parse_entry_group_with_javap(
             for entry in entries
         ]
 
-    while True:
-        remaining = deadline - time.perf_counter()
-        if cancellation_event.is_set() or remaining <= 0:
-            _cancel_process(process)
-            return [
-                {"rows": [], "failures": [], "completed": False, "parsed": False}
-                for _entry in entries
-            ]
-        try:
-            stdout, stderr = process.communicate(timeout=min(0.1, remaining))
-            break
-        except subprocess.TimeoutExpired:
-            continue
+    try:
+        while True:
+            remaining = deadline - time.perf_counter()
+            if cancellation_event.is_set() or remaining <= 0:
+                cleanup_failures = _cancel_process(process)
+                return [
+                    {
+                        "rows": [],
+                        "failures": list(cleanup_failures),
+                        "completed": False,
+                        "parsed": False,
+                    }
+                    for _entry in entries
+                ]
+            try:
+                stdout, stderr = process.communicate(timeout=min(0.1, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                continue
+    except BaseException as error:
+        for failure in _cancel_process(process):
+            add_note = getattr(error, "add_note", None)
+            if callable(add_note):
+                add_note(failure)
+        raise
+    release_process_tree(process)
     if process.returncode != 0:
         detail = (stderr or stdout).strip().replace("\n", " ")
         return [

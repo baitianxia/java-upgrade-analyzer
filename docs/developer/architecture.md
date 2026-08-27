@@ -188,11 +188,15 @@
 - `scripts/auto_discover_bridge_sources.py`
   - 依赖源码桥接发现
 - `scripts/progress_logging.py`
-  - 进度事件落盘与汇总
+  - 进度事件落盘与汇总；当前段与上一轮转段分别有界，超长观测字段只截断记录，不影响正式结果
+- `scripts/process_lock.py`
+  - 跨进程互斥：为工作流状态变更和共享缓存写入提供带超时的文件锁
+- `scripts/javap_contract.py`
+  - `javap` 进程契约：固定工具输出编码与 locale，避免宿主区域设置改变解析结果
 - `scripts/error_handler.py`
   - 统一错误承载
 - `scripts/compat.py`
-  - 运行兼容与命令封装
+  - 运行兼容与命令封装；统一 UTF-8 子进程环境、Windows 无控制台启动和超时后的进程树清理
 
 Step5 的依赖方向固定为“事实/身份/图契约/纯策略 → 图查询 → 结论 → 渲染”，
 `s5_call_chain_engine_integrated.py` 只在最外层编排这些能力。自动化架构测试解析模块 import
@@ -228,6 +232,11 @@ Step5 的两条 `javap` 路径已迁移到 `tool_execution.py`。命令启动失
 - 解析当前步骤输入
 - 执行前置交互或正式步骤
 - 统一持久化成功、待交互和失败状态
+
+同一报告目录的正式变更入口由 `.runtime/state/.workflow-mutation.lock` 串行化。锁覆盖主状态读取、
+步骤执行和结果持久化的完整变更区间；另一个进程在限定时间内无法取得锁时，以
+`WORKFLOW_MUTATION_ALREADY_ACTIVE` 明确停止，不允许两个执行者交错覆盖状态。只读的契约描述
+不获取该锁；调度器为后台步骤递归调用自身时复用当前进程持有的锁，不制造自锁。
 
 ### 唯一主状态
 
@@ -369,12 +378,16 @@ Step1 负责识别依赖变化范围，并建立后续分析所需的最小可�
 - 支持 `artifact_inputs` 与 `checkout_build` 两种入口
 - 输入不足时优先进入前置交互，而不是直接失败
 - base/current 可共享同一个源码仓库路径；revision 才是两侧身份，解析后持久化 requested ref、resolved ref 与 immutable commit
+- base/current 分别保存并使用各自 revision 对应的构建工具；没有显式指定时，在固定后的对应侧快照中独立探测，不能把 current 的 Maven/Gradle 选择复用于 base
 - `artifact_inputs` 先解析最终 JAR，只有坐标缺失的一侧才按需解析 ref 并运行 Maven 补全；`checkout_build` 在构建前解析两侧 ref
 - 坐标补全先采用 Maven `dependency:list` 或 Gradle `runtimeClasspath` artifact inventory；随后用 `analysis_contract.py` 建立目标模块运行时闭包内的内部模块目录，补齐构建输出遗漏的 reactor/project component 身份
 - Maven 内部模块坐标支持 reactor 父子继承以及 `${revision}`、`${project.version}` 等有效属性；Gradle 内部模块按精确 project path 读取有效 group、artifact、version
 - 内部模块目录排除目标模块自身、闭包外 sibling、`unspecified` 和未解析占位符；同坐标版本冲突时构建工具输出优先，静态源码模型不能覆盖已解析结果
 - 内部模块存在唯一主归档时，其物理文件名可匹配自定义 `finalName`；无论是否完成补全，只有最终 fat JAR / boot JAR / WAR 中实际存在的条目才能进入依赖事实
+- Maven timestamped SNAPSHOT 按数值版本基、时间戳和 build sequence 比较，不能按普通字符串顺序误判新旧
+- 从业务 fat JAR / boot JAR / WAR 留存运行时内容时保留业务所需 `META-INF` 与 manifest，排除嵌套依赖的 Maven 身份元数据和已失效签名对（`.SF` 与对应签名块）；无法打开候选归档时对打包类型判断失败关闭
 - ref 解析通过实时 `ls-remote` 获取候选并定向 fetch 所选 ref；不会执行 pull 或改变当前 checkout。候选按 commit 去重，唯一 commit 自动采用，歧义在 Maven 前形成硬 checkpoint；交互选择同时绑定 expected commit，执行前再次校验 ref 未移动
+- 远端 ref 查询只接受请求的精确 ref；意外返回的其他 ref 不参与候选。缓存仓库持久化前会清除 URL userinfo 和敏感 query，保留 SSH 用户语义，日志及错误也不得泄露原始凭据
 - 坐标补全同时拿到 source directory 与 ref 时始终优先 ref；source-only 输入必须确认 HEAD 对应的 commit，不能直接分析可变工作区
 - 所有分支构建和坐标补全使用 detached worktree，不改变用户仓库当前 HEAD 与未提交内容
 - 首轮确认的模块范围必须尽早写入主状态
@@ -395,6 +408,7 @@ Step2 负责把后续步骤真正依赖的上下文收敛回主状态，并产�
 - 处理依赖源码目录入口
 - 固化确认后的映射
 - 恢复时优先使用最新确认输入
+- Maven 上下文先读取模块实际启用的 build/plugin，再以 `pluginManagement` 作为缺省补充；多个 execution 的 `release`、`target`、`source` 取能够覆盖实际编译的最高目标，不能让管理声明覆盖有效插件配置
 
 ### Step3：背景风险扫描
 
@@ -405,6 +419,10 @@ Step3 负责扫描升级背景中的兼容性风险信号，不负责最终影�
 - JDK API 变化
 - `javax.*` / Jakarta 相关变化
 - 内部 API、反射和 Spring Boot 配置风险
+
+同一组扫描规则在一次源码目录遍历中执行；JDK `javax` 判断使用明确的平台命名空间集合，
+`javax.annotation.processing` 等仍属于 JDK 的包不得误报为 Jakarta 迁移。配置与 SPI 文件独立
+分类，XML 输入统一经安全解析入口处理；DTD/ENTITY 阻断覆盖 UTF-8、UTF-16 与 UTF-32 编码形态。
 
 Step3 的职责是暴露风险面，Step5 才负责证明这些变化是否触达业务系统。
 
@@ -964,7 +982,7 @@ Step6 负责把 Step1 到 Step5 的结构化产物收敛成最终交付结果。
 - `deliverables/all-impact-details.md`
 - `deliverables/all-impact-details.csv`
 
-`report.md` 固定按“依赖层面结论 → API 及调用关系 → 用户可见文件说明”组织。依赖层和 API 层统一使用“变化总数、已完成分析、未完成分析、确认有影响、确认不受影响、尚未确认影响”六列统计，并给出五态语义和行动边界。统计母集是 Step5 本轮分析范围：全量模式使用全部变化对象，部分模式只使用 `included_dependency_coords` 及其变化 API；未选择对象不得进入“未完成分析”。部分模式下 `available_dependency_count` / `total_api_count` 只用于范围说明，结果统计分别使用 `included_dependency_count` / `analyzed_api_count`。变化总数等于已完成与未完成之和。API 层后三类结果划分已完成分析；依赖层只要已有 API 确认有影响就保留确认有影响计数，因此仍有其他已选 API 未完成的依赖会同时计入“确认有影响”和“未完成分析”。依赖明细固定使用“依赖、版本变化、API 分析（已完成/总数）、当前系统调用关系、分析结果、结果说明”，API 明细固定使用“依赖、API、新版本中的变化、当前系统调用关系、分析结果、结果说明”；已完成与未完成只改变单元格内容，不改变表头和列顺序。主报告按依赖坐标分组完整展开全部 `reachable` 和 `uncertain` API：先按依赖的已确认触达、最高/累计复核优先分数和调用关系强度排序，再在依赖内部按结论与复核优先分数排序；`not_found_in_static_analysis` 只给统计并明确不等于安全。完整 Markdown 和 CSV 继续覆盖本轮范围内全部状态，正文未展开的明细可从 `all-impact-details.*` 查阅。正文没有展开的依赖进入 `all-affected-dependencies.md`；两份 Markdown 分别生成同数据、同顺序的 CSV。两类完整明细相互独立，且都只覆盖本轮分析范围。选择前的全量依赖/API 仍保留在 Step1/Step4 原始清单，未纳入对象和原因记录在 `analysis-scope.md`。
+`report.md` 在标题、生成信息和范围说明之后先生成只包含本次实际章节的目录，再按“依赖层面结论 → API 及调用关系 → 用户可见文件说明”组织。目录使用原生 Markdown 标题锚点，不插入 HTML 标签，也不承载完整明细文件入口。依赖层和 API 层统一使用“变化总数、已完成分析、未完成分析、确认有影响、确认不受影响、尚未确认影响”六列统计，并给出五态语义和行动边界。统计母集是 Step5 本轮分析范围：全量模式使用全部变化对象，部分模式只使用 `included_dependency_coords` 及其变化 API；未选择对象不得进入“未完成分析”。部分模式下 `available_dependency_count` / `total_api_count` 只用于范围说明，结果统计分别使用 `included_dependency_count` / `analyzed_api_count`。变化总数等于已完成与未完成之和。API 层后三类结果划分已完成分析；依赖层只要已有 API 确认有影响就保留确认有影响计数，因此仍有其他已选 API 未完成的依赖会同时计入“确认有影响”和“未完成分析”。依赖明细固定使用“依赖、版本变化、API 分析（已完成/总数）、当前系统调用关系、分析结果、结果说明”，API 明细固定使用“依赖、API、新版本中的变化、当前系统调用关系、分析结果、结果说明”；已完成与未完成只改变单元格内容，不改变表头和列顺序。主报告按依赖坐标分组、按上限展示排序靠前的 `reachable` 和 `uncertain` API：先按依赖的已确认触达、最高/累计复核优先分数和调用关系强度排序，再在依赖内部按结论与复核优先分数排序；`not_found_in_static_analysis` 只给统计并明确不等于安全。依赖与 API 正文均标明展示数、总数和未展开数量，并在对应章节就近提供完整 Markdown 与 CSV 的用途说明。完整 Markdown 和 CSV 覆盖本轮范围内全部状态且保持同序；两份 Markdown 的跨文件链接使用目标文件自身的原生标题锚点。两类完整明细相互独立，且都只覆盖本轮分析范围。选择前的全量依赖/API 仍保留在 Step1/Step4 原始清单，未纳入对象和原因记录在 `analysis-scope.md`。Step6 为 overview 和依赖身份预建索引，报告生成不得随 API×依赖数量退化为重复线性扫描。
 
 `alerts.csv` 是 Step5 的原始分析记录，一条原始记录一行；它保留分析状态、调用起点、完整调用关系和证据文件。`all-impact-details.md` 与 `all-impact-details.csv` 将这些原始记录按变化 API 归并成用户可读的全量明细，因此它们与原始记录的用途不同，都需要在 `report.md` 的“用户可见文件说明”中解释。
 

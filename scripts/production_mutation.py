@@ -11,6 +11,8 @@ import shutil
 import subprocess
 import sys
 
+from compat import run_managed_subprocess
+
 
 @dataclass(frozen=True)
 class MutationSpec:
@@ -107,12 +109,20 @@ def run_mutant(
     copy_root = report_root / spec.id / "repo"
     diff_path = report_root / spec.id / "mutation.diff"
     log_path = report_root / spec.id / "test.log"
-    command = (sys.executable, "-m", "unittest", "-v", *spec.required_tests)
+    worker_name = "production_mutation_worker.py"
+    command = (
+        sys.executable,
+        str(copy_root / "scripts" / worker_name),
+        *spec.required_tests,
+    )
     try:
         if copy_root.exists():
             shutil.rmtree(copy_root)
         copy_root.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(repo_root, copy_root, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+        worker = copy_root / "scripts" / worker_name
+        if not worker.is_file():
+            shutil.copy2(Path(__file__).with_name(worker_name), worker)
         module = copy_root / spec.module
         original = module.read_text(encoding="utf-8")
         mutated, _ = _mutate_source(original, spec)
@@ -126,7 +136,7 @@ def run_mutant(
             )
         )
         diff_path.write_text(diff, encoding="utf-8")
-        completed = subprocess.run(
+        completed = run_managed_subprocess(
             command,
             cwd=str(copy_root),
             capture_output=True,
@@ -134,15 +144,26 @@ def run_mutant(
             encoding="utf-8",
             errors="replace",
             timeout=timeout_seconds,
+            check=False,
         )
         log_path.write_text(completed.stdout + completed.stderr, encoding="utf-8")
+        if completed.returncode == 0:
+            status = "survived"
+            error = ""
+        elif completed.returncode == 1:
+            status = "killed"
+            error = ""
+        else:
+            status = "infrastructure_failed"
+            error = f"test_worker_exit:{completed.returncode}"
         return MutationRun(
             spec.id,
-            "killed" if completed.returncode else "survived",
+            status,
             completed.returncode,
             command,
             str(diff_path),
             str(log_path),
+            error,
         )
     except subprocess.TimeoutExpired as exc:
         log_path.parent.mkdir(parents=True, exist_ok=True)

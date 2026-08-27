@@ -80,7 +80,30 @@ class ProductionMutationTest(unittest.TestCase):
             result = run_mutant(self._repo(root), self._spec(), root / "runs", 30)
 
         self.assertEqual(result.status, "killed")
-        self.assertEqual(result.command[1:4], ("-m", "unittest", "-v"))
+        self.assertEqual(result.command[0], sys.executable)
+        self.assertTrue(result.command[1].endswith("production_mutation_worker.py"))
+        self.assertEqual(
+            result.command[2],
+            "tests.test_subject.SubjectTest.test_enabled",
+        )
+
+    def test_invalid_required_test_is_an_infrastructure_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = self._spec()
+            invalid = MutationSpec(
+                id=base.id,
+                category=base.category,
+                module=base.module,
+                selector=base.selector,
+                replacement=base.replacement,
+                required_tests=("tests.missing.Case.test_absent",),
+            )
+            result = run_mutant(self._repo(root), invalid, root / "runs", 30)
+
+        self.assertEqual(result.status, "infrastructure_failed")
+        self.assertEqual(result.returncode, 4)
+        self.assertEqual(result.error, "test_worker_exit:4")
 
     def test_registered_production_mutations_have_unique_ast_selectors(self):
         import json

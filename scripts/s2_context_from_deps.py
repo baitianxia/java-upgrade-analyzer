@@ -757,52 +757,81 @@ def detect_jdk_from_pom(pom_content):
         }
         build = _direct_xml_child(root, 'build')
         if build is not None:
-            for plugin in build.iter():
-                if _xml_local_name(plugin.tag) != 'plugin':
-                    continue
-                artifact_node = _direct_xml_child(plugin, 'artifactId')
-                artifact_id = (
-                    ''.join(artifact_node.itertext()).strip()
-                    if artifact_node is not None else ''
-                )
-                if artifact_id not in ('maven-compiler-plugin', 'kotlin-maven-plugin'):
-                    continue
-                field_order = (
-                    ('release', 'target', 'source')
-                    if artifact_id == 'maven-compiler-plugin'
-                    else ('jvmTarget',)
-                )
-                for configuration in plugin.iter():
-                    if _xml_local_name(configuration.tag) != 'configuration':
+            def plugin_configurations(plugins_node):
+                values = {
+                    'maven-compiler-plugin': {},
+                    'kotlin-maven-plugin': {},
+                }
+                if plugins_node is None:
+                    return values
+                for plugin in list(plugins_node):
+                    if _xml_local_name(plugin.tag) != 'plugin':
                         continue
-                    for node in configuration.iter():
-                        name = _xml_local_name(node.tag)
-                        if name in field_order and name not in plugin_values[artifact_id]:
-                            plugin_values[artifact_id][name] = ''.join(
-                                node.itertext()
-                            ).strip()
+                    artifact_node = _direct_xml_child(plugin, 'artifactId')
+                    artifact_id = (
+                        ''.join(artifact_node.itertext()).strip()
+                        if artifact_node is not None else ''
+                    )
+                    if artifact_id not in values:
+                        continue
+                    field_order = (
+                        ('release', 'target', 'source')
+                        if artifact_id == 'maven-compiler-plugin'
+                        else ('jvmTarget',)
+                    )
+                    for configuration in plugin.iter():
+                        if _xml_local_name(configuration.tag) != 'configuration':
+                            continue
+                        for node in configuration.iter():
+                            name = _xml_local_name(node.tag)
+                            value = ''.join(node.itertext()).strip()
+                            if name in field_order and value:
+                                values[artifact_id].setdefault(name, []).append(
+                                    value
+                                )
+                return values
+
+            # The module's active ``build/plugins`` declaration wins over
+            # pluginManagement defaults regardless of XML document order.
+            active_plugins = _direct_xml_child(build, 'plugins')
+            management = _direct_xml_child(build, 'pluginManagement')
+            managed_plugins = _direct_xml_child(management, 'plugins')
+            active_values = plugin_configurations(active_plugins)
+            managed_values = plugin_configurations(managed_plugins)
+            for artifact_id in plugin_values:
+                plugin_values[artifact_id] = (
+                    active_values[artifact_id]
+                    if active_values[artifact_id]
+                    else managed_values[artifact_id]
+                )
 
         # Explicit compiler configuration is the effective task input and wins
         # over shorthand properties. release/target describe produced bytecode
         # more directly than source; java.version is only a final convention.
-        java_candidate_values = (
-            plugin_values['maven-compiler-plugin'].get('release'),
-            properties.get('maven.compiler.release'),
-            plugin_values['maven-compiler-plugin'].get('target'),
-            properties.get('maven.compiler.target'),
-            plugin_values['maven-compiler-plugin'].get('source'),
-            properties.get('maven.compiler.source'),
+        java_candidate_groups = (
+            tuple(plugin_values['maven-compiler-plugin'].get('release') or ()),
+            (properties.get('maven.compiler.release'),),
+            tuple(plugin_values['maven-compiler-plugin'].get('target') or ()),
+            (properties.get('maven.compiler.target'),),
+            tuple(plugin_values['maven-compiler-plugin'].get('source') or ()),
+            (properties.get('maven.compiler.source'),),
         )
-        kotlin_candidate_values = (
-            plugin_values['kotlin-maven-plugin'].get('jvmTarget'),
-            properties.get('kotlin.compiler.jvmTarget'),
+        kotlin_candidate_groups = (
+            tuple(plugin_values['kotlin-maven-plugin'].get('jvmTarget') or ()),
+            (properties.get('kotlin.compiler.jvmTarget'),),
         )
         detected_languages = []
-        for candidate_group in (java_candidate_values, kotlin_candidate_values):
-            for value in candidate_group:
-                detected = _resolve_maven_property(value, properties)
-                if detected:
-                    detected_languages.append(detected)
+        for language_groups in (java_candidate_groups, kotlin_candidate_groups):
+            for candidate_group in language_groups:
+                resolved = [
+                    detected
+                    for value in candidate_group
+                    if (detected := _resolve_maven_property(value, properties))
+                ]
+                if resolved:
+                    detected_languages.append(
+                        str(max(int(item) for item in resolved))
+                    )
                     break
         if detected_languages:
             return str(max(int(item) for item in detected_languages))

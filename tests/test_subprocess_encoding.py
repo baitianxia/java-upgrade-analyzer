@@ -61,6 +61,24 @@ class SubprocessEncodingTest(unittest.TestCase):
         self.assertIn("标准输出：⚠", relayed.getvalue())
         self.assertIn("错误输出：⚠", relayed.getvalue())
 
+    def test_managed_subprocess_forces_utf8_for_python_evidence_children(self):
+        with patch.dict(
+            os.environ,
+            {"PYTHONIOENCODING": "gbk", "PYTHONUTF8": "0"},
+            clear=False,
+        ):
+            completed = compat.run_managed_subprocess(
+                [sys.executable, "-c", "print('测试通过：⚠')"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="strict",
+                check=False,
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "测试通过：⚠")
+
     def test_text_mode_subprocess_calls_explicitly_decode_with_replacement(self):
         violations = []
         for path in (ROOT_DIR / "scripts").glob("*.py"):

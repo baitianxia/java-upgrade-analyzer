@@ -65,7 +65,7 @@ class RunStepBackgroundTest(unittest.TestCase):
     def test_background_platform_flags_do_not_require_nohup(self):
         self.assertEqual(
             run_step._background_platform_kwargs("nt"),
-            {"creationflags": 0x00000200 | 0x00000008},
+            {"creationflags": 0x08000000 | 0x00000200},
         )
         self.assertEqual(
             run_step._background_platform_kwargs("posix"),

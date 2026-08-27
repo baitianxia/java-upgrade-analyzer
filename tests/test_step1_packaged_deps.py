@@ -59,6 +59,7 @@ class Step1PackagedDepsTest(unittest.TestCase):
                 raise AssertionError(f"unexpected command: {command}")
 
             with patch.object(path_runtime, "IS_WINDOWS", True), \
+                    patch.object(path_runtime, "WINDOWS_SAFE_PATH_LENGTH", 4096), \
                     patch.object(path_runtime, "git_cmd", return_value=["git"]), \
                     patch.object(
                         path_runtime,
@@ -2589,6 +2590,80 @@ class Step1PackagedDepsTest(unittest.TestCase):
         self.assertEqual(change_type, "移除")
         self.assertEqual(risk, "待分析")
 
+    def test_timestamped_maven_snapshots_keep_their_logical_base_version(self):
+        parsed = s1_dep_diff.parse_version_info("1.0-20240101.0900-123")
+
+        self.assertEqual(parsed["base"], [1, 0])
+        self.assertEqual(parsed["qualifier"], "snapshot")
+        self.assertTrue(parsed["timestamped_snapshot"])
+        self.assertEqual(
+            s1_dep_diff.compare_versions(
+                "1.0-20240101.0900-123", "1.0.1-SNAPSHOT"
+            ),
+            -1,
+        )
+        self.assertEqual(
+            s1_dep_diff.compare_versions(
+                "1.0-SNAPSHOT", "1.0-20240101.0900-123"
+            ),
+            -1,
+        )
+        self.assertEqual(
+            s1_dep_diff.compare_versions(
+                "1.0-20240102.0900-1", "1.0-20240101.0900-123"
+            ),
+            1,
+        )
+
+    def test_business_archive_keeps_runtime_meta_inf_and_only_removes_paired_signatures(self):
+        plain_bytes = io.BytesIO()
+        with zipfile.ZipFile(plain_bytes, "w") as archive:
+            archive.writestr("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\n")
+            archive.writestr("META-INF/services/com.acme.Service", "com.acme.Impl\n")
+            archive.writestr("META-INF/versions/17/com/acme/App.class", b"class")
+            archive.writestr("META-INF/maven/g/a/pom.properties", "version=1")
+            archive.writestr("META-INF/SIGNER.SF", "signature file")
+            archive.writestr("META-INF/SIGNER.RSA", b"signature block")
+            archive.writestr("META-INF/ORPHAN.SF", "unsigned metadata")
+            archive.writestr("com/acme/App.class", b"class")
+        plain_bytes.seek(0)
+        with zipfile.ZipFile(plain_bytes) as archive:
+            entries = dict(s1_dep_diff._business_content_entries(archive))
+
+        self.assertIn("META-INF/MANIFEST.MF", entries)
+        self.assertIn("META-INF/services/com.acme.Service", entries)
+        self.assertIn("META-INF/versions/17/com/acme/App.class", entries)
+        self.assertIn("META-INF/ORPHAN.SF", entries)
+        self.assertNotIn("META-INF/maven/g/a/pom.properties", entries)
+        self.assertNotIn("META-INF/SIGNER.SF", entries)
+        self.assertNotIn("META-INF/SIGNER.RSA", entries)
+
+        boot_bytes = io.BytesIO()
+        with zipfile.ZipFile(boot_bytes, "w") as archive:
+            archive.writestr("META-INF/MANIFEST.MF", "Multi-Release: true\n")
+            archive.writestr("BOOT-INF/classes/com/acme/App.class", b"class")
+            archive.writestr("BOOT-INF/lib/dependency.jar", b"dependency")
+        boot_bytes.seek(0)
+        with zipfile.ZipFile(boot_bytes) as archive:
+            boot_entries = dict(s1_dep_diff._business_content_entries(archive))
+
+        self.assertEqual(
+            boot_entries,
+            {
+                "BOOT-INF/classes/com/acme/App.class": "com/acme/App.class",
+                "META-INF/MANIFEST.MF": "META-INF/MANIFEST.MF",
+            },
+        )
+
+    def test_archive_packaging_detection_fails_closed_on_open_error(self):
+        with patch.object(
+            s1_dep_diff.zipfile,
+            "ZipFile",
+            side_effect=OSError("archive open failed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "最终制品扫描不完整"):
+                s1_dep_diff._detect_archive_packaging_type("broken.jar")
+
     def test_build_step1_change_rows_keeps_base_and_current_coords_for_cross_group_upgrade(self):
         rows = s1_dep_diff._build_step1_change_rows(
             [
@@ -2977,6 +3052,33 @@ class Step1PackagedDepsTest(unittest.TestCase):
         maven_collect.assert_not_called()
         self.assertIn("org.example:demo", deps)
         self.assertEqual(meta["branch"], "feature/upgrade")
+
+    def test_branch_build_tool_is_detected_inside_the_fixed_revision_worktree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work_dir = Path(tmp)
+            temp_dir = work_dir / "worktree"
+            temp_dir.mkdir(parents=True)
+            (temp_dir / "build.gradle.kts").write_text("plugins {}", encoding="utf-8")
+            with patch.object(s1_dep_diff, "build_java_env", return_value={}), \
+                    patch.object(s1_dep_diff, "create_branch_worktree", return_value=temp_dir), \
+                    patch.object(
+                        s1_dep_diff,
+                        "collect_gradle_deps_for_workspace",
+                        return_value=({"g:a": {"version": "1"}}, {"mode": "final_artifact"}),
+                    ) as gradle_collect, \
+                    patch.object(s1_dep_diff, "collect_maven_deps_for_workspace") as maven_collect, \
+                    patch.object(s1_dep_diff, "remove_branch_worktree"), \
+                    patch.object(s1_dep_diff, "run_cmd", return_value=("a" * 40, "", 0)):
+                deps, meta = s1_dep_diff.get_packaged_deps_by_switching_branch(
+                    "fixed-revision",
+                    work_dir,
+                    build_tool="",
+                )
+
+        gradle_collect.assert_called_once()
+        maven_collect.assert_not_called()
+        self.assertIn("g:a", deps)
+        self.assertEqual(meta["build_tool"], "gradle")
 
     def test_artifact_coordinate_enrichment_prefers_branch_over_source_directory(self):
         branch_deps = {"org.example:branch": {"version": "2.0.0"}}

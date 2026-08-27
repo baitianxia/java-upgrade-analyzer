@@ -22,12 +22,45 @@ import re
 import shlex
 import signal
 import shutil
+import tempfile
 import threading
+import time
 import safe_xml as ET
 from pathlib import Path
 
 # ── 平台检测 ──────────────────────────────────────────────────────
 IS_WINDOWS = sys.platform == 'win32'
+
+
+def subprocess_platform_kwargs(*, new_process_group=False, platform_name=None):
+    """Return invisible, platform-safe process creation options.
+
+    Python launched from a Windows GUI does not own a console.  Starting a
+    console-subsystem executable (Git, Python, Java, Maven, and similar tools)
+    without ``CREATE_NO_WINDOW`` makes Windows flash a new console for every
+    command.  Keep that policy in one place so product subprocesses cannot
+    accidentally regress to visible windows.
+
+    Long-lived detached product tasks may additionally request an independent
+    process group. POSIX Git commands use session isolation for ``killpg``;
+    Windows Git commands deliberately stay on ``CREATE_NO_WINDOW`` alone and
+    use ``taskkill /T`` for timeout cleanup.
+    """
+    normalized_platform = str(platform_name or '').strip().lower()
+    windows = (
+        IS_WINDOWS
+        if not normalized_platform
+        else normalized_platform in {'nt', 'win32', 'windows'}
+    )
+    if windows:
+        create_no_window = getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)
+        creation_flags = create_no_window
+        if new_process_group:
+            creation_flags |= getattr(
+                subprocess, 'CREATE_NEW_PROCESS_GROUP', 0x00000200
+            )
+        return {'creationflags': creation_flags}
+    return {'start_new_session': True} if new_process_group else {}
 
 # ── stdout/stderr 强制 UTF-8（Windows 默认 GBK 会导致中文乱码）──
 def setup_utf8_io():
@@ -73,12 +106,14 @@ def _detect_subprocess_encoding():
         try:
             # chcp 返回当前代码页，如 "活动代码页: 65001" (65001 = UTF-8)
             result = subprocess.run(
-                ['cmd', '/c', 'chcp'], capture_output=True, timeout=5
+                ['cmd', '/c', 'chcp'], capture_output=True, timeout=5,
+                **subprocess_platform_kwargs(),
             )
             output = result.stdout.decode('mbcs', errors='replace')
             if '65001' in output:
                 return 'utf-8'
-            if '936' in output or '54936' in output:
+            # 54936 already contains the substring 936.
+            if '936' in output:
                 return 'gbk'
             if '950' in output:
                 return 'big5'
@@ -288,7 +323,7 @@ def _read_maven_settings_local_repo():
         root = ET.fromstring(text)
         for elem in root.iter():
             if (elem.tag or '').endswith('localRepository') and (elem.text or '').strip():
-                return (elem.text or '').strip()
+                return elem.text.strip()
     except Exception:
         m = re.search(r'<localRepository>\s*([^<]+)\s*</localRepository>', text)
         if m:
@@ -324,12 +359,14 @@ def maven_repo_dir():
 def _decode_subprocess_output(raw_bytes):
     if not raw_bytes:
         return ''
-    for enc in ['utf-8', _SUBPROCESS_ENCODING, 'latin-1']:
+    for enc in ('utf-8', _SUBPROCESS_ENCODING):
         try:
             return raw_bytes.decode(enc)
         except (UnicodeDecodeError, LookupError):
             continue
-    return raw_bytes.decode('utf-8', errors='replace')
+    # Latin-1 defines every byte value, so this final decode cannot fail and
+    # does not need an unreachable retry/fallback branch.
+    return raw_bytes.decode('latin-1')
 
 
 def _normalized_executable_path(value):
@@ -404,56 +441,521 @@ def _sanitize_git_environment(proc_env):
     return proc_env
 
 
-def _git_process_group_kwargs(is_git):
-    """Start Git in an isolated process group so timeouts can reap helpers too."""
-    if not is_git:
-        return {}
+def managed_foreground_process_kwargs():
+    """Isolate every synchronous command so failure can reap its whole tree.
+
+    ``run_cmd`` is the product's managed *foreground* command boundary.  A
+    Maven/Gradle/Python/JVM launcher can create descendants just as Git can, so
+    limiting process-group isolation to Git leaves those descendants alive
+    after a timeout or interruption.
+
+    POSIX starts the command in a new session, making the child PID a stable
+    process-group ID for ``killpg``.  Windows keeps the existing invisible
+    console policy; :func:`managed_popen` additionally assigns a Job Object so
+    descendants remain addressable even if the root exits before a timeout.
+    Detached/background launchers do not use this helper and retain their
+    existing lifecycle.
+    """
     if IS_WINDOWS:
-        creation_flag = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
-        return {'creationflags': creation_flag} if creation_flag else {}
-    return {'start_new_session': True}
+        return subprocess_platform_kwargs()
+    return subprocess_platform_kwargs(new_process_group=True)
+
+
+_WINDOWS_JOB_HANDLE_ATTRIBUTE = "_jua_managed_job_handle"
+_WINDOWS_JOB_ASSIGNMENT_RETRY_COUNT = 2
+_WINDOWS_JOB_ASSIGNMENT_RETRY_DELAY_SECONDS = 0.05
+_WINDOWS_ERROR_ACCESS_DENIED = 5
+_MANAGED_PROCESS_TREE_TOKEN_ATTRIBUTE = "_jua_managed_process_tree_token"
+_MANAGED_PROCESS_TREE_LOCK = threading.RLock()
+_MANAGED_PROCESS_TREES = {}
+_POSIX_MANAGED_PROCESS_GROUPS = set()
+_MANAGED_SIGTERM_HANDLER_INSTALLED = False
+_PREVIOUS_SIGTERM_HANDLER = None
+
+
+def _managed_sigterm_handler(signum, frame):
+    """Reap isolated foreground groups before preserving SIGTERM semantics."""
+    global _MANAGED_SIGTERM_HANDLER_INSTALLED, _PREVIOUS_SIGTERM_HANDLER
+    with _MANAGED_PROCESS_TREE_LOCK:
+        groups = tuple(_POSIX_MANAGED_PROCESS_GROUPS)
+        _POSIX_MANAGED_PROCESS_GROUPS.clear()
+        records = tuple(_MANAGED_PROCESS_TREES.items())
+        _MANAGED_PROCESS_TREES.clear()
+        for token, (proc, _pid, _posix) in records:
+            if getattr(proc, _MANAGED_PROCESS_TREE_TOKEN_ATTRIBUTE, None) is token:
+                try:
+                    delattr(proc, _MANAGED_PROCESS_TREE_TOKEN_ATTRIBUTE)
+                except AttributeError:
+                    pass
+    for process_group in groups:
+        try:
+            os.killpg(process_group, signal.SIGKILL)
+        except (AttributeError, OSError):
+            pass
+
+    previous = _PREVIOUS_SIGTERM_HANDLER
+    _MANAGED_SIGTERM_HANDLER_INSTALLED = False
+    _PREVIOUS_SIGTERM_HANDLER = None
+    if callable(previous):
+        signal.signal(signum, previous)
+        previous(signum, frame)
+        return
+    if previous == signal.SIG_IGN:
+        signal.signal(signum, signal.SIG_IGN)
+        return
+    # Preserve the operating system's normal SIGTERM exit status instead of
+    # translating process shutdown into an arbitrary Python exception.
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+
+def _ensure_managed_sigterm_handler():
+    global _MANAGED_SIGTERM_HANDLER_INSTALLED, _PREVIOUS_SIGTERM_HANDLER
+    if (
+        IS_WINDOWS
+        or not hasattr(signal, "SIGTERM")
+        or threading.current_thread() is not threading.main_thread()
+    ):
+        return
+    with _MANAGED_PROCESS_TREE_LOCK:
+        try:
+            current = signal.getsignal(signal.SIGTERM)
+            if current is _managed_sigterm_handler:
+                _MANAGED_SIGTERM_HANDLER_INSTALLED = True
+                return
+            previous = current
+            signal.signal(signal.SIGTERM, _managed_sigterm_handler)
+        except (OSError, ValueError):
+            return
+        _PREVIOUS_SIGTERM_HANDLER = previous
+        _MANAGED_SIGTERM_HANDLER_INSTALLED = True
+
+
+def _restore_managed_sigterm_handler():
+    global _MANAGED_SIGTERM_HANDLER_INSTALLED, _PREVIOUS_SIGTERM_HANDLER
+    if IS_WINDOWS or threading.current_thread() is not threading.main_thread():
+        return
+    with _MANAGED_PROCESS_TREE_LOCK:
+        if (
+            _POSIX_MANAGED_PROCESS_GROUPS
+            or not _MANAGED_SIGTERM_HANDLER_INSTALLED
+        ):
+            return
+        try:
+            if signal.getsignal(signal.SIGTERM) is _managed_sigterm_handler:
+                signal.signal(signal.SIGTERM, _PREVIOUS_SIGTERM_HANDLER)
+        except (OSError, ValueError):
+            return
+        _MANAGED_SIGTERM_HANDLER_INSTALLED = False
+        _PREVIOUS_SIGTERM_HANDLER = None
+
+
+def _register_managed_process_tree(proc):
+    if not IS_WINDOWS:
+        _ensure_managed_sigterm_handler()
+    try:
+        process_group = int(proc.pid)
+    except (AttributeError, TypeError, ValueError):
+        if not IS_WINDOWS:
+            raise ValueError("managed POSIX process is missing a valid pid")
+        process_group = None
+    token = object()
+    with _MANAGED_PROCESS_TREE_LOCK:
+        previous = getattr(
+            proc, _MANAGED_PROCESS_TREE_TOKEN_ATTRIBUTE, None
+        )
+        if previous in _MANAGED_PROCESS_TREES:
+            raise RuntimeError("process tree is already managed")
+        setattr(proc, _MANAGED_PROCESS_TREE_TOKEN_ATTRIBUTE, token)
+        _MANAGED_PROCESS_TREES[token] = (
+            proc, process_group, not IS_WINDOWS,
+        )
+        if not IS_WINDOWS:
+            _POSIX_MANAGED_PROCESS_GROUPS.add(process_group)
+
+
+def _unregister_managed_process_tree(proc):
+    released = _take_managed_process_tree(proc)
+    if released is not None:
+        _restore_managed_sigterm_handler()
+        return True
+    return False
+
+
+def _take_managed_process_tree(proc):
+    """Atomically consume ownership bound to this exact Popen instance."""
+    with _MANAGED_PROCESS_TREE_LOCK:
+        token = getattr(proc, _MANAGED_PROCESS_TREE_TOKEN_ATTRIBUTE, None)
+        record = _MANAGED_PROCESS_TREES.get(token)
+        if record is None or record[0] is not proc:
+            return None
+        del _MANAGED_PROCESS_TREES[token]
+        try:
+            delattr(proc, _MANAGED_PROCESS_TREE_TOKEN_ATTRIBUTE)
+        except AttributeError:
+            pass
+        _owned_proc, process_group, posix = record
+        if posix and not any(
+            other_posix and other_group == process_group
+            for _other_proc, other_group, other_posix
+            in _MANAGED_PROCESS_TREES.values()
+        ):
+            _POSIX_MANAGED_PROCESS_GROUPS.discard(process_group)
+        return record
+
+
+def _claim_managed_process_tree(proc):
+    """Claim this exact managed Popen tree for termination exactly once."""
+    claimed = _take_managed_process_tree(proc)
+    if claimed is None:
+        return False
+    _restore_managed_sigterm_handler()
+    return True
+
+
+def _attach_windows_managed_job(proc):
+    """Assign a real Windows child to a retained Job Object.
+
+    The job intentionally does not use ``KILL_ON_JOB_CLOSE``: a successful
+    synchronous command may deliberately launch a fully detached background
+    task.  Explicit timeout/interruption paths terminate the job, while normal
+    completion merely releases our handle.
+    """
+    if not (IS_WINDOWS and os.name == "nt"):
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.argtypes = (wintypes.LPVOID, wintypes.LPCWSTR)
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.AssignProcessToJobObject.argtypes = (
+        wintypes.HANDLE, wintypes.HANDLE,
+    )
+    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    job_handle = kernel32.CreateJobObjectW(None, None)
+    if not job_handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        process_handle = wintypes.HANDLE(int(proc._handle))
+        for attempt in range(_WINDOWS_JOB_ASSIGNMENT_RETRY_COUNT + 1):
+            if kernel32.AssignProcessToJobObject(job_handle, process_handle):
+                break
+            error_code = ctypes.get_last_error()
+            if (
+                error_code != _WINDOWS_ERROR_ACCESS_DENIED
+                or attempt >= _WINDOWS_JOB_ASSIGNMENT_RETRY_COUNT
+            ):
+                raise ctypes.WinError(error_code)
+            # A bounded retry accommodates a genuinely transient denial
+            # without treating every Job Object failure as transient.  Keep
+            # the Job handle/process unchanged; other errors still fail closed
+            # without delaying deterministic faults.
+            time.sleep(
+                _WINDOWS_JOB_ASSIGNMENT_RETRY_DELAY_SECONDS * (attempt + 1)
+            )
+        setattr(proc, _WINDOWS_JOB_HANDLE_ATTRIBUTE, int(job_handle))
+    except BaseException:
+        kernel32.CloseHandle(job_handle)
+        raise
+
+
+def _release_windows_managed_job(proc, *, terminate=False):
+    """Release a retained Job Object; optionally terminate all its members."""
+    raw_handle = getattr(proc, _WINDOWS_JOB_HANDLE_ATTRIBUTE, None)
+    if not raw_handle or not (IS_WINDOWS and os.name == "nt"):
+        return False
+
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.TerminateJobObject.argtypes = (wintypes.HANDLE, wintypes.UINT)
+    kernel32.TerminateJobObject.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = wintypes.HANDLE(int(raw_handle))
+    terminated = False
+    try:
+        if terminate:
+            terminated = bool(kernel32.TerminateJobObject(handle, 1))
+    finally:
+        try:
+            kernel32.CloseHandle(handle)
+        finally:
+            try:
+                delattr(proc, _WINDOWS_JOB_HANDLE_ATTRIBUTE)
+            except AttributeError:
+                pass
+    return terminated
+
+
+def managed_popen(*popenargs, **kwargs):
+    """Start a synchronous child with cross-platform process-tree ownership."""
+    if not IS_WINDOWS:
+        # Install before process creation so an external SIGTERM cannot arrive
+        # after the child exists but before the manager has any cleanup policy.
+        # A tiny CreateProcess-return-to-registration window remains without a
+        # thread-unsafe preexec hook; registration is the first post-spawn act.
+        _ensure_managed_sigterm_handler()
+    for key, value in managed_foreground_process_kwargs().items():
+        if key == "creationflags":
+            kwargs[key] = int(kwargs.get(key, 0)) | int(value)
+        elif key == "start_new_session":
+            if key in kwargs and not kwargs[key]:
+                raise ValueError("managed foreground process requires a new session")
+            kwargs[key] = value
+        elif key in kwargs and kwargs[key] != value:
+            raise ValueError(f"conflicting managed process option: {key}")
+        else:
+            kwargs[key] = value
+    try:
+        proc = subprocess.Popen(*popenargs, **kwargs)
+    except BaseException:
+        _restore_managed_sigterm_handler()
+        raise
+    registered = False
+    try:
+        _register_managed_process_tree(proc)
+        registered = True
+        _attach_windows_managed_job(proc)
+    except BaseException as error:
+        # Assignment failure means the advertised tree contract cannot be
+        # honored.  Fail closed and reap the just-created process.
+        _terminate_subprocess(proc, process_group=registered)
+        if not isinstance(error, Exception):
+            raise
+        raise OSError(
+            f"MANAGED_PROCESS_JOB_ASSIGNMENT_FAILED: {type(error).__name__}: {error}"
+        ) from error
+    return proc
+
+
+def release_process_tree(proc):
+    """Release tree-tracking resources after successful synchronous completion."""
+    # Consume ownership before closing the Job handle. A timeout callback that
+    # races or fires late then observes no token and cannot target a recycled
+    # PID or a handle already released by the successful path.
+    if _unregister_managed_process_tree(proc):
+        _release_windows_managed_job(proc, terminate=False)
+
+
+def _git_command_requires_stdout(command):
+    """Return whether a successful Git command must produce semantic output."""
+    arguments = [str(item or '') for item in (command or ())]
+    if 'rev-parse' in arguments or 'symbolic-ref' in arguments:
+        return True
+    for parent, child in (
+        ('worktree', 'list'),
+        ('remote', 'get-url'),
+    ):
+        try:
+            index = arguments.index(parent)
+        except ValueError:
+            continue
+        if child in arguments[index + 1:]:
+            return True
+    return False
+
+
+def _run_git_file_capture(
+    cmd, *, cwd, timeout, input_bytes, env, process_group_kwargs,
+):
+    """Retry one read-only Git query without relying on a stdout pipe.
+
+    Some Windows GUI-parent process configurations have returned exit code zero
+    while losing Git's piped stdout. A temporary file uses an independent
+    standard-handle path and lets callers distinguish a capture failure from a
+    genuinely empty Git result.
+    """
+    with tempfile.TemporaryFile(mode='w+b') as stdout_file:
+        proc = managed_popen(
+            cmd,
+            cwd=cwd,
+            stdout=stdout_file,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
+            env=env,
+            close_fds=True,
+            **process_group_kwargs,
+        )
+        try:
+            _ignored_stdout, stderr_bytes = proc.communicate(
+                input=input_bytes,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            _terminate_subprocess(proc, process_group=True)
+            _close_subprocess_pipes(proc)
+            return '', f'Git 文件捕获重试超时（{timeout}秒）', -1
+        except KeyboardInterrupt:
+            _terminate_subprocess(proc, process_group=True)
+            _close_subprocess_pipes(proc)
+            raise
+        except BaseException:
+            # ``communicate`` may fail while copying input or draining a pipe.
+            # The command is still live in that case, so never let it escape
+            # the managed foreground boundary without reaping its descendants.
+            _terminate_subprocess(proc, process_group=True)
+            _close_subprocess_pipes(proc)
+            raise
+        release_process_tree(proc)
+        stdout_file.seek(0)
+        stdout_bytes = stdout_file.read()
+    return (
+        _decode_subprocess_output(stdout_bytes),
+        _decode_subprocess_output(stderr_bytes),
+        proc.returncode,
+    )
 
 
 def _terminate_subprocess(proc, *, process_group=False):
-    """Best-effort termination with process-tree cleanup for isolated Git groups."""
-    if process_group and IS_WINDOWS:
-        try:
-            subprocess.run(
-                ['taskkill', '/PID', str(proc.pid), '/T', '/F'],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=5,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
-            pass
-    elif process_group:
+    """Best-effort process-tree cleanup for managed foreground commands."""
+    claimed_process_group = bool(
+        process_group and _claim_managed_process_tree(proc)
+    )
+    if process_group and not claimed_process_group:
+        # Ownership may already have been released after success or consumed by
+        # another timeout/interrupt path. In either case this call is stale and
+        # must not act on a potentially recycled numeric PID.
+        return
+    if claimed_process_group and IS_WINDOWS:
+        # A retained Job Object still owns descendants when the root PID has
+        # already exited. Prefer that identity-stable handle and never pair it
+        # with a numeric-PID taskkill that could race PID reuse.
+        has_job = bool(getattr(proc, _WINDOWS_JOB_HANDLE_ATTRIBUTE, None))
+        if has_job:
+            try:
+                _release_windows_managed_job(proc, terminate=True)
+            except BaseException:
+                pass
+        else:
+            # Assignment failure is the sole managed path without a Job. The
+            # root has just been created, so use taskkill only while its Popen
+            # handle still reports the original process as running.
+            try:
+                root_running = proc.poll() is None
+            except (AttributeError, OSError):
+                root_running = False
+            if root_running:
+                try:
+                    subprocess.run(
+                        ['taskkill', '/PID', str(proc.pid), '/T', '/F'],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=5,
+                        check=False,
+                        **subprocess_platform_kwargs(),
+                    )
+                except BaseException:
+                    pass
+    elif claimed_process_group:
         try:
             # start_new_session=True makes the child PID the process-group ID.
             os.killpg(proc.pid, signal.SIGKILL)
         except (AttributeError, OSError):
             pass
 
-    if proc.poll() is None:
+    try:
+        running = proc.poll() is None
+    except (AttributeError, OSError):
+        running = True
+    if running:
         try:
             proc.kill()
-        except OSError:
+        except (AttributeError, OSError):
             pass
     try:
         proc.wait(timeout=5)
-    except (OSError, subprocess.SubprocessError):
+    except (AttributeError, OSError, subprocess.SubprocessError):
         pass
+
+
+def terminate_process_tree(proc):
+    """Terminate and reap a process launched with managed foreground options.
+
+    This public wrapper lets other synchronous ``Popen`` users share exactly
+    the same POSIX/Windows tree-cleanup contract as ``run_cmd``.  Pipe owners
+    remain responsible for closing or draining their own file objects.
+    """
+    _terminate_subprocess(proc, process_group=True)
 
 
 def _close_subprocess_pipes(proc):
     """Close captured pipes after a forced exit when their output is discarded."""
-    for pipe in (proc.stdin, proc.stdout, proc.stderr):
+    for pipe in (
+        getattr(proc, "stdin", None),
+        getattr(proc, "stdout", None),
+        getattr(proc, "stderr", None),
+    ):
         if pipe is None:
             continue
         try:
             pipe.close()
         except OSError:
             pass
+
+
+def run_managed_subprocess(
+    command, *, input=None, capture_output=False, timeout=None, check=False,
+    **popen_kwargs,
+):
+    """A ``subprocess.run``-compatible foreground boundary with tree cleanup.
+
+    Only the standard ``run`` arguments used by this project are surfaced;
+    remaining process-creation arguments are forwarded to :class:`Popen`.
+    Timeout, interruption, and pipe failures terminate the entire managed tree
+    before the original exception is re-raised.
+    """
+    if input is not None and popen_kwargs.get("stdin") is not None:
+        raise ValueError("stdin and input arguments may not both be used")
+    if capture_output:
+        if popen_kwargs.get("stdout") is not None or popen_kwargs.get("stderr") is not None:
+            raise ValueError("stdout and stderr arguments may not be used with capture_output")
+        popen_kwargs["stdout"] = subprocess.PIPE
+        popen_kwargs["stderr"] = subprocess.PIPE
+    if input is not None:
+        popen_kwargs["stdin"] = subprocess.PIPE
+
+    # These managed calls are the common boundary used by the quality and
+    # evidence runners.  A Python child must not inherit a GBK/CP936 stdout
+    # codec and turn a successfully completed Unicode test run into return
+    # code 1 while printing its final JSON payload.
+    provided_env = popen_kwargs.get("env")
+    proc_env = dict(os.environ if provided_env is None else provided_env)
+    for key in tuple(proc_env):
+        if str(key).upper() == "PYTHONIOENCODING":
+            proc_env.pop(key, None)
+    proc_env["PYTHONIOENCODING"] = "utf-8"
+    popen_kwargs["env"] = proc_env
+
+    proc = managed_popen(command, **popen_kwargs)
+    try:
+        stdout, stderr = proc.communicate(input=input, timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        terminate_process_tree(proc)
+        try:
+            cleanup_stdout, cleanup_stderr = proc.communicate(timeout=5)
+        except BaseException:
+            cleanup_stdout = cleanup_stderr = None
+            _close_subprocess_pipes(proc)
+        if getattr(error, "output", None) is None:
+            error.output = cleanup_stdout
+        if getattr(error, "stderr", None) is None:
+            error.stderr = cleanup_stderr
+        raise
+    except BaseException:
+        terminate_process_tree(proc)
+        _close_subprocess_pipes(proc)
+        raise
+    release_process_tree(proc)
+    completed = subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
+    if check:
+        completed.check_returncode()
+    return completed
 
 
 def run_cmd(
@@ -478,7 +980,7 @@ def run_cmd(
     raw_command_is_git = _command_uses_git(cmd)
     cmd = resolve_command(cmd)
     command_is_git = raw_command_is_git or _command_uses_git(cmd)
-    process_group_kwargs = _git_process_group_kwargs(command_is_git)
+    process_group_kwargs = managed_foreground_process_kwargs()
     observer = _PROCESS_OBSERVER
     try:
         observed_command = _redact_git_command(cmd) if command_is_git else cmd
@@ -523,17 +1025,44 @@ def run_cmd(
 
     try:
         if stream_output:
-            proc = subprocess.Popen(
+            deadline = (
+                None
+                if timeout is None
+                else time.monotonic() + max(0.0, float(timeout))
+            )
+
+            def remaining_timeout():
+                if deadline is None:
+                    return None
+                return max(0.0, deadline - time.monotonic())
+
+            proc = managed_popen(
                 cmd,
                 cwd=cwd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                stdin=subprocess.PIPE if input_text is not None else None,
+                stdin=(
+                    subprocess.PIPE
+                    if input_text is not None
+                    else (subprocess.DEVNULL if command_is_git else None)
+                ),
                 env=proc_env,
+                close_fds=True,
                 **process_group_kwargs,
             )
             stdout_chunks = []
             stderr_chunks = []
+            drain_errors = []
+            termination_lock = threading.Lock()
+            termination_started = False
+
+            def terminate_tree_once():
+                nonlocal termination_started
+                with termination_lock:
+                    if termination_started:
+                        return
+                    termination_started = True
+                _terminate_subprocess(proc, process_group=True)
 
             def drain(pipe, chunks, relay):
                 try:
@@ -548,8 +1077,14 @@ def run_cmd(
                                 relay_text = _redact_git_text(relay_text)
                             sys.stderr.write(relay_text)
                             sys.stderr.flush()
+                except Exception as error:  # pipe/relay failure must reap child tree
+                    drain_errors.append(error)
+                    terminate_tree_once()
                 finally:
-                    pipe.close()
+                    try:
+                        pipe.close()
+                    except OSError:
+                        pass
 
             stdout_thread = threading.Thread(
                 target=drain, args=(proc.stdout, stdout_chunks, stream_stdout), daemon=True,
@@ -559,71 +1094,111 @@ def run_cmd(
             )
             stdout_thread.start()
             stderr_thread.start()
-            if input_text is not None and proc.stdin is not None:
-                proc.stdin.write(input_text.encode('utf-8'))
-                proc.stdin.close()
             try:
-                return_code = proc.wait(timeout=timeout)
+                if input_text is not None and proc.stdin is not None:
+                    proc.stdin.write(input_text.encode('utf-8'))
+                    proc.stdin.close()
+                return_code = proc.wait(timeout=remaining_timeout())
             except subprocess.TimeoutExpired:
-                _terminate_subprocess(proc, process_group=command_is_git)
+                terminate_tree_once()
                 stdout_thread.join(timeout=5)
                 stderr_thread.join(timeout=5)
+                _close_subprocess_pipes(proc)
                 return finish(('', f'命令超时（{timeout}秒）：{" ".join(str(c) for c in cmd)}', -1))
             except KeyboardInterrupt:
-                _terminate_subprocess(proc, process_group=command_is_git)
+                terminate_tree_once()
                 stdout_thread.join(timeout=5)
                 stderr_thread.join(timeout=5)
+                _close_subprocess_pipes(proc)
                 raise
-            stdout_thread.join()
-            stderr_thread.join()
+            except BaseException:
+                terminate_tree_once()
+                stdout_thread.join(timeout=5)
+                stderr_thread.join(timeout=5)
+                _close_subprocess_pipes(proc)
+                raise
+
+            stdout_thread.join(timeout=remaining_timeout())
+            stderr_thread.join(timeout=remaining_timeout())
+            if stdout_thread.is_alive() or stderr_thread.is_alive():
+                # A launcher can exit while one of its descendants retains a
+                # captured pipe.  Treat the complete tree as the foreground
+                # command and enforce the same overall deadline.
+                terminate_tree_once()
+                stdout_thread.join(timeout=5)
+                stderr_thread.join(timeout=5)
+                _close_subprocess_pipes(proc)
+                return finish(('', f'命令超时（{timeout}秒）：{" ".join(str(c) for c in cmd)}', -1))
+            if drain_errors:
+                raise drain_errors[0]
+            release_process_tree(proc)
             return finish((
                 _decode_subprocess_output(b''.join(stdout_chunks)),
                 _decode_subprocess_output(b''.join(stderr_chunks)),
                 return_code,
             ))
         input_bytes = input_text.encode('utf-8') if input_text is not None else None
-        if command_is_git:
-            proc = subprocess.Popen(
-                cmd,
-                cwd=cwd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                stdin=subprocess.PIPE if input_bytes is not None else None,
-                env=proc_env,
-                **process_group_kwargs,
-            )
-            try:
-                stdout_bytes, stderr_bytes = proc.communicate(
-                    input=input_bytes,
-                    timeout=timeout,
-                )
-            except subprocess.TimeoutExpired:
-                _terminate_subprocess(proc, process_group=True)
-                _close_subprocess_pipes(proc)
-                return finish(
-                    ('', f'命令超时（{timeout}秒）：{" ".join(str(c) for c in cmd)}', -1),
-                )
-            except KeyboardInterrupt:
-                _terminate_subprocess(proc, process_group=True)
-                _close_subprocess_pipes(proc)
-                raise
-            stdout = _decode_subprocess_output(stdout_bytes)
-            stderr = _decode_subprocess_output(stderr_bytes)
-            return finish((stdout, stderr, proc.returncode))
-
-        proc = subprocess.run(
+        proc = managed_popen(
             cmd,
             cwd=cwd,
-            timeout=timeout,
-            capture_output=True,
-            # 不使用 text=True，手动解码以控制错误处理
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=(
+                subprocess.PIPE
+                if input_bytes is not None
+                else (subprocess.DEVNULL if command_is_git else None)
+            ),
             env=proc_env,
-            input=input_bytes,
+            close_fds=True,
+            **process_group_kwargs,
         )
+        try:
+            stdout_bytes, stderr_bytes = proc.communicate(
+                input=input_bytes,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            _terminate_subprocess(proc, process_group=True)
+            _close_subprocess_pipes(proc)
+            return finish(
+                ('', f'命令超时（{timeout}秒）：{" ".join(str(c) for c in cmd)}', -1),
+            )
+        except KeyboardInterrupt:
+            _terminate_subprocess(proc, process_group=True)
+            _close_subprocess_pipes(proc)
+            raise
+        except BaseException:
+            _terminate_subprocess(proc, process_group=True)
+            _close_subprocess_pipes(proc)
+            raise
+        release_process_tree(proc)
 
         # 解码输出：先尝试 UTF-8，失败则用系统编码，再失败则替换非法字符
-        stdout = _decode_subprocess_output(proc.stdout)
-        stderr = _decode_subprocess_output(proc.stderr)
+        stdout = _decode_subprocess_output(stdout_bytes)
+        stderr = _decode_subprocess_output(stderr_bytes)
+        if (
+            command_is_git
+            and proc.returncode == 0
+            and not stdout.strip()
+            and _git_command_requires_stdout(cmd)
+        ):
+            retry_stdout, retry_stderr, retry_rc = _run_git_file_capture(
+                cmd,
+                cwd=cwd,
+                timeout=timeout,
+                input_bytes=input_bytes,
+                env=proc_env,
+                process_group_kwargs=process_group_kwargs,
+            )
+            if retry_rc == 0 and retry_stdout.strip():
+                return finish((retry_stdout, retry_stderr, retry_rc))
+            if retry_rc == 0:
+                detail = "GIT_REQUIRED_STDOUT_EMPTY: " \
+                    "Git 两种捕获方式均返回成功但没有必要输出"
+                if stderr or retry_stderr:
+                    detail += f"；stderr={retry_stderr or stderr}"
+                return finish(('', detail, -1))
+            return finish((retry_stdout, retry_stderr or stderr, retry_rc))
         return finish((stdout, stderr, proc.returncode))
 
     except KeyboardInterrupt:
@@ -715,10 +1290,9 @@ def _git_executable_works(path):
     probe_environment = os.environ.copy()
     _sanitize_git_environment(probe_environment)
     try:
-        completed = subprocess.run(
+        completed = run_managed_subprocess(
             [candidate, '--version'],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             timeout=5,
             check=False,
             env=probe_environment,
@@ -797,14 +1371,17 @@ def find_executable(name):
     跨平台查找可执行文件。
     Windows 上会自动尝试加 .cmd/.bat/.exe 后缀。
     """
-    if str(name or '').strip().lower() in {'git', 'git.exe'}:
+    normalized_name = str(name or '').strip()
+    if not normalized_name:
+        return None
+    if normalized_name.lower() in {'git', 'git.exe'}:
         return _find_working_git()
-    found = shutil.which(name)
+    found = shutil.which(normalized_name)
     if found:
         return found
     if IS_WINDOWS:
         for ext in ['.cmd', '.bat', '.exe', '']:
-            found = shutil.which(name + ext)
+            found = shutil.which(normalized_name + ext)
             if found:
                 return found
     return None
@@ -863,7 +1440,7 @@ def resolve_command(cmd):
 def _xml_first_text(elem, local_tag):
     for child in list(elem):
         if (child.tag or '').endswith(local_tag) and (child.text or '').strip():
-            return (child.text or '').strip()
+            return child.text.strip()
     return ''
 
 
@@ -898,7 +1475,7 @@ def _extract_gradle_group_from_text(text):
         return ''
 
     def is_valid_group_id(value):
-        value = (value or '').strip()
+        value = value.strip()
         if not value:
             return False
         if any(ch.isupper() for ch in value):
@@ -913,7 +1490,7 @@ def _extract_gradle_group_from_text(text):
     for pattern in patterns:
         m = re.search(pattern, text, re.MULTILINE)
         if m:
-            candidate = (m.group(1) or '').strip()
+            candidate = m.group(1).strip()
             if is_valid_group_id(candidate):
                 return candidate
     return ''
@@ -931,7 +1508,7 @@ def _extract_gradle_artifact_from_text(text):
     for pattern in patterns:
         m = re.search(pattern, text, re.MULTILINE)
         if m:
-            return (m.group(1) or '').strip()
+            return m.group(1).strip()
     return ''
 
 
@@ -943,7 +1520,7 @@ def _extract_group_from_gradle_properties(module_dir):
             continue
         m = re.search(r'^\s*group\s*=\s*([A-Za-z0-9_.\-]+)\s*$', text, re.MULTILINE)
         if m:
-            return (m.group(1) or '').strip()
+            return m.group(1).strip()
     return ''
 
 
@@ -956,7 +1533,7 @@ def _extract_artifact_from_settings(module_dir):
                 continue
             m = re.search(r'^\s*rootProject\.name\s*=\s*[\'"]([^\'"]+)[\'"]', text, re.MULTILINE)
             if m:
-                return (m.group(1) or '').strip()
+                return m.group(1).strip()
     return ''
 
 
@@ -1028,11 +1605,17 @@ def _parse_gradle_coord(build_file):
     group_id = _extract_gradle_group_from_text(text) or _extract_group_from_gradle_properties(module_dir)
     artifact_id = _extract_gradle_artifact_from_text(text)
     if not artifact_id:
-        artifact_id = (
-            _artifact_id_from_gradle_build_file(build_file)
-            or module_dir.name
-            or _extract_artifact_from_settings(module_dir)
-        )
+        artifact_id = _artifact_id_from_gradle_build_file(build_file)
+    if not artifact_id and any(
+        (module_dir / name).is_file()
+        for name in ('settings.gradle', 'settings.gradle.kts')
+    ):
+        # A root project's declared name is stable across temporary checkout
+        # directories.  Do not search ancestor settings for nested modules:
+        # their artifact identity remains the module/build-file name.
+        artifact_id = _extract_artifact_from_settings(module_dir)
+    if not artifact_id:
+        artifact_id = module_dir.name
     if group_id and artifact_id:
         return f"{group_id}:{artifact_id}"
     return None
@@ -1064,7 +1647,6 @@ def _resolve_repo_probe_roots(project_dir):
     path = path.resolve()
 
     roots = []
-    seen = set()
     manifest_names = {
         'pom.xml',
         'build.gradle',
@@ -1077,10 +1659,6 @@ def _resolve_repo_probe_roots(project_dir):
         has_marker = any((candidate / name).exists() for name in manifest_names) or (candidate / '.git').exists()
         if not has_marker:
             continue
-        resolved = str(candidate.resolve())
-        if resolved in seen:
-            continue
-        seen.add(resolved)
         roots.append(candidate.resolve())
     if not roots:
         roots.append(path)
@@ -1177,9 +1755,9 @@ def infer_maven_coord_locations(
     skip_dirs = {'.git', 'target', 'build', '.gradle', 'out', 'bin', '.idea', '.upgrade-report'}
     count = 0
     target_coords = {
-        str(item or "").strip()
+        normalized
         for item in (target_coords or [])
-        if str(item or "").strip()
+        if (normalized := str(item or "").strip())
     }
 
     def add_location(coord, module_dir, repo_root):
@@ -1211,7 +1789,7 @@ def infer_maven_coord_locations(
             c = _parse_pom_coord(str(direct_pom))
             add_location(c, probe_root, repo_root)
         for direct_build in _iter_gradle_build_files(probe_root):
-            if direct_build.exists() and not skip_probe_root_as_module:
+            if not skip_probe_root_as_module:
                 c = _parse_gradle_coord_with_repo_context(str(direct_build), repo_root)
                 add_location(c, probe_root, repo_root)
 

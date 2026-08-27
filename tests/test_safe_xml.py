@@ -13,6 +13,16 @@ class SafeXmlTest(unittest.TestCase):
         with self.assertRaises(safe_xml.ParseError):
             safe_xml.parse(io.BytesIO(payload))
 
+        for encoding in ("utf-16", "utf-16-le", "utf-16-be", "utf-32"):
+            with self.subTest(encoding=encoding), self.assertRaises(
+                safe_xml.ParseError
+            ):
+                safe_xml.fromstring(
+                    '<!DOCTYPE x [<!ENTITY boom "expanded">]><x>&boom;</x>'.encode(
+                        encoding
+                    )
+                )
+
     def test_preserves_elementtree_compatible_parse_api(self):
         root = safe_xml.fromstring(b'<project><artifactId>demo</artifactId></project>')
         tree = safe_xml.parse(io.BytesIO(b'<project><groupId>g</groupId></project>'))

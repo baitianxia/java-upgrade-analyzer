@@ -144,19 +144,35 @@ SKIP_DIRS = {'.git', 'target', 'build', '.gradle', 'out', 'bin',
 
 # ── JDK 内置 javax 包（不需要迁移到 jakarta）──────────────────────
 JDK_JAVAX_PKGS = {
-    'javax.crypto', 'javax.net', 'javax.security.auth',
-    'javax.security.cert', 'javax.security.sasl',
+    'javax.accessibility', 'javax.annotation.processing',
+    'javax.crypto', 'javax.lang.model', 'javax.net', 'javax.rmi.ssl',
+    'javax.script', 'javax.security.auth', 'javax.security.cert',
+    'javax.security.jgss', 'javax.security.sasl', 'javax.smartcardio',
     'javax.sql', 'javax.management', 'javax.naming',
     'javax.swing', 'javax.imageio', 'javax.print',
     'javax.sound', 'javax.xml.crypto', 'javax.xml.namespace',
-    'javax.xml.parsers', 'javax.xml.stream', 'javax.xml.transform',
-    'javax.xml.validation', 'javax.xml.xpath',
+    'javax.tools', 'javax.transaction.xa', 'javax.xml.catalog',
+    'javax.xml.datatype', 'javax.xml.parsers', 'javax.xml.stream',
+    'javax.xml.transform', 'javax.xml.validation', 'javax.xml.xpath',
 }
 
 
 def is_jdk_javax(pkg_prefix):
     """判断某个 javax 包是否属于 JDK 自身（不需要迁移）"""
-    return any(pkg_prefix.startswith(j) for j in JDK_JAVAX_PKGS)
+    value = str(pkg_prefix or '').strip()
+    return any(value == package or value.startswith(f'{package}.')
+               for package in JDK_JAVAX_PKGS)
+
+
+def javax_content_needs_migration(content):
+    """Classify all concrete ``javax`` names on a config/SPI line.
+
+    A line remains migratable when it contains any Java/Jakarta EE namespace;
+    JDK-only names such as ``javax.annotation.processing.Processor`` do not
+    become migration findings merely because they occur outside Java source.
+    """
+    names = re.findall(r'\bjavax(?:\.[A-Za-z_$][\w$]*)+', str(content or ''))
+    return not names or any(not is_jdk_javax(name) for name in names)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -216,15 +232,33 @@ def scan_pattern(source_dir, pattern, extensions=('.java',),
     返回 [(file, lineno, content), ...]
     纯 Python 实现，无需 grep，Windows 完全兼容。
     """
-    try:
-        compiled = re.compile(pattern, re.IGNORECASE)
-    except re.error as e:
-        print(f"  正则编译失败 '{pattern}': {e}", file=sys.stderr)
-        return []
+    return scan_patterns(
+        source_dir,
+        [(0, pattern)],
+        extensions=extensions,
+        skip_comment=skip_comment,
+        skip_test=skip_test,
+        max_per_file=max_per_file,
+    )[0]
 
-    results = []
+
+def scan_patterns(source_dir, patterns, extensions=('.java',),
+                  skip_comment=True, skip_test=False, max_per_file=None):
+    """Scan a file tree once for multiple independently attributed patterns."""
+    compiled_patterns = []
+    results = {}
+    for key, pattern in patterns:
+        results[key] = []
+        try:
+            compiled_patterns.append((key, re.compile(pattern, re.IGNORECASE)))
+        except re.error as exc:
+            print(f"  正则编译失败 '{pattern}': {exc}", file=sys.stderr)
+
+    if not compiled_patterns:
+        return results
+
     for fpath in walk_files(source_dir, set(extensions), skip_test=skip_test):
-        count = 0
+        counts = {key: 0 for key, _compiled in compiled_patterns}
         try:
             with open_text(fpath) as f:
                 for lineno, line in enumerate(f, 1):
@@ -235,11 +269,12 @@ def scan_pattern(source_dir, pattern, extensions=('.java',),
                                          stripped.startswith('*') or
                                          stripped.startswith('/*')):
                         continue
-                    if compiled.search(raw):
-                        results.append((fpath, lineno, stripped[:200]))
-                        count += 1
-                        if max_per_file and count >= max_per_file:
-                            break
+                    for key, compiled in compiled_patterns:
+                        if max_per_file and counts[key] >= max_per_file:
+                            continue
+                        if compiled.search(raw):
+                            results[key].append((fpath, lineno, stripped[:200]))
+                            counts[key] += 1
         except (OSError, UnicodeError) as exc:
             record_scan_diagnostic(
                 stage='source_pattern_scan', path=fpath, error=exc,
@@ -984,12 +1019,21 @@ JDK_RUNTIME_FLAG_RULES = [
 def scan_jdk_removed(source_dir, output_path, _dep_changes_path=None):
     """扫描 JDK 9~21 已移除 API"""
     rows = []
-    for rule, pack in active_jdk_removed_rules(BASE_JDK, TARGET_JDK):
+    active_rules = active_jdk_removed_rules(BASE_JDK, TARGET_JDK)
+    hits_by_rule = scan_patterns(
+        source_dir,
+        [
+            (index, rule['pattern'])
+            for index, (rule, _pack) in enumerate(active_rules)
+        ],
+        extensions=('.java',),
+    )
+    for index, (rule, pack) in enumerate(active_rules):
         pattern = rule['pattern']
         api_name = rule['name']
         removed_ver = f"JDK{rule['affected_version']}"
         status = rule['status']
-        hits = scan_pattern(source_dir, pattern, extensions=('.java',))
+        hits = hits_by_rule[index]
         for fpath, lineno, content in hits:
             rows.append({
                 '文件': fpath,
@@ -1148,7 +1192,7 @@ def scan_javax(source_dir, output_path, _dep_changes_path=None):
                 '文件': fpath, '行号': lineno,
                 '内容': content.replace(',', ';'),
                 '引用类型': ref_type,
-                '需迁移': 'Y',  # 配置文件里的 javax 通常是 Java EE 包
+                '需迁移': 'Y' if javax_content_needs_migration(content) else 'N',
             })
 
     # SPI 文件（META-INF/services/）
@@ -1171,7 +1215,9 @@ def scan_javax(source_dir, output_path, _dep_changes_path=None):
                                     '文件': fpath, '行号': lineno,
                                     '内容': line.strip().replace(',', ';'),
                                     '引用类型': 'spi',
-                                    '需迁移': 'Y',
+                                    '需迁移': (
+                                        'Y' if javax_content_needs_migration(line) else 'N'
+                                    ),
                                 })
                 except (OSError, UnicodeError) as exc:
                     rows.append({
@@ -1191,7 +1237,9 @@ def scan_javax(source_dir, output_path, _dep_changes_path=None):
                             '文件': fpath, '行号': lineno,
                             '内容': line.strip().replace(',', ';'),
                             '引用类型': 'spring_factories',
-                            '需迁移': 'Y',
+                            '需迁移': (
+                                'Y' if javax_content_needs_migration(line) else 'N'
+                            ),
                         })
         except (OSError, UnicodeError) as exc:
             rows.append({
@@ -1236,9 +1284,16 @@ def scan_javax(source_dir, output_path, _dep_changes_path=None):
 def scan_jdk_internal(source_dir, output_path, _dep_changes_path=None):
     """扫描 JDK 内部 API 使用"""
     rows = []
-    for pattern, api_type in JDK_INTERNAL_RULES:
-        hits = scan_pattern(source_dir, pattern, extensions=('.java',),
-                            skip_comment=True)
+    hits_by_rule = scan_patterns(
+        source_dir,
+        [
+            (index, pattern)
+            for index, (pattern, _api_type) in enumerate(JDK_INTERNAL_RULES)
+        ],
+        extensions=('.java',), skip_comment=True,
+    )
+    for index, (_pattern, api_type) in enumerate(JDK_INTERNAL_RULES):
+        hits = hits_by_rule[index]
         for fpath, lineno, content in hits:
             rows.append({
                 '文件': fpath, '行号': lineno,
@@ -1255,8 +1310,16 @@ def scan_jdk_internal(source_dir, output_path, _dep_changes_path=None):
 def scan_reflection(source_dir, output_path, _dep_changes_path=None):
     """扫描反射操作"""
     rows = []
-    for pattern, reflect_type in REFLECTION_RULES:
-        hits = scan_pattern(source_dir, pattern, extensions=('.java',))
+    hits_by_rule = scan_patterns(
+        source_dir,
+        [
+            (index, pattern)
+            for index, (pattern, _reflect_type) in enumerate(REFLECTION_RULES)
+        ],
+        extensions=('.java',),
+    )
+    for index, (_pattern, reflect_type) in enumerate(REFLECTION_RULES):
+        hits = hits_by_rule[index]
         for fpath, lineno, content in hits:
             rows.append({
                 '文件': fpath, '行号': lineno,

@@ -15,13 +15,18 @@ import subprocess
 import sys
 import time
 
-from compat import setup_utf8_io
+from compat import run_managed_subprocess, setup_utf8_io
 from path_runtime import short_temp_root
 from runtime_contract import contract_payload
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_AUDIT_ROOT = short_temp_root() / "jua-quality-gate"
+DEFAULT_AUDIT_ROOT = short_temp_root() / f"jua-quality-gate-{os.getpid()}"
+TEST_TIMEOUT_SECONDS_BY_PROFILE = {
+    "default": 60 * 60,
+    "heavy": 6 * 60 * 60,
+    "real_project": 6 * 60 * 60,
+}
 
 setup_utf8_io()
 
@@ -45,6 +50,8 @@ class GateResult:
     elapsed_sec: float = 0.0
     returncode: int = 0
     purpose: str = ""
+    timed_out: bool = False
+    timeout_seconds: float = 0.0
 
 
 STEP5_TESTS = [
@@ -576,6 +583,32 @@ def build_plan(profile, python_exe=None, skip_real=True, real_case="guard", repo
     return tasks
 
 
+def _task_timeout_seconds(task):
+    profile = (
+        "real_project" if task.real_project
+        else "heavy" if task.heavy
+        else "default"
+    )
+    return float(TEST_TIMEOUT_SECONDS_BY_PROFILE[profile])
+
+
+def _run_bounded_subprocess(command, *, timeout_seconds, **kwargs):
+    timeout_seconds = float(timeout_seconds)
+    try:
+        return run_managed_subprocess(
+            command,
+            timeout=timeout_seconds,
+            **kwargs,
+        ), False
+    except subprocess.TimeoutExpired as exc:
+        return subprocess.CompletedProcess(
+            command,
+            124,
+            stdout=exc.output,
+            stderr=exc.stderr,
+        ), True
+
+
 def _run_task(task, env=None):
     if task.name == "environment_contract":
         return _run_environment_contract_task(task)
@@ -585,12 +618,20 @@ def _run_task(task, env=None):
             output.unlink()
     started = time.perf_counter()
     print(f"[quality-gate] START {task.name}: {' '.join(task.command)}", flush=True)
-    completed = subprocess.run(task.command, cwd=str(ROOT), env=env)
+    timeout_seconds = _task_timeout_seconds(task)
+    completed, timed_out = _run_bounded_subprocess(
+        task.command,
+        timeout_seconds=timeout_seconds,
+        cwd=str(ROOT),
+        env=env,
+        check=False,
+    )
     elapsed = time.perf_counter() - started
     status = "passed" if completed.returncode == 0 else "failed"
     print(
         f"[quality-gate] {status.upper()} {task.name} "
-        f"elapsed={elapsed:.2f}s rc={completed.returncode}",
+        f"elapsed={elapsed:.2f}s rc={completed.returncode}"
+        + (f" timeout={timeout_seconds:.0f}s" if timed_out else ""),
         flush=True,
     )
     return GateResult(
@@ -600,6 +641,8 @@ def _run_task(task, env=None):
         elapsed_sec=round(elapsed, 3),
         returncode=completed.returncode,
         purpose=task.purpose,
+        timed_out=timed_out,
+        timeout_seconds=timeout_seconds,
     )
 
 

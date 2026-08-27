@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import bootstrap_runtime  # noqa: E402
+import javap_contract  # noqa: E402
 import runtime_contract  # noqa: E402
 
 
@@ -109,6 +110,18 @@ class RuntimeContractTest(unittest.TestCase):
             ),
             17,
         )
+        self.assertIsNone(runtime_contract._jdk_major("1"))
+
+    def test_javap_commands_force_stable_utf8_and_english_output(self):
+        command = javap_contract.javap_command("javap", "-version")
+
+        self.assertEqual(command[0], "javap")
+        self.assertIn("-J-Dfile.encoding=UTF-8", command)
+        self.assertIn("-J-Dsun.stdout.encoding=UTF-8", command)
+        self.assertIn("-J-Dsun.stderr.encoding=UTF-8", command)
+        self.assertIn("-J-Duser.language=en", command)
+        self.assertIn("-J-Duser.country=US", command)
+        self.assertEqual(command[-1], "-version")
 
     def test_contract_accepts_project_selected_legacy_java_and_maven(self):
         outputs = {
@@ -184,7 +197,7 @@ class RuntimeContractTest(unittest.TestCase):
 
     def test_formal_runner_preflight_does_not_select_project_build_tools(self):
         source = (ROOT / "scripts" / "run_step.py").read_text(encoding="utf-8")
-        main_source = source[source.index("def main("):]
+        main_source = source[source.index("def _main_with_workflow_lock_held("):]
         self.assertIn("contract_payload()", main_source)
         preflight = main_source[:main_source.index("load_main_state(report_dir")]
         self.assertNotIn("require_maven=True", preflight)

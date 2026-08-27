@@ -133,6 +133,11 @@ def _absence_observation_failure(observations):
             "remote_ref_observation_malformed",
             "remote repeatedly returned malformed ref output; absence cannot be established",
         )
+    if any(item.get("status") == "remote_ref_observation_unexpected" for item in observations):
+        return (
+            "remote_ref_observation_unexpected",
+            "remote returned refs outside the exact requested identity; absence cannot be established",
+        )
     if len(observations) < 2:
         return (
             "remote_ref_observation_unconfirmed",
@@ -182,7 +187,9 @@ def _sleep_before_retry(delays, attempt_number, *, deadline=None):
 
 
 def _parse_remote_names(stdout):
-    return sorted({line.strip() for line in str(stdout or "").splitlines() if line.strip()})
+    if stdout is None:
+        return []
+    return sorted(set(filter(None, map(str.strip, str(stdout).splitlines()))))
 
 
 def _parse_remote_url_keys(stdout):
@@ -194,7 +201,10 @@ def _parse_remote_url_keys(stdout):
         if not key:
             continue
         match = re.fullmatch(r"remote\.(.+)\.url", key, re.IGNORECASE)
-        if not match or not match.group(1).strip():
+        # The key is the first whitespace-delimited token and `(.+)` requires
+        # a non-empty remote name, so a successful match cannot have a blank
+        # captured name.
+        if not match:
             malformed.append(key)
             continue
         names.append(match.group(1).strip())
@@ -261,9 +271,9 @@ def _remote_names(repo_dir, *, deadline=None):
         ]
         if rc == 0 and names:
             break
-        if rc == 0 and not names and sum(
-            1 for item in successful_so_far if not item["remotes"]
-        ) >= 2:
+        # A prior successful non-empty observation would already have broken
+        # the loop, so every successful observation here is an empty one.
+        if rc == 0 and len(successful_so_far) >= 2:
             break
 
     successful = [item for item in observations if item["return_code"] == 0]
@@ -323,7 +333,7 @@ def _remote_names(repo_dir, *, deadline=None):
             "reason": "" if config_valid else config_reason,
             "return_code": config_rc,
         })
-        if config_valid or attempt_number >= DEFAULT_FETCH_ATTEMPTS:
+        if config_valid:
             break
         if not _sleep_before_retry(
             _LOCAL_DISCOVERY_RETRY_DELAYS,
@@ -346,7 +356,9 @@ def _remote_names(repo_dir, *, deadline=None):
         # `git remote` reads all config scopes; names injected through global or
         # system config are not remotes configured for this repository.
         return [], []
-    if not nonempty_sets and empty_reads >= 2 and config_no_match:
+    # The preceding branch already handled the only path where a proven
+    # no-match coexists with a non-empty inherited remote observation.
+    if config_no_match and empty_reads >= 2:
         return [], []
     reason_parts = [
         "remote discovery observations were inconsistent",
@@ -354,7 +366,7 @@ def _remote_names(repo_dir, *, deadline=None):
         f"configured remote URLs={config_names}",
     ]
     reason_parts.extend(
-        str(item.get("reason") or "")
+        str(item["reason"])
         for item in observations
         if item.get("reason")
     )
@@ -362,7 +374,7 @@ def _remote_names(repo_dir, *, deadline=None):
         reason_parts.append(str(config_stderr or config_stdout or f"git config exited with {config_rc}"))
     return _remote_discovery_failure(
         repo_dir,
-        "; ".join(part for part in reason_parts if part),
+        "; ".join(reason_parts),
         attempts=attempts,
         inconsistent=True,
     )
@@ -457,7 +469,7 @@ def query_live_remote_refs(
                         "reason": stderr,
                         "retryable": False,
                     })
-                    break
+                    continue
             else:
                 failure_type, retryable = classify_fetch_failure(stderr or stdout, rc)
                 attempt_records.append({
@@ -467,8 +479,10 @@ def query_live_remote_refs(
                     "reason": stderr or stdout or f"git ls-remote exited with {rc}",
                     "retryable": retryable,
                 })
-                if not retryable or attempt_number >= max_attempts:
+                if not retryable:
                     break
+                if attempt_number >= max_attempts:
+                    continue
             if not _sleep_before_retry(
                 delays,
                 attempt_number,
@@ -485,12 +499,12 @@ def query_live_remote_refs(
                 })
                 break
         if rc != 0:
-            last_attempt = attempt_records[-1] if attempt_records else {}
+            last_attempt = attempt_records[-1]
             failures.append({
                 "remote": remote,
                 "stage": "ls_remote",
                 "reason": stderr or f"git ls-remote exited with {rc}",
-                "reason_code": str(last_attempt.get("status") or "fetch_failed"),
+                "reason_code": str(last_attempt["status"]),
                 "retryable": bool(last_attempt.get("retryable")),
                 "attempts": attempt_records,
             })
@@ -576,6 +590,43 @@ def _matching_remote_candidates(inventory, requested_ref):
     return sorted((row for row in scored if row["score"] == highest), key=lambda row: (row["remote"], row["kind"], row["ref"]))
 
 
+def match_remote_refs_by_version(repo_dir, version, query_timeout=30):
+    """Match a released version to immutable remote commits.
+
+    Branch and tag aliases that point to the same commit are one candidate.
+    Only distinct commit identities create a user-facing ambiguity.
+    """
+    requested = str(version or "").strip()
+    if not requested:
+        return {
+            "status": "version_missing",
+            "version": "",
+            "candidates": [],
+            "failures": [],
+        }
+    inventory = query_live_remote_refs(repo_dir, timeout=query_timeout)
+    matches = _matching_remote_candidates(inventory, requested)
+    groups = _group_remote_candidates(matches)
+    candidates = [group[1] for group in groups]
+    failures = list(inventory.get("failures") or [])
+    if len(groups) == 1 and not failures:
+        status = "resolved"
+    elif len(groups) > 1:
+        status = "ambiguous"
+    elif failures:
+        status = "query_failed"
+    else:
+        status = "not_found"
+    return {
+        "status": status,
+        "version": requested,
+        "candidates": candidates,
+        "failures": failures,
+        "queried_at": inventory.get("queried_at", ""),
+        "configured_remotes": list(inventory.get("remotes") or []),
+    }
+
+
 def _base_result(status, requested_ref, candidates=None, failures=None, queried_at=""):
     candidates = list(candidates or [])
     failures = list(failures or [])
@@ -629,7 +680,7 @@ def _verify_commit_object(repo_dir, commit, *, timeout=10, deadline=None):
         f"{expected}^{{commit}}",
         timeout=verify_timeout,
     )
-    fixed_commit = str(stdout or "").splitlines()[-1].strip() if rc == 0 and stdout else ""
+    fixed_commit = str(stdout).splitlines()[-1].strip() if rc == 0 and stdout else ""
     return fixed_commit if fixed_commit.lower() == expected.lower() else ""
 
 
@@ -778,6 +829,7 @@ def _targeted_remote_ref_inventory(
             f"refs/tags/{short_name}",
             f"refs/tags/{short_name}^{{}}",
         ))
+    expected_refs = set(patterns)
     attempts = []
     stdout = stderr = ""
     rc = 1
@@ -808,20 +860,35 @@ def _targeted_remote_ref_inventory(
             timeout=attempt_timeout,
         )
         if rc == 0:
-            rows, malformed = _parse_remote_rows(stdout)
+            parsed_rows, malformed = _parse_remote_rows(stdout)
+            unexpected_refs = sorted({
+                ref for _commit, ref in parsed_rows if ref not in expected_refs
+            })
+            rows = [
+                (commit, ref)
+                for commit, ref in parsed_rows
+                if ref in expected_refs
+            ]
             if rows and not malformed:
-                attempts.append({
+                attempt_record = {
                     "attempt": attempt_number,
                     "stage": "targeted_ls_remote",
                     "status": "success",
                     "reason": "",
                     "retryable": False,
-                })
+                }
+                if unexpected_refs:
+                    attempt_record["ignored_unexpected_refs"] = unexpected_refs
+                attempts.append(attempt_record)
                 break
             observation_status = (
                 "remote_ref_observation_malformed"
                 if malformed
-                else "remote_ref_observation_empty"
+                else (
+                    "remote_ref_observation_unexpected"
+                    if unexpected_refs
+                    else "remote_ref_observation_empty"
+                )
             )
             absence_observations.append({
                 "status": observation_status,
@@ -831,7 +898,16 @@ def _targeted_remote_ref_inventory(
                 "attempt": attempt_number,
                 "stage": "targeted_ls_remote",
                 "status": observation_status,
-                "reason": "\n".join(malformed) if malformed else "remote returned no matching ref",
+                "reason": (
+                    "\n".join(malformed)
+                    if malformed
+                    else (
+                        "remote returned only unexpected refs: "
+                        + ", ".join(unexpected_refs)
+                        if unexpected_refs
+                        else "remote returned no matching ref"
+                    )
+                ),
                 "retryable": attempt_number < max_attempts,
             })
             observation_failure = _absence_observation_failure(
@@ -847,7 +923,7 @@ def _targeted_remote_ref_inventory(
                     "reason": stderr,
                     "retryable": False,
                 })
-                break
+                continue
         else:
             reason = stderr or stdout or f"git ls-remote exited with {rc}"
             failure_type, retryable = classify_fetch_failure(reason, rc)
@@ -858,8 +934,10 @@ def _targeted_remote_ref_inventory(
                 "reason": reason,
                 "retryable": retryable,
             })
-            if not retryable or attempt_number >= max_attempts:
+            if not retryable:
                 break
+            if attempt_number >= max_attempts:
+                continue
         if not _sleep_before_retry(
             delays,
             attempt_number,
@@ -878,15 +956,15 @@ def _targeted_remote_ref_inventory(
 
     queried_at = _now()
     if rc != 0:
-        last = attempts[-1] if attempts else {}
+        last = attempts[-1]
         return {
             "queried_at": queried_at,
             "refs": [],
             "failures": [{
                 "remote": remote,
                 "stage": "targeted_ls_remote",
-                "reason": str(last.get("reason") or stderr or stdout),
-                "reason_code": str(last.get("status") or "fetch_failed"),
+                "reason": str(last["reason"]),
+                "reason_code": str(last["status"]),
                 "retryable": bool(last.get("retryable")),
                 "attempts": attempts,
             }],
@@ -1016,7 +1094,7 @@ def _compat_advertised_commit_inventory(
                     "reason": stderr,
                     "retryable": False,
                 })
-                break
+                continue
         else:
             reason = stderr or stdout or f"git ls-remote exited with {rc}"
             failure_type, retryable = classify_fetch_failure(reason, rc)
@@ -1027,8 +1105,10 @@ def _compat_advertised_commit_inventory(
                 "reason": reason,
                 "retryable": retryable,
             })
-            if not retryable or attempt_number >= max_attempts:
+            if not retryable:
                 break
+            if attempt_number >= max_attempts:
+                continue
         if not _sleep_before_retry(delays, attempt_number, deadline=deadline):
             rc = 1
             stderr = "the total remote resolution deadline was exhausted"
@@ -1043,15 +1123,15 @@ def _compat_advertised_commit_inventory(
 
     queried_at = _now()
     if rc != 0:
-        last = attempts[-1] if attempts else {}
+        last = attempts[-1]
         return {
             "queried_at": queried_at,
             "refs": [],
             "failures": [{
                 "remote": remote,
                 "stage": "compat_advertised_ls_remote",
-                "reason": str(last.get("reason") or stderr or stdout),
-                "reason_code": str(last.get("status") or "fetch_failed"),
+                "reason": str(last["reason"]),
+                "reason_code": str(last["status"]),
                 "retryable": bool(last.get("retryable")),
                 "attempts": attempts,
             }],
@@ -1294,8 +1374,10 @@ def _materialize_targeted_commit(
                 "retryable": retryable,
                 "target": canonical_ref,
             })
-            if not retryable or attempt_number >= max_attempts:
+            if not retryable:
                 break
+            if attempt_number >= max_attempts:
+                continue
             if not _sleep_before_retry(
                 delays,
                 attempt_number,
@@ -1310,7 +1392,7 @@ def _materialize_targeted_commit(
 
     should_try_exact_sha = (
         not last_failure
-        or str(last_failure.get("failure_type") or "") != "authentication_failed"
+        or last_failure["failure_type"] != "authentication_failed"
     )
     for attempt_number in (
         range(1, max_attempts + 1) if should_try_exact_sha else ()
@@ -1377,8 +1459,10 @@ def _materialize_targeted_commit(
                 "retryable": False,
             })
             break
-        if not fetched.get("retryable") or attempt_number >= max_attempts:
+        if not fetched.get("retryable"):
             break
+        if attempt_number >= max_attempts:
+            continue
         if not _sleep_before_retry(
             delays,
             attempt_number,
@@ -1404,7 +1488,7 @@ def _materialize_targeted_commit(
         "attempts": attempts,
         "failure": {
             "remote": str((candidate or {}).get("remote") or ""),
-            "stage": str((attempts[-1] if attempts else {}).get("stage") or "fetch_commit"),
+            "stage": str(attempts[-1]["stage"]),
             "reason": str(last_failure.get("reason") or "remote fetch failed"),
             "reason_code": failure_type,
             "retryable": bool(last_failure.get("retryable")),
@@ -1498,8 +1582,10 @@ def _materialize_explicit_commit_from_remote(
                 "retryable": False,
             })
             break
-        if not fetched.get("retryable") or attempt_number >= max_attempts:
+        if not fetched.get("retryable"):
             break
+        if attempt_number >= max_attempts:
+            continue
         if not _sleep_before_retry(
             delays,
             attempt_number,

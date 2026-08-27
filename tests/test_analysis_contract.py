@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
@@ -18,6 +19,7 @@ from analysis_contract import (
     discover_maven_modules,
     discover_gradle_modules,
 )
+import analysis_contract as contract
 
 
 def write_pom(path, artifact, packaging="jar", modules=None, dependencies=None, plugin=""):
@@ -37,6 +39,48 @@ def write_pom(path, artifact, packaging="jar", modules=None, dependencies=None, 
 
 
 class AnalysisContractTest(unittest.TestCase):
+    def test_gradle_dependency_parser_ignores_colon_only_project_paths(self):
+        edges = contract._gradle_project_dependencies(
+            """
+            implementation project(':core')
+            api(project(path: ':nested:api'))
+            runtime project('::::')
+            """
+        )
+
+        self.assertEqual(
+            [row["module"] for row in edges], ["core", "nested/api"]
+        )
+
+    def test_gradle_declared_source_parser_filters_blank_paths(self):
+        sources, resources = contract._gradle_declared_source_paths(
+            """
+            sourceSets { main {
+              java.srcDirs 'src/custom', 'src/custom', ''
+              resources.srcDir 'res/custom'
+            } }
+            """
+        )
+
+        self.assertEqual(sources, ["src/custom"])
+        self.assertEqual(resources, ["res/custom"])
+
+    def test_explicit_empty_project_scope_does_not_invent_missing_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coverage = derive_coverage_report(
+                tmp,
+                project_scope={
+                    "status": "insufficient",
+                    "reason_codes": [],
+                },
+            )
+
+        component = next(
+            item for item in coverage["components"]
+            if item["id"] == "project_scope"
+        )
+        self.assertEqual(component["reason_codes"], [])
+
     def test_gradle_multimodule_scope_includes_project_dependencies_and_custom_sources(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

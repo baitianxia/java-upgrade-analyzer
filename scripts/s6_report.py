@@ -11,7 +11,7 @@ s6_report.py — Step 6：汇总报告
     --output-report   .upgrade-report/deliverables/report.md
 """
 
-import argparse, csv, hashlib, json, os, re, sys
+import argparse, csv, json, os, re, sys, unicodedata
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
@@ -4726,12 +4726,15 @@ def _item_api_label(item):
     return api
 
 
-def _item_business_entries(findings, item, limit=3, statuses=None):
+def _item_business_entries(
+    findings, item, limit=3, statuses=None, *, overview=None,
+):
     entries = []
     direct_entry = str(item.get('business_entry') or '').strip()
     if direct_entry:
         entries.append(direct_entry)
-    overview = _overview_for_item(findings, item)
+    if overview is None:
+        overview = _overview_for_item(findings, item)
     overview_entries = []
     if statuses:
         for status in statuses:
@@ -4778,9 +4781,10 @@ def _item_business_entries(findings, item, limit=3, statuses=None):
     return deduplicated[:limit]
 
 
-def _item_modules(findings, item, limit=3):
+def _item_modules(findings, item, limit=3, *, overview=None):
     modules = []
-    overview = _overview_for_item(findings, item)
+    if overview is None:
+        overview = _overview_for_item(findings, item)
     for module in overview.get('sample_modules') or []:
         module = str(module or '').strip()
         if module and module not in modules:
@@ -5357,6 +5361,15 @@ def build_api_result_rows(findings):
         _identity_without_severity(item): item
         for item in ((findings.get('impact_overview') or {}).get('apis') or [])
     }
+    dependency_lookup = {}
+    for dependency in findings.get('impacted_dependencies') or []:
+        coord = _canonical_identity_coord(dependency.get('coord'))
+        if coord:
+            dependency_lookup.setdefault(coord, dependency)
+    for dependency in findings.get('per_dependency_results') or []:
+        coord = _canonical_identity_coord(dependency.get('coord'))
+        if coord:
+            dependency_lookup.setdefault(coord, dependency)
     source_buckets = [
         ('已确认影响', 'P0', findings.get('p0') or []),
         ('已确认影响', 'P1', findings.get('p1') or []),
@@ -5390,6 +5403,7 @@ def build_api_result_rows(findings):
         }.get(fallback_conclusion, ())
         for item in items:
             identity = _identity_without_severity(item)
+            overview = overview_lookup.get(identity) or {}
             report_item = item
             if fallback_conclusion == UNCERTAIN_CANDIDATE_CONCLUSION:
                 report_item = {
@@ -5402,7 +5416,10 @@ def build_api_result_rows(findings):
                 report_item, fallback_conclusion
             )
             key = (identity, item_conclusion)
-            dependency = _dependency_for_item(findings, item)
+            dependency = dependency_lookup.get(
+                _canonical_identity_coord(item.get('coord')),
+                {},
+            )
             old_version = str(
                 item.get("old_version")
                 or dependency.get("old_version")
@@ -5435,6 +5452,7 @@ def build_api_result_rows(findings):
                     item,
                     limit=None,
                     statuses=desired_statuses,
+                    overview=overview,
                 )
                 existing["business_entries"] = sorted({
                     *existing.get("business_entries", []),
@@ -5453,7 +5471,6 @@ def build_api_result_rows(findings):
                 )
                 continue
             sampled_paths = _paths_for_report(item, overview_lookup, desired_statuses)
-            overview = overview_lookup.get(identity) or {}
             counts_by_status = overview.get('path_counts_by_status') or {}
             logical_counts_by_status = (
                 overview.get("logical_path_counts_by_status") or {}
@@ -5494,6 +5511,7 @@ def build_api_result_rows(findings):
                 item,
                 limit=None,
                 statuses=desired_statuses,
+                overview=overview,
             )
             all_business_entries = {
                 str(entry or "").strip()
@@ -5503,7 +5521,7 @@ def build_api_result_rows(findings):
             }
             all_business_entries.update(fallback_business_entries)
             business_entries = sorted(all_business_entries)
-            modules = _item_modules(findings, item)
+            modules = _item_modules(findings, item, overview=overview)
             path_count = _path_count_for_report(
                 item, overview_lookup, sampled_paths, desired_statuses
             )
@@ -7336,11 +7354,22 @@ def _dependency_change_type(item):
     return "版本变化"
 
 
-def _dependency_anchor(coord):
-    coord = str(coord or "").strip()
-    slug = re.sub(r"[^a-zA-Z0-9]+", "-", coord).strip("-").lower()
-    digest = hashlib.sha1(coord.encode("utf-8")).hexdigest()[:8]
-    return f"dependency-{slug[:48] or 'unknown'}-{digest}"
+def _markdown_heading_fragment(line):
+    """Return the native Markdown fragment used by common report viewers."""
+    heading = re.sub(r"^#{1,6}\s+", "", str(line or "")).strip()
+    heading = heading.replace("`", "").lower()
+    fragment = []
+    for char in heading:
+        if char.isspace():
+            fragment.append("-")
+            continue
+        if char in {"-", "_"}:
+            fragment.append(char)
+            continue
+        if unicodedata.category(char).startswith(("P", "S")):
+            continue
+        fragment.append(char)
+    return "".join(fragment)
 
 
 def _dependency_api_change_text(api_rows):
@@ -7963,7 +7992,24 @@ def _dependency_result_explanation(row):
     return str(row.get("incomplete_reason") or "").strip()
 
 
-def _dependency_detail_table(rows, include_link=False):
+def _full_api_dependency_heading(row):
+    coord = _full_md_cell((row or {}).get("coord") or "依赖身份未记录")
+    heading = f"## `{coord}`"
+    version = _version_transition(row or {})
+    if version:
+        heading += f"：{_full_md_cell(version)}"
+    return heading
+
+
+def _full_api_incomplete_heading(count):
+    return f"## 未完成分析的 API（{int(count or 0)}）"
+
+
+def _dependency_detail_table(
+    rows,
+    include_link=False,
+    incomplete_api_count=0,
+):
     headers = (
         "| 依赖 | 版本变化 | API 分析（已完成/总数） | "
         "当前系统调用关系 | 分析结果 | 结果说明 |"
@@ -7989,14 +8035,20 @@ def _dependency_detail_table(rows, include_link=False):
                     if row.get("analysis_complete") and api_total
                     else "已完成 API 及调用关系"
                 )
+                dependency_target = _markdown_heading_fragment(
+                    _full_api_dependency_heading(row)
+                )
                 links.append(
                     f"[{link_label}]"
-                    f"(all-impact-details.md#{_dependency_anchor(row.get('coord'))})"
+                    f"(all-impact-details.md#{dependency_target})"
                 )
             if api_incomplete or unassigned_api_count:
+                incomplete_target = _markdown_heading_fragment(
+                    _full_api_incomplete_heading(incomplete_api_count)
+                )
                 links.append(
                     "[未完成 API 及原因]"
-                    "(all-impact-details.md#unanalyzed-apis)"
+                    f"(all-impact-details.md#{incomplete_target})"
                 )
             if links:
                 api_analysis += "<br>" + "<br>".join(links)
@@ -8024,12 +8076,28 @@ def _dependency_current_calls_cell(row):
     )
 
 
-def _dependency_completed_table(rows, include_link=False):
-    return _dependency_detail_table(rows, include_link=include_link)
+def _dependency_completed_table(
+    rows,
+    include_link=False,
+    incomplete_api_count=0,
+):
+    return _dependency_detail_table(
+        rows,
+        include_link=include_link,
+        incomplete_api_count=incomplete_api_count,
+    )
 
 
-def _dependency_incomplete_table(rows, include_link=False):
-    return _dependency_detail_table(rows, include_link=include_link)
+def _dependency_incomplete_table(
+    rows,
+    include_link=False,
+    incomplete_api_count=0,
+):
+    return _dependency_detail_table(
+        rows,
+        include_link=include_link,
+        incomplete_api_count=incomplete_api_count,
+    )
 
 
 def _population_total_cell(model):
@@ -8209,7 +8277,11 @@ def render_dependency_conclusions(findings, dependency_model=None):
                     else ""
                 )
                 + "全部未完成原因见"
-                "[完整依赖分析明细](all-affected-dependencies.md)。"
+                "[完整依赖分析明细](all-affected-dependencies.md)"
+                "（`all-affected-dependencies.md`，供人工逐项复核）；"
+                "相同范围的结构化数据见"
+                "[依赖分析 CSV](all-affected-dependencies.csv)"
+                "（`all-affected-dependencies.csv`，便于筛选）。"
             ),
             "",
             *_dependency_incomplete_table(displayed),
@@ -8236,7 +8308,11 @@ def render_dependency_conclusions(findings, dependency_model=None):
                     else ""
                 )
                 + "完整结果见"
-                "[完整依赖分析明细](all-affected-dependencies.md)。"
+                "[完整依赖分析明细](all-affected-dependencies.md)"
+                "（`all-affected-dependencies.md`，供人工逐项复核）；"
+                "相同范围和排序的结构化数据见"
+                "[依赖分析 CSV](all-affected-dependencies.csv)"
+                "（`all-affected-dependencies.csv`，便于筛选）。"
             ),
             "",
             *_dependency_completed_table(displayed),
@@ -8450,7 +8526,11 @@ def render_api_and_calls(findings, api_model=None):
                 )
                 + "全部未完成原因见"
                 "[完整 API 分析与调用关系明细]"
-                "(all-impact-details.md#unanalyzed-apis)。"
+                "(all-impact-details.md)"
+                "（`all-impact-details.md`，供人工逐项复核）；"
+                "相同范围的结构化数据见"
+                "[API 与调用关系 CSV](all-impact-details.csv)"
+                "（`all-impact-details.csv`，便于筛选）。"
             ),
             "",
         ])
@@ -8464,16 +8544,40 @@ def render_api_and_calls(findings, api_model=None):
         actionable_count = sum(
             int(row.get("aggregate_count") or 1) for row in actionable
         )
+        displayed_actionable = actionable[:S6_MAIN_RESULT_LIMIT]
+        displayed_actionable_count = sum(
+            int(row.get("aggregate_count") or 1)
+            for row in displayed_actionable
+        )
+        actionable_display_note = (
+            f"正文展示 {displayed_actionable_count}/{actionable_count} 个"
+        )
+        if displayed_actionable_count < actionable_count:
+            actionable_display_note += (
+                f"；未展开 {actionable_count - displayed_actionable_count} 个。"
+            )
+        else:
+            actionable_display_note += "。"
         lines.extend([
             (
                 "### 已确认触达与结论未确定的 API"
-                f"（完整展示 {actionable_count}/{actionable_count}）"
+                f"（展示 {displayed_actionable_count}/{actionable_count}）"
             ),
             "",
             (
-                "本节按依赖坐标分组，完整展示全部 `reachable` 和 `uncertain` API。"
+                "本节按依赖坐标分组，展示排序靠前的 `reachable` 和 `uncertain` API。"
                 "依赖之间按已确认影响、复核优先分数和调用关系强度排序；"
                 "每个依赖内部再按结论与复核优先分数排序。"
+                + actionable_display_note
+            ),
+            (
+                "主报告中每个 API 只展示代表性调用关系及关系总数。"
+                "全部 API 和完整调用关系见"
+                "[完整 API 分析与调用关系明细](all-impact-details.md)"
+                "（`all-impact-details.md`，供人工逐项复核）；"
+                "相同范围和排序的结构化数据见"
+                "[API 与调用关系 CSV](all-impact-details.csv)"
+                "（`all-impact-details.csv`，便于筛选）。"
             ),
             "",
         ])
@@ -8483,7 +8587,9 @@ def render_api_and_calls(findings, api_model=None):
                 "",
             ])
         for index, (coord, dependency_rows) in enumerate(
-            _completed_api_rows_by_dependency({"completed": actionable}),
+            _completed_api_rows_by_dependency({
+                "completed": displayed_actionable,
+            }),
             start=1,
         ):
             reachable_count = sum(
@@ -8500,7 +8606,7 @@ def render_api_and_calls(findings, api_model=None):
                 f"#### {index}. `{_full_md_cell(coord or '依赖身份未记录')}`",
                 "",
                 (
-                    f"本依赖完整展示 {reachable_count} 个 `reachable`、"
+                    f"本依赖展示 {reachable_count} 个 `reachable`、"
                     f"{uncertain_count} 个 `uncertain` API。"
                 ),
                 "",
@@ -8530,7 +8636,9 @@ def render_api_and_calls(findings, api_model=None):
             (
                 f"全部 {api_model['completed_count']} 个已完成结果及 "
                 f"{api_model['confirmed_relationship_count']} 条已确认调用关系见"
-                "[完整 API 分析与调用关系明细](all-impact-details.md)。"
+                "[完整 API 分析与调用关系明细](all-impact-details.md)；"
+                "结构化数据见"
+                "[API 与调用关系 CSV](all-impact-details.csv)。"
             ),
             "",
         ])
@@ -8907,9 +9015,12 @@ def write_full_dependency_analysis_artifact(
     report_dir,
     findings,
     dependency_model=None,
+    api_model=None,
 ):
+    api_model = api_model or build_human_api_analysis(findings)
     dependency_model = dependency_model or build_human_dependency_analysis(
-        findings
+        findings,
+        api_model,
     )
     output = _deliverables_dir(report_dir) / "all-affected-dependencies.md"
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -8960,6 +9071,7 @@ def write_full_dependency_analysis_artifact(
             *_dependency_incomplete_table(
                 dependency_model["incomplete"],
                 include_link=True,
+                incomplete_api_count=api_model["incomplete_count"],
             ),
             "",
         ])
@@ -8979,6 +9091,7 @@ def write_full_dependency_analysis_artifact(
             *_dependency_completed_table(
                 dependency_model["completed"],
                 include_link=True,
+                incomplete_api_count=api_model["incomplete_count"],
             ),
             "",
         ])
@@ -9058,9 +9171,7 @@ def write_full_api_analysis_artifact(
         ])
     if api_model["incomplete"]:
         lines.extend([
-            '<a id="unanalyzed-apis"></a>',
-            "",
-            f"## 未完成分析的 API（{api_model['incomplete_count']}）",
+            _full_api_incomplete_heading(api_model["incomplete_count"]),
             "",
             *_api_detail_table(
                 api_model["incomplete"],
@@ -9089,16 +9200,7 @@ def write_full_api_analysis_artifact(
     for coord, rows in completed_by_coord:
         dependency = dependency_lookup.get(coord) or {"coord": coord}
         lines.extend([
-            f'<a id="{_dependency_anchor(coord)}"></a>',
-            "",
-            (
-                f"## `{_full_md_cell(coord or '依赖身份未记录')}`"
-                + (
-                    f"：{_full_md_cell(_version_transition(dependency))}"
-                    if _version_transition(dependency)
-                    else ""
-                )
-            ),
+            _full_api_dependency_heading(dependency),
             "",
             (
                 f"本依赖有 {sum(int(row.get('aggregate_count') or 1) for row in rows)} "
@@ -9167,6 +9269,7 @@ def write_primary_report_artifacts(report_dir, findings):
                 report_dir,
                 findings,
                 dependency_model,
+                api_model,
             )
         ),
         "full_dependency_analysis_csv": (
@@ -9414,10 +9517,51 @@ def render_user_visible_files(
 
 def build_report_sections_for_test_only():
     return [
+        "报告目录",
         "依赖层面结论",
         "API 及调用关系",
         "用户可见文件说明",
     ]
+
+
+_MAIN_REPORT_TOC_ENTRIES = (
+    ("## 一、依赖层面结论", "一、依赖层面结论", 0),
+    ("### 未完成分析的依赖", "未完成分析的依赖", 1),
+    ("### 已完成分析的依赖", "已完成分析的依赖", 1),
+    ("## 二、API 及调用关系", "二、API 及调用关系", 0),
+    ("### 未完成分析的 API", "未完成分析的 API", 1),
+    (
+        "### 已确认触达与结论未确定的 API",
+        "已确认触达与结论未确定的 API",
+        1,
+    ),
+    ("### 其他已完成状态统计", "其他已完成状态统计", 1),
+    ("## 三、用户可见文件说明", "三、用户可见文件说明", 0),
+)
+
+
+def _main_report_heading_entry(line):
+    for prefix, label, depth in _MAIN_REPORT_TOC_ENTRIES:
+        if line.startswith(prefix):
+            return prefix, label, depth
+    return None
+
+
+def _render_main_report_toc(section_lines):
+    present_targets = {
+        entry[0]: _markdown_heading_fragment(line)
+        for line in section_lines
+        if (entry := _main_report_heading_entry(line))
+    }
+    lines = ["## 报告目录", ""]
+    for prefix, label, depth in _MAIN_REPORT_TOC_ENTRIES:
+        target = present_targets.get(prefix)
+        if not target:
+            continue
+        indent = "  " if depth else ""
+        lines.append(f"{indent}- [{label}](#{target})")
+    lines.append("")
+    return lines
 
 
 def generate_report(findings):
@@ -9430,13 +9574,25 @@ def generate_report(findings):
         "",
     ]
     L += render_report_scope_notice(findings)
-    L += render_dependency_conclusions(findings, dependency_model)
-    L += render_api_and_calls(findings, api_model)
-    L += render_user_visible_files(
+    dependency_lines = render_dependency_conclusions(
+        findings,
+        dependency_model,
+    )
+    api_lines = render_api_and_calls(findings, api_model)
+    user_visible_file_lines = render_user_visible_files(
         findings,
         api_model,
         dependency_model,
     )
+    all_section_lines = [
+        *dependency_lines,
+        *api_lines,
+        *user_visible_file_lines,
+    ]
+    L += _render_main_report_toc(all_section_lines)
+    L += dependency_lines
+    L += api_lines
+    L += user_visible_file_lines
 
     return '\n'.join(L)
 

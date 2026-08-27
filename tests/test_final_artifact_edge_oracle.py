@@ -294,8 +294,8 @@ class FinalArtifactEdgeOraclePerformanceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             artifact = _fake_artifact(Path(temp_dir) / "version-hang.jar", ["fixture/A.class"])
             with patch.object(
-                oracle.subprocess,
-                "run",
+                oracle,
+                "run_managed_subprocess",
                 side_effect=subprocess.TimeoutExpired(["javap", "-version"], 0.05),
             ) as mocked_run:
                 result = oracle.scan_final_artifact(artifact, time_budget_seconds=0.05)

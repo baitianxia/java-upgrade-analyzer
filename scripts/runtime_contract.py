@@ -12,6 +12,7 @@ import re
 import sys
 
 from compat import find_executable, gradle_cmd, mvn_cmd, run_cmd
+from javap_contract import javap_command
 
 
 MINIMUM_PYTHON = (3, 10)
@@ -125,7 +126,11 @@ def _jdk_major(text):
         version = _version_tuple(candidates[-1]) if candidates else ()
     if not version:
         return None
-    return version[1] if version[0] == 1 and len(version) > 1 else version[0]
+    if version[0] == 1:
+        # ``1.<feature>`` is the legacy form. A bare ``1`` is incomplete and
+        # must not turn the parser's padded zero into a fabricated JDK major.
+        return version[1] or None
+    return version[0]
 
 
 def validate_runtime_contract(
@@ -193,7 +198,7 @@ def validate_runtime_contract(
         commands.update({
             "java": ["java", "-version"],
             "javac": ["javac", "-version"],
-            "javap": ["javap", "-version"],
+            "javap": javap_command("javap", "-version"),
             "jdeps": ["jdeps", "-version"],
         })
     if require_maven:

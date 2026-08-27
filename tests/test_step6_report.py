@@ -3,8 +3,10 @@ import tempfile
 import csv
 import itertools
 import json
+import re
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -14,6 +16,49 @@ import s6_report  # noqa: E402
 
 
 class Step6ReportObjectivityTest(unittest.TestCase):
+    def test_large_api_projection_uses_prebuilt_overview_and_dependency_indexes(self):
+        count = 2000
+        items = [
+            {
+                "coord": f"g:a{index % 10}",
+                "api": f"p.C{index}.run",
+                "api_signature": "()",
+                "symbol_kind": "method",
+                "change_type": "REMOVED",
+                "reason_code": "NOT_FOUND_IN_STATIC_ANALYSIS",
+            }
+            for index in range(count)
+        ]
+        findings = {
+            "p0": [], "p1": [], "p2": [], "probable_impact": [],
+            "uncertain": [], "not_impacted": [], "needs_input": [],
+            "not_analyzed": [], "not_found": items,
+            "impact_overview": {"apis": [dict(item) for item in items]},
+            "impacted_dependencies": [
+                {
+                    "coord": f"g:a{index}",
+                    "old_version": "1",
+                    "new_version": "2",
+                }
+                for index in range(10)
+            ],
+            "per_dependency_results": [],
+        }
+
+        with patch.object(
+            s6_report,
+            "_overview_for_item",
+            side_effect=AssertionError("linear overview scan used"),
+        ), patch.object(
+            s6_report,
+            "_dependency_for_item",
+            side_effect=AssertionError("linear dependency scan used"),
+        ):
+            rows = s6_report.build_api_result_rows(findings)
+
+        self.assertEqual(len(rows), count)
+        self.assertEqual({row["old_version"] for row in rows}, {"1"})
+
     @staticmethod
     def _human_first_findings():
         return {
@@ -752,8 +797,192 @@ class Step6ReportObjectivityTest(unittest.TestCase):
             ),
         ):
             self.assertIn(reader_fact, first_screen)
-        self.assertNotIn("## 报告目录", first_screen)
+        self.assertIn("## 报告目录", first_screen)
+        self.assertLess(
+            first_screen.index("## 报告目录"),
+            first_screen.index("1 个变化依赖已确认存在当前系统调用关系"),
+        )
         self.assertNotIn("不替使用者决定", first_screen)
+
+    def test_report_directory_uses_native_heading_links_without_html_tags(self):
+        report = s6_report.generate_report(self._human_first_findings())
+        toc = report[
+            report.index("## 报告目录") : report.index("## 一、依赖层面结论")
+        ]
+
+        expected_links = (
+            "[一、依赖层面结论](#一依赖层面结论)",
+            "[已完成分析的依赖](#已完成分析的依赖展示-11)",
+            "[二、API 及调用关系](#二api-及调用关系)",
+            (
+                "[已确认触达与结论未确定的 API]"
+                "(#已确认触达与结论未确定的-api展示-11)"
+            ),
+            "[其他已完成状态统计](#其他已完成状态统计)",
+            "[三、用户可见文件说明](#三用户可见文件说明)",
+        )
+        for link in expected_links:
+            self.assertIn(link, toc)
+        self.assertNotIn("[未完成分析的依赖]", toc)
+        self.assertNotIn("[未完成分析的 API]", toc)
+        self.assertNotIn("all-affected-dependencies", toc)
+        self.assertNotIn("all-impact-details", toc)
+
+        targets = re.findall(r"\]\(#([^)]+)\)", toc)
+        self.assertTrue(targets)
+        heading_targets = {
+            s6_report._markdown_heading_fragment(line)
+            for line in report.splitlines()
+            if re.match(r"^#{1,6}\s+", line)
+        }
+        for target in targets:
+            self.assertIn(target, heading_targets)
+        self.assertNotIn("<a ", report)
+
+    def test_report_directory_includes_rendered_conditional_sections(self):
+        findings = self._human_first_findings()
+        existing_api = findings["impact_overview"]["apis"][0]
+        findings["changed_api_inventory"] = [
+            dict(existing_api),
+            {
+                "coord": "com.acme:payments-client",
+                "api": "com.acme.payments.NewClient.missing",
+                "api_signature": "()",
+                "symbol_kind": "method",
+                "change_type": "METHOD_REMOVED",
+                "old_version": "1.0",
+                "new_version": "2.0",
+            },
+        ]
+        findings["dependency_changes"] = [{
+            "coord": "com.acme:payments-client",
+            "old_version": "1.0",
+            "new_version": "2.0",
+            "change_type": "UPDATED",
+        }]
+        findings["analysis_scope"].update({
+            "total_api_count": 2,
+            "analyzed_api_count": 2,
+        })
+
+        report = s6_report.generate_report(findings)
+        toc = report[
+            report.index("## 报告目录") : report.index("## 一、依赖层面结论")
+        ]
+
+        for link in (
+            "[未完成分析的依赖](#未完成分析的依赖展示-11)",
+            "[未完成分析的 API](#未完成分析的-api展示-11)",
+        ):
+            self.assertIn(link, toc)
+
+    def test_detail_file_locations_are_beside_detail_sections(self):
+        report = s6_report.generate_report(self._human_first_findings())
+        toc = report[
+            report.index("## 报告目录") : report.index("## 一、依赖层面结论")
+        ]
+        dependency_section = report[
+            report.index("## 一、依赖层面结论") : report.index("## 二、API 及调用关系")
+        ]
+        api_section = report[
+            report.index("## 二、API 及调用关系") : report.index("## 三、用户可见文件说明")
+        ]
+
+        self.assertNotIn("all-affected-dependencies", toc)
+        self.assertNotIn("all-impact-details", toc)
+        for filename in (
+            "all-affected-dependencies.md",
+            "all-affected-dependencies.csv",
+        ):
+            self.assertIn(filename, dependency_section)
+        for filename in ("all-impact-details.md", "all-impact-details.csv"):
+            self.assertIn(filename, api_section)
+        self.assertIn("供人工逐项复核", report)
+        self.assertIn("便于筛选", report)
+
+    def test_report_reading_contract_keeps_focus_and_complete_details(self):
+        dependency_count = s6_report.S6_MAIN_DEPENDENCY_LIMIT + 5
+        api_count = s6_report.S6_MAIN_RESULT_LIMIT + 3
+        dependencies = [
+            {
+                "coord": f"com.acme:lib-{index:02d}",
+                "old_version": "1.0",
+                "new_version": "2.0",
+                "change_type": "major",
+            }
+            for index in range(dependency_count)
+        ]
+        confirmed_apis = [
+            {
+                "coord": "com.acme:lib-00",
+                "old_version": "1.0",
+                "new_version": "2.0",
+                "api": f"com.acme.Api.changed{index:02d}",
+                "api_signature": "()",
+                "symbol_kind": "method",
+                "change_type": "METHOD_REMOVED",
+                "severity": "P1",
+                "business_entry": f"com.acme.Entry.call{index:02d}()",
+                "reason": "SYSTEM_CODE_REACHED",
+            }
+            for index in range(api_count)
+        ]
+        findings = {
+            "analysis_scope": {
+                "mode": "full",
+                "included_dependency_count": dependency_count,
+                "available_dependency_count": dependency_count,
+                "analyzed_api_count": api_count,
+                "total_api_count": api_count,
+            },
+            "coverage": {"overall_status": "complete"},
+            "dependency_changes": dependencies,
+            "impact_overview": {"apis": []},
+            "p0": [],
+            "p1": confirmed_apis,
+            "p2": [],
+            "probable_impact": [],
+            "uncertain": [],
+            "not_impacted": [],
+            "needs_input": [],
+            "not_analyzed": [],
+            "not_found": [],
+            "artifacts": {},
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            artifacts, _api_model, _dependency_model = (
+                s6_report.write_primary_report_artifacts(tmp, findings)
+            )
+            findings["artifacts"].update(artifacts)
+            report = s6_report.generate_report(findings)
+            with (
+                Path(tmp) / artifacts["full_dependency_analysis_csv"]
+            ).open(encoding="utf-8-sig", newline="") as handle:
+                full_dependency_rows = list(csv.DictReader(handle))
+            with (
+                Path(tmp) / artifacts["full_api_analysis_csv"]
+            ).open(encoding="utf-8-sig", newline="") as handle:
+                full_api_rows = list(csv.DictReader(handle))
+
+        toc = report[
+            report.index("## 报告目录") : report.index("## 一、依赖层面结论")
+        ]
+        dependency_section = report[
+            report.index("## 一、依赖层面结论") : report.index("## 二、API 及调用关系")
+        ]
+        api_section = report[
+            report.index("## 二、API 及调用关系") : report.index("## 三、用户可见文件说明")
+        ]
+
+        self.assertNotIn("all-affected-dependencies", toc)
+        self.assertNotIn("all-impact-details", toc)
+        self.assertIn("已完成分析的依赖（展示 20/25）", dependency_section)
+        self.assertIn("API（展示 12/15）", api_section)
+        self.assertIn("未展开 5 个", dependency_section)
+        self.assertIn("未展开 3 个", api_section)
+        self.assertEqual(len(full_dependency_rows), dependency_count)
+        self.assertEqual(len(full_api_rows), api_count)
 
     def test_main_report_summarizes_diagnostics_without_internal_protocol(self):
         findings = self._human_first_findings()
@@ -1051,7 +1280,7 @@ class Step6ReportObjectivityTest(unittest.TestCase):
             ["com.acme.Api.high", "com.acme.Api.low"],
         )
 
-    def test_main_report_fully_expands_reachable_and_uncertain_by_dependency(self):
+    def test_main_report_groups_focused_reachable_and_uncertain_by_dependency(self):
         reachable = [
             {
                 "coord": "com.acme:reachable",
@@ -1063,7 +1292,7 @@ class Step6ReportObjectivityTest(unittest.TestCase):
                 "conclusion": "已确认影响",
                 "path_count": 1,
             }
-            for index in range(13)
+            for index in range(10)
         ]
         uncertain = [
             {
@@ -1126,8 +1355,8 @@ class Step6ReportObjectivityTest(unittest.TestCase):
 
         self.assertIn("### 五态语义与用户行动", report)
         self.assertIn("`not_found_in_static_analysis` 只表示当前静态范围没有找到路径", report)
-        self.assertIn("完整展示 15/15", report)
-        for index in range(13):
+        self.assertIn("展示 12/12", report)
+        for index in range(10):
             self.assertIn(f"com.acme.Api.reachable{index}", report)
         self.assertLess(report.index("com.beta.Api.high"), report.index("com.beta.Api.low"))
         self.assertLess(report.index("`com.acme:reachable`"), report.index("`com.beta:uncertain`"))
@@ -1723,10 +1952,16 @@ class Step6ReportObjectivityTest(unittest.TestCase):
             detail = detail_path.read_text(encoding="utf-8")
 
         self.assertIn("完整 API 分析与调用关系明细", report)
-        self.assertIn("完整展示 15/15", report)
-        self.assertIn("com.acme.Api.method9", report)
+        self.assertIn("展示 12/15", report)
+        self.assertIn("未展开 3 个", report)
+        self.assertEqual(
+            report.count("| `com.acme:lib` | `com.acme.Api.method"),
+            s6_report.S6_MAIN_RESULT_LIMIT,
+        )
         self.assertIn("com.acme.Api.method14", detail)
+        self.assertIn("com.acme.Api.method9", detail)
         self.assertIn("1.0.0 → 2.0.0", detail)
+        self.assertNotIn("<a ", detail)
 
     def test_large_confirmed_markdown_is_bounded_and_keeps_full_csv(self):
         total = 1920
@@ -3074,6 +3309,9 @@ class Step6ReportObjectivityTest(unittest.TestCase):
             dependency_detail = (
                 Path(tmp) / artifacts["full_dependency_analysis_md"]
             ).read_text(encoding="utf-8")
+            api_detail = (
+                Path(tmp) / artifacts["full_api_analysis_md"]
+            ).read_text(encoding="utf-8")
 
         self.assertIn("1/2", report)
         self.assertIn("| 1 | 0 | 1 | 1 | 0 | 0 |", report)
@@ -3081,6 +3319,19 @@ class Step6ReportObjectivityTest(unittest.TestCase):
         self.assertIn("部分结果确认有影响；分析未完成", report)
         self.assertIn("[已完成 API 及调用关系]", dependency_detail)
         self.assertIn("[未完成 API 及原因]", dependency_detail)
+        self.assertNotIn("<a ", api_detail)
+        detail_targets = {
+            s6_report._markdown_heading_fragment(line)
+            for line in api_detail.splitlines()
+            if re.match(r"^#{1,6}\s+", line)
+        }
+        linked_targets = re.findall(
+            r"all-impact-details\.md#([^\)]+)",
+            dependency_detail,
+        )
+        self.assertTrue(linked_targets)
+        for target in linked_targets:
+            self.assertIn(target, detail_targets)
 
     def test_file_explanation_counts_input_and_analysis_diagnostics_separately(self):
         findings = self._human_first_findings()

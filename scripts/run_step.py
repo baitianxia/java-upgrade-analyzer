@@ -27,6 +27,7 @@ from compat import (
     open_text,
     resolve_repo_input_path,
     run_cmd,
+    subprocess_platform_kwargs,
 )
 from compat import git_cmd
 from artifact_coordinates import artifact_ga
@@ -77,6 +78,7 @@ from step1_ref_resolution import resolve_step1_ref
 from remote_source_refs import classify_fetch_failure
 from runtime_contract import contract_payload
 from progress_logging import emit_progress
+from process_lock import exclusive_file_lock
 from reason_guidance import REASON_GUIDANCE_SCHEMA, guidance_for_reason_code
 
 
@@ -96,6 +98,7 @@ BACKGROUND_CHILD_ENV = "JUA_BACKGROUND_CHILD"
 BACKGROUND_RUN_ID_ENV = "JUA_BACKGROUND_RUN_ID"
 BACKGROUND_STATUS_PATH_ENV = "JUA_BACKGROUND_STATUS_PATH"
 TERMINAL_WORKFLOW_STATUSES = {"completed", "completed_with_limits"}
+_WORKFLOW_MUTATION_CONTEXT = threading.local()
 USER_TASK_NAMES = {
     "step1": "分析对象与依赖范围",
     "step2": "升级上下文",
@@ -139,6 +142,7 @@ INTENT_PATCH_ALLOWED_SET_FIELDS = {
     "base_allow_dirty_local_source",
     "base_jdk_home",
     "base_source_project_dir",
+    "base_tool",
     "current_artifact_path",
     "current_branch",
     "current_allow_local_source",
@@ -147,6 +151,7 @@ INTENT_PATCH_ALLOWED_SET_FIELDS = {
     "current_expected_commit",
     "current_jdk_home",
     "current_source_project_dir",
+    "current_tool",
     "jdk_base",
     "jdk_current",
     "dependency_git_ref_overrides",
@@ -541,12 +546,10 @@ def _background_record_is_live(payload):
 
 
 def _background_platform_kwargs(platform_name=None):
-    platform_name = str(platform_name or os.name)
-    if platform_name == "nt":
-        # Values from the Windows CreateProcess API.  Referencing numeric
-        # constants also keeps this helper importable and testable on POSIX.
-        return {"creationflags": 0x00000200 | 0x00000008}
-    return {"start_new_session": True}
+    return subprocess_platform_kwargs(
+        new_process_group=True,
+        platform_name=str(platform_name or os.name),
+    )
 
 
 def _background_exit_status(exit_code):
@@ -2095,7 +2098,10 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
         updated["analysis_mode"] = normalize_analysis_mode(response.get("analysis_mode"), allow_empty=True)
         updated = apply_explicit_step1_mode_selection(updated)
 
-    for key in ("base_branch", "current_branch", "target_module", "primary_module", "tool"):
+    for key in (
+        "base_branch", "current_branch", "target_module", "primary_module",
+        "tool", "base_tool", "current_tool",
+    ):
         value = response.get(key)
         if isinstance(value, str) and value.strip():
             updated[key] = value.strip()
@@ -2104,8 +2110,15 @@ def merge_user_response_into_run_context(run_context, user_response, project_dir
                 updated["target_module"] = value.strip()
                 updated["primary_module"] = value.strip()
                 updated.pop("pinned_source_snapshot", None)
-            if key == "tool":
-                updated["tool_explicit"] = True
+            if key in {"tool", "base_tool", "current_tool"}:
+                if key == "tool":
+                    updated["base_tool"] = value.strip()
+                    updated["current_tool"] = value.strip()
+                    updated["tool_explicit"] = True
+                else:
+                    updated[f"{key}_explicit"] = True
+                    if key == "current_tool":
+                        updated["tool"] = value.strip()
                 updated.pop("pinned_source_snapshot", None)
             if key in ("base_branch", "current_branch"):
                 updated[f"{key}_explicit"] = True
@@ -2958,6 +2971,19 @@ def is_dependency_source_git_url(path_value, project_dir=None):
     return not local_path.exists()
 
 
+def _git_clone_transport_url(value):
+    """Give ambiguous SCP-style Git inputs the conventional ``git`` user."""
+    text = str(value or "").strip()
+    if not text or re.match(r"(?i)^[a-z][a-z0-9+.-]*://", text):
+        return text
+    if re.fullmatch(r"[^/@\s]+@[^:\s]+:.+", text):
+        return text
+    match = re.fullmatch(r"(?![A-Za-z]:[\\/])([^/:@\s]+):(.+)", text)
+    if match:
+        return f"git@{match.group(1)}:{match.group(2)}"
+    return text
+
+
 def _redact_git_url(value):
     text = str(value or "")
     text = re.sub(
@@ -3039,6 +3065,32 @@ def _canonical_git_endpoint(value):
     return text
 
 
+def _persistable_git_transport_url(value):
+    """Return a credential-free origin URL while preserving an SSH user."""
+    text = _git_clone_transport_url(value)
+    if not re.match(r"(?i)^[a-z][a-z0-9+.-]*://", text):
+        return text
+    parts = urlsplit(text)
+    host = parts.netloc.rsplit("@", 1)[-1]
+    netloc = host
+    if parts.scheme.lower() == "ssh" and "@" in parts.netloc:
+        username = parts.netloc.rsplit("@", 1)[0].split(":", 1)[0]
+        if username:
+            netloc = f"{username}@{host}"
+    query_items = sorted(
+        (key, item_value)
+        for key, item_value in parse_qsl(parts.query, keep_blank_values=True)
+        if not _is_sensitive_git_query_key(key)
+    )
+    return urlunsplit((
+        parts.scheme.lower(),
+        netloc,
+        parts.path,
+        urlencode(query_items, doseq=True),
+        "",
+    ))
+
+
 def _dependency_source_remaining_timeout(deadline, cap=10):
     if deadline is None:
         return float(cap)
@@ -3100,8 +3152,8 @@ def _is_materialized_dependency_source_repo(repo_path, git_url, *, deadline=None
 
 def _scrub_materialized_dependency_source_origin(repo_path, git_url, *, deadline=None):
     """Ensure clone credentials are not retained in the local Git config."""
-    endpoint = _canonical_git_endpoint(git_url)
-    if endpoint == str(git_url or "").strip():
+    transport_url = _persistable_git_transport_url(git_url)
+    if transport_url == str(git_url or "").strip():
         return True, ""
     timeout = _dependency_source_remaining_timeout(deadline)
     if timeout <= 0:
@@ -3109,7 +3161,7 @@ def _scrub_materialized_dependency_source_origin(repo_path, git_url, *, deadline
     stdout, stderr, rc = run_cmd(
         git_cmd() + [
             "-C", str(repo_path), "config", "--local",
-            "remote.origin.url", endpoint,
+            "remote.origin.url", transport_url,
         ],
         timeout=timeout,
         env={"GIT_TERMINAL_PROMPT": "0"},
@@ -3190,6 +3242,7 @@ def materialize_dependency_source_git_url(git_url, report_dir, clone_timeout=300
     )
 
     git_endpoint = _canonical_git_endpoint(git_url)
+    clone_transport_url = _git_clone_transport_url(git_url)
     git_endpoint_sha256 = hashlib.sha256(
         git_endpoint.encode("utf-8")
     ).hexdigest()
@@ -3230,6 +3283,14 @@ def materialize_dependency_source_git_url(git_url, report_dir, clone_timeout=300
         if _is_materialized_dependency_source_repo(
             repo_path, git_url, deadline=deadline,
         ):
+            scrubbed, scrub_reason = _scrub_materialized_dependency_source_origin(
+                repo_path, git_url, deadline=deadline,
+            )
+            if not scrubbed:
+                raise StepError(
+                    f"依赖源码缓存无法安全更新远程地址：{display_url}：{scrub_reason}",
+                    reason_codes=["DEPENDENCY_SOURCE_GIT_ORIGIN_SCRUB_FAILED"],
+                )
             write_json(
                 metadata_path,
                 {
@@ -3291,7 +3352,7 @@ def materialize_dependency_source_git_url(git_url, report_dir, clone_timeout=300
                     "clone",
                     "--origin",
                     "origin",
-                    git_url,
+                    clone_transport_url,
                     str(temp_repo),
                 ],
                 cwd=str(cache_entry),
@@ -3329,7 +3390,9 @@ def materialize_dependency_source_git_url(git_url, report_dir, clone_timeout=300
                 "attempt": attempt_number,
                 "status": failure_type,
                 "reason": _redact_git_sensitive_text(
-                    last_reason.replace(git_url, display_url)
+                    last_reason.replace(clone_transport_url, display_url).replace(
+                        git_url, display_url
+                    )
                 )[:1000],
                 "retryable": bool(retryable),
             })
@@ -3355,7 +3418,9 @@ def materialize_dependency_source_git_url(git_url, report_dir, clone_timeout=300
                 },
             )
             reason = _redact_git_sensitive_text(
-                last_reason.replace(git_url, display_url)
+                last_reason.replace(clone_transport_url, display_url).replace(
+                    git_url, display_url
+                )
             )
             raise StepError(
                 f"无法克隆依赖源码 Git 地址 {display_url}：{reason[:1000]}。"
@@ -4240,6 +4305,8 @@ def infer_non_pending_target_step_from_payload(user_response):
                 "primary_module",
                 "target_module",
                 "tool",
+                "base_tool",
+                "current_tool",
             },
         ),
         (
@@ -5294,7 +5361,11 @@ def _apply_pinned_source_snapshot(run_context, project_dir):
         _stable_path_from_project_relative(project_root, item)
         for item in snapshot.get("source_roots") or []
     ]
-    updated["tool"] = str(snapshot.get("build_tool") or updated.get("tool") or "")
+    updated["current_tool"] = str(
+        snapshot.get("build_tool") or updated.get("current_tool")
+        or updated.get("tool") or ""
+    )
+    updated["tool"] = updated["current_tool"]
     updated["project_scope"] = _materialize_project_scope_paths(
         snapshot.get("project_scope") or {},
         project_root,
@@ -5327,8 +5398,12 @@ def _discard_unpinned_local_source_discovery(run_context):
     if str(updated.get("source_dirs_status") or "") != "explicit":
         updated["source_dirs"] = []
         updated["source_dirs_status"] = "missing"
-    if not updated.get("tool_explicit"):
+    if not (
+        updated.get("tool_explicit")
+        or updated.get("current_tool_explicit")
+    ):
         updated["tool"] = ""
+        updated["current_tool"] = ""
     return updated
 
 
@@ -5391,6 +5466,34 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
         )
         or previous.get("tool_explicit")
     )
+    legacy_tool = str(
+        resolve_value(cli_scalar(args.tool), merged, "tool", detected_tool)
+        or detected_tool
+    ).strip().lower()
+    base_tool_explicit = bool(
+        str(cli_scalar(getattr(args, "base_tool", "")) or "").strip()
+        or str(seed_input.get("base_tool") or "").strip()
+        or previous.get("base_tool_explicit")
+        or tool_explicit
+    )
+    current_tool_explicit = bool(
+        str(cli_scalar(getattr(args, "current_tool", "")) or "").strip()
+        or str(seed_input.get("current_tool") or "").strip()
+        or previous.get("current_tool_explicit")
+        or tool_explicit
+    )
+    base_tool = str(resolve_value(
+        cli_scalar(getattr(args, "base_tool", "")),
+        merged,
+        "base_tool",
+        legacy_tool if tool_explicit else "",
+    ) or "").strip().lower()
+    current_tool = str(resolve_value(
+        cli_scalar(getattr(args, "current_tool", "")),
+        merged,
+        "current_tool",
+        legacy_tool,
+    ) or legacy_tool).strip().lower()
     # Branches are analysis inputs, not safe defaults.
     # Keep auto-detection out of the formal run context unless the user/runtime
     # explicitly provided them in a previous confirmed step.
@@ -5503,7 +5606,11 @@ def build_run_context(args, existing, seed_payload, allow_external_seed=True):
             if "max_depth" in merged
             else args.max_depth
         ),
-        "tool": resolve_value(cli_scalar(args.tool), merged, "tool", detected_tool),
+        "base_tool": base_tool,
+        "current_tool": current_tool,
+        "base_tool_explicit": base_tool_explicit,
+        "current_tool_explicit": current_tool_explicit,
+        "tool": current_tool,
         "tool_explicit": tool_explicit,
         "allow_degraded": (
             parse_bool_like(merged.get("allow_degraded"), "allow_degraded")
@@ -6229,6 +6336,16 @@ def build_step1_response_properties():
             "enum": ["maven", "gradle"],
             "description": "构建工具；通常从项目根目录自动识别 Maven 或 Gradle。",
         },
+        "base_tool": {
+            "type": "string",
+            "enum": ["maven", "gradle"],
+            "description": "可选。基准侧构建工具；未指定时在固定基准 revision 中识别。",
+        },
+        "current_tool": {
+            "type": "string",
+            "enum": ["maven", "gradle"],
+            "description": "可选。当前侧构建工具；默认从当前固定 revision 识别。",
+        },
     }
 
 
@@ -6869,11 +6986,17 @@ def rebuild_current_pinned_source_context(run_context, project_dir):
 
         detected_tool = detect_build_tool(snapshot_project_root)
         configured_tool = (
-            str(updated.get("tool") or "").strip().lower()
-            if updated.get("tool_explicit")
+            str(
+                updated.get("current_tool") or updated.get("tool") or ""
+            ).strip().lower()
+            if (
+                updated.get("current_tool_explicit")
+                or updated.get("tool_explicit")
+            )
             else ""
         )
         build_tool = configured_tool or detected_tool
+        updated["current_tool"] = build_tool
         updated["tool"] = build_tool
         target_module = str(updated.get("target_module") or "").strip()
         active_profiles = set(updated.get("active_maven_profiles") or [])
@@ -7795,6 +7918,8 @@ def _user_field_label(field):
         "current_branch": "当前分支",
         "base_source_project_dir": "基准侧源码仓库目录",
         "current_source_project_dir": "当前侧源码仓库目录",
+        "base_tool": "基准侧构建工具",
+        "current_tool": "当前侧构建工具",
         "base_artifact_path": "升级前构建产物",
         "current_artifact_path": "升级后构建产物",
         "jdk_base": "升级前 JDK 版本",
@@ -7836,6 +7961,8 @@ def _user_field_description(field, meta=None):
         "current_branch": "升级后代码所在分支。",
         "base_artifact_path": "升级前构建出的 jar/war 路径。",
         "current_artifact_path": "升级后构建出的 jar/war 路径。",
+        "base_tool": "升级前固定 revision 使用的 Maven 或 Gradle。",
+        "current_tool": "升级后固定 revision 使用的 Maven 或 Gradle。",
         "jdk_base": "升级前实际使用的 JDK 主版本。",
         "jdk_current": "升级后实际使用的 JDK 主版本。",
         "springboot_base": "升级前实际使用的 Spring Boot 版本。",
@@ -7873,6 +8000,8 @@ def _humanize_interaction_text(text):
         "accept_suggested_mappings": "是否采用建议的依赖源码映射",
         "dependency_git_ref_overrides": "依赖 old_ref/new_ref",
         "source_dirs": "业务源码目录",
+        "base_tool": "基准侧构建工具",
+        "current_tool": "当前侧构建工具",
         "target_module": "目标模块",
         "project_scope": "项目范围",
         "step5_selected_coords": "系统触达证据要分析的依赖坐标",
@@ -11324,7 +11453,7 @@ def execute_step(step_id, args, manifest_steps, run_context, main_state=None):
     )
 
 
-def main(argv=None, _skip_environment_contract=False):
+def _main_with_workflow_lock_held(argv=None, _skip_environment_contract=False):
     argv_values = list(sys.argv[1:] if argv is None else argv)
     ap = argparse.ArgumentParser(description="统一执行 Java 升级分析的单个 Step")
     ap.add_argument("--step", choices=STEP_SEQUENCE + ["auto"])
@@ -11368,6 +11497,8 @@ def main(argv=None, _skip_environment_contract=False):
     ap.add_argument("--primary-module", default="")
     ap.add_argument("--target-module", default="", help="本次分析唯一的目标部署模块；新流程优先使用")
     ap.add_argument("--tool", choices=["maven", "gradle"], default="")
+    ap.add_argument("--base-tool", choices=["maven", "gradle"], default="")
+    ap.add_argument("--current-tool", choices=["maven", "gradle"], default="")
     ap.add_argument("--response-json", default="", help="结构化用户答复 JSON，例如 '{\"action\":\"continue\"}'")
     ap.add_argument("--response-file", default="", help="结构化用户答复 JSON 文件路径")
     ap.add_argument(
@@ -11691,6 +11822,7 @@ def main(argv=None, _skip_environment_contract=False):
                     "--manifest", str(args.manifest),
                 ],
                 _skip_environment_contract=True,
+                _workflow_lock_held=True,
             )
         return 0
     except StepInteractionRequired as exc:
@@ -11712,6 +11844,97 @@ def main(argv=None, _skip_environment_contract=False):
             file=sys.stderr,
         )
         return EXIT_INTERRUPTED
+
+
+@contextmanager
+def _workflow_mutation_lock(report_dir, timeout_seconds=None):
+    if timeout_seconds is None:
+        try:
+            timeout_seconds = float(
+                os.environ.get("JUA_WORKFLOW_MUTATION_LOCK_TIMEOUT_SECONDS")
+                or 1.0
+            )
+        except (TypeError, ValueError):
+            timeout_seconds = 1.0
+    report_root = Path(report_dir).resolve()
+    lock_path = (
+        report_root / RUNTIME_DIRNAME / "state" / ".workflow-mutation.lock"
+    )
+    manager = exclusive_file_lock(
+        lock_path, timeout_seconds=max(0.0, float(timeout_seconds))
+    )
+    try:
+        manager.__enter__()
+    except TimeoutError as error:
+        raise StepError(
+            "同一报告目录已有分析流程正在修改状态或发布结果。",
+            reason_codes=["WORKFLOW_MUTATION_ALREADY_ACTIVE"],
+        ) from error
+    prior_depth = int(
+        getattr(_WORKFLOW_MUTATION_CONTEXT, "depth", 0) or 0
+    )
+    prior_roots = tuple(
+        getattr(_WORKFLOW_MUTATION_CONTEXT, "report_roots", ()) or ()
+    )
+    prior_process_id = getattr(
+        _WORKFLOW_MUTATION_CONTEXT, "process_id", None
+    )
+    current_process_id = os.getpid()
+    if prior_process_id != current_process_id:
+        prior_depth = 0
+        prior_roots = ()
+    _WORKFLOW_MUTATION_CONTEXT.depth = prior_depth + 1
+    _WORKFLOW_MUTATION_CONTEXT.report_roots = (*prior_roots, report_root)
+    _WORKFLOW_MUTATION_CONTEXT.process_id = current_process_id
+    try:
+        yield
+    finally:
+        _WORKFLOW_MUTATION_CONTEXT.depth = prior_depth
+        _WORKFLOW_MUTATION_CONTEXT.report_roots = prior_roots
+        _WORKFLOW_MUTATION_CONTEXT.process_id = prior_process_id
+        manager.__exit__(*sys.exc_info())
+
+
+def _workflow_mutation_lock_is_held(report_dir=None):
+    if (
+        not int(getattr(_WORKFLOW_MUTATION_CONTEXT, "depth", 0) or 0)
+        or getattr(_WORKFLOW_MUTATION_CONTEXT, "process_id", None)
+        != os.getpid()
+    ):
+        return False
+    if report_dir is None:
+        return True
+    return Path(report_dir).resolve() in tuple(
+        getattr(_WORKFLOW_MUTATION_CONTEXT, "report_roots", ()) or ()
+    )
+
+
+def _workflow_report_dir_from_argv(argv):
+    values = list(sys.argv[1:] if argv is None else argv)
+    try:
+        index = values.index("--report-dir")
+    except ValueError:
+        return Path(".upgrade-report").resolve()
+    if index + 1 >= len(values):
+        return Path(".upgrade-report").resolve()
+    return Path(str(values[index + 1] or ".upgrade-report")).resolve()
+
+
+def main(
+    argv=None,
+    _skip_environment_contract=False,
+    _workflow_lock_held=False,
+):
+    values = list(sys.argv[1:] if argv is None else argv)
+    if "--describe-step1-contract" in values or _workflow_lock_held:
+        return _main_with_workflow_lock_held(
+            argv, _skip_environment_contract=_skip_environment_contract
+        )
+    report_dir = _workflow_report_dir_from_argv(argv)
+    with _workflow_mutation_lock(report_dir):
+        return _main_with_workflow_lock_held(
+            argv, _skip_environment_contract=_skip_environment_contract
+        )
 
 
 def _cli_report_dir(argv):

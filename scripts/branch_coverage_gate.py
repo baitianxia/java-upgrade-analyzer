@@ -68,7 +68,7 @@ def function_branch_arcs(source: str, function_names) -> dict[str, set[tuple[int
     return result
 
 
-def trace_test_arcs(test_ids, target_paths) -> tuple[dict[str, set[tuple[int, int]]], bool]:
+def trace_test_arcs(test_ids, target_paths):
     canonical = {str(Path(path).resolve()): set() for path in target_paths}
     previous = {}
 
@@ -92,23 +92,37 @@ def trace_test_arcs(test_ids, target_paths) -> tuple[dict[str, set[tuple[int, in
             return local_tracer
         return None
 
-    suite = unittest.defaultTestLoader.loadTestsFromNames(list(test_ids))
+    loader = unittest.TestLoader()
+    suite = loader.loadTestsFromNames(list(test_ids))
+    loader_errors = list(loader.errors)
+    test_count = suite.countTestCases()
     sys.settrace(global_tracer)
     try:
         result = unittest.TextTestRunner(verbosity=1).run(suite)
     finally:
         sys.settrace(None)
-    return canonical, result.wasSuccessful()
+    return canonical, result.wasSuccessful(), test_count, loader_errors
 
 
 def evaluate_branch_coverage(config: dict, test_ids) -> dict:
     targets = config.get("branch_coverage") or []
+    if not targets:
+        return {
+            "status": "failed",
+            "test_count": 0,
+            "modules": [],
+            "errors": ["branch_coverage_targets_missing"],
+        }
     paths = [ROOT / str(item.get("module") or "") for item in targets]
-    observed, tests_passed = trace_test_arcs(test_ids, paths)
+    observed, tests_passed, executed_test_count, loader_errors = trace_test_arcs(
+        test_ids, paths
+    )
     reports = []
     errors = []
     for item, path in zip(targets, paths):
         functions = [str(name) for name in item.get("functions") or []]
+        if not functions:
+            errors.append(f"branch_functions_missing:{path.name}")
         expected_by_function = function_branch_arcs(
             path.read_text(encoding="utf-8"), functions
         )
@@ -136,9 +150,13 @@ def evaluate_branch_coverage(config: dict, test_ids) -> dict:
         })
     if not tests_passed:
         errors.append("branch_test_profile_failed")
+    if loader_errors:
+        errors.append("branch_test_loader_failed")
+    if executed_test_count <= 0:
+        errors.append("branch_test_profile_empty")
     return {
         "status": "passed" if not errors else "failed",
-        "test_count": len(test_ids),
+        "test_count": executed_test_count,
         "modules": reports,
         "errors": errors,
     }

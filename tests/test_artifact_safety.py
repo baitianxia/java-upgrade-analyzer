@@ -37,6 +37,27 @@ def _archive_bytes(entries, compression=zipfile.ZIP_DEFLATED):
 
 
 class ArtifactSafetyTest(unittest.TestCase):
+    def test_jar_signature_metadata_distinguishes_paired_and_orphan_sf(self):
+        metadata = artifact_safety.jar_signature_metadata((
+            "META-INF/APP.SF",
+            "META-INF/APP.RSA",
+            "META-INF/ORPHAN.SF",
+            "META-INF/SECOND.EC",
+            "META-INF/nested/IGNORED.RSA",
+        ))
+
+        self.assertTrue(metadata.has_signature_block_candidate)
+        self.assertEqual(
+            metadata.signature_blocks,
+            ("META-INF/APP.RSA", "META-INF/SECOND.EC"),
+        )
+        self.assertEqual(metadata.paired_signature_files, ("META-INF/APP.SF",))
+        self.assertEqual(metadata.orphan_signature_files, ("META-INF/ORPHAN.SF",))
+        self.assertEqual(
+            metadata.rewrite_sensitive_entries,
+            ("META-INF/APP.RSA", "META-INF/APP.SF", "META-INF/SECOND.EC"),
+        )
+
     def setUp(self):
         artifact_safety.clear_archive_safety_cache()
 
@@ -196,6 +217,14 @@ class ArtifactSafetyTest(unittest.TestCase):
                 )
                 self.assertFalse(result.safe)
                 self.assertIn(expected[name], result.reason_codes)
+
+    def test_rejects_archive_with_traversal_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "unsafe.jar"
+            artifact.write_bytes(_archive_bytes([("../escape.class", b"x")]))
+
+            with self.assertRaisesRegex(ValueError, "ARCHIVE_ENTRY_PATH_UNSAFE"):
+                artifact_safety.require_safe_archive(artifact)
 
     def test_rejects_nested_archive_depth_and_entry_budget(self):
         nested = _archive_bytes([("Leaf.class", b"x")])

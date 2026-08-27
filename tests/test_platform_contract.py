@@ -380,8 +380,8 @@ class PlatformContractTest(unittest.TestCase):
                 },
                 clear=False,
             ), patch.object(
-                compat.subprocess,
-                "run",
+                compat,
+                "run_managed_subprocess",
                 return_value=completed,
             ) as runner:
                 self.assertTrue(compat._git_executable_works(candidate))

@@ -514,9 +514,12 @@ def _gradle_project_dependencies(text):
         if gradle_path in seen:
             continue
         seen.add(gradle_path)
+        module = gradle_path.strip(":").replace(":", "/")
+        if not module:
+            continue
         edges.append({
             "coord": "",
-            "module": gradle_path.strip(":").replace(":", "/") or ".",
+            "module": module,
             "optional": False,
             "scope": "runtime",
         })
@@ -806,7 +809,10 @@ def build_project_scope(project_dir, target_module, *, active_profiles=None, bui
 
     for item in included:
         module_dir = Path(item["module_dir"])
-        declared_sources = list(item.get('declared_source_paths') or [])
+        declared_sources = [
+            value for value in (item.get('declared_source_paths') or [])
+            if str(value or '').strip()
+        ]
         source_candidates = [module_dir / relative for relative in ('src/main/java', 'src/main/kotlin', 'src/main/groovy')]
         source_candidates.extend(
             resolve_declared(module_dir, value, item.get('properties')) for value in declared_sources
@@ -818,10 +824,12 @@ def build_project_scope(project_dir, target_module, *, active_profiles=None, bui
             elif candidate in declared_source_candidates:
                 missing_declared_roots.append(str(candidate))
         resource_candidates = [module_dir / 'src/main/resources']
-        resource_candidates.extend(
-            resolve_declared(module_dir, value, item.get('properties'))
-            for value in (item.get('declared_resource_paths') or [])
-        )
+        for value in (item.get('declared_resource_paths') or []):
+            if not str(value or '').strip():
+                continue
+            resource_candidates.append(
+                resolve_declared(module_dir, value, item.get('properties'))
+            )
         for resources in resource_candidates:
             if resources.is_dir():
                 resource_roots.append(str(resources.resolve()))
@@ -1031,10 +1039,13 @@ def derive_coverage_report(report_dir, project_scope=None):
     components = []
 
     scope = dict(project_scope or {})
+    scope_reason_codes = list(scope.get("reason_codes") or ())
+    if not scope:
+        scope_reason_codes = ["project_scope_missing"]
     components.append({
         "id": "project_scope",
         "status": scope.get("status") or "insufficient",
-        "reason_codes": list(scope.get("reason_codes") or ["project_scope_missing"]),
+        "reason_codes": scope_reason_codes,
         "evidence": [".runtime/state/main_state.json#project_scope"],
     })
 

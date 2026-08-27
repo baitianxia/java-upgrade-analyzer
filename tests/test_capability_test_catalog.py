@@ -83,6 +83,42 @@ class CapabilityTestCatalogTest(unittest.TestCase):
 
         self.assertEqual(arcs, {(2, 3), (2, 4), (4, 5), (4, 6)})
 
+    def test_branch_gate_rejects_missing_targets_and_empty_function_lists(self):
+        missing = branch_coverage_gate.evaluate_branch_coverage({}, [])
+        empty = branch_coverage_gate.evaluate_branch_coverage(
+            {
+                "branch_coverage": [{
+                    "module": "scripts/branch_coverage_gate.py",
+                    "functions": [],
+                }]
+            },
+            [],
+        )
+
+        self.assertEqual(missing["status"], "failed")
+        self.assertIn("branch_coverage_targets_missing", missing["errors"])
+        self.assertEqual(empty["status"], "failed")
+        self.assertTrue(any(
+            error.startswith("branch_functions_missing:")
+            for error in empty["errors"]
+        ))
+        self.assertIn("branch_test_profile_empty", empty["errors"])
+
+    def test_branch_gate_rejects_loader_failures_as_infrastructure_errors(self):
+        payload = branch_coverage_gate.evaluate_branch_coverage(
+            {
+                "branch_coverage": [{
+                    "module": "scripts/branch_coverage_gate.py",
+                    "functions": ["evaluate_branch_coverage"],
+                    "min_percent": 0,
+                }]
+            },
+            ["tests.missing.Case.test_absent"],
+        )
+
+        self.assertEqual(payload["status"], "failed")
+        self.assertIn("branch_test_loader_failed", payload["errors"])
+
 
 if __name__ == "__main__":
     unittest.main()

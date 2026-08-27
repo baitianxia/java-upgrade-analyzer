@@ -6,6 +6,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime, timezone
@@ -21,6 +22,98 @@ import run_step  # noqa: E402
 
 
 class RunStepMainStateTest(unittest.TestCase):
+    def test_workflow_mutation_lock_rejects_concurrent_writers_for_same_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp).resolve() / ".upgrade-report"
+            acquired = threading.Event()
+            release = threading.Event()
+
+            def hold_lock():
+                with run_step._workflow_mutation_lock(
+                    report, timeout_seconds=1
+                ):
+                    acquired.set()
+                    release.wait(timeout=2)
+
+            owner = threading.Thread(target=hold_lock)
+            owner.start()
+            self.assertTrue(acquired.wait(timeout=2))
+            try:
+                with self.assertRaises(run_step.StepError) as caught:
+                    with run_step._workflow_mutation_lock(
+                        report, timeout_seconds=0.05
+                    ):
+                        self.fail("concurrent workflow lock acquired")
+            finally:
+                release.set()
+                owner.join(timeout=2)
+
+        self.assertFalse(owner.is_alive())
+        self.assertIn(
+            "WORKFLOW_MUTATION_ALREADY_ACTIVE", caught.exception.reason_codes
+        )
+
+    def test_workflow_mutation_lock_preserves_body_timeout_and_releases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp).resolve() / ".upgrade-report"
+            with self.assertRaisesRegex(
+                TimeoutError, "downstream operation timed out"
+            ):
+                with run_step._workflow_mutation_lock(
+                    report, timeout_seconds=0.1
+                ):
+                    raise TimeoutError("downstream operation timed out")
+
+            with run_step._workflow_mutation_lock(
+                report, timeout_seconds=0.1
+            ):
+                self.assertTrue(run_step._workflow_mutation_lock_is_held(report))
+
+    def test_git_transport_normalization_and_persistence_strip_secrets(self):
+        self.assertEqual(
+            run_step._git_clone_transport_url("code.example:team/repo.git"),
+            "git@code.example:team/repo.git",
+        )
+        self.assertEqual(
+            run_step._git_clone_transport_url("deploy@code.example:team/repo.git"),
+            "deploy@code.example:team/repo.git",
+        )
+        persisted = run_step._persistable_git_transport_url(
+            "ssh://deploy:secret@code.example/team/repo.git?token=private&ref=main"
+        )
+        self.assertEqual(
+            persisted,
+            "ssh://deploy@code.example/team/repo.git?ref=main",
+        )
+        self.assertNotIn("secret", persisted)
+        self.assertNotIn("token", persisted)
+
+    def test_run_context_keeps_base_tool_auto_and_current_tool_per_revision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = root / ".upgrade-report"
+            (root / "build.gradle").write_text("plugins {}", encoding="utf-8")
+            args = self._make_default_args(root, report)
+            args.tool = ""
+            args.base_tool = ""
+            args.current_tool = ""
+
+            context = run_step.build_run_context(args, {}, {})
+            overridden = run_step.merge_user_response_into_run_context(
+                context,
+                {"base_tool": "maven", "current_tool": "gradle"},
+                root,
+            )
+
+        self.assertEqual(context["base_tool"], "")
+        self.assertFalse(context["base_tool_explicit"])
+        self.assertEqual(context["current_tool"], "gradle")
+        self.assertFalse(context["current_tool_explicit"])
+        self.assertEqual(overridden["base_tool"], "maven")
+        self.assertTrue(overridden["base_tool_explicit"])
+        self.assertEqual(overridden["current_tool"], "gradle")
+        self.assertTrue(overridden["current_tool_explicit"])
+
     def test_json_reader_rejects_bom_prefixed_input(self):
         with tempfile.TemporaryDirectory() as tmp:
             invalid_path = Path(tmp) / "invalid.json"

@@ -15,7 +15,7 @@ import subprocess
 import sys
 import time
 
-from compat import setup_utf8_io
+from compat import run_managed_subprocess, setup_utf8_io
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -209,7 +209,7 @@ def _run_category(category, python_exe):
     started = time.perf_counter()
     command = [python_exe, "-m", "unittest", *category.tests]
     print(f"[accuracy-benchmark] START {category.name}: {len(category.tests)} tests", flush=True)
-    completed = subprocess.run(command, cwd=str(ROOT))
+    completed = run_managed_subprocess(command, cwd=str(ROOT), check=False)
     elapsed = time.perf_counter() - started
     status = "passed" if completed.returncode == 0 else "failed"
     print(
