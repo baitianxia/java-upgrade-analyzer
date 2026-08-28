@@ -14,6 +14,7 @@
   "public_scenario_contracts": "tests/fixtures/system_test_scenario_contracts.json",
   "internal_test_scope": "tests/fixtures/internal_test_scope.json",
   "whitebox_entry_modules": [
+    "binary_reconciliation_worker",
     "binary_pipeline",
     "binary_report",
     "gate",

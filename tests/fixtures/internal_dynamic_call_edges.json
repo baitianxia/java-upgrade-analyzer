@@ -1,6 +1,6 @@
 {
   "schema": "java-upgrade-analyzer.internal-dynamic-call-edges.v1",
-  "source_identity": "fdbb3e2acf963d78ea993299ff574508221f3b25037afde6d876e1a9dca442e1",
+  "source_identity": "88a0db4f9d3a0365fffde565ca5eb48017cf0ef7a48127d8c990e25de16d8459",
   "inventory_rule": "Every production-to-production edge observed at runtime but unresolved by the static call graph is retained as a required implementation-dependent white-box relationship. New, removed, or source-stale edges require explicit review.",
   "edges": [
     {
@@ -318,10 +318,6 @@
     {
       "caller": "binary_fact_store::BinaryFactStore.add_reconciliation_payloads",
       "callee": "binary_first_contract::BinaryFirstContractError.__init__"
-    },
-    {
-      "caller": "binary_fact_store::BinaryFactStore.add_reconciliation_payloads.<locals>.flush",
-      "callee": "binary_fact_store::BinaryFactStore.add_reconciliation_payloads.<locals>.next_chunk_ordinal"
     },
     {
       "caller": "binary_fact_store::BinaryFactStore.add_source_overlay",

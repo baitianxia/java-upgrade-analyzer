@@ -2,6 +2,7 @@ import gc
 import hashlib
 import json
 import os
+from dataclasses import replace
 import shutil
 import struct
 import subprocess
@@ -203,7 +204,7 @@ class BinaryDefinitionVerifierTest(unittest.TestCase):
                 self.assertTrue(verifier._is_valid_internal_class_name(name))
         for name in (
             "", "/demo/A", "demo/A/", "demo//A", "demo.A", "demo/A;B",
-            "demo/[A",
+            "demo/[A", None, 7,
         ):
             with self.subTest(name=name):
                 self.assertFalse(verifier._is_valid_internal_class_name(name))
@@ -696,6 +697,156 @@ class DefinitionVerifierBoundaryTest(unittest.TestCase):
                 self._verify_with_output({}, b"", completed=completed)
             self.assertEqual(raised.exception.reason_code, expected_reason)
 
+    def test_verifier_range_deadline_failure_detail_and_timeout_matrix(self):
+        failure_timeout = SimpleNamespace(
+            failure_kind="timeout",
+            to_mapping=lambda: {"failure_kind": "timeout"},
+        )
+        base = {
+            "platform": SimpleNamespace(java_executable=Path("/jdk/bin/java")),
+            "helper_dir": Path("/helper"),
+            "java_options": [],
+            "bundle_path": Path("/classes.bundle"),
+            "selected_class_bytes": {"demo/A": b"a", "demo/B": b"b"},
+            "expected_hashes": {"demo/A": "a", "demo/B": "b"},
+            "deadline": 10.0,
+            "invocation_budget_seconds": 1.0,
+        }
+        with patch.object(
+            verifier.time, "perf_counter", side_effect=[0.0, 1.0]
+        ), self.assertRaises(verifier.ClassDefinitionVerifierError) as expired:
+            verifier._execute_verifier_range(
+                **base, names=["demo/A"], start=0, end=1
+            )
+        self.assertEqual(
+            expired.exception.reason_code,
+            "CLASS_DEFINITION_VERIFIER_TIMEOUT",
+        )
+
+        with patch.object(
+            verifier.time, "perf_counter", return_value=0.0
+        ), patch.object(
+            verifier,
+            "execute_binary_tool",
+            return_value=SimpleNamespace(succeeded=False, failure=None),
+        ), patch.object(
+            verifier, "tool_failure_is_retryable", return_value=False
+        ), self.assertRaises(verifier.ClassDefinitionVerifierError) as missing:
+            verifier._execute_verifier_range(
+                **base, names=["demo/A"], start=0, end=1
+            )
+        self.assertEqual(
+            missing.exception.reason_code,
+            "CLASS_DEFINITION_VERIFIER_FAILED",
+        )
+        self.assertIn("missing_failure_detail", str(missing.exception))
+
+        with patch.object(
+            verifier.time, "perf_counter", return_value=0.0
+        ), patch.object(
+            verifier,
+            "execute_binary_tool",
+            return_value=SimpleNamespace(
+                succeeded=False, failure=failure_timeout
+            ),
+        ), self.assertRaises(verifier.ClassDefinitionVerifierError) as timeout:
+            verifier._execute_verifier_range(
+                **base, names=["demo/A", "demo/B"], start=0, end=2
+            )
+        self.assertEqual(
+            timeout.exception.reason_code,
+            "CLASS_DEFINITION_VERIFIER_TIMEOUT",
+        )
+
+    def test_installed_verifier_binding_and_phase_budget_operand_matrix(self):
+        empty_protocol = framed_json(
+            {
+                "frame_type": "definition_output_header",
+                "schema": verifier.SCHEMA,
+                "class_count": 0,
+            },
+            {
+                "frame_type": "definition_output_footer",
+                "class_count": 0,
+                "definition_ready_count": 0,
+                "failure_count": 0,
+            },
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            platform, helper = self._platform(Path(tmp))
+            source_sha = verifier._sha256_file(verifier.JAVA_HELPER)
+            javac = (platform.jdk_home / "bin" / "javac").resolve()
+            compiled = SimpleNamespace(output=helper)
+            bindings = (
+                SimpleNamespace(
+                    source_sha256="different", javac_path=str(javac)
+                ),
+                SimpleNamespace(
+                    source_sha256=source_sha, javac_path="different"
+                ),
+                SimpleNamespace(
+                    source_sha256=source_sha, javac_path=str(javac)
+                ),
+            )
+            for index, binding in enumerate(bindings):
+                with self.subTest(installed=index), patch.object(
+                    verifier,
+                    "_INSTALLED_COMPILED_DEFINITION_HELPER",
+                    (binding, compiled),
+                ), patch.object(
+                    verifier, "_compile_helper", return_value=compiled
+                ), patch.object(
+                    verifier,
+                    "execute_binary_tool",
+                    return_value=SimpleNamespace(
+                        succeeded=True, stdout=empty_protocol
+                    ),
+                ), patch.object(
+                    verifier, "verifier_identity", return_value="verifier-id"
+                ):
+                    self.assertEqual(
+                        verifier.verify_class_definitions(platform, {}), {}
+                    )
+
+            for invocation, phase in ((0, 1), (1, 0)):
+                with self.subTest(invocation=invocation, phase=phase), patch.object(
+                    verifier, "_compile_helper", return_value=compiled
+                ), patch.object(
+                    verifier, "verifier_identity", return_value="verifier-id"
+                ), self.assertRaises(verifier.ClassDefinitionVerifierError):
+                    verifier.verify_class_definitions(
+                        platform,
+                        {},
+                        timeout_seconds=invocation,
+                        phase_time_budget_seconds=phase,
+                    )
+
+            for selected in ({}, {"demo/A": b"a"}):
+                with self.subTest(expired_names=tuple(selected)), patch.object(
+                    verifier, "_compile_helper", return_value=compiled
+                ), patch.object(
+                    verifier, "verifier_identity", return_value="verifier-id"
+                ), patch.object(
+                    verifier.time, "perf_counter", side_effect=[0.0, 2.0]
+                ), patch.object(
+                    verifier,
+                    "execute_binary_tool",
+                    side_effect=AssertionError("expired phase cannot spawn JVM"),
+                ):
+                    result = verifier.verify_class_definitions(
+                        platform,
+                        selected,
+                        timeout_seconds=1,
+                        phase_time_budget_seconds=1,
+                    )
+                if selected:
+                    self.assertEqual(
+                        result["demo/A"]["status"],
+                        "verification_unavailable",
+                    )
+                else:
+                    self.assertEqual(result, {})
+
     def test_failed_batch_is_bisected_and_only_toxic_class_is_failed(self):
         selected = {
             "demo/A": b"class-a",
@@ -915,6 +1066,20 @@ class DefinitionVerifierBoundaryTest(unittest.TestCase):
                 self._verify_with_output({name: content}, stdout)
             self.assertEqual(raised.exception.reason_code, expected_reason)
 
+        with self.assertRaises(
+            verifier.ClassDefinitionVerifierError
+        ) as missing_expected:
+            verifier._parse_verifier_output(
+                framed_json(header, valid_record),
+                [name],
+                {name: content},
+                {},
+            )
+        self.assertEqual(
+            missing_expected.exception.reason_code,
+            "CLASS_DEFINITION_PROTOCOL_CLASS_SET_INVALID",
+        )
+
     def test_protocol_footer_conservation_and_stray_bytes_are_rejected(self):
         name = "demo/A"
         content = b"class"
@@ -1001,6 +1166,151 @@ class DefinitionVerifierBoundaryTest(unittest.TestCase):
             {"verifier-id"},
         )
         self.assertNotIn("-Djava.ext.dirs=", " ".join(command))
+
+    def _compiled_binding_fixture(self):
+        root = Path(self.temp.name) if hasattr(self, "temp") else None
+        if root is None:
+            self._binding_temp = tempfile.TemporaryDirectory()
+            self.addCleanup(self._binding_temp.cleanup)
+            root = Path(self._binding_temp.name)
+        case = root / f"binding-{len(list(root.iterdir()))}"
+        case.mkdir()
+        source = (case / "ClassDefinitionVerifier.java").resolve()
+        javac = (case / "javac").resolve()
+        output = (case / "compiled").resolve()
+        output.mkdir()
+        source.write_bytes(b"final class ClassDefinitionVerifier {}")
+        javac.write_bytes(b"javac")
+        (output / "A.class").write_bytes(b"prefix")
+        (output / "ClassDefinitionVerifier.class").write_bytes(b"main")
+        nested = output / "nested"
+        nested.mkdir()
+        (nested / "Helper.class").write_bytes(b"nested")
+        with patch.object(verifier, "JAVA_HELPER", source):
+            manifest = verifier._compiled_helper_manifest(output)
+        binding = verifier.CompiledDefinitionHelperBinding(
+            source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+            javac_path=str(javac),
+            output_path=output,
+            class_files=manifest,
+        )
+        return case, source, javac, output, binding
+
+    def test_compiled_definition_binding_mapping_manifest_and_reuse_are_exact(self):
+        case, source, _javac, output, binding = self._compiled_binding_fixture()
+        case = case.resolve()
+        mapping = binding.to_mapping()
+        self.assertEqual(
+            verifier.compiled_definition_helper_binding_from_mapping(mapping),
+            binding,
+        )
+        invalid_mappings = [None, {**mapping, "extra": True}]
+        changed = dict(mapping)
+        changed["class_files"] = None
+        invalid_mappings.append(changed)
+        for item in (
+            None,
+            ["Only", 1],
+            [1, 1, "a" * 64],
+            ["Only.class", "1", "a" * 64],
+            ["Only.class", 1, 1],
+        ):
+            changed = dict(mapping)
+            changed["class_files"] = [item]
+            invalid_mappings.append(changed)
+        for index, value in enumerate(invalid_mappings):
+            with self.subTest(mapping=index), self.assertRaises(
+                verifier.ClassDefinitionVerifierError
+            ):
+                verifier.compiled_definition_helper_binding_from_mapping(value)
+
+        empty = case / "empty"
+        empty.mkdir()
+        no_main = case / "no-main"
+        no_main.mkdir()
+        (no_main / "Other.class").write_bytes(b"other")
+        unexpected = case / "unexpected"
+        unexpected.mkdir()
+        (unexpected / "note.txt").write_text("not bytecode", encoding="utf-8")
+        regular_file_root = case / "regular-file-root"
+        regular_file_root.write_bytes(b"not a directory")
+        fifo_root = case / "fifo-root"
+        fifo_root.mkdir()
+        if hasattr(os, "mkfifo"):
+            os.mkfifo(fifo_root / "entry.class")
+        linked_root = case / "linked-root"
+        linked_root.symlink_to(output, target_is_directory=True)
+        linked_entry = case / "linked-entry"
+        linked_entry.mkdir()
+        (linked_entry / "Alias.class").symlink_to(
+            output / "ClassDefinitionVerifier.class"
+        )
+        for value in (
+            Path("relative"), case / "missing", empty, no_main, unexpected,
+            regular_file_root, linked_root, linked_entry,
+            *((fifo_root,) if hasattr(os, "mkfifo") else ()),
+        ):
+            with self.subTest(manifest=str(value)), self.assertRaises(
+                verifier.ClassDefinitionVerifierError
+            ):
+                verifier._compiled_helper_manifest(value)
+
+        verifier._INSTALLED_COMPILED_DEFINITION_HELPER = None
+        self.addCleanup(
+            setattr, verifier, "_INSTALLED_COMPILED_DEFINITION_HELPER", None
+        )
+        with patch.object(verifier, "JAVA_HELPER", source):
+            compiled = verifier._compiled_helper_from_binding(binding)
+            self.assertEqual(compiled.output, output)
+            verifier.install_compiled_definition_helper_binding(binding)
+            verifier.verify_compiled_definition_helper_binding(binding)
+        self.assertEqual(
+            verifier._INSTALLED_COMPILED_DEFINITION_HELPER[0], binding
+        )
+
+        invalid = [
+            object(),
+            replace(binding, source_sha256="bad"),
+            replace(binding, source_sha256="g" * 64),
+            replace(
+                binding,
+                class_files=(("ClassDefinitionVerifier.class", 4, "bad"),),
+            ),
+            replace(binding, output_path=Path("relative")),
+            replace(binding, javac_path=str(output / "missing-javac")),
+        ]
+        for index, value in enumerate(invalid):
+            with self.subTest(binding=index), patch.object(
+                verifier, "JAVA_HELPER", source
+            ), self.assertRaises(verifier.ClassDefinitionVerifierError):
+                verifier._compiled_helper_from_binding(value)
+
+        with patch.object(verifier, "JAVA_HELPER", source), patch.object(
+            verifier, "_sha256_file", return_value="0" * 64
+        ), self.assertRaises(verifier.ClassDefinitionVerifierError):
+            verifier._compiled_helper_from_binding(binding)
+        with patch.object(verifier, "JAVA_HELPER", source), patch.object(
+            verifier, "_compiled_helper_manifest", return_value=()
+        ), self.assertRaises(verifier.ClassDefinitionVerifierError):
+            verifier._compiled_helper_from_binding(binding)
+
+    def test_compiled_definition_binding_capture_is_source_and_tool_bound(self):
+        _case, source, javac, output, binding = self._compiled_binding_fixture()
+        platform = SimpleNamespace(jdk_home=Path("/jdk"))
+        compiled = verifier._CompiledDefinitionHelper(output, None)
+        with patch.object(verifier, "JAVA_HELPER", source), patch.object(
+            verifier, "jdk_tool_path", return_value=javac
+        ), patch.object(
+            verifier, "_compile_helper", return_value=compiled
+        ):
+            self.assertEqual(
+                verifier.capture_compiled_definition_helper_binding(platform),
+                binding,
+            )
+        with patch.object(verifier, "JAVA_HELPER", source), patch.object(
+            verifier, "jdk_tool_path", return_value=output / "missing"
+        ), self.assertRaises(verifier.ClassDefinitionVerifierError):
+            verifier.capture_compiled_definition_helper_binding(platform)
 
 
 if __name__ == "__main__":

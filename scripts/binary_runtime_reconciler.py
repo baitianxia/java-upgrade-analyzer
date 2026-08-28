@@ -58,7 +58,6 @@ _EDGE_JSON_CACHE_MAX_VALUE_BYTES = 16 * 1024
 # repeated hierarchy walks without retaining the complete edge population.
 _SYMBOLIC_MEMBER_CACHE_MAX_ENTRIES = 16_384
 
-
 class RuntimeReconciliationError(BinaryFirstContractError):
     pass
 
@@ -557,6 +556,7 @@ class _ReconciliationAccumulator:
             records=pending,
             collect_identities=False,
             manage_transaction=False,
+            derive_metadata_from_payload=True,
         )
         pending.clear()
 
@@ -695,6 +695,7 @@ class RuntimeReconciler:
             tuple[str, str], Mapping[str, Any]
         ] = {}
         self.class_info_cache: dict[tuple[str, str], dict[str, Any] | None] = {}
+        self._platform_public_class_access_cache: dict[str, bool] = {}
         self.ancestor_type_cache: dict[tuple[str, str], frozenset[str]] = {}
         self.virtual_dispatch_cache: dict[
             tuple[str, str, str], tuple[str, ...]
@@ -1093,47 +1094,35 @@ class RuntimeReconciler:
             and row["class_name"] != "module-info"
         }
         initial_classes.update(
-            owner
+            str(row["class_name"])
             for row in self.store.connection.execute(
                 """
-                SELECT DISTINCT edge.symbolic_owner
-                FROM direct_edges AS edge
+                SELECT reference.class_name
+                FROM runtime_class_references AS reference
                 JOIN artifact_instances AS artifact
                   ON artifact.artifact_instance_identity =
-                     edge.caller_artifact_instance_identity
+                     reference.artifact_instance_identity
                 WHERE artifact.runtime_profile_identity=?
-                  AND edge.symbolic_owner<>''
+                  AND reference.reference_kind='symbolic_owner'
                 """,
                 (self.profile.identity,),
             )
-            for owner in (_type_provider_owner(row["symbolic_owner"]),)
-            if owner
         )
-        loading_constraint_classes: set[str] = set()
-        for row in self.store.connection.execute(
-            """
-            SELECT edge.edge_json
-            FROM direct_edges AS edge
-            JOIN artifact_instances AS artifact
-              ON artifact.artifact_instance_identity =
-                 edge.caller_artifact_instance_identity
-            WHERE artifact.runtime_profile_identity=?
-              AND (
-                edge.edge_kind IN (
-                'method','field','invokedynamic_bootstrap',
-                'ldc_constant_dynamic_bootstrap','ldc_handle'
-                )
-                OR edge.edge_kind LIKE 'invokedynamic_handle_%'
-                OR edge.edge_kind LIKE 'ldc_bootstrap_handle_%'
-              )
-            """,
-            (self.profile.identity,),
-        ):
-            loading_constraint_classes.update(
-                _loading_constraint_type_owners_from_edge_json(
-                    str(row["edge_json"] or "{}")
-                )
+        loading_constraint_classes = {
+            str(row["class_name"])
+            for row in self.store.connection.execute(
+                """
+                SELECT reference.class_name
+                FROM runtime_class_references AS reference
+                JOIN artifact_instances AS artifact
+                  ON artifact.artifact_instance_identity =
+                     reference.artifact_instance_identity
+                WHERE artifact.runtime_profile_identity=?
+                  AND reference.reference_kind='loading_constraint_owner'
+                """,
+                (self.profile.identity,),
             )
+        }
         initial_classes.update(
             name for name in self.additional_initial_classes if name != "module-info"
         )
@@ -1670,11 +1659,30 @@ class RuntimeReconciler:
         owner = str(member["class_name"])
         defining = str(provider["selected_defining_loader_realm_identity"])
         if flags & ACC_PUBLIC:
+            variant = str(member.get("class_variant_identity") or "")
+            # Application classes in the supported profile are in unnamed
+            # modules; a public declaration is therefore accessible without
+            # a module-export lookup. Platform declarations still receive the
+            # exact target-image export check, cached once per immutable class
+            # variant rather than once per call site.
+            if variant and variant in self.class_by_variant:
+                return True
+            access_cache = getattr(
+                self, "_platform_public_class_access_cache", None
+            )
+            if access_cache is None:
+                access_cache = self._platform_public_class_access_cache = {}
+            if variant and variant in access_cache:
+                return access_cache[variant]
             info = self._class_info(provider)
             if info and info["module_name"]:
                 exports = self.platform.module_exports().get(info["module_name"], frozenset())
-                return _package(owner) in exports
-            return True
+                accessible = _package(owner) in exports
+            else:
+                accessible = True
+            if variant:
+                access_cache[variant] = accessible
+            return accessible
         if flags & ACC_PRIVATE:
             return (
                 caller_class == owner and caller_realm == defining
@@ -2180,8 +2188,11 @@ class RuntimeReconciler:
             owner = edge["symbolic_owner"]
             edge_json = str(edge["edge_json"] or "{}")
             edge_payload = _load_edge_json(edge_json)
-            descriptor_type_names = (
-                _loading_constraint_type_owners_from_edge_json(edge_json)
+            # The same immutable payload supplies handle kind and descriptor
+            # constraints. Validate it once per edge instead of traversing the
+            # LRU wrapper a second time; no field or constraint is omitted.
+            descriptor_type_names = _loading_constraint_type_owners(
+                edge_payload
             )
             # Ordinary MethodHandle edges store the handle directly, while an
             # invokedynamic bootstrap edge wraps it in ``payload.bootstrap``.

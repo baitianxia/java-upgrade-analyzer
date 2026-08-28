@@ -11,7 +11,12 @@ import re
 from typing import Any, Iterable
 import zipfile
 
-from binary_asm_helper import BinaryClassInput, BinaryFactRun, extract_class_facts
+from binary_asm_helper import (
+    BinaryClassInput,
+    BinaryFactRun,
+    ParserIdentityBinding,
+    extract_class_facts,
+)
 from binary_first_contract import BinaryFirstContractError, canonical_identity
 from jdk_preflight import JdkPreflightError, jdk_tool_path, resolve_jdk_release
 
@@ -82,9 +87,16 @@ _JDK8_EXTENSION_MODULE_PREFIX = "jdk8-extension."
 
 
 class JdkPlatformImage:
-    def __init__(self, jdk_home: str | Path, *, asm_jar: str | Path | None = None):
+    def __init__(
+        self,
+        jdk_home: str | Path,
+        *,
+        asm_jar: str | Path | None = None,
+        parser_identity_binding: ParserIdentityBinding | None = None,
+    ):
         self.jdk_home = Path(jdk_home).expanduser().resolve()
         self.asm_jar = asm_jar
+        self.parser_identity_binding = parser_identity_binding
         self.release_file = self.jdk_home / "release"
         self.modules_file = self.jdk_home / "lib" / "modules"
         self.java_executable = jdk_tool_path(self.jdk_home, "java")
@@ -310,6 +322,15 @@ class JdkPlatformImage:
                 inputs,
                 asm_jar=self.asm_jar,
                 jdk_home=self.jdk_home,
+                parser_identity_binding=getattr(
+                    self, "parser_identity_binding", None
+                ),
+                # Platform hierarchy discovery expands in several exact
+                # frontiers. Reuse only the transport JVM between frontiers;
+                # extract_class_facts still validates every input/output
+                # count and digest and falls back to one-shot on any session
+                # fault.
+                persistent_session=True,
             )
             self.parser_identity = run.parser_identity
             for record in run.records:
@@ -347,12 +368,18 @@ class JdkPlatformImage:
 
     def get_class(self, class_name: str) -> PlatformClassFact | None:
         name = str(class_name or "").replace(".", "/")
-        self.ensure_classes((name,))
+        # Reconciliation asks for the same provider many times after its
+        # initial frontier has already been loaded.  Avoid rebuilding a
+        # one-item set and sorting an empty pending batch for every cached hit.
+        # A recorded failure is equally final for this content-bound image.
+        if name not in self._facts and name not in self._failures:
+            self.ensure_classes((name,))
         return self._facts.get(name)
 
     def failure(self, class_name: str) -> dict[str, Any] | None:
         name = str(class_name or "").replace(".", "/")
-        self.ensure_classes((name,))
+        if name not in self._facts and name not in self._failures:
+            self.ensure_classes((name,))
         return self._failures.get(name)
 
     def module_exports(self) -> dict[str, frozenset[str]]:
@@ -393,6 +420,10 @@ class JdkPlatformImage:
                 inputs,
                 asm_jar=self.asm_jar,
                 jdk_home=self.jdk_home,
+                parser_identity_binding=getattr(
+                    self, "parser_identity_binding", None
+                ),
+                persistent_session=True,
             )
             self.parser_identity = run.parser_identity
             for record in run.records:

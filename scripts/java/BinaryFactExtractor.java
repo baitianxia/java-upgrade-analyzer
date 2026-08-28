@@ -92,21 +92,41 @@ public final class BinaryFactExtractor {
     }
 
     public static void main(String[] args) {
-        if (args.length != 3) {
-            System.err.println("usage: BinaryFactExtractor <parser-identity> <helper-sha256> <max-class-major>");
+        boolean session = args.length == 4 && "--session".equals(args[3]);
+        if (args.length != 3 && !session) {
+            System.err.println("usage: BinaryFactExtractor <parser-identity> <helper-sha256> <max-class-major> [--session]");
             System.exit(64);
         }
         try {
-            run(args[0], args[1], Integer.parseInt(args[2]));
+            run(args[0], args[1], Integer.parseInt(args[2]), session);
         } catch (Throwable error) {
             error.printStackTrace(System.err);
             System.exit(2);
         }
     }
 
-    private static void run(String parserIdentity, String helperSha, int maxClassMajor) throws Exception {
+    private static void run(String parserIdentity, String helperSha,
+                            int maxClassMajor, boolean session) throws Exception {
         DataInputStream in = new DataInputStream(new BufferedInputStream(System.in));
         DataOutputStream out = new DataOutputStream(new BufferedOutputStream(System.out));
+        if (session) {
+            while (runOne(in, out, parserIdentity, helperSha, maxClassMajor)) {
+                // Every run has fresh digests/counts and emits its own complete
+                // header/footer. EOF is a clean session shutdown boundary.
+            }
+            return;
+        }
+        if (!runOne(in, out, parserIdentity, helperSha, maxClassMajor)) {
+            throw new IOException("input header is missing");
+        }
+        if (nextFrame(in) != null) {
+            throw new IOException("bytes found after input footer");
+        }
+    }
+
+    private static boolean runOne(DataInputStream in, DataOutputStream out,
+                                  String parserIdentity, String helperSha,
+                                  int maxClassMajor) throws Exception {
         MessageDigest inputDigest = MessageDigest.getInstance("SHA-256");
         MessageDigest outputDigest = MessageDigest.getInstance("SHA-256");
         int inputCount = 0;
@@ -114,7 +134,7 @@ public final class BinaryFactExtractor {
         int failureCount = 0;
 
         byte[] headerBytes = nextFrame(in);
-        if (headerBytes == null) throw new IOException("input header is missing");
+        if (headerBytes == null) return false;
         String header = new String(headerBytes, StandardCharsets.UTF_8);
         if (!"input_header".equals(requiredString(header, "frame_type"))) {
             throw new IOException("first input frame must be input_header");
@@ -182,7 +202,6 @@ public final class BinaryFactExtractor {
             writeFrame(out, record, outputDigest, true);
         }
 
-        if (nextFrame(in) != null) throw new IOException("bytes found after input footer");
         String actualInputDigest = hex(inputDigest.digest());
         if (inputCount != expectedInputCount || !actualInputDigest.equals(expectedInputDigest)) {
             throw new IOException("input count/digest mismatch");
@@ -197,6 +216,7 @@ public final class BinaryFactExtractor {
             "fact_output_digest", hex(outputDigest.digest()),
             "coverage_status", failureCount == 0 ? "complete" : "partial"
         ), MessageDigest.getInstance("SHA-256"), false);
+        return true;
     }
 
     private static final class TrackingClassReader extends ClassReader {

@@ -820,10 +820,9 @@ def _side_config(
     # the unsupported policy into runtime reconciliation instead: definitions
     # are then prevented from becoming authoritative while Step4 can complete
     # with an explicit coverage gap.
-    outer_runtime_security_markers = tuple(
-        marker for marker in outer_security_markers
-        if marker != "manifest_ambiguous"
-    )
+    # The fail-closed check above proves this marker is absent.  Preserve the
+    # remaining, content-bound marker order without filtering the tuple again.
+    outer_runtime_security_markers = tuple(outer_security_markers)
     provenance_rows = [
         dict(item)
         for item in provenance["sides"]

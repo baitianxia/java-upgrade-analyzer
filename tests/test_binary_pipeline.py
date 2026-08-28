@@ -1872,10 +1872,43 @@ class BinaryPipelineTest(unittest.TestCase):
         return {**result, "validation_result_path": str(path)}
 
     def test_artifact_snapshot_worker_count_is_bounded_and_exact(self):
-        with patch.object(binary_pipeline.os, "cpu_count", return_value=12):
-            self.assertEqual(_artifact_snapshot_worker_count(None, 20), 3)
-            self.assertEqual(_artifact_snapshot_worker_count(None, 2), 2)
-            self.assertEqual(_artifact_snapshot_worker_count(None, 0), 0)
+        with patch.object(
+            binary_pipeline, "system_available_memory_bytes", return_value=None
+        ):
+            self.assertEqual(
+                _artifact_snapshot_worker_count(None, 20, cpu_count=12),
+                2,
+            )
+        self.assertEqual(
+            _artifact_snapshot_worker_count(
+                None,
+                20,
+                cpu_count=12,
+                available_memory_bytes=12 * 1024**3,
+            ),
+                6,
+        )
+        self.assertEqual(
+            _artifact_snapshot_worker_count(
+                None,
+                20,
+                cpu_count=12,
+                available_memory_bytes=2 * 768 * 1024**2,
+            ),
+            1,
+        )
+        self.assertEqual(
+            _artifact_snapshot_worker_count(
+                None, 2, cpu_count=12, available_memory_bytes=12 * 1024**3
+            ),
+            2,
+        )
+        self.assertEqual(
+            _artifact_snapshot_worker_count(
+                None, 0, cpu_count=12, available_memory_bytes=12 * 1024**3
+            ),
+            0,
+        )
         self.assertEqual(_artifact_snapshot_worker_count(8, 3), 3)
         self.assertEqual(_artifact_snapshot_worker_count("2", 20), 2)
         for value in (True, False, 0, 9, 1.5, "many"):
@@ -4513,6 +4546,7 @@ class BinaryPipelineTest(unittest.TestCase):
                 "binary_output.py",
                 "binary_pipeline.py",
                 "binary_platform_image.py",
+                "binary_reconciliation_worker.py",
                 "binary_runtime_reconciler.py",
                 "binary_semantic_overlay.py",
                 "binary_snapshot_cache.py",
@@ -5799,7 +5833,11 @@ public class demo.ArrayCasts {
             binary_semantic_overlay,
             "semantic_overlay_requires_runtime_selection",
             side_effect=AssertionError("semantic preflight recomputed"),
-        ):
+        ), patch.object(
+            binary_validation_oracle,
+            "_sqlite_logical_contents_equal",
+            wraps=binary_validation_oracle._sqlite_logical_contents_equal,
+        ) as logical_compare:
             result = run_pipeline(
                 config,
                 output_root=self.root / "identical-shared-runtime-output",
@@ -5809,6 +5847,11 @@ public class demo.ArrayCasts {
         self.assertIs(observed["shared_runtime_evidence"], True)
         self.assertTrue(observed["compact_indexes_shared"])
         self.assertEqual(preflight.call_count, 1)
+        logical_compare.assert_not_called()
+        self.assertEqual(
+            result["sidecar_content_identities"]["base_binary_facts.sqlite"],
+            result["sidecar_content_identities"]["current_binary_facts.sqlite"],
+        )
 
     def test_semantic_overlay_preflight_override_preserves_default_contract(self):
         store = Mock()
@@ -5911,6 +5954,49 @@ public class demo.ArrayCasts {
             )
 
         base_store.close.assert_called_once_with()
+
+    def test_distinct_runtime_sides_close_fact_stores_before_parallel_reconciliation(self):
+        artifact = self._jar("parallel-reconciliation-boundary", 1)
+        base = self._side(artifact, "1")
+        current = self._side(artifact, "2")
+        current["runtime_profile"] = {
+            **current["runtime_profile"],
+            "active_profile_identities": ["current-only"],
+        }
+        config = {
+            "schema": "java-upgrade-analyzer.binary-pipeline-input.v1",
+            "source_usage": {
+                "decision": "skip_source",
+                "decision_source": "explicit_config",
+            },
+            "asm_jar": str(self.asm_jar),
+            "base": base,
+            "current": current,
+            "runtime_comparison": {
+                "comparison_intent": "release_snapshot",
+                "changed_or_unknown_profile_fields": [
+                    "active_profile_identities"
+                ],
+            },
+        }
+        sentinel = RuntimeError("parallel reconciliation reached")
+        with patch.object(
+            binary_pipeline,
+            "_runtime_reconciliation_worker_count",
+            return_value=(2, 16 * 1024**3),
+        ), patch.object(
+            binary_pipeline,
+            "_run_parallel_runtime_reconciliation",
+            side_effect=sentinel,
+        ) as parallel:
+            with self.assertRaises(RuntimeError) as raised:
+                run_pipeline(
+                    config,
+                    output_root=self.root / "parallel-reconciliation-output",
+                )
+
+        self.assertIs(raised.exception, sentinel)
+        parallel.assert_called_once()
 
     def test_second_store_open_failure_is_not_masked_by_close_failure(self):
         artifact = self._jar("second-store-primary-preservation", 1)

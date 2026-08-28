@@ -2103,6 +2103,124 @@ class BinaryPipelineResumeBoundaryTest(unittest.TestCase):
                     "BINARY_RESUME_VALIDATION_ATTACHMENT_INVALID", rejected_call,
                 )
 
+    def test_streamed_and_checkpoint_validation_metadata_type_boundaries(self):
+        def load_with(issue_count, issues):
+            return lambda _path, field, **_kwargs: (
+                issue_count if field == "issue_count"
+                else issues if field == "issues"
+                else "value"
+            )
+
+        for issue_count in (True, -1):
+            with self.subTest(issue_count=issue_count), patch.object(
+                binary_pipeline, "prime_canonical_json_fields",
+            ), patch.object(
+                binary_pipeline,
+                "load_canonical_json_top_level_value",
+                side_effect=load_with(issue_count, []),
+            ):
+                with self.assertRaises(binary_pipeline.StreamingJsonReadError):
+                    binary_pipeline._streamed_validation_attachment(Path("validation.json"))
+
+        with patch.object(
+            binary_pipeline, "prime_canonical_json_fields",
+        ), patch.object(
+            binary_pipeline,
+            "load_canonical_json_top_level_value",
+            side_effect=load_with(0, [{}]),
+        ):
+            with self.assertRaises(binary_pipeline.StreamingJsonReadError):
+                binary_pipeline._streamed_validation_attachment(Path("validation.json"))
+
+        with patch.object(
+            binary_pipeline, "prime_canonical_json_fields",
+        ), patch.object(
+            binary_pipeline,
+            "load_canonical_json_top_level_value",
+            side_effect=load_with(0, []),
+        ), patch.object(
+            binary_pipeline, "json_file_digest_if_matches", return_value="digest",
+        ):
+            loaded, digest = binary_pipeline._streamed_validation_attachment(
+                Path("validation.json")
+            )
+        self.assertEqual(loaded["issues"], [])
+        self.assertEqual(digest, "digest")
+
+        with patch.object(
+            binary_pipeline, "prime_canonical_json_fields",
+        ), patch.object(
+            binary_pipeline,
+            "load_canonical_json_top_level_value",
+            side_effect=load_with(1, None),
+        ), patch.object(
+            binary_pipeline, "json_file_digest_if_matches", return_value="digest",
+        ):
+            loaded, _digest = binary_pipeline._streamed_validation_attachment(
+                Path("validation.json")
+            )
+        self.assertIsInstance(loaded["issues"], binary_pipeline.StreamingJsonArray)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            generation = Path(temporary).resolve() / ("a" * 64)
+            validation_dir = generation / "validation"
+            validation_dir.mkdir(parents=True)
+            identity = "b" * 64
+            path = validation_dir / f"{identity}.json"
+            path.write_bytes(b"{}")
+            manifest = {"result_generation_identity": generation.name}
+            checkpoint = {
+                "validation_run_identity": identity,
+                "validation_result_sha256": "c" * 64,
+            }
+            for payload in (None, {}):
+                with self.subTest(payload=payload), patch.object(
+                    binary_pipeline,
+                    "_streamed_validation_attachment",
+                    return_value=(payload, "c" * 64),
+                ):
+                    self.assert_pipeline_error(
+                        "BINARY_RESUME_VALIDATION_ATTACHMENT_INVALID",
+                        lambda: binary_pipeline._checkpoint_validation_attachment(
+                            generation,
+                            manifest,
+                            validation_run_identity=identity,
+                            validation_result_sha256="c" * 64,
+                            expected_status="failed",
+                        ),
+                    )
+                    self.assertFalse(
+                        binary_pipeline._checkpoint_validator_attachment_is_stale(
+                            generation, checkpoint, expected_status="failed"
+                        )
+                    )
+                    self.assertIsNone(
+                        binary_pipeline._discover_current_validation_attachment(
+                            generation, manifest
+                        )
+                    )
+
+    def test_failed_validation_stream_count_mismatch_is_not_reusable(self):
+        class MiscountedIssues(list):
+            def __len__(self):
+                return 1
+
+        manifest = {
+            "result_generation_identity": "g" * 64,
+            "active_snapshot_identities": {},
+        }
+        validation = self._failed_validation(manifest)
+        validation["issues"] = MiscountedIssues((
+            {"domain": "one"},
+            {"domain": "two"},
+        ))
+        validation["issue_count"] = 1
+        self.assertFalse(
+            binary_pipeline._failed_validation_attachment_is_bound(
+                validation, manifest
+            )
+        )
+
     def test_stale_validator_attachment_exhausts_binding_and_identity_matrix(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -7617,6 +7735,9 @@ class BinaryPipelineResumeBoundaryTest(unittest.TestCase):
                     lambda *_args, **_kwargs: None
                 ),
                 resolve_asm_jar=lambda _path: Path("/asm.jar"),
+                capture_parser_identity_binding=(
+                    lambda **_kwargs: SimpleNamespace(identity="parser")
+                ),
                 _resume_implementation_identity=(
                     lambda *_args, **_kwargs: "implementation"
                 ),
@@ -8338,6 +8459,9 @@ class BinaryPipelineResumeBoundaryTest(unittest.TestCase):
                     lambda *_args, **_kwargs: None
                 ),
                 resolve_asm_jar=lambda _path: Path("/asm.jar"),
+                capture_parser_identity_binding=(
+                    lambda **_kwargs: SimpleNamespace(identity="parser")
+                ),
                 _resume_generation_validation=lambda *_args, **_kwargs: None,
                 _delete_resume_checkpoint_durable=lambda _root: False,
                 _prune_unreferenced_generations_best_effort=(

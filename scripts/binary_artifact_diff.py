@@ -24,7 +24,12 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 from artifact_safety import inspect_archive, is_allowed_duplicate_archive_entry
-from binary_asm_helper import BinaryClassInput, BinaryFactRun, extract_class_facts
+from binary_asm_helper import (
+    BinaryClassInput,
+    BinaryFactRun,
+    ParserIdentityBinding,
+    extract_class_facts,
+)
 from binary_first_contract import (
     BinaryFirstContractError,
     canonical_identity_native_json,
@@ -803,6 +808,12 @@ class ArtifactSnapshot:
     parser_identity: str
     comparison_coverage_status: str
     runtime_semantics_diagnostic_codes: tuple[str, ...] = ()
+    # Non-empty only when the snapshot was rebound from a content-addressed
+    # cache template whose exact payload bytes were digest-verified.  Equal
+    # values prove that every instance-independent archive/class fact came
+    # from the same immutable template; ArtifactInstance-bound identities are
+    # deliberately excluded and must still be rebuilt by the fact store.
+    rebind_template_identity: str = ""
 
     @property
     def class_fact_coverage_status(self) -> str:
@@ -845,6 +856,9 @@ def snapshot_archive(
     jdk_home: str | Path | None = None,
     target_jvm_major: int | None = None,
     safety_policy: Mapping[str, Any] | None = None,
+    persistent_asm_session: bool = False,
+    persistent_asm_max_sessions: int = 6,
+    parser_identity_binding: ParserIdentityBinding | None = None,
 ) -> ArtifactSnapshot:
     source_path = Path(path)
     expected_sha256 = _validate_expected_sha(expected_sha256)
@@ -859,6 +873,9 @@ def snapshot_archive(
             jdk_home=jdk_home,
             target_jvm_major=target_jvm_major,
             safety_policy=safety_policy,
+            persistent_asm_session=persistent_asm_session,
+            persistent_asm_max_sessions=persistent_asm_max_sessions,
+            parser_identity_binding=parser_identity_binding,
         )
         _assert_source_path_unchanged(source_path, captured.source_identity)
         return result
@@ -875,6 +892,9 @@ def _snapshot_private_archive(
     jdk_home: str | Path | None = None,
     target_jvm_major: int | None = None,
     safety_policy: Mapping[str, Any] | None = None,
+    persistent_asm_session: bool = False,
+    persistent_asm_max_sessions: int = 6,
+    parser_identity_binding: ParserIdentityBinding | None = None,
 ) -> ArtifactSnapshot:
     effective_safety = {**_SAFETY, **dict(safety_policy or {})}
     safety = inspect_archive(
@@ -890,6 +910,11 @@ def _snapshot_private_archive(
         ),
         inspect_nested_archives=True,
         allow_duplicate_maven_metadata=True,
+        # The loop below reads and hashes every top-level entry from this same
+        # immutable private snapshot before any ArtifactSnapshot is returned.
+        # Avoid a redundant decompression/CRC pass here; nested contents remain
+        # recursively verified by the safety scanner.
+        verify_top_level_entry_payloads=False,
     )
     # ``allow_duplicate_maven_metadata`` already filters the one explicitly
     # tolerated metadata case inside the safety scanner. Any remaining
@@ -1065,6 +1090,9 @@ def _snapshot_private_archive(
         max_heap_megabytes=int(
             str(effective_safety["helper_max_heap"]).removesuffix("m")
         ),
+        persistent_session=persistent_asm_session,
+        persistent_max_sessions=persistent_asm_max_sessions,
+        parser_identity_binding=parser_identity_binding,
     )
 
     recognized = set(_ATTRIBUTE_POLICY["recognized_by_typed_facts"])

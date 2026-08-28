@@ -29,6 +29,49 @@ from binary_tool_execution import BinaryToolFailure, BinaryToolResult  # noqa: E
 
 
 class BinaryValidationPerformanceSafetyTest(unittest.TestCase):
+    def test_process_scan_rejects_bad_parent_helper_then_scans_exactly(self):
+        key = ("a" * 64, "/fixture/javap")
+        scan_result = {
+            "artifact_sha256": key[0],
+            "complete": True,
+            "edges": [],
+            "failures": [],
+            "structural_facts": {},
+        }
+        binding = object()
+        with patch.object(
+            oracle,
+            "install_compiled_javap_session_binding",
+            side_effect=oracle.JavapSessionError("changed"),
+        ) as install, patch.object(
+            oracle, "scan_final_artifact", return_value=scan_result,
+        ) as scan:
+            returned_key, packed = oracle._scan_final_artifact_process((
+                key,
+                "/fixture/app.jar",
+                "/fixture/javap",
+                12.0,
+                binding,
+            ))
+
+        install.assert_called_once_with(binding)
+        scan.assert_called_once_with(
+            Path("/fixture/app.jar"),
+            javap="/fixture/javap",
+            max_workers=1,
+            time_budget_seconds=12.0,
+            include_nested_runtime_jars=False,
+            include_structural_facts=True,
+            cache_result=False,
+            persistent_javap_sessions=True,
+        )
+        self.assertEqual(returned_key, key)
+        metadata = oracle._OracleScanSpoolCache._decode_projection(
+            dict(packed)["metadata"]
+        )
+        self.assertEqual(metadata["artifact_sha256"], key[0])
+        self.assertTrue(metadata["complete"])
+
     def test_transient_string_pool_and_projection_cache_are_hard_bounded(self):
         with patch.object(
             oracle, "MAX_VALIDATION_STRING_POOL_ENTRIES", 3,
@@ -1860,6 +1903,40 @@ class BinaryValidationPerformanceSafetyTest(unittest.TestCase):
             compacted["demo/B"]["members"][0],
         )
 
+    def test_runtime_observation_identity_fast_path_is_byte_exact(self):
+        observations = oracle._compact_observations({
+            "demo/B": {
+                "class_name": "demo/B",
+                "status": "definition_ready",
+                "interfaces": ["demo/Api"],
+                "members": ["method|run|()V|1"],
+                "unknown_future_field": {
+                    "surrogate": "value-\ud800",
+                    "typed": [1, True, 1.5, None],
+                },
+            },
+            "demo/A": {
+                "class_name": "demo/A",
+                "status": "definition_ready",
+                "interfaces": [],
+                "members": [],
+            },
+        }, {})
+        expected = oracle.canonical_identity_streaming(
+            "binary_runtime_observation_set_identity",
+            observations,
+            schema_version="1",
+        )
+
+        with patch.object(
+            oracle,
+            "canonical_identity_streaming",
+            side_effect=AssertionError("ordinary observations must use row chunks"),
+        ):
+            actual = oracle._runtime_observation_set_identity(observations)
+
+        self.assertEqual(actual, expected)
+
     def test_javap_member_fallback_uses_only_selected_provider_artifact(self):
         first = Path("/fixture/first.jar")
         second = Path("/fixture/second.jar")
@@ -2970,6 +3047,20 @@ class BinaryValidationPerformanceSafetyTest(unittest.TestCase):
                     connection, [], [], [], second_observations,
                     [], [], "platform", jdk_home,
                 )
+                with patch.object(
+                    oracle,
+                    "canonical_identity_streaming",
+                    side_effect=AssertionError("digest must be reused"),
+                ):
+                    reused_issues, reused_truth = (
+                        oracle._validate_runtime_outcomes(
+                            connection, [], [], [], first_observations,
+                            [], [], "platform", jdk_home,
+                            proven_equal_observation_set_identity=first_truth[
+                                "runtime_observation_set_identity"
+                            ],
+                        )
+                    )
 
         self.assertEqual(first_issues, [])
         self.assertEqual(second_issues, [])
@@ -2982,6 +3073,8 @@ class BinaryValidationPerformanceSafetyTest(unittest.TestCase):
             first_truth["runtime_observation_set_identity"],
             second_truth["runtime_observation_set_identity"],
         )
+        self.assertEqual(reused_issues, [])
+        self.assertEqual(reused_truth, first_truth)
 
     def test_provider_validation_rejects_wrong_same_content_instance(self):
         connection = self.runtime_connection()

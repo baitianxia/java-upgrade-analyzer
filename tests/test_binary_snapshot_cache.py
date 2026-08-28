@@ -64,6 +64,10 @@ class BinarySnapshotCacheBoundaryTest(unittest.TestCase):
                 (dict(valid, schema="wrong"), "IDENTITY_MISMATCH"),
                 (dict(valid, cache_key="wrong"), "IDENTITY_MISMATCH"),
                 (dict(valid, payload=[]), "DIGEST_MISMATCH"),
+                (dict(valid, payload_sha256=None), "DIGEST_MISMATCH"),
+                (dict(valid, payload_sha256="0" * 63), "DIGEST_MISMATCH"),
+                (dict(valid, payload_sha256="g" + "0" * 63), "DIGEST_MISMATCH"),
+                (dict(valid, payload_sha256="0" * 63 + "g"), "DIGEST_MISMATCH"),
                 (dict(valid, payload_sha256="0" * 64), "DIGEST_MISMATCH"),
             )
             for envelope, reason in cases:

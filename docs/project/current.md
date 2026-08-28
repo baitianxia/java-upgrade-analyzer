@@ -11,7 +11,7 @@
 
 ## 当前项目状态
 
-- 当前开发记录是 [2026-08-27 binary-first 27GB 性能收敛](iterations/2026-08-27-binary-27gb-performance.md)：实现、本地正确性/目标 edge 密度验证、固定性能证据重录和完整 Release 均已通过；目标 Windows 27GB 完整复跑仍待关闭。
+- 当前开发记录是 [2026-08-27 binary-first 27GB 性能收敛](iterations/2026-08-27-binary-27gb-performance.md)：第二轮实现、固定 400 JAR 性能证据重录和最终工作树完整 Release 已通过；changed 完整流水线独立复采相对上一记录提升 52.924%。尚待关闭的是目标 Windows 10/Xeon/32GB 主机上的 27GB 实机复跑，不能用本地合成规模门替代该结论。
 - 上一份完成记录是 [2026-08-27 跨阶段正确性、可靠性与性能修复](iterations/2026-08-27-cross-stage-remediation.md)。
 - `historical-2026-07/` 是迁移前形成的历史设计和计划记录，不是当前开发授权。
 - 尚未完成的两个候选事项位于 [Roadmap](roadmap/README.md)，两者均需先满足各自的证据或观测条件。

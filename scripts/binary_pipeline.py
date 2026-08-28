@@ -35,7 +35,18 @@ except ImportError:  # pragma: no cover - Windows does not provide resource.
     resource = None
 
 from binary_artifact_diff import ArtifactSnapshot, compare_artifact_snapshots, snapshot_archive
-from binary_asm_helper import resolve_asm_jar
+from binary_asm_helper import (
+    BinaryAsmError,
+    capture_compiled_asm_helper_binding,
+    capture_parser_identity_binding,
+    close_persistent_asm_sessions,
+    resolve_asm_jar,
+    verify_parser_identity_binding,
+)
+from binary_definition_verifier import (
+    ClassDefinitionVerifierError,
+    capture_compiled_definition_helper_binding,
+)
 from binary_decision_engine import BinaryDecisionEngine, DEFAULT_RULES
 from binary_fact_store import BinaryFactStore
 from binary_first_contract import (
@@ -76,6 +87,7 @@ from binary_performance_identity import (
 from binary_platform_image import JdkPlatformImage
 from binary_runtime_reconciler import (
     RuntimeCapabilityPolicy,
+    RuntimeReconciliationResult,
     RuntimeReconciler,
     hydrate_runtime_reconciliation,
 )
@@ -103,9 +115,13 @@ from enhanced_source_analyzer import (
     install_global_type_knowledge,
 )
 from path_runtime import short_temporary_directory
+from compat import run_managed_subprocess
 from jdk_preflight import JdkPreflightError, preflight_jdk_home
 from process_lock import exclusive_file_lock
-from process_metrics import windows_current_process_usage
+from process_metrics import (
+    system_available_memory_bytes,
+    windows_current_process_usage,
+)
 from streaming_json import (
     StreamingJsonArray,
     StreamingJsonReadError,
@@ -114,6 +130,7 @@ from streaming_json import (
     json_file_digest_if_matches,
     load_canonical_json_top_level_value,
     prime_canonical_json_fields,
+    write_json_streaming_atomic,
 )
 
 
@@ -249,6 +266,7 @@ _GENERATION_IMPLEMENTATION_SOURCE_PATHS = (
     "binary_output.py",
     "binary_pipeline.py",
     "binary_platform_image.py",
+    "binary_reconciliation_worker.py",
     "binary_runtime_reconciler.py",
     "binary_semantic_overlay.py",
     "binary_snapshot_cache.py",
@@ -267,6 +285,11 @@ _GENERATION_IMPLEMENTATION_SOURCE_PATHS = (
     "java/BinaryFactExtractor.java",
     "java/ClassDefinitionVerifier.java",
 )
+_RECONCILIATION_WORKER = Path(__file__).with_name(
+    "binary_reconciliation_worker.py"
+)
+_PARALLEL_RECONCILIATION_MIN_CLASSES_PER_SIDE = 4_000
+_PARALLEL_RECONCILIATION_MIN_AVAILABLE_BYTES = 6 * 1024 * 1024 * 1024
 _GENERATION_RUNTIME_DISTRIBUTIONS = (
     ("tree-sitter", "tree_sitter"),
     ("tree-sitter-java", "tree_sitter_java"),
@@ -330,15 +353,48 @@ def _unlink_missing_ok(path: Path) -> None:
         pass
 
 
-def _artifact_snapshot_worker_count(configured: Any, lineage_count: int) -> int:
+def _artifact_snapshot_worker_count(
+    configured: Any,
+    lineage_count: int,
+    *,
+    cpu_count: int | None = None,
+    available_memory_bytes: int | None = None,
+) -> int:
     """Return a bounded worker count without accepting lossy JSON coercions."""
     lineage_count = max(0, int(lineage_count))
     if configured in (None, ""):
         if lineage_count == 0:
             return 0
+        cpus = max(1, int(
+            cpu_count if cpu_count is not None else (os.cpu_count() or 1)
+        ))
+        available = available_memory_bytes
+        if available is None:
+            try:
+                available = system_available_memory_bytes()
+            except Exception:
+                available = None
+        # Each concurrent ASM helper has a 512 MiB hard heap ceiling and the
+        # Python task briefly owns one artifact snapshot. Reserve 768 MiB per
+        # worker and use at most six helpers; unknown memory keeps the former
+        # conservative ceiling. This is concurrency only: every artifact and
+        # class is still parsed exactly once.
+        memory_workers = (
+            2
+            if available is None
+            else max(
+                1,
+                min(
+                    6,
+                    max(0, int(available) - 768 * 1024 * 1024)
+                    // (768 * 1024 * 1024),
+                ),
+            )
+        )
         return min(
-            3,
-            max(1, (os.cpu_count() or 1) // 3),
+            6,
+            max(1, cpus // 2),
+            memory_workers,
             lineage_count,
         )
     if isinstance(configured, bool) or isinstance(configured, float):
@@ -380,6 +436,280 @@ def _artifact_hash_worker_count(configured: Any, file_count: int) -> int:
             "BINARY_ARTIFACT_HASH_WORKER_COUNT_INVALID", str(configured)
         )
     return min(workers, file_count)
+
+
+_RECONCILIATION_CAPABILITY_FIELDS = (
+    "supported_loader_policy_versions",
+    "supported_delegation_modes",
+    "supported_security_policy_identities",
+    "supported_module_modes",
+    "supported_transformer_profile_identities",
+    "signed_artifacts_supported",
+    "sealed_packages_supported",
+    "closed_world_dispatch",
+    "policy_version",
+)
+_RECONCILIATION_RESULT_COLLECTION_FIELDS = (
+    "provider_bindings",
+    "class_definitions",
+    "member_resolutions",
+    "dispatch_resolutions",
+    "type_resolutions",
+    "class_initialization_resolutions",
+    "linkage_resolutions",
+    "resource_selections",
+)
+
+
+def _runtime_reconciliation_worker_count(
+    base_class_count: int,
+    current_class_count: int,
+    *,
+    cpu_count: int | None = None,
+    available_memory_bytes: int | None = None,
+) -> tuple[int, int | None]:
+    """Select two isolated side workers only with measured memory headroom."""
+
+    classes = min(
+        max(0, int(base_class_count)),
+        max(0, int(current_class_count)),
+    )
+    cpus = max(1, int(cpu_count if cpu_count is not None else (os.cpu_count() or 1)))
+    available = available_memory_bytes
+    if available is None:
+        try:
+            available = system_available_memory_bytes()
+        except Exception:
+            available = None
+    if (
+        classes < _PARALLEL_RECONCILIATION_MIN_CLASSES_PER_SIDE
+        or cpus < 4
+        or available is None
+        or available < _PARALLEL_RECONCILIATION_MIN_AVAILABLE_BYTES
+    ):
+        return 1, available
+    return 2, available
+
+
+def _runtime_capability_worker_payload(
+    capability: RuntimeCapabilityPolicy,
+) -> dict[str, Any]:
+    payload = {}
+    for field_name in _RECONCILIATION_CAPABILITY_FIELDS:
+        value = getattr(capability, field_name)
+        payload[field_name] = list(value) if isinstance(value, tuple) else value
+    return payload
+
+
+def _runtime_reconciliation_from_worker(
+    value: Any,
+    *,
+    expected_context_identity: str,
+    expected_profile_identity: str,
+) -> RuntimeReconciliationResult:
+    scalar_fields = {
+        "analysis_context_identity",
+        "runtime_profile_identity",
+        "universe_identity",
+        "coverage_status",
+        "coverage_gaps",
+        "identity",
+    }
+    expected_fields = scalar_fields | set(
+        _RECONCILIATION_RESULT_COLLECTION_FIELDS
+    )
+    if not isinstance(value, Mapping) or set(value) != expected_fields:
+        raise BinaryPipelineError(
+            "BINARY_RECONCILIATION_WORKER_RESULT_INVALID",
+            "worker result fields do not match the exact contract",
+        )
+    result = dict(value)
+    if (
+        result["analysis_context_identity"] != expected_context_identity
+        or result["runtime_profile_identity"] != expected_profile_identity
+    ):
+        raise BinaryPipelineError(
+            "BINARY_RECONCILIATION_WORKER_IDENTITY_MISMATCH",
+            "worker returned a result for another runtime context",
+        )
+    for field_name in ("universe_identity", "identity"):
+        if not _is_sha256_identity(result.get(field_name)):
+            raise BinaryPipelineError(
+                "BINARY_RECONCILIATION_WORKER_RESULT_INVALID", field_name
+            )
+    if result.get("coverage_status") not in {"complete", "partial"}:
+        raise BinaryPipelineError(
+            "BINARY_RECONCILIATION_WORKER_RESULT_INVALID",
+            "coverage_status",
+        )
+    gaps = result.get("coverage_gaps")
+    if (
+        not isinstance(gaps, list)
+        or any(type(item) is not str or not item for item in gaps)
+        or gaps != sorted(set(gaps))
+    ):
+        raise BinaryPipelineError(
+            "BINARY_RECONCILIATION_WORKER_RESULT_INVALID",
+            "coverage_gaps",
+        )
+    collections = {}
+    for field_name in _RECONCILIATION_RESULT_COLLECTION_FIELDS:
+        rows = result.get(field_name)
+        if not isinstance(rows, list) or any(
+            not isinstance(row, Mapping) for row in rows
+        ):
+            raise BinaryPipelineError(
+                "BINARY_RECONCILIATION_WORKER_RESULT_INVALID", field_name
+            )
+        collections[field_name] = tuple(dict(row) for row in rows)
+    return RuntimeReconciliationResult(
+        analysis_context_identity=result["analysis_context_identity"],
+        runtime_profile_identity=result["runtime_profile_identity"],
+        universe_identity=result["universe_identity"],
+        **collections,
+        coverage_status=result["coverage_status"],
+        coverage_gaps=tuple(gaps),
+        identity=result["identity"],
+    )
+
+
+def _run_parallel_runtime_reconciliation(
+    *,
+    temporary_directory: Path,
+    base_store_path: Path,
+    current_store_path: Path,
+    base_profile: RuntimeProfile,
+    current_profile: RuntimeProfile,
+    base_platform: JdkPlatformImage,
+    current_platform: JdkPlatformImage,
+    asm_jar: Path,
+    analysis_context_identity: str,
+    capability: RuntimeCapabilityPolicy,
+    additional_initial_classes: Iterable[str],
+    retained_record_kinds: Iterable[str],
+) -> tuple[RuntimeReconciliationResult, RuntimeReconciliationResult]:
+    """Reconcile two disjoint SQLite stores in bounded managed processes."""
+
+    common_classes = sorted({
+        str(name) for name in additional_initial_classes if str(name)
+    })
+    retained = sorted({str(kind) for kind in retained_record_kinds if str(kind)})
+    capability_payload = _runtime_capability_worker_payload(capability)
+    sides = (
+        ("base", base_store_path, base_profile, base_platform),
+        ("current", current_store_path, current_profile, current_platform),
+    )
+    compiled_bindings_by_jdk: dict[
+        str, tuple[dict[str, Any] | None, dict[str, Any] | None]
+    ] = {}
+    paths = {}
+    for side_name, store_path, profile, platform_image in sides:
+        jdk_key = str(platform_image.jdk_home)
+        compiled_bindings = compiled_bindings_by_jdk.get(jdk_key)
+        if compiled_bindings is None:
+            try:
+                compiled_asm_mapping = (
+                    capture_compiled_asm_helper_binding(
+                        asm_jar=asm_jar,
+                        jdk_home=platform_image.jdk_home,
+                    ).to_mapping()
+                )
+            except (BinaryAsmError, OSError, ValueError):
+                compiled_asm_mapping = None
+            try:
+                compiled_definition_mapping = (
+                    capture_compiled_definition_helper_binding(
+                        platform_image
+                    ).to_mapping()
+                )
+            except (
+                ClassDefinitionVerifierError, OSError, ValueError,
+            ):
+                compiled_definition_mapping = None
+            compiled_bindings = (
+                compiled_asm_mapping, compiled_definition_mapping
+            )
+            compiled_bindings_by_jdk[jdk_key] = compiled_bindings
+        input_path = temporary_directory / f"reconcile-{side_name}-input.json"
+        output_path = temporary_directory / f"reconcile-{side_name}-output.json"
+        write_json_streaming_atomic(input_path, {
+            "schema": "java-upgrade-analyzer.binary-reconciliation-worker.v2",
+            "store_path": str(store_path.resolve()),
+            "runtime_profile": dict(profile.payload),
+            "runtime_profile_identity": profile.identity,
+            "jdk_home": str(platform_image.jdk_home),
+            "platform_identity": platform_image.identity,
+            "asm_jar": str(Path(asm_jar).resolve()),
+            "analysis_context_identity": analysis_context_identity,
+            "capability_policy": capability_payload,
+            "capability_policy_identity": capability.identity,
+            "additional_initial_classes": common_classes,
+            "retain_record_kinds": retained,
+            "compiled_asm_helper_binding": compiled_bindings[0],
+            "compiled_definition_helper_binding": compiled_bindings[1],
+        })
+        paths[side_name] = (input_path, output_path)
+
+    def launch(side_name: str):
+        input_path, output_path = paths[side_name]
+        completed = run_managed_subprocess(
+            [
+                sys.executable,
+                str(_RECONCILIATION_WORKER),
+                "--input", str(input_path),
+                "--output", str(output_path),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        return completed, output_path
+
+    completed_by_side = {}
+    with ThreadPoolExecutor(
+        max_workers=2,
+        thread_name_prefix="binary-runtime-reconciliation",
+    ) as executor:
+        futures = {
+            side_name: executor.submit(launch, side_name)
+            for side_name, _store, _profile, _platform in sides
+        }
+        for side_name, future in futures.items():
+            completed_by_side[side_name] = future.result()
+
+    results = []
+    for side_name, _store_path, profile, _platform in sides:
+        completed, output_path = completed_by_side[side_name]
+        try:
+            response = json.loads(output_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise BinaryPipelineError(
+                "BINARY_RECONCILIATION_WORKER_OUTPUT_INVALID",
+                f"{side_name}: {error}; stderr={completed.stderr[-2000:]}",
+            ) from error
+        if (
+            completed.returncode != 0
+            or not isinstance(response, Mapping)
+            or response.get("schema")
+            != "java-upgrade-analyzer.binary-reconciliation-worker.v2"
+            or response.get("status") != "passed"
+        ):
+            failure = (
+                response.get("failure")
+                if isinstance(response, Mapping) else None
+            )
+            raise BinaryPipelineError(
+                "BINARY_RECONCILIATION_WORKER_FAILED",
+                f"{side_name}: {failure!r}; stderr={completed.stderr[-2000:]}",
+            )
+        results.append(_runtime_reconciliation_from_worker(
+            response.get("result"),
+            expected_context_identity=analysis_context_identity,
+            expected_profile_identity=profile.identity,
+        ))
+    return results[0], results[1]
 
 
 def _write_non_authoritative_json(
@@ -6456,6 +6786,10 @@ def _run_pipeline_under_lock(
         ):
             _prune_unreferenced_generations_best_effort(output_root)
         return resumed_result
+    # Pin the complete parser implementation once for this run. Artifact
+    # workers reuse this exact authority; the outer cleanup boundary rehashes
+    # every source/policy/ASM byte before a successful result may escape.
+    asm_parser_binding = capture_parser_identity_binding(asm_jar=asm_jar)
     # A checkpoint that reached this point was either absent or explicitly
     # rejected by the resume decision above.  Remove its stale reference before
     # reclaiming generations so a failed old attempt cannot consume another
@@ -6470,14 +6804,22 @@ def _run_pipeline_under_lock(
     current_jdk_home = Path(
         str(current_config.get("jdk_home") or "")
     ).expanduser().resolve()
-    base_platform = JdkPlatformImage(base_jdk_home, asm_jar=asm_jar)
+    base_platform = JdkPlatformImage(
+        base_jdk_home,
+        asm_jar=asm_jar,
+        parser_identity_binding=asm_parser_binding,
+    )
     if current_jdk_home == base_jdk_home:
         # One canonical JDK path denotes one target platform snapshot. Avoid
         # rehashing its module image, launcher and release file for the second
         # side; validation independently rechecks the same bound toolchain.
         current_platform = base_platform
     else:
-        current_platform = JdkPlatformImage(current_jdk_home, asm_jar=asm_jar)
+        current_platform = JdkPlatformImage(
+            current_jdk_home,
+            asm_jar=asm_jar,
+            parser_identity_binding=asm_parser_binding,
+        )
         if current_platform.identity == base_platform.identity:
             # Distinct paths can still be byte-identical immutable images.
             current_platform = base_platform
@@ -6672,6 +7014,9 @@ def _run_pipeline_under_lock(
                         target_jvm_major=target_jvm_major,
                         template_memo=snapshot_template_memo,
                         safety_policy=artifact_safety_policy,
+                        persistent_asm_session=True,
+                        persistent_asm_max_sessions=artifact_snapshot_workers,
+                        parser_identity_binding=asm_parser_binding,
                     )
 
                 base_pair = base_by_lineage.get(lineage)
@@ -6756,10 +7101,11 @@ def _run_pipeline_under_lock(
                     current_instance, current_outcome,
                 ) = result
                 outcomes = (
-                    (base_outcome, base_instance, base_store),
-                    (current_outcome, current_instance, current_store),
+                    ("base", base_outcome, base_instance, base_store),
+                    ("current", current_outcome, current_instance, current_store),
                 )
-                for outcome, instance, store in outcomes:
+                base_insert_counts = None
+                for side, outcome, instance, store in outcomes:
                     if outcome is None:
                         continue
                     cache_metrics[
@@ -6779,7 +7125,29 @@ def _run_pipeline_under_lock(
                         outcome.parser_invocation_count
                     )
                     parser_identities.add(outcome.snapshot.parser_identity)
-                    store.add_artifact_snapshot(instance, outcome.snapshot)
+                    if (
+                        side == "current"
+                        and base_outcome is not None
+                        and base_instance is not None
+                        and base_insert_counts is not None
+                        and outcome.snapshot.rebind_template_identity
+                        == base_outcome.snapshot.rebind_template_identity
+                        and bool(outcome.snapshot.rebind_template_identity)
+                    ):
+                        store.add_rebound_artifact_snapshot(
+                            instance,
+                            outcome.snapshot,
+                            source_store=base_store,
+                            source_instance=base_instance,
+                            source_snapshot=base_outcome.snapshot,
+                            expected_source_counts=base_insert_counts,
+                        )
+                    else:
+                        inserted_counts = store.add_artifact_snapshot(
+                            instance, outcome.snapshot
+                        )
+                        if side == "base":
+                            base_insert_counts = inserted_counts
                 pairings.append(pairing)
                 diffs.append(artifact_diff)
 
@@ -6810,14 +7178,23 @@ def _run_pipeline_under_lock(
                             ))
                         while active:
                             future = active.pop(0)
-                            record_lineage_snapshot(future.result())
+                            result = future.result()
+                            # Refill the freed parser/ZIP slot before the main
+                            # thread constructs identities and appends SQLite
+                            # rows. This overlaps disjoint artifact work with
+                            # lossless fact-store insertion. Worker selection
+                            # reserves one extra 768 MiB handoff slot so the
+                            # overlap cannot silently expand the RSS budget.
                             try:
                                 lineage = next(remaining)
                             except StopIteration:
-                                continue
-                            active.append(executor.submit(
-                                build_lineage_snapshot, lineage
-                            ))
+                                lineage = None
+                            if lineage is not None:
+                                active.append(executor.submit(
+                                    build_lineage_snapshot, lineage
+                                ))
+                            record_lineage_snapshot(result)
+            close_persistent_asm_sessions()
             del build_lineage_snapshot, record_lineage_snapshot
             # Secondary lookup trees are not consulted while immutable archive
             # facts are appended. Building each tree once is materially cheaper
@@ -6861,14 +7238,16 @@ def _run_pipeline_under_lock(
             current_retained_kinds = {
                 "resource_selection",
             }
-            base_runtime = RuntimeReconciler(
-                base_store, base_profile, base_platform,
-                analysis_context_identity=context.identity,
-                capability_policy=capability,
-                additional_initial_classes=common_runtime_classes,
-            ).reconcile(retain_record_kinds=base_retained_kinds)
             shared_runtime_evidence = False
             if runtime_sides_identical:
+                reconciliation_workers = 1
+                reconciliation_available_memory = None
+                base_runtime = RuntimeReconciler(
+                    base_store, base_profile, base_platform,
+                    analysis_context_identity=context.identity,
+                    capability_policy=capability,
+                    additional_initial_classes=common_runtime_classes,
+                ).reconcile(retain_record_kinds=base_retained_kinds)
                 # Reconciliation is a deterministic function of the complete
                 # runtime side identity. SQLite backup preserves the full
                 # independently-validatable evidence without constructing a
@@ -6882,12 +7261,66 @@ def _run_pipeline_under_lock(
                 current_runtime = base_runtime
                 shared_runtime_evidence = True
             else:
-                current_runtime = RuntimeReconciler(
-                    current_store, current_profile, current_platform,
-                    analysis_context_identity=context.identity,
-                    capability_policy=capability,
-                    additional_initial_classes=common_runtime_classes,
-                ).reconcile(retain_record_kinds=current_retained_kinds)
+                base_class_count = int(base_store.connection.execute(
+                    "SELECT COUNT(*) FROM classes"
+                ).fetchone()[0])
+                current_class_count = int(current_store.connection.execute(
+                    "SELECT COUNT(*) FROM classes"
+                ).fetchone()[0])
+                (
+                    reconciliation_workers,
+                    reconciliation_available_memory,
+                ) = _runtime_reconciliation_worker_count(
+                    base_class_count, current_class_count
+                )
+                if reconciliation_workers == 2:
+                    # Each worker owns one disjoint SQLite database. Commit and
+                    # close both parent handles before launch so Windows file
+                    # sharing and SQLite lock semantics remain deterministic.
+                    base_store.connection.commit()
+                    current_store.connection.commit()
+                    base_store.close()
+                    base_store_open = False
+                    current_store.close()
+                    current_store_open = False
+                    base_runtime, current_runtime = (
+                        _run_parallel_runtime_reconciliation(
+                            temporary_directory=temp,
+                            base_store_path=temp / "base.sqlite",
+                            current_store_path=temp / "current.sqlite",
+                            base_profile=base_profile,
+                            current_profile=current_profile,
+                            base_platform=base_platform,
+                            current_platform=current_platform,
+                            asm_jar=Path(asm_jar),
+                            analysis_context_identity=context.identity,
+                            capability=capability,
+                            additional_initial_classes=common_runtime_classes,
+                            retained_record_kinds=base_retained_kinds,
+                        )
+                    )
+                    base_store = BinaryFactStore(temp / "base.sqlite")
+                    base_store_open = True
+                    try:
+                        current_store = BinaryFactStore(temp / "current.sqlite")
+                        current_store_open = True
+                    except BaseException:
+                        base_store.close()
+                        base_store_open = False
+                        raise
+                else:
+                    base_runtime = RuntimeReconciler(
+                        base_store, base_profile, base_platform,
+                        analysis_context_identity=context.identity,
+                        capability_policy=capability,
+                        additional_initial_classes=common_runtime_classes,
+                    ).reconcile(retain_record_kinds=base_retained_kinds)
+                    current_runtime = RuntimeReconciler(
+                        current_store, current_profile, current_platform,
+                        analysis_context_identity=context.identity,
+                        capability_policy=capability,
+                        additional_initial_classes=common_runtime_classes,
+                    ).reconcile(retain_record_kinds=current_retained_kinds)
             del common_runtime_classes
             base_runtime_identity = base_runtime.identity
             current_runtime_identity = current_runtime.identity
@@ -6908,6 +7341,8 @@ def _run_pipeline_under_lock(
                 "elapsed_seconds": round(
                     time.perf_counter() - reconciliation_started, 6
                 ),
+                "runtime_reconciliation_workers": reconciliation_workers,
+                "available_memory_bytes": reconciliation_available_memory,
             })
             decision_started = time.perf_counter()
             source_overlay = None
@@ -7124,7 +7559,18 @@ def _run_pipeline_under_lock(
                 # their complete evidence, but stream immutable sidecars into
                 # the generation instead of materializing both files in RAM.
                 "base_binary_facts.sqlite": temp / "base.sqlite",
-                "current_binary_facts.sqlite": temp / "current.sqlite",
+                # The identical-side branch above has already reconciled base
+                # once and replaced current through an exact SQLite backup.
+                # Emit both named sidecars from that one complete byte image so
+                # their content identities are equal.  Independent validation
+                # can then reuse its fully proved side truth without rereading
+                # both large databases merely to normalize three non-semantic
+                # SQLite header counters.
+                "current_binary_facts.sqlite": (
+                    temp / "base.sqlite"
+                    if runtime_sides_identical
+                    else temp / "current.sqlite"
+                ),
                 "binary_runtime_semantic_overlay.json": (
                     json.dumps(
                         semantic_overlay.as_payload(),
@@ -7562,6 +8008,14 @@ def _run_pipeline_under_lock(
                     "close current binary fact store",
                     current_store.close,
                 ))
+            store_cleanup_actions.append((
+                "close persistent ASM sessions",
+                close_persistent_asm_sessions,
+            ))
+            store_cleanup_actions.append((
+                "verify run-scoped ASM parser identity",
+                lambda: verify_parser_identity_binding(asm_parser_binding),
+            ))
             _attempt_cleanups(store_cleanup_actions, primary=primary)
 
 

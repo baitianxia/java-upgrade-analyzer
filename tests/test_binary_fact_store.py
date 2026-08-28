@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zlib
 from dataclasses import replace
 from pathlib import Path
 import zipfile
@@ -169,6 +170,735 @@ class BinaryFactStoreTest(unittest.TestCase):
                 identity = store.content_identity()
 
         self.assertEqual(len(identity), 64)
+
+    def test_cached_template_rebind_is_row_exact_without_recompression(self):
+        artifact = self.make_jar("exact-template-rebind.jar")
+        source_instance = self.instance(artifact, 0)
+        target_instance = ArtifactInstance(
+            outer_artifact_sha256=source_instance.outer_artifact_sha256,
+            container_entry=source_instance.container_entry,
+            content_sha256=source_instance.content_sha256,
+            runtime_profile_identity="runtime-2",
+            path_owner_loader_realm_identity=(
+                source_instance.path_owner_loader_realm_identity
+            ),
+            runtime_path_kind=source_instance.runtime_path_kind,
+            runtime_classpath_index=source_instance.runtime_classpath_index,
+            container_loader_policy_version=(
+                source_instance.container_loader_policy_version
+            ),
+            runtime_code_source_origin_identity="target-origin",
+            coord=source_instance.coord,
+        )
+        template_identity = "a" * 64
+        source_snapshot = replace(
+            self.snapshot(artifact, source_instance),
+            rebind_template_identity=template_identity,
+        )
+        target_snapshot = replace(
+            self.snapshot(artifact, target_instance),
+            rebind_template_identity=template_identity,
+        )
+        tables = (
+            "artifact_instances",
+            "archive_entries",
+            "classes",
+            "members",
+            "direct_edges",
+            "resources",
+        )
+
+        with BinaryFactStore() as source, BinaryFactStore() as rebound, (
+            BinaryFactStore()
+        ) as regular:
+            source_counts = source.add_artifact_snapshot(
+                source_instance, source_snapshot
+            )
+            with patch(
+                "binary_fact_store._json_and_transport_jvm_value",
+                side_effect=AssertionError("rebound facts were reserialized"),
+            ), patch.object(
+                BinaryFactStore,
+                "_instruction_edges",
+                side_effect=AssertionError("rebound instructions were replayed"),
+            ), patch(
+                "binary_fact_store.zlib.compress",
+                side_effect=AssertionError("rebound facts were recompressed"),
+            ), patch(
+                "binary_fact_store.zlib.decompress",
+                side_effect=AssertionError("rebound facts were decompressed"),
+            ):
+                rebound_counts = rebound.add_rebound_artifact_snapshot(
+                    target_instance,
+                    target_snapshot,
+                    source_store=source,
+                    source_instance=source_instance,
+                    source_snapshot=source_snapshot,
+                    expected_source_counts=source_counts,
+                )
+            regular_counts = regular.add_artifact_snapshot(
+                target_instance, target_snapshot
+            )
+            rebound_rows = {
+                table: [
+                    tuple(row)
+                    for row in rebound.connection.execute(
+                        f"SELECT * FROM {table} ORDER BY 1"
+                    )
+                ]
+                for table in tables
+            }
+            regular_rows = {
+                table: [
+                    tuple(row)
+                    for row in regular.connection.execute(
+                        f"SELECT * FROM {table} ORDER BY 1"
+                    )
+                ]
+                for table in tables
+            }
+            rebound_summary = rebound.runtime_trigger_summary()
+            regular_summary = regular.runtime_trigger_summary()
+            rebound_identity = rebound.content_identity()
+            regular_identity = regular.content_identity()
+
+        self.assertEqual(rebound_counts, source_counts)
+        self.assertEqual(rebound_counts, regular_counts)
+        self.assertEqual(rebound_rows, regular_rows)
+        self.assertEqual(rebound_summary, regular_summary)
+        self.assertEqual(rebound_identity, regular_identity)
+
+    def test_cached_template_rebind_fails_closed_on_proof_or_count_mismatch(self):
+        artifact = self.make_jar("rebind-fail-closed.jar")
+        source_instance = self.instance(artifact, 0)
+        target_instance = self.instance(
+            artifact, 1, coord="com.acme:caller:2"
+        )
+        source_snapshot = replace(
+            self.snapshot(artifact, source_instance),
+            rebind_template_identity="b" * 64,
+        )
+        target_snapshot = replace(
+            self.snapshot(artifact, target_instance),
+            rebind_template_identity="b" * 64,
+        )
+
+        with BinaryFactStore() as source, BinaryFactStore() as target:
+            counts = source.add_artifact_snapshot(
+                source_instance, source_snapshot
+            )
+            with self.assertRaises(BinaryFactStoreError) as bad_proof:
+                target.add_rebound_artifact_snapshot(
+                    target_instance,
+                    replace(
+                        target_snapshot,
+                        rebind_template_identity="c" * 64,
+                    ),
+                    source_store=source,
+                    source_instance=source_instance,
+                    source_snapshot=source_snapshot,
+                    expected_source_counts=counts,
+                )
+            with self.assertRaises(BinaryFactStoreError) as bad_counts:
+                target.add_rebound_artifact_snapshot(
+                    target_instance,
+                    target_snapshot,
+                    source_store=source,
+                    source_instance=source_instance,
+                    source_snapshot=source_snapshot,
+                    expected_source_counts={**counts, "edges": counts["edges"] + 1},
+                )
+            target_counts = target.counts()
+
+        self.assertEqual(
+            bad_proof.exception.reason_code,
+            "FACT_STORE_REBIND_TEMPLATE_IDENTITY_MISMATCH",
+        )
+        self.assertEqual(
+            bad_counts.exception.reason_code,
+            "FACT_STORE_REBIND_SOURCE_COUNTS_MISMATCH",
+        )
+        self.assertTrue(all(value == 0 for value in target_counts.values()))
+
+    def test_cached_template_rebind_fails_closed_at_every_proof_boundary(self):
+        artifact = self.make_jar("rebind-proof-boundaries.jar")
+        source_instance = self.instance(artifact, 0)
+        target_instance = ArtifactInstance(
+            outer_artifact_sha256=source_instance.outer_artifact_sha256,
+            container_entry=source_instance.container_entry,
+            content_sha256=source_instance.content_sha256,
+            runtime_profile_identity="runtime-2",
+            path_owner_loader_realm_identity=(
+                source_instance.path_owner_loader_realm_identity
+            ),
+            runtime_path_kind=source_instance.runtime_path_kind,
+            runtime_classpath_index=source_instance.runtime_classpath_index,
+            container_loader_policy_version=(
+                source_instance.container_loader_policy_version
+            ),
+            runtime_code_source_origin_identity="target-origin",
+            coord=source_instance.coord,
+        )
+        template_identity = "d" * 64
+        source_snapshot = replace(
+            self.snapshot(artifact, source_instance),
+            rebind_template_identity=template_identity,
+        )
+        target_snapshot = replace(
+            self.snapshot(artifact, target_instance),
+            rebind_template_identity=template_identity,
+        )
+
+        with BinaryFactStore() as source:
+            counts = source.add_artifact_snapshot(
+                source_instance, source_snapshot
+            )
+
+            def expect_failure(
+                reason_code,
+                *,
+                instance=target_instance,
+                snapshot=target_snapshot,
+                source_store=source,
+                source_instance_value=source_instance,
+                source_snapshot_value=source_snapshot,
+                expected_counts=counts,
+            ):
+                with self.subTest(reason_code=reason_code), BinaryFactStore() as target:
+                    with self.assertRaises(BinaryFactStoreError) as caught:
+                        target.add_rebound_artifact_snapshot(
+                            instance,
+                            snapshot,
+                            source_store=source_store,
+                            source_instance=source_instance_value,
+                            source_snapshot=source_snapshot_value,
+                            expected_source_counts=expected_counts,
+                        )
+                    self.assertEqual(caught.exception.reason_code, reason_code)
+
+            expect_failure(
+                "FACT_STORE_REBIND_SOURCE_INVALID", source_store=object()
+            )
+            with self.assertRaises(BinaryFactStoreError) as same_source:
+                source.add_rebound_artifact_snapshot(
+                    target_instance,
+                    target_snapshot,
+                    source_store=source,
+                    source_instance=source_instance,
+                    source_snapshot=source_snapshot,
+                    expected_source_counts=counts,
+                )
+            self.assertEqual(
+                same_source.exception.reason_code,
+                "FACT_STORE_REBIND_SOURCE_INVALID",
+            )
+
+            for invalid_counts in (
+                None,
+                {},
+                {**counts, "edges": True},
+                {**counts, "edges": -1},
+            ):
+                expect_failure(
+                    "FACT_STORE_REBIND_SOURCE_COUNTS_INVALID",
+                    expected_counts=invalid_counts,
+                )
+
+            for side, changed in (
+                ("source", replace(
+                    source_snapshot, artifact_instance_identity="wrong"
+                )),
+                ("target", replace(
+                    target_snapshot, artifact_instance_identity="wrong"
+                )),
+            ):
+                expect_failure(
+                    "FACT_STORE_REBIND_ARTIFACT_IDENTITY_MISMATCH",
+                    source_snapshot_value=(
+                        changed if side == "source" else source_snapshot
+                    ),
+                    snapshot=changed if side == "target" else target_snapshot,
+                )
+            for side, changed in (
+                ("source", replace(
+                    source_snapshot, artifact_content_sha256="wrong"
+                )),
+                ("target", replace(
+                    target_snapshot, artifact_content_sha256="wrong"
+                )),
+            ):
+                expect_failure(
+                    "FACT_STORE_REBIND_ARTIFACT_CONTENT_MISMATCH",
+                    source_snapshot_value=(
+                        changed if side == "source" else source_snapshot
+                    ),
+                    snapshot=changed if side == "target" else target_snapshot,
+                )
+
+            for changed_source, changed_target in (
+                (source_snapshot, replace(
+                    target_snapshot, rebind_template_identity=""
+                )),
+                (source_snapshot, replace(
+                    target_snapshot, rebind_template_identity="D" * 64
+                )),
+                (replace(
+                    source_snapshot, rebind_template_identity="e" * 64
+                ), target_snapshot),
+            ):
+                expect_failure(
+                    "FACT_STORE_REBIND_TEMPLATE_IDENTITY_MISMATCH",
+                    source_snapshot_value=changed_source,
+                    snapshot=changed_target,
+                )
+
+            expect_failure(
+                "FACT_STORE_REBIND_SNAPSHOT_SEMANTICS_MISMATCH",
+                snapshot=replace(
+                    target_snapshot,
+                    runtime_semantics_diagnostic_codes=("changed",),
+                ),
+            )
+
+            source_entries = source_snapshot.entries
+            target_entries = target_snapshot.entries
+            for changed_source, changed_target in (
+                (replace(
+                    source_snapshot,
+                    entries=source_entries + (source_entries[0],),
+                ), target_snapshot),
+                (source_snapshot, replace(
+                    target_snapshot,
+                    entries=target_entries + (target_entries[0],),
+                )),
+                (source_snapshot, replace(
+                    target_snapshot,
+                    entries=(
+                        replace(target_entries[0], name="other/Caller.class"),
+                        *target_entries[1:],
+                    ),
+                )),
+                (source_snapshot, replace(
+                    target_snapshot,
+                    entries=(
+                        replace(
+                            target_entries[0],
+                            byte_length=target_entries[0].byte_length + 1,
+                        ),
+                        *target_entries[1:],
+                    ),
+                )),
+            ):
+                expect_failure(
+                    "FACT_STORE_REBIND_ARCHIVE_INVENTORY_MISMATCH",
+                    source_snapshot_value=changed_source,
+                    snapshot=changed_target,
+                )
+
+            source_records = source_snapshot.class_records
+            target_records = target_snapshot.class_records
+            for changed_source, changed_target in (
+                (replace(
+                    source_snapshot,
+                    class_records=source_records + (source_records[0],),
+                ), target_snapshot),
+                (source_snapshot, replace(
+                    target_snapshot,
+                    class_records=target_records + (target_records[0],),
+                )),
+                (source_snapshot, replace(
+                    target_snapshot,
+                    class_records=({
+                        **target_records[0], "class_entry": "different",
+                    },),
+                )),
+            ):
+                expect_failure(
+                    "FACT_STORE_REBIND_CLASS_INVENTORY_MISMATCH",
+                    source_snapshot_value=changed_source,
+                    snapshot=changed_target,
+                )
+
+            blank_source = replace(
+                source_snapshot,
+                class_records=({**source_records[0], "class_entry": None},),
+            )
+            blank_target = replace(
+                target_snapshot,
+                class_records=({**target_records[0], "class_entry": None},),
+            )
+            expect_failure(
+                "FACT_STORE_REBIND_CLASS_ENTRY_UNBOUND",
+                source_snapshot_value=blank_source,
+                snapshot=blank_target,
+            )
+
+            class EntryWithSpoofedAlignment:
+                def __init__(self, entry):
+                    self.__dict__.update(vars(entry))
+                    self.name = "different/Caller.class"
+                    self.alignment_key = entry.alignment_key
+
+            spoofed_target = replace(
+                target_snapshot,
+                entries=(
+                    EntryWithSpoofedAlignment(target_entries[0]),
+                    *target_entries[1:],
+                ),
+            )
+            with patch.object(
+                BinaryFactStore,
+                "_archive_entry_rebind_fingerprint",
+                return_value=("equal",),
+            ):
+                expect_failure(
+                    "FACT_STORE_REBIND_CLASS_ENTRY_UNBOUND",
+                    snapshot=spoofed_target,
+                )
+
+            missing_source_instance = replace(
+                source_instance,
+                runtime_profile_identity="missing-runtime",
+            )
+            expect_failure(
+                "FACT_STORE_REBIND_SOURCE_ARTIFACT_MISMATCH",
+                source_instance_value=missing_source_instance,
+                source_snapshot_value=replace(
+                    source_snapshot,
+                    artifact_instance_identity=missing_source_instance.identity,
+                ),
+            )
+
+            source.connection.execute("SAVEPOINT bad_artifact_row")
+            source.connection.execute(
+                "UPDATE artifact_instances SET inventory_digest='wrong' "
+                "WHERE artifact_instance_identity=?",
+                (source_instance.identity,),
+            )
+            try:
+                expect_failure("FACT_STORE_REBIND_SOURCE_ARTIFACT_MISMATCH")
+            finally:
+                source.connection.execute("ROLLBACK TO bad_artifact_row")
+                source.connection.execute("RELEASE bad_artifact_row")
+
+            class ConnectionProjection:
+                def __init__(self, connection, marker, transform):
+                    self.connection = connection
+                    self.marker = " ".join(marker.split())
+                    self.transform = transform
+
+                def execute(self, query, parameters=()):
+                    result = self.connection.execute(query, parameters)
+                    if self.marker in " ".join(str(query).split()):
+                        return self.transform([dict(row) for row in result])
+                    return result
+
+                def __getattr__(self, name):
+                    return getattr(self.connection, name)
+
+            def projected_failure(marker, transform, reason_code, **expect_kwargs):
+                original = source.connection
+                source.connection = ConnectionProjection(
+                    original, marker, transform
+                )
+                try:
+                    expect_failure(reason_code, **expect_kwargs)
+                finally:
+                    source.connection = original
+
+            class_marker = (
+                "SELECT * FROM classes WHERE artifact_instance_identity=?"
+            )
+            projected_failure(
+                class_marker, lambda _rows: [],
+                "FACT_STORE_REBIND_SOURCE_CLASS_COUNT_MISMATCH",
+            )
+            projected_failure(
+                class_marker,
+                lambda rows: [{
+                    **row, "physical_entry_label": "different",
+                } for row in rows],
+                "FACT_STORE_REBIND_SOURCE_CLASS_LABEL_MISMATCH",
+            )
+            for field, value, reason_code in (
+                ("artifact_instance_identity", "wrong",
+                 "FACT_STORE_REBIND_SOURCE_CLASS_MISMATCH"),
+                ("physical_entry_identity", "wrong",
+                 "FACT_STORE_REBIND_SOURCE_CLASS_MISMATCH"),
+                ("class_bytes_sha256", "wrong",
+                 "FACT_STORE_REBIND_SOURCE_CLASS_MISMATCH"),
+                ("class_contract_digest", "wrong",
+                 "FACT_STORE_REBIND_SOURCE_CLASS_MISMATCH"),
+                ("parse_status", "wrong",
+                 "FACT_STORE_REBIND_SOURCE_CLASS_MISMATCH"),
+                ("fact_zlib_sha256", "0" * 64,
+                 "FACT_STORE_REBIND_SOURCE_FACT_DIGEST_MISMATCH"),
+            ):
+                projected_failure(
+                    class_marker,
+                    lambda rows, field=field, value=value: [
+                        {**row, field: value} for row in rows
+                    ],
+                    reason_code,
+                )
+
+            for field in ("class_bytes_sha256", "class_contract_digest"):
+                changed_source_record = {**source_records[0], field: None}
+                changed_target_record = {**target_records[0], field: None}
+                projected_failure(
+                    class_marker,
+                    lambda rows, field=field: [{
+                        **row,
+                        field: "",
+                        "fact_zlib_sha256": "0" * 64,
+                    } for row in rows],
+                    "FACT_STORE_REBIND_SOURCE_FACT_DIGEST_MISMATCH",
+                    source_snapshot_value=replace(
+                        source_snapshot,
+                        class_records=(changed_source_record,),
+                    ),
+                    snapshot=replace(
+                        target_snapshot,
+                        class_records=(changed_target_record,),
+                    ),
+                )
+
+            for field in (
+                "class_bytes_sha256", "class_contract_digest", "frame_type",
+            ):
+                changed_target_record = {
+                    **target_records[0], field: "changed"
+                }
+                expect_failure(
+                    "FACT_STORE_REBIND_SOURCE_CLASS_MISMATCH",
+                    snapshot=replace(
+                        target_snapshot,
+                        class_records=(changed_target_record,),
+                    ),
+                )
+            failed_source_record = {
+                **source_records[0], "frame_type": "class_error"
+            }
+            failed_target_record = {
+                **target_records[0], "frame_type": "class_error"
+            }
+            expect_failure(
+                "FACT_STORE_REBIND_SOURCE_CLASS_MISMATCH",
+                source_snapshot_value=replace(
+                    source_snapshot, class_records=(failed_source_record,)
+                ),
+                snapshot=replace(
+                    target_snapshot, class_records=(failed_target_record,)
+                ),
+            )
+
+            member_marker = (
+                "SELECT * FROM members WHERE class_variant_identity IN"
+            )
+            projected_failure(
+                member_marker,
+                lambda rows: [{
+                    **row, "class_variant_identity": "missing",
+                } for row in rows],
+                "FACT_STORE_REBIND_SOURCE_MEMBER_MISMATCH",
+            )
+            projected_failure(
+                member_marker,
+                lambda rows: [{
+                    **row, "artifact_instance_identity": "wrong",
+                } for row in rows],
+                "FACT_STORE_REBIND_SOURCE_MEMBER_MISMATCH",
+            )
+
+            edge_marker = (
+                "SELECT * FROM direct_edges ORDER BY rowid DESC LIMIT ?"
+            )
+            for field in (
+                "caller_member_identity",
+                "caller_class_variant_identity",
+                "caller_artifact_instance_identity",
+            ):
+                projected_failure(
+                    edge_marker,
+                    lambda rows, field=field: [
+                        {**row, field: "missing"} for row in rows
+                    ],
+                    "FACT_STORE_REBIND_SOURCE_EDGE_MISMATCH",
+                )
+
+            reference_marker = (
+                "SELECT reference_kind,class_name FROM runtime_class_references"
+            )
+            projected_failure(
+                reference_marker,
+                lambda rows: [{
+                    **row, "reference_kind": "invalid",
+                } for row in rows],
+                "FACT_STORE_REBIND_RUNTIME_REFERENCE_INVALID",
+            )
+            projected_failure(
+                reference_marker,
+                lambda rows: [{**row, "class_name": ""} for row in rows],
+                "FACT_STORE_REBIND_RUNTIME_REFERENCE_INVALID",
+            )
+
+            with patch.object(
+                source,
+                "_runtime_trigger_data_version",
+                side_effect=[1, 2],
+            ):
+                expect_failure("FACT_STORE_REBIND_SOURCE_CHANGED")
+
+            class ChangingTotalChanges(ConnectionProjection):
+                def __init__(self, connection):
+                    super().__init__(connection, "never-match", lambda rows: rows)
+                    self.reads = 0
+
+                @property
+                def total_changes(self):
+                    self.reads += 1
+                    return self.connection.total_changes + self.reads
+
+            original = source.connection
+            source.connection = ChangingTotalChanges(original)
+            try:
+                expect_failure("FACT_STORE_REBIND_SOURCE_CHANGED")
+            finally:
+                source.connection = original
+
+    def test_cached_template_rebind_zero_edge_and_transaction_failure_matrix(self):
+        empty_artifact = self.root / "empty-rebind.jar"
+        with zipfile.ZipFile(empty_artifact, "w"):
+            pass
+        source_instance = self.instance(empty_artifact, 0)
+        target_instance = replace(
+            source_instance,
+            runtime_profile_identity="runtime-empty-target",
+            runtime_code_source_origin_identity="empty-target-origin",
+        )
+        template_identity = "f" * 64
+        source_snapshot = replace(
+            self.snapshot(empty_artifact, source_instance),
+            rebind_template_identity=template_identity,
+        )
+        target_snapshot = replace(
+            self.snapshot(empty_artifact, target_instance),
+            rebind_template_identity=template_identity,
+        )
+        with BinaryFactStore() as source:
+            counts = source.add_artifact_snapshot(source_instance, source_snapshot)
+            self.assertEqual(counts["edges"], 0)
+            with BinaryFactStore(bulk_load_transaction=True) as target:
+                self.assertEqual(
+                    target.add_rebound_artifact_snapshot(
+                        target_instance,
+                        target_snapshot,
+                        source_store=source,
+                        source_instance=source_instance,
+                        source_snapshot=source_snapshot,
+                        expected_source_counts=counts,
+                    ),
+                    counts,
+                )
+
+        artifact = self.make_jar("rebind-transaction-boundaries.jar")
+        source_instance = self.instance(artifact, 0)
+        target_instance = replace(
+            source_instance,
+            runtime_profile_identity="runtime-transaction-target",
+            runtime_code_source_origin_identity="transaction-target-origin",
+        )
+        source_snapshot = replace(
+            self.snapshot(artifact, source_instance),
+            rebind_template_identity=template_identity,
+        )
+        target_snapshot = replace(
+            self.snapshot(artifact, target_instance),
+            rebind_template_identity=template_identity,
+        )
+        with BinaryFactStore() as source:
+            counts = source.add_artifact_snapshot(source_instance, source_snapshot)
+            fallback_source = replace(
+                source_snapshot,
+                entries=tuple(
+                    replace(entry, logical_resource_entry="")
+                    if entry.kind == "resource" else entry
+                    for entry in source_snapshot.entries
+                ),
+            )
+            fallback_target = replace(
+                target_snapshot,
+                entries=tuple(
+                    replace(entry, logical_resource_entry="")
+                    if entry.kind == "resource" else entry
+                    for entry in target_snapshot.entries
+                ),
+            )
+            with BinaryFactStore() as target:
+                self.assertEqual(
+                    target.add_rebound_artifact_snapshot(
+                        target_instance,
+                        fallback_target,
+                        source_store=source,
+                        source_instance=source_instance,
+                        source_snapshot=fallback_source,
+                        expected_source_counts=counts,
+                    ),
+                    counts,
+                )
+            for bulk in (False, True):
+                with self.subTest(integrity_bulk=bulk), BinaryFactStore(
+                    bulk_load_transaction=bulk
+                ) as target:
+                    target.add_artifact_snapshot(target_instance, target_snapshot)
+                    with self.assertRaises(BinaryFactStoreError) as caught:
+                        target.add_rebound_artifact_snapshot(
+                            target_instance,
+                            target_snapshot,
+                            source_store=source,
+                            source_instance=source_instance,
+                            source_snapshot=source_snapshot,
+                            expected_source_counts=counts,
+                        )
+                    self.assertEqual(
+                        caught.exception.reason_code,
+                        "FACT_STORE_IDENTITY_CONFLICT",
+                    )
+
+            bad_value = object()
+            source_entries = tuple(
+                replace(
+                    entry,
+                    logical_resource_entry="",
+                    resource_semantic_facts=(bad_value,),
+                )
+                if entry.kind == "resource" else entry
+                for entry in source_snapshot.entries
+            )
+            target_entries = tuple(
+                replace(
+                    entry,
+                    logical_resource_entry="",
+                    resource_semantic_facts=(bad_value,),
+                )
+                if entry.kind == "resource" else entry
+                for entry in target_snapshot.entries
+            )
+            bad_source = replace(source_snapshot, entries=source_entries)
+            bad_target = replace(target_snapshot, entries=target_entries)
+            for bulk in (False, True):
+                with self.subTest(base_exception_bulk=bulk), BinaryFactStore(
+                    bulk_load_transaction=bulk
+                ) as target:
+                    with self.assertRaises(TypeError):
+                        target.add_rebound_artifact_snapshot(
+                            target_instance,
+                            bad_target,
+                            source_store=source,
+                            source_instance=source_instance,
+                            source_snapshot=bad_source,
+                            expected_source_counts=counts,
+                        )
 
     def test_fact_store_preserves_unpaired_surrogate_jvm_text(self):
         from tests.test_final_artifact_edge_oracle import (
@@ -335,7 +1065,7 @@ class BinaryFactStoreTest(unittest.TestCase):
             )[0]["value"]
 
         by_name = {row["resource_name"]: row for row in resources}
-        self.assertEqual(schema, "binary-fact-sqlite-v9")
+        self.assertEqual(schema, "binary-fact-sqlite-v11")
         self.assertEqual(counts["resources"], 3)
         self.assertEqual(
             by_name["config/runtime.xml"]["content_sha256"],
@@ -428,7 +1158,7 @@ class BinaryFactStoreTest(unittest.TestCase):
                 "metadata", where="key='schema_version'"
             )[0]["value"]
 
-        self.assertEqual(version, "binary-fact-sqlite-v9")
+        self.assertEqual(version, "binary-fact-sqlite-v11")
         self.assertEqual(after, before)
 
     def test_custom_invokedynamic_bootstrap_tag_validates_from_nested_payload(self):
@@ -1067,6 +1797,181 @@ class BinaryFactStoreTest(unittest.TestCase):
             {row["index"] for row in dispatch_payloads}, set(range(2_501, 4_100))
         )
 
+    def test_reconciliation_v11_columnar_payload_is_exact_and_canonical(self):
+        records = [
+            {
+                "analysis_context_identity": "context",
+                "record_kind": "member_resolution",
+                "status": "resolved",
+                "subject_identity": f"subject-{index}",
+                "payload": (
+                    {"z": index, "a": None}
+                    if index == 0 else {"a": False, "z": index}
+                ),
+            }
+            for index in range(2)
+        ]
+        with BinaryFactStore() as store:
+            expected_identities = store.add_reconciliation_records(records)
+            row = store.connection.execute(
+                "SELECT payload_zlib,metadata_zlib FROM reconciliation_records"
+            ).fetchone()
+            payload = json.loads(zlib.decompress(row[0]).decode("utf-8"))
+            metadata = json.loads(zlib.decompress(row[1]).decode("utf-8"))
+            restored = store.rows("reconciliation_records")
+
+        self.assertEqual(
+            payload,
+            {
+                "format": "binary-reconciliation-columnar-payload-v1",
+                "records": [[0, None, 0], [0, False, 1]],
+                "shapes": [["a", "z"]],
+            },
+        )
+        self.assertEqual(
+            metadata,
+            {
+                "format": "binary-reconciliation-metadata-array-v1",
+                "records": [
+                    ["resolved", "subject-0"],
+                    ["resolved", "subject-1"],
+                ],
+            },
+        )
+        self.assertEqual(
+            [row["record_identity"] for row in restored], expected_identities
+        )
+        self.assertEqual(
+            [json.loads(row["payload_json"]) for row in restored],
+            [record["payload"] for record in records],
+        )
+
+    def test_reconciliation_v11_derived_metadata_round_trips_exactly(self):
+        payload = {
+            "direct_edge_identity": "edge",
+            "member_resolution_status": "resolved",
+            "member_resolution_identity": "member",
+            "optional": None,
+        }
+        with BinaryFactStore() as store:
+            identities = store.add_reconciliation_payloads(
+                analysis_context_identity="context",
+                record_kind="member_resolution",
+                records=[("resolved", "member", payload)],
+                derive_metadata_from_payload=True,
+            )
+            metadata_zlib = store.connection.execute(
+                "SELECT metadata_zlib FROM reconciliation_records"
+            ).fetchone()[0]
+            restored = store.rows("reconciliation_records")
+
+        self.assertEqual(
+            json.loads(zlib.decompress(metadata_zlib).decode("utf-8")),
+            {
+                "format": (
+                    "binary-reconciliation-payload-field-metadata-v1"
+                ),
+                "status_field": "member_resolution_status",
+                "subject_field": "member_resolution_identity",
+            },
+        )
+        self.assertEqual(restored[0]["record_identity"], identities[0])
+        self.assertEqual(json.loads(restored[0]["payload_json"]), payload)
+        self.assertEqual(restored[0]["status"], "resolved")
+        self.assertEqual(restored[0]["subject_identity"], "member")
+
+    def test_reconciliation_v11_invalid_column_shape_fails_closed(self):
+        with BinaryFactStore() as store:
+            store.add_reconciliation_records([{
+                "analysis_context_identity": "context",
+                "record_kind": "member_resolution",
+                "status": "resolved",
+                "subject_identity": "subject",
+                "payload": {"a": 1},
+            }])
+            invalid = {
+                "format": "binary-reconciliation-columnar-payload-v1",
+                "records": [[0, 1]],
+                "shapes": [["a", "a"]],
+            }
+            store.connection.execute(
+                "UPDATE reconciliation_records SET payload_zlib=?",
+                (zlib.compress(json.dumps(invalid).encode("utf-8")),),
+            )
+            store.connection.commit()
+            with self.assertRaises(BinaryFactStoreError) as caught:
+                store.rows("reconciliation_records")
+
+        self.assertEqual(
+            caught.exception.reason_code,
+            "FACT_STORE_RECONCILIATION_CHUNK_INVALID",
+        )
+
+    def test_reconciliation_v9_and_v10_chunks_remain_readable(self):
+        fixtures = (
+            (
+                {
+                    "format": "binary-reconciliation-payload-array-v1",
+                    "records": [{"value": "v10"}],
+                },
+                {
+                    "format": "binary-reconciliation-metadata-array-v1",
+                    "records": [["resolved-v10", "subject-v10"]],
+                },
+                "v10",
+                "resolved-v10",
+                "subject-v10",
+            ),
+            (
+                [{
+                    "record_identity": "a" * 64,
+                    "status": "resolved-v9",
+                    "subject_identity": "subject-v9",
+                    "payload": {"value": "v9"},
+                }],
+                {},
+                "v9",
+                "resolved-v9",
+                "subject-v9",
+            ),
+        )
+        for ordinal, (
+            payload, metadata, value, status, subject,
+        ) in enumerate(fixtures):
+            with self.subTest(value=value), BinaryFactStore() as store:
+                store.connection.execute(
+                    "INSERT INTO metadata(key,value) VALUES(?,?)",
+                    ("reconciliation_analysis_context_identity", "context"),
+                )
+                chunk_identity = bytes([ordinal + 1]) * 32
+                store.connection.execute(
+                    "INSERT INTO reconciliation_records VALUES(?,?,?,?,?)",
+                    (
+                        chunk_identity,
+                        3,
+                        1,
+                        zlib.compress(json.dumps(payload).encode("utf-8")),
+                        zlib.compress(json.dumps(metadata).encode("utf-8")),
+                    ),
+                )
+                store.connection.execute(
+                    "INSERT INTO reconciliation_chunk_order VALUES(?,?,?)",
+                    (3, 0, chunk_identity),
+                )
+                store.connection.commit()
+                restored = store.rows("reconciliation_records")
+                hydrated = list(
+                    store.reconciliation_payloads("member_resolution")
+                )
+
+            self.assertEqual(len(restored), 1)
+            self.assertEqual(json.loads(restored[0]["payload_json"]), {
+                "value": value,
+            })
+            self.assertEqual(restored[0]["status"], status)
+            self.assertEqual(restored[0]["subject_identity"], subject)
+            self.assertEqual(hydrated, [{"value": value}])
+
     def test_specialized_reconciliation_writer_is_byte_identical(self):
         ordinary_path = self.root / "ordinary.sqlite"
         specialized_path = self.root / "specialized.sqlite"
@@ -1298,6 +2203,10 @@ class BinaryFactStoreTest(unittest.TestCase):
             stored_lengths = store.connection.execute(
                 "SELECT length(class_bytes_zlib), length(fact_zlib) FROM classes"
             ).fetchone()
+            stored_fact = store.connection.execute(
+                "SELECT artifact_instance_identity,fact_zlib,fact_zlib_sha256 "
+                "FROM classes"
+            ).fetchone()
             stored_header = dict(store.connection.execute(
                 """
                 SELECT class_access,super_name,interfaces_json,
@@ -1317,6 +2226,7 @@ class BinaryFactStoreTest(unittest.TestCase):
 
         self.assertIn("class_bytes_zlib", columns)
         self.assertIn("fact_zlib", columns)
+        self.assertIn("fact_zlib_sha256", columns)
         self.assertNotIn("class_bytes", columns)
         self.assertNotIn("fact_json", columns)
         self.assertEqual(row["class_bytes"], self.class_bytes)
@@ -1327,6 +2237,19 @@ class BinaryFactStoreTest(unittest.TestCase):
         self.assertNotIn("fact_zlib", metadata_only)
         fact = json.loads(row["fact_json"])
         self.assertEqual(fact["class_name"], "demo/Caller")
+        self.assertEqual(
+            fact["artifact_instance_identity"], instance.identity
+        )
+        normalized_fact = zlib.decompress(stored_fact["fact_zlib"])
+        self.assertNotIn(instance.identity.encode("ascii"), normalized_fact)
+        self.assertIn(
+            b"@binary-fact-store-row-artifact-instance-v1@",
+            normalized_fact,
+        )
+        self.assertEqual(
+            hashlib.sha256(stored_fact["fact_zlib"]).hexdigest(),
+            stored_fact["fact_zlib_sha256"],
+        )
         self.assertEqual(stored_header["class_access"], fact["class_access"])
         self.assertEqual(stored_header["super_name"], fact.get("super_name"))
         self.assertEqual(
@@ -1352,6 +2275,25 @@ class BinaryFactStoreTest(unittest.TestCase):
         )
         self.assertLess(stored_lengths[0], len(self.class_bytes))
         self.assertLess(stored_lengths[1], len(row["fact_json"].encode("utf-8")))
+
+    def test_normalized_class_fact_digest_tampering_fails_closed(self):
+        artifact = self.make_jar("tampered-normalized-fact.jar")
+        instance = self.instance(artifact, 0)
+        snapshot = self.snapshot(artifact, instance)
+
+        with BinaryFactStore() as store:
+            store.add_artifact_snapshot(instance, snapshot)
+            store.connection.execute(
+                "UPDATE classes SET fact_zlib_sha256=?",
+                ("0" * 64,),
+            )
+            with self.assertRaises(BinaryFactStoreError) as raised:
+                store.rows("classes")
+
+        self.assertEqual(
+            raised.exception.reason_code,
+            "FACT_STORE_CLASS_FACT_DIGEST_MISMATCH",
+        )
 
     def test_runtime_trigger_summary_is_incremental_complete_and_reopen_exact(self):
         first_artifact = self.make_jar("annotated-first.jar")

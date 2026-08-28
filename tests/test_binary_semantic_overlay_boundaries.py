@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 import json
+import sqlite3
 from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
@@ -431,9 +432,32 @@ class BinarySemanticOverlayBoundaryTest(unittest.TestCase):
             }
             for row in class_rows
         ]
+        database_class_rows.extend((
+            {
+                "class_variant_identity": None,
+                "artifact_instance_identity": None,
+                "fact_zlib": None,
+            },
+            {
+                "class_variant_identity": "v-unselected",
+                "artifact_instance_identity": None,
+                "fact_zlib": None,
+            },
+            {
+                "class_variant_identity": "v-null",
+                "artifact_instance_identity": None,
+                "fact_zlib": None,
+            },
+        ))
+        class ClosingRows(list):
+            def close(self):
+                self.closed = True
+
+        class_cursor = ClosingRows(database_class_rows)
+        class_cursor.closed = False
         connection = MagicMock()
         connection.execute.side_effect = lambda query, *_args: (
-            database_class_rows if "FROM classes" in query else member_rows
+            class_cursor if "FROM classes" in query else member_rows
         )
         store = MagicMock(connection=connection)
         store.rows.return_value = artifact_rows
@@ -447,6 +471,7 @@ class BinarySemanticOverlayBoundaryTest(unittest.TestCase):
                 {"initiating_loader_realm_identity": None, "class_name": "demo/BlankRealm"},
                 {"initiating_loader_realm_identity": "app", "class_name": None},
                 {"initiating_loader_realm_identity": "app", "class_name": "demo/Empty"},
+                {"initiating_loader_realm_identity": "app", "class_name": "demo/Null"},
             ),
             provider_bindings=(
                 {"class_provider_status": "missing"},
@@ -498,6 +523,12 @@ class BinarySemanticOverlayBoundaryTest(unittest.TestCase):
                     "class_name": "demo/Empty",
                     "selected_class_variant_identity": "v-empty",
                 },
+                {
+                    "class_provider_status": "resolved",
+                    "initiating_loader_realm_identity": "app",
+                    "class_name": "demo/Null",
+                    "selected_class_variant_identity": "v-null",
+                },
             ),
             resource_selections=(
                 {"resource_selection_status": "missing"},
@@ -524,6 +555,7 @@ class BinarySemanticOverlayBoundaryTest(unittest.TestCase):
         self.assertEqual(set(builder.selected), {
             ("app", "demo/Good"), ("app", "demo/GoodAlias"),
             ("app", "demo/Invalid"), ("app", "demo/Empty"),
+            ("app", "demo/Null"),
         })
         self.assertNotIn("fact_json", builder.selected[("app", "demo/Good")][0])
         self.assertIsInstance(builder.members, semantic._MemberSource)
@@ -535,6 +567,7 @@ class BinarySemanticOverlayBoundaryTest(unittest.TestCase):
         self.assertNotIn(
             "FROM direct_edges", connection.execute.call_args.args[0]
         )
+        self.assertTrue(class_cursor.closed)
 
         empty_connection = MagicMock()
         empty_connection.execute.return_value = []
@@ -565,6 +598,295 @@ class BinarySemanticOverlayBoundaryTest(unittest.TestCase):
             "facts": (("ordered_entry", "demo.Provider"),),
             "selection_identity": "selection",
         }])
+
+    def test_streaming_member_and_direct_edge_sources_cover_query_boundaries(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        self.addCleanup(connection.close)
+        connection.execute(
+            "CREATE TABLE direct_edges("
+            "direct_edge_identity TEXT,caller_member_identity TEXT,"
+            "edge_kind TEXT,symbolic_owner TEXT,symbolic_name TEXT,"
+            "symbolic_descriptor TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO direct_edges VALUES(?,?,?,?,?,?)",
+            (
+                ("method", "caller", "method", "demo/Api", "run", "()V"),
+                ("field", "caller", "field", "demo/Api", "value", "I"),
+            ),
+        )
+        edges = semantic._DirectMethodEdgeSource(connection)
+        self.assertEqual(
+            [row["direct_edge_identity"] for row in edges.iter_method_edges()],
+            ["method"],
+        )
+        self.assertEqual(list(edges.iter_method_edges((None, ""))), [])
+        self.assertEqual(
+            [row["direct_edge_identity"] for row in
+             edges.iter_method_edges(("demo/Api", None))],
+            ["method"],
+        )
+
+        connection.execute(
+            "CREATE TABLE members("
+            "member_identity TEXT,class_variant_identity TEXT,"
+            "artifact_instance_identity TEXT,class_name TEXT,member_kind TEXT,"
+            "member_name TEXT,descriptor TEXT,access_flags INTEGER,contract_json TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO members VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                ("method", "variant", "artifact", "demo/Api", "method", "run", "()V", 0, "{}"),
+                ("field", "variant", "artifact", "demo/Api", "field", "value", "I", 0, "{}"),
+            ),
+        )
+        members = semantic._MemberSource(connection)
+        marker = object()
+        self.assertIs(members.get(None, marker), marker)
+        self.assertEqual(members.get("method")["member_name"], "run")
+        self.assertIs(members.get("method"), members.get("method"))
+        self.assertIs(members.get("missing", marker), marker)
+        with patch.object(semantic._MemberSource, "CACHE_LIMIT", 0):
+            self.assertEqual(members.get("field")["member_name"], "value")
+        self.assertEqual(len(members.for_variant("variant")), 2)
+        self.assertEqual(len(members.for_variant("variant")), 2)
+        self.assertEqual(members.for_variant(None), ())
+        self.assertEqual(
+            [row["member_identity"] for row in members.for_variant(
+                "variant", kind="method", name="run"
+            )],
+            ["method"],
+        )
+        self.assertEqual(
+            [row["member_identity"] for row in members.iter_methods()],
+            ["method"],
+        )
+
+        class ListConnection:
+            @staticmethod
+            def execute(_query):
+                return [dict(
+                    member_identity="method", class_variant_identity="variant",
+                    artifact_instance_identity="artifact", class_name="demo/Api",
+                    member_kind="method", member_name="run", descriptor="()V",
+                    access_flags=0, contract_json="{}",
+                )]
+
+        self.assertEqual(
+            len(list(semantic._MemberSource(ListConnection()).iter_methods())), 1
+        )
+
+        builder = bare_builder()
+        builder.direct_edges = (
+            {"edge_kind": "field", "symbolic_owner": "demo/Api"},
+            {"edge_kind": "method", "symbolic_owner": "other/Api"},
+            {"edge_kind": "method", "symbolic_owner": "demo/Api"},
+        )
+        self.assertEqual(len(list(builder._method_edges())), 2)
+        self.assertEqual(
+            len(list(builder._method_edges(("demo/Api",)))), 1
+        )
+
+    def test_streaming_member_fact_join_and_hierarchy_cache_boundaries(self):
+        builder = bare_builder()
+        builder.members_by_variant = None
+        builder._selection_keys_by_variant = {
+            "variant": (("app", "demo/Api"),),
+        }
+        builder.selected = {
+            ("app", "demo/Api"): (
+                {"class_variant_identity": "variant"},
+                {
+                    "methods": (
+                        {"contract": None},
+                        {"contract": {"name": "other", "descriptor": "()V"}},
+                        {"contract": {"name": "run", "descriptor": "()V"}},
+                    ),
+                },
+            ),
+        }
+        builder.members = SimpleNamespace(iter_methods=lambda: iter((
+            {"class_variant_identity": None},
+            {"class_variant_identity": "unknown"},
+            {
+                "class_variant_identity": "variant",
+                "member_identity": "missing",
+                "member_name": "missing",
+                "descriptor": "()V",
+            },
+            {
+                "class_variant_identity": "variant",
+                "member_identity": "matched",
+                "member_name": "run",
+                "descriptor": "()V",
+            },
+            {
+                "class_variant_identity": "empty-fact",
+                "member_identity": "empty-fact-member",
+                "member_name": "run",
+                "descriptor": "()V",
+            },
+        )))
+        builder._selection_keys_by_variant["empty-fact"] = (
+            ("app", "demo/EmptyFact"),
+        )
+        builder.selected[("app", "demo/EmptyFact")] = (
+            {"class_variant_identity": "empty-fact"},
+            {"methods": None},
+        )
+        rows = list(builder._member_fact_rows())
+        self.assertEqual([row[4]["member_identity"] for row in rows], ["matched"])
+
+        fixture_builder = bare_builder()
+        fixture_builder.members_by_variant["variant"] = (
+            {"member_kind": "method", "member_name": "run"},
+            {"member_kind": "field", "member_name": "value"},
+        )
+        self.assertEqual(
+            len(fixture_builder._members_for_variant("variant")), 2
+        )
+        self.assertEqual(
+            fixture_builder._members_for_variant(
+                "variant", kind="method", name="missing"
+            ),
+            (),
+        )
+
+        streaming_builder = bare_builder()
+        streaming_builder.members_by_variant = None
+        streaming_builder.members = SimpleNamespace(
+            for_variant=lambda variant, *, kind="", name="": (
+                {"variant": variant, "kind": kind, "name": name},
+            )
+        )
+        self.assertEqual(
+            streaming_builder._members_for_variant(
+                "stream", kind="method", name="run"
+            )[0]["variant"],
+            "stream",
+        )
+
+        streaming_builder.direct_edges = semantic._DirectMethodEdgeSource(
+            sqlite3.connect(":memory:")
+        )
+        streaming_builder.direct_edges.connection.row_factory = sqlite3.Row
+        self.addCleanup(streaming_builder.direct_edges.connection.close)
+        streaming_builder.direct_edges.connection.execute(
+            "CREATE TABLE direct_edges("
+            "direct_edge_identity TEXT,caller_member_identity TEXT,edge_kind TEXT,"
+            "symbolic_owner TEXT,symbolic_name TEXT,symbolic_descriptor TEXT)"
+        )
+        streaming_builder.direct_edges.connection.execute(
+            "INSERT INTO direct_edges VALUES(?,?,?,?,?,?)",
+            ("edge", "caller", "method", "demo/Api", "run", "()V"),
+        )
+        self.assertEqual(
+            len(list(streaming_builder._method_edges(("demo/Api",)))), 1
+        )
+
+        fixture_builder._hierarchy_cache = {
+            ("app", f"cached-{index}"): frozenset()
+            for index in range(8192)
+        }
+        install_class(fixture_builder, "app", "demo/Child")
+        self.assertEqual(fixture_builder._hierarchy("app", "demo/Child"), set())
+        self.assertEqual(len(fixture_builder._hierarchy_cache), 1)
+
+    def test_filtered_edge_source_preserves_malformed_and_framework_boundaries(self):
+        class EdgeSource:
+            def __init__(self, rows):
+                self.rows = tuple(rows)
+
+            def iter_method_edges(self, _owners=None):
+                return iter(self.rows)
+
+        rows = (
+            {"symbolic_owner": None, "symbolic_name": None},
+            {
+                "symbolic_owner": "org/apache/dubbo/common/extension/ExtensionLoader",
+                "symbolic_name": "unknown",
+            },
+        )
+        builder = bare_builder()
+        builder.direct_edges = EdgeSource(rows)
+        builder.mybatis()
+        builder.dubbo_spi()
+
+        repository = bare_builder(spring=True)
+        repo_method = member(
+            "repo-method", "demo/Repo", "find", variant="repo"
+        )
+        install_class(
+            repository, "app", "demo/Repo", variant="repo",
+            access=semantic.ACC_INTERFACE,
+            interfaces=("org/springframework/data/repository/Repository",),
+            members=(repo_method,),
+        )
+        repository.direct_edges = EdgeSource((
+            {"symbolic_owner": None, "caller_member_identity": "missing"},
+            {
+                "symbolic_owner": "demo/Repo",
+                "symbolic_name": "find",
+                "symbolic_descriptor": "()V",
+                "caller_member_identity": "missing",
+            },
+        ))
+        repository.spring_data_and_bean_wiring()
+
+        custom = bare_builder(spring=True)
+        install_class(
+            custom, "app", "demo/Repo", variant="repo",
+            access=semantic.ACC_INTERFACE,
+            interfaces=("org/springframework/data/repository/Repository",),
+            members=(repo_method,),
+        )
+        install_class(
+            custom, "app", "demo/Config", variant="config",
+            annotations=(annotation(
+                "Lorg/springframework/data/jpa/repository/config/"
+                "EnableJpaRepositories;",
+                [["repositoryBaseClass", "class", "demo/Custom"]],
+            ),),
+        )
+        custom.direct_edges = EdgeSource(({
+            "symbolic_owner": "demo/Repo",
+            "symbolic_name": "find",
+            "symbolic_descriptor": "()V",
+            "caller_member_identity": "missing",
+        },))
+        custom.spring_data_and_bean_wiring()
+        self.assertIn("spring_data_custom_repository_factory", custom.gaps)
+
+        data = bare_builder()
+        endpoint = member(
+            "endpoint", "demo/Controller", "post", "(Ldemo/Dto;)V",
+            annotations=(annotation(
+                "Lorg/springframework/web/bind/annotation/PostMapping;"
+            ),),
+        )
+        data._member_fact_rows = lambda: iter((
+            ("app", "demo/Controller", {}, {}, endpoint, {}),
+        ))
+        field = member(
+            "field", "demo/Dto", "", "Ljava/lang/String;",
+            variant="dto", kind="field",
+        )
+        install_class(data, "app", "demo/Dto", variant="dto", members=(field,))
+        data.realms = ["app"]
+        data.decisions = SimpleNamespace(
+            authoritative_decisions=({
+                "fact_scope": {
+                    "member_kind": "field",
+                    "class_name": "demo/Dto",
+                    "member_name": None,
+                    "descriptor": "Ljava/lang/String;",
+                },
+            },),
+            diagnostic_decisions=(),
+        )
+        data.implicit_data_contracts()
+        self.assertTrue(data.rows)
 
     def test_builder_lookup_hierarchy_business_spring_and_member_rows(self):
         builder = bare_builder()

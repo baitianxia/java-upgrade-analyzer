@@ -4,11 +4,13 @@ import io
 import hashlib
 import json
 import os
+from dataclasses import replace
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -818,6 +820,113 @@ print(json.dumps([
             "ASM_IMPLEMENTATION_CHANGED_DURING_RUN",
         )
 
+    def test_run_scoped_parser_binding_reuses_exact_identity_and_reverifies(self):
+        ordinary = helper.extract_class_facts(
+            [self.class_input()], asm_jar=self.asm_jar
+        )
+        binding = helper.capture_parser_identity_binding(
+            asm_jar=self.asm_jar
+        )
+        with patch.object(
+            helper,
+            "resolve_asm_jar",
+            side_effect=AssertionError("binding use must not rehash ASM"),
+        ), patch.object(
+            helper,
+            "_parser_implementation_source_digests",
+            side_effect=AssertionError("binding use must not rehash sources"),
+        ):
+            bound = helper.extract_class_facts(
+                [self.class_input()],
+                asm_jar=self.asm_jar,
+                parser_identity_binding=binding,
+            )
+
+        self.assertEqual(bound.records, ordinary.records)
+        self.assertEqual(bound.parser_identity, ordinary.parser_identity)
+        self.assertEqual(bound.helper_sha256, ordinary.helper_sha256)
+        self.assertEqual(
+            bound.class_input_digest, ordinary.class_input_digest
+        )
+        self.assertEqual(bound.fact_output_digest, ordinary.fact_output_digest)
+        helper.verify_parser_identity_binding(binding)
+
+    def test_run_scoped_parser_binding_fails_closed_on_change_or_mismatch(self):
+        binding = helper.capture_parser_identity_binding(
+            asm_jar=self.asm_jar
+        )
+        changed_sources = dict(
+            helper._CAPTURED_PARSER_IMPLEMENTATION_SOURCE_DIGESTS
+        )
+        changed_sources["binary_asm_helper.py"] = "0" * 64
+        with patch.object(
+            helper,
+            "_parser_implementation_source_digests",
+            return_value=changed_sources,
+        ):
+            with self.assertRaises(helper.BinaryAsmError) as changed:
+                helper.verify_parser_identity_binding(binding)
+        self.assertEqual(
+            changed.exception.reason_code,
+            "ASM_IMPLEMENTATION_CHANGED_DURING_RUN",
+        )
+
+        with self.assertRaises(helper.BinaryAsmError) as mismatch:
+            helper.parser_identity_from_binding(
+                binding, asm_jar=Path(self.temp.name) / "different.jar"
+            )
+        self.assertEqual(
+            mismatch.exception.reason_code,
+            "ASM_PARSER_IDENTITY_BINDING_MISMATCH",
+        )
+
+        invalid_bindings = (
+            object(),
+            replace(binding, asm_path=Path("relative/asm.jar")),
+            replace(binding, parser_identity=object()),
+            replace(binding, parser_identity="short"),
+            replace(binding, parser_identity="g" * 64),
+            replace(binding, helper_sha256=object()),
+            replace(binding, helper_sha256="short"),
+            replace(binding, helper_sha256="g" * 64),
+        )
+        for index, invalid in enumerate(invalid_bindings):
+            with self.subTest(invalid_binding=index), self.assertRaises(
+                helper.BinaryAsmError
+            ) as raised:
+                helper.parser_identity_from_binding(invalid)
+            self.assertEqual(
+                raised.exception.reason_code,
+                "ASM_PARSER_IDENTITY_BINDING_INVALID",
+            )
+
+        bound_path = Path(binding.asm_path)
+        verify_cases = (
+            (bound_path.parent / "different.jar", binding.parser_identity,
+             binding.helper_sha256),
+            (bound_path, "0" * 64, binding.helper_sha256),
+            (bound_path, binding.parser_identity, "0" * 64),
+        )
+        for index, (resolved, identity, helper_sha) in enumerate(verify_cases):
+            with self.subTest(verify_case=index), patch.object(
+                helper,
+                "parser_identity_from_binding",
+                return_value=(
+                    bound_path, binding.parser_identity, binding.helper_sha256
+                ),
+            ), patch.object(
+                helper, "resolve_asm_jar", return_value=resolved
+            ), patch.object(
+                helper,
+                "_verified_parser_identity",
+                return_value=(identity, helper_sha),
+            ), self.assertRaises(helper.BinaryAsmError) as raised:
+                helper.verify_parser_identity_binding(binding)
+            self.assertEqual(
+                raised.exception.reason_code,
+                "ASM_PARSER_IDENTITY_BINDING_CHANGED",
+            )
+
     def test_input_value_object_rejects_every_missing_and_type_boundary(self):
         cases = (
             ((None, "Entry.class", b"x"), "ASM_ARTIFACT_IDENTITY_MISSING"),
@@ -1240,6 +1349,459 @@ print(json.dumps([
         )
         self.assertEqual(first.fact_output_digest, second.fact_output_digest)
 
+    def test_persistent_transport_is_exact_and_reuses_one_jvm(self):
+        ordinary = helper.extract_class_facts(
+            [self.class_input()], asm_jar=self.asm_jar
+        )
+        helper.close_persistent_asm_sessions()
+        self.addCleanup(helper.close_persistent_asm_sessions)
+
+        with patch.object(
+            helper, "managed_popen", wraps=helper.managed_popen
+        ) as popen:
+            first = helper.extract_class_facts(
+                [self.class_input()],
+                asm_jar=self.asm_jar,
+                persistent_session=True,
+                persistent_max_sessions=1,
+            )
+            second = helper.extract_class_facts(
+                [self.class_input()],
+                asm_jar=self.asm_jar,
+                persistent_session=True,
+                persistent_max_sessions=1,
+            )
+
+        self.assertEqual(popen.call_count, 1)
+        for reused in (first, second):
+            self.assertEqual(reused.records, ordinary.records)
+            self.assertEqual(
+                reused.class_input_digest, ordinary.class_input_digest
+            )
+            self.assertEqual(
+                reused.fact_output_digest, ordinary.fact_output_digest
+            )
+            self.assertEqual(
+                (
+                    reused.input_record_count,
+                    reused.fact_record_count,
+                    reused.failure_record_count,
+                    reused.coverage_status,
+                ),
+                (
+                    ordinary.input_record_count,
+                    ordinary.fact_record_count,
+                    ordinary.failure_record_count,
+                    ordinary.coverage_status,
+                ),
+            )
+
+    def test_persistent_transport_failure_uses_exact_one_shot_fallback(self):
+        expected = helper.extract_class_facts(
+            [self.class_input()], asm_jar=self.asm_jar
+        )
+        with patch.object(
+            helper, "_run_persistent_helper", return_value=None
+        ) as persistent, patch.object(
+            helper,
+            "_run_one_shot_helper",
+            wraps=helper._run_one_shot_helper,
+        ) as one_shot:
+            actual = helper.extract_class_facts(
+                [self.class_input()],
+                asm_jar=self.asm_jar,
+                persistent_session=True,
+            )
+
+        persistent.assert_called_once()
+        one_shot.assert_called_once()
+        self.assertEqual(actual.records, expected.records)
+        self.assertEqual(actual.fact_output_digest, expected.fact_output_digest)
+
+    def test_idle_persistent_sessions_use_bounded_protocol_shutdown(self):
+        calls = []
+
+        class IdleSession:
+            def close(self, *, terminate):
+                calls.append(terminate)
+
+        pool = object.__new__(helper._AsmSessionPool)
+        pool._condition = threading.Condition()
+        pool._idle = helper.queue.LifoQueue()
+        pool._idle.put(IdleSession())
+        pool._idle.put(IdleSession())
+        pool._session_count = 2
+        pool._closed = False
+
+        pool.close()
+
+        self.assertEqual(calls, [False, False])
+        self.assertEqual(pool._session_count, 0)
+        self.assertTrue(pool._closed)
+
+    def test_persistent_session_count_is_strictly_bounded(self):
+        for value in (True, False, 0, 9, 1.5, "2"):
+            with self.subTest(value=value), self.assertRaises(
+                helper.BinaryAsmError
+            ) as raised:
+                helper.extract_class_facts(
+                    [self.class_input()],
+                    asm_jar=self.asm_jar,
+                    persistent_max_sessions=value,
+                )
+            self.assertEqual(
+                raised.exception.reason_code, "ASM_SESSION_COUNT_INVALID"
+            )
+
+    def test_persistent_session_transport_fails_closed_at_every_boundary(self):
+        class Process:
+            def __init__(self, *, poll_values=(None,), stdin=None, stderr=None):
+                self.stdin = io.BytesIO() if stdin is None else stdin
+                self.stdout = io.BytesIO(b"response")
+                self.stderr = io.BytesIO() if stderr is None else stderr
+                self.poll_values = list(poll_values)
+                self.wait_calls = []
+
+            def poll(self):
+                if len(self.poll_values) > 1:
+                    return self.poll_values.pop(0)
+                return self.poll_values[0]
+
+            def wait(self, timeout):
+                self.wait_calls.append(timeout)
+                return 0
+
+        def session(process):
+            value = object.__new__(helper._AsmSession)
+            value.process = process
+            value._closed = False
+            value._close_lock = threading.Lock()
+            value._stderr_tail = bytearray()
+            return value
+
+        with tempfile.TemporaryDirectory() as temporary:
+            request = Path(temporary) / "request.bin"
+            request.write_bytes(b"request")
+
+            dead = session(Process(poll_values=(1,)))
+            with self.assertRaises(helper._AsmSessionError):
+                dead.exchange(request, lambda _stream: "parsed", 1)
+            pipes = session(Process())
+            pipes.process.stdin = None
+            with self.assertRaises(helper._AsmSessionError):
+                pipes.exchange(request, lambda _stream: "parsed", 1)
+            missing_stdout = session(Process())
+            missing_stdout.process.stdout = None
+            with self.assertRaises(helper._AsmSessionError):
+                missing_stdout.exchange(request, lambda _stream: "parsed", 1)
+
+            class PassiveTimer:
+                daemon = False
+
+                def __init__(self, _seconds, callback):
+                    self.callback = callback
+
+                def start(self):
+                    pass
+
+                def cancel(self):
+                    pass
+
+                def join(self):
+                    pass
+
+            successful = session(Process())
+            with patch.object(helper.threading, "Timer", PassiveTimer):
+                self.assertEqual(
+                    successful.exchange(
+                        request, lambda _stream: "parsed", 1
+                    ),
+                    ("parsed", ""),
+                )
+
+            class BrokenWriter(io.BytesIO):
+                def write(self, _value):
+                    raise BrokenPipeError("expected")
+
+            broken = session(Process(stdin=BrokenWriter()))
+            with patch.object(helper.threading, "Timer", PassiveTimer), self.assertRaises(
+                helper._AsmSessionError
+            ):
+                broken.exchange(request, lambda _stream: "parsed", 1)
+
+            class PendingWriter:
+                daemon = False
+
+                def __init__(self, **_kwargs):
+                    pass
+
+                def start(self):
+                    pass
+
+                def join(self, **_kwargs):
+                    pass
+
+                def is_alive(self):
+                    return True
+
+            pending = session(Process())
+            with patch.object(helper.threading, "Timer", PassiveTimer), patch.object(
+                helper.threading, "Thread", PendingWriter
+            ), self.assertRaises(helper._AsmSessionError):
+                pending.exchange(request, lambda _stream: "parsed", 0.01)
+
+            class ImmediateTimer(PassiveTimer):
+                def start(self):
+                    self.callback()
+
+            timed_out = session(Process())
+            timed_out.close = lambda **_kwargs: None
+            with patch.object(helper.threading, "Timer", ImmediateTimer), self.assertRaises(
+                helper._AsmSessionError
+            ):
+                timed_out.exchange(request, lambda _stream: "parsed", 1)
+
+            class BrokenStartTimer(PassiveTimer):
+                def start(self):
+                    raise RuntimeError("timer start")
+
+            start_failed = session(Process())
+            with patch.object(
+                helper.threading, "Timer", BrokenStartTimer
+            ), self.assertRaisesRegex(RuntimeError, "timer start"):
+                start_failed.exchange(request, lambda _stream: "parsed", 1)
+
+            exited = session(Process(poll_values=(None, 1)))
+            exited._stderr_tail.extend(b"exit-detail")
+            with patch.object(helper.threading, "Timer", PassiveTimer), self.assertRaises(
+                helper._AsmSessionError
+            ):
+                exited.exchange(request, lambda _stream: "parsed", 1)
+
+            callback_without_live_process = session(
+                Process(poll_values=(None, 1, 1))
+            )
+            with patch.object(
+                helper.threading, "Timer", ImmediateTimer
+            ), self.assertRaises(RuntimeError):
+                callback_without_live_process.exchange(
+                    request, lambda _stream: (_ for _ in ()).throw(
+                        RuntimeError("reader")
+                    ), 1
+                )
+
+        closed = session(Process())
+        closed._closed = True
+        self.assertFalse(closed.alive)
+        closed.close(terminate=True)
+
+        calls = []
+        normal = session(Process())
+        with patch.object(
+            helper, "terminate_process_tree",
+            side_effect=lambda _process: calls.append("terminate"),
+        ), patch.object(
+            helper, "release_process_tree",
+            side_effect=lambda _process: calls.append("release"),
+        ):
+            normal.close(terminate=True)
+        self.assertEqual(calls, ["terminate", "release"])
+
+        no_handles = session(Process(poll_values=(1,)))
+        no_handles.process.stdin = None
+        no_handles.process.stdout = None
+        no_handles.process.stderr = None
+        with patch.object(helper, "release_process_tree") as release:
+            no_handles.close(terminate=False)
+        release.assert_called_once()
+
+        for stderr in (None, io.BytesIO(b"x" * (70 * 1024))):
+            draining = session(Process(stderr=stderr))
+            draining.process.stderr = stderr
+            draining._drain_stderr()
+            if stderr is not None:
+                self.assertEqual(len(draining._stderr_tail), 64 * 1024)
+
+        class BrokenReader:
+            def read(self, _size):
+                raise OSError("expected")
+
+        draining = session(Process(stderr=BrokenReader()))
+        draining._drain_stderr()
+
+    def test_persistent_pool_registry_lease_cleanup_and_fork_matrix(self):
+        class FakeSession:
+            def __init__(self, *, alive=True, error=None, close_error=None):
+                self.alive = alive
+                self.error = error
+                self.close_error = close_error
+                self.closed = []
+
+            def exchange(self, *_args):
+                if self.error:
+                    raise self.error
+                return ("parsed", "")
+
+            def close(self, *, terminate):
+                self.closed.append(terminate)
+                if self.close_error:
+                    raise self.close_error
+
+        pool = object.__new__(helper._AsmSessionPool)
+        pool._condition = threading.Condition()
+        pool._idle = helper.queue.LifoQueue()
+        pool._session_count = 0
+        pool.max_sessions = 1
+        pool._closed = False
+        created = FakeSession()
+        pool._new_session = lambda: created
+        self.assertIs(pool._acquire(time.perf_counter() + 1), created)
+        pool._idle.put(created)
+        self.assertIs(pool._acquire(time.perf_counter() + 1), created)
+        pool._closed = True
+        with self.assertRaises(helper._AsmSessionError):
+            pool._acquire(time.perf_counter() + 1)
+        pool._closed = False
+        pool._session_count = 1
+        with self.assertRaises(helper._AsmSessionError):
+            pool._acquire(time.perf_counter() - 1)
+
+        class ReleasingCondition:
+            def __init__(self, owner, released):
+                self.owner = owner
+                self.released = released
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def wait(self, *, timeout):
+                self.owner._idle.put(self.released)
+
+            def notify(self):
+                pass
+
+        waiting_pool = object.__new__(helper._AsmSessionPool)
+        waiting_pool._idle = helper.queue.LifoQueue()
+        waiting_pool._session_count = 1
+        waiting_pool.max_sessions = 1
+        waiting_pool._closed = False
+        released = FakeSession()
+        waiting_pool._condition = ReleasingCondition(waiting_pool, released)
+        self.assertIs(
+            waiting_pool._acquire(time.perf_counter() + 1), released
+        )
+
+        run_pool = object.__new__(helper._AsmSessionPool)
+        run_pool._condition = threading.Condition()
+        run_pool._idle = helper.queue.LifoQueue()
+        run_pool._session_count = 1
+        run_pool._closed = False
+        reusable = FakeSession(alive=True)
+        run_pool._acquire = lambda _deadline: reusable
+        self.assertEqual(
+            run_pool.run(Path("request"), lambda _stream: None, 1),
+            ("parsed", ""),
+        )
+        self.assertIs(run_pool._idle.get_nowait(), reusable)
+        run_pool._closed = True
+        closed_reusable = FakeSession(alive=True)
+        run_pool._acquire = lambda _deadline: closed_reusable
+        run_pool._session_count = 1
+        run_pool.run(Path("request"), lambda _stream: None, 1)
+        self.assertEqual(closed_reusable.closed, [True])
+        run_pool._closed = False
+        failed = FakeSession(alive=False, error=helper._AsmSessionError("expected"))
+        run_pool._acquire = lambda _deadline: failed
+        run_pool._session_count = 1
+        with self.assertRaises(helper._AsmSessionError):
+            run_pool.run(Path("request"), lambda _stream: None, 1)
+        self.assertEqual(failed.closed, [True])
+
+        elapsed = FakeSession()
+        run_pool._acquire = lambda _deadline: elapsed
+        run_pool._session_count = 1
+        with patch.object(
+            helper.time, "perf_counter", side_effect=[0.0, 2.0]
+        ), self.assertRaises(helper._AsmSessionError):
+            run_pool.run(Path("request"), lambda _stream: None, 1)
+        self.assertEqual(elapsed.closed, [True])
+
+        already_closed = object.__new__(helper._AsmSessionPool)
+        already_closed._condition = threading.Condition()
+        already_closed._idle = helper.queue.LifoQueue()
+        already_closed._session_count = 0
+        already_closed._closed = True
+        already_closed.close()
+        close_failure = object.__new__(helper._AsmSessionPool)
+        close_failure._condition = threading.Condition()
+        close_failure._idle = helper.queue.LifoQueue()
+        close_failure._idle.put(
+            FakeSession(close_error=RuntimeError("close"))
+        )
+        close_failure._session_count = 1
+        close_failure._closed = False
+        with self.assertRaisesRegex(RuntimeError, "close"):
+            close_failure.close()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            asm = root / "asm.jar"
+            asm.write_bytes(b"asm")
+            compiled = helper._CompiledAsmHelper(root, "java", None)
+            calls = []
+
+            class RegistryPool:
+                def __init__(self, *_args):
+                    calls.append("created")
+
+                def run(self, *_args):
+                    calls.append("run")
+                    return ("parsed", "")
+
+                def close(self):
+                    calls.append("closed")
+
+            helper._ASM_SESSION_POOLS.clear()
+            arguments = dict(
+                protocol_input=root / "request",
+                compiled_helper=compiled,
+                asm_path=asm,
+                identity="identity",
+                helper_sha="a" * 64,
+                max_heap_megabytes=256,
+                max_sessions=1,
+                timeout_seconds=1,
+                response_reader=lambda _stream: None,
+            )
+            with patch.object(helper, "_AsmSessionPool", RegistryPool):
+                self.assertEqual(
+                    helper._run_persistent_helper(**arguments),
+                    ("parsed", ""),
+                )
+                self.assertEqual(
+                    helper._run_persistent_helper(**arguments),
+                    ("parsed", ""),
+                )
+            self.assertEqual(calls.count("created"), 1)
+            helper.close_persistent_asm_sessions()
+            helper.close_persistent_asm_sessions()
+            self.assertIn("closed", calls)
+
+            with patch.object(
+                helper, "_persistent_pool_key",
+                side_effect=helper._AsmSessionError("expected"),
+            ):
+                self.assertIsNone(helper._run_persistent_helper(**arguments))
+
+        helper._ASM_SESSION_POOLS = {("old",): object()}
+        old_lock = helper._ASM_SESSION_POOLS_LOCK
+        helper._forget_persistent_asm_sessions_after_fork()
+        self.assertEqual(helper._ASM_SESSION_POOLS, {})
+        self.assertIsNot(helper._ASM_SESSION_POOLS_LOCK, old_lock)
+
     def test_unsupported_major_is_scoped_failure_not_silent_fallback(self):
         payload = bytearray(self.class_file.read_bytes())
         payload[6:8] = (helper.MAX_SUPPORTED_CLASS_MAJOR + 1).to_bytes(2, "big")
@@ -1294,6 +1856,285 @@ print(json.dumps([
         with self.assertRaises(helper.BinaryAsmError) as error:
             helper.resolve_asm_jar(wrong)
         self.assertEqual(error.exception.reason_code, "ASM_PINNED_JAR_SHA256_MISMATCH")
+
+    def _compiled_binding_fixture(self):
+        root = Path(self.temp.name) / f"binding-{len(list(Path(self.temp.name).iterdir()))}"
+        root.mkdir()
+        asm = (root / "asm.jar").resolve()
+        java = (root / "java").resolve()
+        javac = (root / "javac").resolve()
+        source = (root / "BinaryFactExtractor.java").resolve()
+        output = (root / "compiled").resolve()
+        output.mkdir()
+        asm.write_bytes(b"asm")
+        java.write_bytes(b"java")
+        javac.write_bytes(b"javac")
+        source.write_bytes(b"final class BinaryFactExtractor {}")
+        (output / "A.class").write_bytes(b"prefix")
+        (output / "BinaryFactExtractor.class").write_bytes(b"main")
+        nested = output / "nested"
+        nested.mkdir()
+        (nested / "Helper.class").write_bytes(b"nested")
+        with patch.object(helper, "JAVA_HELPER", source):
+            manifest = helper._compiled_helper_manifest(output)
+        binding = helper.CompiledAsmHelperBinding(
+            asm_path=asm,
+            helper_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+            javac_path=str(javac),
+            java_path=str(java),
+            output_path=output,
+            class_files=manifest,
+        )
+        return root, asm, java, javac, source, output, binding
+
+    def test_compiled_helper_manifest_and_mapping_are_exact(self):
+        root, _asm, _java, _javac, source, output, binding = (
+            self._compiled_binding_fixture()
+        )
+        root = root.resolve()
+        with patch.object(helper, "JAVA_HELPER", source):
+            manifest = helper._compiled_helper_manifest(output)
+        self.assertEqual(manifest, binding.class_files)
+        mapping = binding.to_mapping()
+        self.assertEqual(
+            helper.compiled_asm_helper_binding_from_mapping(mapping), binding
+        )
+
+        invalid_mappings = [None, {**mapping, "extra": True}]
+        no_files = dict(mapping)
+        no_files["class_files"] = None
+        invalid_mappings.append(no_files)
+        for item in (
+            None,
+            ["Only", 1],
+            [1, 1, "a" * 64],
+            ["Only.class", "1", "a" * 64],
+            ["Only.class", 1, 1],
+        ):
+            changed = dict(mapping)
+            changed["class_files"] = [item]
+            invalid_mappings.append(changed)
+        for index, value in enumerate(invalid_mappings):
+            with self.subTest(mapping=index), self.assertRaises(
+                helper.BinaryAsmError
+            ):
+                helper.compiled_asm_helper_binding_from_mapping(value)
+
+        missing = root / "missing"
+        empty = root / "empty"
+        empty.mkdir()
+        no_main = root / "no-main"
+        no_main.mkdir()
+        (no_main / "Other.class").write_bytes(b"other")
+        unexpected = root / "unexpected"
+        unexpected.mkdir()
+        (unexpected / "note.txt").write_text("not bytecode", encoding="utf-8")
+        regular_file_root = root / "regular-file-root"
+        regular_file_root.write_bytes(b"not a directory")
+        fifo_root = root / "fifo-root"
+        fifo_root.mkdir()
+        if hasattr(os, "mkfifo"):
+            os.mkfifo(fifo_root / "entry.class")
+        linked_root = root / "linked-root"
+        linked_root.symlink_to(output, target_is_directory=True)
+        linked_entry = root / "linked-entry"
+        linked_entry.mkdir()
+        (linked_entry / "Alias.class").symlink_to(
+            output / "BinaryFactExtractor.class"
+        )
+        for value in (
+            Path("relative"), missing, empty, no_main, unexpected,
+            regular_file_root, linked_root, linked_entry,
+            *((fifo_root,) if hasattr(os, "mkfifo") else ()),
+        ):
+            with self.subTest(manifest=str(value)), self.assertRaises(
+                helper.BinaryAsmError
+            ):
+                helper._compiled_helper_manifest(value)
+
+    def test_extract_installed_binding_operand_and_timeout_matrix(self):
+        valid = self._valid_fact_record()
+        asm = Path(self.temp.name) / "fake-protocol-asm.jar"
+        javac = Path(shutil.which("javac")).resolve()
+        java = Path(shutil.which("java")).resolve()
+        compiled = SimpleNamespace(
+            output=Path(self.temp.name) / "fake-protocol-classes",
+            java="java",
+        )
+
+        def binding(**changes):
+            values = {
+                "asm_path": asm,
+                "helper_sha256": "helper-sha",
+                "javac_path": str(javac),
+                "java_path": str(java),
+            }
+            values.update(changes)
+            return SimpleNamespace(**values)
+
+        installed_cases = (
+            binding(asm_path=asm.parent / "other.jar"),
+            binding(helper_sha256="different"),
+            binding(javac_path="different"),
+            binding(java_path="different"),
+            binding(),
+        )
+        for index, installed_binding in enumerate(installed_cases):
+            with self.subTest(installed=index), patch.object(
+                helper,
+                "_INSTALLED_COMPILED_ASM_HELPER",
+                (installed_binding, compiled),
+            ):
+                run = self._run_fake_protocol([valid])
+            self.assertEqual(run.fact_record_count, 1)
+
+        for index, (tools, installed_binding) in enumerate((
+            (
+                {"javac": None, "java": str(java)},
+                binding(javac_path=""),
+            ),
+            (
+                {"javac": str(javac), "java": None},
+                binding(java_path=""),
+            ),
+        )):
+            with self.subTest(tool_case=index), patch.object(
+                helper.shutil, "which", side_effect=tools.get
+            ), patch.object(
+                helper,
+                "_INSTALLED_COMPILED_ASM_HELPER",
+                (installed_binding, compiled),
+            ):
+                run = self._run_fake_protocol([valid])
+            self.assertEqual(run.fact_record_count, 1)
+
+        consumed = []
+        with patch.object(
+            helper, "_run_persistent_helper",
+            side_effect=AssertionError("consumer must retain one-shot transport"),
+        ):
+            run = self._run_fake_protocol(
+                [valid],
+                record_consumer=consumed.append,
+                retain_records=False,
+                extract_options={"persistent_session": True},
+            )
+        self.assertEqual(run.fact_record_count, 1)
+        self.assertEqual(consumed, [valid])
+
+        with patch.object(
+            helper, "_run_persistent_helper", return_value=None
+        ), patch.object(
+            helper.time, "perf_counter", side_effect=[0.0, 2.0]
+        ), self.assertRaises(helper.BinaryAsmError) as timed_out:
+            self._run_fake_protocol(
+                [valid],
+                extract_options={
+                    "persistent_session": True,
+                    "timeout_seconds": 1,
+                },
+            )
+        self.assertEqual(timed_out.exception.reason_code, "ASM_HELPER_TIMEOUT")
+
+    def test_compiled_binding_reuse_rejects_every_byte_and_path_change(self):
+        _root, asm, _java, _javac, source, output, binding = (
+            self._compiled_binding_fixture()
+        )
+        helper._INSTALLED_COMPILED_ASM_HELPER = None
+        self.addCleanup(setattr, helper, "_INSTALLED_COMPILED_ASM_HELPER", None)
+        with patch.object(helper, "JAVA_HELPER", source), patch.object(
+            helper, "resolve_asm_jar", return_value=asm
+        ):
+            compiled = helper._compiled_helper_from_binding(binding)
+            self.assertEqual(compiled.output, output)
+            self.assertIsNone(compiled._temporary_directory)
+            helper.install_compiled_asm_helper_binding(binding)
+            helper.verify_compiled_asm_helper_binding(binding)
+        self.assertEqual(helper._INSTALLED_COMPILED_ASM_HELPER[0], binding)
+
+        invalid = [
+            object(),
+            replace(binding, helper_sha256="bad"),
+            replace(binding, helper_sha256="g" * 64),
+            replace(
+                binding,
+                class_files=(("BinaryFactExtractor.class", 4, "bad"),),
+            ),
+            replace(binding, output_path=Path("relative")),
+            replace(binding, java_path=str(output / "missing-java")),
+            replace(binding, javac_path=str(output / "missing-javac")),
+        ]
+        for index, value in enumerate(invalid):
+            with self.subTest(invalid=index), patch.object(
+                helper, "JAVA_HELPER", source
+            ), patch.object(
+                helper, "resolve_asm_jar", return_value=asm
+            ), self.assertRaises(helper.BinaryAsmError):
+                helper._compiled_helper_from_binding(value)
+
+        with patch.object(helper, "JAVA_HELPER", source), patch.object(
+            helper, "resolve_asm_jar", return_value=output / "different.jar"
+        ), self.assertRaises(helper.BinaryAsmError):
+            helper._compiled_helper_from_binding(binding)
+        with patch.object(helper, "JAVA_HELPER", source), patch.object(
+            helper, "resolve_asm_jar", return_value=asm
+        ), patch.object(
+            helper, "_sha256_file", return_value="0" * 64
+        ), self.assertRaises(helper.BinaryAsmError):
+            helper._compiled_helper_from_binding(binding)
+        with patch.object(helper, "JAVA_HELPER", source), patch.object(
+            helper, "resolve_asm_jar", return_value=asm
+        ), patch.object(
+            helper, "_compiled_helper_manifest", return_value=()
+        ), self.assertRaises(helper.BinaryAsmError):
+            helper._compiled_helper_from_binding(binding)
+
+    def test_compiled_binding_capture_supports_both_toolchain_sources(self):
+        _root, asm, java, javac, source, output, binding = (
+            self._compiled_binding_fixture()
+        )
+        compiled = helper._CompiledAsmHelper(output, str(java), None)
+        with patch.object(helper, "JAVA_HELPER", source), patch.object(
+            helper, "resolve_asm_jar", return_value=asm
+        ), patch.object(
+            helper, "parser_identity", return_value=("identity", binding.helper_sha256)
+        ), patch.object(
+            helper, "jdk_tool_path", side_effect=lambda _home, name: java if name == "java" else javac
+        ), patch.object(
+            helper, "_compile_helper", return_value=compiled
+        ):
+            captured = helper.capture_compiled_asm_helper_binding(
+                asm_jar=asm, jdk_home=Path("/jdk")
+            )
+        self.assertEqual(captured, binding)
+
+        parser_binding = object()
+        with patch.object(helper, "JAVA_HELPER", source), patch.object(
+            helper,
+            "parser_identity_from_binding",
+            return_value=(asm, "identity", binding.helper_sha256),
+        ), patch.object(
+            helper.shutil,
+            "which",
+            side_effect=lambda name: str(javac if name == "javac" else java),
+        ), patch.object(helper, "_compile_helper", return_value=compiled):
+            captured = helper.capture_compiled_asm_helper_binding(
+                asm_jar=asm, parser_identity_binding=parser_binding
+            )
+        self.assertEqual(captured, binding)
+
+        for tools in (
+            {"javac": None, "java": str(java)},
+            {"javac": str(javac), "java": None},
+        ):
+            with self.subTest(tools=tools), patch.object(
+                helper, "resolve_asm_jar", return_value=asm
+            ), patch.object(
+                helper, "parser_identity", return_value=("identity", "a" * 64)
+            ), patch.object(
+                helper.shutil, "which", side_effect=tools.get
+            ), self.assertRaises(helper.BinaryAsmError):
+                helper.capture_compiled_asm_helper_binding(asm_jar=asm)
 
 
 if __name__ == "__main__":

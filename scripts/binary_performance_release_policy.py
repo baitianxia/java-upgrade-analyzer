@@ -175,12 +175,12 @@ def _policy_payload() -> dict[str, Any]:
             # combines them with the live source identity and the source-bound
             # reference JDK identity to derive the complete runtime identity.
             "pipeline_generation_implementation_identity": (
-                "a9b3bdb907b237e9928b8436b021f0fa0e013ac073779226a76347"
-                "fec11fa03b"
+                "194c8b7c9a3363bf230c65a4fa8bea60fc9d46369fca5226112dbdc4"
+                "61ac30ba"
             ),
             "validator_implementation_identity": (
-                "0c61b9c848d9b4275ee14afbe1b9d30814d8c7e8c2dc062c435ba"
-                "ef23d52b8da"
+                "ac3fade2b88926b4c290cbf6bfddc8676e25de7797abc029e203fc711"
+                "73be485"
             ),
         },
         "thresholds": {
@@ -200,7 +200,10 @@ def _policy_payload() -> dict[str, Any]:
                 "independent_validation": 140.0,
                 "validated_generation_activation": 1.5,
             },
-            "changed_full_pipeline_end_to_end_seconds": 500.0,
+            # dd25c1f's independently recaptured changed 400-JAR pipeline was
+            # 266.6166238752194s.  The optimization is releasable only when
+            # the same source-bound workload is at least 50% faster.
+            "changed_full_pipeline_end_to_end_seconds": 133.308,
             "changed_full_pipeline_peak_rss_bytes": 3 * 1024 * 1024 * 1024,
             "changed_full_pipeline_phase_seconds": {
                 "static_preflight": 2.0,

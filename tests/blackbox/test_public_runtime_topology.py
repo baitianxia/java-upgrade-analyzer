@@ -97,6 +97,11 @@ def reconciliation_rows(generation: Path, side_name: str) -> list[dict]:
         chunks = [dict(row) for row in connection.execute(
             "SELECT * FROM reconciliation_records ORDER BY record_kind,chunk_identity"
         )]
+        context_row = connection.execute(
+            "SELECT value FROM metadata "
+            "WHERE key='reconciliation_analysis_context_identity'"
+        ).fetchone()
+        analysis_context_identity = str(context_row[0]) if context_row else ""
     if not columns or not chunks:
         raise AssertionError("public reconciliation evidence is empty")
     kind_names = {
@@ -107,13 +112,70 @@ def reconciliation_rows(generation: Path, side_name: str) -> list[dict]:
     }
     rows = []
     for chunk in chunks:
-        envelopes = json.loads(zlib.decompress(chunk["payload_zlib"]).decode("utf-8"))
+        decoded = json.loads(zlib.decompress(
+            chunk["payload_zlib"]
+        ).decode("utf-8"))
+        if isinstance(decoded, dict):
+            if decoded.get("format") == "binary-reconciliation-columnar-payload-v1":
+                shapes = decoded.get("shapes") or []
+                payloads = [
+                    dict(zip(shapes[item[0]], item[1:]))
+                    for item in decoded.get("records") or []
+                ]
+            else:
+                payloads = decoded["records"]
+            metadata_document = json.loads(zlib.decompress(
+                chunk["metadata_zlib"]
+            ).decode("utf-8"))
+            if (
+                metadata_document.get("format")
+                == "binary-reconciliation-payload-field-metadata-v1"
+            ):
+                status_field = metadata_document["status_field"]
+                subject_field = metadata_document["subject_field"]
+                metadata = [
+                    (payload[status_field], payload[subject_field])
+                    for payload in payloads
+                ]
+            else:
+                metadata = metadata_document["records"]
+            envelopes = [
+                {
+                    "status": status,
+                    "subject_identity": subject_identity,
+                    "payload": payload_value,
+                }
+                for payload_value, (status, subject_identity)
+                in zip(payloads, metadata)
+            ]
+        else:
+            envelopes = decoded
         if len(envelopes) != chunk["record_count"]:
             raise AssertionError("reconciliation chunk count mismatch")
         for envelope in envelopes:
+            kind = kind_names[chunk["record_kind"]]
+            record_identity = envelope.get("record_identity")
+            if not record_identity:
+                identity_envelope = {
+                    "namespace": f"{kind}_record_identity",
+                    "payload": {
+                        "analysis_context_identity": analysis_context_identity,
+                        "payload": envelope["payload"],
+                        "status": envelope["status"],
+                        "subject_identity": envelope["subject_identity"],
+                    },
+                    "schema_version": "1",
+                }
+                record_identity = hashlib.sha256(json.dumps(
+                    identity_envelope,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")).hexdigest()
             rows.append({
-                "record_kind": kind_names[chunk["record_kind"]],
-                "record_identity": envelope["record_identity"],
+                "record_kind": kind,
+                "record_identity": record_identity,
                 "status": envelope["status"],
                 "subject_identity": envelope["subject_identity"],
                 "payload_json": json.dumps(envelope["payload"]),

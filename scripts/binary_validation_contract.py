@@ -38,6 +38,8 @@ VALIDATOR_IMPLEMENTATION_SOURCE_PATHS = (
     "final_artifact_edge_oracle.py",
     "jdk_preflight.py",
     "javap_contract.py",
+    "javap_session.py",
+    "java/JavapSession.java",
     "java/RuntimeOutcomeOracle.java",
     "path_runtime.py",
     "streaming_json.py",

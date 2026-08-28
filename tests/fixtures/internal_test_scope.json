@@ -19,6 +19,7 @@
     }
   ],
   "analysis_entry_modules": [
+    "binary_reconciliation_worker",
     "binary_pipeline",
     "binary_report",
     "gate",
@@ -47,6 +48,7 @@
     "binary_performance_release_policy",
     "binary_pipeline",
     "binary_platform_image",
+    "binary_reconciliation_worker",
     "binary_report",
     "binary_runtime_materializer",
     "binary_runtime_reconciler",
@@ -67,6 +69,7 @@
     "gate",
     "javap_contract",
     "jdk_preflight",
+    "javap_session",
     "path_runtime",
     "pipeline_constants",
     "process_lock",

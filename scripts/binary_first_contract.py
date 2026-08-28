@@ -14,7 +14,7 @@ import json
 import re
 from collections.abc import Mapping
 from functools import lru_cache
-from json.encoder import encode_basestring
+from json.encoder import c_make_encoder, encode_basestring
 
 
 PHASE_ORDER = (
@@ -43,6 +43,24 @@ _CANONICAL_JSON_ENCODER = json.JSONEncoder(
     sort_keys=True,
     separators=(",", ":"),
     allow_nan=False,
+)
+# Native hot-path identities are created exclusively from acyclic built-in
+# JSON trees. Reuse CPython's stateless C encoder instead of rebuilding the
+# same encoder closure for every provider/edge/reconciliation identity. The
+# public canonical API retains circular-reference and container normalization.
+_NATIVE_JSON_C_ENCODER = (
+    c_make_encoder(
+        None,
+        _CANONICAL_JSON_ENCODER.default,
+        encode_basestring,
+        None,
+        ":",
+        ",",
+        True,
+        False,
+        False,
+    )
+    if c_make_encoder is not None else None
 )
 _STREAMING_DIGEST_BUFFER_CHARS = 64 * 1024
 JVM_TEXT_TRANSPORT_PREFIX = "~jua-utf16-v1~"
@@ -363,7 +381,12 @@ def canonical_identity_native_json(namespace, payload, *, schema_version):
         )
     prefix, suffix = _native_identity_envelope_bytes(namespace, schema_version)
     digest = hashlib.sha256(prefix)
-    digest.update(_surrogate_safe_utf8(_CANONICAL_JSON_ENCODER.encode(payload)))
+    encoded = (
+        "".join(_NATIVE_JSON_C_ENCODER(payload, 0))
+        if _NATIVE_JSON_C_ENCODER is not None
+        else _CANONICAL_JSON_ENCODER.encode(payload)
+    )
+    digest.update(_surrogate_safe_utf8(encoded))
     digest.update(suffix)
     return digest.hexdigest()
 

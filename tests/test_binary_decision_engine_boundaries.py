@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sqlite3
 from types import SimpleNamespace
@@ -23,9 +24,11 @@ def runtime(
     resources=(),
     coverage_status="complete",
     coverage_gaps=(),
+    runtime_profile_identity="profile",
 ):
     return SimpleNamespace(
         identity=identity,
+        runtime_profile_identity=runtime_profile_identity,
         provider_bindings=tuple(providers),
         class_definitions=tuple(definitions),
         member_resolutions=tuple(members),
@@ -66,6 +69,7 @@ def definition(
     *,
     realm="application-loader",
     status="definition_ready",
+    load_status="ready",
     identity="definition",
     evidence=None,
 ):
@@ -73,12 +77,32 @@ def definition(
         "initiating_loader_realm_identity": realm,
         "class_name": class_name,
         "class_definition_status": status,
+        "class_load_status": load_status,
         "class_definition_resolution_identity": identity,
         "evidence": evidence or {},
     }
 
 
 class DecisionEngineBoundaryTest(unittest.TestCase):
+    def test_empty_artifact_diffs_do_not_resolve_unused_dependency_rows(self):
+        decision_engine = self.engine(diffs=({
+            "base_artifact_instance_identity": "base-artifact",
+            "current_artifact_instance_identity": "current-artifact",
+            "logical_dependency_lineage": "unchanged",
+            "entry_deltas": [],
+        },))
+        decision_engine._dependency_artifacts = lambda *_args, **_kwargs: (
+            (_ for _ in ()).throw(
+                AssertionError("empty diff resolved dependency rows")
+            )
+        )
+
+        decision_engine._process_artifact_diffs()
+
+        self.assertEqual(decision_engine.authoritative, [])
+        self.assertEqual(decision_engine.diagnostic, [])
+        self.assertEqual(decision_engine.excluded, [])
+
     def setUp(self):
         self.base_store = BinaryFactStore()
         self.current_store = BinaryFactStore()
@@ -198,6 +222,7 @@ class DecisionEngineBoundaryTest(unittest.TestCase):
             "super_name": "java/lang/Object",
             "interfaces": [],
         }
+        fact_zlib = zlib.compress(json.dumps(fact).encode("utf-8"))
         if store.connection.execute(
             "SELECT 1 FROM classes WHERE class_variant_identity=?", (variant,),
         ).fetchone() is None:
@@ -210,15 +235,15 @@ class DecisionEngineBoundaryTest(unittest.TestCase):
                     class_contract_digest,parse_status,failure_kind,
                     class_access,super_name,interfaces_json,nest_host,
                     nest_members_json,has_runtime_annotations,
-                    class_bytes_zlib,fact_zlib
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    class_bytes_zlib,fact_zlib,fact_zlib_sha256
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     variant, artifact, entry, f"{class_name}.class#occurrence=0",
                     class_name, 61, 0, "class-sha", "contract", "parsed", "",
                     1, fact.get("super_name"), json.dumps(fact.get("interfaces", [])),
                     None, "[]", 0, zlib.compress(b"class"),
-                    zlib.compress(json.dumps(fact).encode("utf-8")),
+                    fact_zlib, hashlib.sha256(fact_zlib).hexdigest(),
                 ),
             )
         if store.connection.execute(
@@ -2070,7 +2095,9 @@ class DecisionEngineBoundaryTest(unittest.TestCase):
         calls = []
         changed._process_artifact_diffs = lambda: calls.append("artifact")
         changed._process_member_resolution_deltas = lambda: calls.append("member")
-        changed._process_runtime_outcome_deltas = lambda: calls.append("runtime")
+        changed._process_runtime_outcome_deltas = (
+            lambda *_args: calls.append("runtime")
+        )
         changed_bundle = changed.build()
         self.assertEqual(calls, ["artifact", "member", "runtime"])
         self.assertEqual(changed_bundle.coverage_status, "complete")
@@ -2086,6 +2113,274 @@ class DecisionEngineBoundaryTest(unittest.TestCase):
         diagnostic_bundle = diagnostic.build()
         self.assertEqual(diagnostic_bundle.coverage_status, "partial")
         self.assertEqual(diagnostic_bundle.coverage_gaps, ())
+
+    def test_member_edge_merge_skips_only_with_complete_semantic_model_proof(self):
+        self.add_class_edge(
+            self.base_store,
+            artifact="base-artifact",
+            variant="base-variant",
+            class_name="demo/Caller",
+            member="base-member",
+            edge="base-edge",
+        )
+        self.add_class_edge(
+            self.current_store,
+            artifact="current-artifact",
+            variant="current-variant",
+            class_name="demo/Caller",
+            member="current-member",
+            edge="current-edge",
+        )
+        base_runtime = runtime(
+            "base-runtime",
+            providers=(provider(
+                class_name="demo/Caller",
+                artifact="base-artifact",
+                variant="base-variant",
+                identity="base-provider",
+            ),),
+            definitions=(definition(class_name="demo/Caller"),),
+        )
+        current_runtime = runtime(
+            "current-runtime",
+            providers=(provider(
+                class_name="demo/Caller",
+                artifact="current-artifact",
+                variant="current-variant",
+                identity="current-provider",
+            ),),
+            definitions=(definition(class_name="demo/Caller"),),
+        )
+        preserving_entry = {
+            "entry_scope": {
+                "entry_kind": "class",
+                "entry_name": "demo/Caller.class",
+            },
+            "runtime_effective_analysis": True,
+            "class_change_category": "implementation_changed",
+        }
+        complete_diff = {
+            "base_artifact_instance_identity": "base-artifact",
+            "current_artifact_instance_identity": "current-artifact",
+            "logical_dependency_lineage": "dependency:caller",
+            "class_comparison_coverage_status": "complete",
+            "entry_deltas": [preserving_entry],
+        }
+        decision_engine = self.engine(
+            base_runtime=base_runtime,
+            current_runtime=current_runtime,
+            diffs=(complete_diff,),
+        )
+        keys, model_equal = decision_engine._runtime_class_delta_plan()
+        self.assertEqual(keys, ())
+        self.assertTrue(model_equal)
+        decision_engine._process_artifact_diffs = lambda: None
+        decision_engine._process_member_resolution_deltas = lambda: self.fail(
+            "full member-edge merge must be omitted after an exact model proof"
+        )
+        decision_engine.build()
+        self.assertEqual(
+            decision_engine._paired_semantic_member_outcome_deltas_cache, ()
+        )
+
+        for label, changed_diff, changed_runtime in (
+            (
+                "contract change",
+                {
+                    **complete_diff,
+                    "entry_deltas": [{
+                        **preserving_entry,
+                        "class_change_category": "contract_changed",
+                    }],
+                },
+                current_runtime,
+            ),
+            (
+                "incomplete comparison",
+                {
+                    **complete_diff,
+                    "class_comparison_coverage_status": "partial",
+                },
+                current_runtime,
+            ),
+            (
+                "class load outcome change",
+                complete_diff,
+                runtime(
+                    "current-runtime-load-failed",
+                    providers=current_runtime.provider_bindings,
+                    definitions=(definition(
+                        class_name="demo/Caller",
+                        load_status="failed",
+                    ),),
+                ),
+            ),
+        ):
+            with self.subTest(label=label):
+                fallback = self.engine(
+                    base_runtime=base_runtime,
+                    current_runtime=changed_runtime,
+                    diffs=(changed_diff,),
+                )
+                _keys, equal = fallback._runtime_class_delta_plan()
+                self.assertFalse(equal)
+
+    def test_contract_equality_proof_rejects_every_incomplete_lineage_shape(self):
+        complete_entry = {
+            "entry_scope": {
+                "entry_kind": "class",
+                "entry_name": "demo/Api.class",
+            },
+            "runtime_effective_analysis": True,
+            "class_change_category": "implementation_changed",
+        }
+        complete = {
+            "base_artifact_instance_identity": "base-artifact",
+            "current_artifact_instance_identity": "current-artifact",
+            "logical_dependency_lineage": "dependency:api",
+            "class_comparison_coverage_status": "complete",
+            "entry_deltas": (complete_entry,),
+        }
+        self.add_artifact(self.base_store, "base-artifact")
+        self.add_artifact(self.current_store, "current-artifact")
+
+        def proven(diff):
+            decision_engine = self.engine(diffs=(complete,))
+            decision_engine.artifact_diffs = tuple(diff)
+            return decision_engine._artifact_class_contracts_proven_equal()
+
+        self.assertTrue(proven((complete,)))
+        rejected = (
+            {**complete, "base_artifact_instance_identity": ""},
+            {**complete, "current_artifact_instance_identity": ""},
+            {**complete, "logical_dependency_lineage": " "},
+            {**complete, "base_artifact_instance_identity": "ABSENT:base"},
+            {**complete, "current_artifact_instance_identity": "ABSENT:current"},
+            {**complete, "class_comparison_coverage_status": None,
+             "comparison_coverage_status": "partial"},
+            {**complete, "entry_deltas": ({
+                **complete_entry, "class_change_category": "unknown",
+            },)},
+        )
+        for index, diff in enumerate(rejected):
+            with self.subTest(index=index):
+                self.assertFalse(proven((diff,)))
+
+        tolerated = (
+            {**complete, "entry_deltas": ({"entry_scope": None},)},
+            {**complete, "entry_deltas": ({
+                **complete_entry, "entry_scope": {"entry_kind": "resource"},
+            },)},
+            {**complete, "entry_deltas": ({
+                **complete_entry, "runtime_effective_analysis": False,
+                "class_change_category": "contract_changed",
+            },)},
+        )
+        for index, diff in enumerate(tolerated):
+            with self.subTest(tolerated=index):
+                self.assertTrue(proven((diff,)))
+
+        duplicate_variants = (
+            {
+                **complete,
+                "current_artifact_instance_identity": "current-other",
+                "logical_dependency_lineage": "dependency:other",
+            },
+            {
+                **complete,
+                "base_artifact_instance_identity": "base-other",
+                "logical_dependency_lineage": "dependency:other",
+            },
+            {
+                **complete,
+                "base_artifact_instance_identity": "base-other",
+                "current_artifact_instance_identity": "current-other",
+            },
+        )
+        for duplicate in duplicate_variants:
+            with self.subTest(duplicate=duplicate):
+                self.assertFalse(proven((complete, duplicate)))
+
+        self.add_artifact(self.base_store, "base-extra")
+        mismatched_store = self.engine(diffs=(complete,))
+        self.assertFalse(
+            mismatched_store._artifact_class_contracts_proven_equal()
+        )
+
+    def test_runtime_delta_and_changed_class_frontier_empty_value_boundaries(self):
+        decision_engine = self.engine(diffs=({
+            "base_artifact_instance_identity": "base-artifact",
+            "current_artifact_instance_identity": "current-artifact",
+            "logical_dependency_lineage": "dependency:api",
+            "entry_deltas": (
+                {"entry_scope": None},
+                {
+                    "entry_scope": {"entry_kind": "class", "entry_name": None},
+                    "runtime_effective_analysis": True,
+                },
+            ),
+        },))
+        self.assertIn("", decision_engine._provider_realms_by_changed_class)
+
+        key = ("application-loader", "demo/Api")
+        decision_engine._base_providers = {key: provider()}
+        decision_engine._current_providers = {key: provider()}
+        decision_engine._base_definitions = {}
+        decision_engine._current_definitions = {}
+        decision_engine._artifact_class_contracts_proven_equal = lambda: True
+        keys, equal = decision_engine._runtime_class_delta_plan()
+        self.assertEqual(keys, ())
+        self.assertTrue(equal)
+
+        decision_engine._base_definitions = {key: {
+            "class_definition_status": "definition_ready",
+        }}
+        decision_engine._current_definitions = {key: {
+            "class_definition_status": "failed",
+        }}
+        keys, equal = decision_engine._runtime_class_delta_plan()
+        self.assertEqual(keys, (key,))
+        self.assertFalse(equal)
+
+    def test_build_fails_closed_for_unknown_blank_and_unowned_obligations(self):
+        def prepared():
+            decision_engine = self.engine()
+            decision_engine._process_artifact_diffs = lambda: None
+            record = decision_engine._decision(
+                observed_identity="observed",
+                channel="authoritative",
+                reason_code="CHANGE",
+                fact_kind="class",
+                fact_scope={},
+            )
+            return decision_engine, record
+
+        unknown, _record = prepared()
+        unknown._obligation_origins.clear()
+        with self.assertRaises(BinaryFirstContractError) as raised:
+            unknown.build()
+        self.assertEqual(
+            raised.exception.reason_code,
+            "DISPOSITION_OBLIGATION_CONSERVATION_FAILED",
+        )
+
+        for blank in (None, ""):
+            decision_engine, record = prepared()
+            record["decision_identity"] = blank
+            with self.subTest(blank=blank), self.assertRaises(
+                BinaryFirstContractError
+            ) as raised:
+                decision_engine.build()
+            self.assertEqual(raised.exception.reason_code, "DECISION_IDENTITY_INVALID")
+
+        unowned, _record = prepared()
+        unowned._obligation_origins["unowned"] = {"channel": "authoritative"}
+        with self.assertRaises(BinaryFirstContractError) as raised:
+            unowned.build()
+        self.assertEqual(
+            raised.exception.reason_code,
+            "DISPOSITION_OBLIGATION_CONSERVATION_FAILED",
+        )
 
     def test_build_conservation_does_not_reconstruct_decision_payloads(self):
         decision_engine = self.engine()

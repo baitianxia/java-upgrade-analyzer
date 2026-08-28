@@ -626,6 +626,371 @@ class BinaryFactStoreBoundaryTest(unittest.TestCase):
             with self.assertRaises(facts.BinaryFactStoreError):
                 list(store.reconciliation_payloads("provider_binding"))
 
+    def test_reconciliation_chunk_decoders_fail_closed_for_every_shape_boundary(self):
+        def compressed(value):
+            return zlib.compress(
+                json.dumps(value, separators=(",", ":")).encode("utf-8")
+            )
+
+        columnar = {
+            "format": facts._RECONCILIATION_PAYLOAD_FORMAT,
+            "records": [[0, 1]],
+            "shapes": [["value"]],
+        }
+        valid_payloads, legacy = facts._decode_reconciliation_payload_chunk(
+            compressed(columnar), 1, "valid-columnar"
+        )
+        self.assertEqual(valid_payloads, [{"value": 1}])
+        self.assertIsNone(legacy)
+
+        invalid_payloads = (
+            {**columnar, "extra": True},
+            {**columnar, "records": {}},
+            {**columnar, "shapes": {}},
+            {**columnar, "shapes": ["value"]},
+            {**columnar, "shapes": [[1]]},
+            {**columnar, "shapes": [["z", "a"]], "records": [[0, 1, 2]]},
+            {**columnar, "shapes": [["a"], ["a"]]},
+            {**columnar, "records": [{}]},
+            {**columnar, "records": [[]]},
+            {**columnar, "records": [[True, 1]]},
+            {**columnar, "records": [[-1, 1]]},
+            {**columnar, "records": [[1, 1]]},
+            {**columnar, "records": [[0]]},
+            {
+                "format": facts._RECONCILIATION_LEGACY_PAYLOAD_FORMAT,
+                "records": [],
+                "extra": True,
+            },
+            {
+                "format": facts._RECONCILIATION_LEGACY_PAYLOAD_FORMAT,
+                "records": {},
+            },
+            {"format": "unknown", "records": []},
+            7,
+            ["not-an-envelope"],
+            [{"record_identity": "id", "status": "ok", "subject_identity": "s"}],
+        )
+        for ordinal, value in enumerate(invalid_payloads):
+            with self.subTest(payload_case=ordinal):
+                with self.assertRaises(facts.BinaryFactStoreError) as caught:
+                    facts._decode_reconciliation_payload_chunk(
+                        compressed(value), 1, f"bad-payload-{ordinal}"
+                    )
+                self.assertEqual(
+                    caught.exception.reason_code,
+                    "FACT_STORE_RECONCILIATION_CHUNK_INVALID",
+                )
+
+        for ordinal, (value, count) in enumerate((
+            ({**columnar, "records": []}, 1),
+            ({
+                "format": facts._RECONCILIATION_LEGACY_PAYLOAD_FORMAT,
+                "records": [1],
+            }, 1),
+        )):
+            with self.subTest(payload_terminal_case=ordinal):
+                with self.assertRaises(facts.BinaryFactStoreError):
+                    facts._decode_reconciliation_payload_chunk(
+                        compressed(value), count, f"bad-terminal-{ordinal}"
+                    )
+        with self.assertRaises(facts.BinaryFactStoreError):
+            facts._decode_reconciliation_payload_chunk(
+                b"not-zlib", 0, "bad-zlib"
+            )
+
+        metadata = {
+            "format": facts._RECONCILIATION_METADATA_FORMAT,
+            "records": [["resolved", "subject"]],
+        }
+        self.assertEqual(
+            facts._decode_reconciliation_metadata_chunk(
+                compressed(metadata), 1, "valid-metadata", "provider_binding",
+                [{"value": 1}],
+            ),
+            [("resolved", "subject")],
+        )
+        invalid_metadata = (
+            [],
+            {**metadata, "extra": True},
+            {**metadata, "records": {}},
+            {**metadata, "records": []},
+            {**metadata, "records": ["bad"]},
+            {**metadata, "records": [["only-one"]]},
+            {**metadata, "records": [["resolved", 1]]},
+            {
+                "format": facts._RECONCILIATION_DERIVED_METADATA_FORMAT,
+                "status_field": "wrong",
+                "subject_field": "wrong",
+            },
+        )
+        for ordinal, value in enumerate(invalid_metadata):
+            with self.subTest(metadata_case=ordinal):
+                with self.assertRaises(facts.BinaryFactStoreError) as caught:
+                    facts._decode_reconciliation_metadata_chunk(
+                        compressed(value), 1, f"bad-metadata-{ordinal}",
+                        "provider_binding", [{"value": 1}],
+                    )
+                self.assertEqual(
+                    caught.exception.reason_code,
+                    "FACT_STORE_RECONCILIATION_METADATA_INVALID",
+                )
+
+        derived = {
+            "format": facts._RECONCILIATION_DERIVED_METADATA_FORMAT,
+            "status_field": "class_provider_status",
+            "subject_field": "provider_binding_identity",
+        }
+        self.assertEqual(
+            facts._decode_reconciliation_metadata_chunk(
+                compressed(derived), 1, "derived", "provider_binding", [{
+                    "class_provider_status": "resolved",
+                    "provider_binding_identity": "binding",
+                }],
+            ),
+            [("resolved", "binding")],
+        )
+        for ordinal, (payloads, count) in enumerate((
+            ([{"provider_binding_identity": "binding"}], 1),
+            ([{
+                "class_provider_status": 1,
+                "provider_binding_identity": "binding",
+            }], 1),
+            ([{
+                "class_provider_status": "resolved",
+                "provider_binding_identity": 1,
+            }], 1),
+            ([{
+                "class_provider_status": "resolved",
+                "provider_binding_identity": "binding",
+            }], 2),
+        )):
+            with self.subTest(derived_case=ordinal):
+                with self.assertRaises(facts.BinaryFactStoreError):
+                    facts._decode_reconciliation_metadata_chunk(
+                        compressed(derived), count, f"bad-derived-{ordinal}",
+                        "provider_binding", payloads,
+                    )
+
+    def test_runtime_reference_projection_and_reconciliation_small_api_matrix(self):
+        self.assertEqual(facts.BinaryFactStore._runtime_provider_owner(""), "")
+        self.assertEqual(
+            facts.BinaryFactStore._runtime_provider_owner("pkg/Owner"),
+            "pkg/Owner",
+        )
+        self.assertEqual(
+            facts.BinaryFactStore._runtime_provider_owner("[[Lpkg/Owner;"),
+            "pkg/Owner",
+        )
+        self.assertEqual(
+            facts.BinaryFactStore._runtime_provider_owner("[[I"), ""
+        )
+        self.assertEqual(
+            facts.BinaryFactStore._runtime_provider_owner("[[Lpkg/Open"), ""
+        )
+        self.assertEqual(facts.BinaryFactStore._descriptor_owner("Lpkg/Open"), "")
+
+        self.assertEqual(
+            facts.BinaryFactStore._runtime_class_references({}), set()
+        )
+        self.assertEqual(
+            facts.BinaryFactStore._runtime_class_references({
+                "symbolic_owner": "pkg/Owner", "payload": None,
+            }),
+            {("symbolic_owner", "pkg/Owner")},
+        )
+        expected = {
+            ("symbolic_owner", "pkg/Owner"),
+            ("loading_constraint_owner", "pkg/A"),
+            ("loading_constraint_owner", "pkg/B"),
+        }
+        self.assertEqual(
+            facts.BinaryFactStore._runtime_class_references({
+                "symbolic_owner": "[Lpkg/Owner;",
+                "payload": {
+                    facts.LOADING_CONSTRAINT_TYPE_OWNERS_KEY: ["pkg/A", "pkg/B"]
+                },
+            }),
+            expected,
+        )
+        for ordinal, owners in enumerate((
+            "pkg/A", [], [""], [1], ["pkg/B", "pkg/A"], ["pkg/A", "pkg/A"],
+        )):
+            with self.subTest(reference_case=ordinal):
+                with self.assertRaises(facts.BinaryFactStoreError):
+                    facts.BinaryFactStore._runtime_class_references({
+                        "symbolic_owner": "[[I",
+                        "symbolic_descriptor": "()V",
+                        "payload": {
+                            facts.LOADING_CONSTRAINT_TYPE_OWNERS_KEY: owners
+                        },
+                    })
+        with self.assertRaises(facts.BinaryFactStoreError):
+            facts.BinaryFactStore._runtime_class_references({
+                "payload": {facts.LOADING_CONSTRAINT_TYPE_OWNERS_KEY: []},
+            })
+
+        class RecordingConnection:
+            def __init__(self):
+                self.calls = []
+
+            def execute(self, query, values):
+                self.calls.append((query, values))
+
+        fake_store = SimpleNamespace(
+            connection=RecordingConnection(),
+            _member_values=facts.BinaryFactStore._member_values,
+        )
+        member_identity = facts.BinaryFactStore._insert_member(
+            fake_store, "variant", "artifact", "pkg/Owner", "method",
+            {"name": "run", "descriptor": "()V", "access": 1}, "digest",
+        )
+        self.assertEqual(len(member_identity), 64)
+        self.assertEqual(len(fake_store.connection.calls), 1)
+
+        with facts.BinaryFactStore() as store:
+            record_identity = store.add_reconciliation_record(
+                analysis_context_identity="context",
+                record_kind="provider_binding",
+                status="resolved",
+                subject_identity="binding",
+                payload={"value": 1},
+            )
+            self.assertEqual(len(record_identity), 64)
+            self.assertEqual(store.reconciliation_payload_count("provider_binding"), 1)
+            for kind in (None, "", "unknown"):
+                with self.subTest(count_kind=kind):
+                    with self.assertRaises(facts.BinaryFactStoreError):
+                        store.reconciliation_payload_count(kind)
+
+        with facts.BinaryFactStore() as store:
+            store.connection.execute("BEGIN")
+            self.assertEqual(store.add_reconciliation_records([]), [])
+
+    def test_reconciliation_specialized_writer_shape_cache_and_validation_matrix(self):
+        with facts.BinaryFactStore() as store:
+            records = [
+                ("s0", "a" * 64, {"z": 1, "a": 2}),
+                ("s0", "b" * 64, {"z": 3, "a": 4}),
+                ("s1", "short", {"a": 5, "z": 6}),
+                ("s1", "short", {"other": 7}),
+            ]
+            identities = store.add_reconciliation_payloads(
+                analysis_context_identity="context",
+                record_kind="provider_binding",
+                records=records,
+            )
+            self.assertEqual(len(identities), len(records))
+
+            cache_records = [
+                (f"status-{index}", "é" * 64 if index == 0 else (
+                    "_" * 64 if index == 1 else f"subject-{index}"
+                ), {"index": index})
+                for index in range(66)
+            ]
+            self.assertEqual(len(store.add_reconciliation_payloads(
+                analysis_context_identity="context",
+                record_kind="provider_binding",
+                records=cache_records,
+                collect_identities=False,
+            )), 0)
+
+            with self.assertRaises(facts.BinaryFactStoreError) as caught:
+                store.add_reconciliation_payloads(
+                    analysis_context_identity="context",
+                    record_kind="provider_binding",
+                    records=[],
+                    derive_metadata_from_payload=1,
+                )
+            self.assertEqual(
+                caught.exception.reason_code,
+                "FACT_STORE_RECONCILIATION_METADATA_MODE_INVALID",
+            )
+            with self.assertRaises(facts.BinaryFactStoreError):
+                store.add_reconciliation_payloads(
+                    analysis_context_identity="context",
+                    record_kind="provider_binding",
+                    records=[("s", "subject", {1: "non-string-key"})],
+                )
+
+        derived_base = {
+            "class_provider_status": "resolved",
+            "provider_binding_identity": "binding",
+        }
+        with facts.BinaryFactStore() as store:
+            self.assertEqual(len(store.add_reconciliation_payloads(
+                analysis_context_identity="derived",
+                record_kind="provider_binding",
+                records=[
+                    ("resolved", "binding", derived_base),
+                    ("resolved", "binding-2", {
+                        **derived_base,
+                        "provider_binding_identity": "binding-2",
+                    }),
+                ],
+                derive_metadata_from_payload=True,
+            )), 2)
+            for ordinal, row in enumerate((
+                ("wrong", "binding", derived_base),
+                ("resolved", "wrong", derived_base),
+            )):
+                with self.subTest(derived_write_case=ordinal):
+                    with self.assertRaises(facts.BinaryFactStoreError):
+                        store.add_reconciliation_payloads(
+                            analysis_context_identity="derived",
+                            record_kind="provider_binding",
+                            records=[row],
+                            derive_metadata_from_payload=True,
+                        )
+
+    def test_class_fact_normalization_rejects_ambiguous_or_corrupt_identity(self):
+        identity = "a" * 64
+        field = f'"artifact_instance_identity":"{identity}"'
+        for document in ("{}", "{" + field + "," + field + "}"):
+            with self.subTest(document=document):
+                with self.assertRaises(facts.BinaryFactStoreError):
+                    facts._encode_stored_class_fact(document, identity)
+
+        for raw in (b"{}", b"{\xff}"):
+            compressed = zlib.compress(raw)
+            with self.subTest(raw=raw):
+                with self.assertRaises(facts.BinaryFactStoreError):
+                    facts._decode_stored_class_fact(
+                        compressed, identity,
+                        __import__("hashlib").sha256(compressed).hexdigest(),
+                    )
+
+    def test_reconciliation_rows_without_context_rebuild_v11_identity(self):
+        with facts.BinaryFactStore() as store:
+            store.add_reconciliation_payloads(
+                analysis_context_identity="context",
+                record_kind="provider_binding",
+                records=[("resolved", "subject", {"value": 1})],
+            )
+            store.connection.execute(
+                "DELETE FROM metadata WHERE key=?",
+                ("reconciliation_analysis_context_identity",),
+            )
+            store.connection.commit()
+            rows = store.rows("reconciliation_records")
+
+        self.assertEqual(rows[0]["analysis_context_identity"], "")
+
+    def test_content_identity_rejects_table_without_primary_key(self):
+        class NoPrimaryKeyConnection:
+            def execute(self, query):
+                if query.startswith("PRAGMA table_info("):
+                    return [(0, "value", "TEXT", 0, None, 0)]
+                raise AssertionError(query)
+
+        fake = SimpleNamespace(connection=NoPrimaryKeyConnection())
+        with self.assertRaises(facts.BinaryFactStoreError) as caught:
+            facts.BinaryFactStore.content_identity(fake)
+        self.assertEqual(
+            caught.exception.reason_code,
+            "FACT_STORE_CONTENT_IDENTITY_ORDER_MISSING",
+        )
+
     def test_reconciliation_normalized_context_kind_and_conflict_matrix(self):
         with facts.BinaryFactStore() as store:
             with self.assertRaises(facts.BinaryFactStoreError):
@@ -733,6 +1098,7 @@ class BinaryFactStoreBoundaryTest(unittest.TestCase):
         label = "pkg/Example.class#occurrence=0"
         parsed = {
             "frame_type": "class_fact",
+            "artifact_instance_identity": "instance",
             "class_entry": label,
             "class_name": None,
             "class_bytes_sha256": None,
@@ -777,6 +1143,7 @@ class BinaryFactStoreBoundaryTest(unittest.TestCase):
         second_label = "pkg/Second.class#occurrence=3"
         second_record = {
             "frame_type": "class_fact", "class_entry": second_label,
+            "artifact_instance_identity": "instance",
             "class_name": "pkg/Second", "class_bytes_sha256": "second",
             "annotations": [], "fields": None, "methods": None,
             "super_name": None, "interfaces": [],
@@ -794,6 +1161,7 @@ class BinaryFactStoreBoundaryTest(unittest.TestCase):
         failed_label = "pkg/Failed.class#occurrence=0"
         failed = {
             "frame_type": "class_error", "class_entry": failed_label,
+            "artifact_instance_identity": "instance",
             "class_name": "pkg/Failed", "failure_kind": "parse_error",
             "interfaces": [], "nest_members": [],
         }
@@ -846,7 +1214,7 @@ class BinaryFactStoreBoundaryTest(unittest.TestCase):
                 "subject_identity": "subject", "payload": {},
             }]
             store.connection.execute(
-                "INSERT INTO reconciliation_records VALUES(?,?,?,?)",
+                "INSERT INTO reconciliation_records VALUES(?,?,?,?,?)",
                 (
                     sqlite3.Binary(b"x" * 32),
                     facts.RECONCILIATION_KIND_CODES["provider_binding"],
@@ -854,6 +1222,7 @@ class BinaryFactStoreBoundaryTest(unittest.TestCase):
                     sqlite3.Binary(zlib.compress(
                         json.dumps(envelope).encode("utf-8"), level=1
                     )),
+                    sqlite3.Binary(zlib.compress(b"{}", level=1)),
                 ),
             )
             store.connection.commit()

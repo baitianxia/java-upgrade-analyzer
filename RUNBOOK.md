@@ -168,6 +168,10 @@ generation 身份全部一致时复用该 generation 并重做验证。任一身
 
 验收必须同时满足：完整分析墙钟不超过 5 小时；validation issue 为 0；base/current 的 artifact、class、member、edge 和 reconciliation 数与输入及 generation 对账；正式 fact/API/path 身份集合与同输入正确性基线完全一致；无采样、跳过、缩小 JVM 观察或因预算提前结束。若超过目标，先按 `latest_phase_timings.json` 定位 phase，再结合 `latest_in_progress.json` 的 `average_cpu_cores`、`peak_rss_bytes` 和系统磁盘吞吐区分 CPU、换页和 I/O，不能只看总墙钟。
 
+2026-08-28 当前参考机的 source-bound 固定门中，changed 400 JAR/100000 class 完整流水线独立复采为 125.512 秒，100000/100000 class、250 条实现变化、250 条正式 API 和 0 validation issue；上一份同协议记录为 266.617 秒，提升 52.924%。release policy 将 changed 总耗时上限固定为 133.308 秒。该结果用于发现实现回退，不等价于目标 Windows 27GB 实测；目标机仍必须按上一段的 5 小时、完整计数和身份集合验收。
+
+性能排障时需同时读取 phase 和 fallback 事件：ASM/Javap 长驻会话、父进程 helper 绑定、双侧 reconciliation worker 或 javap 进程池任一失败都会自动执行完整精确回退，结果不会少算，但墙钟会显著上升。若日志出现“切回完整线程扫描”或 worker fallback，先修复进程权限、临时目录或 JDK/helper 字节绑定，再评估机器性能；不能通过禁止回退或忽略失败来压缩耗时。
+
 ## 开发验证
 
 ```bash

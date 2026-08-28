@@ -316,6 +316,32 @@ class BinaryDecisionEngine:
                     "resource_selections", "resource_selection",
                 )
             )
+        # Artifact-local decisions consult provider realms only for classes
+        # that actually changed.  Rebuilding the union of both complete
+        # provider maps for every changed class made C changes cost O(C*N).
+        # Materialize the exact, sorted realm set once for that bounded class
+        # frontier; provider records and their selection evidence are unchanged.
+        changed_classes = {
+            self._class_name(str(scope.get("entry_name") or ""))
+            for artifact_diff in self.artifact_diffs
+            for entry in artifact_diff.get("entry_deltas") or ()
+            if entry.get("runtime_effective_analysis") is not False
+            for scope in (entry.get("entry_scope") or {},)
+            if scope.get("entry_kind") == "class"
+        }
+        provider_realms: dict[str, set[str]] = {
+            class_name: set() for class_name in changed_classes
+        }
+        for realm, class_name in self._base_providers:
+            if class_name in provider_realms:
+                provider_realms[class_name].add(realm)
+        for realm, class_name in self._current_providers:
+            if class_name in provider_realms:
+                provider_realms[class_name].add(realm)
+        self._provider_realms_by_changed_class = {
+            class_name: tuple(sorted(realms))
+            for class_name, realms in provider_realms.items()
+        }
         self._shared_runtime_evidence = shared_runtime_evidence
         self._base_full_definitions = None
         self._current_full_definitions = None
@@ -330,6 +356,143 @@ class BinaryDecisionEngine:
         self._current_hierarchy_parent_cache: dict[
             tuple[str, str], tuple[str, ...]
         ] = {}
+
+    def _artifact_class_contracts_proven_equal(self) -> bool:
+        """Prove that every runtime-effective class contract is unchanged.
+
+        This is deliberately stricter than the artifact diff's user-facing
+        summary.  The proof requires a complete, one-to-one inventory of both
+        fact stores and complete class comparison for every pairing.  Changed
+        bytecode, verifier metadata, diagnostics and classfile noise are safe:
+        the member resolver consumes the typed class contract, while target-JVM
+        load readiness is compared separately.  Any absent pairing, duplicate
+        lineage, unknown category or incomplete comparison falls back to the
+        full semantic-edge merge.
+        """
+        if not self.artifact_diffs:
+            return False
+        base_artifacts: set[str] = set()
+        current_artifacts: set[str] = set()
+        lineages: set[str] = set()
+        contract_preserving_categories = {
+            "implementation_changed",
+            "runtime_metadata_changed",
+            "runtime_diagnostic_metadata_changed",
+            "classfile_noise_only",
+        }
+        for artifact_diff in self.artifact_diffs:
+            base = str(
+                artifact_diff.get("base_artifact_instance_identity") or ""
+            )
+            current = str(
+                artifact_diff.get("current_artifact_instance_identity") or ""
+            )
+            lineage = str(
+                artifact_diff.get("logical_dependency_lineage") or ""
+            ).strip()
+            if (
+                not base
+                or not current
+                or not lineage
+                or base.startswith("ABSENT:")
+                or current.startswith("ABSENT:")
+                or base in base_artifacts
+                or current in current_artifacts
+                or lineage in lineages
+                or artifact_diff.get(
+                    "class_comparison_coverage_status",
+                    artifact_diff.get("comparison_coverage_status"),
+                )
+                != "complete"
+            ):
+                return False
+            base_artifacts.add(base)
+            current_artifacts.add(current)
+            lineages.add(lineage)
+            for entry in artifact_diff.get("entry_deltas") or ():
+                scope = entry.get("entry_scope") or {}
+                if scope.get("entry_kind") != "class":
+                    continue
+                if entry.get("runtime_effective_analysis") is False:
+                    # Inactive MR variants are outside the selected runtime
+                    # model.  A variant-selection change is also represented by
+                    # the synthesized runtime-effective delta and checked below.
+                    continue
+                if entry.get("class_change_category") not in (
+                    contract_preserving_categories
+                ):
+                    return False
+
+        persisted_base = {
+            str(row[0]) for row in self.base_store.connection.execute(
+                "SELECT artifact_instance_identity FROM artifact_instances"
+            )
+        }
+        persisted_current = {
+            str(row[0]) for row in self.current_store.connection.execute(
+                "SELECT artifact_instance_identity FROM artifact_instances"
+            )
+        }
+        return (
+            persisted_base == base_artifacts
+            and persisted_current == current_artifacts
+        )
+
+    def _runtime_class_delta_plan(
+        self,
+    ) -> tuple[tuple[tuple[str, str], ...], bool]:
+        """Return exact class-outcome delta keys and member-model equality.
+
+        Provider/definition comparisons are the same predicates used by the
+        decision pass.  If they and every class contract are equal, resolution
+        of any common semantic method/field edge is deterministic and equal;
+        only then may the expensive all-edge merge be omitted.
+        """
+        all_keys = sorted(set(self._base_providers) | set(self._current_providers))
+        changed_keys = []
+        member_model_equal = (
+            self.base_runtime.coverage_status == "complete"
+            and self.current_runtime.coverage_status == "complete"
+            and self._artifact_class_contracts_proven_equal()
+            and set(self._base_providers) == set(self._current_providers)
+            and set(self._base_definitions) == set(self._current_definitions)
+        )
+        for realm, class_name in all_keys:
+            key = (realm, class_name)
+            base = self._base_providers.get(key)
+            current = self._current_providers.get(key)
+            provider_changed = not _same_json_value(
+                self._provider_outcome_payload(
+                    self.base_store, base, self._base_artifact_lineages
+                ),
+                self._provider_outcome_payload(
+                    self.current_store, current, self._current_artifact_lineages
+                ),
+            )
+            base_definition = self._base_definitions.get(key)
+            current_definition = self._current_definitions.get(key)
+            base_definition_outcome = (
+                (base_definition or {}).get(
+                    "class_definition_status", "ABSENT"
+                ),
+                (base_definition or {}).get("class_load_status", "ABSENT"),
+            )
+            current_definition_outcome = (
+                (current_definition or {}).get(
+                    "class_definition_status", "ABSENT"
+                ),
+                (current_definition or {}).get("class_load_status", "ABSENT"),
+            )
+            if (
+                provider_changed
+                or base_definition_outcome[0] != current_definition_outcome[0]
+            ):
+                changed_keys.append(key)
+            if provider_changed or (
+                base_definition_outcome != current_definition_outcome
+            ):
+                member_model_equal = False
+        return tuple(changed_keys), member_model_equal
 
     @staticmethod
     def _reconciliation_chunk_manifest(
@@ -1406,6 +1569,13 @@ class BinaryDecisionEngine:
 
     def _process_artifact_diffs(self) -> None:
         for artifact_diff in self.artifact_diffs:
+            entry_deltas = artifact_diff.get("entry_deltas") or ()
+            if not entry_deltas:
+                # An exact empty local diff cannot emit a decision. Avoid two
+                # artifact-store lookups and dependency evidence construction
+                # for every unchanged lineage; the fixed 400-JAR comparison
+                # has 399 such pairings.
+                continue
             base_artifact = artifact_diff["base_artifact_instance_identity"]
             current_artifact = artifact_diff["current_artifact_instance_identity"]
             lineage = str(artifact_diff.get("logical_dependency_lineage") or "")
@@ -1419,7 +1589,7 @@ class BinaryDecisionEngine:
                 )
                 == "complete"
             )
-            for entry in artifact_diff.get("entry_deltas") or ():
+            for entry in entry_deltas:
                 if entry.get("runtime_effective_analysis") is False:
                     continue
                 if entry["entry_scope"].get("entry_kind") != "class":
@@ -1428,10 +1598,12 @@ class BinaryDecisionEngine:
                     )
                     continue
                 class_name = self._class_name(entry["entry_scope"]["entry_name"])
-                keys = sorted({
-                    key for key in set(self._base_providers) | set(self._current_providers)
-                    if key[1] == class_name
-                })
+                keys = (
+                    (realm, class_name)
+                    for realm in self._provider_realms_by_changed_class.get(
+                        class_name, ()
+                    )
+                )
                 member_deltas = entry.get("member_deltas") or ()
                 if not member_deltas:
                     member_deltas = ({
@@ -1668,8 +1840,15 @@ class BinaryDecisionEngine:
                 dependency_artifacts=self._resource_dependency_artifacts(base, current),
             )
 
-    def _process_runtime_outcome_deltas(self) -> None:
-        all_keys = sorted(set(self._base_providers) | set(self._current_providers))
+    def _process_runtime_outcome_deltas(
+        self,
+        class_delta_keys: Iterable[tuple[str, str]] | None = None,
+    ) -> None:
+        all_keys = (
+            sorted(set(self._base_providers) | set(self._current_providers))
+            if class_delta_keys is None
+            else class_delta_keys
+        )
         for realm, class_name in all_keys:
             base = self._base_providers.get((realm, class_name))
             current = self._current_providers.get((realm, class_name))
@@ -2030,8 +2209,16 @@ class BinaryDecisionEngine:
         # passes are empty. Artifact-local deltas still run above because a
         # changed but shadowed artifact can legitimately produce an exclusion.
         if self.base_runtime.identity != self.current_runtime.identity:
-            self._process_member_resolution_deltas()
-            self._process_runtime_outcome_deltas()
+            class_delta_keys, member_model_equal = (
+                self._runtime_class_delta_plan()
+            )
+            if member_model_equal:
+                # Preserve the same immutable result as the empty merge while
+                # making the proof visible to compatibility helpers/tests.
+                self._paired_semantic_member_outcome_deltas_cache = ()
+            else:
+                self._process_member_resolution_deltas()
+            self._process_runtime_outcome_deltas(class_delta_keys)
         # ``_decision`` already indexed every unique obligation together with
         # its diagnostic origin. Consume that existing index to prove a
         # one-to-one owner mapping and release it as we go. Building a second

@@ -746,7 +746,7 @@ class BinaryTraceEngine:
                     dispatch_resolution_identity=str(
                         dispatch.get("dispatch_resolution_identity", "")
                     ),
-                    resolution_status=str(status or ""),
+                    resolution_status=str(status),
                     linkage_status=str(linkage_status or ""),
                     initiating_loader_realm_identity=str(
                         resolution.get("initiating_loader_realm_identity") or ""
@@ -778,7 +778,7 @@ class BinaryTraceEngine:
                         dispatch_resolution_identity=str(
                             dispatch.get("dispatch_resolution_identity", "")
                         ),
-                        resolution_status=str(status or ""),
+                        resolution_status=str(status),
                         linkage_status=str(linkage_status or ""),
                         initiating_loader_realm_identity=str(
                             resolution.get(

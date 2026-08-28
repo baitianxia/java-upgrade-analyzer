@@ -1,5 +1,6 @@
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -472,6 +473,246 @@ class BinaryTraceFastPathTest(unittest.TestCase):
 
 
 class BinaryTraceBoundaryTest(unittest.TestCase):
+    def test_compact_row_mapping_and_sqlite_lookup_protocols(self):
+        executable = binary_trace_engine._ExecutableResolutionRow("edge")
+        self.assertEqual(len(executable), len(executable.FIELDS))
+        self.assertEqual(tuple(executable), executable.FIELDS)
+        self.assertEqual(executable["direct_edge_identity"], "edge")
+        with self.assertRaises(KeyError):
+            executable["unknown"]
+
+        empty = binary_trace_engine._IncomingTraceEdge(
+            caller_member_identity="caller",
+            direct_edge_identity="edge",
+            certainty="exact",
+        )
+        full = binary_trace_engine._IncomingTraceEdge(
+            caller_member_identity="caller",
+            direct_edge_identity="edge",
+            certainty="exact",
+            class_initialization_resolution_identity="init",
+            inline_overlay_identity="inline",
+            semantic_edge_identity="semantic",
+        )
+        self.assertEqual(len(empty), len(empty.REQUIRED_FIELDS))
+        self.assertEqual(
+            len(full), len(full.REQUIRED_FIELDS) + len(full.OPTIONAL_FIELDS)
+        )
+        self.assertEqual(tuple(empty), empty.REQUIRED_FIELDS)
+        self.assertEqual(
+            tuple(full), full.REQUIRED_FIELDS + full.OPTIONAL_FIELDS
+        )
+        self.assertEqual(full["inline_overlay_identity"], "inline")
+        with self.assertRaises(KeyError):
+            empty["inline_overlay_identity"]
+        with self.assertRaises(KeyError):
+            empty["unknown"]
+
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        self.addCleanup(connection.close)
+        connection.execute(
+            "CREATE TABLE items(identity TEXT PRIMARY KEY,value TEXT,"
+            "caller_member_identity TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO items VALUES(?,?,?)",
+            (("one", "1", "1"), ("two", "2", "2")),
+        )
+        lookup = binary_trace_engine._SQLiteTraceRowLookup(
+            connection, "items", "identity", ("identity", "value")
+        )
+        self.assertEqual(len(lookup), 2)
+        self.assertEqual(set(lookup), {"one", "two"})
+        self.assertEqual(lookup["one"]["value"], "1")
+        self.assertIs(lookup["one"], lookup["one"])
+        with self.assertRaises(KeyError):
+            lookup["missing"]
+        with patch.object(
+            binary_trace_engine._SQLiteTraceRowLookup, "CACHE_LIMIT", 0
+        ):
+            self.assertEqual(lookup["two"]["value"], "2")
+        self.assertEqual(
+            list(lookup.iter_graph_items()),
+            [("one", {"identity": "one", "value": "1"}),
+             ("two", {"identity": "two", "value": "2"})],
+        )
+        self.assertEqual(
+            list(lookup.iter_matching_items(("two", "missing"))),
+            [("two", {"identity": "two", "caller_member_identity": "2"})],
+        )
+        self.assertEqual(list(lookup.iter_service_activation_rows(())), [])
+
+        connection.execute(
+            "CREATE TABLE direct_edges("
+            "direct_edge_identity TEXT PRIMARY KEY,"
+            "caller_member_identity TEXT,edge_kind TEXT,symbolic_owner TEXT,"
+            "symbolic_name TEXT,symbolic_descriptor TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO direct_edges VALUES(?,?,?,?,?,?)",
+            (
+                (
+                    "load", "caller", "method", "java/util/ServiceLoader",
+                    "load", "(Ljava/lang/Class;)Ljava/util/ServiceLoader;",
+                ),
+                ("literal", "caller", "type", "demo/Api", "", "Ldemo/Api;"),
+            ),
+        )
+        direct_lookup = binary_trace_engine._SQLiteTraceRowLookup(
+            connection,
+            "direct_edges",
+            "direct_edge_identity",
+            (
+                "direct_edge_identity", "caller_member_identity", "edge_kind",
+                "symbolic_owner", "symbolic_name", "symbolic_descriptor",
+            ),
+        )
+        self.assertEqual(
+            {row["direct_edge_identity"] for row in
+             direct_lookup.iter_service_activation_rows(("demo/Api",))},
+            {"load", "literal"},
+        )
+
+    def test_compact_resolution_indexes_and_batched_edge_join_boundaries(self):
+        engine = self.graph_engine()
+        engine.store = SimpleNamespace()
+        engine._node_identity_pool = {}
+        reconciliation = SimpleNamespace(
+            member_resolutions=(
+                {
+                    "direct_edge_identity": "",
+                    "member_resolution_status": None,
+                    "resolved_member_identity": None,
+                    "member_resolution_identity": None,
+                    "initiating_loader_realm_identity": None,
+                },
+                {
+                    "direct_edge_identity": "member-edge",
+                    "member_resolution_status": "resolved",
+                    "resolved_member_identity": "target",
+                    "member_resolution_identity": "member-resolution",
+                    "initiating_loader_realm_identity": "loader",
+                },
+                {
+                    "direct_edge_identity": "member-edge",
+                    "member_resolution_status": "ambiguous",
+                    "resolved_member_identity": "",
+                    "member_resolution_identity": "replacement",
+                    "initiating_loader_realm_identity": "loader",
+                },
+            ),
+            dispatch_resolutions=(
+                {
+                    "direct_edge_identity": "",
+                    "dispatch_status": "possible",
+                    "implementation_target_identities": (),
+                    "dispatch_resolution_identity": "empty-edge",
+                },
+                {
+                    "direct_edge_identity": "dispatch-only",
+                    "dispatch_status": None,
+                    "implementation_target_identities": (None, "implementation"),
+                    "dispatch_resolution_identity": None,
+                },
+                {
+                    "direct_edge_identity": "member-edge",
+                    "dispatch_status": "exact",
+                    "implementation_target_identities": (),
+                    "dispatch_resolution_identity": "dispatch-resolution",
+                },
+            ),
+            linkage_resolutions=(
+                {"direct_edge_identity": "", "linkage_status": None},
+                {"direct_edge_identity": "missing", "linkage_status": "resolved"},
+                {
+                    "direct_edge_identity": "member-edge",
+                    "linkage_status": "resolved",
+                },
+            ),
+        )
+        engine._load_compact_resolution_indexes(reconciliation)
+
+        self.assertIs(engine.member_resolutions, engine.dispatch)
+        self.assertIs(engine.member_resolutions, engine.linkage_resolutions)
+        self.assertEqual(
+            engine.member_resolutions["member-edge"].member_resolution_status,
+            "ambiguous",
+        )
+        self.assertEqual(
+            engine.member_resolutions["member-edge"].linkage_status,
+            "resolved",
+        )
+        self.assertEqual(
+            engine.member_resolutions["dispatch-only"].implementation_target_identities,
+            ("implementation",),
+        )
+        self.assertIs(engine._trace_reconciliation, reconciliation)
+
+        class MatchingEdges:
+            @staticmethod
+            def iter_matching_items(identities):
+                self.assertEqual(tuple(identities), ("present", "absent"))
+                return iter((
+                    ("present", {"caller_member_identity": "caller"}),
+                    ("not-requested", {"caller_member_identity": "ignored"}),
+                ))
+
+        engine.edges = MatchingEdges()
+        matched = list(engine._matching_resolution_edges({
+            "present": {"direct_edge_identity": "present"},
+            "absent": {"direct_edge_identity": "absent"},
+        }))
+        self.assertEqual(len(matched), 1)
+
+        engine.edges = {
+            "implicit": {"caller_member_identity": "implicit-caller"},
+            "explicit": {"caller_member_identity": "explicit-caller"},
+        }
+        matched = list(engine._matching_resolution_edges({
+            "implicit": {"status": "resolved"},
+            "explicit": {"direct_edge_identity": "explicit"},
+            "missing": {"status": "missing"},
+        }))
+        self.assertEqual(
+            matched[0][0]["direct_edge_identity"], "implicit"
+        )
+        self.assertEqual(
+            matched[1][0]["direct_edge_identity"], "explicit"
+        )
+
+        records = ({"direct_edge_identity": ""},) + tuple(
+            {"direct_edge_identity": f"edge-{index}"} for index in range(2_001)
+        )
+        with patch.object(
+            engine,
+            "_matching_resolution_edges",
+            side_effect=lambda pending: iter(
+                (resolution, {"direct_edge_identity": edge_id})
+                for edge_id, resolution in pending.items()
+            ),
+        ) as matcher:
+            self.assertEqual(
+                len(list(engine._iter_resolution_edge_batches(records))), 2_001
+            )
+        self.assertEqual(matcher.call_count, 2)
+
+        del engine._node_identity_pool
+        self.assertEqual(engine._node_identity(None), "")
+        engine.member_resolutions = {}
+        engine.linkage_resolutions = {}
+        self.assertEqual(engine._path_edge_outcome({}), (None, None, ""))
+        engine._path_outcomes = {"edge": ("resolved", "linked", "loader")}
+        self.assertEqual(
+            engine._path_edge_outcome({"direct_edge_identity": "edge"}),
+            ("resolved", "linked", "loader"),
+        )
+        engine._path_outcomes = {"empty": ("", "", "")}
+        self.assertEqual(
+            engine._path_edge_outcome({"direct_edge_identity": "empty"}),
+            (None, None, ""),
+        )
+
     @staticmethod
     def discovery(*, exact=(), possible=(), gaps=(), records=()):
         return SimpleNamespace(
@@ -835,6 +1076,7 @@ class BinaryTraceBoundaryTest(unittest.TestCase):
     def test_reverse_graph_admits_only_reconciled_executable_edges_and_overlays(self):
         engine = self.graph_engine()
         engine.member_resolutions = {
+            "no-status": {"member_resolution_identity": "r-no-status"},
             "missing-edge": {"member_resolution_status": "resolved"},
             "unsupported": {
                 "member_resolution_status": "resolved",
@@ -844,6 +1086,10 @@ class BinaryTraceBoundaryTest(unittest.TestCase):
                 "member_resolution_status": "resolved",
                 "resolved_member_identity": "target-resolved",
                 "member_resolution_identity": "r-resolved",
+            },
+            "resolved-no-identities": {
+                "member_resolution_status": "resolved",
+                "resolved_member_identity": "target-no-identities",
             },
             "possible": {
                 "member_resolution_status": "resolved",
@@ -877,6 +1123,10 @@ class BinaryTraceBoundaryTest(unittest.TestCase):
                 "member_resolution_status": "no_class_definition",
                 "member_resolution_identity": "r-unresolved",
             },
+            "unresolved-no-identities": {
+                "member_resolution_status": "ambiguous",
+                "initiating_loader_realm_identity": "loader",
+            },
         }
         base_edge = {
             "caller_member_identity": "caller",
@@ -885,10 +1135,13 @@ class BinaryTraceBoundaryTest(unittest.TestCase):
             "symbolic_descriptor": "()V",
         }
         engine.edges = {
+            "no-status": dict(base_edge, edge_kind="method"),
             "unsupported": dict(base_edge, edge_kind="resource"),
             "resolved": dict(base_edge, edge_kind="method"),
+            "resolved-no-identities": dict(base_edge, edge_kind="method"),
             "possible": dict(base_edge, edge_kind="invokedynamic_bootstrap"),
             "unresolved": dict(base_edge, edge_kind="field"),
+            "unresolved-no-identities": dict(base_edge, edge_kind="method"),
             "resolved-empty": dict(base_edge, edge_kind="method"),
             "missing-kind": dict(base_edge, edge_kind=None),
             "unresolved-method": dict(base_edge, edge_kind="method"),
@@ -897,6 +1150,10 @@ class BinaryTraceBoundaryTest(unittest.TestCase):
             "type-none": dict(base_edge, edge_kind="type", direct_edge_identity="type-none"),
             "type-bad": dict(base_edge, edge_kind="type", direct_edge_identity="type-bad"),
             "type-good": dict(base_edge, edge_kind="type", direct_edge_identity="type-good"),
+            "init-empty": dict(base_edge, edge_kind="method", direct_edge_identity="init-empty"),
+            "init-no-identity": dict(
+                base_edge, edge_kind="method", direct_edge_identity="init-no-identity"
+            ),
             "other": dict(base_edge, edge_kind="method", direct_edge_identity="other"),
         }
         engine.dispatch = {
@@ -909,6 +1166,7 @@ class BinaryTraceBoundaryTest(unittest.TestCase):
         engine.linkage_resolutions = {
             "resolved": {"linkage_status": "resolved"},
             "possible": {"linkage_status": "loader_constraint_violation"},
+            "unresolved-no-identities": {"linkage_status": "unresolved"},
         }
         alias = BinaryTraceEngine._symbolic_target(
             "alias/Owner", "run", "()V", "method"
@@ -917,7 +1175,10 @@ class BinaryTraceBoundaryTest(unittest.TestCase):
         engine.paired_artifact_missing_targets = {alias}
         engine.type_resolutions = {
             "type-bad": {"type_resolution_status": "missing"},
-            "type-good": {"type_resolution_status": "resolved"},
+            "type-good": {
+                "direct_edge_identity": "type-good",
+                "type_resolution_status": "resolved",
+            },
         }
         engine.class_initializations = {
             "missing-edge": {
@@ -929,6 +1190,14 @@ class BinaryTraceBoundaryTest(unittest.TestCase):
                 "class_initialization_status": "resolved",
                 "initializer_target_identities": ("initializer",),
                 "class_initialization_resolution_identity": "init-resolution",
+            },
+            "init-empty": {
+                "class_initialization_status": "resolved",
+                "initializer_target_identities": (),
+            },
+            "init-no-identity": {
+                "class_initialization_status": "resolved",
+                "initializer_target_identities": ("initializer-no-identity",),
             },
         }
         engine.inline_overlay = SimpleNamespace(rows=(
@@ -960,6 +1229,11 @@ class BinaryTraceBoundaryTest(unittest.TestCase):
                                   "target_member_identity": "semantic-possible-target",
                                   "path_certainty": "possible"},
         }
+        engine.reverse["preseeded"].append({
+            "caller_member_identity": "caller",
+            "certainty": "exact",
+            "direct_edge_identity": "preseeded-edge",
+        })
 
         engine._build_reverse_graph()
 
@@ -967,9 +1241,54 @@ class BinaryTraceBoundaryTest(unittest.TestCase):
         self.assertEqual(engine.reverse["target-possible"][0]["certainty"], "possible")
         self.assertEqual(engine.reverse[alias][0]["certainty"], "exact")
         self.assertIn("initializer", engine.reverse)
+        self.assertIn("initializer-no-identity", engine.reverse)
         self.assertIn("inline-target", engine.reverse)
         self.assertIn("semantic-target", engine.reverse)
         self.assertNotIn("init-missing", engine.reverse)
+
+    def test_reverse_graph_streams_and_filters_auxiliary_resolution_rows(self):
+        engine = self.graph_engine()
+        engine.store = SimpleNamespace()
+        engine._node_identity_pool = {}
+        engine._release_resolution_indexes_after_build = True
+        engine._stream_auxiliary_resolutions = True
+        engine._trace_reconciliation = SimpleNamespace(
+            type_resolutions=(
+                {"direct_edge_identity": "type-bad", "type_resolution_status": "missing"},
+                {
+                    "direct_edge_identity": "type-good",
+                    "type_resolution_status": "primitive_or_array_type",
+                    "symbolic_owner": "demo/Type",
+                },
+            ),
+            class_initialization_resolutions=(
+                {
+                    "direct_edge_identity": "init-empty",
+                    "class_initialization_status": "resolved",
+                    "initializer_target_identities": (),
+                },
+                {
+                    "direct_edge_identity": "init-good",
+                    "class_initialization_status": "resolved",
+                    "initializer_target_identities": ("initializer",),
+                },
+            ),
+        )
+        engine.edges = {
+            "type-good": {
+                "caller_member_identity": "caller",
+                "symbolic_owner": "fallback/Type",
+                "symbolic_descriptor": "Ldemo/Type;",
+            },
+            "init-good": {"caller_member_identity": "caller"},
+        }
+
+        engine._build_reverse_graph()
+
+        self.assertIn("initializer", engine.reverse)
+        self.assertEqual(engine.member_resolutions, {})
+        self.assertEqual(engine.dispatch, {})
+        self.assertIsNone(engine._trace_reconciliation)
 
     def test_reachability_scc_and_batch_graph_cover_cycles_duplicates_and_possible_paths(self):
         self.assertEqual(
@@ -1500,6 +1819,19 @@ class BinaryTraceBoundaryTest(unittest.TestCase):
             "reachable",
         )
 
+        class FilteredEdges(dict):
+            def iter_service_activation_rows(self, service_owners):
+                self.service_owners = service_owners
+                return self.values()
+
+        filtered = self.service_engine(certainty="exact")
+        filtered.edges = FilteredEdges(filtered.edges)
+        self.assertEqual(
+            filtered._service_activation_results()[0]["activation_status"],
+            "reachable",
+        )
+        self.assertEqual(filtered.edges.service_owners, ("demo/Api",))
+
     def test_service_activation_without_service_decisions_does_not_scan_edges(self):
         class Edges:
             def values(self):
@@ -1676,6 +2008,16 @@ class BinaryTraceEngineTest(unittest.TestCase):
             raise unittest.SkipTest("full JDK required")
         cls.asm_jar = binary_asm_helper.resolve_asm_jar()
         cls.platform = JdkPlatformImage(home, asm_jar=cls.asm_jar)
+
+    @classmethod
+    def tearDownClass(cls):
+        # JdkPlatformImage deliberately shares the exact, digest-checked ASM
+        # transport across hierarchy frontiers.  The production pipeline owns
+        # and closes that phase-scoped pool in its ``finally`` block; this
+        # standalone integration fixture must provide the matching boundary so
+        # later process-lifecycle contract tests do not inherit its JVM.
+        binary_asm_helper.close_persistent_asm_sessions()
+        cls.platform = None
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

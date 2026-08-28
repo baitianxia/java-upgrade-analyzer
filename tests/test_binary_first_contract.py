@@ -4,6 +4,7 @@ import hashlib
 import random
 from pathlib import Path
 import unittest
+from unittest import mock
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -258,6 +259,16 @@ class BinaryFirstContractTest(unittest.TestCase):
         with self.assertRaises(TypeError):
             contract.canonical_identity_native_json(
                 "native-json", {"value": {"unsupported"}}, schema_version="1"
+            )
+
+        with mock.patch.object(contract, "_NATIVE_JSON_C_ENCODER", None):
+            self.assertEqual(
+                contract.canonical_identity(
+                    "native-json", payloads[1], schema_version="1"
+                ),
+                contract.canonical_identity_native_json(
+                    "native-json", payloads[1], schema_version="1"
+                ),
             )
 
     def test_canonical_identity_losslessly_encodes_unpaired_surrogates(self):

@@ -52,7 +52,7 @@
     "class_count": 100000,
     "changed_jar_count": 1,
     "changed_class_count": 250,
-    "recorded_gate_sha256": "f9ca7263e0dd75e56554404ee243393095347c4e44d0e46b407afc666f7b110f",
+    "recorded_gate_sha256": "65a2012e3de7ade844eed897a44da6c6faa97231265633b6f5e6dfb8ccb3c633",
     "scheduled_release_workflow": ".github/workflows/release-regression.yml"
   }
 }

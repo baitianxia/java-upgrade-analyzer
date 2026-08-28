@@ -10,7 +10,13 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    wait,
+)
+from concurrent.futures.process import BrokenProcessPool
 from contextlib import contextmanager
 import csv
 from dataclasses import dataclass
@@ -19,8 +25,10 @@ from functools import lru_cache
 import gc
 import hashlib
 import heapq
+import io
 from itertools import chain
 import json
+import multiprocessing
 import ntpath
 import os
 from pathlib import Path
@@ -44,6 +52,7 @@ from binary_first_contract import (
     canonical_identity,
     canonical_identity_native_json,
     canonical_identity_streaming,
+    surrogate_safe_json_bytes,
     surrogate_safe_json_dumps,
     transport_jvm_text,
 )
@@ -81,6 +90,12 @@ from final_artifact_edge_oracle import (
     parse_structural_javap,
     scan_final_artifact,
 )
+from javap_session import (
+    CompiledJavapSessionBinding,
+    JavapSessionError,
+    capture_compiled_javap_session_binding,
+    install_compiled_javap_session_binding,
+)
 
 
 ORACLE_SOURCE = Path(__file__).with_name("java") / "RuntimeOutcomeOracle.java"
@@ -102,6 +117,8 @@ _NATIVE_ARTIFACT_IDENTITY_MAX_ESTIMATED_BYTES = 16 * 1024 * 1024
 # Avoid process-startup concurrency for tiny projects/tests. Above this point
 # each batch has enough reflection work to amortize one isolated JVM process.
 MIN_CLASSES_FOR_CONCURRENT_RUNTIME_ORACLE = 4_000
+MIN_ARTIFACTS_FOR_PROCESS_ORACLE_SCAN = 16
+MAX_PROCESS_ORACLE_SCAN_WORKERS = 6
 _ORACLE_RECONCILIATION_KIND_CODES = {
     "provider_binding": 1,
     "class_definition": 2,
@@ -162,7 +179,7 @@ def _runtime_oracle_execution_shape(
         memory_workers = 2
     else:
         adaptive_limit = 12_000
-        memory_workers = 3
+        memory_workers = 4
     batch_size = max(
         1, min(int(MAX_CLASSES_PER_RUNTIME_ORACLE_PROCESS), adaptive_limit)
     )
@@ -467,7 +484,9 @@ class _CompactObservation(Mapping[str, Any]):
     stored in ``_extras`` so validation fails neither open nor silently.
     """
 
-    __slots__ = ("_values", "_extras", "_length")
+    __slots__ = (
+        "_values", "_extras", "_length", "_declared_members_cache",
+    )
 
     def __init__(self, row: Mapping[str, Any]):
         values = [_MISSING_OBSERVATION_VALUE] * len(_OBSERVATION_FIELDS)
@@ -481,6 +500,9 @@ class _CompactObservation(Mapping[str, Any]):
         self._values = tuple(values)
         self._extras = tuple(extras)
         self._length = len(row)
+        # Derived only from immutable mapping fields and intentionally absent
+        # from iteration/canonical identities.
+        self._declared_members_cache = None
 
     def __getitem__(self, key: str) -> Any:
         index = _OBSERVATION_FIELD_INDEX.get(key)
@@ -1206,7 +1228,9 @@ def _independent_archive_class_access_flags(
     """
 
     try:
-        with archive.open(info) as handle:
+        with archive.open(info) as raw_handle, io.BufferedReader(
+            raw_handle, buffer_size=64 * 1024,
+        ) as handle:
             def take(size: int) -> bytes:
                 value = handle.read(size)
                 if len(value) != size:
@@ -3228,6 +3252,19 @@ class _OracleScanSpoolCache:
     only the artifact currently being compared is decoded.
     """
 
+    _PROJECTION_NAMES = (
+        "metadata",
+        "direct_edges",
+        "dynamic_handle_edges",
+        "discovery_classes",
+        "type_edges",
+        "class_init_edges",
+        "clinit_classes",
+        "semantic_instructions",
+        "declared_members",
+        "structural_class_names",
+    )
+
     def __init__(self, *, memory_limit_per_entry: int = 64 * 1024):
         self._memory_limit_per_entry = max(0, int(memory_limit_per_entry))
         self._entries: dict[
@@ -3258,6 +3295,56 @@ class _OracleScanSpoolCache:
     @staticmethod
     def _decode_projection(packed: bytes) -> Any:
         return pickle.loads(zlib.decompress(packed))
+
+    @staticmethod
+    def _evidence_projections(
+        evidence: _OracleScanEvidence,
+    ) -> tuple[tuple[str, Any], ...]:
+        return (
+            ("metadata", {
+                "artifact_sha256": evidence.artifact_sha256,
+                "complete": evidence.complete,
+                "failures": evidence.failures,
+            }),
+            ("direct_edges", evidence.direct_truth.direct_edges),
+            (
+                "dynamic_handle_edges",
+                evidence.direct_truth.dynamic_handle_edges,
+            ),
+            (
+                "discovery_classes",
+                evidence.direct_truth.discovery_classes,
+            ),
+            ("type_edges", evidence.structural_truth.type_edges),
+            (
+                "class_init_edges",
+                evidence.structural_truth.class_init_edges,
+            ),
+            (
+                "clinit_classes",
+                evidence.structural_truth.clinit_classes,
+            ),
+            (
+                "semantic_instructions",
+                evidence.structural_truth.semantic_instructions,
+            ),
+            (
+                "declared_members",
+                evidence.structural_truth.declared_members,
+            ),
+            ("structural_class_names", evidence.structural_class_names),
+        )
+
+    @classmethod
+    def pack_evidence(
+        cls, evidence: _OracleScanEvidence,
+    ) -> tuple[tuple[str, bytes], ...]:
+        """Create the exact disk-spool representation without a raw graph."""
+
+        return tuple(
+            (name, cls._encode_projection(value))
+            for name, value in cls._evidence_projections(evidence)
+        )
 
     def _new_handle(self):
         return tempfile.SpooledTemporaryFile(
@@ -3306,45 +3393,28 @@ class _OracleScanSpoolCache:
     ) -> None:
         """Replace a verbose scanner object with independently readable sets."""
 
-        projections = (
-            ("metadata", {
-                "artifact_sha256": evidence.artifact_sha256,
-                "complete": evidence.complete,
-                "failures": evidence.failures,
-            }),
-            ("direct_edges", evidence.direct_truth.direct_edges),
-            (
-                "dynamic_handle_edges",
-                evidence.direct_truth.dynamic_handle_edges,
-            ),
-            (
-                "discovery_classes",
-                evidence.direct_truth.discovery_classes,
-            ),
-            ("type_edges", evidence.structural_truth.type_edges),
-            (
-                "class_init_edges",
-                evidence.structural_truth.class_init_edges,
-            ),
-            (
-                "clinit_classes",
-                evidence.structural_truth.clinit_classes,
-            ),
-            (
-                "semantic_instructions",
-                evidence.structural_truth.semantic_instructions,
-            ),
-            (
-                "declared_members",
-                evidence.structural_truth.declared_members,
-            ),
-            ("structural_class_names", evidence.structural_class_names),
-        )
+        self.put_packed_evidence(key, self.pack_evidence(evidence))
+
+    def put_packed_evidence(
+        self,
+        key: tuple[str, str],
+        projections: Iterable[tuple[str, bytes]],
+    ) -> None:
+        """Store a worker-produced projection only after strict framing checks."""
+
+        packed_items = tuple(projections)
+        if (
+            tuple(name for name, _packed in packed_items)
+            != self._PROJECTION_NAMES
+            or any(type(packed) is not bytes for _name, packed in packed_items)
+        ):
+            raise BinaryValidationError(
+                "BINARY_ORACLE_SHARED_SCAN_PROJECTION_INVALID", repr(key)
+            )
         handle = self._new_handle()
         offsets: dict[str, tuple[int, int]] = {}
         try:
-            for name, value in projections:
-                packed = self._encode_projection(value)
+            for name, packed in packed_items:
                 offset = handle.tell()
                 handle.write(packed)
                 offsets[name] = (offset, len(packed))
@@ -3916,6 +3986,44 @@ def _normalize_oracle_scan(
     )
 
 
+def _scan_final_artifact_process(
+    request: tuple[
+        tuple[str, str], str, str, float | None,
+        CompiledJavapSessionBinding | None,
+    ],
+) -> tuple[tuple[str, str], tuple[tuple[str, bytes], ...]]:
+    """Build one complete compressed Oracle projection in an isolated worker.
+
+    Javap text parsing, normalization and projection compression are all CPU
+    heavy Python work.  Returning only bounded compressed projections avoids
+    both the GIL bottleneck of the former thread pool and a second giant graph
+    serialization in the parent.  The parent still validates projection names,
+    later decodes every set, and compares every fact against production.
+    """
+
+    key, path_text, javap, time_budget_seconds, compiled_binding = request
+    if compiled_binding is not None:
+        try:
+            install_compiled_javap_session_binding(compiled_binding)
+        except (JavapSessionError, OSError, ValueError):
+            # The binding is an optional transport optimization. A changed or
+            # inaccessible parent temporary directory falls back to compiling
+            # the same pinned helper locally; no scan may be skipped.
+            pass
+    result = scan_final_artifact(
+        Path(path_text),
+        javap=javap,
+        max_workers=1,
+        time_budget_seconds=time_budget_seconds,
+        include_nested_runtime_jars=False,
+        include_structural_facts=True,
+        cache_result=False,
+        persistent_javap_sessions=True,
+    )
+    evidence = _normalize_oracle_scan(result, None)
+    return key, _OracleScanSpoolCache.pack_evidence(evidence)
+
+
 def _same_json_value(left: Any, right: Any) -> bool:
     """Compare JSON-like values without conflating bool/int or int/float."""
     if isinstance(left, Mapping) and isinstance(right, Mapping):
@@ -4029,6 +4137,83 @@ def _compact_observations(
     return compacted
 
 
+def _runtime_observation_set_identity(
+    observations: Mapping[str, Mapping[str, Any]],
+) -> str:
+    """Hash all observations through bounded, exact canonical row chunks.
+
+    The generic streaming identity is the byte-contract authority, but writing
+    every scalar through Python is unnecessarily expensive for this unusually
+    wide and flat mapping. Encoding one class record at a time with the same
+    frozen JSON options preserves that exact byte stream while bounding
+    transient memory by the largest observation rather than the full graph.
+
+    Generated observations contain string keys and JSON-native values. Fall
+    back to the generic contract for independently authored boundary objects,
+    so this optimization can neither admit a wider value domain nor weaken a
+    validation failure.
+    """
+
+    if any(type(class_name) is not str for class_name in observations):
+        return canonical_identity_streaming(
+            "binary_runtime_observation_set_identity",
+            observations,
+            schema_version="1",
+        )
+    digest = hashlib.sha256()
+    digest.update(
+        b'{"namespace":"binary_runtime_observation_set_identity",'
+        b'"payload":{'
+    )
+    for index, class_name in enumerate(sorted(observations)):
+        row = observations[class_name]
+        if not isinstance(row, Mapping) or any(
+            type(key) is not str for key in row
+        ):
+            return canonical_identity_streaming(
+                "binary_runtime_observation_set_identity",
+                observations,
+                schema_version="1",
+            )
+        if index:
+            digest.update(b",")
+        digest.update(surrogate_safe_json_bytes(
+            class_name,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ))
+        digest.update(b":")
+        digest.update(surrogate_safe_json_bytes(
+            dict(row),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ))
+    digest.update(b'},"schema_version":"1"}')
+    return digest.hexdigest()
+
+
+def _observation_needs_javap_members(
+    observation: Mapping[str, Any],
+) -> bool:
+    status = observation.get("status")
+    if status is None:
+        # Compatibility for focused fixtures predating runtime status rows.
+        return True
+    if status == "definition_ready":
+        # The pinned helper always emits this field for a ready class. Keep a
+        # defensive exact fallback for independently authored/legacy rows that
+        # claim readiness without the declaration projection.
+        return not isinstance(observation.get("members"), (list, tuple))
+    return bool(
+        status == "definition_failed"
+        and observation.get("failure_phase") == "member_linkage"
+    )
+
+
 def _attach_provider_declared_members(
     artifacts: Iterable[Mapping[str, Any]],
     edge_truth: Mapping[str, Any],
@@ -4071,13 +4256,18 @@ def _attach_provider_declared_members(
             )
         for class_name, values in fallback_members.items():
             observation = observations.get(class_name)
-            if observation is not None:
+            if (
+                observation is not None
+                and _observation_needs_javap_members(observation)
+            ):
                 observation["javap_declared_members"] = tuple(
                     _pooled_string(value, string_pool)
                     for value in sorted(set(values))
                 )
         return
     for class_name, observation in observations.items():
+        if not _observation_needs_javap_members(observation):
+            continue
         provider_path = _provider_resource_path(
             _oracle_provider_location(observation)
         )
@@ -4104,6 +4294,14 @@ def _attach_provider_declared_members_from_scan_cache(
 
     classes_by_provider: dict[Path, set[str]] = defaultdict(set)
     for class_name, observation in observations.items():
+        # Reflection emits the complete declared-member set before reporting
+        # ``definition_ready``. Javap is an exact fallback only when class
+        # definition succeeded but enumerating members failed because an
+        # unrelated signature type could not link. Decoding every artifact's
+        # independently scanned member projection for ready classes repeated
+        # millions of rows that could never participate in the fallback.
+        if not _observation_needs_javap_members(observation):
+            continue
         provider_path = _provider_resource_path(
             _oracle_provider_location(observation)
         )
@@ -4259,13 +4457,96 @@ def _iter_reconciliation(
                 (kind_code,),
             )
     for row in chunks:
-        records = json.loads(zlib.decompress(row["payload_zlib"]).decode("utf-8"))
+        decoded = json.loads(
+            zlib.decompress(row["payload_zlib"]).decode("utf-8")
+        )
+        if isinstance(decoded, dict):
+            payload_format = decoded.get("format")
+            if payload_format == "binary-reconciliation-columnar-payload-v1":
+                if (
+                    set(decoded) != {"format", "records", "shapes"}
+                    or not isinstance(decoded.get("records"), list)
+                    or not isinstance(decoded.get("shapes"), list)
+                ):
+                    raise BinaryValidationError(
+                        "BINARY_ORACLE_RECONCILIATION_CHUNK_FORMAT_INVALID",
+                        kind,
+                    )
+                shapes: list[tuple[str, ...]] = []
+                seen_shapes: set[tuple[str, ...]] = set()
+                for raw_shape in decoded["shapes"]:
+                    if (
+                        not isinstance(raw_shape, list)
+                        or any(type(field) is not str for field in raw_shape)
+                    ):
+                        raise BinaryValidationError(
+                            "BINARY_ORACLE_RECONCILIATION_CHUNK_FORMAT_INVALID",
+                            kind,
+                        )
+                    shape = tuple(raw_shape)
+                    if (
+                        shape != tuple(sorted(set(shape)))
+                        or shape in seen_shapes
+                    ):
+                        raise BinaryValidationError(
+                            "BINARY_ORACLE_RECONCILIATION_CHUNK_FORMAT_INVALID",
+                            kind,
+                        )
+                    seen_shapes.add(shape)
+                    shapes.append(shape)
+                records = []
+                for raw_record in decoded["records"]:
+                    if (
+                        not isinstance(raw_record, list)
+                        or not raw_record
+                        or type(raw_record[0]) is not int
+                        or not 0 <= raw_record[0] < len(shapes)
+                    ):
+                        raise BinaryValidationError(
+                            "BINARY_ORACLE_RECONCILIATION_RECORD_INVALID",
+                            kind,
+                        )
+                    shape = shapes[raw_record[0]]
+                    if len(raw_record) != len(shape) + 1:
+                        raise BinaryValidationError(
+                            "BINARY_ORACLE_RECONCILIATION_RECORD_INVALID",
+                            kind,
+                        )
+                    records.append(dict(zip(shape, raw_record[1:])))
+                payload_only = True
+            elif (
+                payload_format == "binary-reconciliation-payload-array-v1"
+                and set(decoded) == {"format", "records"}
+                and isinstance(decoded.get("records"), list)
+            ):
+                # Immutable v10 chunks retain the former payload-only array.
+                records = decoded["records"]
+                payload_only = True
+            else:
+                raise BinaryValidationError(
+                    "BINARY_ORACLE_RECONCILIATION_CHUNK_FORMAT_INVALID",
+                    kind,
+                )
+        elif isinstance(decoded, list):
+            # Immutable v9 fixtures retain the former redundant envelope.
+            # The independent Oracle accepts all formats and still reads every
+            # exact payload; newer schemas remove only redundant encoding.
+            records = decoded
+            payload_only = False
+        else:
+            raise BinaryValidationError(
+                "BINARY_ORACLE_RECONCILIATION_CHUNK_FORMAT_INVALID", kind
+            )
         if len(records) != int(row["record_count"]):
             raise BinaryValidationError(
                 "BINARY_ORACLE_RECONCILIATION_CHUNK_COUNT_INVALID", kind
             )
         for item in records:
-            yield item["payload"]
+            if not isinstance(item, dict):
+                raise BinaryValidationError(
+                    "BINARY_ORACLE_RECONCILIATION_RECORD_INVALID", kind
+                )
+            yield item if payload_only else item["payload"]
 
 
 def _reconciliation(connection: sqlite3.Connection, kind: str) -> list[dict[str, Any]]:
@@ -4334,6 +4615,34 @@ def _declared_members(observation: Mapping[str, Any]) -> list[tuple[str, str, st
             member = _member_tuple(value)
             result.setdefault(member[:3], member)
     return list(result.values())
+
+
+def _cached_declared_members(
+    observations: Mapping[str, Mapping[str, Any]],
+    owner: str,
+    cache: dict[str, tuple[tuple[str, str, str, int], ...]],
+    observation: Mapping[str, Any] | None = None,
+) -> tuple[tuple[str, str, str, int], ...]:
+    """Return one exact declaration projection shared by semantic passes."""
+
+    normalized_owner = str(owner)
+    source = (
+        observation
+        if observation is not None
+        else observations.get(normalized_owner) or {}
+    )
+    if isinstance(source, _CompactObservation):
+        cached = source._declared_members_cache
+        if cached is None:
+            cached = tuple(_declared_members(source))
+            source._declared_members_cache = cached
+        return cached
+    cached = cache.get(normalized_owner)
+    if cached is not None:
+        return cached
+    projected = tuple(_declared_members(source))
+    cache[normalized_owner] = projected
+    return projected
 
 
 def _oracle_class_load_ready(observation: Mapping[str, Any] | None) -> bool:
@@ -4626,10 +4935,17 @@ def _validate_entrypoint_discovery(
     semantic_instructions: Iterable[Iterable[Any]],
     *,
     inventories: list[dict[str, Any]] | None = None,
+    declared_members_cache: dict[
+        str, tuple[tuple[str, str, str, int], ...]
+    ] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Independently reconstruct automatic callback roots using target-JVM reflection."""
 
     issues = []
+    shared_declared_members = (
+        declared_members_cache
+        if declared_members_cache is not None else {}
+    )
     candidate_activation_gaps = set()
     runtime_profile = current_side.get("runtime_profile") or {}
     profile = runtime_profile.get("business_entrypoint_profile")
@@ -4714,15 +5030,36 @@ def _validate_entrypoint_discovery(
         path = artifact_path(observation)
         return path is not None and path_kinds_by_path.get(path) in business_path_kinds
 
-    subtype_cache: dict[tuple[str, str], bool] = {}
-
-    def is_subtype_cached(child: str, parent: str) -> bool:
-        key = (child, parent)
-        result = subtype_cache.get(key)
-        if result is None:
-            result = _is_subtype(observations, child, parent)
-            subtype_cache[key] = result
-        return result
+    # Resolve all framework callback-interface subtypes in one reverse
+    # hierarchy walk. The former method/member loop recursively walked the
+    # same superclass graph once per (class, callback interface), producing
+    # millions of equivalent subtype checks on large dependency closures.
+    children_by_parent: dict[str, list[str]] = defaultdict(list)
+    for child_name, child_observation in observations.items():
+        for parent_name in (
+            child_observation.get("super_name"),
+            *(child_observation.get("interfaces") or ()),
+        ):
+            normalized_parent = str(parent_name or "")
+            if normalized_parent:
+                children_by_parent[normalized_parent].append(child_name)
+    callback_kinds_by_class: dict[
+        str, dict[str, set[str]]
+    ] = defaultdict(lambda: defaultdict(set))
+    for interface_name, callbacks in _ORACLE_INTERFACE_CALLBACKS.items():
+        pending_subtypes = [interface_name]
+        visited_subtypes = set()
+        while pending_subtypes:
+            subtype = pending_subtypes.pop()
+            if subtype in visited_subtypes:
+                continue
+            visited_subtypes.add(subtype)
+            if subtype in observations:
+                for callback_name, entry_kind in callbacks.items():
+                    callback_kinds_by_class[subtype][callback_name].add(
+                        entry_kind
+                    )
+            pending_subtypes.extend(children_by_parent.get(subtype, ()))
 
     annotation_closure_cache: dict[tuple[str, ...], frozenset[str]] = {}
 
@@ -4975,7 +5312,9 @@ def _validate_entrypoint_discovery(
                 configuration_complete=configuration_complete,
                 observations=observations,
             )
-            for kind, member_name, descriptor, flags in _declared_members(observation):
+            for kind, member_name, descriptor, flags in _cached_declared_members(
+                observations, class_name, shared_declared_members, observation
+            ):
                 if kind != "method":
                     continue
                 if flags & 0x0400:
@@ -4999,11 +5338,11 @@ def _validate_entrypoint_discovery(
                 for annotation, (entry_kind, names) in _ORACLE_CLASS_TRIGGER_KINDS.items():
                     if annotation in class_annotations and member_name in names:
                         candidate_kinds.add(entry_kind)
-                for interface, callbacks in _ORACLE_INTERFACE_CALLBACKS.items():
-                    if is_subtype_cached(class_name, interface):
-                        entry_kind = callbacks.get(member_name)
-                        if entry_kind:
-                            candidate_kinds.add(entry_kind)
+                candidate_kinds.update(
+                    callback_kinds_by_class.get(class_name, {}).get(
+                        member_name, ()
+                    )
+                )
                 for callback_name, entry_kind in spring_factories_callbacks.get(
                     class_name, ()
                 ):
@@ -5156,8 +5495,11 @@ def _validate_entrypoint_discovery(
                     callback_candidates = [
                         (name, descriptor)
                         for kind, name, descriptor, _flags in (
-                            _declared_members(
-                                receiver_observation
+                            _cached_declared_members(
+                                observations,
+                                receiver_owner,
+                                shared_declared_members,
+                                receiver_observation,
                             )
                         )
                         if kind == "method" and name in callback_names
@@ -5233,8 +5575,11 @@ def _validate_entrypoint_discovery(
                         continue
                     candidates = [
                         (name, descriptor)
-                        for kind, name, descriptor, _flags in _declared_members(
-                            class_observation
+                        for kind, name, descriptor, _flags in _cached_declared_members(
+                            observations,
+                            class_name,
+                            shared_declared_members,
+                            class_observation,
                         )
                         if kind == "method" and name in callback_names
                     ]
@@ -5267,8 +5612,11 @@ def _validate_entrypoint_discovery(
                     continue
                 candidates = [
                     (name, descriptor)
-                    for kind, name, descriptor, _flags in _declared_members(
-                        class_observation
+                    for kind, name, descriptor, _flags in _cached_declared_members(
+                        observations,
+                        class_name,
+                        shared_declared_members,
+                        class_observation,
                     )
                     if kind == "method" and name == method_name
                 ]
@@ -6249,11 +6597,23 @@ def _validate_direct_edges(
             # base/current and structural passes. Avoid building the oracle's
             # separate JSON-string cache for the same result first.
             cache_result=False,
+            # Reuse the exact target JDK's standard javap ToolProvider across
+            # artifacts. Transport failure falls back to the ordinary javap
+            # executable inside the scanner; no class or edge can be skipped.
+            persistent_javap_sessions=True,
         )
 
-    requests = iter(scan_requests.items())
     worker_count, scan_available_memory = _artifact_scan_worker_count(
         len(scan_requests)
+    )
+    process_scan = bool(
+        spooled_scan_results
+        and worker_count > 1
+        and len(scan_requests) >= MIN_ARTIFACTS_FOR_PROCESS_ORACLE_SCAN
+    )
+    scan_executor_workers = (
+        min(worker_count, MAX_PROCESS_ORACLE_SCAN_WORKERS)
+        if process_scan else worker_count
     )
     if scan_requests:
         _notify_progress(
@@ -6261,7 +6621,7 @@ def _validate_direct_edges(
             "validation-direct-edges",
             (
                 f"{progress_label or '当前侧'}：独立 javap 并发度 "
-                f"{worker_count}，按可用内存抑制换页"
+                f"{scan_executor_workers}，按可用内存抑制换页"
             ),
             len(available_scan_keys),
             scan_total,
@@ -6271,13 +6631,67 @@ def _validate_direct_edges(
                 else f"available_memory={scan_available_memory}"
             ),
         )
-    if worker_count:
-        with ThreadPoolExecutor(
-            max_workers=worker_count,
-            thread_name_prefix="binary-oracle-artifact",
+
+    compiled_javap_binding: CompiledJavapSessionBinding | None = None
+    if process_scan:
+        try:
+            # Spawned workers do not inherit the parent's in-memory helper
+            # cache. Compile the content-pinned ToolProvider bridge once and
+            # let every worker verify those exact bytes before reuse. Any
+            # setup or verification failure remains an optimization miss:
+            # workers compile the same helper locally and still scan all
+            # requested classes.
+            compiled_javap_binding = (
+                capture_compiled_javap_session_binding(javap)
+            )
+        except (JavapSessionError, OSError, ValueError):
+            compiled_javap_binding = None
+
+    def execute_scans(use_process: bool) -> None:
+        pending_requests = [
+            item for item in scan_requests.items()
+            if item[0] not in available_scan_keys
+        ]
+        if not pending_requests:
+            return
+        requests = iter(pending_requests)
+        executor_workers = (
+            min(worker_count, MAX_PROCESS_ORACLE_SCAN_WORKERS)
+            if use_process else worker_count
+        )
+
+        def submit_scan(executor, request):
+            if not use_process:
+                return executor.submit(scan_request, request)
+            key, path = request
+            remaining_budget = (
+                phase_deadline - time.perf_counter()
+                if phase_deadline is not None else None
+            )
+            return executor.submit(
+                _scan_final_artifact_process,
+                (
+                    key,
+                    str(path),
+                    javap,
+                    remaining_budget,
+                    compiled_javap_binding,
+                ),
+            )
+
+        executor_type = (
+            ProcessPoolExecutor if use_process else ThreadPoolExecutor
+        )
+        executor_options = (
+            {"mp_context": multiprocessing.get_context("spawn")}
+            if use_process
+            else {"thread_name_prefix": "binary-oracle-artifact"}
+        )
+        with executor_type(
+            max_workers=executor_workers, **executor_options
         ) as executor:
             active = {}
-            for _ in range(worker_count):
+            for _ in range(executor_workers):
                 if (
                     phase_deadline is not None
                     and time.perf_counter() >= phase_deadline
@@ -6287,7 +6701,7 @@ def _validate_direct_edges(
                     request = next(requests)
                 except StopIteration:
                     break
-                active[executor.submit(scan_request, request)] = request[0]
+                active[submit_scan(executor, request)] = request[0]
             while active:
                 remaining_wait = (
                     phase_deadline - time.perf_counter()
@@ -6329,15 +6743,16 @@ def _validate_direct_edges(
                         except StopIteration:
                             request = None
                         if request is not None:
-                            active[executor.submit(
-                                scan_request, request
-                            )] = request[0]
+                            active[submit_scan(executor, request)] = request[0]
                     available_scan_keys.add(scan_key)
                     if spooled_scan_results:
-                        scan_cache.put_evidence(
-                            scan_key,
-                            _normalize_oracle_scan(result, string_pool),
-                        )
+                        if use_process:
+                            scan_cache.put_packed_evidence(scan_key, result)
+                        else:
+                            scan_cache.put_evidence(
+                                scan_key,
+                                _normalize_oracle_scan(result, string_pool),
+                            )
                     else:
                         normalized = _normalize_oracle_scan(
                             result, string_pool
@@ -6355,6 +6770,35 @@ def _validate_direct_edges(
                         str(scan_requests[scan_key]),
                     )
                     del result
+
+    if worker_count:
+        if process_scan:
+            process_attempt_started = time.perf_counter()
+            try:
+                execute_scans(True)
+            except (OSError, BrokenProcessPool) as error:
+                # Process creation may be prohibited by a container/desktop
+                # policy. Preserve the configured semantic time budget by not
+                # charging failed transport setup, then execute every missing
+                # artifact through the original exact thread/JVM path.
+                if phase_deadline is not None:
+                    phase_deadline += (
+                        time.perf_counter() - process_attempt_started
+                    )
+                _notify_progress(
+                    progress_callback,
+                    "validation-direct-edges",
+                    (
+                        f"{progress_label or '当前侧'}：进程扫描不可用，"
+                        "切回完整线程扫描"
+                    ),
+                    len(available_scan_keys),
+                    scan_total,
+                    f"{type(error).__name__}: {error}",
+                )
+                execute_scans(False)
+        else:
+            execute_scans(False)
     for scan_key in scan_requests:
         if scan_key in available_scan_keys:
             continue
@@ -6667,6 +7111,7 @@ def _validate_runtime_outcomes(
     jdk_home: Path,
     *,
     runtime_security_policy_identity: str = "standard-unsealed-unsigned-v1",
+    proven_equal_observation_set_identity: str = "",
     progress_callback: ValidationProgressCallback | None = None,
     progress_label: str = "",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -7394,12 +7839,21 @@ def _validate_runtime_outcomes(
                 dispatch_direct_projection.close()
             seen_connection.close()
 
+    if proven_equal_observation_set_identity:
+        if re.fullmatch(
+            r"[0-9a-f]{64}", proven_equal_observation_set_identity
+        ) is None:
+            raise BinaryValidationError(
+                "BINARY_RUNTIME_OBSERVATION_IDENTITY_INVALID",
+                proven_equal_observation_set_identity,
+            )
+        observation_set_identity = proven_equal_observation_set_identity
+    else:
+        observation_set_identity = _runtime_observation_set_identity(
+            observations
+        )
     return issues, {
-        "runtime_observation_set_identity": canonical_identity_streaming(
-            "binary_runtime_observation_set_identity",
-            observations,
-            schema_version="1",
-        ),
+        "runtime_observation_set_identity": observation_set_identity,
         "runtime_observation_count": len(observations),
         "provider_count": provider_count,
         "member_resolution_count": member_resolution_count,
@@ -7574,6 +8028,7 @@ def _iter_edge_rows_with_local_callers(
     *,
     selected_columns: str,
     edge_predicate: str,
+    edge_parameters: tuple[Any, ...] = (),
     member_rowid_ranges: Mapping[
         str, tuple[int, int, int]
     ] | None = None,
@@ -7602,7 +8057,8 @@ def _iter_edge_rows_with_local_callers(
             JOIN members AS m
               ON m.member_identity=e.caller_member_identity
             WHERE {edge_predicate}
-            """
+            """,
+            edge_parameters,
         ):
             yield edge, (
                 str(edge["caller_class_name"]),
@@ -7643,7 +8099,7 @@ def _iter_edge_rows_with_local_callers(
                   AND ({edge_predicate})
                 ORDER BY e.rowid
                 """,
-                (artifact_identity,),
+                (artifact_identity, *edge_parameters),
             ):
                 yield edge, (
                     str(edge["caller_class_name"]),
@@ -7659,7 +8115,7 @@ def _iter_edge_rows_with_local_callers(
                   AND ({edge_predicate})
                 ORDER BY e.rowid
                 """,
-                (artifact_identity,),
+                (artifact_identity, *edge_parameters),
             ):
                 caller_identity = str(edge["caller_member_identity"])
                 caller = member_projection.get(caller_identity)
@@ -7691,6 +8147,7 @@ def _iter_edge_rows_with_local_callers(
 def _iter_validated_direct_edges(
     database: Path,
     *,
+    symbolic_method_target: tuple[str, str] | None = None,
     member_rowid_ranges: Mapping[
         str, tuple[int, int, int]
     ] | None = None,
@@ -7705,6 +8162,25 @@ def _iter_validated_direct_edges(
     semantic validators.
     """
 
+    if symbolic_method_target is None:
+        edge_predicate = "e.edge_kind IN ('method','field')"
+        edge_parameters: tuple[Any, ...] = ()
+    else:
+        if (
+            type(symbolic_method_target) is not tuple
+            or len(symbolic_method_target) != 2
+            or any(type(value) is not str or not value for value in symbolic_method_target)
+        ):
+            raise BinaryValidationError(
+                "BINARY_VALIDATED_DIRECT_EDGE_FILTER_INVALID",
+                repr(symbolic_method_target),
+            )
+        edge_predicate = (
+            "e.edge_kind='method' AND e.symbolic_owner=? "
+            "AND e.symbolic_name=?"
+        )
+        edge_parameters = symbolic_method_target
+
     connection = _open_immutable_sqlite(database)
     connection.row_factory = sqlite3.Row
     try:
@@ -7714,7 +8190,8 @@ def _iter_validated_direct_edges(
                 "e.edge_kind,e.symbolic_owner,e.symbolic_name,"
                 "e.symbolic_descriptor,e.opcode,e.bytecode_offset,e.edge_json"
             ),
-            edge_predicate="e.edge_kind IN ('method','field')",
+            edge_predicate=edge_predicate,
+            edge_parameters=edge_parameters,
             member_rowid_ranges=member_rowid_ranges,
             progress_callback=progress_callback,
             progress_label=progress_label,
@@ -8349,8 +8826,15 @@ def _javap_reference(comment: str) -> tuple[str, str, str]:
 def _oracle_runtime_semantic_rows(
     observations: Mapping[str, Mapping[str, Any]],
     instructions: Iterable[Iterable[Any]],
+    declared_members_cache: dict[
+        str, tuple[tuple[str, str, str, int], ...]
+    ] | None = None,
 ) -> set[tuple[str, str, str, str, str, str, str, str]]:
     """Rebuild literal reflection and JDK proxy edges from javap output."""
+    shared_declared_members = (
+        declared_members_cache
+        if declared_members_cache is not None else {}
+    )
     grouped: dict[tuple[str, str, str], list[tuple[int, str, str]]] = defaultdict(list)
     for owner, member, descriptor, bci, opcode, comment in instructions:
         grouped[(str(owner), str(member), str(descriptor))].append(
@@ -8425,8 +8909,10 @@ def _oracle_runtime_semantic_rows(
             )
             candidates = [
                 (name, descriptor)
-                for kind, name, descriptor, _flags in _declared_members(
-                    observations.get(target_owner) or {}
+                for kind, name, descriptor, _flags in _cached_declared_members(
+                    observations,
+                    target_owner,
+                    shared_declared_members,
                 )
                 if kind == member_kind and name == target_name
             ]
@@ -8464,8 +8950,10 @@ def _oracle_runtime_semantic_rows(
             candidates = [
                 (handler, name, descriptor)
                 for handler in handler_classes
-                for kind, name, descriptor, _flags in _declared_members(
-                    observations.get(handler) or {}
+                for kind, name, descriptor, _flags in _cached_declared_members(
+                    observations,
+                    handler,
+                    shared_declared_members,
                 )
                 if kind == "method" and name == "invoke"
             ]
@@ -8484,6 +8972,10 @@ def _validate_runtime_semantic_overlay(
     semantic_instructions: Iterable[Iterable[Any]],
     direct_edges: Iterable[Iterable[Any]],
     resource_truth: Iterable[Mapping[str, Any]],
+    *,
+    current_declared_members_cache: dict[
+        str, tuple[tuple[str, str, str, int], ...]
+    ] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     supported_kinds = {
         "reflection_method_invocation", "reflection_constructor_invocation",
@@ -8503,17 +8995,27 @@ def _validate_runtime_semantic_overlay(
     }
     expected = set()
 
-    @lru_cache(maxsize=20_000)
+    shared_current_declared_members = (
+        current_declared_members_cache
+        if current_declared_members_cache is not None else {}
+    )
+    base_declared_members_cache: dict[
+        str, tuple[tuple[str, str, str, int], ...]
+    ] = {}
+
     def current_declared_members(
         owner: str,
     ) -> tuple[tuple[str, str, str, int], ...]:
-        return tuple(_declared_members(observations.get(owner) or {}))
+        return _cached_declared_members(
+            observations, owner, shared_current_declared_members
+        )
 
-    @lru_cache(maxsize=20_000)
     def base_declared_members(
         owner: str,
     ) -> tuple[tuple[str, str, str, int], ...]:
-        return tuple(_declared_members(base_observations.get(owner) or {}))
+        return _cached_declared_members(
+            base_observations, owner, base_declared_members_cache
+        )
 
     @lru_cache(maxsize=20_000)
     def runtime_type_closure(child: str) -> frozenset[str]:
@@ -8552,7 +9054,9 @@ def _validate_runtime_semantic_overlay(
             instruction_batch = tuple(instruction_batch)
         expected.update(
             row for row in _oracle_runtime_semantic_rows(
-                observations, instruction_batch
+                observations,
+                instruction_batch,
+                shared_current_declared_members,
             )
             if _file_url_path(
                 str(
@@ -9228,8 +9732,9 @@ def _validate_runtime_semantic_overlay(
     # Release construction-only indexes before the production semantic rows
     # are decoded. The two complete edge sets must overlap briefly for exact
     # equality, but their unrelated hierarchy/factory caches do not.
-    current_declared_members.cache_clear()
-    base_declared_members.cache_clear()
+    if current_declared_members_cache is None:
+        shared_current_declared_members.clear()
+    base_declared_members_cache.clear()
     runtime_type_closure.cache_clear()
     spring_dispatch_candidates.cache_clear()
     repository_dispatch_candidates.cache_clear()
@@ -12523,10 +13028,21 @@ def validate_generation(
                 validation_string_pool,
             )
             reference_observations = observations_by_side.get("base")
+            proven_equal_observation_set_identity = ""
             if reference_observations is not None:
-                _share_equal_observation_values(
+                shared_rows, _shared_values = _share_equal_observation_values(
                     reference_observations, observations
                 )
+                if (
+                    shared_rows == len(observations)
+                    and len(observations) == len(reference_observations)
+                ):
+                    proven_equal_observation_set_identity = str(
+                        (truth_parts.get("base") or {}).get(
+                            "runtime_observation_set_identity"
+                        )
+                        or ""
+                    )
             observations = _compact_observations(
                 observations,
                 validation_string_pool,
@@ -12549,6 +13065,9 @@ def validate_generation(
                         "runtime_security_and_package_sealing_policy_identity"
                     )
                     or ""
+                ),
+                proven_equal_observation_set_identity=(
+                    proven_equal_observation_set_identity
                 ),
                 progress_callback=progress_callback,
                 progress_label=side_name,
@@ -12635,6 +13154,9 @@ def validate_generation(
         current_javap,
         validation_string_pool,
     )
+    current_declared_members_cache: dict[
+        str, tuple[tuple[str, str, str, int], ...]
+    ] = {}
     entrypoint_issues, entrypoint_truth = _validate_entrypoint_discovery(
         generation,
         current_side,
@@ -12643,12 +13165,21 @@ def validate_generation(
         (truth_parts.get("current") or {}).get("resource_selections") or (),
         _iter_validated_direct_edges(
             generation / "current_binary_facts.sqlite",
+            # Entrypoint reconstruction consumes direct-edge truth only to
+            # prove SpringApplication.run activation. The foundational pass
+            # has already established full edge-set equality, so selecting
+            # this exact symbolic target in immutable SQLite is equivalent to
+            # filtering the former all-edge Python iterator.
+            symbolic_method_target=(
+                "org/springframework/boot/SpringApplication", "run",
+            ),
             member_rowid_ranges=member_rowid_ranges_by_side.get("current"),
             progress_callback=progress_callback,
             progress_label="current：重放入口发现调用边",
         ),
         current_instruction_source,
         inventories=current_inventories,
+        declared_members_cache=current_declared_members_cache,
     )
     issues.extend(entrypoint_issues)
     truth_parts["entrypoint_discovery"] = entrypoint_truth
@@ -12673,7 +13204,9 @@ def validate_generation(
             progress_label="current：重放语义覆盖调用边",
         ),
         (truth_parts.get("current") or {}).get("resource_selections") or (),
+        current_declared_members_cache=current_declared_members_cache,
     )
+    current_declared_members_cache.clear()
     issues.extend(semantic_issues)
     truth_parts["runtime_semantic_overlay"] = semantic_truth
     _notify_progress(

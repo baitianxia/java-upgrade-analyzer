@@ -112,7 +112,8 @@ class PlatformContractTest(unittest.TestCase):
 
     def test_windows_job_assignment_failure_fails_closed_after_reaping_root(self):
         process = SimpleNamespace(pid=43210)
-        with patch.object(
+        self.addCleanup(compat.release_process_tree, process)
+        with patch.object(compat, "IS_WINDOWS", True), patch.object(
             compat.subprocess, "Popen", return_value=process,
         ), patch.object(
             compat, "_attach_windows_managed_job",
@@ -392,7 +393,7 @@ class PlatformContractTest(unittest.TestCase):
         self.assertEqual(observed_transfer_callers, {
             (
                 "final_artifact_edge_oracle.py",
-                "_parse_entry_group_with_javap",
+                "_parse_entry_group_with_javap_impl",
             ),
             ("final_artifact_edge_oracle.py", "_parse_entry_with_javap"),
         })
@@ -1508,6 +1509,39 @@ compat.run_cmd([sys.executable, sys.argv[2], sys.argv[3]], timeout=60)
             compat._PREVIOUS_SIGTERM_HANDLER = None
             compat._POSIX_MANAGED_PROCESS_GROUPS.clear()
             compat._MANAGED_PROCESS_TREES.clear()
+
+    @unittest.skipIf(os.name == "nt", "POSIX signal semantics only")
+    def test_parallel_process_cleanup_restores_signal_state_on_owner_thread(self):
+        previous = signal.getsignal(signal.SIGTERM)
+        process = None
+        try:
+            process = compat.managed_popen([
+                sys.executable, "-c", "pass",
+            ])
+            process.wait(timeout=5)
+            releaser = threading.Thread(
+                target=compat.release_process_tree,
+                args=(process,),
+            )
+            releaser.start()
+            releaser.join(timeout=5)
+
+            self.assertFalse(releaser.is_alive())
+            self.assertEqual(compat._POSIX_MANAGED_PROCESS_GROUPS, set())
+            self.assertIs(
+                signal.getsignal(signal.SIGTERM),
+                compat._managed_sigterm_handler,
+            )
+
+            compat.finalize_parallel_process_tree_cleanup()
+
+            self.assertEqual(signal.getsignal(signal.SIGTERM), previous)
+            self.assertFalse(compat._MANAGED_SIGTERM_HANDLER_INSTALLED)
+            self.assertIsNone(compat._PREVIOUS_SIGTERM_HANDLER)
+        finally:
+            if process is not None and process.poll() is None:
+                compat.terminate_process_tree(process)
+            compat.finalize_parallel_process_tree_cleanup()
 
     def test_bare_git_command_is_replaced_with_validated_absolute_path(self):
         with patch.object(

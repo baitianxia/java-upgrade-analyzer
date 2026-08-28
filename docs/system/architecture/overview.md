@@ -302,7 +302,11 @@ Binary 性能策略：
 - Spring Boot 等容器中多个逻辑制品共享同一个外层 JAR 时，按稳定文件身份复用外层摘要，并在输入画像结束前再次完整校验；
 - 内容寻址缓存绑定 artifact SHA、RuntimeProfile、parser 和 policy；
 - 冷缓存解析复用 snapshot 自带的前后摘要校验；相邻 base/current 内容相同时只在内存保留一个解码模板，仍分别校验实际文件并重建 ArtifactInstance 身份；
+- ASM 解析使用有界长驻 JVM 会话和父进程已编译、逐字节绑定的 helper；协议或绑定异常精确回退到 one-shot helper，正常空闲会话以 EOF 退出；并行清理完成后由所有者主线程恢复 POSIX 信号状态；
+- 两侧非同一 runtime side 时，可在内存门槛允许下用两个隔离进程并行 reconciliation；两侧完全相同时只计算一次并 backup 完整 SQLite 证据，Oracle 的两个具名 sidecar 从同一精确字节镜像产生并分别校验路径、摘要和绑定身份；worker 失败回到完整串行 reconciliation；
+- fact-store v11 用列式 shape 保存 reconciliation payload，并从固定 payload 字段派生重复 metadata；所有 shape、数量、摘要和 rebind 占位符均校验，旧 v9/v10 只读恢复保持相同逻辑记录；
 - 独立 Oracle 仍对每个 base/current 制品实例分别绑定并比对生产数据库；只有 artifact SHA、目标 `javap` 与 class inventory 都相同的不可变规范化真值才跨侧复用，并在两侧 structural 校验完成后立即释放扫描缓存；
+- 独立 `javap` 扫描按制品进入有界进程池，worker 内复用目标 JDK 的 ToolProvider 并返回压缩投影；进程策略不可用时完整回退到线程/one-shot 扫描；
 - target JVM 观测不会抽样或跳过；两侧完成观测和 declared-member 补全后，仅共享 JSON 类型及值都完全相同的只读字段，保持 canonical truth bytes 不变；
 - 批量建图、SCC 和多目标遍历；
 - 缓存完整性失败重建；

@@ -550,6 +550,19 @@ def _restore_managed_sigterm_handler():
         _PREVIOUS_SIGTERM_HANDLER = None
 
 
+def finalize_parallel_process_tree_cleanup():
+    """Restore POSIX signal state after worker-owned process cleanup.
+
+    A pool may wait for several independent children concurrently and release
+    their process-tree registrations from those worker threads.  Python only
+    permits the main thread to replace a signal handler, so the last worker
+    cannot finish that part of the lifecycle.  Pool owners call this function
+    after joining their cleanup workers; it is idempotent and a no-op while a
+    managed process group is still live.
+    """
+    _restore_managed_sigterm_handler()
+
+
 def _register_managed_process_tree(proc):
     if not IS_WINDOWS:
         _ensure_managed_sigterm_handler()

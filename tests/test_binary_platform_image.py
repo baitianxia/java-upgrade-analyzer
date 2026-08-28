@@ -396,7 +396,9 @@ class BinaryPlatformImageBoundaryTest(unittest.TestCase):
                     })
             return SimpleNamespace(parser_identity=f"parser-{runs}", records=records)
 
-        with patch.object(platform_image, "extract_class_facts", side_effect=extract):
+        with patch.object(
+            platform_image, "extract_class_facts", side_effect=extract
+        ) as extractor:
             facts = image.ensure_classes(
                 (None, "", "  ", " demo.Root ", "demo/Root")
             )
@@ -409,6 +411,10 @@ class BinaryPlatformImageBoundaryTest(unittest.TestCase):
             "platform_class_missing",
         )
         self.assertEqual(image.parser_identity, "parser-2")
+        self.assertTrue(all(
+            call.kwargs["persistent_session"]
+            for call in extractor.call_args_list
+        ))
 
         all_missing = self._blank_image()
         all_missing._read_class = Mock(return_value=None)
@@ -453,8 +459,16 @@ class BinaryPlatformImageBoundaryTest(unittest.TestCase):
         self.assertIs(image.get_class("demo.Type"), fact)
         self.assertIsNone(image.get_class(None))
         self.assertEqual(image.failure(None), {"failure_kind": "empty"})
-        image.ensure_classes.assert_any_call(("demo/Type",))
-        image.ensure_classes.assert_any_call(("",))
+        image.ensure_classes.assert_not_called()
+
+        image.get_class("demo.Missing")
+        image.ensure_classes.assert_called_once_with(("demo/Missing",))
+        image.ensure_classes.reset_mock()
+        self.assertIsNone(image.failure("demo.Unknown"))
+        image.ensure_classes.assert_called_once_with(("demo/Unknown",))
+        image.ensure_classes.reset_mock()
+        self.assertIsNone(image.failure("demo.Type"))
+        image.ensure_classes.assert_not_called()
 
         image._build_index = Mock()
         image._class_index = None
@@ -516,6 +530,7 @@ class BinaryPlatformImageBoundaryTest(unittest.TestCase):
         self.assertIs(cached, exports)
         self.assertEqual(modern.parser_identity, "parser-exports")
         extractor.assert_called_once()
+        self.assertTrue(extractor.call_args.kwargs["persistent_session"])
 
     def test_modular_exports_without_readable_descriptors_returns_empty(self):
         with tempfile.TemporaryDirectory() as tmp:

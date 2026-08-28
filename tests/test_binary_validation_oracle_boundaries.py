@@ -34,7 +34,7 @@ class BinaryValidationOracleBoundaryTest(unittest.TestCase):
             (3 * gib, 1_000, 1),
             (6 * gib, 4_000, 1),
             (12 * gib, 8_000, 2),
-            (20 * gib, 12_000, 3),
+            (20 * gib, 12_000, 4),
         )
         for available, expected_limit, expected_workers in memory_cases:
             effect = RuntimeError("memory unavailable") if available is None else available
@@ -405,6 +405,27 @@ class BinaryValidationOracleBoundaryTest(unittest.TestCase):
             self.assertFalse(oracle._sqlite_logical_contents_equal(
                 TruncatedDuringRead(bytes(valid_header)),
                 TruncatedDuringRead(b"x" * 99),
+            ))
+
+            class DeclaredLargeRead(TruncatedDuringRead):
+                def stat(self):
+                    # Force the progress interval above one physical read so
+                    # the exact comparison also exercises its no-report path.
+                    return SimpleNamespace(st_size=200 * 1024 * 1024)
+
+            declared_large = bytes(valid_header) + b"z" * (1024 * 1024)
+            self.assertTrue(oracle._sqlite_logical_contents_equal(
+                DeclaredLargeRead(declared_large),
+                DeclaredLargeRead(declared_large),
+            ))
+
+            class ExactRead(TruncatedDuringRead):
+                def stat(self):
+                    return SimpleNamespace(st_size=len(self.content))
+
+            self.assertTrue(oracle._sqlite_logical_contents_equal(
+                ExactRead(declared_large),
+                ExactRead(declared_large),
             ))
             valid_right = bytearray(valid_header)
             valid_right[30] = 1
@@ -4783,6 +4804,23 @@ class BinaryValidationOracleBoundaryTest(unittest.TestCase):
                 row[-1] == "interface_method" for row in direct
             ))
             self.assertTrue(any(row[-1] == "field" for row in direct))
+            filtered = list(oracle._iter_validated_direct_edges(
+                base_database,
+                symbolic_method_target=("demo/Target", "target"),
+            ))
+            self.assertEqual(len(filtered), 2)
+            self.assertTrue(all(
+                row[3:5] == ("demo.Target", "target")
+                for row in filtered
+            ))
+            with self.assertRaises(oracle.BinaryValidationError) as raised:
+                list(oracle._iter_validated_direct_edges(
+                    base_database, symbolic_method_target=("demo/Target", ""),
+                ))
+            self.assertEqual(
+                raised.exception.reason_code,
+                "BINARY_VALIDATED_DIRECT_EDGE_FILTER_INVALID",
+            )
             self.assertEqual(
                 list(oracle._iter_validated_direct_edges(empty_database)), [],
             )
@@ -10688,6 +10726,361 @@ class BinaryValidationOracleBoundaryTest(unittest.TestCase):
         }
         self.assertTrue(
             oracle._independent_artifact_security_unsupported(sealed)
+        )
+
+    def test_projection_memory_pool_and_observation_fallback_boundaries(self):
+        gib = 1024 * 1024 * 1024
+        for available, expected in (
+            (None, 100_000),
+            (gib, 20_000),
+            (3 * gib, 50_000),
+            (6 * gib, 100_000),
+            (9 * gib, 250_000),
+        ):
+            with self.subTest(available=available), patch.object(
+                oracle, "system_available_memory_bytes", return_value=available,
+            ):
+                self.assertEqual(
+                    oracle._runtime_member_projection_cache_limit(), expected,
+                )
+        with patch.object(
+            oracle, "system_available_memory_bytes", side_effect=OSError("probe"),
+        ):
+            self.assertEqual(
+                oracle._runtime_member_projection_cache_limit(), 100_000,
+            )
+
+        pool = {}
+        with patch.object(oracle, "MAX_VALIDATION_STRING_POOL_ENTRIES", 0):
+            self.assertEqual(oracle._pooled_string("value", pool), "value")
+            self.assertEqual(pool, {})
+        with (
+            patch.object(oracle, "MAX_VALIDATION_STRING_POOL_ENTRIES", 10),
+            patch.object(oracle, "MAX_VALIDATION_POOLED_STRING_CHARS", 0),
+        ):
+            self.assertEqual(oracle._pooled_string("value", pool), "value")
+            self.assertEqual(pool, {})
+
+        sentinel = "fallback-identity"
+        fallback_rows = (
+            {1: {}},
+            {"demo/A": []},
+            {"demo/A": {1: "non-string-key"}},
+        )
+        for observations in fallback_rows:
+            with self.subTest(observations=observations), patch.object(
+                oracle, "canonical_identity_streaming", return_value=sentinel,
+            ) as canonical:
+                self.assertEqual(
+                    oracle._runtime_observation_set_identity(observations), sentinel,
+                )
+                canonical.assert_called_once_with(
+                    "binary_runtime_observation_set_identity",
+                    observations,
+                    schema_version="1",
+                )
+
+        self.assertTrue(oracle._observation_needs_javap_members({}))
+        self.assertTrue(oracle._observation_needs_javap_members({
+            "status": "definition_ready",
+        }))
+        self.assertFalse(oracle._observation_needs_javap_members({
+            "status": "definition_ready", "members": [],
+        }))
+        self.assertTrue(oracle._observation_needs_javap_members({
+            "status": "definition_failed", "failure_phase": "member_linkage",
+        }))
+        self.assertFalse(oracle._observation_needs_javap_members({
+            "status": "definition_failed", "failure_phase": "class_loading",
+        }))
+        self.assertFalse(oracle._observation_needs_javap_members({
+            "status": "provider_missing",
+        }))
+
+    def test_jsonl_file_url_and_scan_projection_protocol_boundaries(self):
+        self.assertEqual(
+            list(oracle._iter_jsonl_values(' \t{"value":1}\r\n2')),
+            [{"value": 1}, 2],
+        )
+        with self.assertRaises(json.JSONDecodeError):
+            list(oracle._iter_jsonl_values("\n"))
+
+        self.assertIsNone(oracle._file_url_path("file:"))
+        empty = SimpleNamespace(path=None, netloc=None)
+        self.assertEqual(oracle._decoded_file_url_path(empty, windows=False), "")
+        self.assertEqual(oracle._decoded_file_url_path(empty, windows=True), "")
+        localhost = SimpleNamespace(path="/tmp/demo.jar", netloc="LOCALHOST")
+        self.assertEqual(
+            oracle._decoded_file_url_path(localhost, windows=False),
+            "/tmp/demo.jar",
+        )
+        remote = SimpleNamespace(path="/share/demo.jar", netloc="server")
+        self.assertEqual(
+            oracle._decoded_file_url_path(remote, windows=False),
+            "//server/share/demo.jar",
+        )
+
+        key = ("a" * 64, "javap")
+        cache = oracle._OracleScanSpoolCache(memory_limit_per_entry=0)
+        self.addCleanup(cache.clear)
+        valid = tuple((name, b"") for name in cache._PROJECTION_NAMES)
+        invalid = (
+            valid[:-1],
+            ((cache._PROJECTION_NAMES[0], bytearray()), *valid[1:]),
+            (*valid[:-1], (cache._PROJECTION_NAMES[-1], bytearray())),
+        )
+        for projections in invalid:
+            with self.subTest(projections=len(projections)), self.assertRaises(
+                oracle.BinaryValidationError,
+            ) as raised:
+                cache.put_packed_evidence(key, projections)
+            self.assertEqual(
+                raised.exception.reason_code,
+                "BINARY_ORACLE_SHARED_SCAN_PROJECTION_INVALID",
+            )
+
+    def test_reconciliation_columnar_protocol_rejects_every_malformed_shape(self):
+        class FakeConnection:
+            def __init__(self, payload, count=1):
+                self.row = {
+                    "record_count": count,
+                    "payload_zlib": zlib.compress(
+                        json.dumps(payload).encode("utf-8")
+                    ),
+                }
+
+            def execute(self, *_args):
+                return [self.row]
+
+        columnar = "binary-reconciliation-columnar-payload-v1"
+        array = "binary-reconciliation-payload-array-v1"
+        valid = {
+            "format": columnar,
+            "records": [[0, 1, 2]],
+            "shapes": [["a", "b"]],
+        }
+        self.assertEqual(
+            list(oracle._iter_reconciliation(
+                FakeConnection(valid), "provider_binding",
+            )),
+            [{"a": 1, "b": 2}],
+        )
+        self.assertEqual(
+            list(oracle._iter_reconciliation(
+                FakeConnection({"format": array, "records": [{"a": 1}]}),
+                "provider_binding",
+            )),
+            [{"a": 1}],
+        )
+        self.assertEqual(
+            list(oracle._iter_reconciliation(
+                FakeConnection([{"payload": {"a": 1}}]),
+                "provider_binding",
+            )),
+            [{"a": 1}],
+        )
+
+        malformed = (
+            {"format": columnar, "records": [], "shapes": [], "extra": 1},
+            {"format": columnar, "records": {}, "shapes": []},
+            {"format": columnar, "records": [], "shapes": {}},
+            {"format": columnar, "records": [], "shapes": ["a"]},
+            {"format": columnar, "records": [], "shapes": [[1]]},
+            {"format": columnar, "records": [], "shapes": [["a", 1]]},
+            {"format": columnar, "records": [], "shapes": [["b", "a"]]},
+            {"format": columnar, "records": [], "shapes": [["a", "a"]]},
+            {"format": columnar, "records": [], "shapes": [["a"], ["a"]]},
+            {"format": columnar, "records": ["record"], "shapes": []},
+            {"format": columnar, "records": [[]], "shapes": []},
+            {"format": columnar, "records": [["0"]], "shapes": []},
+            {"format": columnar, "records": [[-1]], "shapes": []},
+            {"format": columnar, "records": [[1]], "shapes": [[]]},
+            {"format": columnar, "records": [[0]], "shapes": [["a"]]},
+            {"format": array, "records": [], "extra": 1},
+            {"format": array, "records": {}},
+            {"format": "unknown", "records": []},
+            1,
+            ["not-a-record"],
+        )
+        for payload in malformed:
+            with self.subTest(payload=payload), self.assertRaises(
+                oracle.BinaryValidationError,
+            ):
+                list(oracle._iter_reconciliation(
+                    FakeConnection(payload, count=0 if payload == [] else 1),
+                    "provider_binding",
+                ))
+
+    def test_sqlite_locality_and_sequential_projection_preserve_exact_rows(self):
+        gib = 1024 * 1024 * 1024
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.row_factory = sqlite3.Row
+        connection.execute(
+            "CREATE TABLE facts (identity TEXT, payload TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO facts(rowid,identity,payload) VALUES (?,?,?)",
+            ((1, "a", "A"), (2, "extra", "X"), (100, "b", "B")),
+        )
+
+        kwargs = {
+            "table": "facts",
+            "identity_column": "identity",
+            "selected_columns": ("identity", "payload"),
+        }
+        self.assertEqual(
+            oracle._identity_rows_with_table_locality(
+                connection, identities=(), **kwargs,
+            ),
+            (),
+        )
+        legacy = oracle._identity_rows_with_table_locality(
+            connection, identities=("a",), prefer_table_locality=False, **kwargs,
+        )
+        self.assertEqual([row["payload"] for row in legacy], ["A"])
+        dense = oracle._identity_rows_with_table_locality(
+            connection, identities=("a", "extra"), **kwargs,
+        )
+        self.assertEqual([row["payload"] for row in dense], ["A", "X"])
+        sparse = oracle._identity_rows_with_table_locality(
+            connection, identities=("a", "b"), **kwargs,
+        )
+        self.assertEqual([row["payload"] for row in sparse], ["A", "B"])
+        self.assertEqual(
+            oracle._identity_rows_with_table_locality(
+                connection, identities=("missing",), **kwargs,
+            ),
+            (),
+        )
+        for changed in (
+            dict(kwargs, table="unsafe-name"),
+            dict(kwargs, identity_column="unsafe-name"),
+            dict(kwargs, selected_columns=("identity", "unsafe-name")),
+        ):
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                oracle._identity_rows_with_table_locality(
+                    connection, identities=("a",), **changed,
+                )
+
+        projection = oracle._SequentialIdentityProjection(
+            connection, prefer_table_locality=True, **kwargs,
+        )
+        self.assertEqual(projection.resolve(()), ())
+        self.assertEqual(
+            [row["payload"] for row in projection.resolve(("a", "b"))],
+            ["A", "B"],
+        )
+        projection.close()
+        projection.close()
+        with self.assertRaises(ValueError):
+            oracle._SequentialIdentityProjection(
+                connection,
+                table="unsafe-name",
+                identity_column="identity",
+                selected_columns=("identity",),
+                prefer_table_locality=True,
+            )
+
+        class DatabaseListConnection:
+            def execute(self, _query):
+                return [(0, "main", "/fixture/large.sqlite")]
+
+        with (
+            patch.object(
+                oracle, "Path",
+                return_value=SimpleNamespace(
+                    stat=lambda: SimpleNamespace(st_size=8 * gib)
+                ),
+            ),
+            patch.object(
+                oracle, "system_available_memory_bytes",
+                side_effect=OSError("memory probe"),
+            ),
+        ):
+            self.assertTrue(oracle._prefer_identity_table_locality(
+                DatabaseListConnection()
+            ))
+
+    def test_validated_edge_filter_and_artifact_order_boundaries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "edges.sqlite"
+            connection = sqlite3.connect(database)
+            connection.executescript("""
+                CREATE TABLE members (
+                    member_identity TEXT PRIMARY KEY,
+                    class_name TEXT,
+                    member_name TEXT,
+                    descriptor TEXT
+                );
+                CREATE TABLE direct_edges (
+                    caller_artifact_instance_identity TEXT,
+                    caller_member_identity TEXT,
+                    edge_kind TEXT,
+                    symbolic_owner TEXT,
+                    symbolic_name TEXT,
+                    symbolic_descriptor TEXT,
+                    opcode INTEGER,
+                    edge_json TEXT
+                );
+            """)
+            connection.commit()
+            connection.close()
+            for invalid in (
+                ["demo/A", "run"],
+                ("demo/A",),
+                ("", "run"),
+                ("demo/A", ""),
+                ("demo/A", 1),
+            ):
+                with self.subTest(invalid=invalid), self.assertRaises(
+                    oracle.BinaryValidationError,
+                ):
+                    list(oracle._iter_validated_direct_edges(
+                        database, symbolic_method_target=invalid,
+                    ))
+
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.execute(
+            "CREATE TABLE direct_edges (caller_artifact_instance_identity TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO direct_edges VALUES (?)", (("b",), ("a",), ("a",)),
+        )
+        self.assertEqual(
+            oracle._edge_scan_artifact_identities(connection), ("a", "b"),
+        )
+
+        connection.execute("""
+            CREATE TABLE artifact_instances (
+                artifact_instance_identity TEXT,
+                runtime_classpath_index INTEGER
+            )
+        """)
+        connection.executemany(
+            "INSERT INTO artifact_instances VALUES (?,?)", (("b", 1), ("a", 0)),
+        )
+        self.assertEqual(
+            oracle._edge_scan_artifact_identities(connection), ("a", "b"),
+        )
+
+    def test_security_manifest_malformed_facts_never_expand_authority(self):
+        inventory = {
+            "resources": {
+                "META-INF/MANIFEST.MF": [
+                    None,
+                    {"semantic_facts": [
+                        None,
+                        ["sealed"],
+                        ["other", "true"],
+                        ["sealed", "false"],
+                    ]},
+                ],
+            },
+        }
+        self.assertFalse(
+            oracle._independent_artifact_security_unsupported(inventory)
         )
 
 

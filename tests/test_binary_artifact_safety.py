@@ -28,7 +28,15 @@ def archive_bytes(entries, *, compression=zipfile.ZIP_DEFLATED):
 
 class BinaryArtifactSafetyTest(unittest.TestCase):
     def test_jar_signature_metadata_separates_orphan_sf_from_block_candidates(self):
+        self.assertTrue(
+            artifact_safety.is_jar_signature_file_entry("META-INF/DEMO.SF")
+        )
+        self.assertFalse(
+            artifact_safety.is_jar_signature_file_entry("META-INF/DEMO.RSA")
+        )
+        self.assertFalse(artifact_safety.is_jar_signature_file_entry(None))
         orphan = artifact_safety.jar_signature_metadata((
+            None,
             "META-INF/BOOT.SF",
             # OpenJDK reserves this as signing-related metadata but does not
             # feed it to JarVerifier's block/SF signer installation path.
@@ -408,6 +416,27 @@ class ArtifactSafetyBoundaryTest(unittest.TestCase):
         self.assertTrue(result.safe, result)
         self.assertEqual(result.nested_archives, 1)
         self.assertEqual(result.max_observed_depth, 0)
+
+    def test_top_level_payload_reuse_still_fully_validates_nested_archives(self):
+        nested = archive_bytes((("inside.txt", b"content"),))
+        payload = archive_bytes((("plain.txt", b"top"), ("lib/a.jar", nested)))
+
+        inspected = artifact_safety.inspect_archive_bytes(
+            payload,
+            verify_top_level_entry_payloads=False,
+        )
+        skipped_by_policy = artifact_safety.inspect_archive_bytes(
+            payload,
+            verify_top_level_entry_payloads=False,
+            inspect_nested_archives=False,
+        )
+
+        self.assertTrue(inspected.safe, inspected)
+        self.assertEqual(inspected.nested_archives, 1)
+        self.assertEqual(inspected.max_observed_depth, 1)
+        self.assertTrue(skipped_by_policy.safe, skipped_by_policy)
+        self.assertEqual(skipped_by_policy.nested_archives, 1)
+        self.assertEqual(skipped_by_policy.max_observed_depth, 0)
 
     def test_zero_nested_depth_rejects_first_nested_archive(self):
         nested = archive_bytes((("inside.txt", b"x"),))

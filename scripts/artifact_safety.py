@@ -156,6 +156,7 @@ def _inspect_archive_source(
     max_nested_archive_bytes=64 * 1024 * 1024,
     inspect_nested_archives=True,
     allow_duplicate_maven_metadata=False,
+    verify_top_level_entry_payloads=True,
     cancellation_check=None,
 ):
     reasons = set()
@@ -254,6 +255,19 @@ def _inspect_archive_source(
                         if info.file_size > max_nested_archive_bytes:
                             reasons.add("ARCHIVE_NESTED_SIZE_EXCEEDED")
                             continue
+                    # Some callers immediately read and cryptographically bind
+                    # every top-level entry from this same private archive
+                    # snapshot. They may avoid decompressing those bytes twice;
+                    # nested archives still receive a complete recursive CRC
+                    # pass because the later top-level read cannot validate
+                    # entries inside them. The default remains a standalone,
+                    # complete payload-integrity inspection.
+                    if (
+                        depth == 0
+                        and not verify_top_level_entry_payloads
+                        and not (is_nested and inspect_nested_archives)
+                    ):
+                        continue
                     try:
                         nested_chunks = []
                         with archive.open(info) as entry_stream:

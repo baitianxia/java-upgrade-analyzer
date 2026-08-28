@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import hashlib
+import io
 import os
 from pathlib import Path
 import stat
 import sys
 import tempfile
+import threading
+import time
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -28,6 +33,7 @@ import binary_runtime_reconciler
 import binary_semantic_overlay
 import binary_validation_contract
 import diagnostic_contract
+import javap_session
 import path_runtime
 import process_lock
 import progress_logging
@@ -38,6 +44,767 @@ import signature_utils
 
 
 class InternalIdentityHelperContractTest(unittest.TestCase):
+    def _compiled_javap_binding_fixture(self, root: Path):
+        bin_dir = root / "jdk" / "bin"
+        bin_dir.mkdir(parents=True)
+        javap = bin_dir / "javap"
+        java = bin_dir / "java"
+        javap.write_bytes(b"pinned-javap")
+        java.write_bytes(b"pinned-java")
+        helper_source = root / "JavapSession.java"
+        helper_source.write_bytes(b"final class JavapSession {}")
+        output = root / "compiled"
+        output.mkdir()
+        helper_class = output / "JavapSession.class"
+        helper_class.write_bytes(b"pinned-helper-bytecode")
+        source_sha = hashlib.sha256(helper_source.read_bytes()).hexdigest()
+        class_sha = hashlib.sha256(helper_class.read_bytes()).hexdigest()
+        status = javap.stat()
+        binding = javap_session.CompiledJavapSessionBinding(
+            javap=str(javap.resolve()),
+            javap_size=int(status.st_size),
+            javap_mtime_ns=int(status.st_mtime_ns),
+            java=str(java.resolve()),
+            output=str(output.resolve()),
+            helper_source_sha256=source_sha,
+            helper_class_sha256=class_sha,
+        )
+        return javap.resolve(), helper_source, helper_class, binding
+
+    def test_compiled_javap_binding_reuses_only_exact_parent_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            javap, helper_source, _helper_class, binding = (
+                self._compiled_javap_binding_fixture(Path(temporary))
+            )
+            javap_session._EXTERNAL_COMPILED_HELPERS.clear()
+            self.addCleanup(javap_session._EXTERNAL_COMPILED_HELPERS.clear)
+            with patch.object(
+                javap_session, "JAVA_HELPER", helper_source,
+            ), patch.object(
+                javap_session,
+                "_CAPTURED_HELPER_SHA256",
+                binding.helper_source_sha256,
+            ), patch.object(javap_session, "_compile_helper") as compile_helper:
+                javap_session.install_compiled_javap_session_binding(binding)
+                compiled = javap_session._compiled_helper(javap)
+
+            compile_helper.assert_not_called()
+            self.assertEqual(compiled.output, Path(binding.output))
+            self.assertEqual(compiled.java, binding.java)
+            self.assertIsNone(compiled._owned_directory)
+
+    def test_compiled_javap_binding_rejects_tampered_class_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            javap, helper_source, helper_class, binding = (
+                self._compiled_javap_binding_fixture(Path(temporary))
+            )
+            helper_class.write_bytes(b"tampered-helper-bytecode")
+            with patch.object(
+                javap_session, "JAVA_HELPER", helper_source,
+            ), patch.object(
+                javap_session,
+                "_CAPTURED_HELPER_SHA256",
+                binding.helper_source_sha256,
+            ):
+                with self.assertRaises(javap_session.JavapSessionError):
+                    javap_session.install_compiled_javap_session_binding(binding)
+
+            self.assertNotIn(str(javap), javap_session._EXTERNAL_COMPILED_HELPERS)
+
+    def test_idle_javap_sessions_use_bounded_protocol_shutdown(self):
+        calls = []
+
+        class IdleSession:
+            def close(self, *, terminate=False):
+                calls.append(terminate)
+
+        pool = object.__new__(javap_session._SessionPool)
+        pool._condition = threading.Condition()
+        pool._idle = javap_session.queue.LifoQueue()
+        pool._idle.put(IdleSession())
+        pool._idle.put(IdleSession())
+        pool._session_count = 2
+        pool._closed = False
+
+        pool.close()
+
+        self.assertEqual(calls, [False, False])
+        self.assertEqual(pool._session_count, 0)
+        self.assertTrue(pool._closed)
+
+    def test_compiled_javap_capture_rejects_every_bound_byte_and_path_change(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            javap, helper_source, helper_class, binding = (
+                self._compiled_javap_binding_fixture(root)
+            )
+            compiled = javap_session._CompiledHelper(
+                Path(binding.output), binding.java, None
+            )
+            with patch.object(
+                javap_session, "JAVA_HELPER", helper_source
+            ), patch.object(
+                javap_session,
+                "_CAPTURED_HELPER_SHA256",
+                binding.helper_source_sha256,
+            ), patch.object(
+                javap_session, "_resolved_tool", return_value=javap
+            ), patch.object(
+                javap_session, "_compiled_helper", return_value=compiled
+            ):
+                self.assertEqual(
+                    javap_session.capture_compiled_javap_session_binding(
+                        str(javap)
+                    ),
+                    binding,
+                )
+            with patch.object(
+                javap_session, "_resolved_tool", return_value=None
+            ), self.assertRaises(javap_session.JavapSessionError):
+                javap_session.capture_compiled_javap_session_binding("missing")
+            with self.assertRaises(javap_session.JavapSessionError):
+                javap_session.install_compiled_javap_session_binding(object())
+
+            linked_output = root / "linked-output"
+            linked_output.symlink_to(Path(binding.output), target_is_directory=True)
+            empty_output = root / "empty-output"
+            empty_output.mkdir()
+            invalid = (
+                replace(binding, javap=str(root / "different-javap")),
+                replace(binding, javap_size=binding.javap_size + 1),
+                replace(binding, javap_mtime_ns=binding.javap_mtime_ns + 1),
+                replace(binding, java=str(root / "different-java")),
+                replace(binding, output="relative"),
+                replace(binding, output=str(linked_output)),
+                replace(binding, helper_source_sha256="0" * 64),
+                replace(binding, output=str(empty_output.resolve())),
+                replace(binding, helper_class_sha256="0" * 64),
+            )
+            for index, changed in enumerate(invalid):
+                with self.subTest(case=index), patch.object(
+                    javap_session, "JAVA_HELPER", helper_source
+                ), self.assertRaises(javap_session.JavapSessionError):
+                    javap_session._compiled_from_binding(javap, changed)
+            with patch.object(
+                javap_session, "JAVA_HELPER", helper_source
+            ), patch.object(
+                javap_session, "_sibling_tool", return_value=None
+            ), self.assertRaises(javap_session.JavapSessionError):
+                javap_session._compiled_from_binding(javap, binding)
+
+            self.assertEqual(javap_session._resolved_tool(str(javap)), javap)
+            self.assertIsNone(
+                javap_session._resolved_tool(str(root / "missing-tool"))
+            )
+            self.assertEqual(
+                javap_session._sibling_tool(javap, "java"), Path(binding.java)
+            )
+            self.assertIsNone(javap_session._sibling_tool(javap, "missing"))
+            self.assertTrue(helper_class.is_file())
+
+    def test_javap_owned_directories_and_fork_state_are_process_local(self):
+        calls = []
+        path = Path("/private/owned-javap-test")
+        javap_session._remove_owned_directory(
+            path, 10, getpid=lambda: 11,
+            rmtree=lambda *args, **kwargs: calls.append((args, kwargs)),
+        )
+        self.assertEqual(calls, [])
+        javap_session._remove_owned_directory(
+            path, 10, getpid=lambda: 10,
+            rmtree=lambda *args, **kwargs: calls.append((args, kwargs)),
+        )
+        self.assertEqual(calls[0][0], (path,))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            owned_path = Path(temporary) / "owned"
+
+            def make_owned(**_kwargs):
+                owned_path.mkdir()
+                return owned_path
+
+            with patch.object(
+                javap_session, "make_short_temp_dir", side_effect=make_owned
+            ):
+                owned = javap_session._OwnedDirectory()
+                self.assertTrue(owned.path.is_dir())
+                owned.cleanup()
+                self.assertFalse(owned.path.exists())
+
+        javap_session._POOLS = {("old", 1, 1, "v"): object()}
+        javap_session._EXTERNAL_COMPILED_HELPERS = {"old": object()}
+        old_lock = javap_session._POOLS_LOCK
+        javap_session._after_fork_in_child()
+        self.assertEqual(javap_session._POOLS, {})
+        self.assertEqual(javap_session._EXTERNAL_COMPILED_HELPERS, {})
+        self.assertIsNot(javap_session._POOLS_LOCK, old_lock)
+
+    def test_javap_protocol_readers_cover_chunking_and_length_bounds(self):
+        class OneByteReader:
+            def __init__(self, payload):
+                self.payload = bytearray(payload)
+
+            def read(self, _size):
+                if not self.payload:
+                    return b""
+                return bytes((self.payload.pop(0),))
+
+        self.assertEqual(
+            javap_session._read_exact(OneByteReader(b"abc"), 3), b"abc"
+        )
+        with self.assertRaises(javap_session.JavapSessionError):
+            javap_session._read_exact(OneByteReader(b"a"), 2)
+        self.assertEqual(
+            javap_session._read_payload(
+                io.BytesIO((3).to_bytes(4, "big", signed=True) + b"abc"),
+                "stdout",
+            ),
+            b"abc",
+        )
+        for length in (-1, javap_session.MAX_RESPONSE_BYTES + 1):
+            with self.subTest(length=length), self.assertRaises(
+                javap_session.JavapSessionError
+            ):
+                javap_session._read_payload(
+                    io.BytesIO(length.to_bytes(4, "big", signed=True)),
+                    "stdout",
+                )
+
+    def test_javap_helper_compile_session_start_and_public_fallback_matrix(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            javap = (bin_dir / "javap").resolve()
+            java = (bin_dir / "java").resolve()
+            javac = (bin_dir / "javac").resolve()
+            source = (root / "JavapSession.java").resolve()
+            for path, content in (
+                (javap, b"javap"), (java, b"java"), (javac, b"javac"),
+                (source, b"final class JavapSession {}"),
+            ):
+                path.write_bytes(content)
+            source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+            status = javap.stat()
+
+            with patch.object(
+                javap_session, "JAVA_HELPER", source
+            ), self.assertRaises(javap_session.JavapSessionError):
+                javap_session._compile_helper.__wrapped__(
+                    str(javap), status.st_size, status.st_mtime_ns, "0" * 64
+                )
+            for missing in ("java", "javac"):
+                def sibling(_javap, name, *, missing_name=missing):
+                    if name == missing_name:
+                        return None
+                    return java if name == "java" else javac
+
+                with self.subTest(missing=missing), patch.object(
+                    javap_session, "JAVA_HELPER", source
+                ), patch.object(
+                    javap_session, "_sibling_tool", side_effect=sibling
+                ), self.assertRaises(javap_session.JavapSessionError):
+                    javap_session._compile_helper.__wrapped__(
+                        str(javap), status.st_size, status.st_mtime_ns, source_sha
+                    )
+
+            def compile_result(returncode, *, create_class):
+                def run(command, **_kwargs):
+                    output = Path(command[command.index("-d") + 1])
+                    if create_class:
+                        (output / "JavapSession.class").write_bytes(b"class")
+                    return SimpleNamespace(
+                        returncode=returncode, stderr="stderr", stdout="stdout"
+                    )
+                return run
+
+            for returncode, create_class in ((1, False), (0, False)):
+                with self.subTest(
+                    returncode=returncode, create_class=create_class
+                ), patch.object(
+                    javap_session, "JAVA_HELPER", source
+                ), patch.object(
+                    javap_session,
+                    "run_managed_subprocess",
+                    side_effect=compile_result(returncode, create_class=create_class),
+                ), self.assertRaises(javap_session.JavapSessionError):
+                    javap_session._compile_helper.__wrapped__(
+                        str(javap), status.st_size, status.st_mtime_ns, source_sha
+                    )
+
+            def stdout_only_failure(_command, **_kwargs):
+                return SimpleNamespace(
+                    returncode=1, stderr="", stdout="stdout-only failure"
+                )
+
+            with patch.object(
+                javap_session, "JAVA_HELPER", source
+            ), patch.object(
+                javap_session,
+                "run_managed_subprocess",
+                side_effect=stdout_only_failure,
+            ), self.assertRaisesRegex(
+                javap_session.JavapSessionError, "stdout-only failure"
+            ):
+                javap_session._compile_helper.__wrapped__(
+                    str(javap), status.st_size, status.st_mtime_ns, source_sha
+                )
+
+            with patch.object(
+                javap_session, "JAVA_HELPER", source
+            ), patch.object(
+                javap_session,
+                "run_managed_subprocess",
+                side_effect=compile_result(0, create_class=True),
+            ):
+                compiled = javap_session._compile_helper.__wrapped__(
+                    str(javap), status.st_size, status.st_mtime_ns, source_sha
+                )
+            self.assertTrue((compiled.output / "JavapSession.class").is_file())
+            compiled._owned_directory.cleanup()
+
+            calls = []
+
+            class EmptyThread:
+                def __init__(self, *, target, **_kwargs):
+                    self.target = target
+
+                def start(self):
+                    self.target()
+
+            process = SimpleNamespace(
+                stdin=io.BytesIO(), stdout=io.BytesIO(), stderr=io.BytesIO(),
+                poll=lambda: 0,
+            )
+            with patch.object(
+                javap_session, "JAVAP_STABLE_JVM_OPTIONS", ("-J-Xexact", "plain")
+            ), patch.object(
+                javap_session,
+                "managed_popen",
+                side_effect=lambda command, **_kwargs: calls.append(command) or process,
+            ), patch.object(javap_session.threading, "Thread", EmptyThread):
+                session = javap_session._Session(
+                    javap_session._CompiledHelper(root, str(java), None)
+                )
+            self.assertIn("-Xexact", calls[0])
+            self.assertNotIn("plain", calls[0])
+            self.assertFalse(session.alive)
+
+            cancelled = threading.Event()
+            cancelled.set()
+            self.assertIsNone(javap_session.run_persistent_javap(
+                str(javap), (), "v", cancelled, time.perf_counter() + 1
+            ))
+            with patch.object(
+                javap_session, "_resolved_tool", return_value=None
+            ):
+                self.assertIsNone(javap_session.run_persistent_javap(
+                    "missing", (), "v", threading.Event(),
+                    time.perf_counter() + 1,
+                ))
+            with patch.object(
+                javap_session, "_resolved_tool", return_value=javap
+            ), patch.object(
+                javap_session, "_pool_key", return_value=("key", 1, 1, "v")
+            ), patch.object(
+                javap_session,
+                "_SessionPool",
+                side_effect=javap_session.JavapSessionError("expected"),
+            ):
+                javap_session._POOLS.clear()
+                self.assertIsNone(javap_session.run_persistent_javap(
+                    str(javap), (), "v", threading.Event(),
+                    time.perf_counter() + 1,
+                ))
+
+    @staticmethod
+    def _javap_response(returncode=0, stdout=b"ok", stderr=b""):
+        return b"".join((
+            javap_session._RESPONSE_MAGIC,
+            int(returncode).to_bytes(4, "big", signed=True),
+            len(stdout).to_bytes(4, "big", signed=True), stdout,
+            len(stderr).to_bytes(4, "big", signed=True), stderr,
+        ))
+
+    def test_javap_session_exchange_and_close_fail_closed(self):
+        def session_for(payload, *, poll=lambda: None, stdin=None, stdout=True):
+            session = object.__new__(javap_session._Session)
+            session._closed = False
+            session._stderr_tail = bytearray(b"diagnostic")
+            session.process = SimpleNamespace(
+                stdin=io.BytesIO() if stdin is None else stdin,
+                stdout=io.BytesIO(payload) if stdout is True else stdout,
+                stderr=io.BytesIO(),
+                poll=poll,
+            )
+            return session
+
+        cancellation = threading.Event()
+        success = session_for(self._javap_response(3, b"out", b"err"))
+        result = success.exchange(
+            ("-c", "demo.Sample"), cancellation, time.perf_counter() + 5
+        )
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (3, "out", "err"))
+
+        dead = session_for(self._javap_response(), poll=lambda: 1)
+        with self.assertRaises(javap_session.JavapSessionError):
+            dead.exchange((), cancellation, time.perf_counter() + 1)
+        with patch.object(javap_session, "MAX_ARGUMENTS", 0), self.assertRaises(
+            javap_session.JavapSessionError
+        ):
+            success.exchange(("one",), cancellation, time.perf_counter() + 1)
+        with patch.object(
+            javap_session, "MAX_ARGUMENT_BYTES", 0
+        ), self.assertRaises(javap_session.JavapSessionError):
+            success.exchange(("one",), cancellation, time.perf_counter() + 1)
+        for stdin, stdout in ((None, io.BytesIO()), (io.BytesIO(), None)):
+            missing = session_for(
+                self._javap_response(), stdin=stdin, stdout=stdout
+            )
+            if stdin is None:
+                missing.process.stdin = None
+            with self.assertRaises(javap_session.JavapSessionError):
+                missing.exchange((), cancellation, time.perf_counter() + 1)
+
+        class BrokenWriter(io.BytesIO):
+            def write(self, _value):
+                raise BrokenPipeError("closed")
+
+        broken = session_for(self._javap_response(), stdin=BrokenWriter())
+        with self.assertRaises(javap_session.JavapSessionError):
+            broken.exchange((), cancellation, time.perf_counter() + 1)
+        bad_magic = session_for(b"BAD!" + self._javap_response()[4:])
+        with self.assertRaises(javap_session.JavapSessionError):
+            bad_magic.exchange((), cancellation, time.perf_counter() + 1)
+
+        for cancelled, deadline in (
+            (True, time.perf_counter() + 5),
+            (False, time.perf_counter() - 1),
+        ):
+            pending = session_for(self._javap_response())
+            event = threading.Event()
+            if cancelled:
+                event.set()
+
+            class PendingThread:
+                def __init__(self, **_kwargs):
+                    pass
+
+                def start(self):
+                    pass
+
+                def join(self, **_kwargs):
+                    pass
+
+            with self.subTest(cancelled=cancelled), patch.object(
+                javap_session.threading, "Thread", PendingThread
+            ), patch.object(pending, "close") as close, self.assertRaises(
+                javap_session.JavapSessionError
+            ):
+                pending.exchange((), event, deadline)
+            close.assert_called_once_with(terminate=True)
+
+        class CloseHandle(io.BytesIO):
+            def __init__(self, *, fail=False):
+                super().__init__()
+                self.fail = fail
+
+            def close(self):
+                if self.fail:
+                    self.fail = False
+                    raise OSError("expected")
+                super().close()
+
+        calls = []
+        process = SimpleNamespace(
+            stdin=CloseHandle(), stdout=CloseHandle(fail=True), stderr=None,
+            poll=lambda: None,
+            wait=lambda timeout: calls.append(("wait", timeout)),
+        )
+        closing = object.__new__(javap_session._Session)
+        closing._closed = False
+        closing._stderr_tail = bytearray()
+        closing.process = process
+        with patch.object(
+            javap_session, "terminate_process_tree",
+            side_effect=lambda _process: calls.append(("terminate", None)),
+        ), patch.object(
+            javap_session, "release_process_tree",
+            side_effect=lambda _process: calls.append(("release", None)),
+        ):
+            closing.close(terminate=True)
+            closing.close(terminate=False)
+        self.assertIn(("terminate", None), calls)
+        self.assertEqual(calls[-1], ("release", None))
+
+        exited_process = SimpleNamespace(
+            stdin=CloseHandle(), stdout=None, stderr=None,
+            poll=lambda: 1,
+            wait=lambda timeout: calls.append(("exited-wait", timeout)),
+        )
+        exited_closing = object.__new__(javap_session._Session)
+        exited_closing._closed = False
+        exited_closing._stderr_tail = bytearray()
+        exited_closing.process = exited_process
+        with patch.object(
+            javap_session, "terminate_process_tree"
+        ) as terminate, patch.object(javap_session, "release_process_tree"):
+            exited_closing.close(terminate=True)
+        terminate.assert_not_called()
+
+        closed = session_for(self._javap_response())
+        closed._closed = True
+        self.assertFalse(closed.alive)
+
+        for stderr in (None, io.BytesIO(b"x" * (70 * 1024))):
+            draining = session_for(self._javap_response())
+            draining.process.stderr = stderr
+            draining._drain_stderr()
+            if stderr is not None:
+                self.assertEqual(len(draining._stderr_tail), 64 * 1024)
+
+        class BrokenReader:
+            def read(self, _size):
+                raise OSError("expected")
+
+        draining = session_for(self._javap_response())
+        draining.process.stderr = BrokenReader()
+        draining._drain_stderr()
+
+        no_handles = session_for(self._javap_response(), poll=lambda: 1)
+        no_handles.process.stdin = None
+        no_handles.process.stdout = None
+        no_handles.process.stderr = None
+        no_handles.process.wait = lambda timeout: None
+        with patch.object(javap_session, "release_process_tree") as release:
+            no_handles.close(terminate=False)
+        release.assert_called_once_with(no_handles.process)
+
+    def test_javap_session_pool_covers_identity_lease_and_cleanup_matrix(self):
+        cancellation = threading.Event()
+
+        class FakeSession:
+            def __init__(self, result=None, error=None, alive=True, close_error=None):
+                self.result = result or javap_session.JavapSessionResult(0, "v", "")
+                self.error = error
+                self.alive = alive
+                self.close_error = close_error
+                self.closed = []
+
+            def exchange(self, *_args):
+                if self.error:
+                    raise self.error
+                return self.result
+
+            def close(self, *, terminate):
+                self.closed.append(terminate)
+                if self.close_error:
+                    raise self.close_error
+
+        pool = object.__new__(javap_session._SessionPool)
+        pool.expected_version = "v"
+        pool._compiled = object()
+        for result in (
+            javap_session.JavapSessionResult(1, "v", ""),
+            javap_session.JavapSessionResult(0, "wrong", ""),
+        ):
+            candidate = FakeSession(result=result)
+            with patch.object(javap_session, "_Session", return_value=candidate), self.assertRaises(
+                javap_session.JavapSessionError
+            ):
+                pool._new_session(cancellation, time.perf_counter() + 1)
+            self.assertEqual(candidate.closed, [True])
+        candidate = FakeSession()
+        with patch.object(javap_session, "_Session", return_value=candidate):
+            self.assertIs(
+                pool._new_session(cancellation, time.perf_counter() + 1),
+                candidate,
+            )
+        stderr_candidate = FakeSession(
+            result=javap_session.JavapSessionResult(0, "", "v")
+        )
+        with patch.object(
+            javap_session, "_Session", return_value=stderr_candidate
+        ):
+            self.assertIs(
+                pool._new_session(cancellation, time.perf_counter() + 1),
+                stderr_candidate,
+            )
+
+        lease = object.__new__(javap_session._SessionPool)
+        lease._condition = threading.Condition()
+        lease._idle = javap_session.queue.LifoQueue()
+        lease._session_count = 0
+        lease.max_sessions = 1
+        lease._closed = False
+        created = FakeSession()
+        lease._new_session = lambda *_args: created
+        self.assertIs(
+            lease._acquire(cancellation, time.perf_counter() + 1), created
+        )
+        lease._idle.put(created)
+        self.assertIs(
+            lease._acquire(cancellation, time.perf_counter() + 1), created
+        )
+        lease._closed = True
+        with self.assertRaises(javap_session.JavapSessionError):
+            lease._acquire(cancellation, time.perf_counter() + 1)
+        lease._closed = False
+        lease._session_count = 1
+        cancelled = threading.Event()
+        cancelled.set()
+        with self.assertRaises(javap_session.JavapSessionError):
+            lease._acquire(cancelled, time.perf_counter() + 1)
+        with self.assertRaises(javap_session.JavapSessionError):
+            lease._acquire(threading.Event(), time.perf_counter() - 1)
+        wait_event = threading.Event()
+
+        def cancel_after_wait(*_args, **_kwargs):
+            wait_event.set()
+
+        with patch.object(
+            lease._condition, "wait", side_effect=cancel_after_wait
+        ), self.assertRaises(javap_session.JavapSessionError):
+            lease._acquire(wait_event, time.perf_counter() + 1)
+        self.assertTrue(wait_event.is_set())
+
+        run_pool = object.__new__(javap_session._SessionPool)
+        run_pool._condition = threading.Condition()
+        run_pool._idle = javap_session.queue.LifoQueue()
+        run_pool._session_count = 1
+        run_pool._closed = False
+        reusable = FakeSession(alive=True)
+        run_pool._acquire = lambda *_args: reusable
+        self.assertEqual(
+            run_pool.run((), cancellation, time.perf_counter() + 1).stdout,
+            "v",
+        )
+        self.assertIs(run_pool._idle.get_nowait(), reusable)
+        run_pool._closed = True
+        closed_reusable = FakeSession(alive=True)
+        run_pool._acquire = lambda *_args: closed_reusable
+        run_pool._session_count = 1
+        run_pool.run((), cancellation, time.perf_counter() + 1)
+        self.assertEqual(closed_reusable.closed, [True])
+        self.assertEqual(run_pool._session_count, 0)
+        run_pool._closed = False
+        disposable = FakeSession(alive=False)
+        run_pool._acquire = lambda *_args: disposable
+        run_pool._session_count = 1
+        run_pool.run((), cancellation, time.perf_counter() + 1)
+        self.assertEqual(disposable.closed, [True])
+        self.assertEqual(run_pool._session_count, 0)
+
+        failure_pool = object.__new__(javap_session._SessionPool)
+        failure_pool._condition = threading.Condition()
+        failure_pool._idle = javap_session.queue.LifoQueue()
+        failure_pool._session_count = 1
+        failure_pool._closed = False
+        failing = FakeSession(
+            error=javap_session.JavapSessionError("expected"), alive=False
+        )
+        failure_pool._acquire = lambda *_args: failing
+        with self.assertRaises(javap_session.JavapSessionError):
+            failure_pool.run((), cancellation, time.perf_counter() + 1)
+        self.assertEqual(failing.closed, [True])
+
+        already_closed = object.__new__(javap_session._SessionPool)
+        already_closed._condition = threading.Condition()
+        already_closed._idle = javap_session.queue.LifoQueue()
+        already_closed._session_count = 0
+        already_closed._closed = True
+        already_closed.close()
+        close_failure = object.__new__(javap_session._SessionPool)
+        close_failure._condition = threading.Condition()
+        close_failure._idle = javap_session.queue.LifoQueue()
+        close_failure._idle.put(FakeSession(close_error=RuntimeError("close")))
+        close_failure._session_count = 1
+        close_failure._closed = False
+        with self.assertRaisesRegex(RuntimeError, "close"):
+            close_failure.close()
+
+    def test_javap_pool_registry_reuses_exact_tool_identity_and_closes_all(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            javap = root / "javap"
+            javap.write_bytes(b"javap")
+            compiled = javap_session._CompiledHelper(root, "java", None)
+            with patch.object(
+                javap_session, "_compiled_helper", return_value=compiled
+            ):
+                pool = javap_session._SessionPool(javap, "version", 999)
+                self.assertEqual(pool.max_sessions, javap_session.MAX_SESSION_PROCESSES)
+                self.assertIs(pool._compiled, compiled)
+                small = javap_session._SessionPool(javap, "version", 0)
+                self.assertEqual(small.max_sessions, 1)
+
+            binding = object()
+            with patch.object(
+                javap_session, "_compile_helper", return_value=compiled
+            ) as compile_helper:
+                javap_session._EXTERNAL_COMPILED_HELPERS.clear()
+                self.assertIs(javap_session._compiled_helper(javap), compiled)
+            compile_helper.assert_called_once()
+            with patch.object(
+                javap_session, "_compiled_from_binding", return_value=compiled
+            ) as from_binding:
+                javap_session._EXTERNAL_COMPILED_HELPERS[str(javap)] = binding
+                self.assertIs(javap_session._compiled_helper(javap), compiled)
+            from_binding.assert_called_once_with(javap, binding)
+
+            calls = []
+
+            class FakePool:
+                def __init__(self, *_args):
+                    calls.append("created")
+
+                def run(self, arguments, *_args):
+                    calls.append(tuple(arguments))
+                    return javap_session.JavapSessionResult(0, "ok", "")
+
+                def close(self):
+                    calls.append("closed")
+
+            javap_session._POOLS.clear()
+            event = threading.Event()
+            with patch.object(
+                javap_session, "_resolved_tool", return_value=javap
+            ), patch.object(
+                javap_session, "_pool_key", return_value=("key", 1, 1, "v")
+            ), patch.object(javap_session, "_SessionPool", FakePool):
+                self.assertEqual(
+                    javap_session.run_persistent_javap(
+                        str(javap), (), "v", event, time.perf_counter() + 1
+                    ).stdout,
+                    "ok",
+                )
+                self.assertEqual(
+                    javap_session.run_persistent_javap(
+                        str(javap), ("-c",), "v", event,
+                        time.perf_counter() + 1,
+                    ).stdout,
+                    "ok",
+                )
+            self.assertEqual(calls.count("created"), 1)
+            self.assertIn((), calls)
+            self.assertIn(("-c",), calls)
+            javap_session.close_persistent_javap_sessions()
+            self.assertIn("closed", calls)
+            javap_session.close_persistent_javap_sessions()
+
+            with patch.object(
+                javap_session.shutil, "which", return_value=str(javap)
+            ):
+                self.assertEqual(
+                    javap_session._resolved_tool("javap"), javap.resolve()
+                )
+            windows_java = root / "java.exe"
+            windows_java.write_bytes(b"java")
+            with patch.object(javap_session.os, "name", "nt"):
+                self.assertEqual(
+                    javap_session._sibling_tool(javap, "java"), windows_java
+                )
+
     def test_performance_identity_rejects_every_structural_boundary(self):
         valid_sha = "a" * 64
         valid_source_components = {
@@ -347,13 +1114,14 @@ class InternalFailureHelperContractTest(unittest.TestCase):
 
     def test_platform_failure_normalizes_class_name_before_lookup(self):
         image = object.__new__(JdkPlatformImage)
+        image._facts = {}
         image._failures = {"java/lang/Missing": {"reason": "not found"}}
         image.ensure_classes = MagicMock()
 
         self.assertEqual(
             image.failure("java.lang.Missing"), {"reason": "not found"},
         )
-        image.ensure_classes.assert_called_once_with(("java/lang/Missing",))
+        image.ensure_classes.assert_not_called()
 
     def test_diagnostic_mapping_is_shallow_immutable_and_canonical(self):
         source = {

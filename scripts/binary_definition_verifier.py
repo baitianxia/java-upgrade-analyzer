@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from functools import lru_cache
 import hashlib
 import io
@@ -10,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import struct
 import time
 import weakref
@@ -82,10 +84,28 @@ class _CompiledDefinitionHelper:
     def __init__(
         self,
         output: Path,
-        temporary_directory: _OwnedHelperDirectory,
+        temporary_directory: _OwnedHelperDirectory | None,
     ) -> None:
         self.output = output
         self._temporary_directory = temporary_directory
+
+
+@dataclass(frozen=True)
+class CompiledDefinitionHelperBinding:
+    """Content proof for one parent-compiled definition verifier."""
+
+    source_sha256: str
+    javac_path: str
+    output_path: Path
+    class_files: tuple[tuple[str, int, str], ...]
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "source_sha256": self.source_sha256,
+            "javac_path": self.javac_path,
+            "output_path": str(self.output_path),
+            "class_files": [list(item) for item in self.class_files],
+        }
 
 
 def _sha256_file(path: Path) -> str:
@@ -130,6 +150,162 @@ def _compile_helper(
     except BaseException:
         temporary.cleanup()
         raise
+
+
+def _compiled_helper_manifest(
+    output: Path,
+) -> tuple[tuple[str, int, str], ...]:
+    root = Path(output)
+    try:
+        if (
+            not root.is_absolute()
+            or root.resolve() != root
+            or not stat.S_ISDIR(root.lstat().st_mode)
+        ):
+            raise ValueError("compiled verifier root is not canonical")
+        records = []
+        for path in sorted(root.rglob("*")):
+            mode = path.lstat().st_mode
+            if stat.S_ISDIR(mode):
+                continue
+            if not stat.S_ISREG(mode) or path.suffix != ".class":
+                raise ValueError("compiled verifier contains an unexpected entry")
+            records.append((
+                path.relative_to(root).as_posix(),
+                path.stat().st_size,
+                _sha256_file(path),
+            ))
+    except (OSError, ValueError) as error:
+        raise ClassDefinitionVerifierError(
+            "CLASS_DEFINITION_COMPILED_BINDING_INVALID", str(error)
+        ) from error
+    if not records or not any(
+        name == "ClassDefinitionVerifier.class"
+        for name, _size, _sha in records
+    ):
+        raise ClassDefinitionVerifierError(
+            "CLASS_DEFINITION_COMPILED_BINDING_INVALID",
+            "main verifier class is missing",
+        )
+    return tuple(records)
+
+
+def compiled_definition_helper_binding_from_mapping(
+    value: Mapping[str, Any],
+) -> CompiledDefinitionHelperBinding:
+    fields = {"source_sha256", "javac_path", "output_path", "class_files"}
+    if not isinstance(value, Mapping) or set(value) != fields:
+        raise ClassDefinitionVerifierError(
+            "CLASS_DEFINITION_COMPILED_BINDING_INVALID", "binding fields changed"
+        )
+    raw_files = value.get("class_files")
+    if not isinstance(raw_files, list):
+        raise ClassDefinitionVerifierError(
+            "CLASS_DEFINITION_COMPILED_BINDING_INVALID", "class_files"
+        )
+    class_files = []
+    for item in raw_files:
+        if (
+            not isinstance(item, list)
+            or len(item) != 3
+            or type(item[0]) is not str
+            or type(item[1]) is not int
+            or type(item[2]) is not str
+        ):
+            raise ClassDefinitionVerifierError(
+                "CLASS_DEFINITION_COMPILED_BINDING_INVALID", "class_files"
+            )
+        class_files.append((item[0], item[1], item[2]))
+    return CompiledDefinitionHelperBinding(
+        source_sha256=str(value["source_sha256"]),
+        javac_path=str(value["javac_path"]),
+        output_path=Path(str(value["output_path"])),
+        class_files=tuple(class_files),
+    )
+
+
+def _compiled_helper_from_binding(
+    binding: CompiledDefinitionHelperBinding,
+) -> _CompiledDefinitionHelper:
+    if type(binding) is not CompiledDefinitionHelperBinding:
+        raise ClassDefinitionVerifierError(
+            "CLASS_DEFINITION_COMPILED_BINDING_INVALID", "binding type"
+        )
+    for field_name, value in (
+        ("source_sha256", binding.source_sha256),
+        *(
+            (f"class_files[{index}].sha256", item[2])
+            for index, item in enumerate(binding.class_files)
+        ),
+    ):
+        if (
+            len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ClassDefinitionVerifierError(
+                "CLASS_DEFINITION_COMPILED_BINDING_INVALID", field_name
+            )
+    javac_path = Path(binding.javac_path)
+    output_path = binding.output_path
+    try:
+        canonical = all(
+            path.is_absolute() and path.resolve() == path
+            for path in (javac_path, output_path)
+        )
+    except OSError as error:
+        raise ClassDefinitionVerifierError(
+            "CLASS_DEFINITION_COMPILED_BINDING_INVALID", str(error)
+        ) from error
+    if not canonical or not javac_path.is_file():
+        raise ClassDefinitionVerifierError(
+            "CLASS_DEFINITION_COMPILED_BINDING_INVALID", "javac path changed"
+        )
+    if _sha256_file(JAVA_HELPER) != binding.source_sha256:
+        raise ClassDefinitionVerifierError(
+            "CLASS_DEFINITION_COMPILED_BINDING_CHANGED", "source changed"
+        )
+    if _compiled_helper_manifest(output_path) != binding.class_files:
+        raise ClassDefinitionVerifierError(
+            "CLASS_DEFINITION_COMPILED_BINDING_CHANGED", "classes changed"
+        )
+    return _CompiledDefinitionHelper(output_path, None)
+
+
+_INSTALLED_COMPILED_DEFINITION_HELPER: tuple[
+    CompiledDefinitionHelperBinding, _CompiledDefinitionHelper
+] | None = None
+
+
+def capture_compiled_definition_helper_binding(
+    platform: JdkPlatformImage,
+) -> CompiledDefinitionHelperBinding:
+    source_sha = _sha256_file(JAVA_HELPER)
+    javac = jdk_tool_path(platform.jdk_home, "javac").resolve()
+    if not javac.is_file():
+        raise ClassDefinitionVerifierError(
+            "TARGET_JAVAC_MISSING", "a full target JDK is required"
+        )
+    compiled = _compile_helper(str(javac), source_sha)
+    return CompiledDefinitionHelperBinding(
+        source_sha256=source_sha,
+        javac_path=str(javac),
+        output_path=compiled.output,
+        class_files=_compiled_helper_manifest(compiled.output),
+    )
+
+
+def install_compiled_definition_helper_binding(
+    binding: CompiledDefinitionHelperBinding,
+) -> None:
+    compiled = _compiled_helper_from_binding(binding)
+    global _INSTALLED_COMPILED_DEFINITION_HELPER
+    _INSTALLED_COMPILED_DEFINITION_HELPER = (binding, compiled)
+
+
+def verify_compiled_definition_helper_binding(
+    binding: CompiledDefinitionHelperBinding,
+) -> None:
+    _compiled_helper_from_binding(binding)
 
 
 if hasattr(os, "register_at_fork"):
@@ -409,12 +585,20 @@ def verify_class_definitions(
     phase_time_budget_seconds: float = _VERIFY_PHASE_TIME_BUDGET_SECONDS,
 ) -> dict[str, dict[str, Any]]:
     source_sha = _sha256_file(JAVA_HELPER)
-    javac = jdk_tool_path(platform.jdk_home, "javac")
+    javac = jdk_tool_path(platform.jdk_home, "javac").resolve()
     if not javac.is_file():
         raise ClassDefinitionVerifierError(
             "TARGET_JAVAC_MISSING", "a full target JDK is required to compile the verifier"
         )
-    compiled_helper = _compile_helper(str(javac), source_sha)
+    installed = _INSTALLED_COMPILED_DEFINITION_HELPER
+    if (
+        installed is not None
+        and installed[0].source_sha256 == source_sha
+        and installed[0].javac_path == str(javac)
+    ):
+        compiled_helper = installed[1]
+    else:
+        compiled_helper = _compile_helper(str(javac), source_sha)
     helper_dir = compiled_helper.output
     all_names = sorted(selected_class_bytes)
     invalid_names = [
@@ -533,6 +717,11 @@ def verify_class_definitions(
 
 __all__ = [
     "ClassDefinitionVerifierError",
+    "CompiledDefinitionHelperBinding",
+    "capture_compiled_definition_helper_binding",
+    "compiled_definition_helper_binding_from_mapping",
+    "install_compiled_definition_helper_binding",
     "verifier_identity",
+    "verify_compiled_definition_helper_binding",
     "verify_class_definitions",
 ]

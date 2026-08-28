@@ -136,6 +136,8 @@ Artifact identity 由逻辑和物理两部分组成：
 - security/topology facts；
 - parser、selection 和 pairing completeness。
 
+独立制品可以按可用内存和 CPU 有界并行；每个任务仍读取完整 ZIP、完整 classfile 和完整资源事实。ASM helper 使用长度分帧的长驻会话减少 JVM 冷启动，但每次请求仍校验 header/footer、输入输出数量、逐帧摘要和 parser identity。父进程编译产物传给子进程前后均校验源码、class、JDK 和 ASM 字节；绑定失效、会话损坏或传输失败时，必须回到同一 helper 的完整 one-shot 执行，不能跳过 class。空闲会话用协议 EOF 正常退出，只有超时或异常才执行进程树强制终止；并行清理线程完成后由所有者主线程恢复 POSIX 信号状态，不能留下无进程的管理器状态。
+
 ZIP 时间戳、条目顺序、签名重打包等只有在版本化安全规则证明不影响已声明分析范围时才能排除。未知 attribute、解析失败、pairing 歧义或无法证明安全的差异不能被归为“无变化”。
 
 ### 6.2 Step5A：Runtime-effective reconciliation
@@ -151,7 +153,9 @@ ZIP 时间戳、条目顺序、签名重打包等只有在版本化安全规则�
 
 Artifact-local 变化只有在当前 realm/profile 下生效，或它本身属于当前分析范围可观察事实时，才能进入正式裁决。被其他 provider 遮蔽的变化保留审计证据，但不能生成正式 API 目标。
 
-Runtime reconciliation 以调用边 `rowid` 的确定性顺序生成并分块持久化。fact-store 的 reconciliation chunk ordinal 只用于恢复该顺序和提高 SQLite 局部性，不是事实、完整性或排序真值：ordinal 缺失、损坏或旧库不具备该表时，所有消费者仍必须读取全部 chunk，并对无法顺序合并的记录执行精确主键回退。schema 变化必须使旧 checkpoint 失效并重建，不能把旧库静默解释为新库。
+Runtime reconciliation 以调用边 `rowid` 的确定性顺序生成并分块持久化。当前 fact-store schema 是 `binary-fact-sqlite-v11`：v9 的 chunk ordinal 继续提供局部性；v10 把重复 envelope 拆成 payload/metadata；v11 再把重复 payload key 写成受校验的列式 shape+value 行，并允许从 payload 中精确派生固定 status/subject 字段。缺字段与显式 `null` 必须保持可区分，shape、数量或元数据不规范必须失败关闭；v9/v10 chunk 仅提供只读解码兼容，新 generation 只写 v11。class fact 中已经由同一 SQLite 行拥有的 ArtifactInstance identity 以受摘要保护的规范化占位符保存，精确 rebind 恢复目标 identity，摘要、占位符或计数不一致即拒绝复用。
+
+fact-store 的 reconciliation chunk ordinal 只用于恢复顺序和提高 SQLite 局部性，不是事实、完整性或排序真值：ordinal 缺失、损坏或旧库不具备该表时，所有消费者仍必须读取全部 chunk，并对无法顺序合并的记录执行精确主键回退。schema 变化必须使旧 checkpoint 失效并重建，不能把旧库静默解释为新库。base/current 是不同 runtime side 且两侧规模与内存满足门槛时，可由两个隔离进程并行 reconciliation；每个进程独占一侧 SQLite，并校验 RuntimeProfile、平台、capability、helper 字节和完整结果 identity。启动、绑定或 worker 结果失败时回到父进程的完整串行实现。两侧运行输入完全相同时只运行一次 deterministic reconciliation，再用 SQLite backup 复制全部可独立验证证据；Oracle 的两个具名 SQLite sidecar 从该已完成 backup 的同一精确字节镜像产生，仍分别校验路径、摘要和绑定身份，但不重复逻辑读取已证明逐字节相同的数据库。不同 runtime side 禁止使用该路径。
 
 ### 6.3 Step4B：Decision 与 projection freeze
 
@@ -378,8 +382,11 @@ DecisionEngine 解压 provider/definition chunk 后可以在 base/current compac
 - 缓存键包含 artifact SHA、RuntimeProfile、policy 和 parser version；
 - 缓存完整性失败直接重建，不能读取近似结果；
 - reconciliation ordinal、顺序游标和整数 rowid 只能作为局部性提示；任何提示缺失都必须精确回退并保持完整事实集合；
+- reconciliation v11 的列式 shape、派生 metadata 和 class-fact identity 占位符都必须可逆并受摘要/数量校验；v9/v10 只读兼容不得改变重建出的记录 identity；
 - 内存压力只允许降低 worker/cache 数量，不能降低 class、member、edge、archive entry 或 JVM observation 数量；
 - 独立验证的五个调用边解析域共享一次顺序表扫描，禁止为每域复制 SHA 索引或重复全表随机读取；
+- 独立 `javap` 按制品由最多六个隔离进程并行解析，worker 只返回受结构校验的压缩投影；每个 worker 内复用目标 JDK 自带的 `ToolProvider`，其失败必须回到完整线程/one-shot `javap`，不能把 transport 失败解释为没有边；
+- target-JVM observation、declared-member 补全和 base/current 只读字段共享都必须先证明集合/逐值严格相等；缓存或共享失败只增加工作量，不改变 Oracle truth；
 - 记录端到端耗时、各 phase 耗时、峰值 RSS、archive/class/edge 数和缓存命中率；
 - 性能回归门和准确性 Oracle 同时通过后才能发布。
 

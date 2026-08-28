@@ -1773,6 +1773,37 @@ class FinalArtifactProcessAndExtractionBoundaryTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            with patch.object(
+                oracle, "_classfile_header_facts", return_value=(False, 0)
+            ):
+                entries, failures = oracle._extract_packaged_classes(
+                    plain_archive,
+                    root,
+                    21,
+                    defer_writes=True,
+                    retain_class_bytes=True,
+                )
+            self.assertEqual(entries[0].content, self.CLASS_BYTES)
+            self.assertEqual(failures, [])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch.object(
+                oracle, "_classfile_header_facts", return_value=(False, 0)
+            ):
+                entries, failures = oracle._extract_packaged_classes(
+                    two_classes,
+                    root,
+                    21,
+                    retain_class_bytes=True,
+                    max_staged_class_bytes=len(self.CLASS_BYTES),
+                )
+            self.assertEqual(len(entries), 2)
+            self.assertTrue(all(entry.content is None for entry in entries))
+            self.assertEqual(failures, [])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
             with patch.object(oracle, "_classfile_header_facts", return_value=(False, 0)), patch.object(
                 oracle, "_stage_javap_archive", side_effect=OSError("staging failed"),
             ):
@@ -1839,6 +1870,10 @@ class FinalArtifactJavapExecutionBoundaryTest(unittest.TestCase):
                     "jar:file:///C:/work/app.jar!/classes/a.class"
                 ),
             )
+            self.assertEqual(
+                oracle._javap_path_key("jar:file:///C:/work/app.jar"),
+                "jar:file:///c:/work/app.jar",
+            )
 
         transient = OSError(errno.EACCES, "temporarily denied")
         transient.winerror = 5
@@ -1858,6 +1893,209 @@ class FinalArtifactJavapExecutionBoundaryTest(unittest.TestCase):
         self.assertIs(started, process)
         self.assertEqual(popen.call_count, 2)
         cancellation.wait.assert_called_once()
+
+    def test_spawn_retry_exhaustion_cancellation_deadline_and_empty_attempts(self):
+        transient = OSError(errno.EAGAIN, "retry")
+        cancellation = Mock()
+        cancellation.is_set.side_effect = (False, True)
+        with patch.object(
+            oracle, "managed_popen", side_effect=transient,
+        ), patch.object(oracle.time, "perf_counter", return_value=0):
+            with self.assertRaises(OSError):
+                oracle._spawn_javap(["javap"], cancellation, 10)
+
+        cancellation = Mock()
+        cancellation.is_set.return_value = False
+        cancellation.wait.return_value = False
+        with patch.object(
+            oracle, "managed_popen", side_effect=transient,
+        ), patch.object(
+            oracle.time, "perf_counter", return_value=10,
+        ):
+            with self.assertRaises(OSError):
+                oracle._spawn_javap(["javap"], cancellation, 1)
+
+        cancellation = Mock()
+        cancellation.is_set.return_value = False
+        with patch.object(oracle, "JAVAP_SPAWN_MAX_ATTEMPTS", 0):
+            with self.assertRaisesRegex(TimeoutError, "deadline exceeded"):
+                oracle._spawn_javap(["javap"], cancellation, 1)
+
+        cancellation = Mock()
+        cancellation.is_set.return_value = False
+        cancellation.wait.return_value = False
+        with patch.object(
+            oracle, "managed_popen", side_effect=transient,
+        ), patch.object(oracle.time, "perf_counter", return_value=0):
+            with self.assertRaises(OSError):
+                oracle._spawn_javap(["javap"], cancellation, 10)
+
+    def test_persistent_single_and_group_javap_transport_boundaries(self):
+        from javap_session import JavapSessionResult
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = self.entry(root, "A.class", requires_verbose_javap=False)
+            second = self.entry(root, "B.class", requires_verbose_javap=False)
+            failed = JavapSessionResult(1, "stdout", "stderr")
+            with patch.object(
+                oracle, "run_persistent_javap", return_value=failed,
+            ) as persistent, patch.object(
+                oracle, "_spawn_javap",
+                side_effect=AssertionError("one-shot fallback was not expected"),
+            ), patch.object(oracle.time, "perf_counter", return_value=0):
+                result = oracle._parse_entry_with_javap(
+                    first, "sha", "javap", "21", Event(), 100,
+                    persistent_javap_sessions=True,
+                )
+            self.assertIn("javap failed: stderr", result["failures"][0])
+            persistent.assert_called_once()
+
+            changing = Mock()
+            changing.is_set.side_effect = (False, True)
+            with patch.object(
+                oracle, "run_persistent_javap", return_value=None,
+            ), patch.object(oracle.time, "perf_counter", return_value=0):
+                result = oracle._parse_entry_with_javap(
+                    first, "sha", "javap", "21", changing, 100,
+                    persistent_javap_sessions=True,
+                )
+            self.assertFalse(result["completed"])
+
+            with patch.object(
+                oracle, "run_persistent_javap", return_value=None,
+            ), patch.object(
+                oracle, "_spawn_javap", return_value=self.process(returncode=1),
+            ) as spawn, patch.object(
+                oracle, "release_process_tree",
+            ), patch.object(oracle.time, "perf_counter", return_value=0):
+                result = oracle._parse_entry_with_javap(
+                    first, "sha", "javap", "21", Event(), 100,
+                    persistent_javap_sessions=True,
+                )
+            self.assertFalse(result["parsed"])
+            spawn.assert_called_once()
+
+            event = Mock()
+            event.is_set.return_value = False
+            with patch.object(
+                oracle, "run_persistent_javap", return_value=None,
+            ), patch.object(
+                oracle.time, "perf_counter", side_effect=(0, 0, 101),
+            ):
+                result = oracle._parse_entry_with_javap(
+                    first, "sha", "javap", "21", event, 100,
+                    persistent_javap_sessions=True,
+                )
+            self.assertFalse(result["completed"])
+
+            fallback = {
+                "rows": [], "failures": [], "completed": True, "parsed": True,
+            }
+            with patch.object(
+                oracle, "run_persistent_javap", return_value=failed,
+            ), patch.object(
+                oracle, "_parse_entry_with_javap", return_value=fallback,
+            ) as separate, patch.object(
+                oracle.time, "perf_counter", return_value=0,
+            ):
+                results = oracle._parse_entry_group_with_javap(
+                    [first, second], "sha", "javap", "21", Event(), 100,
+                    force_verbose=False, persistent_javap_sessions=True,
+                )
+            self.assertEqual(len(results), 2)
+            self.assertEqual(separate.call_count, 2)
+
+            changing = Mock()
+            changing.is_set.side_effect = (False, True)
+            with patch.object(
+                oracle, "run_persistent_javap", return_value=None,
+            ), patch.object(oracle.time, "perf_counter", return_value=0):
+                results = oracle._parse_entry_group_with_javap(
+                    [first, second], "sha", "javap", "21", changing, 100,
+                    force_verbose=False, persistent_javap_sessions=True,
+                )
+            self.assertTrue(all(not result["completed"] for result in results))
+
+            event = Mock()
+            event.is_set.return_value = False
+            with patch.object(
+                oracle, "run_persistent_javap", return_value=None,
+            ), patch.object(
+                oracle.time, "perf_counter", side_effect=(0, 0, 101),
+            ):
+                results = oracle._parse_entry_group_with_javap(
+                    [first, second], "sha", "javap", "21", event, 100,
+                    force_verbose=False, persistent_javap_sessions=True,
+                )
+            self.assertTrue(all(not result["completed"] for result in results))
+
+            with patch.object(
+                oracle, "run_persistent_javap", return_value=None,
+            ), patch.object(
+                oracle, "_spawn_javap", return_value=self.process(returncode=1),
+            ) as spawn, patch.object(
+                oracle, "release_process_tree",
+            ), patch.object(
+                oracle, "_parse_entry_with_javap", return_value=fallback,
+            ), patch.object(oracle.time, "perf_counter", return_value=0):
+                results = oracle._parse_entry_group_with_javap(
+                    [first, second], "sha", "javap", "21", Event(), 100,
+                    force_verbose=False, persistent_javap_sessions=True,
+                )
+            self.assertEqual(len(results), 2)
+            spawn.assert_called_once()
+
+            success = JavapSessionResult(
+                0,
+                f"Classfile {first.extracted_path}\nfirst\n"
+                f"Classfile {second.extracted_path}\nsecond\n",
+                "",
+            )
+            inventory = FinalArtifactParserBoundaryTest.inventory()
+            inventory_future = Mock()
+            inventory_future.result.return_value = ((inventory, None),)
+            with patch.object(
+                oracle, "run_persistent_javap", return_value=success,
+            ), patch.object(oracle.time, "perf_counter", return_value=0):
+                with self.assertRaisesRegex(RuntimeError, "conservation mismatch"):
+                    oracle._parse_entry_group_with_javap_impl(
+                        [first, second], "sha", "javap", "21", Event(), 100,
+                        force_verbose=False,
+                        persistent_javap_sessions=True,
+                        inventory_future=inventory_future,
+                    )
+
+            for error in (
+                TimeoutError("timeout"),
+                OSError(errno.EAGAIN, "retryable"),
+            ):
+                with self.subTest(error=type(error).__name__), patch.object(
+                    oracle, "_spawn_javap", side_effect=error,
+                ), patch.object(
+                    oracle, "_parse_entry_with_javap", return_value=fallback,
+                ), patch.object(oracle.time, "perf_counter", return_value=0):
+                    results = oracle._parse_entry_group_with_javap(
+                        [first, second], "sha", "javap", "21", Event(), 100,
+                        force_verbose=False,
+                    )
+                self.assertEqual(len(results), 2)
+
+            with patch.object(
+                oracle, "_parse_entry_group_with_javap",
+                return_value=[fallback],
+            ) as parse_group:
+                results, submitted, timed_out, interrupted = oracle._parse_entry_batch(
+                    [first], "sha", "javap", "21", Event(), None, 1,
+                    persistent_javap_sessions=True,
+                )
+            self.assertEqual(submitted, 1)
+            self.assertFalse(timed_out)
+            self.assertFalse(interrupted)
+            self.assertTrue(results[0]["parsed"])
+            self.assertTrue(
+                parse_group.call_args.kwargs["persistent_javap_sessions"]
+            )
 
     def test_single_entry_javap_preflight_execution_and_result_matrix(self):
         with tempfile.TemporaryDirectory() as temporary:

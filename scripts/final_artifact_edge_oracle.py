@@ -28,6 +28,10 @@ from compat import (
 )
 from edge_truth import EdgeIdentity, canonical_edge_identity
 from javap_contract import JAVAP_STABLE_JVM_OPTIONS, javap_command
+from javap_session import (
+    close_persistent_javap_sessions,
+    run_persistent_javap,
+)
 from path_runtime import short_temporary_directory
 
 
@@ -142,7 +146,7 @@ PROCEDURE = (
     "ACC_MODULE module descriptors and retain malformed ACC_MODULE classfiles "
     "for fail-closed scanning"
 )
-ORACLE_PROCEDURE_VERSION = "java-upgrade-analyzer.final-artifact-javap.v17"
+ORACLE_PROCEDURE_VERSION = "java-upgrade-analyzer.final-artifact-javap.v18"
 MAX_JAVAP_WORKERS = 8
 # Windows' command-line limit is much smaller than POSIX ARG_MAX. On POSIX,
 # larger batches materially reduce target-JVM startup overhead while remaining
@@ -213,11 +217,26 @@ class BootstrapReferenceSet:
     type_arguments: tuple[tuple[str, str], ...]
 
 
+@dataclass(frozen=True)
+class _JavapLinkageIndex:
+    """One immutable parse of linkage tables shared by both Oracle parsers."""
+
+    lines: tuple[str, ...]
+    dynamic_references: dict[int, tuple[int, str, str]]
+    constant_dynamic_references: dict[int, tuple[int, str, str]]
+    method_handle_interfaces: dict[int, bool]
+    bootstrap_references: dict[int, BootstrapReferenceSet]
+
+
 def clear_immutable_oracle_cache() -> None:
     """Reset process-local immutable oracle results for isolated tests."""
     with _IMMUTABLE_ORACLE_CACHE_LOCK:
         _IMMUTABLE_ORACLE_CACHE.clear()
         _JAVAP_VERSION_CACHE.clear()
+    # Validation keeps a bounded pool of target-JDK javap ToolProvider
+    # processes across artifact scans.  A cache/run boundary must also release
+    # those JVMs so they cannot retain memory or tool state into another run.
+    close_persistent_javap_sessions()
 
 
 def _decode_modified_utf8(value: bytes) -> str:
@@ -860,6 +879,7 @@ def _extract_packaged_classes(
     *,
     defer_writes: bool = False,
     stage_javap_archive: bool = False,
+    retain_class_bytes: bool = False,
     max_staged_class_bytes: int = MAX_STAGED_JAVAP_CLASS_BYTES,
     excluded_nested_jars: set[str] | None = None,
     include_nested_runtime_jars: bool = True,
@@ -868,9 +888,12 @@ def _extract_packaged_classes(
     failures: list[str] = []
     staged_class_bytes = 0
     staging_enabled = bool(stage_javap_archive)
+    retained_class_bytes = 0
+    retention_enabled = bool(retain_class_bytes)
 
     def spill_staged_entries() -> None:
-        nonlocal entries, staging_enabled
+        nonlocal entries, retained_class_bytes, retention_enabled
+        nonlocal staging_enabled
         materialized: list[PackagedClass] = []
         for entry in entries:
             # This helper is only reached while staging is enabled; staged
@@ -893,12 +916,30 @@ def _extract_packaged_classes(
             ))
         entries = materialized
         staging_enabled = False
+        retained_class_bytes = 0
+        retention_enabled = False
+
+    def discard_retained_bytes() -> None:
+        nonlocal entries, retained_class_bytes, retention_enabled
+        entries = [
+            PackagedClass(
+                artifact_entry=entry.artifact_entry,
+                extracted_path=entry.extracted_path,
+                content=None,
+                requires_verbose_javap=entry.requires_verbose_javap,
+                javap_argument=entry.javap_argument,
+            )
+            for entry in entries
+        ]
+        retained_class_bytes = 0
+        retention_enabled = False
 
     def append_class(
         artifact_entry: str,
         content: bytes,
         requires_verbose: bool,
     ) -> None:
+        nonlocal retained_class_bytes, retention_enabled
         nonlocal staged_class_bytes, staging_enabled
         if staging_enabled:
             if staged_class_bytes + len(content) <= max_staged_class_bytes:
@@ -915,10 +956,21 @@ def _extract_packaged_classes(
         path = destination / f"class-{len(entries):06d}.class"
         if not defer_writes:
             path = _write_extracted_class(destination, len(entries), content)
+        retained_content = content if defer_writes else None
+        if retention_enabled and not defer_writes:
+            if retained_class_bytes + len(content) <= max_staged_class_bytes:
+                retained_content = content
+                retained_class_bytes += len(content)
+            else:
+                # Keep the per-artifact RSS bound hard. Once an artifact
+                # crosses it, all member-inventory reads use the already
+                # materialized exact class files instead of retaining a
+                # partial, input-order-dependent byte subset.
+                discard_retained_bytes()
         entries.append(PackagedClass(
             artifact_entry,
             path,
-            content if defer_writes else None,
+            retained_content,
             requires_verbose,
         ))
 
@@ -1395,9 +1447,11 @@ def _parse_field_reference(comment: str, caller_owner: str) -> tuple[str, str, s
     return owner, member, match.group("descriptor")
 
 
-def _dynamic_references(output: str) -> dict[int, tuple[int, str, str]]:
+def _dynamic_references(
+    output: str, *, lines: tuple[str, ...] | None = None,
+) -> dict[int, tuple[int, str, str]]:
     references: dict[int, tuple[int, str, str]] = {}
-    for line in _javap_lines(output):
+    for line in lines if lines is not None else _javap_lines(output):
         match = CONSTANT_POOL_DYNAMIC_RE.match(line)
         if match and _is_method_descriptor(match.group("descriptor")):
             references[int(match.group("constant"))] = (
@@ -1409,10 +1463,10 @@ def _dynamic_references(output: str) -> dict[int, tuple[int, str, str]]:
 
 
 def _constant_dynamic_references(
-    output: str,
+    output: str, *, lines: tuple[str, ...] | None = None,
 ) -> dict[int, tuple[int, str, str]]:
     references: dict[int, tuple[int, str, str]] = {}
-    for line in _javap_lines(output):
+    for line in lines if lines is not None else _javap_lines(output):
         match = CONSTANT_POOL_CONSTANT_DYNAMIC_RE.match(line)
         if match and _is_field_descriptor(match.group("descriptor")):
             references[int(match.group("constant"))] = (
@@ -1423,7 +1477,9 @@ def _constant_dynamic_references(
     return references
 
 
-def _method_handle_interfaces(output: str) -> dict[int, bool]:
+def _method_handle_interfaces(
+    output: str, *, lines: tuple[str, ...] | None = None,
+) -> dict[int, bool]:
     """Resolve MethodHandle CP entries to Methodref vs InterfaceMethodref.
 
     ``REF_invokeStatic`` and ``REF_invokeSpecial`` do not encode this bit in
@@ -1432,7 +1488,7 @@ def _method_handle_interfaces(output: str) -> dict[int, bool]:
     """
     reference_interfaces: dict[int, bool] = {}
     handle_targets: dict[int, int] = {}
-    for line in _javap_lines(output):
+    for line in lines if lines is not None else _javap_lines(output):
         reference = CONSTANT_POOL_MEMBER_REFERENCE_KIND_RE.match(line)
         if reference:
             reference_interfaces[int(reference.group("constant"))] = (
@@ -1452,12 +1508,12 @@ def _method_handle_interfaces(output: str) -> dict[int, bool]:
 
 
 def _javap_constant_type_values(
-    output: str,
+    output: str, *, lines: tuple[str, ...] | None = None,
 ) -> tuple[dict[int, str], dict[int, str]]:
     """Read CONSTANT_Class/MethodType values from verbose javap output."""
     classes: dict[int, str] = {}
     method_types: dict[int, str] = {}
-    for line in _javap_lines(output):
+    for line in lines if lines is not None else _javap_lines(output):
         class_match = CONSTANT_POOL_CLASS_RE.match(line)
         if class_match:
             rendered = _unquote_javap_identifier(
@@ -1478,17 +1534,28 @@ def _bootstrap_references(
     output: str,
     constant_dynamic_references: dict[int, tuple[int, str, str]],
     member_inventory: ClassfileMemberInventory | None = None,
+    *,
+    lines: tuple[str, ...] | None = None,
+    handle_interfaces: dict[int, bool] | None = None,
+    constant_type_values: tuple[dict[int, str], dict[int, str]] | None = None,
 ) -> dict[int, BootstrapReferenceSet]:
     in_bootstrap_section = False
     current_bootstrap: int | None = None
-    handle_interfaces = _method_handle_interfaces(output)
+    if lines is None:
+        lines = tuple(_javap_lines(output))
+    if handle_interfaces is None:
+        handle_interfaces = _method_handle_interfaces(output, lines=lines)
     bootstraps: dict[int, tuple[str, str, str, str, bool | None]] = {}
     argument_handles: dict[
         int, list[tuple[str, str, str, str, bool | None]]
     ] = {}
     constant_dynamic_arguments: dict[int, list[int]] = {}
     type_arguments: dict[int, list[tuple[str, str]]] = {}
-    javap_classes, javap_method_types = _javap_constant_type_values(output)
+    javap_classes, javap_method_types = (
+        constant_type_values
+        if constant_type_values is not None
+        else _javap_constant_type_values(output, lines=lines)
+    )
     raw_classes = (
         dict(member_inventory.class_constants)
         if member_inventory is not None else {}
@@ -1504,7 +1571,7 @@ def _bootstrap_references(
     class_constants = raw_classes or javap_classes
     method_type_constants = raw_method_types or javap_method_types
     invalid_bootstraps: set[int] = set()
-    for line in _javap_lines(output):
+    for line in lines:
         if line.strip() == "BootstrapMethods:":
             in_bootstrap_section = True
             continue
@@ -1674,6 +1741,40 @@ def _bootstrap_references(
         for index, bootstrap in bootstraps.items()
         if index not in invalid_bootstraps
     }
+
+
+def _javap_linkage_index(
+    output: str,
+    member_inventory: ClassfileMemberInventory | None,
+) -> _JavapLinkageIndex:
+    """Parse shared javap linkage tables once without merging validators."""
+
+    lines = tuple(_javap_lines(output))
+    dynamic_references = _dynamic_references(output, lines=lines)
+    constant_dynamic_references = _constant_dynamic_references(
+        output, lines=lines
+    )
+    method_handle_interfaces = _method_handle_interfaces(
+        output, lines=lines
+    )
+    constant_type_values = _javap_constant_type_values(
+        output, lines=lines
+    )
+    bootstrap_references = _bootstrap_references(
+        output,
+        constant_dynamic_references,
+        member_inventory,
+        lines=lines,
+        handle_interfaces=method_handle_interfaces,
+        constant_type_values=constant_type_values,
+    )
+    return _JavapLinkageIndex(
+        lines=lines,
+        dynamic_references=dynamic_references,
+        constant_dynamic_references=constant_dynamic_references,
+        method_handle_interfaces=method_handle_interfaces,
+        bootstrap_references=bootstrap_references,
+    )
 
 
 def _bootstrap_argument_handles(
@@ -1950,6 +2051,8 @@ def _parse_javap_output(
     artifact_entry: str,
     authority_version: str,
     member_inventory: ClassfileMemberInventory | None = None,
+    *,
+    linkage_index: _JavapLinkageIndex | None = None,
 ) -> tuple[list[dict], list[str]]:
     caller_owner = (
         member_inventory.owner.replace("/", ".")
@@ -1977,14 +2080,16 @@ def _parse_javap_output(
             f"{artifact_entry}: javap UTF-8 cannot losslessly render an "
             "unpaired-surrogate constant-pool reference"
         ]
-    dynamic_references = _dynamic_references(output)
-    constant_dynamic_references = _constant_dynamic_references(output)
-    method_handle_interfaces = _method_handle_interfaces(output)
-    bootstrap_references = _bootstrap_references(
-        output, constant_dynamic_references, member_inventory
+    if linkage_index is None:
+        linkage_index = _javap_linkage_index(output, member_inventory)
+    dynamic_references = linkage_index.dynamic_references
+    constant_dynamic_references = (
+        linkage_index.constant_dynamic_references
     )
+    method_handle_interfaces = linkage_index.method_handle_interfaces
+    bootstrap_references = linkage_index.bootstrap_references
 
-    for line in _javap_lines(output):
+    for line in linkage_index.lines:
         if descriptor_continuation:
             expected = descriptor_continuation.pop(0)
             if line != expected:
@@ -2347,6 +2452,8 @@ def _parse_class_reference(comment: str) -> str | None:
 def parse_structural_javap(
     output: str,
     member_inventory: ClassfileMemberInventory | None = None,
+    *,
+    linkage_index: _JavapLinkageIndex | None = None,
 ) -> dict[str, set]:
     """Extract type/init/semantic facts from the same independent javap text.
 
@@ -2390,12 +2497,14 @@ def parse_structural_javap(
             "failures": failures,
         }
 
-    dynamic_references = _dynamic_references(output)
-    constant_dynamic_references = _constant_dynamic_references(output)
-    bootstrap_references = _bootstrap_references(
-        output, constant_dynamic_references, member_inventory
+    if linkage_index is None:
+        linkage_index = _javap_linkage_index(output, member_inventory)
+    dynamic_references = linkage_index.dynamic_references
+    constant_dynamic_references = (
+        linkage_index.constant_dynamic_references
     )
-    method_handle_interfaces = _method_handle_interfaces(output)
+    bootstrap_references = linkage_index.bootstrap_references
+    method_handle_interfaces = linkage_index.method_handle_interfaces
     method_type_constants = (
         dict(member_inventory.method_type_constants)
         if member_inventory is not None else {}
@@ -2526,7 +2635,7 @@ def parse_structural_javap(
                 flags |= value
         return flags
 
-    for line in _javap_lines(output):
+    for line in linkage_index.lines:
         if descriptor_continuation:
             expected = descriptor_continuation.pop(0)
             if line != expected:
@@ -3074,6 +3183,7 @@ def _parse_entry_with_javap(
     deadline: float | None,
     *,
     verbose: bool | None = None,
+    persistent_javap_sessions: bool = False,
 ) -> dict:
     materialize_error = _materialize_packaged_class(entry)
     if materialize_error:
@@ -3091,12 +3201,33 @@ def _parse_entry_with_javap(
     deadline = min(deadline, per_class_deadline) if deadline is not None else per_class_deadline
     if cancellation_event.is_set() or time.perf_counter() >= deadline:
         return {"rows": [], "failures": [], "completed": False, "parsed": False}
+    command = _javap_command(javap)
+    if _entry_requires_verbose_javap(entry) if verbose is None else verbose:
+        command.append("-v")
+    command.extend(("-c", "-p", "-s", _entry_javap_argument(entry)))
+    session_result = None
+    if persistent_javap_sessions:
+        session_result = run_persistent_javap(
+            javap,
+            tuple(command[1 + len(JAVAP_STABLE_JVM_OPTIONS):]),
+            version,
+            cancellation_event,
+            deadline,
+            max_sessions=MAX_JAVAP_WORKERS,
+        )
+        if session_result is None and (
+            cancellation_event.is_set() or time.perf_counter() >= deadline
+        ):
+            return {
+                "rows": [], "failures": [], "completed": False,
+                "parsed": False,
+            }
     try:
-        command = _javap_command(javap)
-        if _entry_requires_verbose_javap(entry) if verbose is None else verbose:
-            command.append("-v")
-        command.extend(("-c", "-p", "-s", _entry_javap_argument(entry)))
-        process = _spawn_javap(command, cancellation_event, deadline)
+        process = (
+            None
+            if session_result is not None
+            else _spawn_javap(command, cancellation_event, deadline)
+        )
     except (OSError, TimeoutError) as error:
         return {
             "rows": [],
@@ -3105,26 +3236,31 @@ def _parse_entry_with_javap(
             "parsed": False,
         }
 
-    try:
-        while True:
-            remaining = deadline - time.perf_counter()
-            if cancellation_event.is_set() or remaining <= 0:
-                _cancel_process(process)
-                return {"rows": [], "failures": [], "completed": False, "parsed": False}
-            wait_seconds = min(0.1, remaining)
-            try:
-                stdout, stderr = process.communicate(timeout=wait_seconds)
-                break
-            except subprocess.TimeoutExpired:
-                continue
-    except BaseException:
-        # KeyboardInterrupt, decoding failures and unexpected pipe errors used
-        # to unwind while leaving javap alive with both PIPE descriptors open.
-        _cancel_process(process)
-        raise
-    release_process_tree(process)
+    if session_result is not None:
+        stdout, stderr = session_result.stdout, session_result.stderr
+        returncode = session_result.returncode
+    else:
+        try:
+            while True:
+                remaining = deadline - time.perf_counter()
+                if cancellation_event.is_set() or remaining <= 0:
+                    _cancel_process(process)
+                    return {"rows": [], "failures": [], "completed": False, "parsed": False}
+                wait_seconds = min(0.1, remaining)
+                try:
+                    stdout, stderr = process.communicate(timeout=wait_seconds)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+        except BaseException:
+            # KeyboardInterrupt, decoding failures and unexpected pipe errors used
+            # to unwind while leaving javap alive with both PIPE descriptors open.
+            _cancel_process(process)
+            raise
+        release_process_tree(process)
+        returncode = process.returncode
 
-    if process.returncode != 0:
+    if returncode != 0:
         detail = (stderr or stdout).strip().replace("\n", " ")
         return {
             "rows": [],
@@ -3150,14 +3286,20 @@ def _parse_entry_with_javap(
             "completed": True,
             "parsed": False,
         }
+    linkage_index = _javap_linkage_index(stdout, member_inventory)
     rows, failures = _parse_javap_output(
         stdout,
         artifact_sha256,
         entry.artifact_entry,
         version,
         member_inventory,
+        linkage_index=linkage_index,
     )
-    structural_facts = parse_structural_javap(stdout, member_inventory)
+    structural_facts = parse_structural_javap(
+        stdout,
+        member_inventory,
+        linkage_index=linkage_index,
+    )
     failures.extend(
         f"{entry.artifact_entry}: {failure}"
         for failure in sorted(structural_facts.pop("failures", set()))
@@ -3180,6 +3322,7 @@ def _parse_entry_group_with_javap(
     deadline: float | None,
     *,
     force_verbose: bool | None = None,
+    persistent_javap_sessions: bool = False,
 ) -> list[dict]:
     if not entries:
         return []
@@ -3204,6 +3347,7 @@ def _parse_entry_group_with_javap(
                     cancellation_event,
                     deadline,
                     force_verbose=verbose,
+                    persistent_javap_sessions=persistent_javap_sessions,
                 )
                 by_path.update(
                     (entry.extracted_path, result)
@@ -3216,8 +3360,47 @@ def _parse_entry_group_with_javap(
             _parse_entry_with_javap(
                 entries[0], artifact_sha256, javap, version, cancellation_event, deadline,
                 verbose=force_verbose,
+                persistent_javap_sessions=persistent_javap_sessions,
             )
         ]
+    # Raw member_info parsing is Python CPU/file work, while javap executes in
+    # the separately bounded target-JDK process. Compute the former on one
+    # thread while the caller waits for the latter, then feed the exact
+    # ordered results to both independent text parsers. The executor context
+    # joins on every timeout/fallback path, so no parser can outlive the
+    # private artifact snapshot.
+    with ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="final-artifact-member-inventory",
+    ) as inventory_executor:
+        inventory_future = inventory_executor.submit(
+            lambda: tuple(_entry_member_inventory(entry) for entry in entries)
+        )
+        return _parse_entry_group_with_javap_impl(
+            entries,
+            artifact_sha256,
+            javap,
+            version,
+            cancellation_event,
+            deadline,
+            force_verbose=force_verbose,
+            persistent_javap_sessions=persistent_javap_sessions,
+            inventory_future=inventory_future,
+        )
+
+
+def _parse_entry_group_with_javap_impl(
+    entries: list[PackagedClass],
+    artifact_sha256: str,
+    javap: str,
+    version: str,
+    cancellation_event: Event,
+    deadline: float | None,
+    *,
+    force_verbose: bool,
+    persistent_javap_sessions: bool,
+    inventory_future,
+) -> list[dict]:
     overall_deadline = deadline
 
     def parse_separately(candidates: list[PackagedClass]) -> list[dict]:
@@ -3230,6 +3413,7 @@ def _parse_entry_group_with_javap(
                 cancellation_event,
                 overall_deadline,
                 verbose=force_verbose,
+                persistent_javap_sessions=persistent_javap_sessions,
             )
             for entry in candidates
         ]
@@ -3247,6 +3431,7 @@ def _parse_entry_group_with_javap(
                 cancellation_event,
                 overall_deadline,
                 force_verbose=force_verbose,
+                persistent_javap_sessions=persistent_javap_sessions,
             ),
             *_parse_entry_group_with_javap(
                 candidates[midpoint:],
@@ -3256,6 +3441,7 @@ def _parse_entry_group_with_javap(
                 cancellation_event,
                 overall_deadline,
                 force_verbose=force_verbose,
+                persistent_javap_sessions=persistent_javap_sessions,
             ),
         ]
 
@@ -3275,11 +3461,10 @@ def _parse_entry_group_with_javap(
             {"rows": [], "failures": [], "completed": False, "parsed": False}
             for _entry in entries
         ]
-    try:
-        command = _javap_command(javap)
-        if force_verbose:
-            command.append("-v")
-        else:
+    command = _javap_command(javap)
+    if force_verbose:
+        command.append("-v")
+    else:
             # A source declaration is not a class boundary: legal raw JVM
             # names may contain controls, quotes, or a leading ``[`` and javap
             # renders those declarations across multiple physical lines.
@@ -3287,10 +3472,32 @@ def _parse_entry_group_with_javap(
             # constant-pool volume of ``-v``, so every valid class stays in the
             # original batched invocation and its raw member_info inventory
             # remains bound to the correct output section.
-            command.append("-sysinfo")
-        command.extend(("-c", "-p", "-s"))
-        command.extend(_entry_javap_argument(entry) for entry in entries)
-        process = _spawn_javap(command, cancellation_event, deadline)
+        command.append("-sysinfo")
+    command.extend(("-c", "-p", "-s"))
+    command.extend(_entry_javap_argument(entry) for entry in entries)
+    session_result = None
+    if persistent_javap_sessions:
+        session_result = run_persistent_javap(
+            javap,
+            tuple(command[1 + len(JAVAP_STABLE_JVM_OPTIONS):]),
+            version,
+            cancellation_event,
+            deadline,
+            max_sessions=MAX_JAVAP_WORKERS,
+        )
+        if session_result is None and (
+            cancellation_event.is_set() or time.perf_counter() >= deadline
+        ):
+            return [
+                {"rows": [], "failures": [], "completed": False, "parsed": False}
+                for _entry in entries
+            ]
+    try:
+        process = (
+            None
+            if session_result is not None
+            else _spawn_javap(command, cancellation_event, deadline)
+        )
     except (OSError, TimeoutError) as error:
         # The single-entry path returned above, so every group here can bisect.
         if (
@@ -3308,6 +3515,7 @@ def _parse_entry_group_with_javap(
                     cancellation_event,
                     overall_deadline,
                     force_verbose=force_verbose,
+                    persistent_javap_sessions=persistent_javap_sessions,
                 ),
                 *_parse_entry_group_with_javap(
                     entries[midpoint:],
@@ -3317,6 +3525,7 @@ def _parse_entry_group_with_javap(
                     cancellation_event,
                     overall_deadline,
                     force_verbose=force_verbose,
+                    persistent_javap_sessions=persistent_javap_sessions,
                 ),
             ]
         return [
@@ -3329,33 +3538,38 @@ def _parse_entry_group_with_javap(
             for entry in entries
         ]
 
-    try:
-        while True:
-            remaining = deadline - time.perf_counter()
-            if cancellation_event.is_set() or remaining <= 0:
-                _cancel_process(process)
-                if (
-                    not cancellation_event.is_set()
-                    and (
-                        overall_deadline is None
-                        or time.perf_counter() < overall_deadline
-                    )
-                ):
-                    return parse_smaller_batches(entries)
-                return [
-                    {"rows": [], "failures": [], "completed": False, "parsed": False}
-                    for _entry in entries
-                ]
-            try:
-                stdout, stderr = process.communicate(timeout=min(0.1, remaining))
-                break
-            except subprocess.TimeoutExpired:
-                continue
-    except BaseException:
-        _cancel_process(process)
-        raise
-    release_process_tree(process)
-    if process.returncode != 0:
+    if session_result is not None:
+        stdout, stderr = session_result.stdout, session_result.stderr
+        returncode = session_result.returncode
+    else:
+        try:
+            while True:
+                remaining = deadline - time.perf_counter()
+                if cancellation_event.is_set() or remaining <= 0:
+                    _cancel_process(process)
+                    if (
+                        not cancellation_event.is_set()
+                        and (
+                            overall_deadline is None
+                            or time.perf_counter() < overall_deadline
+                        )
+                    ):
+                        return parse_smaller_batches(entries)
+                    return [
+                        {"rows": [], "failures": [], "completed": False, "parsed": False}
+                        for _entry in entries
+                    ]
+                try:
+                    stdout, stderr = process.communicate(timeout=min(0.1, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+        except BaseException:
+            _cancel_process(process)
+            raise
+        release_process_tree(process)
+        returncode = process.returncode
+    if returncode != 0:
         return parse_smaller_batches(entries)
 
     sections: dict[str, str] = {}
@@ -3365,13 +3579,16 @@ def _parse_entry_group_with_javap(
         sections[_javap_path_key(marker.group("path").strip())] = (
             stdout[marker.start():end]
         )
+    inventory_results = inventory_future.result()
+    if len(inventory_results) != len(entries):
+        raise RuntimeError("member inventory result conservation mismatch")
     results = []
-    for entry in entries:
+    for entry, inventory_result in zip(entries, inventory_results):
         section = sections.get(_entry_javap_section_key(entry))
         if section is None:
             results.extend(parse_separately([entry]))
             continue
-        member_inventory, inventory_failure = _entry_member_inventory(entry)
+        member_inventory, inventory_failure = inventory_result
         if inventory_failure or member_inventory is None:
             results.append({
                 "rows": [],
@@ -3383,14 +3600,20 @@ def _parse_entry_group_with_javap(
                 "parsed": False,
             })
             continue
+        linkage_index = _javap_linkage_index(section, member_inventory)
         rows, failures = _parse_javap_output(
             section,
             artifact_sha256,
             entry.artifact_entry,
             version,
             member_inventory,
+            linkage_index=linkage_index,
         )
-        structural_facts = parse_structural_javap(section, member_inventory)
+        structural_facts = parse_structural_javap(
+            section,
+            member_inventory,
+            linkage_index=linkage_index,
+        )
         failures.extend(
             f"{entry.artifact_entry}: {failure}"
             for failure in sorted(structural_facts.pop("failures", set()))
@@ -3486,6 +3709,7 @@ def _parse_entry_batch(
     max_workers: int | None,
     *,
     batch_javap: bool = True,
+    persistent_javap_sessions: bool = False,
 ) -> tuple[list[dict | None], int, bool, bool]:
     if not entries:
         return [], 0, False, False
@@ -3512,6 +3736,10 @@ def _parse_entry_batch(
         # started (for example at the process/thread resource limit). Keep it
         # inside the shutdown guard so those workers and child javap processes
         # cannot outlive the failed scan.
+        persistent_kwargs = (
+            {"persistent_javap_sessions": True}
+            if persistent_javap_sessions else {}
+        )
         futures = [
             executor.submit(
                 _parse_entry_group_with_javap,
@@ -3521,6 +3749,7 @@ def _parse_entry_batch(
                 version,
                 cancellation_event,
                 deadline,
+                **persistent_kwargs,
             )
             for group in groups
         ]
@@ -3636,6 +3865,7 @@ def scan_final_artifact(
     include_nested_runtime_jars: bool = True,
     include_structural_facts: bool = False,
     cache_result: bool = True,
+    persistent_javap_sessions: bool = False,
 ) -> dict:
     """Return executable edges from one archive and, when requested, nested runtime JARs."""
     artifact = Path(artifact)
@@ -3716,6 +3946,7 @@ def scan_final_artifact(
                 include_nested_runtime_jars=include_nested_runtime_jars,
                 include_structural_facts=include_structural_facts,
                 cache_result=cache_result,
+                persistent_javap_sessions=persistent_javap_sessions,
                 started_at=started_at,
                 budget=budget,
                 deadline=deadline,
@@ -3736,6 +3967,7 @@ def _scan_final_artifact_snapshot(
     started_at: float,
     budget: float,
     deadline: float | None,
+    persistent_javap_sessions: bool = False,
 ) -> dict:
     version_timeout = JAVAP_VERSION_TIMEOUT_SECONDS
     if deadline is not None:
@@ -3864,6 +4096,13 @@ def _scan_final_artifact_snapshot(
                 # memory. Oversized artifacts automatically spill to the
                 # established file-backed representation.
                 stage_javap_archive=USE_STAGED_JAVAP_ARCHIVE,
+                # On non-Windows hosts javap still consumes exact class-file
+                # paths. Retain the bytes already read from the private
+                # artifact snapshot for raw member_info parsing so the same
+                # 100k classes are not reopened from disk. The staging bound
+                # also caps this optimization; oversized JARs fall back to
+                # file-backed reads for every class.
+                retain_class_bytes=True,
                 excluded_nested_jars=set(normalized_exclusions),
                 include_nested_runtime_jars=include_nested_runtime_jars,
             )
@@ -3915,6 +4154,9 @@ def _scan_final_artifact_snapshot(
                         _parse_entry_batch(
                             candidates, digest, javap, version, cancellation_event,
                             deadline, max_workers, batch_javap=True,
+                            persistent_javap_sessions=(
+                                persistent_javap_sessions
+                            ),
                         )
                     )
                     results.extend(batch_results)
@@ -3951,6 +4193,7 @@ def _scan_final_artifact_snapshot(
                 results, worker_count, timed_out, interrupted = _parse_entry_batch(
                     entries, digest, javap, version, cancellation_event,
                     deadline, max_workers,
+                    persistent_javap_sessions=persistent_javap_sessions,
                 )
                 if any(result is None or not result.get("completed") for result in results):
                     if deadline is not None and time.perf_counter() >= deadline:

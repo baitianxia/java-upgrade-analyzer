@@ -236,6 +236,33 @@ class RuntimeReconcilerBoundaryTest(unittest.TestCase):
             hydrated.member_resolutions, ({"kind": "member_resolution"},),
         )
 
+    def test_persisted_reconciliation_collection_protocol_is_repeatable(self):
+        rows = ({"value": 1}, {"value": 2})
+        store = SimpleNamespace(
+            reconciliation_payload_count=lambda kind: len(rows),
+            reconciliation_payloads=lambda kind: iter(rows),
+        )
+        view = rr._PersistedReconciliationPayloads(
+            store, "member_resolution"
+        )
+        self.assertEqual(len(view), 2)
+        self.assertEqual(list(view), list(rows))
+        self.assertIn({"value": 1}, view)
+        self.assertNotIn({"value": 3}, view)
+        self.assertEqual(view, rows)
+        self.assertNotEqual(view, ({"value": 1},))
+        self.assertNotEqual(view, (*rows, {"value": 3}))
+        self.assertNotEqual(view, ({"value": 1}, {"value": 3}))
+        self.assertNotEqual(view, 7)
+
+        legacy_store = SimpleNamespace(
+            reconciliation_payloads=lambda kind: iter(rows),
+        )
+        legacy = rr._PersistedReconciliationPayloads(
+            legacy_store, "member_resolution"
+        )
+        self.assertEqual(len(legacy), 2)
+
     def test_compact_identity_sequence_and_accumulator_contracts(self):
         sequence = rr._CompactIdentitySequence()
         for invalid in ("", "not-hex", "00", "AA" * 32):
@@ -2070,17 +2097,13 @@ class RuntimeReconcilerBoundaryTest(unittest.TestCase):
 
         class Connection:
             def execute(self, query, _parameters=()):
-                if "SELECT DISTINCT edge.symbolic_owner" in query:
+                if "reference.reference_kind='symbolic_owner'" in query:
                     return [
-                        {"symbolic_owner": "demo/Root"},
-                        {"symbolic_owner": "[I"},
+                        {"class_name": "demo/Root"},
                     ]
-                if "SELECT edge.edge_json" in query:
+                if "reference.reference_kind='loading_constraint_owner'" in query:
                     return [
-                        {"edge_json": ""},
-                        {"edge_json": json.dumps({
-                            rr.LOADING_CONSTRAINT_TYPE_OWNERS_KEY: ["Constraint"],
-                        })},
+                        {"class_name": "Constraint"},
                     ]
                 return []
 

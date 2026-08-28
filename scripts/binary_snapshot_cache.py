@@ -15,7 +15,12 @@ from typing import Any
 import zlib
 
 from binary_artifact_diff import ArchiveEntryFact, ArtifactSnapshot, snapshot_archive
-from binary_asm_helper import parser_identity, resolve_asm_jar
+from binary_asm_helper import (
+    ParserIdentityBinding,
+    parser_identity,
+    parser_identity_from_binding,
+    resolve_asm_jar,
+)
 from binary_first_contract import (
     BinaryFirstContractError,
     canonical_identity_native_json,
@@ -44,6 +49,7 @@ class SnapshotCacheOutcome:
 class _DecodedSnapshotTemplate:
     payload: dict[str, Any]
     class_payloads: tuple[tuple[str, bytes], ...]
+    payload_sha256: str
 
 
 class SnapshotTemplateMemo:
@@ -130,7 +136,9 @@ def _template_payload(snapshot: ArtifactSnapshot) -> dict[str, Any]:
     }
 
 
-def _decode_template(path: Path, expected_key: str) -> dict[str, Any]:
+def _decode_template(
+    path: Path, expected_key: str,
+) -> dict[str, Any]:
     try:
         envelope = json.loads(zlib.decompress(path.read_bytes()).decode("utf-8"))
     except (OSError, zlib.error, UnicodeError, json.JSONDecodeError) as error:
@@ -138,18 +146,26 @@ def _decode_template(path: Path, expected_key: str) -> dict[str, Any]:
     if envelope.get("schema") != CACHE_SCHEMA or envelope.get("cache_key") != expected_key:
         raise BinarySnapshotCacheError("BINARY_SNAPSHOT_CACHE_IDENTITY_MISMATCH", str(path))
     payload = envelope.get("payload")
-    if not isinstance(payload, dict) or hashlib.sha256(_json_bytes(payload)).hexdigest() != envelope.get("payload_sha256"):
+    payload_sha256 = str(envelope.get("payload_sha256") or "")
+    if (
+        not isinstance(payload, dict)
+        or len(payload_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in payload_sha256)
+        or hashlib.sha256(_json_bytes(payload)).hexdigest() != payload_sha256
+    ):
         raise BinarySnapshotCacheError("BINARY_SNAPSHOT_CACHE_DIGEST_MISMATCH", str(path))
     return payload
 
 
-def _write_template(path: Path, cache_key: str, payload: dict[str, Any]) -> None:
+def _write_template(path: Path, cache_key: str, payload: dict[str, Any]) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
+    payload_bytes = _json_bytes(payload)
+    payload_sha256 = hashlib.sha256(payload_bytes).hexdigest()
     envelope = {
         "schema": CACHE_SCHEMA,
         "cache_key": cache_key,
         "cache_policy_version": CACHE_POLICY_VERSION,
-        "payload_sha256": hashlib.sha256(_json_bytes(payload)).hexdigest(),
+        "payload_sha256": payload_sha256,
         "payload": payload,
     }
     content = zlib.compress(_json_bytes(envelope), level=6)
@@ -163,13 +179,17 @@ def _write_template(path: Path, cache_key: str, payload: dict[str, Any]) -> None
     finally:
         if os.path.exists(temporary_name):
             os.unlink(temporary_name)
+    return payload_sha256
 
 
 def _decoded_template(
     payload: dict[str, Any],
     *,
+    payload_sha256: str = "",
     class_payloads: tuple[tuple[str, bytes], ...] | None = None,
 ) -> _DecodedSnapshotTemplate:
+    if not payload_sha256:
+        payload_sha256 = hashlib.sha256(_json_bytes(payload)).hexdigest()
     try:
         decoded = (
             tuple(class_payloads)
@@ -188,12 +208,17 @@ def _decoded_template(
     # of the largest adjacent base/current JAR.
     metadata = dict(payload)
     metadata.pop("class_payloads", None)
-    return _DecodedSnapshotTemplate(payload=metadata, class_payloads=decoded)
+    return _DecodedSnapshotTemplate(
+        payload=metadata,
+        class_payloads=decoded,
+        payload_sha256=payload_sha256,
+    )
 
 
 def _rebind(
     template: _DecodedSnapshotTemplate,
     artifact_instance_identity: str,
+    cache_key: str = "",
 ) -> ArtifactSnapshot:
     payload = template.payload
     entries = []
@@ -250,6 +275,17 @@ def _rebind(
         runtime_semantics_diagnostic_codes=tuple(
             payload["runtime_semantics_diagnostic_codes"]
         ),
+        rebind_template_identity=(
+            _identity(
+                "binary_snapshot_rebind_template_identity",
+                {
+                    "cache_key": cache_key,
+                    "payload_sha256": template.payload_sha256,
+                },
+            )
+            if cache_key
+            else ""
+        ),
     )
 
 
@@ -264,6 +300,9 @@ def cached_snapshot_archive(
     target_jvm_major: int | None = None,
     template_memo: SnapshotTemplateMemo | None = None,
     safety_policy: dict[str, Any] | None = None,
+    persistent_asm_session: bool = False,
+    persistent_asm_max_sessions: int = 6,
+    parser_identity_binding: ParserIdentityBinding | None = None,
 ) -> SnapshotCacheOutcome:
     archive = Path(path)
     expected_sha = str(expected_sha256 or "").strip().lower()
@@ -273,8 +312,13 @@ def cached_snapshot_archive(
         raise BinarySnapshotCacheError(
             "BINARY_SNAPSHOT_CACHE_EXPECTED_SHA256_INVALID", expected_sha
         )
-    asm_path = resolve_asm_jar(asm_jar)
-    parser_id, _helper_sha = parser_identity(asm_jar=asm_path)
+    if parser_identity_binding is None:
+        asm_path = resolve_asm_jar(asm_jar)
+        parser_id, _helper_sha = parser_identity(asm_jar=asm_path)
+    else:
+        asm_path, parser_id, _helper_sha = parser_identity_from_binding(
+            parser_identity_binding, asm_jar=asm_jar
+        )
     # The Step1-bound digest is sufficient to locate a prospective cache entry.
     # A hit is still independently verified against the current artifact bytes.
     # On a miss, snapshot_archive streams the source once while hashing it into
@@ -327,19 +371,23 @@ def cached_snapshot_archive(
             jdk_home=jdk_home,
             target_jvm_major=target_jvm_major,
             safety_policy=safety_policy,
+            persistent_asm_session=persistent_asm_session,
+            persistent_asm_max_sessions=persistent_asm_max_sessions,
+            parser_identity_binding=parser_identity_binding,
         )
         parser_invocations = 1
         payload = _template_payload(parsed_snapshot)
-        _write_template(cache_path, key, payload)
+        payload_sha256 = _write_template(cache_path, key, payload)
         template = _decoded_template(
             payload,
+            payload_sha256=payload_sha256,
             class_payloads=tuple(parsed_snapshot.class_payloads),
         )
         del payload
     if template_memo is not None:
         template_memo.remember(key, template)
     return SnapshotCacheOutcome(
-        snapshot=_rebind(template, artifact_instance_identity),
+        snapshot=_rebind(template, artifact_instance_identity, key),
         cache_status=cache_status,
         cache_tier=cache_tier,
         parser_invocation_count=parser_invocations,
