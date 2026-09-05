@@ -506,7 +506,12 @@ class _SidecarRowSpool:
                     encoded = surrogate_safe_json_bytes(
                         row,
                         ensure_ascii=False,
-                        sort_keys=True,
+                        # The source reader already validated the object and
+                        # consumers compare decoded values, not cache bytes.
+                        # Avoid re-sorting every key while creating the
+                        # derived row spool; key order is irrelevant after
+                        # JSON decoding and the source remains authoritative.
+                        sort_keys=False,
                         separators=(",", ":"),
                     )
                     batch.append((cache_key, count, zlib.compress(encoded, 1)))
