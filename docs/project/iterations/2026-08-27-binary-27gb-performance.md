@@ -41,6 +41,7 @@
 13. Oracle 对 declared member、runtime observation、archive inventory、production edge projection 和 base/current 严格相等字段使用有界缓存/共享；只在完整输入、数据库逻辑内容或逐值 JSON 类型和值相等后复用，任何证明缺失都重新计算。
 14. 严格相同 runtime side 在生成 Oracle sidecar 时，从同一份已完成 SQLite backup 的精确字节镜像产生两个具名文件；独立验证器仍检查两个路径、字节摘要和绑定身份，但不再为已证明逐字节相同的 20GB 级数据库做两次逻辑重读。不同 side 完全不走该路径。
 15. ASM/Javap 会话仍并行执行 EOF 关闭；所有清理线程 join 后由所有者主线程恢复 POSIX SIGTERM 状态，避免进程组已清空但信号管理器残留。对应组合测试验证后续进程合同不受污染。
+16. 闭世界 formal path 复核为重复 evidence 增加 8192 项有界 LRU 工作集；关系查询同时返回 member/linkage 状态，路径层的后续状态读取复用同一证明结果，超出上限或旧适配器缺少 orphan 表时回到原查询。所有关系、状态和失败关闭语义保持不变。
 
 ## 本地证据
 

@@ -12,6 +12,7 @@
 ## 当前项目状态
 
 - 当前开发记录是 [2026-08-27 binary-first 27GB 性能收敛](iterations/2026-08-27-binary-27gb-performance.md)：第二轮实现、固定 400 JAR 性能证据重录和最终工作树完整 Release 已通过；changed 完整流水线独立复采相对上一记录提升 52.924%。尚待关闭的是目标 Windows 10/Xeon/32GB 主机上的 27GB 实机复跑，不能用本地合成规模门替代该结论。
+- 当前增量优化为闭世界路径复核增加有界 evidence 工作集缓存：关系查询同时带回 member/linkage 状态，重复路径不再为同一 evidence 重新执行状态查询；缓存达到 8192 项后按 LRU 淘汰，旧适配器和 orphan evidence 保留精确回退。Step4 相关定向回归 219/219 通过，`git diff --check` 通过；尚未在目标 Windows 27GB 数据上重新录制墙钟和 RSS，因此不把本地回归计为目标机达标。
 - 上一份完成记录是 [2026-08-27 跨阶段正确性、可靠性与性能修复](iterations/2026-08-27-cross-stage-remediation.md)。
 - `historical-2026-07/` 是迁移前形成的历史设计和计划记录，不是当前开发授权。
 - 尚未完成的两个候选事项位于 [Roadmap](roadmap/README.md)，两者均需先满足各自的证据或观测条件。

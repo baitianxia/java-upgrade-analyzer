@@ -9,7 +9,7 @@ resolver, member resolver, dispatch resolver, decision engine or tracer.
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from concurrent.futures import (
     FIRST_COMPLETED,
     ProcessPoolExecutor,
@@ -112,6 +112,10 @@ MAX_CLASSES_PER_RUNTIME_ORACLE_PROCESS = 12_000
 LOW_AVAILABLE_MEMORY_WARNING_BYTES = 4 * 1024 * 1024 * 1024
 MAX_VALIDATION_STRING_POOL_ENTRIES = 250_000
 MAX_VALIDATION_POOLED_STRING_CHARS = 4_096
+# Formal paths commonly reuse the same direct-edge evidence. Keep only a
+# bounded working set so repeated path checks avoid three SQLite lookups while
+# a wide result set cannot turn the optimisation into another memory spike.
+MAX_CLOSED_WORLD_EVIDENCE_CACHE_ENTRIES = 8_192
 _NATIVE_ARTIFACT_IDENTITY_MAX_ROWS = 50_000
 _NATIVE_ARTIFACT_IDENTITY_MAX_ESTIMATED_BYTES = 16 * 1024 * 1024
 # Avoid process-startup concurrency for tiny projects/tests. Above this point
@@ -9858,6 +9862,9 @@ class _ClosedWorldGraphIndex:
         self._progress_callback = progress_callback
         self._closed = False
         self._compact_resolution_index = True
+        self._evidence_cache: OrderedDict[
+            str, tuple[list[tuple[str, str, str, str]], str, str]
+        ] = OrderedDict()
         self.connection = sqlite3.connect(index_path, uri=True)
         self.connection.row_factory = sqlite3.Row
         self.connection.executescript(
@@ -10296,6 +10303,17 @@ class _ClosedWorldGraphIndex:
         caller: str | None = None,
         evidence: str | None = None,
     ) -> list[tuple[str, str, str, str]]:
+        evidence_cache = getattr(self, "_evidence_cache", None)
+        if evidence_cache is None:
+            # Boundary tests and legacy adapters may construct this index via
+            # __new__ and populate only the old fields.
+            evidence_cache = OrderedDict()
+            self._evidence_cache = evidence_cache
+        if evidence is not None:
+            cached = evidence_cache.get(str(evidence))
+            if cached is not None:
+                evidence_cache.move_to_end(str(evidence))
+                return cached[0]
         predicate = (
             "e.caller_member_identity=?" if caller is not None
             else "e.direct_edge_identity=?"
@@ -10330,7 +10348,8 @@ class _ClosedWorldGraphIndex:
                    dr.targets_json AS dispatch_targets,
                    tr.status AS type_status,
                    ir.status AS initialization_status,
-                   ir.targets_json AS initialization_targets
+                   ir.targets_json AS initialization_targets,
+                   lr.status AS linkage_status
             FROM facts.direct_edges AS e
             LEFT JOIN member_resolution AS mr
               ON {member_join}
@@ -10340,12 +10359,21 @@ class _ClosedWorldGraphIndex:
               ON {type_join}
             LEFT JOIN initialization_resolution AS ir
               ON {initialization_join}
+            LEFT JOIN linkage_resolution AS lr
+              ON {(
+                  "lr.edge_rowid=e.rowid"
+                  if compact_index else "lr.evidence=e.direct_edge_identity"
+              )}
             WHERE {predicate}
             """,
             (parameter,),
         )
         relations: list[tuple[str, str, str, str]] = []
+        member_status = ""
+        linkage_status = ""
         for row in rows:
+            member_status = str(row["member_status"] or "")
+            linkage_status = str(row["linkage_status"] or "")
             edge_id = str(row["direct_edge_identity"] or "")
             edge_caller = str(row["caller_member_identity"] or "")
             edge_kind = str(row["edge_kind"] or "")
@@ -10415,6 +10443,38 @@ class _ClosedWorldGraphIndex:
                     )
                     if target
                 )
+        if evidence is not None:
+            evidence_key = str(evidence)
+            if not member_status:
+                try:
+                    orphan_member = self.connection.execute(
+                        "SELECT status FROM orphan_member_resolution "
+                        "WHERE evidence=?",
+                        (evidence_key,),
+                    ).fetchone()
+                except sqlite3.Error:
+                    orphan_member = None
+                member_status = (
+                    str(orphan_member[0] or "") if orphan_member else ""
+                )
+            if not linkage_status:
+                try:
+                    orphan_linkage = self.connection.execute(
+                        "SELECT status FROM orphan_linkage_resolution "
+                        "WHERE evidence=?",
+                        (evidence_key,),
+                    ).fetchone()
+                except sqlite3.Error:
+                    orphan_linkage = None
+                linkage_status = (
+                    str(orphan_linkage[0] or "") if orphan_linkage else ""
+                )
+            evidence_cache[evidence_key] = (
+                list(relations), member_status, linkage_status,
+            )
+            evidence_cache.move_to_end(evidence_key)
+            while len(evidence_cache) > MAX_CLOSED_WORLD_EVIDENCE_CACHE_ENTRIES:
+                evidence_cache.popitem(last=False)
         return relations
 
     def transitions(self, caller: str) -> list[tuple[str, str, str]]:
@@ -10461,6 +10521,14 @@ class _ClosedWorldGraphIndex:
         return result
 
     def resolution_status(self, evidence: str) -> str:
+        evidence_cache = getattr(self, "_evidence_cache", None)
+        cached = (
+            evidence_cache.get(str(evidence))
+            if evidence_cache is not None else None
+        )
+        if cached is not None:
+            evidence_cache.move_to_end(str(evidence))
+            return cached[1]
         if bool(getattr(self, "_compact_resolution_index", False)):
             edge = self.connection.execute(
                 "SELECT rowid FROM facts.direct_edges "
@@ -10483,6 +10551,14 @@ class _ClosedWorldGraphIndex:
         return str(row[0] or "") if row else ""
 
     def linkage_status(self, evidence: str) -> str:
+        evidence_cache = getattr(self, "_evidence_cache", None)
+        cached = (
+            evidence_cache.get(str(evidence))
+            if evidence_cache is not None else None
+        )
+        if cached is not None:
+            evidence_cache.move_to_end(str(evidence))
+            return cached[2]
         if bool(getattr(self, "_compact_resolution_index", False)):
             edge = self.connection.execute(
                 "SELECT rowid FROM facts.direct_edges "
