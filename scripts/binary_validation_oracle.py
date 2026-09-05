@@ -116,6 +116,25 @@ MAX_VALIDATION_POOLED_STRING_CHARS = 4_096
 # bounded working set so repeated path checks avoid three SQLite lookups while
 # a wide result set cannot turn the optimisation into another memory spike.
 MAX_CLOSED_WORLD_EVIDENCE_CACHE_ENTRIES = 8_192
+_LARGE_SIDECAR_FIELDS = {
+    "binary_decisions.json": (
+        "analysis_context_identity",
+        "authoritative_change_facts",
+        "diagnostic_candidate_facts",
+    ),
+    "binary_entrypoints.json": (
+        "coverage_gaps", "coverage_status", "records",
+    ),
+    "binary_formal_results.json": (
+        "by_api", "resource_activation_results", "results",
+    ),
+    "binary_projections.json": (
+        "authoritative_projection_assessments", "formal_projections",
+    ),
+    "binary_runtime_semantic_overlay.json": (
+        "coverage_gaps", "rows",
+    ),
+}
 _NATIVE_ARTIFACT_IDENTITY_MAX_ROWS = 50_000
 _NATIVE_ARTIFACT_IDENTITY_MAX_ESTIMATED_BYTES = 16 * 1024 * 1024
 # Avoid process-startup concurrency for tiny projects/tests. Above this point
@@ -1069,28 +1088,9 @@ def _prime_large_sidecar_fields(
     generation: Path,
     progress_callback: ValidationProgressCallback | None = None,
 ) -> None:
-    fields_by_sidecar = {
-        "binary_decisions.json": (
-            "analysis_context_identity",
-            "authoritative_change_facts",
-            "diagnostic_candidate_facts",
-        ),
-        "binary_entrypoints.json": (
-            "coverage_gaps", "coverage_status", "records",
-        ),
-        "binary_formal_results.json": (
-            "by_api", "resource_activation_results", "results",
-        ),
-        "binary_projections.json": (
-            "authoritative_projection_assessments", "formal_projections",
-        ),
-        "binary_runtime_semantic_overlay.json": (
-            "coverage_gaps", "rows",
-        ),
-    }
     existing = [
         (name, fields)
-        for name, fields in fields_by_sidecar.items()
+        for name, fields in _LARGE_SIDECAR_FIELDS.items()
         if (generation / name).is_file()
     ]
     for index, (name, fields) in enumerate(existing, start=1):
@@ -12495,17 +12495,40 @@ def validate_generation(
             ))
             continue
         sidecar = generation / str(name)
-        actual = (
-            _sha256_file(
-                sidecar,
-                progress_callback=progress_callback,
-                progress_phase="validation-generation-integrity",
-                progress_message="逐字节校验生成侧车完整性",
-                progress_item=str(name),
-            )
-            if not sidecar.is_symlink() and sidecar.is_file()
-            else "MISSING_OR_SYMLINK"
-        )
+        actual = "MISSING_OR_SYMLINK"
+        if not sidecar.is_symlink() and sidecar.is_file():
+            indexed_digest: list[str] = []
+            indexed_fields = _LARGE_SIDECAR_FIELDS.get(str(name))
+            if indexed_fields is not None:
+                try:
+                    prime_canonical_json_fields(
+                        sidecar,
+                        indexed_fields,
+                        digest_output=indexed_digest,
+                        progress_callback=lambda completed, total: _notify_progress(
+                            progress_callback,
+                            "validation-generation-integrity",
+                            "逐字节校验生成侧车完整性并建立字段索引",
+                            completed,
+                            total,
+                            str(name),
+                        ),
+                    )
+                except StreamingJsonReadError:
+                    # Non-canonical or malformed input must use the exact
+                    # byte scanner and will still fail semantic validation at
+                    # the normal streaming reader boundary.
+                    indexed_digest.clear()
+            if indexed_digest:
+                actual = indexed_digest[0]
+            else:
+                actual = _sha256_file(
+                    sidecar,
+                    progress_callback=progress_callback,
+                    progress_phase="validation-generation-integrity",
+                    progress_message="逐字节校验生成侧车完整性",
+                    progress_item=str(name),
+                )
         if actual != expected:
             integrity_issues.append(_validation_issue(
                 "generation_integrity", "ORACLE_GENERATION_SIDECAR_TAMPERED",

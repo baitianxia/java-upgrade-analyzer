@@ -132,6 +132,10 @@ def _advance_json_structure(
 def prime_canonical_json_fields(
     path: str | Path,
     keys: Iterable[str],
+    *,
+    digest_output: list[str] | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
+    progress_interval_bytes: int = 64 * 1024 * 1024,
 ) -> None:
     """Locate several canonical JSON fields in one native regex scan.
 
@@ -139,6 +143,8 @@ def prime_canonical_json_fields(
     sidecar. Searching the entire mapping once per field multiplied disk reads
     even though only byte offsets were needed. This shared index remains
     content-bound by size and mtime and retains only a few integer offsets.
+    When ``digest_output`` is supplied, the same mmap also computes the raw
+    SHA-256 in bounded slices and appends it only after the scan completes.
     """
 
     source = Path(path)
@@ -154,8 +160,13 @@ def prime_canonical_json_fields(
                 resolved, metadata.st_size, metadata.st_mtime_ns, key
             ) not in _CANONICAL_VALUE_START_CACHE
         ]
-        if not missing:
+        if not missing and digest_output is None:
             return
+        if digest_output is not None and not missing:
+            # Keep the same authenticated mapping pass even when a prior
+            # caller populated the offset cache.  Reusing cached offsets must
+            # never force the integrity caller back to a second file open.
+            missing = list(normalized_keys)
         if metadata.st_size <= 0:
             raise StreamingJsonReadError(f"empty JSON sidecar: {source}")
         encoded_by_key = {
@@ -199,6 +210,31 @@ def prime_canonical_json_fields(
                     # decision is whether the match is a direct root child.
                     if int(structure_state[0]) == 1:
                         found[key].append(match.end())
+                if digest_output is not None:
+                    # The mapping has already been opened for the structural
+                    # scan. Reuse it for the authoritative raw digest so the
+                    # caller does not close and reopen a multi-GiB sidecar.
+                    digest = hashlib.sha256()
+                    mapped_view = memoryview(mapped)
+                    report_interval = max(1, int(progress_interval_bytes))
+                    next_report = report_interval
+                    try:
+                        for offset in range(0, metadata.st_size, 8 * 1024 * 1024):
+                            end = min(
+                                metadata.st_size, offset + 8 * 1024 * 1024,
+                            )
+                            digest.update(mapped_view[offset:end])
+                            if (
+                                progress_callback is not None
+                                and end >= next_report
+                            ):
+                                progress_callback(end, metadata.st_size)
+                                next_report = end + report_interval
+                    finally:
+                        mapped_view.release()
+                    if progress_callback is not None:
+                        progress_callback(metadata.st_size, metadata.st_size)
+                    digest_output.append(digest.hexdigest())
         if len(_CANONICAL_VALUE_START_CACHE) > 512:
             _CANONICAL_VALUE_START_CACHE.clear()
         for key, starts in found.items():

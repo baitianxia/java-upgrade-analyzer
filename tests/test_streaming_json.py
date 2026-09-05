@@ -196,6 +196,31 @@ class StreamingJsonTest(unittest.TestCase):
                     "complete",
                 )
 
+    def test_field_priming_can_publish_exact_digest_from_same_mapping(self):
+        payload = {
+            "coverage_gaps": ["gap"],
+            "records": [{"identity": index} for index in range(100)],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "digest.json"
+            write_json_streaming(path, payload)
+            expected = hashlib.sha256(path.read_bytes()).hexdigest()
+            actual = []
+            progress = []
+            prime_canonical_json_fields(
+                path,
+                ("coverage_gaps", "records"),
+                digest_output=actual,
+                progress_callback=lambda completed, total: progress.append(
+                    (completed, total)
+                ),
+                progress_interval_bytes=1,
+            )
+
+        self.assertEqual(actual, [expected])
+        self.assertTrue(progress)
+        self.assertEqual(progress[-1][0], progress[-1][1])
+
     def test_canonical_object_array_reader_handles_nested_delimiters(self):
         payload = {
             "coverage_gaps": ["one"],
