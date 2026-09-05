@@ -28,6 +28,7 @@ import heapq
 import io
 from itertools import chain
 import json
+import marshal
 import multiprocessing
 import ntpath
 import os
@@ -421,6 +422,38 @@ _REPEATED_SIDECAR_ARRAYS = frozenset({
     ("binary_runtime_semantic_overlay.json", "rows"),
     ("binary_entrypoints.json", "records"),
 })
+_SIDECAR_SPOOL_RAW_ROW_BYTES = 512
+_SIDECAR_SPOOL_RAW_MARKER = b"\x00"
+_SIDECAR_SPOOL_COMPRESSED_MARKER = b"\x01"
+
+
+class _SidecarSpoolError(ValueError):
+    """A derived row cache is unusable; authoritative input remains valid."""
+
+
+def _encode_sidecar_spool_row(row: dict[str, Any]) -> bytes:
+    """Encode one already-validated JSON-shaped row for the local spool."""
+
+    encoded = marshal.dumps(row)
+    if len(encoded) <= _SIDECAR_SPOOL_RAW_ROW_BYTES:
+        return _SIDECAR_SPOOL_RAW_MARKER + encoded
+    return _SIDECAR_SPOOL_COMPRESSED_MARKER + zlib.compress(encoded, 1)
+
+
+def _decode_sidecar_spool_row(payload: bytes) -> Any:
+    """Decode a local spool row without reparsing JSON text."""
+
+    if not payload:
+        raise _SidecarSpoolError("empty sidecar spool row")
+    marker, encoded = payload[:1], payload[1:]
+    try:
+        if marker == _SIDECAR_SPOOL_RAW_MARKER:
+            return marshal.loads(encoded)
+        if marker == _SIDECAR_SPOOL_COMPRESSED_MARKER:
+            return marshal.loads(zlib.decompress(encoded))
+    except (EOFError, TypeError, ValueError, zlib.error) as error:
+        raise _SidecarSpoolError(str(error)) from error
+    raise _SidecarSpoolError("unknown sidecar spool row codec")
 
 
 class _SidecarRowSpool:
@@ -473,6 +506,7 @@ class _SidecarRowSpool:
         self._completed: dict[
             str, tuple[int, int, int]
         ] = {}
+        self._disabled = False
         self._closed = False
 
     @staticmethod
@@ -493,7 +527,40 @@ class _SidecarRowSpool:
         field_name: str,
         source_factory: Callable[[], Iterable[dict[str, Any]]],
     ) -> Iterable[dict[str, Any]]:
-        cache_key, size, modified_ns = self._cache_key(path, field_name)
+        if self._disabled:
+            yield from source_factory()
+            return
+        source_key = self._cache_key(path, field_name)
+        emitted = 0
+        try:
+            for row in self._iter_cached_rows(
+                path, field_name, source_factory, source_key
+            ):
+                yield row
+                emitted += 1
+            return
+        except (sqlite3.Error, _SidecarSpoolError):
+            # A derived cache is never an activation prerequisite.  Resume
+            # the exact source sequence after the last emitted row, rather
+            # than restarting at row zero and duplicating consumer counts.
+            self._disabled = True
+            self._completed.clear()
+            if self._cache_key(path, field_name) != source_key:
+                raise BinaryValidationError(
+                    "BINARY_VALIDATION_JSON_CHANGED_DURING_STREAM", str(path)
+                )
+        for ordinal, row in enumerate(source_factory()):
+            if ordinal >= emitted:
+                yield row
+
+    def _iter_cached_rows(
+        self,
+        path: Path,
+        field_name: str,
+        source_factory: Callable[[], Iterable[dict[str, Any]]],
+        source_key: tuple[str, int, int],
+    ) -> Iterable[dict[str, Any]]:
+        cache_key, size, modified_ns = source_key
         completed = self._completed.get(cache_key)
         if completed is None or completed[:2] != (size, modified_ns):
             self._database.execute(
@@ -503,18 +570,9 @@ class _SidecarRowSpool:
             count = 0
             try:
                 for row in source_factory():
-                    encoded = surrogate_safe_json_bytes(
-                        row,
-                        ensure_ascii=False,
-                        # The source reader already validated the object and
-                        # consumers compare decoded values, not cache bytes.
-                        # Avoid re-sorting every key while creating the
-                        # derived row spool; key order is irrelevant after
-                        # JSON decoding and the source remains authoritative.
-                        sort_keys=False,
-                        separators=(",", ":"),
-                    )
-                    batch.append((cache_key, count, zlib.compress(encoded, 1)))
+                    batch.append((
+                        cache_key, count, _encode_sidecar_spool_row(row)
+                    ))
                     count += 1
                     if len(batch) >= 512:
                         self._database.executemany(
@@ -568,33 +626,15 @@ class _SidecarRowSpool:
                     str(path),
                 )
             self._completed[cache_key] = (size, modified_ns, count)
-        else:
-            # A cache hit must still reject a changed source before yielding
-            # any derived row.
-            current_key, current_size, current_mtime = self._cache_key(
-                path, field_name
-            )
-            if (
-                current_key != cache_key
-                or current_size != size
-                or current_mtime != modified_ns
-            ):
-                raise BinaryValidationError(
-                    "BINARY_VALIDATION_JSON_CHANGED_DURING_STREAM",
-                    str(path),
-                )
-
         cursor = self._database.execute(
             "SELECT payload FROM rows WHERE cache_key=? ORDER BY ordinal",
             (cache_key,),
         )
         try:
             for (payload,) in cursor:
-                value = json.loads(zlib.decompress(payload).decode("utf-8"))
+                value = _decode_sidecar_spool_row(payload)
                 if not isinstance(value, dict):
-                    raise BinaryValidationError(
-                        "BINARY_VALIDATION_JSON_INVALID", str(path)
-                    )
+                    raise _SidecarSpoolError("non-object sidecar spool row")
                 yield value
         finally:
             cursor.close()

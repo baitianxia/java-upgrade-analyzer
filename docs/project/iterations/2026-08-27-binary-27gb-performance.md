@@ -46,6 +46,7 @@
 18. trace 反向图构建采用 direct-edge 窄列投影，不读取建图不消费的 `edge_json`；旧的零参数适配器继续使用完整行，因而不会改变兼容输入的结果。
 19. immutable SQLite 读连接设置有界 mmap 和页缓存提示，SQLite 不支持时回退默认读取；该设置只改变物理 I/O，仍使用相同的只读 immutable 数据库和 SQL。
 20. 独立验证对会被多个域重复消费的三个 canonical sidecar 数组使用验证生命周期内的压缩磁盘行 spool；首次读取完整解析并复核源文件身份，缓存损坏、源文件变化或临时盘不可用时精确回退。direct-edge replay 将 `edge_json` 的严格布尔判定下推到 SQLite，并以 8192 项/4KiB 单值上限复用高重复小 payload，避免逐边创建 Python JSON 对象，非法 JSON/类型仍产生原有 replay 错误。
+21. spool 行的派生编码改为进程内 `marshal`，小行不压缩、大行使用低级别 zlib；缓存损坏或 SQLite 辅助错误会从权威 sidecar 按已输出序号续读，不重复计数也不阻断正式分析。
 
 ## 本地证据
 

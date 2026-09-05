@@ -68,6 +68,39 @@ class BinaryValidationPerformanceSafetyTest(unittest.TestCase):
                 oracle._ACTIVE_SIDECAR_ROW_SPOOL = previous
                 spool.close()
 
+    def test_corrupt_sidecar_spool_falls_back_without_result_drift(self):
+        with tempfile.TemporaryDirectory() as temp_text:
+            sidecar = Path(temp_text) / "binary_entrypoints.json"
+            sidecar.write_text(
+                '{"records":[{"member_identity":"a",'
+                '"path_certainty":"exact"}]}',
+                encoding="utf-8",
+            )
+            spool = oracle._SidecarRowSpool()
+            previous = oracle._ACTIVE_SIDECAR_ROW_SPOOL
+            oracle._ACTIVE_SIDECAR_ROW_SPOOL = spool
+            try:
+                with patch.object(
+                    oracle,
+                    "iter_canonical_json_object_array",
+                    wraps=oracle.iter_canonical_json_object_array,
+                ) as reader:
+                    first = list(oracle._iter_sidecar_object_rows(
+                        Path(temp_text), "binary_entrypoints.json", "records"
+                    ))
+                    spool._database.execute(
+                        "UPDATE rows SET payload=?", (b"\\x7f",)
+                    )
+                    spool._database.commit()
+                    second = list(oracle._iter_sidecar_object_rows(
+                        Path(temp_text), "binary_entrypoints.json", "records"
+                    ))
+                self.assertEqual(first, second)
+                self.assertEqual(reader.call_count, 2)
+            finally:
+                oracle._ACTIVE_SIDECAR_ROW_SPOOL = previous
+                spool.close()
+
     def test_process_scan_rejects_bad_parent_helper_then_scans_exactly(self):
         key = ("a" * 64, "/fixture/javap")
         scan_result = {
