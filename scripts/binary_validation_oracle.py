@@ -116,6 +116,8 @@ MAX_VALIDATION_POOLED_STRING_CHARS = 4_096
 # bounded working set so repeated path checks avoid three SQLite lookups while
 # a wide result set cannot turn the optimisation into another memory spike.
 MAX_CLOSED_WORLD_EVIDENCE_CACHE_ENTRIES = 8_192
+SQLITE_READ_MMAP_BYTES = 256 * 1024 * 1024
+SQLITE_READ_CACHE_KIB = 64 * 1024
 _LARGE_SIDECAR_FIELDS = {
     "binary_decisions.json": (
         "analysis_context_identity",
@@ -803,6 +805,21 @@ def _open_immutable_sqlite(path: Path) -> sqlite3.Connection:
     )
     try:
         connection.execute("PRAGMA query_only = ON")
+        # Immutable validation is read-only and dominated by forward scans of
+        # multi-GiB tables. A bounded mmap avoids repeated Python buffer copies
+        # while the negative cache size prevents SQLite from competing with
+        # the JVM and JSON workers for all available RAM. Unsupported builds
+        # retain SQLite defaults without changing the query contract.
+        try:
+            connection.execute(
+                f"PRAGMA mmap_size={SQLITE_READ_MMAP_BYTES}"
+            )
+            connection.execute(
+                f"PRAGMA cache_size=-{SQLITE_READ_CACHE_KIB}"
+            )
+            connection.execute("PRAGMA temp_store=FILE")
+        except sqlite3.Error:
+            pass
         return connection
     except BaseException:
         # Connection setup is not atomic: connect() may succeed before the
