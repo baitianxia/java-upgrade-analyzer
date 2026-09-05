@@ -343,7 +343,7 @@ Oracle 与生产实现只能共享最终制品、RuntimeProfile 和身份协议�
 
 缺失、额外、重复、冲突或无法绑定本次制品的 Oracle 结果都使 generation 无法激活。
 
-Oracle 可以改变证据遍历和临时索引的物理策略，但不能改变独立性或范围。大规模调用边验证采用一次顺序扫描同时合并 member、dispatch、type、class-init 和 linkage 五域；临时索引以 SQLite `rowid` 整数关联原始边，旧顺序、缺失 ordinal 和孤立 evidence 逐条回退到 SHA 主键查询。路径复核对重复 evidence 使用有界工作集缓存，并把关系、resolution 和 linkage 状态绑定在同一次查询结果中；缓存淘汰只增加查询，不改变结果。trace 反向图扫描只投影建图所需的 direct-edge 字段，不读取建图不消费的 `edge_json`；兼容适配器仍可提供完整行。immutable SQLite 读连接使用有界 mmap 和页缓存提示，提示不受支持时保持默认读取策略。大 sidecar 的字段偏移索引可与原始 SHA-256 在同一 mmap 生命周期完成，结构化索引失败时回退到完整顺序字节哈希。字符串池和 resolved-member projection cache 都有硬上限，达到上限后仅停止缓存，绝不采样、截断、跳过或改写记录。制品 SHA、ZIP/resource/XML inventory 可按可用内存并发执行，但每个物理路径仍单独校验完整 SHA，每个唯一 content/target 组合仍完整清点。
+Oracle 可以改变证据遍历和临时索引的物理策略，但不能改变独立性或范围。大规模调用边验证采用一次顺序扫描同时合并 member、dispatch、type、class-init 和 linkage 五域；临时索引以 SQLite `rowid` 整数关联原始边，旧顺序、缺失 ordinal 和孤立 evidence 逐条回退到 SHA 主键查询。路径复核对重复 evidence 使用有界工作集缓存，并把关系、resolution 和 linkage 状态绑定在同一次查询结果中；缓存淘汰只增加查询，不改变结果。重复消费的 canonical sidecar 数组可以在一次验证生命周期内写入压缩的有界磁盘行 spool：spool 只保存已完整解析的字典行，源文件身份变化、写入失败或临时目录不可用时不复用并精确回退，不能把派生缓存当作事实来源。direct-edge replay 将 `edge_json` 中的严格布尔字段判定下推到 SQLite；重复的小型 JSON payload 可用有界解码缓存复用，超过大小或数量上限即停止缓存，同时保留非法 JSON/非法类型的同一验证错误。trace 反向图扫描只投影建图所需的 direct-edge 字段，不读取建图不消费的 `edge_json`；兼容适配器仍可提供完整行。immutable SQLite 读连接使用有界 mmap 和页缓存提示，提示不受支持时保持默认读取策略。大 sidecar 的字段偏移索引可与原始 SHA-256 在同一 mmap 生命周期完成，结构化索引失败时回退到完整顺序字节哈希。字符串池和 resolved-member projection cache 都有硬上限，达到上限后仅停止缓存，绝不采样、截断、跳过或改写记录。制品 SHA、ZIP/resource/XML inventory 可按可用内存并发执行，但每个物理路径仍单独校验完整 SHA，每个唯一 content/target 组合仍完整清点。
 
 DecisionEngine 解压 provider/definition chunk 后可以在 base/current compact view 间共享 realm、runtime-profile 和封闭状态枚举的不可变字符串对象；class 名、事实身份、证据和任意高基数字段不得进入该池。共享只允许改变对象复用，不得改变字段类型、值、记录数、遍历范围或最终身份。
 

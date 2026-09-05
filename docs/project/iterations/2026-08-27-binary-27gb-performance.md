@@ -45,6 +45,7 @@
 17. 大 sidecar 的完整性 SHA-256 与 canonical 字段偏移索引共享一次 mmap 生命周期；摘要只在映射成功完成后发布，结构化索引失败回到原有顺序字节哈希，避免把格式提示变成验证捷径。
 18. trace 反向图构建采用 direct-edge 窄列投影，不读取建图不消费的 `edge_json`；旧的零参数适配器继续使用完整行，因而不会改变兼容输入的结果。
 19. immutable SQLite 读连接设置有界 mmap 和页缓存提示，SQLite 不支持时回退默认读取；该设置只改变物理 I/O，仍使用相同的只读 immutable 数据库和 SQL。
+20. 独立验证对会被多个域重复消费的三个 canonical sidecar 数组使用验证生命周期内的压缩磁盘行 spool；首次读取完整解析并复核源文件身份，缓存损坏、源文件变化或临时盘不可用时精确回退。direct-edge replay 将 `edge_json` 的严格布尔判定下推到 SQLite，并以 8192 项/4KiB 单值上限复用高重复小 payload，避免逐边创建 Python JSON 对象，非法 JSON/类型仍产生原有 replay 错误。
 
 ## 本地证据
 

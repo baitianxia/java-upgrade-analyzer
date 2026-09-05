@@ -411,6 +411,208 @@ def _iter_jsonl_values(payload: str) -> Iterable[Any]:
         cursor = boundary + 1
 
 
+# These arrays are consumed by more than one independent validation domain.
+# Keeping their decoded rows in RAM would recreate the paging failure this
+# validator is intended to prevent, while rescanning the source sidecar for
+# every domain repeatedly evicts the fact-store pages.  The lifecycle cache
+# below uses a private SQLite spool and compressed row payloads instead.
+_REPEATED_SIDECAR_ARRAYS = frozenset({
+    ("binary_decisions.json", "authoritative_change_facts"),
+    ("binary_runtime_semantic_overlay.json", "rows"),
+    ("binary_entrypoints.json", "records"),
+})
+
+
+class _SidecarRowSpool:
+    """Bounded disk cache for repeated immutable sidecar array reads.
+
+    A spool is created only for arrays known to be consumed by multiple
+    validators.  The first consumer parses the canonical source exactly once
+    and writes one compressed JSON object per row.  Later consumers read the
+    spool sequentially, avoiding another multi-GiB mmap walk and keeping the
+    Python heap bounded to one row.  The source stat is checked on every hit so
+    a mutable generation cannot be silently served from stale derived data.
+    """
+
+    def __init__(self) -> None:
+        self._temporary_context = short_temporary_directory(
+            prefix="binary-validation-sidecar"
+        )
+        self._temporary_root = Path(self._temporary_context.__enter__())
+        try:
+            self._database = sqlite3.connect(
+                self._temporary_root / "rows.sqlite",
+            )
+            self._database.execute("PRAGMA journal_mode=OFF")
+            self._database.execute("PRAGMA synchronous=OFF")
+            self._database.execute("PRAGMA temp_store=FILE")
+            self._database.execute("PRAGMA cache_size=-32768")
+            self._database.execute(
+                """
+                CREATE TABLE rows (
+                    cache_key TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    payload BLOB NOT NULL,
+                    PRIMARY KEY (cache_key, ordinal)
+                ) WITHOUT ROWID
+                """
+            )
+            self._database.commit()
+        except BaseException:
+            database = getattr(self, "_database", None)
+            if database is not None:
+                try:
+                    database.close()
+                except Exception:
+                    pass
+            try:
+                self._temporary_context.__exit__(*sys.exc_info())
+            except Exception:
+                pass
+            raise
+        self._completed: dict[
+            str, tuple[int, int, int]
+        ] = {}
+        self._closed = False
+
+    @staticmethod
+    def _cache_key(path: Path, field_name: str) -> tuple[str, int, int]:
+        try:
+            metadata = path.stat()
+        except OSError as error:
+            raise StreamingJsonReadError(f"{path}: {error}") from error
+        return (
+            f"{path.resolve()}\x00{field_name}",
+            int(metadata.st_size),
+            int(metadata.st_mtime_ns),
+        )
+
+    def iter_rows(
+        self,
+        path: Path,
+        field_name: str,
+        source_factory: Callable[[], Iterable[dict[str, Any]]],
+    ) -> Iterable[dict[str, Any]]:
+        cache_key, size, modified_ns = self._cache_key(path, field_name)
+        completed = self._completed.get(cache_key)
+        if completed is None or completed[:2] != (size, modified_ns):
+            self._database.execute(
+                "DELETE FROM rows WHERE cache_key=?", (cache_key,)
+            )
+            batch: list[tuple[str, int, bytes]] = []
+            count = 0
+            try:
+                for row in source_factory():
+                    encoded = surrogate_safe_json_bytes(
+                        row,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    batch.append((cache_key, count, zlib.compress(encoded, 1)))
+                    count += 1
+                    if len(batch) >= 512:
+                        self._database.executemany(
+                            "INSERT INTO rows(cache_key,ordinal,payload) "
+                            "VALUES (?,?,?)",
+                            batch,
+                        )
+                        batch.clear()
+                if batch:
+                    self._database.executemany(
+                        "INSERT INTO rows(cache_key,ordinal,payload) VALUES (?,?,?)",
+                        batch,
+                    )
+                self._database.commit()
+            except BaseException:
+                # A malformed or changing source must not leave a partial
+                # cache that a later validator could mistake for a complete
+                # canonical array.  Roll back and remove rows explicitly
+                # because the source generator may have opened a read cursor
+                # outside this SQLite transaction.
+                self._database.rollback()
+                self._database.execute(
+                    "DELETE FROM rows WHERE cache_key=?", (cache_key,)
+                )
+                self._database.commit()
+                self._completed.pop(cache_key, None)
+                raise
+            # Re-stat after the complete source pass. A changed generation is
+            # never promoted to a valid cached view.
+            try:
+                final_key, final_size, final_mtime = self._cache_key(
+                    path, field_name
+                )
+            except StreamingJsonReadError:
+                self._database.execute(
+                    "DELETE FROM rows WHERE cache_key=?", (cache_key,)
+                )
+                self._database.commit()
+                raise
+            if (
+                final_key != cache_key
+                or final_size != size
+                or final_mtime != modified_ns
+            ):
+                self._database.execute(
+                    "DELETE FROM rows WHERE cache_key=?", (cache_key,)
+                )
+                self._database.commit()
+                raise BinaryValidationError(
+                    "BINARY_VALIDATION_JSON_CHANGED_DURING_STREAM",
+                    str(path),
+                )
+            self._completed[cache_key] = (size, modified_ns, count)
+        else:
+            # A cache hit must still reject a changed source before yielding
+            # any derived row.
+            current_key, current_size, current_mtime = self._cache_key(
+                path, field_name
+            )
+            if (
+                current_key != cache_key
+                or current_size != size
+                or current_mtime != modified_ns
+            ):
+                raise BinaryValidationError(
+                    "BINARY_VALIDATION_JSON_CHANGED_DURING_STREAM",
+                    str(path),
+                )
+
+        cursor = self._database.execute(
+            "SELECT payload FROM rows WHERE cache_key=? ORDER BY ordinal",
+            (cache_key,),
+        )
+        try:
+            for (payload,) in cursor:
+                value = json.loads(zlib.decompress(payload).decode("utf-8"))
+                if not isinstance(value, dict):
+                    raise BinaryValidationError(
+                        "BINARY_VALIDATION_JSON_INVALID", str(path)
+                    )
+                yield value
+        finally:
+            cursor.close()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._database.close()
+        finally:
+            try:
+                self._temporary_context.__exit__(None, None, None)
+            except Exception:
+                # The cache is non-authoritative temporary state. Failure to
+                # clean it must never replace an analysis result or validation
+                # exception.
+                pass
+
+
+_ACTIVE_SIDECAR_ROW_SPOOL: _SidecarRowSpool | None = None
+
+
 def _environment_progress_callback() -> ValidationProgressCallback | None:
     report_dir = str(os.environ.get("UPGRADE_REPORT_DIR") or "").strip()
     if not report_dir:
@@ -1058,12 +1260,23 @@ def _iter_sidecar_object_rows(
             sidecar_name,
         )
 
-    try:
+    def source_rows() -> Iterable[dict[str, Any]]:
         yield from iter_canonical_json_object_array(
             path,
             field_name,
             progress_callback=report if progress_callback is not None else None,
         )
+
+    try:
+        if (
+            _ACTIVE_SIDECAR_ROW_SPOOL is not None
+            and (sidecar_name, field_name) in _REPEATED_SIDECAR_ARRAYS
+        ):
+            yield from _ACTIVE_SIDECAR_ROW_SPOOL.iter_rows(
+                path, field_name, source_rows
+            )
+        else:
+            yield from source_rows()
     except StreamingJsonReadError as error:
         # Focused fixtures and third-party integrations may still emit
         # whitespace-formatted JSON. Preserve compatibility for bounded files
@@ -2746,7 +2959,9 @@ def _production_structural_truth_for_artifact(
             edge["caller_class_name"], edge["caller_member_name"],
             edge["caller_descriptor"], int(edge["bytecode_offset"]),
         )
-        payload = json.loads(edge["edge_json"])
+        payload = _decode_validation_edge_json(
+            edge["edge_json"], None, strict=True
+        )
         # direct_edges.edge_kind is NOT NULL and this query only admits
         # explicit edge kinds/prefixes, so an empty fallback cannot occur.
         edge_kind = str(edge["edge_kind"])
@@ -4060,6 +4275,42 @@ def _same_json_value(left: Any, right: Any) -> bool:
     if type(left) is not type(right):
         return False
     return left == right
+
+
+MAX_VALIDATION_EDGE_JSON_CACHE_ENTRIES = 8_192
+MAX_VALIDATION_EDGE_JSON_CACHE_BYTES = 4 * 1024
+_EDGE_JSON_CACHE_MISS = object()
+
+
+def _decode_validation_edge_json(
+    value: Any,
+    cache: OrderedDict[str, Any] | None = None,
+    *,
+    strict: bool = False,
+) -> Any:
+    """Decode repeated compact edge payloads without retaining a graph."""
+
+    text = str(value)
+    cacheable = len(text.encode("utf-8", "surrogatepass")) <= (
+        MAX_VALIDATION_EDGE_JSON_CACHE_BYTES
+    )
+    if cache is not None and cacheable:
+        decoded = cache.get(text, _EDGE_JSON_CACHE_MISS)
+        if decoded is not _EDGE_JSON_CACHE_MISS:
+            cache.move_to_end(text)
+            return decoded
+    try:
+        decoded = json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        if strict:
+            raise
+        decoded = None
+    if cache is not None and cacheable:
+        cache[text] = decoded
+        cache.move_to_end(text)
+        while len(cache) > MAX_VALIDATION_EDGE_JSON_CACHE_ENTRIES:
+            cache.popitem(last=False)
+    return decoded
 
 
 def _pooled_string(value: str, pool: dict[str, str]) -> str:
@@ -6221,6 +6472,7 @@ def _production_direct_truth_for_artifact(
     *,
     include_structural: bool = False,
     member_rowid_range: tuple[int, int, int] | None = None,
+    edge_json_cache: OrderedDict[str, Any] | None = None,
 ) -> (
     tuple[set[tuple[Any, ...]], set[tuple[Any, ...]]]
     | tuple[
@@ -6313,7 +6565,9 @@ def _production_direct_truth_for_artifact(
         if include_structural:
             try:
                 # direct_edges.edge_json is NOT NULL in the fact-store schema.
-                edge_payload = json.loads(str(edge["edge_json"]))
+                edge_payload = _decode_validation_edge_json(
+                    edge["edge_json"], edge_json_cache
+                )
             except (TypeError, ValueError, json.JSONDecodeError):
                 edge_payload = None
             edge_payload_loaded = True
@@ -6429,7 +6683,9 @@ def _production_direct_truth_for_artifact(
         ):
             if not edge_payload_loaded:
                 try:
-                    edge_payload = json.loads(str(edge["edge_json"]))
+                    edge_payload = _decode_validation_edge_json(
+                        edge["edge_json"], edge_json_cache
+                    )
                 except (TypeError, ValueError, json.JSONDecodeError):
                     edge_payload = None
             handle_payload = edge_payload
@@ -6483,7 +6739,9 @@ def _production_direct_truth_for_artifact(
         if edge_kind == "method":
             if not edge_payload_loaded:
                 try:
-                    edge_payload = json.loads(str(edge["edge_json"]))
+                    edge_payload = _decode_validation_edge_json(
+                        edge["edge_json"], edge_json_cache
+                    )
                 except (TypeError, ValueError, json.JSONDecodeError):
                     edge_payload = None
             reference_interface = (
@@ -6537,6 +6795,7 @@ def _validate_direct_edges(
     validated_projection_cache: dict[
         tuple[Any, ...], dict[str, Any]
     ] | None = None,
+    edge_json_cache: OrderedDict[str, Any] | None = None,
     member_rowid_ranges_output: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     issues = []
@@ -6923,6 +7182,7 @@ def _validate_direct_edges(
                 instance_identity,
                 issues,
                 member_rowid_range=member_rowid_range,
+                edge_json_cache=edge_json_cache,
             )
         else:
             (
@@ -6934,6 +7194,7 @@ def _validate_direct_edges(
                 issues,
                 include_structural=True,
                 member_rowid_range=member_rowid_range,
+                edge_json_cache=edge_json_cache,
             )
             production_structural_cache.put(
                 instance_identity, actual_type, actual_init
@@ -8209,7 +8470,15 @@ def _iter_validated_direct_edges(
             connection,
             selected_columns=(
                 "e.edge_kind,e.symbolic_owner,e.symbolic_name,"
-                "e.symbolic_descriptor,e.opcode,e.bytecode_offset,e.edge_json"
+                "e.symbolic_descriptor,e.opcode,e.bytecode_offset,"
+                "CASE "
+                "WHEN e.edge_kind='field' THEN 'field' "
+                "WHEN json_valid(e.edge_json)=0 THEN '__invalid__' "
+                "WHEN json_type(e.edge_json,'$.interface')='true' "
+                "THEN 'interface_method' "
+                "WHEN json_type(e.edge_json,'$.interface')='false' "
+                "THEN 'method' "
+                "ELSE '__invalid__' END AS oracle_reference_kind"
             ),
             edge_predicate=edge_predicate,
             edge_parameters=edge_parameters,
@@ -8220,28 +8489,23 @@ def _iter_validated_direct_edges(
             # All selected text columns are NOT NULL in the validated fact
             # store. Empty strings remain observable; SQL NULL is impossible.
             edge_kind = str(edge["edge_kind"])
-            if edge_kind == "method":
-                try:
-                    payload = json.loads(str(edge["edge_json"]))
-                except (TypeError, ValueError, json.JSONDecodeError) as error:
-                    raise BinaryValidationError(
-                        "BINARY_VALIDATED_DIRECT_EDGE_REPLAY_INVALID",
-                        str(error),
-                    ) from error
-                reference_interface = (
-                    payload.get("interface")
-                    if isinstance(payload, Mapping) else None
+            reference_kind = str(edge["oracle_reference_kind"])
+            if reference_kind == "__invalid__":
+                raise BinaryValidationError(
+                    "BINARY_VALIDATED_DIRECT_EDGE_REPLAY_INVALID",
+                    str(edge["bytecode_offset"]),
                 )
-                if type(reference_interface) is not bool:
-                    raise BinaryValidationError(
-                        "BINARY_VALIDATED_DIRECT_EDGE_REPLAY_INVALID",
-                        str(edge["bytecode_offset"]),
-                    )
-                reference_kind = (
-                    "interface_method" if reference_interface else "method"
+            # The SQL projection above performs the same strict boolean
+            # validation as the former Python json.loads path, while keeping
+            # the multi-million-row replay in SQLite's C implementation and
+            # avoiding materialisation of edge_json in Python.
+            if edge_kind == "method" and reference_kind not in {
+                "method", "interface_method"
+            }:
+                raise BinaryValidationError(
+                    "BINARY_VALIDATED_DIRECT_EDGE_REPLAY_INVALID",
+                    str(edge["bytecode_offset"]),
                 )
-            else:
-                reference_kind = "field"
             yield (
                 caller[0].replace("/", "."),
                 caller[1],
@@ -12341,6 +12605,38 @@ def validate_generation(
     *,
     progress_callback: ValidationProgressCallback | None = None,
 ) -> dict[str, Any]:
+    """Validate one generation with a bounded repeated-sidecar row spool."""
+
+    global _ACTIVE_SIDECAR_ROW_SPOOL
+    previous_spool = _ACTIVE_SIDECAR_ROW_SPOOL
+    try:
+        spool = _SidecarRowSpool()
+    except Exception:
+        # The spool is a derived performance aid.  A read-only or exhausted
+        # temporary volume must retain the original exact streaming validator.
+        return _validate_generation_impl(
+            config,
+            generation_directory,
+            progress_callback=progress_callback,
+        )
+    _ACTIVE_SIDECAR_ROW_SPOOL = spool
+    try:
+        return _validate_generation_impl(
+            config,
+            generation_directory,
+            progress_callback=progress_callback,
+        )
+    finally:
+        _ACTIVE_SIDECAR_ROW_SPOOL = previous_spool
+        spool.close()
+
+
+def _validate_generation_impl(
+    config: Mapping[str, Any],
+    generation_directory: str | Path,
+    *,
+    progress_callback: ValidationProgressCallback | None = None,
+) -> dict[str, Any]:
     # URL resolution is repeated for every observed provider but normally has
     # only one value per artifact. Scope the memo to this validation run so a
     # later run cannot inherit stale filesystem/symlink state.
@@ -12855,6 +13151,7 @@ def validate_generation(
     # only the artifact it is actively comparing. Focused callers can still
     # pass ordinary dict caches to the helpers for compatibility.
     direct_scan_cache = _OracleScanSpoolCache()
+    validation_edge_json_cache: OrderedDict[str, Any] = OrderedDict()
     validated_projection_cache: dict[
         tuple[Any, ...], dict[str, Any]
     ] = {}
@@ -13000,6 +13297,7 @@ def validate_generation(
                 retain_truth_rows=False,
                 production_structural_cache=production_structural_cache,
                 validated_projection_cache=validated_projection_cache,
+                edge_json_cache=validation_edge_json_cache,
                 member_rowid_ranges_output=member_range_output,
             )
             member_rowid_ranges_by_side[side_name] = (

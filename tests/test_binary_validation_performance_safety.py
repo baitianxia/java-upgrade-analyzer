@@ -29,6 +29,45 @@ from binary_tool_execution import BinaryToolFailure, BinaryToolResult  # noqa: E
 
 
 class BinaryValidationPerformanceSafetyTest(unittest.TestCase):
+    def test_repeated_sidecar_rows_are_spooled_once_without_result_drift(self):
+        with tempfile.TemporaryDirectory() as temp_text:
+            sidecar = Path(temp_text) / "binary_entrypoints.json"
+            sidecar.write_text(
+                '{"records":[{"member_identity":"a","path_certainty":"exact"},'
+                '{"member_identity":"b","path_certainty":"possible"}]}',
+                encoding="utf-8",
+            )
+            previous = oracle._ACTIVE_SIDECAR_ROW_SPOOL
+            spool = oracle._SidecarRowSpool()
+            oracle._ACTIVE_SIDECAR_ROW_SPOOL = spool
+            try:
+                with patch.object(
+                    oracle,
+                    "iter_canonical_json_object_array",
+                    wraps=oracle.iter_canonical_json_object_array,
+                ) as reader:
+                    first = list(oracle._iter_sidecar_object_rows(
+                        Path(temp_text), "binary_entrypoints.json", "records"
+                    ))
+                    second = list(oracle._iter_sidecar_object_rows(
+                        Path(temp_text), "binary_entrypoints.json", "records"
+                    ))
+                    self.assertEqual(first, second)
+                    self.assertEqual(reader.call_count, 1)
+                    sidecar.write_text(
+                        '{"records":[{"member_identity":"changed",'
+                        '"path_certainty":"exact"}]}',
+                        encoding="utf-8",
+                    )
+                    changed = list(oracle._iter_sidecar_object_rows(
+                        Path(temp_text), "binary_entrypoints.json", "records"
+                    ))
+                    self.assertEqual(changed[0]["member_identity"], "changed")
+                    self.assertEqual(reader.call_count, 2)
+            finally:
+                oracle._ACTIVE_SIDECAR_ROW_SPOOL = previous
+                spool.close()
+
     def test_process_scan_rejects_bad_parent_helper_then_scans_exactly(self):
         key = ("a" * 64, "/fixture/javap")
         scan_result = {
@@ -110,6 +149,22 @@ class BinaryValidationPerformanceSafetyTest(unittest.TestCase):
         )
         self.assertEqual(loads, [("a", "missing"), ("b",)])
         self.assertLessEqual(len(cache.values), 2)
+
+    def test_edge_payload_cache_is_bounded_and_value_preserving(self):
+        cache = oracle.OrderedDict()
+        first = oracle._decode_validation_edge_json(
+            '{"interface":false}', cache
+        )
+        second = oracle._decode_validation_edge_json(
+            '{"interface":false}', cache
+        )
+        self.assertIs(first, second)
+        self.assertIs(first["interface"], False)
+        self.assertIsNone(oracle._decode_validation_edge_json("not-json", cache))
+        with patch.object(oracle, "MAX_VALIDATION_EDGE_JSON_CACHE_ENTRIES", 1):
+            oracle._decode_validation_edge_json('{"tag":1}', cache)
+            oracle._decode_validation_edge_json('{"tag":2}', cache)
+            self.assertLessEqual(len(cache), 1)
 
     def test_artifact_truth_identity_uses_bounded_native_fast_path(self):
         rows = [
