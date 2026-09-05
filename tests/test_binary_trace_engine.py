@@ -538,6 +538,11 @@ class BinaryTraceBoundaryTest(unittest.TestCase):
              ("two", {"identity": "two", "value": "2"})],
         )
         self.assertEqual(
+            list(lookup.iter_graph_items(("identity",))),
+            [("one", {"identity": "one"}),
+             ("two", {"identity": "two"})],
+        )
+        self.assertEqual(
             list(lookup.iter_matching_items(("two", "missing"))),
             [("two", {"identity": "two", "caller_member_identity": "2"})],
         )

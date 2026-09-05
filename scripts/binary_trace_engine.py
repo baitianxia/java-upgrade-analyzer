@@ -239,6 +239,10 @@ _EDGE_COLUMNS = (
 _MEMBER_COLUMNS = (
     "member_identity", "class_name", "member_name", "descriptor",
 )
+_GRAPH_EDGE_COLUMNS = (
+    "direct_edge_identity", "caller_member_identity", "edge_kind",
+    "symbolic_owner", "symbolic_name", "symbolic_descriptor",
+)
 
 
 class _SQLiteTraceRowLookup(Mapping[str, Mapping[str, Any]]):
@@ -287,9 +291,16 @@ class _SQLiteTraceRowLookup(Mapping[str, Mapping[str, Any]]):
             f"SELECT COUNT(*) FROM {self.table}"
         ).fetchone()[0])
 
-    def iter_graph_items(self) -> Iterator[tuple[str, Mapping[str, Any]]]:
+    def iter_graph_items(
+        self,
+        columns: tuple[str, ...] | None = None,
+    ) -> Iterator[tuple[str, Mapping[str, Any]]]:
+        projection = (
+            self._projection
+            if columns is None else ",".join(str(column) for column in columns)
+        )
         for row in self.connection.execute(
-            f"SELECT {self._projection} FROM {self.table}"
+            f"SELECT {projection} FROM {self.table}"
         ):
             yield str(row[self.identity_column]), dict(row)
 
@@ -636,7 +647,13 @@ class BinaryTraceEngine:
     ) -> Iterator[tuple[str, Mapping[str, Any]]]:
         iterator = getattr(self.edges, "iter_graph_items", None)
         if callable(iterator):
-            yield from iterator()
+            try:
+                yield from iterator(_GRAPH_EDGE_COLUMNS)
+            except TypeError:
+                # Compatibility adapters may expose the pre-optimisation
+                # zero-argument iterator. Their complete rows remain valid;
+                # only the SQL-backed path uses the narrow projection.
+                yield from iterator()
             return
         for edge_id, edge in self.edges.items():
             yield str(edge_id), edge
