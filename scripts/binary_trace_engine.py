@@ -302,7 +302,12 @@ class _SQLiteTraceRowLookup(Mapping[str, Mapping[str, Any]]):
         for row in self.connection.execute(
             f"SELECT {projection} FROM {self.table}"
         ):
-            yield str(row[self.identity_column]), dict(row)
+            # The narrow graph projection is consumed immediately by the
+            # reverse-graph builder. Retain sqlite3.Row there instead of
+            # copying every scanned edge into a temporary dict; the default
+            # full projection keeps the historical mapping contract.
+            value = row if columns is not None else dict(row)
+            yield str(row[self.identity_column]), value
 
     def iter_matching_items(
         self, identities: tuple[str, ...]
@@ -705,7 +710,7 @@ class BinaryTraceEngine:
             edge_id = str(
                 resolution.get("direct_edge_identity") or scanned_edge_id
             )
-            edge_kind = str(edge.get("edge_kind") or "")
+            edge_kind = str(edge["edge_kind"] or "")
             dynamic_handle = (
                 edge_kind.startswith("invokedynamic_handle_")
                 or edge_kind.startswith("ldc_bootstrap_handle_")
@@ -847,13 +852,13 @@ class BinaryTraceEngine:
             symbolic = self._node_identity(self._symbolic_target(
                 str(
                     type_resolution.get("symbolic_owner")
-                    or edge.get("symbolic_owner")
+                    or edge["symbolic_owner"]
                     or ""
                 ),
                 "<class>",
                 str(
                     type_resolution.get("symbolic_descriptor")
-                    or edge.get("symbolic_descriptor")
+                    or edge["symbolic_descriptor"]
                     or ""
                 ),
                 "class",

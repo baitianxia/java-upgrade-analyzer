@@ -538,7 +538,9 @@ class BinaryTraceBoundaryTest(unittest.TestCase):
              ("two", {"identity": "two", "value": "2"})],
         )
         self.assertEqual(
-            list(lookup.iter_graph_items(("identity",))),
+            [(
+                identity, dict(row)
+            ) for identity, row in lookup.iter_graph_items(("identity",))],
             [("one", {"identity": "one"}),
              ("two", {"identity": "two"})],
         )
